@@ -64,6 +64,23 @@ Diff tabs are created via `createTab(workspaceId, { kind: "diff" })`. Entry poin
 
 Each tab initializes its state in the diff store on mount if none exists for that `tabId`.
 
+### The right panel's Diff pane
+
+`DiffPane` also mounts as a pane in the right-panel deck, under a synthetic
+diff-store key (`right-panel:<workspaceId>:diff`) — one per workspace, so
+the panel's diff has its own persisted layout and file selection without
+occupying a workspace tab. It is mounted with `embedded`, which suppresses
+`DiffToolbar` entirely: the deck's tab-row action slot carries the
+split/unified toggle and **Open in a tab** (which promotes the current file
+to a real diff tab), and the deck's status foot names the file being
+diffed — the panel has no breadcrumb row to put it in. Files are picked from the Changes pane, whose row
+click targets this pane rather than the main area.
+
+Hunk navigation, file navigation, section filtering and focus mode stay on
+the **main-area tab**, which has the room for them; the panel's copy is a
+narrow read surface, not a reduced version of the tab. Nothing was removed
+from the tab surface.
+
 > The standalone "Diff Viewer" new-tab (`+`) menu item and the "Open Diff
 > Viewer" command-palette action were removed in `v0.7.5` (`283660a`): both
 > opened a diff tab with no file selected, landing on an empty "Select a file
@@ -95,7 +112,7 @@ Each tab initializes its state in the diff store on mount if none exists for tha
 
 ## Important Touch Points
 
-- `src/components/diff/DiffPane.tsx` — top-level diff tab container, fetches data, wires up navigation
+- `src/components/diff/DiffPane.tsx` — top-level diff container, fetches data, wires up navigation; `embedded` drops the toolbar for the right-panel deck
 - `src/components/diff/DiffToolbar.tsx` — toolbar with layout, section, navigation, focus mode, edit, close
 - `src/components/diff/DiffUnifiedView.tsx` — unified-view renderer with `scrollToHunk` imperative handle
 - `src/components/diff/DiffSplitView.tsx` — split-view renderer

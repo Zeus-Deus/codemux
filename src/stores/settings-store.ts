@@ -29,11 +29,16 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
   // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
   "sidebar.show_git_stats": "true",
-  // Working-indicator glyph shown while an agent is working — the animation
-  // variant and its token color. Rendered by the WorkingIndicator component
-  // in the sidebar row and rail flyout.
-  "sidebar.working_indicator": "braille",
-  "sidebar.working_indicator_color": "status-working",
+  // Whether the agent orb's animation follows what the agent is actually
+  // doing (searching / composing / connecting / …) or stays pinned to the
+  // neutral "working" orb everywhere. See src/lib/orb-state.ts.
+  //
+  // This replaced the old `sidebar.working_indicator` glyph picker and
+  // `sidebar.working_indicator_color` swatches. Those keys are simply no
+  // longer read — a settings row left over from an older build is inert
+  // (the table is free-form key/value, so nothing rejects it) and is never
+  // written back, so it ages out on its own.
+  "agents.orb_match_activity": "true",
   // How many days a workspace card may sit without agent activity before the
   // inbox sweeps it into the Settled section on its own. "off" disables the
   // idle sweep (merged/closed-PR cards still auto-settle once idle). See
@@ -55,24 +60,6 @@ export type AppearanceDensity = "comfortable" | "compact";
 /** Idle-sweep window for the inbox auto-settle. "off" disables the
  *  inactivity rule; the numeric values are day counts. */
 export type AutoSettleDays = "off" | "1" | "3" | "7" | "14";
-
-/** Working-indicator animation variant. */
-export type WorkingIndicatorVariant =
-  | "braille"
-  | "ring"
-  | "blink"
-  | "sweep"
-  | "typing";
-
-/** Working-indicator color token. No red — that's reserved for the
- *  needs-you dot. */
-export type WorkingIndicatorColor =
-  | "status-working"
-  | "foreground"
-  | "accent-ember"
-  | "status-open"
-  | "status-remote"
-  | "accent-violet";
 
 interface SettingsState {
   loaded: boolean;
@@ -183,16 +170,8 @@ export const selectChatCodeWrap = (s: SettingsStore): boolean =>
   (s.settings["chat.code_wrap"] ?? SETTINGS_DEFAULTS["chat.code_wrap"]!) ===
   "true";
 
-export const selectWorkingIndicator = (
-  s: SettingsStore,
-): WorkingIndicatorVariant =>
-  (s.settings["sidebar.working_indicator"] ??
-    SETTINGS_DEFAULTS["sidebar.working_indicator"]!) as WorkingIndicatorVariant;
-
-export const selectWorkingIndicatorColor = (
-  s: SettingsStore,
-): WorkingIndicatorColor =>
-  (s.settings["sidebar.working_indicator_color"] ??
-    SETTINGS_DEFAULTS[
-      "sidebar.working_indicator_color"
-    ]!) as WorkingIndicatorColor;
+/** Whether agent orbs follow the current activity. Default on; off pins
+ *  every orb to the neutral working state. */
+export const selectOrbMatchActivity = (s: SettingsStore): boolean =>
+  (s.settings["agents.orb_match_activity"] ??
+    SETTINGS_DEFAULTS["agents.orb_match_activity"]!) !== "false";

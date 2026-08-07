@@ -1195,7 +1195,7 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it
                 // — unless GUI-mode background browsing suppresses it (see above).
                 let should_create = should_create_browser_pane(
-                    agent_session.pane_id.is_some(),
+                    agent_session.is_surfaced(),
                     agent_session.user_dismissed,
                     gui_background_mode,
                 );
@@ -1720,16 +1720,21 @@ fn filter_ports_by_workspace<'a>(
 /// Extracted as a small pure function so the GUI-mode background-browsing
 /// gate (docs/features/browser.md "Background browser in GUI mode") is
 /// unit-testable without standing up `AppStateStore`/`ObservabilityStore`.
-/// `pane_attached` and `user_dismissed` mirror the existing pre-GUI-mode
+/// `surfaced` and `user_dismissed` mirror the existing pre-GUI-mode
 /// rule; `gui_background_mode` is `true` when the Agent Chat GUI beta is on
 /// for a workspace, in which case the session must stay detached even though
 /// it would otherwise qualify for a new pane.
+///
+/// `surfaced` is `AgentBrowserSession::is_surfaced()`, not `pane_id.is_some()`:
+/// a session docked in the right-panel deck is already on screen, so
+/// splitting a second surface into the pane tree for it would show the user
+/// the same Chromium twice.
 fn should_create_browser_pane(
-    pane_attached: bool,
+    surfaced: bool,
     user_dismissed: bool,
     gui_background_mode: bool,
 ) -> bool {
-    !pane_attached && !user_dismissed && !gui_background_mode
+    !surfaced && !user_dismissed && !gui_background_mode
 }
 
 /// Pane-creation decision for the **legacy no-workspace-context fallback**

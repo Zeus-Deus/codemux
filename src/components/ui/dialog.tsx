@@ -47,6 +47,29 @@ function DialogOverlay({
   )
 }
 
+/**
+ * Transform-free centering, for dialogs whose text must stay crisp.
+ *
+ * `DialogContent` centers with `top-1/2 left-1/2` + `-translate-x-1/2
+ * -translate-y-1/2`. A translate puts the element on its own composited
+ * layer, and every one of those four halves is fractional as soon as the
+ * thing it halves is odd — the window height, the window width, or the
+ * dialog's own height. A composited layer sitting on a half pixel gets
+ * resampled when it is drawn, and every glyph inside it goes soft on
+ * WebKitGTK. Measured on the search dialog before this existed: `top:
+ * 330.5px` at an 801px-tall window, `left: 448.5px` at a 1281px-wide one.
+ *
+ * This replaces both translates with layout: a whole `96px` from the top
+ * (the same offset the command palette uses) and auto margins between
+ * `inset-x-0` for the horizontal center. Layout offsets are painted snapped
+ * to the pixel grid; transform offsets are not.
+ *
+ * Worth applying to any dialog that is mostly text and is opened often —
+ * the search overlays are the ones where the softness was obvious.
+ */
+export const DIALOG_CRISP_POSITION =
+  "inset-x-0 top-24 mx-auto translate-x-0 translate-y-0"
+
 function DialogContent({
   className,
   children,

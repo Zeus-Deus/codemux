@@ -1,41 +1,54 @@
-import {
-  Ban,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Info,
-  LoaderCircle,
-  X,
-} from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronRight, X } from "lucide-react";
 import { memo, useState } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
-  describeToolCall,
+  formatElapsed,
   isRunning,
-  recentToolCalls,
   statusTone,
   subagentActivityLine,
+  subagentGroupRollup,
+  subagentLatestOutput,
   subagentMetaLine,
 } from "@/lib/agent-chat/subagents";
 import type { SubagentRunItem, SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
 import { TickingText } from "./TickingText";
+import { formatCompactTokens } from "./WorkflowRunCard";
 
 /**
- * Subagents orchestration card (design "Subagents, made visible"). One
- * card per contiguous spawn group; one row per subagent with a status
- * spinner/check/x, name + model column, a shimmering live activity line
- * (or muted result line when done), mono meta ("2m 41s · 28 tools"), an
- * Enter button and a chevron that opens an inline "recent activity" peek.
+ * Subagents in the thread (design 1b, "Subagents in the thread").
+ *
+ * There is no card here any more: no border box, no tinted rows, no
+ * `Enter ›` buttons. A spawn group is a 1.5px vertical gradient **rail**
+ * carrying the group's state (accent while running, success once settled)
+ * with the content sitting to its right, so the block reads as part of the
+ * transcript rather than a widget dropped into it. Rows are plain hover
+ * targets that expand inline; status is a rail and a glyph, never a filled
+ * row.
+ *
+ * Three shapes, one component:
+ * - **running** — rail + header + rows, each running row owning its own
+ *   activity-matched orb (the whole-run orb lives on the composer strip).
+ * - **settled, collapsed** (the resting state once the run is over) — a
+ *   single ~30px hover row: check · "Ran N subagents" · mono rollup · View.
+ * - **settled, expanded** — clicking that line re-opens the rail view with
+ *   settled styling, so the detail is one click away and never in the way.
  *
  * Rendered as a single memoized transcript row: a streaming child event
- * mutates only this card's `item` reference, so exactly this row
- * re-renders (issue #77 scroller contract preserved). A local 1s tick
- * refreshes the derived elapsed time while any subagent is running.
+ * mutates only this group's `item` reference, so exactly this row
+ * re-renders (issue #77 scroller contract preserved). Elapsed labels tick
+ * through `TickingText`, which writes `textContent` directly and never
+ * re-enters React.
  *
  * The root carries `data-subagent-card={item.id}` so MessageList can apply
  * the post-navigation highlight after LegendList mounts the requested row.
+ *
+ * Prototype sizes are half-pixel (12.5 / 11.5 / 10.5px); they are rounded
+ * to the whole-pixel compact scale here per the design system — half-pixel
+ * font sizes soften glyphs badly in the WebKitGTK desktop renderer.
  */
 export const SubagentsCard = memo(function SubagentsCard({
   item,
@@ -45,81 +58,186 @@ export const SubagentsCard = memo(function SubagentsCard({
   onEnter: (subagentId: string) => void;
 }) {
   const subs = item.subagents;
-  const anyRunning = subs.some((s) => s.status === "running");
+  // `pending` counts as live: a queued subagent has not settled, so the
+  // group must not collapse to its "Ran N subagents" resting line yet.
+  const anyRunning = subs.some((s) => isRunning(s));
   const anyFailed = subs.some((s) => s.status === "failed");
+  const anyHalted = subs.some(
+    (s) => s.status === "interrupted" || s.status === "stopped",
+  );
   const [openId, setOpenId] = useState<string | null>(null);
+  const [groupOpen, setGroupOpen] = useState(false);
 
-  const doneCount = subs.filter(
-    (s) =>
-      s.status === "completed" ||
-      s.status === "failed" ||
-      s.status === "stopped" ||
-      s.status === "interrupted",
-  ).length;
-  const activeCount = subs.filter((s) => isRunning(s)).length;
+  if (!anyRunning && !groupOpen) {
+    return (
+      <div data-subagent-card={item.id}>
+        <SettledLine
+          subs={subs}
+          anyFailed={anyFailed}
+          anyHalted={anyHalted}
+          onOpen={() => setGroupOpen(true)}
+        />
+      </div>
+    );
+  }
 
   return (
-    <div
-      data-subagent-card={item.id}
-      className="overflow-hidden rounded-[13px] border border-border bg-foreground/[0.025]"
-    >
-      {/* Aggregate header */}
-      <div className="flex items-center gap-2.5 border-b border-border/60 px-3.5 py-3">
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-          {anyRunning ? (
-            <LoaderCircle
-              className="h-[18px] w-[18px] animate-spin text-status-working"
-              strokeWidth={1.8}
-              aria-hidden
-            />
-          ) : anyFailed ? (
-            <X
-              className="h-[18px] w-[18px] text-status-attention"
-              strokeWidth={1.8}
-              aria-hidden
-            />
-          ) : (
-            <Check
-              className="h-[18px] w-[18px] text-status-open"
-              strokeWidth={1.8}
-              aria-hidden
-            />
-          )}
-        </span>
-        <span className="text-[13px] font-bold text-foreground">Subagents</span>
-        <span className="text-[12px] text-muted-foreground">
-          {subs.length} {subs.length === 1 ? "task" : "tasks"}
-          {anyRunning ? " · running in parallel" : " · complete"}
-        </span>
-        <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-          {doneCount} done · {activeCount} active
-        </span>
-      </div>
+    <div data-subagent-card={item.id} className="flex">
+      {/* Group rail: the card border's replacement. Carries the group's
+          state as a top-to-transparent gradient — accent while work is in
+          flight, success (or attention / halted) once it settles. */}
+      <div
+        data-testid="subagent-group-rail"
+        data-state={anyRunning ? "running" : anyFailed ? "failed" : "settled"}
+        className={cn(
+          "w-[1.5px] shrink-0 rounded-full bg-gradient-to-b",
+          anyRunning
+            ? "from-accent-ember to-accent-ember/[0.12]"
+            : anyFailed
+              ? "from-status-attention to-status-attention/10"
+              : anyHalted
+                ? "from-status-working/80 to-status-working/10"
+                : "from-status-open to-status-open/10",
+        )}
+        aria-hidden
+      />
 
-      {/* Rows */}
-      <div className="p-1.5">
-        {subs.map((sub) => (
-          <SubagentRow
-            key={sub.id}
-            sub={sub}
-            open={openId === sub.id}
-            onToggle={() =>
-              setOpenId((cur) => (cur === sub.id ? null : sub.id))
-            }
-            onEnter={() => onEnter(sub.id)}
-          />
-        ))}
-      </div>
+      <div className="min-w-0 flex-1 pl-[15px]">
+        {/* Header line */}
+        <div className="flex h-6 items-center gap-2.5">
+          <span className="text-[13px] font-bold text-foreground">
+            Subagents
+          </span>
+          <span className="text-[12px] text-muted-foreground">
+            {subs.length} {subs.length === 1 ? "task" : "tasks"}
+            {anyRunning ? " · running in parallel" : " · complete"}
+          </span>
+          <span className="ml-auto shrink-0 font-mono text-[11px] text-muted-foreground">
+            {subs.filter((s) => !isRunning(s)).length} done ·{" "}
+            {subs.filter((s) => isRunning(s)).length} active
+          </span>
+        </div>
 
-      {/* Footer note */}
-      <div className="flex items-center gap-2 border-t border-border/60 px-3.5 py-2 text-[11px] text-muted-foreground">
-        <Info className="h-3 w-3 shrink-0" strokeWidth={1.4} aria-hidden />
-        Subagents report back to this thread when finished. Steering messages go
-        to the orchestrator.
+        {/* Rows. The negative margin lets a hover target breathe past the
+            content box without indenting the text away from the rail. */}
+        <div className="-mx-2 mt-1.5 flex flex-col">
+          {subs.map((sub) => (
+            <SubagentRow
+              key={sub.id}
+              sub={sub}
+              open={openId === sub.id}
+              // One row expanded at a time (design behavior).
+              onToggle={() =>
+                setOpenId((cur) => (cur === sub.id ? null : sub.id))
+              }
+              onEnter={() => onEnter(sub.id)}
+            />
+          ))}
+        </div>
+
+        <div className="px-px pt-2 text-[11px] leading-normal text-muted-foreground">
+          Subagents report back to this thread when they finish. Steering
+          messages go to the orchestrator.
+        </div>
       </div>
     </div>
   );
 });
+
+/**
+ * The settled group's resting shape: one ~30px hover row. Clicking it
+ * expands the rail view — the detail never disappears, it just stops
+ * occupying the transcript once nobody is waiting on it.
+ */
+function SettledLine({
+  subs,
+  anyFailed,
+  anyHalted,
+  onOpen,
+}: {
+  subs: SubagentView[];
+  anyFailed: boolean;
+  anyHalted: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <div
+      data-testid="subagent-group-settled"
+      role="button"
+      tabIndex={0}
+      aria-expanded={false}
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      className="-mx-2.5 flex h-[30px] cursor-pointer items-center gap-2.5 rounded-md px-2.5 hover:bg-foreground/[0.05]"
+    >
+      {anyFailed ? (
+        <X
+          className="h-3.5 w-3.5 shrink-0 text-status-attention"
+          strokeWidth={1.8}
+          aria-hidden
+        />
+      ) : anyHalted ? (
+        <Ban
+          className="h-3.5 w-3.5 shrink-0 text-status-working/80"
+          strokeWidth={1.8}
+          aria-hidden
+        />
+      ) : (
+        <Check
+          className="h-3.5 w-3.5 shrink-0 text-status-open"
+          strokeWidth={1.8}
+          aria-hidden
+        />
+      )}
+      <span className="truncate text-[13px] font-semibold text-foreground/80">
+        Ran {subs.length} subagent{subs.length === 1 ? "" : "s"}
+      </span>
+      <TickingText
+        className="ml-auto shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
+        // The run is over: freeze the label rather than tick a static
+        // duration once a second for the rest of the session.
+        active={false}
+        compute={(now) => groupRollupLabel(subs, now)}
+      />
+      <span className="shrink-0 font-mono text-[11px] text-foreground/80">
+        View
+      </span>
+      <ChevronDown
+        className="h-2.5 w-2.5 shrink-0 text-muted-foreground"
+        strokeWidth={1.8}
+        aria-hidden
+      />
+    </div>
+  );
+}
+
+/**
+ * Whole-group mono rollup ("1m 14s · Σ 38.8k · 9 tools").
+ *
+ * Every segment is dropped rather than faked when the providers never
+ * reported it — a group whose subagents carried no usage prints the
+ * duration and the tool count and stops there.
+ */
+export function groupRollupLabel(
+  subs: readonly SubagentView[],
+  now: number,
+): string {
+  const rollup = subagentGroupRollup(subs, now);
+  const parts: string[] = [];
+  if (rollup.elapsedMs != null) parts.push(formatElapsed(rollup.elapsedMs));
+  if (rollup.totalTokens != null) {
+    parts.push(`Σ ${formatCompactTokens(rollup.totalTokens)}`);
+  }
+  parts.push(
+    `${rollup.toolCount} ${rollup.toolCount === 1 ? "tool" : "tools"}`,
+  );
+  return parts.join(" · ");
+}
 
 function SubagentRow({
   sub,
@@ -134,16 +252,11 @@ function SubagentRow({
 }) {
   const running = isRunning(sub);
   const tone = statusTone(sub.status);
-  const activity = subagentActivityLine(sub);
-  const peek = recentToolCalls(sub, 3);
+  const summary = subagentActivityLine(sub);
+  const output = subagentLatestOutput(sub);
 
   return (
-    <div
-      className={cn(
-        "mb-0.5 overflow-hidden rounded-[10px]",
-        open && "bg-foreground/[0.03]",
-      )}
-    >
+    <div>
       <div
         role="button"
         tabIndex={0}
@@ -155,134 +268,88 @@ function SubagentRow({
             onToggle();
           }
         }}
-        className="flex cursor-pointer items-center gap-2.5 rounded-[10px] px-2.5 py-2.5 hover:bg-foreground/[0.04]"
+        className="flex cursor-pointer items-center gap-[11px] rounded-md px-[9px] py-[7px] hover:bg-foreground/[0.05]"
       >
-        {/* Status glyph */}
-        <span className="flex h-[22px] w-[22px] shrink-0 items-center justify-center">
+        {/* Status glyph — 20px slot. Running rows animate (one orb per
+            live thing); everything settled drops back to a flat glyph. */}
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
           {running ? (
-            <LoaderCircle
-              className={cn("h-[17px] w-[17px] animate-spin", tone.text)}
-              strokeWidth={1.9}
+            <AgentOrb size={20} {...subagentOrbActivity(sub)} aria-hidden />
+          ) : sub.status === "failed" ? (
+            <X
+              className={cn("h-3.5 w-3.5", tone.text)}
+              strokeWidth={1.8}
               aria-hidden
             />
-          ) : sub.status === "failed" ? (
-            <X className={cn("h-[18px] w-[18px]", tone.text)} strokeWidth={1.8} aria-hidden />
-          ) : sub.status === "interrupted" ? (
-            // Muted-amber non-spinning glyph — settled-but-unresolved, not
-            // a green success check and not a red failure ✕.
-            <Ban className={cn("h-[17px] w-[17px]", tone.text)} strokeWidth={1.8} aria-hidden />
+          ) : sub.status === "interrupted" || sub.status === "stopped" ? (
+            // Settled-but-unresolved: neither a success check nor a
+            // failure ✕.
+            <Ban
+              className={cn("h-3.5 w-3.5", tone.text)}
+              strokeWidth={1.8}
+              aria-hidden
+            />
           ) : (
             <Check
-              className={cn("h-[18px] w-[18px]", tone.text)}
+              className={cn("h-3.5 w-3.5", tone.text)}
               strokeWidth={1.8}
               aria-hidden
             />
           )}
         </span>
 
-        {/* Name + model column */}
-        <div className="flex w-[150px] shrink-0 flex-col gap-0.5">
-          <span className="truncate text-[13px] font-bold text-foreground">
-            {sub.name ?? sub.agentType ?? "Subagent"}
-          </span>
-          {sub.model && (
-            <span className="truncate font-mono text-[10px] text-muted-foreground">
-              {sub.model}
-            </span>
-          )}
-        </div>
+        <span className="w-[132px] shrink-0 truncate text-[13px] font-semibold text-foreground">
+          {sub.name ?? sub.agentType ?? "Subagent"}
+        </span>
 
-        {/* Live activity / result line */}
-        <div className="min-w-0 flex-1 overflow-hidden">
-          {running ? (
-            <span className="shimmer block truncate font-mono text-[12px]">
-              {activity}
-            </span>
-          ) : (
-            <span className="block truncate text-[12px] text-muted-foreground">
-              {activity}
-            </span>
-          )}
-        </div>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
+          {summary}
+        </span>
 
-        {/* Meta */}
         <TickingText
-          className="shrink-0 font-mono text-[11px] text-muted-foreground"
+          className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
           active={running}
           compute={(now) => subagentMetaLine(sub, now)}
         />
 
-        {/* Enter */}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onEnter();
-          }}
-          className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-[7px] border border-border bg-background px-2.5 text-[11px] font-semibold text-muted-foreground hover:border-muted-foreground/60 hover:text-foreground"
-        >
-          Enter
-          <ChevronRight className="h-3 w-3" strokeWidth={1.7} aria-hidden />
-        </button>
-
-        {/* Chevron */}
-        <ChevronDown
+        <ChevronRight
           className={cn(
-            "h-3 w-3 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-180",
+            "h-3 w-3 shrink-0 text-muted-foreground/70 transition-transform",
+            open && "rotate-90",
           )}
           strokeWidth={1.6}
           aria-hidden
         />
       </div>
 
-      {/* Inline peek */}
       {open && (
-        <div className="flex flex-col gap-1 border-t border-border/60 py-2.5 pl-[43px] pr-3">
-          <div className="mb-1 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Recent activity
+        <div className="rise-in mt-px mr-[9px] mb-[7px] ml-[34px] flex flex-col gap-2 border-l-[1.5px] border-border py-2 pr-1 pl-3">
+          <pre className="m-0 font-mono text-[11px] leading-[1.75] whitespace-pre-wrap text-muted-foreground">
+            {output ?? "No output yet."}
+          </pre>
+          <div className="flex items-center gap-3.5">
+            {/* Replaces the old `Enter ›` button: same drill-in, as a
+                text button that belongs to the expansion instead of a
+                control competing with the row. */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEnter();
+              }}
+              className="flex items-center gap-1 text-[12px] font-semibold text-accent-ember hover:text-accent-ember/80"
+            >
+              Open thread
+              <ChevronRight className="h-3 w-3" strokeWidth={1.7} aria-hidden />
+            </button>
+            {sub.model && (
+              <span className="truncate font-mono text-[10px] text-muted-foreground">
+                {sub.model}
+              </span>
+            )}
           </div>
-          {peek.length === 0 ? (
-            <div className="font-mono text-[11px] text-muted-foreground">
-              No tool activity yet.
-            </div>
-          ) : (
-            peek.map((tool) => {
-              const d = describeToolCall(tool);
-              return (
-                <div
-                  key={tool.id}
-                  className="flex min-w-0 items-center gap-2.5 font-mono text-[11px] text-muted-foreground"
-                >
-                  <span className="shrink-0 text-muted-foreground/70">
-                    {d.verb}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-foreground/80">
-                    {d.target}
-                  </span>
-                  {d.meta && (
-                    <span className="shrink-0 text-muted-foreground/70">
-                      {d.meta}
-                    </span>
-                  )}
-                </div>
-              );
-            })
-          )}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onEnter();
-            }}
-            className="mt-2 flex h-7 items-center gap-1.5 self-start rounded-lg bg-foreground/[0.09] px-3 text-[12px] font-semibold text-foreground hover:bg-foreground/[0.14]"
-          >
-            Enter subagent
-            <ChevronRight className="h-3 w-3" strokeWidth={1.7} aria-hidden />
-          </button>
         </div>
       )}
     </div>
   );
 }
-

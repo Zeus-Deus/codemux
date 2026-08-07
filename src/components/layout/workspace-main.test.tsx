@@ -15,6 +15,7 @@ const state = {
   workflowRun: null as WorkflowRunItem | null,
   tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
+  rightPanelMaximized: false,
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
@@ -88,9 +89,16 @@ vi.mock("@/stores/ui-store", () => ({
         setOnboardingProjectDir: vi.fn(),
         rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: 320,
+        rightPanelRowWidth: 0,
+        rightPanelMaximized: state.rightPanelMaximized,
       }),
     ),
-    { getState: () => ({ setRightPanelWidth: vi.fn() }) },
+    {
+      getState: () => ({
+        setRightPanelWidth: vi.fn(),
+        setRightPanelRowWidth: vi.fn(),
+      }),
+    },
   ),
 }));
 
@@ -156,6 +164,7 @@ beforeEach(() => {
   state.workflowRun = null;
   state.tasks = null;
   state.rightPanelTabs = {};
+  state.rightPanelMaximized = false;
 });
 
 afterEach(cleanup);
@@ -293,5 +302,52 @@ describe("WorkspaceMain right-panel stale-tab guard", () => {
     };
     const { getByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("right-panel").dataset.activeTab).toBe("tasks");
+  });
+});
+
+// Full expand ("⤢" in the titlebar's fixed cluster) hands the panel the whole
+// content row. The workspace column collapses to zero width rather than
+// unmounting, so terminals keep their PTYs and the transcript keeps its
+// scroll position — and the panel drops its inline width rather than
+// overwriting it, which is what makes the restore exact and free.
+describe("WorkspaceMain right-panel full expand", () => {
+  it("gives the panel a fixed width beside a flexible workspace column normally", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTabs = { "ws-1": "files" };
+    const { getByTestId } = render(<WorkspaceMain />);
+
+    expect(getByTestId("right-panel-column").style.width).toBe("320px");
+    expect(getByTestId("right-panel-column")).toHaveClass("shrink-0");
+    expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
+    expect(getByTestId("right-panel-resizer")).toBeInTheDocument();
+  });
+
+  it("swaps to a flexible panel and a zero-width workspace column when expanded", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTabs = { "ws-1": "files" };
+    state.rightPanelMaximized = true;
+    const { getByTestId, queryByTestId } = render(<WorkspaceMain />);
+
+    const panel = getByTestId("right-panel-column");
+    // No inline width at all — the stored one is left untouched, so
+    // restoring returns to it exactly.
+    expect(panel.style.width).toBe("");
+    expect(panel).toHaveClass("flex-1");
+
+    const workspace = getByTestId("workspace-content-column");
+    expect(workspace).toHaveClass("w-0", "flex-none");
+    // Still mounted: the pane tree keeps its terminals and scroll state.
+    expect(workspace.querySelector("[data-testid=\'pane-container\']")).not.toBeNull();
+
+    // Nothing left to drag the boundary against.
+    expect(queryByTestId("right-panel-resizer")).toBeNull();
+  });
+
+  it("ignores a stale expand flag while the panel is collapsed", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTabs = {};
+    state.rightPanelMaximized = true;
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("workspace-content-column")).toHaveClass("flex-1");
   });
 });

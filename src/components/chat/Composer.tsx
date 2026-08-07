@@ -177,6 +177,13 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
+  /** Optional strip welded flush INSIDE the composer card's top edge —
+   *  the running-subagents strip (`SubagentActivityBar`). It lives inside
+   *  the card rather than docked above it so the composer keeps a single
+   *  border and radius; the slot's own element owns the matching top
+   *  corner radius and its hairline bottom border. `undefined`/`null`
+   *  (the default) renders nothing and leaves the card untouched. */
+  topStripSlot?: React.ReactNode;
   /** Latest context-window occupancy for the thread, forwarded to the
    *  footer's meter. Optional (defaults to `null`): the draft surface
    *  has no session yet, so it omits this and the meter stays hidden. */
@@ -299,6 +306,7 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
+  topStripSlot,
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
@@ -2137,6 +2145,10 @@ export function Composer({
               }
             />
           )}
+          {/* Flush top-edge strip (running subagents). First element in
+              flow order — everything above it is either `hidden` or
+              absolutely positioned — so it sits on the card's top edge. */}
+          {topStripSlot ?? null}
           {errorMessage && (
             <div
               role="alert"

@@ -24,6 +24,11 @@ const state = {
   workspaceId: "ws-1" as string | null,
   workspaceType: "standard" as WorkspaceType | null,
   rightPanelTab: null as "files" | null,
+  rightPanelRowWidth: 0,
+  rightPanelMaximized: false,
+  browserDocked: false,
+  setRightPanelTab: vi.fn(),
+  toggleMaximized: vi.fn(),
 };
 
 // Heavy / GUI-only children → sentinels.
@@ -105,6 +110,9 @@ vi.mock("@/stores/app-store", () => ({
             workspace_type: state.workspaceType,
           },
         ],
+        agent_browser_sessions: [
+          { workspace_id: "ws-1", right_panel_docked: state.browserDocked },
+        ],
       },
     }),
   ),
@@ -145,6 +153,7 @@ vi.mock("@/stores/feature-flags", () => ({
 }));
 
 vi.mock("@/stores/ui-store", () => ({
+  RIGHT_PANEL_EMPTY: "empty",
   useUIStore: Object.assign(
     vi.fn((sel: (s: unknown) => unknown) =>
       sel({
@@ -152,7 +161,10 @@ vi.mock("@/stores/ui-store", () => ({
           ? { "ws-1": state.rightPanelTab }
           : {},
         rightPanelWidth: 320,
-        setRightPanelTab: vi.fn(),
+        rightPanelRowWidth: state.rightPanelRowWidth,
+        rightPanelMaximized: state.rightPanelMaximized,
+        setRightPanelTab: state.setRightPanelTab,
+        toggleRightPanelMaximized: state.toggleMaximized,
       }),
     ),
     { getState: () => ({ setShowSettings: vi.fn() }) },
@@ -172,6 +184,7 @@ vi.mock("@/tauri/commands", () => ({
   openInEditor: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   applyPreset: vi.fn().mockResolvedValue(undefined),
+  undockBrowserFromRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -207,7 +220,11 @@ function makeWorkspace(): WorkspaceSnapshot {
 }
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
+import {
+  agentChatCreatePane,
+  applyPreset,
+  undockBrowserFromRightPanel,
+} from "@/tauri/commands";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import {
@@ -252,9 +269,15 @@ beforeEach(() => {
   state.workspaceId = "ws-1";
   state.workspaceType = "standard";
   state.rightPanelTab = null;
+  state.rightPanelRowWidth = 0;
+  state.rightPanelMaximized = false;
+  state.browserDocked = false;
+  state.setRightPanelTab.mockClear();
+  state.toggleMaximized.mockClear();
   presetSnapshot = chatPresetSnapshot;
   vi.mocked(agentChatCreatePane).mockClear();
   vi.mocked(applyPreset).mockClear();
+  vi.mocked(undockBrowserFromRightPanel).mockClear();
   // Titlebar tile pins are opt-in and persisted (localStorage) — reset to
   // the real default (empty) before every test so tests don't leak into
   // each other or depend on ordering.
@@ -364,7 +387,13 @@ describe("TitleBar chrome gating", () => {
       "data-variant",
       "toolbar",
     );
-    expect(utilities).toContainElement(
+    // The panel toggle deliberately does *not* live here any more: this
+    // island tracks the panel's left edge, so the toggle used to jump across
+    // the window whenever the panel opened. It now sits in the fixed cluster.
+    expect(utilities).not.toContainElement(
+      getByRole("button", { name: "Open panel" }),
+    );
+    expect(getByTestId("titlebar-panel-cluster")).toContainElement(
       getByRole("button", { name: "Open panel" }),
     );
     expect(
@@ -511,9 +540,10 @@ describe("TitleBar GUI chrome — floating placement", () => {
     // `[data-slot="sidebar-gap"]` node exists in this test tree), so
     // `useSidebarGapWidth` stays on its fallback — which matches
     // `SidebarProvider`'s own default width (256px). The floating band
-    // begins six pixels beyond that edge and stops before window controls.
+    // begins six pixels beyond that edge and stops before the fixed panel
+    // cluster (56 + 6) plus the window controls (104).
     expect(band.style.left).toBe("262px");
-    expect(band.style.right).toBe("104px");
+    expect(band.style.right).toBe("166px");
   });
 
   it("moves the workspace actions left of an open right panel", () => {
@@ -545,6 +575,75 @@ describe("TitleBar GUI chrome — floating placement", () => {
     state.rightPanelTab = "files";
     const { getByTestId } = renderBar();
     expect(getByTestId("titlebar-floating-band").style.right).toBe("104px");
+  });
+});
+
+// The complaint this cluster answers: with the panel closed the toggle sat
+// at the window's top-right; opening the panel moved it hundreds of pixels
+// left, to the *left edge* of a 40px empty strip above the panel's own tabs.
+// Nothing about a panel control should depend on the panel's width.
+describe("TitleBar GUI chrome — fixed panel cluster", () => {
+  it("pins the cluster to the same corner whether the panel is open or closed", () => {
+    state.enableAgentChat = true;
+    const closed = renderBar();
+    const closedRight = closed.getByTestId("titlebar-panel-cluster").style.right;
+    cleanup();
+
+    state.rightPanelTab = "files";
+    const open = renderBar();
+    expect(open.getByTestId("titlebar-panel-cluster").style.right).toBe(
+      closedRight,
+    );
+    expect(closedRight).toBe("104px");
+  });
+
+  it("offers full-expand only while the panel is on screen", () => {
+    state.enableAgentChat = true;
+    const closed = renderBar();
+    expect(closed.queryByTestId("right-panel-maximize")).toBeNull();
+    cleanup();
+
+    state.rightPanelTab = "files";
+    const open = renderBar();
+    fireEvent.click(open.getByTestId("right-panel-maximize"));
+    expect(state.toggleMaximized).toHaveBeenCalledWith("ws-1");
+  });
+
+  // Full-expand hands the whole content row to the panel, so workspace tabs
+  // and actions would be chrome for a zero-width column drawn on top of the
+  // panel's own row.
+  it("hides the workspace band while the panel is fully expanded", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    state.rightPanelMaximized = true;
+    state.rightPanelRowWidth = 900;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-floating-band")).toHaveClass("hidden");
+    // The drag layer stops at the panel's left edge — which, maximized, is
+    // the whole measured content row.
+    expect(getByTestId("titlebar-drag-layer").style.right).toBe("900px");
+  });
+
+  it("opens the panel to the picker rather than forcing Files open", () => {
+    state.enableAgentChat = true;
+    const { getByRole } = renderBar();
+    fireEvent.click(getByRole("button", { name: "Open panel" }));
+    expect(state.setRightPanelTab).toHaveBeenCalledWith("ws-1", "empty");
+  });
+
+  // A collapsed panel is not a surface: leaving the session docked would tell
+  // the backend the user can see a browser they can't.
+  it("undocks a docked browser when it collapses the panel", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    state.browserDocked = true;
+    const { getByRole } = renderBar();
+    fireEvent.click(getByRole("button", { name: "Close panel" }));
+    expect(vi.mocked(undockBrowserFromRightPanel)).toHaveBeenCalledWith(
+      "ws-1",
+      false,
+    );
+    expect(state.setRightPanelTab).toHaveBeenCalledWith("ws-1", null);
   });
 });
 

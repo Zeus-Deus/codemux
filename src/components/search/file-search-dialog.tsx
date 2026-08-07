@@ -4,13 +4,18 @@ import {
   DialogContent,
   DialogTitle,
   DialogDescription,
+  DIALOG_CRISP_POSITION,
 } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
+import { useEditorStore } from "@/stores/editor-store";
 import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchFileNames } from "@/tauri/commands";
+import { docEditorTabId } from "@/components/layout/right-panel/doc-pane";
+import { docPaneId } from "@/components/layout/right-panel/pane-registry";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { basename } from "@/lib/path";
 
@@ -76,7 +81,19 @@ export function FileSearchDialog() {
       if (!ws) return;
       try {
         const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
-        await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
+        // "Open file…" from the right panel's `+` menu targets the deck:
+        // the pick becomes a closable doc pane there instead of yanking
+        // the user to a main-area editor tab.
+        if (useUIStore.getState().fileSearchTarget === "right-panel") {
+          useEditorStore
+            .getState()
+            .initTab(docEditorTabId(ws.workspace_id, fullPath), {
+              filePath: fullPath,
+            });
+          useUIStore.getState().setRightPanelTab(ws.workspace_id, docPaneId(fullPath));
+        } else {
+          await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
+        }
       } catch (err) {
         console.error("Failed to open file:", err);
       }
@@ -108,7 +125,21 @@ export function FileSearchDialog() {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-[560px] p-0 gap-0" onKeyDown={handleKeyDown}>
+      {/* `DIALOG_CRISP_POSITION`: this dialog is nothing but text, and the
+       *  default translate-based centering was rasterizing it on a half
+       *  pixel — see the constant for the mechanism.
+       *
+       *  No `×`: this app's overlays close on Escape or a backdrop click and
+       *  pass `showCloseButton={false}` — the palette, clone, new-workspace,
+       *  confirm-push, archive and settings dialogs all do. This one never
+       *  opted out, so it inherited the shared absolutely-positioned button,
+       *  which landed on the search input's top-right corner because the
+       *  content here is `p-0` rather than the `p-4` that button assumes. */}
+      <DialogContent
+        className={cn(DIALOG_CRISP_POSITION, "gap-0 p-0")}
+        showCloseButton={false}
+        onKeyDown={handleKeyDown}
+      >
         <DialogTitle className="sr-only">Search Files</DialogTitle>
         <DialogDescription className="sr-only">Find files by name</DialogDescription>
         <div className="p-3 pb-0">

@@ -10,7 +10,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProviderLogo } from "@/components/chat/provider-logo";
-import { WorkingIndicator } from "@/components/ui/working-indicator";
+import { AgentOrb } from "@/components/ui/agent-orb";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
   PrStatusIcon,
@@ -20,11 +20,6 @@ import {
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
-import {
-  useSettingsStore,
-  selectWorkingIndicator,
-  selectWorkingIndicatorColor,
-} from "@/stores/settings-store";
 import {
   useSidebarDensityStore,
   formatElapsed,
@@ -111,8 +106,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   onSelect,
   onMarkUnread,
 }: Props) {
-  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
-  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const appearance = useProjectAppearance(repo.path);
 
   // Observe status transitions so elapsed labels (idle "26m") can be derived
@@ -273,9 +266,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         !status && "font-medium text-muted-foreground/70",
       )}
     >
-      {isWorking && (
-        <WorkingIndicator variant={indicatorVariant} color={indicatorColor} />
-      )}
+      {/* The sidebar sees `pane_statuses`, a five-value enum with no tool
+          name in it, so this orb stays on the neutral working state — it
+          is the "something is alive here" mark, not a readout. The
+          activity-matched states live where the tool is actually visible
+          (the thread and its subagents). */}
+      {isWorking && <AgentOrb size={20} aria-label="Agent working" />}
       {isNeeds && (
         <span className="size-1.5 animate-pulse rounded-full bg-status-attention" />
       )}

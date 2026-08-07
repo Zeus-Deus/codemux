@@ -13,9 +13,15 @@ import type { WorkspaceSnapshot, GitFileStatus } from "@/tauri/types";
 interface Props {
   tabId: string;
   workspace: WorkspaceSnapshot;
+  /** Hosted in the right-panel deck. The dense toolbar is suppressed —
+   *  the deck's shared pane bar carries the crumb, the split/unified
+   *  toggle and "open in a tab", and files are picked from the Changes
+   *  pane. The full toolbar (hunk + file navigation, focus mode) stays
+   *  on the main-area diff tab, which is where it has room. */
+  embedded?: boolean;
 }
 
-export function DiffPane({ tabId, workspace }: Props) {
+export function DiffPane({ tabId, workspace, embedded = false }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const tab = useDiffStore((s) => s.getTab(tabId));
   const initTab = useDiffStore((s) => s.initTab);
@@ -133,18 +139,20 @@ export function DiffPane({ tabId, workspace }: Props) {
   if (!tab.filePath) {
     return (
       <div className="flex h-full w-full flex-col bg-card">
-        <DiffToolbar
-          tabId={tabId}
-          workspaceId={workspace.workspace_id}
-          tabs={workspace.tabs}
-          tab={tab}
-          fileCount={filteredFiles.length}
-          fileIndex={tab.fileIndex}
-          onPrevHunk={handlePrevHunk}
-          onNextHunk={handleNextHunk}
-          onPrevFile={handlePrevFile}
-          onNextFile={handleNextFile}
-        />
+        {!embedded && (
+          <DiffToolbar
+            tabId={tabId}
+            workspaceId={workspace.workspace_id}
+            tabs={workspace.tabs}
+            tab={tab}
+            fileCount={filteredFiles.length}
+            fileIndex={tab.fileIndex}
+            onPrevHunk={handlePrevHunk}
+            onNextHunk={handleNextHunk}
+            onPrevFile={handlePrevFile}
+            onNextFile={handleNextFile}
+          />
+        )}
         <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
           <GitCompare className="h-8 w-8 opacity-30" />
           <p className="text-xs">Select a file to view changes</p>
@@ -161,18 +169,20 @@ export function DiffPane({ tabId, workspace }: Props) {
 
   return (
     <div className="flex h-full w-full flex-col bg-card overflow-hidden">
-      <DiffToolbar
-        tabId={tabId}
-        workspaceId={workspace.workspace_id}
-        tabs={workspace.tabs}
-        tab={tab}
-        fileCount={filteredFiles.length}
-        fileIndex={tab.fileIndex}
-        onPrevHunk={handlePrevHunk}
-        onNextHunk={handleNextHunk}
-        onPrevFile={handlePrevFile}
-        onNextFile={handleNextFile}
-      />
+      {!embedded && (
+        <DiffToolbar
+          tabId={tabId}
+          workspaceId={workspace.workspace_id}
+          tabs={workspace.tabs}
+          tab={tab}
+          fileCount={filteredFiles.length}
+          fileIndex={tab.fileIndex}
+          onPrevHunk={handlePrevHunk}
+          onNextHunk={handleNextHunk}
+          onPrevFile={handlePrevFile}
+          onNextFile={handleNextFile}
+        />
+      )}
       {loading ? (
         <div className="flex flex-1 items-center justify-center text-muted-foreground">
           <p className="text-xs">Loading diff...</p>

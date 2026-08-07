@@ -819,6 +819,221 @@ and lightbox stay visually testable.
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
+## Right panel — the pane deck
+
+The right panel is a **deck of openable panes**, not a fixed tab bar. It
+replaced a 45px segmented control that split its width between four
+hard-coded tabs (Files / Changes / Review / Tasks), each pane growing its
+own header underneath.
+
+**Two fixed rows, one body.**
+
+| Row | Height | Surface | Contents |
+| --- | --- | --- | --- |
+| Tab row | 40px in GUI chrome (36px under the legacy bar) | `bg-card` | 26px closable icon+label tabs and the `+` menu on the left; then a flex spacer that doubles as a window-drag surface, and the **active pane's** actions as 24px icon buttons |
+| Pane body | flex | — | exactly one pane, flush under the tab row's single hairline |
+| Status foot | 26px | `bg-card` | 5px accent dot + the active pane's status line, and the thread's running token total on the right |
+
+**The tab row *is* the window's titlebar band.** In GUI chrome it renders
+flush with the window's top edge at `h-10`, and the panel body starts exactly
+at its bottom edge — one hairline, no gap. It used to reserve a blank `mt-10`
+strip for the floating titlebar and start below it, which drew an empty ~40px
+header across the top of the panel and made it read as a pane inside a pane.
+The row pads its right side to clear the fixed panel cluster and the native
+window buttons drawn above it; `src/lib/titlebar-geometry.ts` owns those
+numbers and `docs/features/gui-chrome.md` § "Band geometry" explains the
+whole band. Under the legacy in-flow `h-9` bar nothing changes: the row is an
+ordinary 36px strip and keeps the panel controls itself.
+
+**One band of chrome, not two.** There used to be a third row between the
+tabs and the body: a 32px pane bar with a `project › context` breadcrumb on
+the left and the pane's actions on the right. With the window tab bar above
+it, the panel rendered *three* stacked bands before the first line of
+content. The breadcrumb said nothing new — the workspace name is already in
+the sidebar and the composer, and the pane's name is already its tab label —
+so the row was deleted and its buttons moved into the tab row's right-hand
+slot. The "what am I looking at" text it did carry (the browser's URL, the
+diff's file) moved down to the status foot, which was already reporting the
+same kind of fact for Tasks, Changes and Review.
+
+**Pane actions.** A pane declares its controls as a plain `ReactNode` that
+`right-panel.tsx` builds for the active pane and hands to `PaneTabStrip`'s
+`actions` prop; the strip renders it into a `right-panel-pane-actions`
+container left of the divider. Everything left of that divider swaps when
+you switch tabs, everything right of it does not. Files contributes refresh
++ hide-hidden-files, the doc pane raw/wrap/copy/file-explorer, Changes the
+`+N`/`−N` totals with its filter and refresh, Diff its layout toggle and
+promote-to-tab, Browser back/forward/reload, Tasks its Copy-as-markdown. Both
+kinds of button in the row are the one `PaneActionButton`
+(`right-panel/pane-actions.tsx`) — a pane that needs a new control adds it to
+its `actions` node rather than inventing a toolbar.
+
+**Tabs are light on purpose.** Active is a 7% foreground fill with
+full-strength text at weight 600 and **no border or shadow**; inactive is
+transparent with text at 42% foreground and weight 500. Both are 26px tall,
+9px horizontal padding, 7px radius, 120ms colour/background transition. The
+bordered active chip was the single heaviest thing in the panel.
+
+Because the tabs and the pane actions now share one row, a four- or
+five-pane deck overflows at the panel's default 320px: inactive tabs
+ellipsize to a 58px stub (icon + badge, full label on hover via `title`),
+past which the tab area scrolls, and the selected tab scrolls itself into
+view so it is never the clipped one.
+
+**Pane declaration.** `src/components/layout/right-panel/pane-registry.ts`
+holds every pane the deck can host (`files`, `changes`, `diff`, `review`,
+`browser`, `tasks`, `subagents`, `orchestration`) with its label and icon. Adding a
+pane means adding a registry entry plus a body case in `right-panel.tsx`
+— never another trigger welded into the strip. A file opened into the
+panel gets its own pane id, `doc:<absolute path>`, so the open-pane list
+stays a plain persistable string array.
+
+**Openness vs availability.** They are separate axes:
+
+- *Open* is persisted per workspace in `ui-store`: `rightPanelPanes`
+  (ordered ids, defaulting to Files / Changes / Review),
+  `rightPanelTabs` (the active id — `null` still means "collapsed",
+  `RIGHT_PANEL_EMPTY` means "open, showing the picker"), and
+  `rightPanelDismissedPanes` (panes the user closed).
+- *Available* is derived: `tasks`, `subagents` and `orchestration` exist
+  only while the focused thread has the data behind them. An available
+  pane **auto-opens** the moment its data appears — which is how the
+  Tasks tab has always behaved — unless it is in the dismissed list, so
+  closing one keeps it closed instead of having it reappear on the next
+  render.
+
+`setRightPanelTab` also opens (and un-dismisses) the pane it activates,
+so every pre-existing caller — the titlebar toggle, `Ctrl+Shift+B`, the
+command palette, the in-thread "Open tasks" / "View run" links — lands on
+a tab that is actually in the strip without knowing about the deck.
+
+**Closing.** Every tab carries a close affordance (always visible on the
+active tab, on hover otherwise). Closing the active pane hands focus to its
+neighbour; closing the **last** one lands on the surface picker rather than
+collapsing the panel. Closing a tab and dismissing the column it lives in are
+different requests — collapsing is what the titlebar's panel toggle is for,
+and it is one click away. `rightPanelTabs[ws]` therefore has three states:
+`null` (collapsed), `RIGHT_PANEL_EMPTY` (open, picker), or a pane id.
+
+**Empty-panel surface picker.** An open panel with no panes renders a
+centred placeholder — "Open a surface" over "Choose what to show in the right
+panel." — above a card grid of everything it can open. Cards are
+`rounded-xl` bordered `bg-card` tiles with an 18px icon, a 13px title and an
+11px muted description, one column narrow and two columns past a 380px
+*container* width (the panel's width, not the viewport's). The grid renders
+the **same `SurfaceAction[]` the `+` menu renders**, built once in
+`right-panel.tsx` (`right-panel/surface-actions.ts` holds the type) — so a
+Terminal card routes to a real workspace terminal and a Browser card docks
+the agent browser, exactly as the menu items do, and the two affordances
+cannot drift. Descriptions live on the registry entry beside the label.
+
+**The `+` menu** ("OPEN PANE") lists **Terminal**, then every available
+registry pane that is not currently open (Browser among them), a
+separator, and **Open file…** with its real resolved binding
+(`Ctrl+Shift+P` by default — the app has no `⌘P`). Terminal is a *routed
+action*, not a pane: it calls the same `createTab("terminal")` the main
+tab strip's `+` uses, because a terminal is a workspace pane. **Browser
+is a real deck pane** — it hosts the workspace's one agent browser
+session rather than faking an embedded copy, so opening it moves that
+browser into the panel instead of splitting the main area (see
+`docs/features/browser.md` § "The browser in the right-panel deck").
+"Open file…" opens the existing file-search dialog with
+`fileSearchTarget: "right-panel"`, so the pick becomes a doc pane here
+instead of a main-area editor tab.
+
+**Panel controls** are two 24px buttons in the titlebar's fixed top-right
+cluster, not in the panel's own row — that is what stops them sliding across
+the window whenever the panel opens (see `docs/features/gui-chrome.md`).
+
+- **`⤢` Full expand** hands the panel the entire content row: the workspace
+  column goes to `w-0 flex-none` (still mounted — terminals keep their PTYs
+  and the transcript keeps its scroll position), the resize handle unmounts,
+  and the titlebar's workspace band hides. Pressing it again restores the
+  **exact** previous width, because maximizing never writes a width: the
+  panel column simply drops its inline `style.width` and swaps `shrink-0` for
+  `flex-1`, leaving the stored value untouched. The flag
+  (`rightPanelMaximized`) is runtime-only — deliberately **not** persisted,
+  and cleared whenever the panel collapses, so the app can never boot into a
+  maximized panel over a hidden chat. There is no keyboard binding for it.
+- **Panel toggle** opens the panel to `RIGHT_PANEL_EMPTY` (whatever panes the
+  deck already has, or the picker if it has none) and collapses it on the way
+  back, undocking a docked browser as it goes.
+
+Under the legacy `h-9` bar there is no cluster to delegate to, so the panel's
+row keeps its original pair: an *Expand* that flips `rightPanelWidth` between
+320 and whatever the current layout allows (persisted to SQLite like a drag),
+and *Close panel*.
+
+**Width.** The panel's minimum is **360px** — it was 240 until the tab row
+moved into the titlebar band, which spends 166px of that row on the fixed
+panel cluster and the window buttons; at 240 there was no room left to draw
+a tab at all. The maximum is a share of the row it shares with the workspace
+content, not a pixel number: at most 75% of that row, and never so wide that
+the chat/terminal side drops below 240px (that floor is about *reading*,
+which is why it did not move with the panel's). `@/lib/right-panel-width`
+owns both rules (`maxRightPanelWidth`, `clampRightPanelWidth`) and the
+resizer, the layout, the title bar's floating band and the expand toggle
+all clamp through it. `workspace-main.tsx` measures the row — the left
+sidebar is separately resizable and sits *outside* it, so measuring the
+window instead would let a wide sidebar and a wide panel squeeze the
+content between them — and publishes it as the runtime-only
+`rightPanelRowWidth`. The **stored** width (`rightPanelWidth`, persisted
+to both localStorage and SQLite) is the width the user asked for and is
+bounded only for sanity; the layout-aware clamp is applied at render
+time, so a panel dragged wide on an external monitor is still that wide
+when the monitor comes back rather than being permanently shrunk by one
+session on a laptop screen.
+
+**No blinking dots.** The strip's live affordance is the badge: a plain
+mono count (`12`, `3/4`, running-subagent count), and the Tasks badge
+reads the theme accent token while its pane is the active one. The
+1.5px `cm-blink` dots the old Tasks/Orchestration triggers carried are
+gone — app-wide, "working" is the orb (`src/components/ui/agent-orb`).
+
+**Status foot copy** lives in `right-panel/pane-status.ts`
+(`deckStatusLine`, pure and unit-tested) and follows the active pane:
+tasks → `3 of 4 done · 1 working`; changes → `4 files changed · +130 −12`
+(or `working tree clean`); review → `PR #256 · open` or `no pull
+request`; browser → the current address plus `· agent session` while the
+session is live (`starting browser…` until the backend hands it back);
+anything else → the deck's own shape, `5 panes · 1 agent working`. The right side is the focused thread's
+`contextUsage.total_processed_tokens` through the shared
+`formatContextTokens` — the same figure the composer's context meter
+reads — and is **omitted** when no thread is focused or the provider has
+not reported usage, rather than printing a zero that would read as a
+measurement.
+
+**Per-pane chrome is gone.** Every pane's controls were relocated into
+the tab row's action slot: the file tree's folder label / hidden-files
+toggle / refresh, the Changes panel's title / count / refresh (plus new
+`+N`/`−N` totals from the git watcher and a section filter), the Tasks
+panel's Copy. Panes receive the slot's intent as props
+(`refreshKey`, `sectionFilter`, `onOpenFile`, `onOpenDiff`), which keeps
+their main-area behavior byte-identical when those props are absent.
+
+**Panes that are new to the panel.** *Diff* mounts `DiffPane` with
+`embedded`, which suppresses its dense toolbar; the tab row's action slot
+carries the split/unified toggle and "Open in a tab" (which promotes the
+current file to a full main-area diff tab, where hunk/file navigation and
+focus mode have room), and the status foot names the file being diffed.
+Clicking a row in the Changes pane targets this pane rather
+than jumping to the main area. *Subagents* renders the same
+`SubagentsCard` the transcript renders, from the same
+`subagentRunItems(messages)` derivation — a placement, not a second
+presentation. Entering a subagent still belongs to `AgentChatPane` (the
+drill-in replaces its transcript), so the row raises a one-shot
+`subagentEnterRequest` in `ui-store` that the chat pane consumes and
+clears.
+
+**Doc panes** mount the existing `EditorPane` with `embedded`, so
+editing, `Ctrl+S`, syntax highlighting, images and rendered markdown are
+the same code paths as the main-area editor tab. The tab row's action slot
+drives its state: the `</>` source toggle (markdown only), soft wrap (a CodeMirror
+compartment, so flipping it doesn't reload the file), copy, and a file
+tree that opens as a 196px column inside the pane with a "Search files"
+header wired to the same dialog. That state is held per pane id in the
+deck, so switching tabs and coming back restores it.
+
 ## Agent Tasks panel
 
 Provider-authored plans are normalized into the durable
@@ -837,21 +1052,23 @@ the plan and progress but cannot check, reorder, or rewrite its rows.
   leaf pane, then reads only that pane's thread snapshot. Switching panes or
   split focus therefore switches the task source instead of leaking another
   chat's plan into the workspace panel.
-- **Conditional chrome.** A compact `Tasks N/M` composer control and right-panel
-  Tasks tab appear only for a non-empty snapshot. Clicking the composer control
-  toggles the shared right panel. A stale persisted `tasks` panel selection
-  falls back to Files when the focused pane has no task state. Both controls
-  carry run state so progress stays readable from any tab: the composer chip
-  turns amber with a spinner while a step is in flight and green with a check
-  once every row is done, and the Tasks tab shows a blinking amber dot while a
-  step is running and the tab is not the active one.
+- **Conditional chrome.** A compact `Tasks N/M` composer control and a
+  right-panel Tasks *pane* appear only for a non-empty snapshot. Clicking the
+  composer control toggles the shared right panel. A stale persisted `tasks`
+  selection falls back to Files when the focused pane has no task state, and
+  the deck hides the tab entirely (see "Right panel — the pane deck"). The
+  composer chip carries run state — amber with a spinner while a step is in
+  flight, green with a check once every row is done. The tab's own affordance
+  is its `N/M` badge, tinted with the theme accent while the pane is active;
+  it does not blink.
 - **Live affordances end with the run.** The snapshot is durable and
   nothing rewrites it when a turn finishes, so an `in_progress` row is not
   evidence that work is happening — the thread's `streaming` flag is. Both
   live affordances are therefore gated on it: the composer chip's spinner
   (`taskChipSummary` in `src/lib/agent-chat/task-summary.ts`, consumed by
-  `AgentChatPane`) and the Tasks tab's blinking dot (`right-panel.tsx`, via
-  the `streaming` field `useActiveChatTasks` now returns). A plan the
+  `AgentChatPane`) and the deck's status-foot "agents working" count
+  (`right-panel.tsx`, via the `streaming` field `useActiveChatTasks`
+  returns). A plan the
   provider left mid-step otherwise spun forever, including across a restart
   (`TasksUpdated` is persisted and hydrate-replayed). The chip is **not**
   hidden when the run ends — the durable snapshot is by design — it simply
@@ -866,8 +1083,12 @@ the plan and progress but cannot check, reorder, or rewrite its rows.
   (`tasksUpdatedAt`, stamped by the reducer on each `tasks_updated`), and a
   3px tone-colored progress bar; the provider's one-line explanation renders
   above the rows as run intent. Dependency ids resolve to task titles when
-  possible, and a footer offers a Copy action (markdown checklist via
-  `tasksToMarkdown`). Snapshots persist in `agent_chat_messages` and hydrate
+  possible. The Copy action (markdown checklist via `tasksToMarkdown`) moved
+  out of the panel's own footer into the deck's tab-row action slot,
+  exported as `TasksPaneActions`. The "updates live" caption that travelled
+  with it is gone — it shared the row with the tabs, and the status foot
+  below already reports the live figure it was promising.
+  Snapshots persist in `agent_chat_messages` and hydrate
   through the ordinary event reducer, so reopening a thread restores the same
   toggle and panel (`tasksUpdatedAt` then reflects hydration time, not the
   original wall time).
@@ -1540,16 +1761,46 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
   ⇒ a new card; per-subagent cap 500). Pure helpers live in
   `subagents.ts`; `subagent_run` is a standalone unfoldable transcript
   slot.
-- `SubagentsCard.tsx` — the orchestration card: aggregate header
-  ("N tasks · running in parallel" / "X done · Y active"), one row per
-  subagent (status spinner/check/x, name + mono model, shimmering
-  activity line while running / muted result when done, mono
-  `elapsed · N tools` meta, Enter button, chevron), an inline "Recent
-  activity" peek (last 3 child tool rows + "Enter subagent"), and the
-  footer note. The card root carries `data-subagent-card={item.id}` so
-  the docked activity bar (below) can locate + scroll to + flash-
-  highlight it by plain DOM query — no prop plumbing through
-  `MessageList`/`ChatTranscript` needed.
+- `SubagentsCard.tsx` — the in-thread spawn group. **There is no card any
+  more**: the bordered box, the tinted rows and the `Enter ›` buttons were
+  deleted so the block reads as part of the transcript rather than a widget
+  dropped into it (`Canvas-3.dc.html` §1b). What renders instead:
+  - a **group rail** — 1.5px wide, fully rounded, a vertical gradient from
+    the state token to a ~10–12% fade: `accent-ember` while anything runs,
+    `status-open` when it settled clean, `status-attention` on a failure,
+    dimmed `status-working` when something was halted. Content sits 15px to
+    its right. Status is a rail or a glyph, never a filled row.
+  - a **header line** (24px): "Subagents" + muted caption
+    ("N tasks · running in parallel" / "· complete") + right-aligned mono
+    rollup ("X done · Y active"). It carries **no orb** — one orb per live
+    thing, and the whole run's orb lives on the composer strip.
+  - **rows as plain hover targets** (radius 8, `foreground/[0.05]` hover):
+    20px status slot (`AgentOrb` with the row's own activity while running,
+    flat check / ✕ / ⊘ once settled), name (132px, ellipsized), muted task
+    summary (flex, ellipsized), mono `elapsed · N tools`, and a chevron that
+    rotates 90° when open. Clicking **expands inline**: an indented block
+    (34px, 1.5px muted left border) with the subagent's latest output
+    (`subagentLatestOutput`, mono, `pre-wrap`, full multi-line result), an
+    accent **"Open thread ›"** text button routing to the same drill-in the
+    old `Enter ›` did, and the mono model/effort label. One row open at a
+    time.
+  - a **footer caption** (11px muted) about reporting back / steering going
+    to the orchestrator.
+  - **settled groups collapse to one line.** Once nothing is running the
+    whole group renders as a single 30px hover row: flat glyph ·
+    "Ran N subagents" · mono rollup · "View" + chevron. Clicking expands
+    back to the rail view with settled styling. The rollup
+    (`subagentGroupRollup` in `subagents.ts`) uses **real data only**: the
+    **longest** row's elapsed rather than the sum (the group ran in
+    parallel), summed usage only when at least one provider reported any —
+    otherwise the `Σ` segment is dropped rather than faked — and a tool
+    count that falls back to counted child tool calls.
+
+  The root still carries `data-subagent-card={item.id}` so the composer
+  strip (below) can locate + scroll to + flash-highlight it by plain DOM
+  query — no prop plumbing through `MessageList`/`ChatTranscript` needed.
+  The right panel's Subagents pane renders this same component, so the two
+  placements can never drift (see `right-panel/subagents-pane.tsx`).
 - `SubagentView.tsx` + `SubagentBreadcrumb.tsx` — the read-only drill-in:
   a `← Orchestrator › ⟨ordinal⟩ Name` breadcrumb with model chip and
   right-aligned blinking status, a tone-tinted read-only banner, the
@@ -1560,23 +1811,49 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
   breadcrumb, Esc / back returns, and the composer stays parent-bound
   with the placeholder "Steering goes to the orchestrator…".
 
-### Docked live activity bar (`SubagentActivityBar.tsx`)
+### Composer running strip (`SubagentActivityBar.tsx`)
 
 Replaces the old pane-header / title-bar "N subagents running" pills
 (removed — they read as a broken tab strip entry once the drill-in and
-orchestration card already say the same thing). One docked bar per
-thread, mounted in `AgentChatPane.tsx` between the transcript and the
-composer, hidden while `enteredSubagentId` is set (design: the bar only
-shows in the conversation view) and rendered as `null` entirely while
-idle — no resting state.
+the in-thread group already say the same thing). One strip per thread,
+hidden while `enteredSubagentId` is set (the strip only shows in the
+conversation view) and rendered as `null` entirely while idle — no
+resting state.
+
+**It is welded inside the composer, not docked above it.** `AgentChatPane`
+passes it through `Composer`'s `topStripSlot`, which renders it as the
+first flow child inside the composer card — so the composer keeps a single
+border and a single 20px radius, and the strip owns the matching
+`rounded-t-[19px]` (20px minus the 1px border), a hairline bottom border
+and a faint `foreground/[0.03]` band. Layout: orb (20) · "N subagents
+running" · mono current-activity label · flex · mono elapsed · the
+"View" / "Show all" / "Hide" text button. Height is exactly 32px.
+
+- **No filled bar.** The only motion besides the orb is a **1px accent
+  sweep**: a 30%-wide `transparent → accent-ember → transparent` gradient
+  travelling the strip's top edge over 2.4s, via the shared `cm-sweep`
+  keyframe with its track endpoints converted to segment-relative
+  percentages. `cm-sweep` drops the animation entirely under
+  `prefers-reduced-motion`. A saturated band across the composer is
+  exactly the noise this redesign removes.
+- **The mono label names the kind of busy** ("solving · connecting"),
+  derived by running each live row through the shared `resolveOrbState`
+  mapper and deduping — so the strip speaks the same vocabulary the rows
+  animate. It is deliberately *not* gated on the Settings → Appearance →
+  Agents "Match the orb to the activity" pin: that setting governs whether
+  the animation varies, and withholding the text to match a calmer orb
+  would just be hiding what the app already knows.
+- **The expand list opens upward as an overlay** (`absolute bottom-full`,
+  the same pattern the composer's own popups use) rather than pushing
+  layout, since the strip sits at the very top of the composer.
 
 - **Whole-thread rollup.** `runningSubagentEntries(messages, streaming)`
   (`subagents.ts`) flattens every `running`/`pending` subagent across
   **every** `subagent_run` card in the thread, tagging each with its card
   id and a `from task N` label (omitted when the thread has only one card
-  — there is nothing to disambiguate). The bar's count and expand-list
-  both key off this list, so scattered work from different replies still
-  reads as one signal.
+  — there is nothing to disambiguate). The strip's count, mono activity
+  label and expand-list all key off this list, so scattered work from
+  different replies still reads as one signal.
 - **Live activity respects the end of the run.** `isLiveActivity` (the
   shared predicate behind `runningSubagentEntries` and
   `countRunningSubagents`) drops rows carrying `backgroundTask` once
@@ -1585,38 +1862,40 @@ idle — no resting state.
   indicators](#sidebar-status-indicators)) and is merged **stickily** in
   `mergeSnapshot` — a later snapshot that omits it never promotes the row
   back to "real subagent". Without this, a background shell command that
-  never reports a terminal status kept the bar and its spinner up forever
+  never reports a terminal status kept the strip and its orb up forever
   after the turn settled, including across a restart (subagent snapshots
   are persisted and hydrate-replayed). `AgentChatPane` passes the thread's
   streaming flag; mid-run nothing changes.
-- **1 running** → the whole bar is one click target labelled "View";
-  clicking jumps straight to that subagent's card.
-- **>1 running** → the action chip reads "Show all" / "Hide" with a
-  rotating caret; clicking the bar toggles an expand list that opens
-  upward (`rise-in` class) above the bar: a header
+- **1 running** → the whole strip is one click target labelled "View";
+  clicking jumps straight to that subagent's group.
+- **>1 running** → the action reads "Show all" / "Hide" with a rotating
+  caret; clicking the strip toggles the overlay list (`rise-in`): a header
   ("N subagents running · across this thread · tap one to jump") and one
-  row per running subagent (spinner, name, shimmering activity, mono
-  elapsed, `from <label>`, chevron) — clicking a row collapses the list
-  and jumps to that subagent's card.
+  row per running subagent (its own activity-matched orb, name, shimmering
+  activity, mono elapsed, `from <label>`, chevron) — clicking a row
+  collapses the list and jumps to that subagent's group.
 - **Just finished** (the running count is observed transitioning from
-  `>0` to `0` — never on initial mount or a thread hydrate): the bar
-  flashes green for ~2.5s (check icon, "Subagents finished", muted mono
-  "all tasks complete · results are in the thread"), then unmounts. The
-  flash is itself clickable (design gallery "Jump" CTA): it jumps to the
-  card of the last subagent that was still running before the
+  `>0` to `0` — never on initial mount or a thread hydrate): the strip
+  holds the same 32px shape for ~2.5s in a `status-open/[0.06]` tint
+  (check icon, "Subagents finished", muted mono "all tasks complete ·
+  results are in the thread", no sweep), then unmounts — leaving the
+  composer's own top edge. The flash is itself clickable: it jumps to the
+  group of the last subagent that was still running before the
   transition.
 - **Jump + highlight.** `AgentChatPane.tsx` sends a keyed jump request through
   `ChatTranscript` to `MessageList`. The list resolves the matching slot and
   calls LegendList's `scrollToIndex`, then applies `subagent-card-highlight`
   after the destination row mounts
   (ember `box-shadow` ring, ~1100ms, token-driven per the design-system
-  no-hardcoded-color rule) via plain `classList`. The bar itself never
+  no-hardcoded-color rule) via plain `classList`. The strip itself never
   touches the DOM directly; off-screen targets are valid because navigation
   is index-based.
-- All tones consume design-system tokens (running = `status-working`,
-  finished flash = `status-open`, highlight ring = `accent-ember`); the
-  top-edge sweep animation (`cm-sweep` in `globals.css`) and `.cm-blink`
-  (still used by the breadcrumb's status dot) honor reduced-motion.
+- All tones consume design-system tokens (running rail + sweep =
+  `accent-ember`, settled rail + finished flash = `status-open`, failure =
+  `status-attention`, highlight ring = `accent-ember`); no tint anywhere in
+  the block exceeds ~6% foreground-mix. The sweep animation (`cm-sweep` in
+  `globals.css`) and `.cm-blink` (still used by the breadcrumb's status
+  dot) honor reduced-motion.
 
 ### Run-state settlement (issue #153)
 
@@ -2984,12 +3263,62 @@ event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
 
+## Agent activity orb
+
+Every "an agent is moving here" indicator in chat is the same component:
+`AgentOrb` (`src/components/ui/agent-orb.tsx`), a thin wrapper over the
+`thinking-orbs` library. Two rules govern it.
+
+**Always monochrome.** The library inks white on dark and black on light
+from `theme="auto"`, which reads the `dark`/`light` root class the app
+already sets. Nothing passes it a color or tint — there is no color knob,
+and red stays reserved for state a human must act on. Only two sizes ship
+(20 inline, 64 avatar-scale); chat uses 20 everywhere.
+
+**One orb per live thing.** An orb never sits next to text that is not
+currently moving:
+
+- **The turn in flight** — the Activity block's working header
+  (`ActivityBlock.tsx`) owns the thread while a tool runs; the
+  transcript-tail `StreamingMarker` fills the dead time either side. These
+  are mutually exclusive by construction, because
+  `shouldShowThinkingIndicator` stands the tail marker down whenever the
+  last item is a running tool call, so the thread shows exactly one orb.
+  Individual tool-call rows and step glyphs stay still.
+- **Subagent rows** — `SubagentsCard`, the `SubagentActivityBar` expand
+  list, `SubagentView`'s live tail, and the Orchestration panel's agent
+  drill-in. A finished row reverts to the existing flat check.
+- **The composer running strip** — `SubagentActivityBar`'s orb stands for
+  the *whole* run, so it stays neutral even when a single subagent is
+  doing something more specific. Same for aggregate headers
+  (`WorkflowRunCard`, a workflow phase). The in-thread subagent group's
+  header line carries no orb at all: the strip already owns the run, and
+  each running row owns itself.
+
+The activity → orb-state mapping is the single shared helper
+`src/lib/orb-state.ts` (`resolveOrbState` / `orbStateForTool`); the
+transcript adapters that feed it live in
+`src/lib/agent-chat/orb-activity.ts` (`turnOrbActivity`,
+`subagentOrbActivity`). No new backend plumbing was added: the reducer
+already stamps every tool call with its name, input, and status, which is
+the whole signal. Shell tools additionally read their `command` string, so
+`git push` reads as *connecting* and `cargo test` as *working* rather than
+both collapsing to "ran a command". Precedence is stopped-reason first —
+`listening` (blocked on a human) → `breathing` (queued) → `solving`
+(a running tool immediately after an errored one, the only retry evidence
+the event model carries) → the tool mapping → the neutral `working`
+fallback. Settings → Appearance → Agents → "Match the orb to the activity"
+(default on) pins every orb to `working` when off; the pin is applied
+inside `AgentOrb`, so no call site can opt out of it.
+
 ## Sidebar status indicators
 
 Chat sessions publish into the same `pane_statuses` snapshot the left
-sidebar reads, so a chat workspace shows the working spinner / red
+sidebar reads, so a chat workspace shows the working orb / red
 needs-input pulse / green ready-for-review dot exactly like a terminal
-agent (previously chat panes showed nothing). `forward_event` in
+agent (previously chat panes showed nothing). `pane_statuses` is a
+five-value enum carrying **no tool name**, which is why a sidebar card's
+orb is deliberately neutral while a thread's is activity-matched. `forward_event` in
 `commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
 `PaneStatus` (`map_event_to_pane_status`) and writes it through
 `AppStateStore::set_pane_status_by_thread`, which resolves the
@@ -3020,7 +3349,7 @@ per-thread `ThreadSubagentState` (running `subagent_id`s + a
 (`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
 `Review` only when no subagents are tracked — otherwise it *holds
 `Working`* and marks `review_pending`, and the deferred `Review` fires
-when the last subagent goes terminal. The working indicator therefore
+when the last subagent goes terminal. The working orb therefore
 persists until the turn **and** all tracked subagents finish, matching the
 still-running `SubagentsCard` in the drill-in.
 

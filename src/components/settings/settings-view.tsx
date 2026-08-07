@@ -69,15 +69,13 @@ import {
   selectDensity,
   selectChatCodeWrap,
   selectSidebarShowGitStats,
-  selectWorkingIndicator,
-  selectWorkingIndicatorColor,
+  selectOrbMatchActivity,
   type AppearancePalette,
   type AppearanceDensity,
   type AutoSettleDays,
-  type WorkingIndicatorVariant,
-  type WorkingIndicatorColor,
 } from "@/stores/settings-store";
-import { WorkingIndicator } from "@/components/ui/working-indicator";
+import { AgentOrb } from "@/components/ui/agent-orb";
+import type { OrbActivity } from "@/lib/orb-state";
 import {
   detectEditors,
   setNotificationSoundEnabled,
@@ -418,110 +416,30 @@ function SegmentedControl<T extends string>({
   );
 }
 
-/** Tile picker for the working-indicator animation variant. Each tile shows
- *  a live preview (in the currently-selected color) + a label. */
-const INDICATOR_VARIANTS: { value: WorkingIndicatorVariant; label: string }[] = [
-  { value: "braille", label: "Braille" },
-  { value: "ring", label: "Ring" },
-  { value: "blink", label: "Blink" },
-  { value: "sweep", label: "Sweep" },
-  { value: "typing", label: "Typing" },
-];
-
-function WorkingIndicatorTiles({
-  value,
-  color,
-  onChange,
+/** One preview row in the Agents section: an orb doing a specific thing,
+ *  next to the kind of label it sits beside in the real sidebar. Reads the
+ *  live setting through AgentOrb, so toggling pins both rows to the same
+ *  working orb without any extra wiring here. */
+function OrbPreviewRow({
+  activity,
+  label,
+  elapsed,
 }: {
-  value: WorkingIndicatorVariant;
-  color: WorkingIndicatorColor;
-  onChange: (value: WorkingIndicatorVariant) => void;
-}) {
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Working indicator"
-      className="flex gap-1.5"
-    >
-      {INDICATOR_VARIANTS.map((opt) => {
-        const active = opt.value === value;
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            aria-label={opt.label}
-            onClick={() => onChange(opt.value)}
-            className={cn(
-              "flex h-[60px] w-[72px] flex-col items-center justify-center gap-1.5 rounded-[10px] border transition-[color,background-color,border-color,transform]",
-              active
-                ? "border-accent-ember bg-accent-ember/8"
-                : "border-border/60 bg-muted/30 hover:bg-muted/50 hover:-translate-y-px",
-            )}
-          >
-            <span className="flex h-5 items-center justify-center">
-              <WorkingIndicator variant={opt.value} color={color} preview />
-            </span>
-            <span className="text-[11px] text-muted-foreground">
-              {opt.label}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-/** Round color swatches for the working-indicator color. Static token → class
- *  maps (Tailwind can't compose dynamic names). No red — that tone is
- *  reserved for the needs-you dot. */
-const INDICATOR_COLORS: {
-  value: WorkingIndicatorColor;
+  activity: OrbActivity;
   label: string;
-  dot: string;
-  ring: string;
-}[] = [
-  { value: "status-working", label: "Amber", dot: "bg-status-working", ring: "ring-status-working" },
-  { value: "foreground", label: "White", dot: "bg-foreground", ring: "ring-foreground" },
-  { value: "accent-ember", label: "Ember", dot: "bg-accent-ember", ring: "ring-accent-ember" },
-  { value: "status-open", label: "Green", dot: "bg-status-open", ring: "ring-status-open" },
-  { value: "status-remote", label: "Sky", dot: "bg-status-remote", ring: "ring-status-remote" },
-  { value: "accent-violet", label: "Violet", dot: "bg-accent-violet", ring: "ring-accent-violet" },
-];
-
-function IndicatorColorSwatches({
-  value,
-  onChange,
-}: {
-  value: WorkingIndicatorColor;
-  onChange: (value: WorkingIndicatorColor) => void;
+  elapsed: string;
 }) {
   return (
-    <div
-      role="radiogroup"
-      aria-label="Indicator color"
-      className="flex items-center gap-[9px]"
-    >
-      {INDICATOR_COLORS.map((opt) => {
-        const active = opt.value === value;
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            aria-label={opt.label}
-            onClick={() => onChange(opt.value)}
-            className={cn(
-              "size-5 rounded-full transition-transform",
-              opt.dot,
-              active &&
-                cn("ring-2 ring-offset-2 ring-offset-background", opt.ring),
-            )}
-          />
-        );
-      })}
+    <div className="flex items-center gap-2.5 rounded-[8px] px-2.5 py-2">
+      <span className="flex size-5 shrink-0 items-center justify-center">
+        <AgentOrb size={20} {...activity} aria-hidden />
+      </span>
+      <span className="flex-1 truncate text-[13px] font-semibold text-foreground">
+        {label}
+      </span>
+      <span className="font-mono text-[11px] text-muted-foreground">
+        {elapsed}
+      </span>
     </div>
   );
 }
@@ -1401,8 +1319,7 @@ export function SettingsView() {
       (s.settings["sidebar.auto_settle_days"] ??
         SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!) as AutoSettleDays,
   );
-  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
-  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
+  const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -1828,52 +1745,43 @@ export function SettingsView() {
             <SectionGroup>
               <SubsectionHeader
                 title="Agents"
-                description="The glyph shown in the sidebar while an agent runs."
+                description="The orb shown wherever an agent is running — sidebar cards, thread turns, subagent rows and the composer."
               />
               <div className="space-y-1">
                 <SettingRow
-                  label="Working indicator"
-                  description="The animation that replaces a workspace's icon while its agent is working."
+                  label="Match the orb to the activity"
+                  description="The orb changes with what the agent is doing — searching the repo, solving a failure, talking to GitHub. Off shows the same working orb everywhere."
                 >
-                  <WorkingIndicatorTiles
-                    value={indicatorVariant}
-                    color={indicatorColor}
-                    onChange={(value) =>
-                      storeSet("sidebar.working_indicator", value)
-                    }
-                  />
-                </SettingRow>
-                <SettingRow
-                  label="Indicator color"
-                  description="Tint for the working indicator. Red is reserved for workspaces that need you."
-                >
-                  <IndicatorColorSwatches
-                    value={indicatorColor}
-                    onChange={(value) =>
-                      storeSet("sidebar.working_indicator_color", value)
+                  <Switch
+                    checked={orbMatchActivity}
+                    onCheckedChange={(checked) =>
+                      storeSet(
+                        "agents.orb_match_activity",
+                        checked ? "true" : "false",
+                      )
                     }
                   />
                 </SettingRow>
               </div>
 
-              {/* Live preview at the sidebar row's scale. */}
+              {/* Live preview at the sidebar row's scale. Two rows doing
+                  different things, so the toggle's effect is visible: with
+                  it on they animate differently, with it off they match. */}
               <div className="mt-4">
                 <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55">
                   Preview
                 </p>
-                <div className="flex max-w-[300px] items-center gap-2 rounded-[10px] border border-border/60 bg-muted/30 px-2.5 py-2">
-                  <span className="flex size-5 items-center justify-center shrink-0">
-                    <WorkingIndicator
-                      variant={indicatorVariant}
-                      color={indicatorColor}
-                    />
-                  </span>
-                  <span className="text-[13px] font-semibold text-foreground">
-                    Fix scroll pinning on send
-                  </span>
-                  <span className="ml-auto font-mono text-[11px] text-muted-foreground">
-                    6m
-                  </span>
+                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-[11px] border border-border/60 bg-muted/30 p-1.5">
+                  <OrbPreviewRow
+                    activity={{ toolName: "Grep" }}
+                    label="Fix scroll pinning on send"
+                    elapsed="6m"
+                  />
+                  <OrbPreviewRow
+                    activity={{ toolName: "Bash", toolInput: { command: "git push" } }}
+                    label="Dim settled workspaces"
+                    elapsed="2m"
+                  />
                 </div>
               </div>
             </SectionGroup>

@@ -1,6 +1,7 @@
 import { ExternalLink, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 
+import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
 import { BrowserPane } from "@/components/browser/BrowserPane";
 import {
   Tooltip,
@@ -17,7 +18,8 @@ import {
   selectBrowserDefaultViewport,
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
-import { createBrowserPane } from "@/tauri/commands";
+import { useUIStore } from "@/stores/ui-store";
+import { dockBrowserInRightPanel } from "@/tauri/commands";
 
 /** Fallback pinned viewport for the "Desktop-size background browser"
  *  setting when no `browser.default_viewport` is configured. Matches
@@ -36,11 +38,12 @@ const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
  * inline chat chip or terminal-header indicator opens this instead of
  * splitting the chat into a pane. Renders the live browser stream as a
  * top-right floating panel absolutely positioned over the chat surface — it
- * never resizes or reflows the chat. "Open as pane" promotes to today's
- * split-pane behavior via `create_browser_pane` (which reconnects the
- * detached session, see `create_browser_pane_impl` in
- * `src-tauri/src/commands/browser.rs`); closing the overlay just hides it,
- * the background session keeps running.
+ * never resizes or reflows the chat. "Open in side panel" graduates the
+ * session into the right-panel deck's `browser` pane via
+ * `dock_browser_in_right_panel` — the deck is the one persistent home for a
+ * browser, so the peek stays a transient look rather than a second place a
+ * browser can permanently live. Closing the overlay just hides it; the
+ * background session keeps running.
  *
  * Mounted once at the app-shell level, inside `SidebarInset` (already a
  * `position: relative` anchor) so `absolute` positioning here never
@@ -55,14 +58,9 @@ export function BrowserPeekOverlay() {
     activeWorkspaceId ? s.isOpen(activeWorkspaceId) : false,
   );
   const close = useBrowserPeekStore((s) => s.close);
-  const session = useAppStore((s) => {
-    if (!activeWorkspaceId) return null;
-    const found = s.appState?.agent_browser_sessions?.find(
-      (abs) => abs.workspace_id === activeWorkspaceId,
-    );
-    if (!found || !found.is_active || found.pane_id) return null;
-    return found;
-  });
+  const session = useAppStore((s) =>
+    selectBackgroundBrowserSession(s.appState, activeWorkspaceId),
+  );
   const desktopViewport = useSyncedSettingsStore(
     selectBackgroundBrowserDesktopViewport,
   );
@@ -111,22 +109,22 @@ export function BrowserPeekOverlay() {
   if (!open || !activeWorkspaceId || !session) return null;
 
   const handlePromote = async () => {
-    // Same command the "+" launcher's Panes → Browser item uses
-    // (agent-launcher.tsx); create_browser_pane_impl already finds and
-    // reconnects this workspace's detached agent session.
-    const appState = useAppStore.getState().appState;
-    const ws = appState?.workspaces.find(
-      (w) => w.workspace_id === activeWorkspaceId,
-    );
-    const surface = ws?.surfaces.find(
-      (s) => s.surface_id === ws.active_surface_id,
-    );
-    if (!surface) return;
+    // Promote into the right-panel deck, not a pane-tree split — the same
+    // action the deck's "+" ▸ Browser item performs, so there is exactly
+    // one persistent home for a browser and the peek stays what it is: a
+    // transient look that graduates into that home. Splitting the chat
+    // in half to show a browser was the old model; the deck gives the
+    // browser real estate without reflowing the conversation.
+    //
+    // `dock_browser_in_right_panel` docks *this* session (same
+    // `cli_session_name`, same daemon), so the agent keeps driving the
+    // browser the user just took hold of.
     try {
-      await createBrowserPane(surface.active_pane_id);
+      await dockBrowserInRightPanel(activeWorkspaceId);
+      useUIStore.getState().setRightPanelTab(activeWorkspaceId, "browser");
       close(activeWorkspaceId);
     } catch (err) {
-      console.error("[BrowserPeekOverlay] promote to pane failed:", err);
+      console.error("[BrowserPeekOverlay] promote to panel failed:", err);
     }
   };
 
@@ -154,14 +152,14 @@ export function BrowserPeekOverlay() {
             <button
               type="button"
               onClick={handlePromote}
-              aria-label="Open as pane"
+              aria-label="Open in side panel"
               className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.09] hover:text-foreground"
             >
               <ExternalLink className="h-3.5 w-3.5" aria-hidden />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>
-            Open as pane
+            Open in side panel
           </TooltipContent>
         </Tooltip>
         <button

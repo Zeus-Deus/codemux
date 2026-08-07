@@ -15,20 +15,32 @@ import { ImageViewer } from "./ImageViewer";
 
 interface Props {
   tabId: string;
+  /** Hosted inside the right-panel deck: the pane's own toolbar is
+   *  suppressed because the deck's shared pane bar carries those controls
+   *  (source toggle, wrap, copy, file tree) for every pane. */
+  embedded?: boolean;
+  /** Controlled rendered/raw mode. Omitted ⇒ the pane keeps its own
+   *  state (markdown opens rendered, everything else raw). */
+  viewMode?: EditorViewMode;
+  /** Soft-wrap long lines. Defaults to on, which is what the main-area
+   *  editor tab has always done. */
+  wrap?: boolean;
 }
 
-type ViewMode = "raw" | "rendered";
+export type EditorViewMode = "raw" | "rendered";
+type ViewMode = EditorViewMode;
 
-function isMarkdownFile(path: string): boolean {
+export function isMarkdownFile(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase();
   return ext === "md" || ext === "mdx" || ext === "markdown";
 }
 
-export function EditorPane({ tabId }: Props) {
+export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wrap = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const themeCompartment = useRef(new Compartment());
   const languageCompartment = useRef(new Compartment());
+  const wrapCompartment = useRef(new Compartment());
   const isLoadingRef = useRef(false);
 
   const { theme } = useThemeColors();
@@ -46,7 +58,8 @@ export function EditorPane({ tabId }: Props) {
 
   const isMd = filePath != null && isMarkdownFile(filePath);
   const isImage = filePath != null && isImageExtension(filePath);
-  const [viewMode, setViewMode] = useState<ViewMode>("raw");
+  const [localViewMode, setViewMode] = useState<ViewMode>("raw");
+  const viewMode = viewModeProp ?? localViewMode;
 
   // Default to rendered for markdown files when filePath changes
   useEffect(() => {
@@ -127,7 +140,7 @@ export function EditorPane({ tabId }: Props) {
         themeExt,
         langExt,
         updateListener,
-        EditorView.lineWrapping,
+        wrapCompartment.current.of(wrap ? EditorView.lineWrapping : []),
       ],
     });
 
@@ -140,6 +153,17 @@ export function EditorPane({ tabId }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId]);
+
+  // Wrap is a compartment so the deck's pane-bar toggle can flip it
+  // without tearing the editor down and reloading the file.
+  useEffect(() => {
+    if (!viewRef.current) return;
+    viewRef.current.dispatch({
+      effects: wrapCompartment.current.reconfigure(
+        wrap ? EditorView.lineWrapping : [],
+      ),
+    });
+  }, [wrap]);
 
   // Update theme when it changes
   useEffect(() => {
@@ -241,7 +265,7 @@ export function EditorPane({ tabId }: Props) {
   if (errorMsg) {
     return (
       <div className="flex h-full w-full flex-col">
-        <div className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2">
+        <div className={`${embedded ? "hidden" : "flex"} h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2`}>
           <span className="text-xs font-mono text-muted-foreground truncate">
             {filePath}
           </span>
@@ -258,8 +282,9 @@ export function EditorPane({ tabId }: Props) {
 
   return (
     <div className="flex h-full w-full flex-col">
-      {/* Toolbar */}
-      <div className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2">
+      {/* Toolbar — suppressed in the deck, whose shared pane bar owns
+          the path crumb and the source/wrap/copy controls. */}
+      <div className={`${embedded ? "hidden" : "flex"} h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2`}>
         <span className="text-xs font-mono text-muted-foreground truncate min-w-0">
           {filePath}
         </span>

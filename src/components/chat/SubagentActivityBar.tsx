@@ -1,6 +1,8 @@
-import { Check, ChevronDown, ChevronRight, LoaderCircle } from "lucide-react";
+import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import { memo, useEffect, useId, useRef, useState } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   formatElapsed,
   runningSubagentEntries,
@@ -9,23 +11,40 @@ import {
   type RunningSubagentEntry,
 } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
+import { resolveOrbState } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
 
-import { CHAT_COLUMN } from "./chat-column";
 import { TickingText } from "./TickingText";
 
 /** How long the green "just finished" flash stays up before the bar
  *  disappears entirely (design "for ~2.5s, then disappears"). */
 const FINISHED_FLASH_MS = 2500;
 
+/** Sweep geometry (design: a 1px, ~30%-wide light travelling across the
+ *  strip's top edge from -60% to 260% of the track).
+ *
+ *  `cm-sweep` resolves its `translateX` percentages against the SEGMENT's
+ *  own width, so the track endpoints are converted here: own-width % =
+ *  track % ÷ segment %. Reduced motion is handled by the keyframe class
+ *  itself, which drops the animation entirely. */
+const SWEEP_STYLE = {
+  "--cm-sweep-from": "-200%",
+  "--cm-sweep-to": "866%",
+  animationDuration: "2.4s",
+} as React.CSSProperties;
+
 /**
- * Docked live subagent activity bar (design "A living status, docked by
- * the composer"). One bar for the whole thread: counts every live
- * (running|pending) subagent across every `subagent_run` card, no matter
- * which reply spawned it. Mounted between the transcript and the
- * composer; renders nothing while idle — no resting state, and this
- * replaces the old pane-header / title-bar "N subagents running" pills
- * (design note: "no tab-strip pill... looks like a broken tab").
+ * The composer's running strip (design 1b, "COMPOSER · RUNNING STRIP").
+ * One strip for the whole thread: counts every live (running|pending)
+ * subagent across every `subagent_run` card, no matter which reply
+ * spawned it.
+ *
+ * It is **welded inside the composer's top edge** rather than docked as a
+ * separate bar above it — the composer keeps one border and one radius,
+ * and the strip is a 32px band with a hairline bottom border and a faint
+ * foreground tint. There is no saturated filled bar: liveness is carried
+ * by the orb plus a 1px accent light sweeping the top edge. Renders
+ * nothing while idle — no resting state.
  *
  * - 1 running -> action chip is "View"; clicking the bar jumps straight
  *   to that subagent's card.
@@ -41,6 +60,9 @@ const FINISHED_FLASH_MS = 2500;
  * elapsed-time tick. The actual transcript scroll + highlight is done by
  * the caller (`onJump`) since that requires DOM access scoped to the
  * owning pane (see `AgentChatPane.tsx`'s jump handler).
+ *
+ * Mounted through `Composer`'s `topStripSlot`, so the corner radius here
+ * is the composer card's 20px minus its 1px border.
  */
 export const SubagentActivityBar = memo(function SubagentActivityBar({
   messages,
@@ -118,45 +140,40 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
       if (finishedCardId) onJump(finishedCardId);
     };
     return (
-      <div className={CHAT_COLUMN}>
-        <div
-          data-testid="subagent-activity-bar"
-          data-tone="finished"
-          role="button"
-          tabIndex={0}
-          onClick={jumpToFinished}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              jumpToFinished();
-            }
-          }}
-          title="Jump to the Subagents card"
-          className="flex h-11 cursor-pointer items-center gap-2.5 rounded-xl border border-status-open/30 bg-status-open/10 px-3.5 hover:bg-status-open/[0.15]"
-        >
-          <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-            <Check
-              className="h-[19px] w-[19px] text-status-open"
-              strokeWidth={1.8}
-              aria-hidden
-            />
-          </span>
-          <span className="shrink-0 whitespace-nowrap text-[13px] font-bold text-foreground">
-            Subagents finished
-          </span>
-          <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-muted-foreground">
-            all tasks complete · results are in the thread
-          </span>
-        </div>
+      <div
+        data-testid="subagent-activity-bar"
+        data-tone="finished"
+        role="button"
+        tabIndex={0}
+        onClick={jumpToFinished}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            jumpToFinished();
+          }
+        }}
+        title="Jump to the Subagents card"
+        className="flex h-8 cursor-pointer items-center gap-2.5 rounded-t-[19px] border-b border-border/60 bg-status-open/[0.06] pr-2.5 pl-3 hover:bg-status-open/10"
+      >
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+          <Check
+            className="h-4 w-4 text-status-open"
+            strokeWidth={1.8}
+            aria-hidden
+          />
+        </span>
+        <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+          Subagents finished
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+          all tasks complete · results are in the thread
+        </span>
       </div>
     );
   }
 
   const multi = count > 1;
   const primary = entries[0];
-  const primaryName =
-    primary.subagent.name ?? primary.subagent.agentType ?? "Subagent";
-  const primaryActivity = subagentActivityLine(primary.subagent);
 
   const handleBarClick = () => {
     if (multi) {
@@ -177,12 +194,15 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   };
 
   return (
-    <div className={CHAT_COLUMN}>
+    <div className="relative">
+      {/* The strip sits at the very top of the composer, so its expand
+          list opens upward as an overlay (the same `bottom-full` pattern
+          the composer's own popups use) instead of pushing layout. */}
       {multi && open && (
         <div
           id={listId}
           data-testid="subagent-activity-bar-list"
-          className="rise-in mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
+          className="rise-in absolute right-0 bottom-full left-0 z-50 mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
         >
           <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2.5">
             <span className="whitespace-nowrap text-[12px] font-bold text-foreground">
@@ -216,35 +236,35 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
         title={
           multi ? "Show all running subagents" : "Jump to the Subagents card"
         }
-        className="relative flex h-11 cursor-pointer items-center gap-2.5 overflow-hidden rounded-xl border border-status-working/30 bg-status-working/10 py-0 pl-3.5 pr-1.5 hover:bg-status-working/[0.15]"
+        className="relative flex h-8 cursor-pointer items-center gap-2.5 overflow-hidden rounded-t-[19px] border-b border-border/60 bg-foreground/[0.03] pr-2.5 pl-3 hover:bg-foreground/[0.05]"
       >
-        <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-status-working/15">
-          {/* 38% wide — matches the `cm-sweep` keyframe defaults, so no
-              travel overrides are needed here. */}
-          <div className="cm-sweep absolute top-0 left-0 h-0.5 w-[38%] rounded-full bg-status-working" />
-        </div>
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-          <LoaderCircle
-            className="h-[17px] w-[17px] animate-spin text-status-working"
-            strokeWidth={1.9}
-            aria-hidden
-          />
-        </span>
-        <span className="shrink-0 whitespace-nowrap text-[13px] font-bold text-foreground">
-          {count} subagent{count === 1 ? "" : "s"} running
-        </span>
+        {/* The one moving mark besides the orb: a 1px accent light
+            travelling the top edge. No filled progress bar — a saturated
+            band across the composer is exactly the noise this redesign
+            removes. */}
         <span
-          className="h-[3px] w-[3px] shrink-0 rounded-full bg-muted-foreground"
+          className="cm-sweep pointer-events-none absolute top-0 left-0 h-px w-[30%] bg-gradient-to-r from-transparent via-accent-ember to-transparent"
+          style={SWEEP_STYLE}
           aria-hidden
         />
-        <span className="shimmer min-w-0 flex-1 truncate font-mono text-[12px]">
-          {primaryName} · {primaryActivity}
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+          {/* This orb stands for the whole run, not for any one subagent,
+              so it stays on the neutral working state even when a single
+              subagent is doing something more specific. Each expanded row
+              below owns its own activity-matched orb. */}
+          <AgentOrb size={20} aria-hidden />
+        </span>
+        <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+          {count} subagent{count === 1 ? "" : "s"} running
+        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+          {runningActivityLabel(entries)}
         </span>
         <TickingText
           className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
           compute={(now) => elapsedLabel(primary.subagent, now)}
         />
-        <span className="flex h-[30px] shrink-0 items-center gap-1.5 rounded-lg bg-foreground/[0.08] px-2.5 text-[11px] font-semibold text-muted-foreground">
+        <span className="flex shrink-0 items-center gap-1 text-[11px] font-semibold text-foreground/80">
           {multi ? (open ? "Hide" : "Show all") : "View"}
           {multi ? (
             <ChevronDown
@@ -263,6 +283,30 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
     </div>
   );
 });
+
+/**
+ * The strip's mono activity label — what kind of busy the run currently
+ * is, e.g. "solving · connecting".
+ *
+ * Reuses the orb-state mapper rather than inventing a second vocabulary:
+ * the strip then names the same states the rows are animating. Deduped
+ * (three parallel greps read as one "searching") and capped, because this
+ * label shares a 32px line with the count, the elapsed time and the
+ * action.
+ *
+ * Deliberately NOT gated on the Settings "Match the orb to the activity"
+ * pin. That setting governs whether the *animation* varies; the app knows
+ * what the tools are either way, and a text label that says less to match
+ * a calmer orb would just be withholding.
+ */
+function runningActivityLabel(entries: RunningSubagentEntry[]): string {
+  const states = new Set<string>();
+  for (const entry of entries) {
+    states.add(resolveOrbState(subagentOrbActivity(entry.subagent)));
+    if (states.size >= 3) break;
+  }
+  return [...states].join(" · ");
+}
 
 function SubagentActivityBarRow({
   entry,
@@ -290,12 +334,8 @@ function SubagentActivityBarRow({
       }}
       className="flex cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 hover:bg-foreground/[0.06]"
     >
-      <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center">
-        <LoaderCircle
-          className="h-[15px] w-[15px] animate-spin text-status-working"
-          strokeWidth={1.9}
-          aria-hidden
-        />
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+        <AgentOrb size={20} {...subagentOrbActivity(subagent)} aria-hidden />
       </span>
       <span className="w-20 shrink-0 truncate text-[12px] font-bold text-foreground">
         {name}

@@ -191,6 +191,7 @@ vi.mock("./Composer", () => ({
   Composer: ({
     zone1Override,
     belowComposerSlot,
+    topStripSlot,
     onSubmit,
     onContinueRun,
     onModeRemove,
@@ -202,6 +203,7 @@ vi.mock("./Composer", () => ({
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
+    topStripSlot?: React.ReactNode;
     onSubmit: () => void;
     onContinueRun?: () => void;
     onModeRemove: () => void;
@@ -212,6 +214,10 @@ vi.mock("./Composer", () => ({
     provider: "claude" | "codex" | "opencode";
   }) => (
     <div data-testid="composer" data-provider={provider}>
+      {/* The running-subagents strip is welded inside the real composer's
+          top edge, so the mock has to render the slot for the pane's
+          drill-in visibility rule to be observable. */}
+      <div data-testid="composer-top-strip">{topStripSlot}</div>
       <div data-testid="zone1">{zone1Override}</div>
       <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
@@ -897,15 +903,18 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
   });
 
-  it("hides the docked subagent activity bar while drilled into a subagent, and shows it again on Esc", () => {
+  it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", () => {
     const { container } = render(<AgentChatPane pane={pane} />);
-    // Orchestrator mode: one live subagent — the bar is up.
+    // Orchestrator mode: one live subagent — the strip is up, and it is
+    // mounted inside the composer rather than docked above it.
     expect(
-      container.querySelector('[data-testid="subagent-activity-bar"]'),
+      container.querySelector(
+        '[data-testid="composer-top-strip"] [data-testid="subagent-activity-bar"]',
+      ),
     ).not.toBeNull();
 
     fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
-    // Design: the docked bar only shows in the conversation view.
+    // Design: the strip only shows in the conversation view.
     expect(
       container.querySelector('[data-testid="subagent-activity-bar"]'),
     ).toBeNull();

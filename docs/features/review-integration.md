@@ -8,7 +8,9 @@
 
 ## What This Feature Is
 
-The Review tab is a right-sidebar surface that displays pull request details, review threads, and CI checks for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+The Review tab is a pane in the right-panel deck that displays pull request details, review threads, and CI checks for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+
+As a deck pane it is closable like any other and reopens from the `+` menu. Its tab badge (comment count + a check rollup glyph) is unchanged; the status foot reads `PR #N · <state>`, or `no pull request`. The panel deliberately has no chrome of its own — it never had a refresh button (auto-poll owns freshness), so it contributes nothing to the deck's tab-row action slot and that slot renders empty while Review is active.
 
 > The tab was previously named "PR." It was renamed to "Review" in Phase 3 of the right-sidebar work to match Superset's terminology (`pr-panel.tsx` → `review-panel.tsx`, `pr/` subfolder → `review/`).
 >

@@ -56,8 +56,7 @@ vi.mock("@/stores/settings-store", () => {
     "appearance.smooth_scrolling": "false",
     "sidebar.show_git_stats": "true",
     "sidebar.auto_settle_days": "3",
-    "sidebar.working_indicator": "braille",
-    "sidebar.working_indicator_color": "status-working",
+    "agents.orb_match_activity": "true",
     "chat.code_wrap": "false",
   };
   return {
@@ -75,8 +74,7 @@ vi.mock("@/stores/settings-store", () => {
     selectSidebarShowGitStats: () => true,
     selectChatCodeWrap: () => false,
     selectSidebarAutoSettleDays: () => 3,
-    selectWorkingIndicator: () => "braille",
-    selectWorkingIndicatorColor: () => "status-working",
+    selectOrbMatchActivity: () => true,
   };
 });
 
@@ -383,10 +381,10 @@ describe("SettingsPanel — Git section model pickers", () => {
 
 // ── Appearance → Agents section ──
 //
-// The new "Agents" subsection exposes the three sidebar-live settings:
-// grouping mode (segmented control), working-indicator variant (tile
-// picker), and indicator color (swatches). Each writes to the machine-local
-// settings store via the shared `set`.
+// The "Agents" subsection now holds exactly one control: whether the agent
+// orb's animation follows the current activity. The working-indicator tile
+// picker and the indicator-color swatches were deleted outright when the
+// orb replaced them — there is nothing left to pick.
 
 describe("SettingsPanel — Appearance Agents section", () => {
   beforeEach(() => {
@@ -401,18 +399,24 @@ describe("SettingsPanel — Appearance Agents section", () => {
     fireEvent.click(appearanceButtons[0]);
   }
 
-  it("renders the Agents subsection with both indicator controls", () => {
+  it("renders the Agents subsection with the match-activity toggle", () => {
     openAppearance();
     expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Working indicator").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Indicator color").length).toBeGreaterThan(0);
-    // Tile picker + swatch groups are present.
     expect(
-      screen.getAllByRole("radiogroup", { name: /Working indicator/i }).length,
+      screen.getAllByText("Match the orb to the activity").length,
     ).toBeGreaterThan(0);
+  });
+
+  it("no longer offers the retired working-indicator or color pickers", () => {
+    openAppearance();
+    expect(screen.queryByText("Working indicator")).toBeNull();
+    expect(screen.queryByText("Indicator color")).toBeNull();
     expect(
-      screen.getAllByRole("radiogroup", { name: /Indicator color/i }).length,
-    ).toBeGreaterThan(0);
+      screen.queryByRole("radiogroup", { name: /Working indicator/i }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("radiogroup", { name: /Indicator color/i }),
+    ).toBeNull();
   });
 
   it("renders the Sidebar subsection and toggling Show git stats writes sidebar.show_git_stats", () => {
@@ -439,23 +443,15 @@ describe("SettingsPanel — Appearance Agents section", () => {
     );
   });
 
-  it("choosing a working-indicator tile writes sidebar.working_indicator", () => {
+  it("toggling Match the orb to the activity writes agents.orb_match_activity", () => {
     openAppearance();
-    const [sweep] = screen.getAllByRole("radio", { name: /^Sweep$/i });
-    fireEvent.click(sweep);
+    const row = screen
+      .getAllByText("Match the orb to the activity")[0]
+      .closest("div")!.parentElement!;
+    fireEvent.click(within(row).getByRole("switch"));
     expect(mockSettingsSet).toHaveBeenCalledWith(
-      "sidebar.working_indicator",
-      "sweep",
-    );
-  });
-
-  it("choosing a color swatch writes sidebar.working_indicator_color", () => {
-    openAppearance();
-    const [violet] = screen.getAllByRole("radio", { name: /^Violet$/i });
-    fireEvent.click(violet);
-    expect(mockSettingsSet).toHaveBeenCalledWith(
-      "sidebar.working_indicator_color",
-      "accent-violet",
+      "agents.orb_match_activity",
+      "false",
     );
   });
 });

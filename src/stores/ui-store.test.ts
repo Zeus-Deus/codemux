@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useUIStore } from "./ui-store";
+import { RIGHT_PANEL_MIN_WIDTH } from "@/lib/right-panel-width";
+import { RIGHT_PANEL_EMPTY, useUIStore } from "./ui-store";
 
 const STORAGE_KEY = "codemux-ui";
 
@@ -11,6 +12,7 @@ beforeEach(() => {
   useUIStore.setState({
     rightPanelTabs: {},
     rightPanelWidth: 320,
+    rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
     showSettings: false,
@@ -165,6 +167,30 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.expandProjectRequest).toBeUndefined();
     });
 
+    it("keeps the width the user asked for, not the width that fits today", () => {
+      // The layout-aware limit lives in `right-panel-width.ts` and is
+      // applied at render time. Clamping on the way in would permanently
+      // shrink a panel sized on a wide monitor the first time the app
+      // opened on a narrow one.
+      useUIStore.getState().setRightPanelWidth(1400);
+      expect(useUIStore.getState().rightPanelWidth).toBe(1400);
+    });
+
+    it("still refuses a width below the panel minimum", () => {
+      useUIStore.getState().setRightPanelWidth(10);
+      expect(useUIStore.getState().rightPanelWidth).toBe(
+        RIGHT_PANEL_MIN_WIDTH,
+      );
+    });
+
+    it("does not persist the measured row width", () => {
+      useUIStore.getState().setRightPanelRowWidth(1720);
+      useUIStore.getState().setOnboardingProjectDir(null);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.rightPanelRowWidth).toBeUndefined();
+    });
+
     it("persists hasSeenOnboarding alongside existing allowlist fields", () => {
       useUIStore.setState({
         rightPanelWidth: 400,
@@ -202,5 +228,74 @@ describe("ui-store — expand-project request (Needs-you jump)", () => {
     useUIStore.getState().requestExpandProject("/home/user/beta");
     useUIStore.getState().clearExpandProjectRequest("/home/user/alpha");
     expect(useUIStore.getState().expandProjectRequest).toBe("/home/user/beta");
+  });
+});
+
+// Full-expand is the panel's ⤢ control: the panel takes the whole content
+// row and the workspace column collapses to zero width beside it. It stores
+// no width of its own — that is what makes "restore" exact.
+describe("ui-store — right-panel full expand", () => {
+  it("is off by default and only toggles while the panel is open", () => {
+    expect(useUIStore.getState().rightPanelMaximized).toBe(false);
+
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    expect(useUIStore.getState().rightPanelMaximized).toBe(false);
+
+    useUIStore.getState().setRightPanelTab("ws-1", "files");
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    expect(useUIStore.getState().rightPanelMaximized).toBe(true);
+  });
+
+  it("leaves the stored width untouched, so restoring is exact", () => {
+    useUIStore.getState().setRightPanelWidth(612);
+    useUIStore.getState().setRightPanelTab("ws-1", "files");
+
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    expect(useUIStore.getState().rightPanelWidth).toBe(612);
+
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    expect(useUIStore.getState().rightPanelMaximized).toBe(false);
+    expect(useUIStore.getState().rightPanelWidth).toBe(612);
+  });
+
+  it("clears on collapse, so the app can't come back to a hidden workspace", () => {
+    useUIStore.getState().setRightPanelTab("ws-1", "files");
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    useUIStore.getState().setRightPanelTab("ws-1", null);
+    expect(useUIStore.getState().rightPanelMaximized).toBe(false);
+  });
+
+  it("is never persisted", () => {
+    useUIStore.getState().setRightPanelTab("ws-1", "files");
+    useUIStore.getState().toggleRightPanelMaximized("ws-1");
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+    expect(persisted.state).not.toHaveProperty("rightPanelMaximized");
+  });
+});
+
+// `RIGHT_PANEL_EMPTY` is "open, showing the surface picker" — a third state
+// beside "collapsed" (null) and "showing pane X".
+describe("ui-store — the empty-panel sentinel", () => {
+  it("opens the panel without joining the deck", () => {
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files"] } });
+    useUIStore.getState().setRightPanelTab("ws-1", RIGHT_PANEL_EMPTY);
+
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe(
+      RIGHT_PANEL_EMPTY,
+    );
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["files"]);
+  });
+
+  it("catches the last closed pane instead of collapsing the panel", () => {
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files"] },
+      rightPanelTabs: { "ws-1": "files" },
+    });
+    useUIStore.getState().closeRightPanelPane("ws-1", "files");
+
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual([]);
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe(
+      RIGHT_PANEL_EMPTY,
+    );
   });
 });

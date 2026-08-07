@@ -130,3 +130,50 @@ describe("ActivityBlock — step-row inline detail", () => {
     expect(screen.getByText(/hidden detail line/)).toBeInTheDocument();
   });
 });
+
+// ── Agent orb (the turn's one live indicator) ──
+//
+// While a tool is running this block owns the thread's "in progress"
+// signal — `shouldShowThinkingIndicator` stands the transcript-tail marker
+// down — so the orb here must reflect what the agent is actually doing.
+
+describe("ActivityBlock — agent orb", () => {
+  const orbState = () =>
+    document.querySelector("canvas")?.getAttribute("data-orb-state") ?? null;
+
+  it("shows no orb once the run has settled", () => {
+    renderBlock([read(0, "/a"), read(1, "/b")], false);
+    expect(document.querySelector("canvas")).toBeNull();
+  });
+
+  it("matches the orb to the running tool", () => {
+    renderBlock([read(0, "/a", { status: "running" })], true);
+    expect(orbState()).toBe("searching");
+  });
+
+  it("reads a running shell's command, not just the tool name", () => {
+    renderBlock([bash(0, "git push origin HEAD", { status: "running" })], true);
+    expect(orbState()).toBe("connecting");
+  });
+
+  it("goes neutral between tools rather than holding the last one's state", () => {
+    renderBlock([read(0, "/a")], true);
+    expect(orbState()).toBe("working");
+  });
+
+  it("reads a running tool after a failed one as a retry", () => {
+    renderBlock(
+      [bash(0, "cargo test", { status: "error" }), bash(1, "cargo test", { status: "running" })],
+      true,
+    );
+    expect(orbState()).toBe("solving");
+  });
+
+  it("renders exactly one orb for the whole block", () => {
+    renderBlock(
+      [read(0, "/a"), think(1, "hmm"), read(2, "/b", { status: "running" })],
+      true,
+    );
+    expect(document.querySelectorAll("canvas")).toHaveLength(1);
+  });
+});

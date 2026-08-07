@@ -93,27 +93,6 @@ export function TasksPanel({
     snapshot.tasks.map((task) => [task.task_id, task.title]),
   );
 
-  const [copied, setCopied] = useState(false);
-  const copyTimer = useRef<number | null>(null);
-  useEffect(
-    () => () => {
-      if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
-    },
-    [],
-  );
-  const handleCopy = useCallback(() => {
-    void navigator.clipboard
-      ?.writeText(tasksToMarkdown(snapshot))
-      .then(() => {
-        setCopied(true);
-        if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
-        copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {
-        /* best-effort */
-      });
-  }, [snapshot]);
-
   return (
     <div
       className="flex h-full min-h-0 flex-col bg-background"
@@ -224,24 +203,56 @@ export function TasksPanel({
         </div>
       </ScrollArea>
 
-      <div className="flex shrink-0 items-center gap-2 border-t border-border/60 px-3 py-2">
-        <span className="min-w-0 flex-1 font-mono text-[10px] text-muted-foreground">
-          agent plan · updates live
-        </span>
-        <button
-          type="button"
-          onClick={handleCopy}
-          data-testid="tasks-copy"
-          className="inline-flex h-[23px] items-center gap-1.5 rounded-[7px] border border-border/60 px-2 text-[11px] font-semibold text-muted-foreground transition-colors hover:border-border hover:bg-foreground/6 hover:text-foreground"
-        >
-          {copied ? (
-            <Check className="size-3" aria-hidden />
-          ) : (
-            <Copy className="size-3" aria-hidden />
-          )}
-          {copied ? "Copied" : "Copy"}
-        </button>
-      </div>
     </div>
+  );
+}
+
+/**
+ * The tasks pane's actions, rendered into the deck tab row's pane-action
+ * slot: Copy-as-markdown, which used to sit in this panel's own footer.
+ *
+ * The "updates live" caption that travelled with it is gone. It shared the
+ * row with the tabs after the deck collapsed to a single band, and the
+ * status foot below already reports the live figure it was promising
+ * ("3 of 4 done · 1 working").
+ */
+export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+  const handleCopy = useCallback(() => {
+    void navigator.clipboard
+      ?.writeText(tasksToMarkdown(snapshot))
+      .then(() => {
+        setCopied(true);
+        if (copyTimer.current != null) window.clearTimeout(copyTimer.current);
+        copyTimer.current = window.setTimeout(() => setCopied(false), 1500);
+      })
+      .catch(() => {
+        /* best-effort */
+      });
+  }, [snapshot]);
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleCopy}
+        data-testid="tasks-copy"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-[11px] font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground"
+      >
+        {copied ? (
+          <Check className="size-3" aria-hidden />
+        ) : (
+          <Copy className="size-3" aria-hidden />
+        )}
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </>
   );
 }

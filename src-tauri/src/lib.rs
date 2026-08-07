@@ -1941,6 +1941,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::refresh_workspace_git_info,
             commands::checkout_default_branch_in_workspace,
             commands::create_browser_pane,
+            commands::dock_browser_in_right_panel,
+            commands::undock_browser_from_right_panel,
             commands::browser_open_url,
             commands::browser_history_back,
             commands::browser_history_forward,

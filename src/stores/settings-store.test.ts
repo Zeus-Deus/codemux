@@ -40,8 +40,7 @@ import {
   getDefaultBaseBranch,
   selectSidebarShowGitStats,
   selectSidebarAutoSettleDays,
-  selectWorkingIndicator,
-  selectWorkingIndicatorColor,
+  selectOrbMatchActivity,
 } from "./settings-store";
 
 function stateWith(settings: Record<string, string>) {
@@ -88,13 +87,15 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["terminal.font_family"]).toBeDefined();
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
       expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
-      // Sidebar / working-indicator keys present
+      // Sidebar / agent-orb keys present
       expect(SETTINGS_DEFAULTS["sidebar.show_git_stats"]).toBe("true");
-      expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBe("braille");
-      expect(SETTINGS_DEFAULTS["sidebar.working_indicator_color"]).toBe(
-        "status-working",
-      );
       expect(SETTINGS_DEFAULTS["sidebar.auto_settle_days"]).toBe("3");
+      expect(SETTINGS_DEFAULTS["agents.orb_match_activity"]).toBe("true");
+      // The retired working-indicator picker keys are gone, not migrated.
+      expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBeUndefined();
+      expect(
+        SETTINGS_DEFAULTS["sidebar.working_indicator_color"],
+      ).toBeUndefined();
       // Per-user keys NOT present
       expect(SETTINGS_DEFAULTS["terminal.font_size"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["terminal.cursor_style"]).toBeUndefined();
@@ -139,28 +140,28 @@ describe("settings-store", () => {
       ).toBe(14);
     });
 
-    it("selectWorkingIndicator defaults to 'braille'", () => {
-      expect(selectWorkingIndicator(stateWith({}))).toBe("braille");
+    it("selectOrbMatchActivity defaults to true", () => {
+      expect(selectOrbMatchActivity(stateWith({}))).toBe(true);
     });
 
-    it("selectWorkingIndicator reflects a stored variant", () => {
+    it("selectOrbMatchActivity reflects a stored 'false' value", () => {
       expect(
-        selectWorkingIndicator(
-          stateWith({ "sidebar.working_indicator": "sweep" }),
+        selectOrbMatchActivity(
+          stateWith({ "agents.orb_match_activity": "false" }),
         ),
-      ).toBe("sweep");
+      ).toBe(false);
     });
 
-    it("selectWorkingIndicatorColor defaults to 'status-working'", () => {
-      expect(selectWorkingIndicatorColor(stateWith({}))).toBe("status-working");
-    });
-
-    it("selectWorkingIndicatorColor reflects a stored token", () => {
-      expect(
-        selectWorkingIndicatorColor(
-          stateWith({ "sidebar.working_indicator_color": "accent-violet" }),
-        ),
-      ).toBe("accent-violet");
+    // Migration contract: an old settings row is dropped on read, not
+    // mapped onto anything. Loading a pre-orb settings blob must neither
+    // throw nor change how anything renders.
+    it("ignores retired working-indicator keys left in stored settings", () => {
+      const legacy = stateWith({
+        "sidebar.working_indicator": "sweep",
+        "sidebar.working_indicator_color": "accent-violet",
+      });
+      expect(selectOrbMatchActivity(legacy)).toBe(true);
+      expect(selectSidebarShowGitStats(legacy)).toBe(true);
     });
   });
 

@@ -209,6 +209,12 @@ export interface AgentBrowserSession {
   pane_id: string | null;
   browser_id: string | null;
   user_dismissed: boolean;
+  /** The session is hosted by the right-panel deck's `browser` pane rather
+   *  than by a pane-tree node. Mutually exclusive with `pane_id`; together
+   *  they mean "the user can already see this browser", which is what the
+   *  background chip / peek overlay and the backend's auto-pane gate test.
+   *  Optional because older persisted snapshots predate the field. */
+  right_panel_docked?: boolean;
 }
 
 // ── Pane Status ──

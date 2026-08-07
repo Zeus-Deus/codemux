@@ -3,27 +3,43 @@ import { useGuiChrome } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
-import type { AgentBrowserSession } from "@/tauri/types";
+import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 
 /**
  * GUI-mode background browser session lookup for a workspace (see
  * docs/features/browser.md "Background browser in GUI mode") — a
- * detached agent browser session that is live (`is_active`) but not
- * attached to a pane (`pane_id === null`). Shared by
- * the terminal pane header and the Context Row's `WorkspaceStatusCluster`
- * so both surfaces resolve the indicator from the exact same predicate.
+ * detached agent browser session that is live (`is_active`) but has no
+ * visible surface of its own.
+ *
+ * "No surface" is the union of both hosts, mirroring
+ * `AgentBrowserSession::is_surfaced()` in `state_impl.rs`: not attached to
+ * a pane-tree node (`pane_id === null`) *and* not docked in the
+ * right-panel deck (`right_panel_docked !== true`). Every surface that
+ * offers to *reveal* a background browser — the terminal pane header, the
+ * Context Row's `WorkspaceStatusCluster`, the inline chat chip and the
+ * peek overlay — resolves it here so none of them can drift into offering
+ * to reveal a browser the user is already looking at.
  */
+export function selectBackgroundBrowserSession(
+  appState: AppStateSnapshot | null | undefined,
+  workspaceId: string | null | undefined,
+): AgentBrowserSession | null {
+  if (!workspaceId) return null;
+  const session = appState?.agent_browser_sessions?.find(
+    (abs) => abs.workspace_id === workspaceId,
+  );
+  if (!session) return null;
+  if (!session.is_active) return null;
+  if (session.pane_id || session.right_panel_docked) return null;
+  return session;
+}
+
 export function useBackgroundBrowserSession(
   workspaceId: string | null | undefined,
 ): AgentBrowserSession | null {
-  return useAppStore((s) => {
-    if (!workspaceId) return null;
-    const session = s.appState?.agent_browser_sessions?.find(
-      (abs) => abs.workspace_id === workspaceId,
-    );
-    if (!session || !session.is_active || session.pane_id) return null;
-    return session;
-  });
+  return useAppStore((s) =>
+    selectBackgroundBrowserSession(s.appState, workspaceId),
+  );
 }
 
 /**

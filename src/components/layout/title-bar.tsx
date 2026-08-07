@@ -11,7 +11,9 @@ import {
   PanelRight,
   ChevronDown,
   ExternalLink,
+  Maximize2,
   MessageSquare,
+  Minimize2,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -30,6 +32,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
+import { clampRightPanelWidth } from "@/lib/right-panel-width";
+import { panelClusterRight, topRightReserve } from "@/lib/titlebar-geometry";
+import { PaneActionButton } from "./right-panel/pane-actions";
 import {
   Tooltip,
   TooltipContent,
@@ -50,13 +55,14 @@ import {
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
-import { useUIStore } from "@/stores/ui-store";
+import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
 import {
   agentChatCreatePane,
   applyPreset,
   detectEditors,
   openInEditor,
+  undockBrowserFromRightPanel,
 } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import {
@@ -251,42 +257,70 @@ function SidebarToggleButton({
   );
 }
 
-// ── Right-panel toggle (rehomed from TabBar for GUI chrome) ──
+// ── Fixed panel-control cluster ──
+//
+// Full-expand + the right-panel toggle, pinned to the window's top-right
+// corner just inside the native window buttons. This cluster does not move:
+// panel open or closed, narrow or wide, it is in the same place. That is the
+// whole point of it existing separately from the action island — the island
+// stops at the panel's left edge (it belongs to the workspace column), and
+// when the toggle rode along inside it, opening the panel teleported the
+// button hundreds of pixels left and left a dead 40px strip above the
+// panel's own tab row. See `src/lib/titlebar-geometry.ts`.
 
-function RightPanelToggle({ workspaceId }: { workspaceId: string }) {
+function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const toggleMaximized = useUIStore((s) => s.toggleRightPanelMaximized);
+  const maximized = useUIStore((s) => s.rightPanelMaximized);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspaceId] ?? null,
   );
+  const open = rightPanelTab !== null;
+  const browserDocked = useAppStore(
+    (s) =>
+      s.appState?.agent_browser_sessions?.some(
+        (abs) => abs.workspace_id === workspaceId && abs.right_panel_docked,
+      ) === true,
+  );
 
-  // True toggle: any open tab closes the panel; closed opens to Files.
+  // True toggle. Opening lands on the picker sentinel, which resolves to
+  // whatever panes the deck already has — and to the surface picker when it
+  // has none, instead of force-opening Files over the user's last choice.
   const togglePanel = () => {
-    setRightPanelTab(workspaceId, rightPanelTab == null ? "files" : null);
+    if (open && browserDocked) {
+      // A collapsed panel is not a surface: leaving the session docked would
+      // tell the backend the user can see a browser they can't.
+      // `dismissed: false` — collapsing the panel is not "close this
+      // browser", so the agent may still surface it, and reopening re-docks.
+      undockBrowserFromRightPanel(workspaceId, false).catch(console.error);
+    }
+    setRightPanelTab(workspaceId, open ? null : RIGHT_PANEL_EMPTY);
   };
 
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className={cn(
-            "shrink-0",
-            rightPanelTab
-              ? "text-foreground"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-          onClick={togglePanel}
-          aria-pressed={rightPanelTab != null}
-          aria-label={rightPanelTab ? "Close panel" : "Open panel"}
-        >
-          <PanelRight className="h-3.5 w-3.5" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4}>
-        {rightPanelTab ? "Close panel" : "Open panel"}
-      </TooltipContent>
-    </Tooltip>
+    <div
+      data-testid="titlebar-panel-cluster"
+      className="pointer-events-auto absolute top-1 z-10 flex h-8 items-center gap-[2px]"
+      style={{ right: `${panelClusterRight(isRemoteClient())}px` }}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      {open && (
+        <PaneActionButton
+          label={maximized ? "Restore panel width" : "Expand panel"}
+          icon={maximized ? Minimize2 : Maximize2}
+          active={maximized}
+          testId="right-panel-maximize"
+          onClick={() => toggleMaximized(workspaceId)}
+        />
+      )}
+      <PaneActionButton
+        label={open ? "Close panel" : "Open panel"}
+        icon={PanelRight}
+        active={open}
+        testId="right-panel-toggle"
+        onClick={togglePanel}
+      />
+    </div>
   );
 }
 
@@ -560,12 +594,24 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // `useGuiChrome`.
   const guiChrome = useGuiChrome();
   const draftGuiChrome = useDraftGuiChrome();
-  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth ?? 320);
+  // The *rendered* width, not the stored one: the panel's stored width can
+  // exceed what fits in the current window (see `right-panel-width.ts`), and
+  // the band has to stop at the panel's real edge.
+  const rightPanelWidth = useUIStore((s) => {
+    const stored = s.rightPanelWidth ?? 320;
+    const row = s.rightPanelRowWidth ?? 0;
+    return row > 0 ? clampRightPanelWidth(stored, row) : stored;
+  });
   const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
       ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null
       : false,
   );
+  const rightPanelMaximized = useUIStore((s) => s.rightPanelMaximized);
+  // The measured content row — the only honest width for "the panel covers
+  // everything" while full-expand is on, since the panel then has no inline
+  // width of its own.
+  const rightPanelRowWidth = useUIStore((s) => s.rightPanelRowWidth);
   // During a lazy draft the backend's "active workspace" is whatever was
   // focused before the draft opened, and the draft surface never renders
   // that workspace's right panel. Reading its `rightPanelTabs` entry would
@@ -573,7 +619,15 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // below it — same reason the draft branch suppresses the other
   // workspace-scoped controls.
   const rightPanelOpen = guiChrome && activeWorkspacePanelOpen;
+  const panelMaximized = rightPanelOpen && rightPanelMaximized;
   const remoteClient = isRemoteClient();
+  // How much of the band the panel owns, measured from the window's right
+  // edge. Everything the *workspace* puts in the band has to stop here.
+  const panelBandWidth = panelMaximized
+    ? rightPanelRowWidth > 0
+      ? rightPanelRowWidth
+      : rightPanelWidth
+    : rightPanelWidth;
   const contentUnder = useSyncExternalStore(
     subscribeTitlebarContentUnder,
     () => getTitlebarContentUnder(activeWorkspaceId),
@@ -636,17 +690,21 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       {/* The unoccupied top edge remains a native drag target. The floating
           islands below sit above it and opt back into pointer events.
 
-          Desktop only. This layer spans the full app width — over the
-          sidebar, the workspace, and the right panel — so on the web remote
-          client, where `data-tauri-drag-region` does nothing at all, it
-          would be a pure 40px pointer sink: it swallowed clicks on the top
-          of the right panel's 45px tab row (making Files/Tasks/… reliably
-          unclickable there) and ate wheel events over the transcript. */}
+          Desktop only, and it stops at the right panel's left edge. The
+          panel's tab row now lives *in* this band rather than 40px below
+          it, so a full-width layer would sit on top of every tab, the `+`
+          and the pane actions. The panel supplies its own drag surface in
+          the gap after its tabs (see `pane-tab-strip.tsx`). On the web
+          remote client the layer is dropped entirely: there
+          `data-tauri-drag-region` does nothing at all, so it would be a
+          pure 40px pointer sink that also ate wheel events over the
+          transcript. */}
       {!remoteClient && (
         <div
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
-          className="pointer-events-auto absolute inset-0"
+          className="pointer-events-auto absolute inset-y-0 left-0"
+          style={{ right: rightPanelOpen ? `${panelBandWidth}px` : 0 }}
         />
       )}
 
@@ -661,18 +719,27 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       </div>
 
       {/* Workspace band. It spans only the space between the measured left
-          sidebar and either the right panel or native window controls. Tabs
-          and actions are separate islands with a calm drag region between. */}
+          sidebar and either the right panel or the fixed top-right cluster.
+          Tabs and actions are separate islands with a calm drag region
+          between.
+
+          Full-expand hides it outright: the panel then owns the whole
+          content row, so the workspace tabs would be labels for a column
+          that is zero pixels wide, drawn on top of the panel's own tab row.
+          Restoring brings them straight back. */}
       <div
         data-testid="titlebar-floating-band"
-        className="absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2"
+        className={cn(
+          "absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2",
+          panelMaximized && "hidden",
+        )}
         style={{
           left: `${sidebarGapWidth + 6}px`,
           right: rightPanelOpen
-            ? `${rightPanelWidth + 8}px`
-            : remoteClient
-              ? "6px"
-              : "104px",
+            ? `${panelBandWidth + 8}px`
+            : // The workspace branch stops before the fixed panel cluster;
+              // a draft has no panel cluster to clear, only window buttons.
+              `${guiChrome ? topRightReserve(remoteClient) : remoteClient ? 6 : 104}px`,
         }}
       >
         <div
@@ -714,14 +781,14 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
                 )}
                 <IdeLauncher compact />
               </div>
+              {/* The right-panel toggle used to sit here. It now lives in
+                  the fixed top-right cluster below, because this island
+                  tracks the panel's left edge and the toggle must not. */}
               <div
                 data-testid="titlebar-utility-actions"
                 className="ml-1 flex items-center gap-0.5"
               >
                 <ResourceMonitor variant="toolbar" />
-                {activeWorkspaceId && (
-                  <RightPanelToggle workspaceId={activeWorkspaceId} />
-                )}
               </div>
             </>
           ) : (
@@ -730,6 +797,14 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           {remoteClient && <RemoteConnectionChip compact />}
         </div>
       </div>
+
+      {/* Panel controls. Fixed to the window's top-right corner, just inside
+          the native buttons — the one cluster in this band whose position
+          never depends on the panel. Workspace-only: a draft renders no
+          right panel, so there is nothing for it to control. */}
+      {guiChrome && activeWorkspaceId && (
+        <RightPanelChromeCluster workspaceId={activeWorkspaceId} />
+      )}
 
       {/* Native window controls stay attached to the physical window edge,
           outside the workspace action island. */}

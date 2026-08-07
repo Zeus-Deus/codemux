@@ -4,7 +4,9 @@ import {
   DialogContent,
   DialogTitle,
   DialogDescription,
+  DIALOG_CRISP_POSITION,
 } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
@@ -132,7 +134,17 @@ export function ContentSearchDialog() {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-[640px] p-0 gap-0 max-h-[80vh] flex flex-col" onKeyDown={handleKeyDown}>
+      {/* Same treatment as its sibling `file-search-dialog.tsx`: crisp
+       *  transform-free positioning, and no inherited `×` (this app's
+       *  overlays close on Escape or a backdrop click). */}
+      <DialogContent
+        className={cn(
+          DIALOG_CRISP_POSITION,
+          "flex max-h-[80vh] flex-col gap-0 p-0",
+        )}
+        showCloseButton={false}
+        onKeyDown={handleKeyDown}
+      >
         <DialogTitle className="sr-only">Search in Files</DialogTitle>
         <DialogDescription className="sr-only">Search file contents</DialogDescription>
         <div className="p-3 pb-2 space-y-2 shrink-0">

@@ -588,6 +588,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleEnterSubagent = useCallback((subagentId: string) => {
     setEnteredSubagentId(subagentId);
   }, []);
+  // The right panel's Subagents pane can't drill in on its own — the
+  // drill-in replaces this pane's transcript, so it's this pane's state.
+  // It raises a one-shot request instead; consume and clear it here.
+  const subagentEnterRequest = useUIStore((s) => s.subagentEnterRequest);
+  useEffect(() => {
+    if (!subagentEnterRequest || subagentEnterRequest.threadId !== threadId) return;
+    setEnteredSubagentId(subagentEnterRequest.subagentId);
+    useUIStore.getState().clearSubagentEnterRequest();
+  }, [subagentEnterRequest, threadId]);
   const handleExitSubagent = useCallback(() => {
     setEnteredSubagentId(null);
   }, []);
@@ -2889,6 +2898,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
+      // Running-subagents strip, welded flush inside the composer's top
+      // edge. Hidden in a subagent drill-in (the design only shows it in
+      // the conversation view) and null while nothing is running.
+      topStripSlot={
+        enteredSubagent ? null : (
+          <SubagentActivityBar
+            messages={messages}
+            threadId={threadId}
+            streaming={transcriptStreaming}
+            onJump={handleJumpToSubagentCard}
+          />
+        )
+      }
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
       onTasksClick={handleTasksClick}
@@ -3006,22 +3028,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               workspaceId={workspaceIdForPane}
             />
           )}
-          {/* Docked live subagent activity bar (design "A living status,
-              docked by the composer"): one bar for the whole thread,
-              hidden while drilled into a subagent (the design only shows
-              it in the conversation view) and hidden entirely while idle. */}
+          {/* The running-subagents strip used to dock here, between the
+              transcript and the composer; it now lives inside the
+              composer's top edge (see `topStripSlot` above). What stays
+              is the opposite temperature: the strip is progress you wait
+              on, this is a watch loop you can end. The two are mutually
+              exclusive in practice — a thread with live agent tasks
+              reports `working`, not `monitoring`. */}
           {!enteredSubagent && (
             <div className="pt-2.5">
-              <SubagentActivityBar
-                messages={messages}
-                threadId={threadId}
-                streaming={transcriptStreaming}
-                onJump={handleJumpToSubagentCard}
-              />
-              {/* Same slot, opposite temperature: the activity bar is
-                  progress you wait on, this is a watch loop you can end.
-                  They are mutually exclusive in practice — a thread with
-                  live agent tasks reports `working`, not `monitoring`. */}
               <MonitoringBar
                 monitoring={!!isMonitoring}
                 reason={monitoringReason}
