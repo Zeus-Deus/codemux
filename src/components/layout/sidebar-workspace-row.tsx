@@ -29,17 +29,40 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
+  AlarmClock,
+  AlarmClockOff,
   Archive,
+  Check,
+  Clock,
+  Copy,
   Laptop,
   GitBranch,
   AlertTriangle,
   BellOff,
   Cloud,
   Loader2,
+  Mail,
+  MonitorSmartphone,
+  Pencil,
   Pin,
   PinOff,
+  RotateCcw,
+  Server,
+  Terminal,
+  Trash2,
+  Undo2,
   X,
 } from "lucide-react";
+import {
+  MENU_ROW,
+  MENU_ROW_DESTRUCTIVE,
+  MENU_ROW_META,
+  MENU_ROW_TWO_LINE_COMPACT,
+  MENU_SECTION_LABEL,
+  MENU_SEPARATOR,
+  MenuKeycap,
+} from "@/components/ui/menu-chrome";
+import { useProjectAppearance } from "./use-project-appearance";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
@@ -277,19 +300,23 @@ function SnoozeUntilSubmenu({
   const [presets] = useState(() => computeSnoozePresets(Date.now()));
   return (
     <ContextMenuSub>
-      <ContextMenuSubTrigger>Snooze until…</ContextMenuSubTrigger>
-      <ContextMenuSubContent>
+      <ContextMenuSubTrigger className={MENU_ROW}>
+        <AlarmClock />
+        <span className="flex-1">Snooze until…</span>
+      </ContextMenuSubTrigger>
+      <ContextMenuSubContent {...SUBMENU_CASCADE} className="w-[246px]">
         {presets.map((preset) => (
           <ContextMenuItem
             key={preset.id}
-            className="gap-4"
+            className={MENU_ROW}
             onClick={() => onSnooze(preset.at)}
           >
+            <Clock />
             <span className="flex-1">{preset.label}</span>
             {/* The relative label says how far away a wake is and never when:
                 "Next week" is a deferral the user would have to guess the end
                 of. */}
-            <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+            <span className={cn(MENU_ROW_META, "tabular-nums")}>
               {preset.whenLabel}
             </span>
           </ContextMenuItem>
@@ -299,8 +326,160 @@ function SnoozeUntilSubmenu({
   );
 }
 
+/**
+ * A submenu cascades off its trigger row with its FIRST ITEM level with that
+ * row, not with the panel's top edge — otherwise the entry the user is
+ * reaching for sits a row lower than the one they pointed at. The negative
+ * align offset backs the panel up by its own 6px padding; the negative side
+ * offset overlaps the parent by 4px so the pointer never crosses a gap (and
+ * so never falls through to a sibling row on the way across).
+ */
+const SUBMENU_CASCADE = { sideOffset: -4, alignOffset: -6 } as const;
+
+/** Project identity for the menu's header strip. Kept optional: the legacy
+ *  tree row renders this menu without a resolved project. */
+export interface MenuProject {
+  name: string;
+  path: string;
+}
+
+/** The avatar in the menu header, resolving the project's chosen colour or
+ *  image. Its own component so the appearance hook runs unconditionally. */
+function MenuProjectAvatar({ project }: { project: MenuProject }) {
+  const appearance = useProjectAppearance(project.path);
+  return (
+    <ProjectAvatar
+      name={project.name}
+      color={appearance.customColor}
+      imageUrl={appearance.imageUrl}
+      cacheBust={appearance.imageVersion}
+      shape="square"
+      className="size-[23px] rounded-[7px] text-[10.5px] font-semibold"
+    />
+  );
+}
+
+/**
+ * Identity strip at the top of the workspace menu.
+ *
+ * A right-click menu is the one surface with no visual tie back to the row it
+ * came from — it is portalled to the pointer, and every entry in it is
+ * destructive-adjacent enough that "which workspace is this?" is a fair
+ * question. The strip answers it (workspace, project, and how much
+ * uncommitted work is at stake) and is deliberately not a menuitem: it is
+ * context, so keyboard navigation skips straight past it to Pin.
+ */
+function WorkspaceMenuHeader({
+  workspace,
+  project,
+}: {
+  workspace: WorkspaceSnapshot;
+  project: MenuProject | null;
+}) {
+  const additions = workspace.git_additions ?? 0;
+  const deletions = workspace.git_deletions ?? 0;
+  const hasStats = additions > 0 || deletions > 0;
+
+  return (
+    <div className="mb-1 flex items-center gap-2.5 border-b border-border/70 px-2 pt-2 pb-2.5">
+      {project ? (
+        <MenuProjectAvatar project={project} />
+      ) : (
+        <ProjectAvatar
+          name={workspace.title}
+          shape="square"
+          className="size-[23px] rounded-[7px] text-[10.5px] font-semibold"
+        />
+      )}
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="truncate text-[12.5px] font-semibold tracking-[-0.01em] text-foreground">
+          {workspace.title}
+        </span>
+        {project && (
+          <span className="truncate font-mono text-[9.5px] text-muted-foreground/70">
+            {project.name}
+          </span>
+        )}
+      </span>
+      {hasStats && (
+        <span className="flex shrink-0 gap-1.5 font-mono text-[9.5px] tabular-nums">
+          {additions > 0 && (
+            <span className="text-status-open/80">+{additions}</span>
+          )}
+          {deletions > 0 && (
+            <span className="text-status-attention/80">−{deletions}</span>
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The "Move to device…" submenu.
+ *
+ * Two lines per device rather than a bare name: the question a user asks here
+ * is "which machine is that, and can it take this right now?", and a hostname
+ * alone answers neither. This device leads the list with an accent check, so
+ * the menu always states where the workspace is before offering to move it.
+ */
+function MoveToDeviceSubmenu({
+  hosts,
+  onPick,
+}: {
+  hosts: HostView[];
+  onPick: (host: HostView) => void;
+}) {
+  return (
+    <ContextMenuSub>
+      <ContextMenuSubTrigger className={MENU_ROW}>
+        <MonitorSmartphone />
+        <span className="flex-1">Move to device…</span>
+      </ContextMenuSubTrigger>
+      <ContextMenuSubContent {...SUBMENU_CASCADE} className="w-[246px]">
+        {/* Not a menuitem: "this device" is where the workspace already is,
+            so there is nothing to select. It is the list's anchor. */}
+        <div
+          className={cn(
+            MENU_ROW_TWO_LINE_COMPACT,
+            "flex items-center text-foreground",
+          )}
+        >
+          <MonitorSmartphone className="size-3.5 shrink-0 text-muted-foreground/70" />
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="truncate">This device</span>
+          </span>
+          <Check className="size-3 shrink-0 text-accent-ember" />
+        </div>
+        {hosts.length === 0 ? (
+          <p className="px-[9px] pt-2 pb-1.5 text-[11px] leading-snug text-muted-foreground/70">
+            No other devices signed in.
+          </p>
+        ) : (
+          hosts.map((host) => (
+            <ContextMenuItem
+              key={host.id}
+              className={MENU_ROW_TWO_LINE_COMPACT}
+              onClick={() => onPick(host)}
+            >
+              <Server />
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="truncate">{host.name}</span>
+                <span className="truncate font-mono text-[9.5px] text-muted-foreground/70">
+                  {host.dirty ? "not synced yet" : host.ssh_target}
+                </span>
+              </span>
+            </ContextMenuItem>
+          ))
+        )}
+      </ContextMenuSubContent>
+    </ContextMenuSub>
+  );
+}
+
 export function WorkspaceContextMenuItems({
   workspace,
+  project,
   settleAction,
   snoozeAction,
   unreadAction,
@@ -310,6 +489,10 @@ export function WorkspaceContextMenuItems({
   onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
+  /** The project this workspace belongs to, for the menu's header strip.
+   *  Optional — the legacy tree row has no resolved project, and the header
+   *  degrades to the workspace name alone rather than inventing one. */
+  project?: MenuProject;
   settleAction?: SettleMenuAction;
   snoozeAction?: SnoozeMenuAction;
   /** Optional "Mark unread" entry. The caller decides when re-marking is
@@ -503,14 +686,27 @@ export function WorkspaceContextMenuItems({
     defaultBranch !== null && workspace.git_branch === defaultBranch;
 
   return (
-    <ContextMenuContent>
+    <ContextMenuContent className="w-[274px]">
+      <WorkspaceMenuHeader workspace={workspace} project={project ?? null} />
+      {/* Section labels rather than bare rules: a divider says "these are
+          different", a label says what they are — and the workspace menu is
+          long enough that the difference is worth naming. They render through
+          the Label slot, so they are not menuitems and arrow keys skip them. */}
+      <ContextMenuLabel className={MENU_SECTION_LABEL}>
+        Workspace
+      </ContextMenuLabel>
       {/* Pin/unpin leads the menu: it is the one entry that is always
           available and always means the same thing, whatever shelf the row is
           on. It also gates the lifecycle block below, so reading it first
           explains why those entries may be missing. */}
-      <ContextMenuItem onClick={() => void handleTogglePinned()}>
+      <ContextMenuItem
+        className={MENU_ROW}
+        onClick={() => void handleTogglePinned()}
+      >
         {workspace.pinned_at != null ? <PinOff /> : <Pin />}
-        {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
+        <span className="flex-1">
+          {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
+        </span>
       </ContextMenuItem>
       {/* Lifecycle block, hidden entirely while pinned — a pin suppresses
           every park verb, and showing them disabled would only invite the
@@ -521,16 +717,21 @@ export function WorkspaceContextMenuItems({
       {workspace.pinned_at == null && (
         <>
           {settleAction?.kind === "unsettle" && (
-            <ContextMenuItem onClick={settleAction.onAction}>
-              Un-settle workspace
+            <ContextMenuItem className={MENU_ROW} onClick={settleAction.onAction}>
+              <Undo2 />
+              <span className="flex-1">Un-settle workspace</span>
             </ContextMenuItem>
           )}
           {snooze?.kind === "wake" && (
-            <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
+            <ContextMenuItem className={MENU_ROW} onClick={snooze.onWake}>
+              <AlarmClockOff />
+              <span className="flex-1">Wake now</span>
+            </ContextMenuItem>
           )}
           {settleAction?.kind === "settle" && (
-            <ContextMenuItem onClick={settleAction.onAction}>
-              Settle workspace
+            <ContextMenuItem className={MENU_ROW} onClick={settleAction.onAction}>
+              <Check />
+              <span className="flex-1">Settle workspace</span>
             </ContextMenuItem>
           )}
           {/* `offered` is the guardrail (a working or blocked workspace is
@@ -542,18 +743,27 @@ export function WorkspaceContextMenuItems({
         </>
       )}
       {unreadAction && (
-        <ContextMenuItem onClick={unreadAction.onMarkUnread}>
-          Mark unread
+        <ContextMenuItem className={MENU_ROW} onClick={unreadAction.onMarkUnread}>
+          <Mail />
+          <span className="flex-1">Mark unread</span>
         </ContextMenuItem>
       )}
-      <ContextMenuSeparator />
-      <ContextMenuItem onClick={handleRename}>
-        Rename workspace
+
+      <ContextMenuLabel className={cn(MENU_SECTION_LABEL, "mt-1")}>
+        Actions
+      </ContextMenuLabel>
+      <ContextMenuItem className={MENU_ROW} onClick={handleRename}>
+        <Pencil />
+        <span className="flex-1">Rename workspace</span>
+        <MenuKeycap keys="F2" />
       </ContextMenuItem>
       {editors.length === 1 ? (
-        <ContextMenuItem onClick={() => handleOpenInEditor(editors[0].id)}>
-          <EditorIcon id={editors[0].id} className="h-4 w-4" />
-          Open in {editors[0].name}
+        <ContextMenuItem
+          className={MENU_ROW}
+          onClick={() => handleOpenInEditor(editors[0].id)}
+        >
+          <EditorIcon id={editors[0].id} className="size-3.5 shrink-0" />
+          <span className="flex-1">Open in {editors[0].name}</span>
         </ContextMenuItem>
       ) : editors.length > 1 ? (
         (() => {
@@ -561,8 +771,11 @@ export function WorkspaceContextMenuItems({
           const showGroupLabels = groupedEditors.length > 1;
           return (
             <ContextMenuSub>
-              <ContextMenuSubTrigger>Open in editor</ContextMenuSubTrigger>
-              <ContextMenuSubContent>
+              <ContextMenuSubTrigger className={MENU_ROW}>
+                <Terminal />
+                <span className="flex-1">Open in editor</span>
+              </ContextMenuSubTrigger>
+              <ContextMenuSubContent {...SUBMENU_CASCADE} className="w-[186px]">
                 {groupedEditors.map((group, groupIdx) => (
                   // Same grouping pattern as the title-bar launcher —
                   // render section labels between families when more
@@ -570,16 +783,22 @@ export function WorkspaceContextMenuItems({
                   // family is present so a "VS Code family" header
                   // doesn't dangle over a single entry.
                   <ContextMenuGroup key={group.id}>
-                    {groupIdx > 0 && <ContextMenuSeparator />}
+                    {groupIdx > 0 && (
+                      <ContextMenuSeparator className={MENU_SEPARATOR} />
+                    )}
                     {showGroupLabels && (
-                      <ContextMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                      <ContextMenuLabel className={MENU_SECTION_LABEL}>
                         {group.label}
                       </ContextMenuLabel>
                     )}
                     {group.editors.map((editor) => (
-                      <ContextMenuItem key={editor.id} onClick={() => handleOpenInEditor(editor.id)}>
-                        <EditorIcon id={editor.id} className="h-4 w-4" />
-                        {editor.name}
+                      <ContextMenuItem
+                        key={editor.id}
+                        className={MENU_ROW}
+                        onClick={() => handleOpenInEditor(editor.id)}
+                      >
+                        <EditorIcon id={editor.id} className="size-3.5 shrink-0" />
+                        <span className="flex-1">{editor.name}</span>
                       </ContextMenuItem>
                     ))}
                   </ContextMenuGroup>
@@ -590,88 +809,107 @@ export function WorkspaceContextMenuItems({
         })()
       ) : null}
       <ContextMenuItem
+        className={MENU_ROW}
         onClick={handleCopyBranch}
         disabled={!workspace.git_branch}
       >
-        Copy branch name
+        <Copy />
+        <span className="flex-1">Copy branch name</span>
       </ContextMenuItem>
       {showCheckoutDefault && (
         <ContextMenuItem
+          className={MENU_ROW}
           onClick={handleCheckoutDefault}
           disabled={isOnDefault}
         >
-          Checkout default branch
+          <GitBranch />
+          <span className="flex-1">Checkout default branch</span>
         </ContextMenuItem>
       )}
       <ContextMenuItem
+        className={MENU_ROW}
         onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
       >
-        Re-run Setup
+        <RotateCcw />
+        <span className="flex-1">Re-run Setup</span>
       </ContextMenuItem>
-      <ContextMenuItem onClick={handleToggleMute}>
-        {workspace.notifications_muted
-          ? "Unmute notifications"
-          : "Mute notifications"}
-      </ContextMenuItem>
-
-      {projectMenu && (
-        <>
-          <ContextMenuSeparator />
-          {projectMenu}
-        </>
-      )}
-
-      <ContextMenuSeparator />
-      {isRemote ? (
-        <ContextMenuItem onClick={() => void handlePullBack()}>
-          Pull back to this device
-        </ContextMenuItem>
-      ) : hosts.length > 0 ? (
-        <ContextMenuSub>
-          <ContextMenuSubTrigger>Move to device…</ContextMenuSubTrigger>
-          <ContextMenuSubContent>
-            {hosts.map((host) => (
-              <ContextMenuItem
-                key={host.id}
-                onClick={() => {
-                  // Phase-4 confirmation gate. If the user clicked
-                  // "Don't ask again for X" previously, skip the
-                  // dialog and push immediately — otherwise hoist
-                  // to the parent to open the confirm modal.
-                  if (
-                    onRequestPushConfirm &&
-                    !shouldSkipPushConfirm(host.id)
-                  ) {
-                    onRequestPushConfirm(host);
-                  } else {
-                    void handleMoveToHost(host);
-                  }
-                }}
-              >
-                {host.name}
-              </ContextMenuItem>
-            ))}
-          </ContextMenuSubContent>
-        </ContextMenuSub>
-      ) : (
-        <ContextMenuItem
-          disabled
-          title="Add a device in Settings → Devices to push workspaces"
+      <ContextMenuItem className={MENU_ROW} onClick={handleToggleMute}>
+        <BellOff />
+        <span className="flex-1">
+          {workspace.notifications_muted
+            ? "Unmute notifications"
+            : "Mute notifications"}
+        </span>
+        {/* The label already names the verb; the pill says which way the
+            switch is currently thrown, which the label alone cannot. */}
+        <span
+          aria-hidden
+          className={cn(
+            "ml-auto flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors",
+            workspace.notifications_muted
+              ? "justify-end bg-accent-ember/70"
+              : "bg-foreground/15",
+          )}
         >
-          Move to device… (no devices configured)
+          <span
+            className={cn(
+              "size-2.5 rounded-full",
+              workspace.notifications_muted
+                ? "bg-background"
+                : "bg-muted-foreground/70",
+            )}
+          />
+        </span>
+      </ContextMenuItem>
+
+      <ContextMenuLabel className={cn(MENU_SECTION_LABEL, "mt-1")}>
+        Organize
+      </ContextMenuLabel>
+      {projectMenu}
+      {isRemote ? (
+        <ContextMenuItem
+          className={MENU_ROW}
+          onClick={() => void handlePullBack()}
+        >
+          <MonitorSmartphone />
+          <span className="flex-1">Pull back to this device</span>
         </ContextMenuItem>
+      ) : (
+        // Always a submenu now, hosts or none: the parent row is the answer
+        // to "where else could this go?", and a menu that reads
+        // "Move to device… (no devices configured)" answers it by removing
+        // the affordance. The empty submenu says the same thing without
+        // taking the door away.
+        <MoveToDeviceSubmenu
+          hosts={hosts}
+          onPick={(host) => {
+            // Phase-4 confirmation gate. If the user clicked
+            // "Don't ask again for X" previously, skip the
+            // dialog and push immediately — otherwise hoist
+            // to the parent to open the confirm modal.
+            if (onRequestPushConfirm && !shouldSkipPushConfirm(host.id)) {
+              onRequestPushConfirm(host);
+            } else {
+              void handleMoveToHost(host);
+            }
+          }}
+        />
       )}
 
-      <ContextMenuSeparator />
-      <ContextMenuItem onClick={onArchiveRequest}>
-        {isAttachOrRemote ? "Close workspace" : "Archive Workspace"}
+      <ContextMenuSeparator className={MENU_SEPARATOR} />
+      <ContextMenuItem className={MENU_ROW} onClick={onArchiveRequest}>
+        <Archive />
+        <span className="flex-1 text-muted-foreground">
+          {isAttachOrRemote ? "Close workspace" : "Archive Workspace"}
+        </span>
       </ContextMenuItem>
       {canDelete && (
         <ContextMenuItem
-          className="text-destructive focus:text-destructive"
+          className={MENU_ROW_DESTRUCTIVE}
           onClick={onDeleteRequest}
         >
-          Delete Worktree…
+          <Trash2 />
+          <span className="flex-1">Delete Worktree…</span>
         </ContextMenuItem>
       )}
     </ContextMenuContent>

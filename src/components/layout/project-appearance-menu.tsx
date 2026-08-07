@@ -1,4 +1,4 @@
-import { Check, Image as ImageIcon } from "lucide-react";
+import { Image as ImageIcon } from "lucide-react";
 import {
   ContextMenuItem,
   ContextMenuLabel,
@@ -7,6 +7,12 @@ import {
   ContextMenuSubContent,
   ContextMenuSubTrigger,
 } from "@/components/ui/context-menu";
+import {
+  MENU_ROW,
+  MENU_SECTION_LABEL,
+  MENU_SEPARATOR,
+} from "@/components/ui/menu-chrome";
+import { cn } from "@/lib/utils";
 import { useProjectAppearance } from "./use-project-appearance";
 import { useProjectAppearanceStore } from "@/stores/project-appearance-store";
 
@@ -61,42 +67,126 @@ export function ProjectAppearanceMenu({
   const { customColor, imageUrl } = useProjectAppearance(projectPath);
   const setColor = useProjectAppearanceStore((s) => s.setColor);
 
+  const selected =
+    PROJECT_COLORS.find((c) => c.value === customColor) ?? null;
+
   return (
     <ContextMenuSub>
-      <ContextMenuSubTrigger aria-label={`Project ${projectName}`}>
-        Project &ldquo;{projectName}&rdquo;
+      <ContextMenuSubTrigger
+        aria-label={`Project ${projectName}`}
+        className={MENU_ROW}
+      >
+        <ImageIcon />
+        <span className="min-w-0 flex-1 truncate">
+          Project &ldquo;{projectName}&rdquo;
+        </span>
+        {/* The current accent, so the submenu's answer is visible without
+            opening it. */}
+        <span
+          aria-hidden
+          className={cn(
+            "size-[9px] shrink-0 rounded-[3px]",
+            !selected && "bg-foreground/20",
+          )}
+          style={selected ? { backgroundColor: selected.value } : undefined}
+        />
       </ContextMenuSubTrigger>
-      <ContextMenuSubContent className="w-44">
-        <ContextMenuItem onClick={onRequestImageDialog}>
-          <ImageIcon className="mr-2 h-3.5 w-3.5" />
-          {imageUrl ? "Change image…" : "Set image…"}
+      <ContextMenuSubContent sideOffset={-4} alignOffset={-6} className="w-[274px]">
+        <ContextMenuItem className={MENU_ROW} onClick={onRequestImageDialog}>
+          <ImageIcon />
+          <span className="flex-1">
+            {imageUrl ? "Change image…" : "Set image…"}
+          </span>
         </ContextMenuItem>
 
-        <ContextMenuSeparator />
-        <ContextMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
-          Color
-        </ContextMenuLabel>
-        <ContextMenuItem onClick={() => setColor(projectPath, null)}>
-          <span className="mr-2 size-3.5 shrink-0 rounded-full border border-border bg-background" />
-          Default
-          {!customColor && <Check className="ml-auto h-3.5 w-3.5" />}
-        </ContextMenuItem>
-        {PROJECT_COLORS.map((color) => (
-          <ContextMenuItem
-            key={color.value}
-            onClick={() => setColor(projectPath, color.value)}
-          >
-            <span
-              className="mr-2 size-3.5 shrink-0 rounded-full border border-border/50"
-              style={{ backgroundColor: color.value }}
+        <ContextMenuSeparator className={MENU_SEPARATOR} />
+        <ContextMenuLabel className={MENU_SECTION_LABEL}>Color</ContextMenuLabel>
+        {/* A grid, not thirteen rows. The colours are the whole content of
+            this choice, so showing them as a palette lets the eye pick one
+            directly instead of reading a list of colour names — and it turns
+            a submenu that used to be taller than its parent into four lines.
+            Each swatch stays a real menuitem, so arrow-key navigation and the
+            colour's accessible name both survive the change. */}
+        <div className="grid grid-cols-7 gap-1.5 px-2 pt-1 pb-2">
+          <ColorSwatch
+            name="Default"
+            selected={!customColor}
+            onSelect={() => setColor(projectPath, null)}
+          />
+          {PROJECT_COLORS.map((color) => (
+            <ColorSwatch
+              key={color.value}
+              name={color.name}
+              value={color.value}
+              selected={customColor === color.value}
+              onSelect={() => setColor(projectPath, color.value)}
             />
-            {color.name}
-            {customColor === color.value && (
-              <Check className="ml-auto h-3.5 w-3.5" />
+          ))}
+        </div>
+        <div className="flex items-center gap-[7px] px-[9px] pt-0.5 pb-2">
+          <span
+            aria-hidden
+            className={cn(
+              "size-2 shrink-0 rounded-[3px]",
+              !selected && "bg-foreground/20",
             )}
-          </ContextMenuItem>
-        ))}
+            style={selected ? { backgroundColor: selected.value } : undefined}
+          />
+          <span className="text-[11.5px] text-muted-foreground">
+            {selected?.name ?? "Default"}
+          </span>
+          <span className="flex-1" />
+          {/* Says out loud what the submenu title only implies: this is a
+              project setting reached from one workspace's row. */}
+          <span className="font-mono text-[9.5px] text-muted-foreground/60">
+            applies to all workspaces
+          </span>
+        </div>
       </ContextMenuSubContent>
     </ContextMenuSub>
+  );
+}
+
+/** One swatch in the colour grid. A real menuitem (keyboard-navigable) whose
+ *  accessible name is the colour, since the tile itself carries no text. */
+function ColorSwatch({
+  name,
+  value,
+  selected,
+  onSelect,
+}: {
+  name: string;
+  /** Absent for "Default", which clears the custom colour. */
+  value?: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <ContextMenuItem
+      aria-label={name}
+      title={name}
+      data-selected={selected ? "true" : undefined}
+      onClick={onSelect}
+      className={cn(
+        "h-[26px] justify-center rounded-[7px] p-0",
+        // Selection is a ring held off the tile by a popover-coloured gap, so
+        // it reads on a dark swatch and a light one alike — a check glyph
+        // would have to fight whichever colour it lands on. The keyboard/hover
+        // state is the same ring in a quieter tone, so a swatch under the
+        // cursor is never mistaken for the chosen one.
+        selected
+          ? "shadow-[0_0_0_2px_var(--popover),0_0_0_3.5px_var(--foreground)]"
+          : "shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--foreground)_7%,transparent)]",
+        "data-highlighted:shadow-[0_0_0_2px_var(--popover),0_0_0_3.5px_var(--muted-foreground)]",
+        "focus:shadow-[0_0_0_2px_var(--popover),0_0_0_3.5px_var(--muted-foreground)]",
+      )}
+      style={{
+        // "Default" has no chosen colour, so it shows the neutral the avatar
+        // falls back to. Inline rather than a utility so the menu's shared
+        // highlight fill can't repaint a swatch on hover.
+        backgroundColor:
+          value ?? "color-mix(in oklch, var(--foreground) 22%, transparent)",
+      }}
+    />
   );
 }

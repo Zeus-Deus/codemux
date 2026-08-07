@@ -26,6 +26,27 @@ source-control seam, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
+- **Popup menus restyled onto the command-palette surface.** The workspace
+  right-click menu, the footer gear menu and the projects `+` menu now share
+  one chrome (`src/components/ui/menu-chrome.tsx` + `.cm-menu-surface` in
+  `globals.css`): 13px radius, hairline border, one elevation, 32px rows with
+  a 14px icon on every row, and right-aligned mono keycaps — resolved through
+  `keybind-registry` where a binding exists, omitted where none does (no new
+  global bindings were registered, and a keycap is never shown for a combo the
+  registry hands to a different action). The item lists are unchanged.
+  New presentation: an identity header on the workspace menu (avatar,
+  workspace, project, `+A −D`), named **Workspace / Actions / Organize** groups
+  instead of bare dividers, a red-tinted destructive tail, the project colour
+  palette as a 7-across swatch grid, a two-line device submenu that always
+  exists (with "No other devices signed in." when it is empty), two-line rows
+  in the `+` menu, and a version/update footer strip in the gear menu fed by
+  the new `src/stores/update-status-store.ts` mirror — so the menu reads the
+  one `useUpdateChecker` that `UpdateToast` mounts rather than starting a
+  second poll. The shadcn dropdown/context-menu primitives adopted the surface
+  globally (submenus included, which previously diverged); the row rhythm is
+  opt-in, so the ~17 other menus on those primitives keep their dense lists.
+  See `docs/features/sidebar.md` and `docs/features/project-avatars.md`.
+
 - **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
 
 - **A finished run can no longer stay stuck on "Working"** (PR #254).

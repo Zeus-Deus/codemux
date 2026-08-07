@@ -22,20 +22,102 @@ import {
   BookOpen,
   Bug,
   CalendarClock,
-  Info,
   LayoutGrid,
   LogOut,
   ExternalLink,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { useAuthStore } from "@/stores/auth-store";
+import { useUpdateStatusStore } from "@/stores/update-status-store";
+import { cn } from "@/lib/utils";
+import {
+  MENU_ROW,
+  MENU_ROW_META,
+  MENU_SEPARATOR,
+  MenuKeycap,
+} from "@/components/ui/menu-chrome";
 import { SidebarPortsPopover } from "./sidebar-ports-popover";
 
-function ShortcutHint({ actionId }: { actionId: string }) {
-  const { getKeysForAction } = useResolvedKeybinds();
-  const keys = getKeysForAction(actionId);
-  if (!keys) return null;
-  return <kbd className="ml-auto text-[10px] text-muted-foreground">{keys}</kbd>;
+/**
+ * The menu's bottom strip: which build is running, and whether it is the
+ * current one. It replaced a disabled "Codemux v0.0.0" menu item — a version
+ * string is a fact about the app, not an action, and rendering it as a dead
+ * row meant the one row users tried to click was the one that could never do
+ * anything. Flush to the container's bottom corners so it reads as chrome.
+ */
+function AppMenuFooter({ version }: { version: string | null }) {
+  const state = useUpdateStatusStore((s) => s.state);
+  const published = useUpdateStatusStore((s) => s.published);
+  const updateVersion = useUpdateStatusStore((s) => s.updateVersion);
+  const isRemote = useUpdateStatusStore((s) => s.isRemote);
+  const startDownload = useUpdateStatusStore((s) => s.startDownload);
+  const installAndRestart = useUpdateStatusStore((s) => s.installAndRestart);
+  const requestDesktopUpdate = useUpdateStatusStore(
+    (s) => s.requestDesktopUpdate,
+  );
+
+  // Copy stays short enough to sit on one line beside the version: the strip
+  // is a status readout, not the update flow — the toast owns that.
+  let label = "Up to date";
+  let tone = "text-status-open";
+  let action: (() => void) | null = null;
+  if (state === "checking") {
+    label = "Checking…";
+    tone = "text-muted-foreground";
+  } else if (state === "update-available") {
+    // The remote client has no updater plugin, so `startDownload` there is a
+    // no-op; its only route is asking the desktop to update itself, exactly as
+    // the toast's "Update & restart desktop" button does.
+    label = isRemote ? "Update desktop" : "Update available";
+    tone = "text-status-working";
+    action = isRemote ? requestDesktopUpdate : startDownload;
+  } else if (state === "downloading") {
+    label = "Downloading…";
+    tone = "text-status-working";
+  } else if (state === "ready") {
+    label = "Restart to update";
+    tone = "text-status-working";
+    action = installAndRestart;
+  } else if (state === "error") {
+    label = "Update failed";
+    tone = "text-status-attention";
+  }
+
+  const status = (
+    <>
+      <span className={cn("size-[5px] shrink-0 rounded-full bg-current")} />
+      {label}
+    </>
+  );
+
+  return (
+    <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-[12px] border-t border-border/70 bg-background/50 px-3.5">
+      <span className="font-mono text-[10px] text-muted-foreground/70">
+        Codemux {version ? `v${version}` : ""}
+      </span>
+      <span className="flex-1" />
+      {/* No checker has published yet (the first check is still pending, or
+          this is a dev build where it never runs). The version alone is still
+          a fact; "Up to date" would be a claim nothing has verified. */}
+      {!published ? null : action ? (
+        <button
+          type="button"
+          onClick={action}
+          title={updateVersion ? `Version ${updateVersion}` : undefined}
+          className={cn(
+            "flex items-center gap-1.5 rounded-[5px] px-1 text-[10.5px] transition-colors hover:brightness-125",
+            tone,
+          )}
+        >
+          {status}
+        </button>
+      ) : (
+        <span className={cn("flex items-center gap-1.5 text-[10.5px]", tone)}>
+          {status}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function AppMenu({
@@ -45,6 +127,7 @@ function AppMenu({
 }) {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
+  const accountName = useAuthStore((s) => s.user?.name ?? s.user?.email ?? null);
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -70,54 +153,66 @@ function AppMenu({
           Menu
         </TooltipContent>
       </Tooltip>
-      <DropdownMenuContent side="top" align="start" className="w-52">
-        <DropdownMenuItem onClick={() => setShowSettings(true)}>
-          <Settings className="h-4 w-4" />
-          <span>Settings</span>
-          <ShortcutHint actionId="openSettings" />
+      {/* Bottom padding is zero so the version/update strip can sit flush in
+          the container's bottom corners. */}
+      <DropdownMenuContent
+        side="top"
+        align="start"
+        className="w-[252px] pb-0"
+      >
+        <DropdownMenuItem className={MENU_ROW} onClick={() => setShowSettings(true)}>
+          <Settings />
+          <span className="flex-1">Settings</span>
+          <MenuKeycap actionId="openSettings" />
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => toggleCommandPalette()}>
-          <Search className="h-4 w-4" />
-          <span>Command palette</span>
-          <ShortcutHint actionId="commandPalette" />
+        <DropdownMenuItem className={MENU_ROW} onClick={() => toggleCommandPalette()}>
+          <Search />
+          <span className="flex-1">Command palette</span>
+          <MenuKeycap actionId="commandPalette" />
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => setShowSettings(true, "shortcuts")}>
-          <Keyboard className="h-4 w-4" />
-          <span>Keyboard shortcuts</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
         <DropdownMenuItem
+          className={MENU_ROW}
+          onClick={() => setShowSettings(true, "shortcuts")}
+        >
+          <Keyboard />
+          <span className="flex-1">Keyboard shortcuts</span>
+          <MenuKeycap actionId="showShortcuts" />
+        </DropdownMenuItem>
+        <DropdownMenuSeparator className={MENU_SEPARATOR} />
+        <DropdownMenuItem
+          className={MENU_ROW}
           onClick={() => openUrl("https://docs.codemux.org/installation")}
         >
-          <BookOpen className="h-4 w-4" />
-          <span>Documentation</span>
-          <ExternalLink className="ml-auto h-3 w-3 text-muted-foreground" />
+          <BookOpen />
+          <span className="flex-1">Documentation</span>
+          <ExternalLink className="ml-auto size-[11px] shrink-0 text-muted-foreground/60" />
         </DropdownMenuItem>
         <DropdownMenuItem
+          className={MENU_ROW}
           onClick={() =>
             openUrl("https://github.com/Zeus-Deus/codemux/issues/new")
           }
         >
-          <Bug className="h-4 w-4" />
-          <span>Report issue</span>
-          <ExternalLink className="ml-auto h-3 w-3 text-muted-foreground" />
+          <Bug />
+          <span className="flex-1">Report issue</span>
+          <ExternalLink className="ml-auto size-[11px] shrink-0 text-muted-foreground/60" />
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem disabled>
-          <Info className="h-4 w-4" />
-          <span>Codemux {version ? `v${version}` : ""}</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
+        <DropdownMenuSeparator className={MENU_SEPARATOR} />
         <DropdownMenuItem
-          onClick={() => {
-            import("@/stores/auth-store").then(({ useAuthStore }) =>
-              useAuthStore.getState().signOut(),
-            );
-          }}
+          className={MENU_ROW}
+          onClick={() => useAuthStore.getState().signOut()}
         >
-          <LogOut className="h-4 w-4" />
-          <span>Sign out</span>
+          <LogOut />
+          <span className="flex-1 text-muted-foreground">Sign out</span>
+          {/* Only shown when the frontend actually knows the account — a
+              signed-out or offline install gets no invented name. */}
+          {accountName && (
+            <span className={cn(MENU_ROW_META, "max-w-[96px] truncate")}>
+              {accountName}
+            </span>
+          )}
         </DropdownMenuItem>
+        <AppMenuFooter version={version} />
       </DropdownMenuContent>
     </DropdownMenu>
   );

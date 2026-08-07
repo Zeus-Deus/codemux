@@ -824,3 +824,64 @@ body.pane-resizing iframe {
   box-shadow: 0 0 0 2px var(--accent-ember);
   transition: box-shadow 0.3s ease;
 }
+
+/* ── Popup-menu surface ────────────────────────────────────────────────
+ * Every dropdown/context menu sits on the same surface language as the
+ * command palette: one radius, one hairline border, one elevation. The
+ * radius and the elevation are the two things Tailwind can't express as a
+ * token utility here, so they live as a class instead of being re-typed
+ * per menu.
+ *
+ * The drop shadow is deliberately literal black: a cast shadow is an
+ * absence of light, not a themed surface, so it is the same documented
+ * exception the titlebar overlap surface already takes. The alpha is
+ * scheme-aware because a 58%-black plume that reads as "lifted" over a
+ * dark app reads as "smeared" over a white one. The inner top highlight
+ * IS token-derived (foreground alpha), since that one is a light. */
+@keyframes cm-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.cm-menu-surface {
+  border-radius: 13px;
+  box-shadow:
+    0 26px 70px oklch(0 0 0 / 0.22),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+  animation: cm-menu-in 0.14s ease-out;
+}
+
+/* Submenus are a step less elevated — they cascade off a surface that is
+ * already lifted, so repeating the parent's plume double-darkens the seam. */
+.cm-menu-surface-sub {
+  border-radius: 12px;
+  box-shadow:
+    0 22px 60px oklch(0 0 0 / 0.22),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+  animation: cm-menu-in 0.14s ease-out;
+}
+
+.dark .cm-menu-surface {
+  box-shadow:
+    0 26px 70px oklch(0 0 0 / 0.58),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+}
+
+.dark .cm-menu-surface-sub {
+  box-shadow:
+    0 22px 60px oklch(0 0 0 / 0.58),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cm-menu-surface,
+  .cm-menu-surface-sub {
+    animation: none;
+  }
+}
