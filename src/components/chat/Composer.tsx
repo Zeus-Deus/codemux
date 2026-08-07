@@ -19,6 +19,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 
 import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
+import { resolveProvider } from "@/lib/source-control";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
@@ -241,21 +242,31 @@ interface Props {
    *  "doesn't support images" hint. The parent decides this from
    *  `activeModel.supports_images`. */
   modelSupportsImages?: boolean;
-  /** Step 8 Stage 4 — preflight result for `is_github_repo` on `cwd`.
-   *  Drives:
+  /** Does a hosting product Codemux can serve back this `cwd`? Drives:
    *   - `attach:issue` / `attach:pr` enable state in the `+` popup,
    *   - whether `@issue:` autocomplete fetches at all.
    *  `null` means "not yet known"; the parent runs the preflight on
    *  mount and patches this in. While `null`, the popup keeps the
-   *  GitHub entries disabled so a slow preflight can't flash an
+   *  hosting entries disabled so a slow preflight can't flash an
    *  enabled-then-disabled affordance. */
-  isGithubRepo?: boolean | null;
-  /** Step 8 Stage 4 — when the user is in a GitHub repo but `gh` is
-   *  not authenticated, the popup footer surfaces the auth-recovery
-   *  hint. `null` (or true) means we have a usable `gh`; `false` means
-   *  the user needs to run `gh auth login` before the GitHub kinds
-   *  will work. */
-  ghAuthenticated?: boolean | null;
+  repoSupported?: boolean | null;
+  /** Is that product's CLI on PATH at all? `false` gates the hosting
+   *  entries the same way a signed-out CLI does — neither can serve a
+   *  picker — but the hint names the download rather than the login
+   *  command, since there is nothing to sign in to yet. `null` means
+   *  not yet known. */
+  providerCliInstalled?: boolean | null;
+  /** Is that product's CLI signed in to the instance this checkout
+   *  points at? `false` surfaces the auth-recovery hint in the popup
+   *  footer, naming that product's own login command. A CLI that is not
+   *  installed is `false` here too — it cannot act on the checkout —
+   *  with `providerCliInstalled` carrying the difference in the copy.
+   *  `null` means not yet known. */
+  providerAuthenticated?: boolean | null;
+  /** `provider_kind` of the workspace this composer is bound to, so the
+   *  attach rows and footer hints name the right product and CLI.
+   *  Absent means GitHub, matching the rest of the app. */
+  providerKind?: string | null;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -322,8 +333,10 @@ export function Composer({
   onAttachPr,
   onAttachImage,
   modelSupportsImages = false,
-  isGithubRepo = null,
-  ghAuthenticated = null,
+  repoSupported = null,
+  providerCliInstalled = null,
+  providerAuthenticated = null,
+  providerKind = null,
   onDraftChange,
   onSubmit,
   onStop,
@@ -336,6 +349,9 @@ export function Composer({
   onModeActivate,
   onModeRemove,
 }: Props) {
+  // Named apart from the `provider` prop above, which is the AI agent
+  // backend (claude/codex/…) — a different axis entirely.
+  const scProvider = resolveProvider(providerKind);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Mirror layer that paints the colored highlights behind the
   // transparent textarea. The textarea owns scroll position; the
@@ -719,11 +735,11 @@ export function Composer({
   useEffect(() => {
     if (!mentionOpen) return;
     if (parsedMention.category !== "issue") return;
-    if (!cwd || isGithubRepo === false) {
+    if (!cwd || repoSupported === false) {
       setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
       return;
     }
-    if (ghAuthenticated === false) {
+    if (providerCliInstalled === false || providerAuthenticated === false) {
       setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
       return;
     }
@@ -758,8 +774,9 @@ export function Composer({
     parsedMention.category,
     parsedMention.filter,
     cwd,
-    isGithubRepo,
-    ghAuthenticated,
+    repoSupported,
+    providerCliInstalled,
+    providerAuthenticated,
   ]);
 
   // ─── Mention popup: `@pr:<query>` fetch ──────────────────────────
@@ -770,11 +787,11 @@ export function Composer({
   useEffect(() => {
     if (!mentionOpen) return;
     if (parsedMention.category !== "pr") return;
-    if (!cwd || isGithubRepo === false) {
+    if (!cwd || repoSupported === false) {
       setMentionPrMatches(EMPTY_PR_MATCHES);
       return;
     }
-    if (ghAuthenticated === false) {
+    if (providerCliInstalled === false || providerAuthenticated === false) {
       setMentionPrMatches(EMPTY_PR_MATCHES);
       return;
     }
@@ -811,8 +828,9 @@ export function Composer({
     parsedMention.category,
     parsedMention.filter,
     cwd,
-    isGithubRepo,
-    ghAuthenticated,
+    repoSupported,
+    providerCliInstalled,
+    providerAuthenticated,
   ]);
 
   const closeSlash = () => {
@@ -1072,32 +1090,64 @@ export function Composer({
     fileMatches,
   ]);
 
+  // Why the hosting affordances are inert, in the product's own words:
+  // no host Codemux serves, no CLI on PATH, or a CLI that is signed
+  // out. Ordered most-fundamental first — a missing CLI is not a login
+  // problem, so it must be named before the login command is. `null`
+  // when nothing is blocking them.
+  const hostingBlockedHint = useMemo<string | null>(() => {
+    if (repoSupported === false) return `Not a ${scProvider.name} repo`;
+    if (providerCliInstalled === false && scProvider.cli) {
+      return `Install ${scProvider.cli} from ${scProvider.installUrl}`;
+    }
+    if (providerAuthenticated === false) return `Run ${scProvider.loginCommand}`;
+    return null;
+  }, [repoSupported, providerCliInstalled, providerAuthenticated, scProvider]);
+
+  // Both hosting attach rows gate on the same three answers; a row that
+  // stays enabled while any of them is negative opens a picker that can
+  // only error.
+  const hostingAttachDisabled =
+    repoSupported !== true ||
+    providerCliInstalled === false ||
+    providerAuthenticated === false;
+
   // Footer hint per category. File hints stay file-flavoured; issue
-  // and pr hints surface the GitHub-specific failure modes (not a
-  // repo, gh not authenticated). Keeps the user oriented when the
-  // popup is empty for *reasons* rather than just no-matches.
+  // and pr hints surface the hosting-product failure modes (not a
+  // supported repo, CLI missing, CLI not authenticated). Keeps the user
+  // oriented when the popup is empty for *reasons* rather than just
+  // no-matches.
   const mentionPopupFooter = useMemo(() => {
     if (
       parsedMention.category === "issue" ||
       parsedMention.category === "pr"
     ) {
-      const noun = parsedMention.category === "issue" ? "issues" : "PRs";
+      const noun =
+        parsedMention.category === "issue"
+          ? "issues"
+          : `${scProvider.shortNoun}s`;
       if (!cwd) {
         return {
           tone: "muted" as const,
           message: `Open this chat in a project to attach ${noun}.`,
         };
       }
-      if (isGithubRepo === false) {
+      if (repoSupported === false) {
         return {
           tone: "muted" as const,
-          message: "Not a GitHub repo.",
+          message: `Not a ${scProvider.name} repo.`,
         };
       }
-      if (ghAuthenticated === false) {
+      if (providerCliInstalled === false && scProvider.cli) {
         return {
           tone: "muted" as const,
-          message: "Sign in with: gh auth login",
+          message: `Install ${scProvider.cli} from ${scProvider.installUrl}`,
+        };
+      }
+      if (providerAuthenticated === false) {
+        return {
+          tone: "muted" as const,
+          message: `Sign in with: ${scProvider.loginCommand}`,
         };
       }
       return null;
@@ -1109,7 +1159,14 @@ export function Composer({
       };
     }
     return null;
-  }, [parsedMention.category, cwd, isGithubRepo, ghAuthenticated]);
+  }, [
+    parsedMention.category,
+    cwd,
+    repoSupported,
+    providerCliInstalled,
+    providerAuthenticated,
+    scProvider,
+  ]);
 
   // ─── Attach popup items + pick handler ───────────────────────────
   // Items are derived per-submode. The `main` view is static
@@ -1205,43 +1262,32 @@ export function Composer({
         },
         {
           id: "attach:issue",
-          label: "GitHub Issue…",
-          // Stage 4 — three flavours of disabled-state copy so the
-          // user knows whether the row is disabled because they're
-          // off-GitHub, off-auth, or just waiting on the preflight.
-          // The row stays VISIBLE and dimmed with its reason in the
-          // description; once the preflight resolves to true +
-          // authenticated it enables and the copy returns to the
-          // active-affordance line.
-          description:
-            isGithubRepo === false
-              ? "Not a GitHub repo"
-              : ghAuthenticated === false
-                ? "Run gh auth login"
-                : "Pick an issue from this repo",
+          label: `${scProvider.name} Issue…`,
+          // Stage 4 — flavoured disabled-state copy so the user knows
+          // whether the row is disabled because the repo has no
+          // supported host, because the CLI is missing or signed out,
+          // or because the preflight is still running. The row stays
+          // VISIBLE and dimmed with its reason in the description;
+          // once the preflight resolves to a usable CLI it enables and
+          // the copy returns to the active-affordance line.
+          description: hostingBlockedHint ?? "Pick an issue from this repo",
           command: "",
           icon: CircleDot,
           tone: "muted",
           group: "ATTACH",
-          disabled:
-            isGithubRepo !== true || ghAuthenticated === false,
+          disabled: hostingAttachDisabled,
           onSelect: () => {},
         },
         {
           id: "attach:pr",
-          label: "GitHub PR…",
+          label: `${scProvider.name} ${scProvider.shortNoun}…`,
           description:
-            isGithubRepo === false
-              ? "Not a GitHub repo"
-              : ghAuthenticated === false
-                ? "Run gh auth login"
-                : "Pick a pull request from this repo",
+            hostingBlockedHint ?? `Pick a ${scProvider.noun} from this repo`,
           command: "",
           icon: GitPullRequest,
           tone: "muted",
           group: "ATTACH",
-          disabled:
-            isGithubRepo !== true || ghAuthenticated === false,
+          disabled: hostingAttachDisabled,
           onSelect: () => {},
         },
         {
@@ -1330,8 +1376,9 @@ export function Composer({
     mcpDisabledIds,
     mcpToggleDisabled,
     mode,
-    isGithubRepo,
-    ghAuthenticated,
+    hostingBlockedHint,
+    hostingAttachDisabled,
+    scProvider,
     modelSupportsImages,
     workflowCommand,
   ]);
@@ -2097,6 +2144,7 @@ export function Composer({
               <IssuePickerPanel
                 projectPath={cwd ?? ""}
                 open
+                providerKind={providerKind}
                 onSelect={(issue) => {
                   insertInlineToken(`#${issue.number}`);
                   onAttachIssue?.(issue);
@@ -2114,6 +2162,7 @@ export function Composer({
               <PrPickerPanel
                 projectPath={cwd ?? ""}
                 open
+                providerKind={providerKind}
                 onSelect={(pr) => {
                   // Stage 5 — `@!<n>` is the inline token convention
                   // for PRs (one-char distinct from `@#<n>` issues).

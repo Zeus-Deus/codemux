@@ -25,6 +25,11 @@ import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { getGithubPrByPath, gitPullChanges } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  providerRef,
+  providerRefLabel,
+} from "@/lib/source-control";
 
 /**
  * Context Row status cluster (design: `.design-import/Context Row.dc.html`)
@@ -38,15 +43,15 @@ import type { PullRequestInfo } from "@/tauri/types";
  *    pane-less agent browser session; click opens the peek overlay,
  *  - a behind-count chip (↓N, warning tone) when the branch trails
  *    its upstream,
- *  - a PR chip (#N, tone-tinted per state) that opens the PR on
- *    GitHub,
+ *  - a change-request chip (tone-tinted per state) that opens it on
+ *    the hosting product,
  *  - a linked-issue chip (Issue #N) that opens the issue detail
  *    popover upward — the same `IssueDetailPopover` (chip variant) the
  *    old bar rendered, so a thread's linked issue stays visible on the
  *    Context Row,
  *  - a "workspace details" button that opens a compact popover with
  *    the full picture (branch, base, behind, ahead, uncommitted diff,
- *    PR, issue, device) plus quick View PR / Sync actions.
+ *    PR, issue, device) plus quick view / sync actions.
  *
  * Self-contained: reads the active workspace directly. This only ever
  * renders from inside an `AgentChatPane`, and `PaneContainer` only
@@ -116,6 +121,7 @@ export function WorkspaceStatusCluster() {
 
   const prState = normalizePrState(workspace.pr_state);
   const prHumanState = humanizePrState(workspace.pr_state);
+  const provider = providerForWorkspace(workspace);
   const showBehind = workspace.git_behind > 0;
   const showAhead = workspace.git_ahead > 0;
   const showUncommitted =
@@ -137,6 +143,7 @@ export function WorkspaceStatusCluster() {
      a linked issue still shows it (standalone render below). */
   const issueChip = workspace.linked_issue ? (
     <IssueDetailPopover
+      providerKind={workspace.provider_kind}
       workspaceId={workspace.workspace_id}
       issue={workspace.linked_issue}
       variant="chip"
@@ -202,12 +209,12 @@ export function WorkspaceStatusCluster() {
               disabled={!workspace.pr_url}
               aria-label={
                 workspace.pr_number
-                  ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
-                  : `Open pull request on GitHub — ${prHumanState ?? ""}`
+                  ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prHumanState ?? provider.nounTitle}`
+                  : `Open ${provider.noun} on ${provider.name} — ${prHumanState ?? ""}`
               }
               title={
                 workspace.pr_number
-                  ? `Pull request #${workspace.pr_number} — ${prHumanState ?? ""}`
+                  ? `${provider.nounTitle} ${providerRef(provider, workspace.pr_number)} — ${prHumanState ?? ""}`
                   : undefined
               }
               className={cn(
@@ -216,7 +223,9 @@ export function WorkspaceStatusCluster() {
                 !workspace.pr_url && "cursor-not-allowed opacity-60",
               )}
             >
-              {workspace.pr_number ? `#${workspace.pr_number}` : "PR"}
+              {workspace.pr_number
+                ? providerRef(provider, workspace.pr_number)
+                : provider.shortNoun}
             </button>
           )}
 
@@ -278,8 +287,8 @@ export function WorkspaceStatusCluster() {
                 )}
                 {prState && (
                   <DetailRow
-                    label="Pull request"
-                    value={`#${workspace.pr_number} · ${prHumanState}`}
+                    label={provider.nounTitle}
+                    value={`${providerRef(provider, workspace.pr_number)} · ${prHumanState}`}
                     valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
                   />
                 )}
@@ -304,7 +313,8 @@ export function WorkspaceStatusCluster() {
                       onClick={handlePrClick}
                       className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
                     >
-                      View PR #{workspace.pr_number}
+                      View {provider.shortNoun}{" "}
+                      {providerRef(provider, workspace.pr_number)}
                     </button>
                   )}
                   {showBehind && (

@@ -36,6 +36,7 @@ const FULL_CUSTOM: UserSettings = {
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 2000, cursor_style: "underline" },
   git: { default_base_branch: "develop" },
+  source_control: { custom_hosts: {} },
   keyboard: { shortcuts: { "ctrl+s": "save", "ctrl+p": "palette" } },
   notifications: { sound_enabled: false, desktop_enabled: false },
   file_tree: { show_hidden_files: true },

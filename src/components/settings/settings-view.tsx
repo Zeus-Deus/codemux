@@ -49,6 +49,7 @@ import {
   Server,
   Sparkles,
   MonitorSmartphone,
+  GitPullRequest,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -141,7 +142,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "source_control" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -169,6 +170,10 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     // manage the workspace lifecycle rather than personal preferences.
     { id: "archive", label: "Archive", icon: Archive },
     { id: "git", label: "Git", icon: GitBranch },
+    // Source Control — which hosting product each checkout talks to, and
+    // whether that product's CLI is installed and signed in. Sits next to
+    // Git because it is the hosting half of the same subject.
+    { id: "source_control", label: "Source Control", icon: GitPullRequest },
     { id: "agent", label: "Agent", icon: Bot },
     ...(agentChatEnabled
       ? ([
@@ -217,14 +222,17 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "interface",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "archive", "git", "agent", "permissions", "skills", "mcp", "hosts",
-  "remote_access", "browser", "shortcuts", "notifications", "session_restore",
+  "archive", "git", "source_control", "agent", "permissions", "skills", "mcp",
+  "hosts", "remote_access", "browser", "shortcuts", "notifications",
+  "session_restore",
 ];
 
 import { KeybindEditor } from "./keybind-editor";
 import { ArchiveSection } from "./archive-section";
 import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
+import { SourceControlSection } from "./source-control-section";
+import { SubsectionHeader } from "./settings-primitives";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
@@ -260,37 +268,6 @@ function SectionHeader({ title, description }: { title: string; description: str
   );
 }
 
-/** In-section heading for grouped content (e.g. "AI Tools",
- *  "Detected editors"). Distinct from SectionHeader (which titles
- *  the whole panel) — lower visual weight, no max width, sits
- *  immediately above a stack of rows or a card. */
-function SubsectionHeader({
-  title,
-  description,
-  action,
-  className,
-}: {
-  title: string;
-  description?: string;
-  action?: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
-      <div className="min-w-0">
-        <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
-          {title}
-        </p>
-        {description && (
-          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
-            {description}
-          </p>
-        )}
-      </div>
-      {action && <div className="shrink-0">{action}</div>}
-    </div>
-  );
-}
 
 /** Section break — adds breathing room between subsections inside a
  *  single settings page. First subsection gets no extra top margin. */
@@ -1548,11 +1525,11 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
+                    <span className="select-text font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
-                    <span className="text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
+                    <span className="select-text text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
                   </SettingRow>
                   {isDevBypass && (
                     <>
@@ -2213,6 +2190,17 @@ export function SettingsView() {
               description="Any machine you can SSH into — a home desktop, an always-on box, a cloud server. Push a workspace to any device, pull it back from any device. SSH credentials stay on your machine; only the device name and SSH target sync across your account."
             />
             <HostsSection />
+          </div>
+        );
+
+      case "source_control":
+        return (
+          <div>
+            <SectionHeader
+              title="Source Control"
+              description="Codemux reads pull and merge requests through each product's own command-line tool. This is where you check that tooling is installed and signed in, and where you tell Codemux which product a self-hosted server runs."
+            />
+            <SourceControlSection />
           </div>
         );
 

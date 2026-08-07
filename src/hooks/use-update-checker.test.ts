@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, waitFor, cleanup } from "@testing-library/react";
 import type { WebRemoteStatus } from "@/tauri/types";
 
 // The hook module imports Tauri plugins + web-remote helpers at the top level.
@@ -21,7 +22,15 @@ import {
   remoteClientsAttached,
   desktopUpdateFromStatus,
   updateAdvanceAction,
+  useUpdateChecker,
 } from "./use-update-checker";
+import { webRemoteStatus, webRemoteRequestUpdate } from "@/tauri/commands";
+import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
+import { listen } from "@tauri-apps/api/event";
+import {
+  useUpdateStatusStore,
+  __resetUpdateStatusStoreForTests,
+} from "@/stores/update-status-store";
 
 /** Build a full `WebRemoteStatus` for the defer/availability decision tests. */
 function status(overrides: Partial<WebRemoteStatus>): WebRemoteStatus {
@@ -148,5 +157,52 @@ describe("updateAdvanceAction (desktop handling of a web request)", () => {
     expect(updateAdvanceAction("idle", true)).toBe("none");
     expect(updateAdvanceAction("checking", true)).toBe("none");
     expect(updateAdvanceAction("downloading", true)).toBe("none");
+  });
+});
+
+describe("useUpdateChecker → update status store mirror", () => {
+  beforeEach(() => {
+    __resetUpdateStatusStoreForTests();
+    vi.mocked(webRemoteStatus).mockResolvedValue(
+      status({ update_available: true, update_version: "9.9.9" }),
+    );
+    vi.mocked(onWebRemoteStateChanged).mockResolvedValue(() => {});
+    vi.mocked(webRemoteRequestUpdate).mockResolvedValue(undefined);
+    vi.mocked(listen).mockResolvedValue(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    vi.clearAllMocks();
+  });
+
+  it("publishes the remote branch so a reader can act on a web client", async () => {
+    // Without `isRemote` + `requestDesktopUpdate` in the mirror, the app-menu
+    // footer would call `startDownload`, which is a no-op in a browser (there
+    // is no updater plugin) — a dead "Update available" button.
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    renderHook(() => useUpdateChecker());
+
+    await waitFor(() => {
+      const s = useUpdateStatusStore.getState();
+      expect(s.published).toBe(true);
+      expect(s.state).toBe("update-available");
+      expect(s.isRemote).toBe(true);
+    });
+
+    useUpdateStatusStore.getState().requestDesktopUpdate!();
+    expect(webRemoteRequestUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("publishes the desktop branch untouched", async () => {
+    renderHook(() => useUpdateChecker());
+
+    await waitFor(() => {
+      const s = useUpdateStatusStore.getState();
+      expect(s.published).toBe(true);
+      expect(s.isRemote).toBe(false);
+      expect(s.startDownload).toBeTypeOf("function");
+    });
   });
 });

@@ -71,6 +71,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Merge resolver (**currently unreachable from the UI** — backend, commands, store, and settings row intact, but both entry-point buttons were removed by `92965c9`): `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
 - Review tab / PR integration (resting layout: header + checks + read-only threads; the review composer, merge controls, and deployments were intentionally removed, backends retained): `docs/features/review-integration.md`
+- Source control providers (which git *hosting* product serves a checkout, and how Codemux talks to it — offline `ProviderKind` detection from remotes with a synced `source_control.custom_hosts` override, the `SourceControlProvider` trait + registry with GitHub (`gh`) and GitLab (`glab`) adapters, per-instance CLI auth with nothing stored, the `provider_kind` snapshot field and the PR/MR presentation map, and Settings → Source Control; Bitbucket and Azure DevOps are recognised but not served; unreleased after `v0.17.0`): `docs/features/source-control-providers.md`
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system (incl. the pane-header live cwd hint — OSC 7 primary + Linux `/proc` poll fallback, shown only off the workspace root; PR #209, shipped `v0.15.5`): `docs/features/terminal.md`
 - Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`

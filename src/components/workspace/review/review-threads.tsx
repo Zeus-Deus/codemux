@@ -168,7 +168,7 @@ export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Pr
             {/* Review body */}
             {g.review.body && (
               <div className="group/comment flex items-start gap-1 pl-7 pr-1">
-                <p className="text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
+                <p className="select-text text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
                   {g.review.body}
                 </p>
                 <CopyButton text={g.review.body} />
@@ -193,7 +193,7 @@ export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Pr
                   </span>
                   <CopyButton text={ic.body} />
                 </div>
-                <p className="text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words">
                   {ic.body}
                 </p>
               </div>

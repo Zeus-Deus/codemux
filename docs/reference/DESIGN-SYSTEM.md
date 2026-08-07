@@ -95,6 +95,47 @@ overview):
 
 ## Text Selection
 
+### Selectability: chrome is not selectable, content is
+
+Codemux follows the desktop-app convention: drag-selection only ever grabs
+real content, never UI chrome. Selectable-everything is a website default —
+being able to rubber-band sidebar cards, settings labels, buttons, and layout
+whitespace makes the app read as a web page. The document therefore opts out
+once at the root (`body { user-select: none; cursor: default }` in
+`src/globals.css` `@layer base`, with the `-webkit-` prefix WebKitGTK
+requires) and content opts back in.
+
+Two opt-in tiers, both in the same `@layer base` block:
+
+1. **Automatic element/root selectors** — `input`, `textarea`,
+   `[contenteditable]`, `pre`, `code`, `kbd`, `samp`, `.cm-content`,
+   `.chat-markdown`, `.markdown-rendered`, and sonner toast title/description.
+   Because `user-select` inherits, a rule on a content root re-enables its
+   whole subtree, so most new content stays selectable without remembering a
+   class.
+2. **The `select-text` utility** for one-off prose/mono blocks that have no
+   shared root (user message text, reasoning text, tool-output divs, diff pane
+   content, review-thread comments). A base-layer companion rule gives
+   `.select-text` elements `cursor: auto` so re-enabled text gets its I-beam
+   back.
+
+Rules of thumb:
+
+- New chrome needs no class — it is unselectable by default.
+- New content surfaces should either render under an existing content root or
+  carry `select-text`.
+- Chrome *inside* a content root (a code-block header bar, a copy button)
+  opts out again with `select-none`; Tailwind utilities beat the base-layer
+  opt-ins, so precedence works in both directions.
+- Never re-disable selection on error text, paths, IDs, or anything a user
+  might legitimately copy. Rendered diffs, file-path headers, grep matches,
+  ssh targets, and inline error/notice lines all count as content.
+- `cursor` inherits from the body opt-out too, so a base-layer `a { cursor:
+  pointer }` keeps links clickable-looking; any other custom cursor still
+  needs its own rule or utility.
+
+### Highlight colors
+
 Selectable Codemux-owned DOM text inherits one document-level highlight
 contract from `:root::selection`: solid `--selection-background` with
 `--selection-foreground`. Keep the selector root-scoped rather than using a

@@ -193,7 +193,7 @@ export const ToolCallCard = memo(function ToolCallCard({
       )}
 
       {isRequestFailed && resolution?.state === "failed" && (
-        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
+        <div className="select-text border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
           {resolution.message}
         </div>
       )}

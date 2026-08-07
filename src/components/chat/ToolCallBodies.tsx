@@ -94,7 +94,7 @@ export function BashToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {command && (
-        <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
+        <div className="select-text rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
           <span className="text-muted-foreground/70">$ </span>
           {command}
           {description && (
@@ -146,7 +146,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {path && (
-        <div className="font-mono text-[12px] text-foreground">
+        <div className="select-text font-mono text-[12px] text-foreground">
           {path}
           {(offset != null || limit != null) && (
             <span className="ml-2 text-muted-foreground/70">
@@ -182,7 +182,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {(pattern || path) && (
-        <div className="font-mono text-[12px] text-foreground">
+        <div className="select-text font-mono text-[12px] text-foreground">
           {pattern && <span>{pattern}</span>}
           {path && (
             <span className="ml-2 text-muted-foreground/70">in {path}</span>
@@ -190,7 +190,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
         </div>
       )}
       {matches.length > 0 ? (
-        <div className="rounded-md bg-muted/40 px-3 py-2 space-y-1">
+        <div className="select-text rounded-md bg-muted/40 px-3 py-2 space-y-1">
           <p className="text-[11px] text-muted-foreground/80">
             {matches.length} match{matches.length === 1 ? "" : "es"}
           </p>
@@ -246,10 +246,10 @@ export function WebFetchToolBody({ item, input }: BodyProps) {
         )
       )}
       {title && (
-        <p className="text-[12px] text-muted-foreground">{title}</p>
+        <p className="select-text text-[12px] text-muted-foreground">{title}</p>
       )}
       {prompt && (
-        <p className="rounded-md bg-muted/40 px-3 py-2 text-[12px] text-foreground">
+        <p className="select-text rounded-md bg-muted/40 px-3 py-2 text-[12px] text-foreground">
           {prompt}
         </p>
       )}
@@ -295,7 +295,7 @@ export function EditToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-1">
       {path && (
-        <div className="font-mono text-[12px] text-foreground">{path}</div>
+        <div className="select-text font-mono text-[12px] text-foreground">{path}</div>
       )}
       {result && <ToolCallBlock content={result} />}
     </div>
@@ -388,7 +388,7 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
   const hidden = Math.max(stub.line_count - previewLineCount(stub.preview), 0);
 
   return (
-    <div className="rounded-md bg-muted/40 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
+    <div className="select-text rounded-md bg-muted/40 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
       <div className="px-3 py-2">
         {stub.preview}
         <span className="text-muted-foreground/60">{"\n"}…</span>

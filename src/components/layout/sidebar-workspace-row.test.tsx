@@ -86,17 +86,19 @@ vi.mock("@/components/ui/context-menu", () => {
     children,
     onClick,
     disabled,
+    ...rest
   }: {
     children?: React.ReactNode;
     onClick?: () => void;
     disabled?: boolean;
-  }) => (
+  } & React.HTMLAttributes<HTMLButtonElement>) => (
     <button
       type="button"
       role="menuitem"
       onClick={onClick}
       disabled={disabled}
       data-disabled={disabled ? "true" : undefined}
+      {...rest}
     >
       {children}
     </button>
@@ -108,6 +110,12 @@ vi.mock("@/components/ui/context-menu", () => {
       <div role="menu">{children}</div>
     ),
     ContextMenuItem,
+    // Section labels are chrome, not menuitems — the role-based queries in
+    // this suite must not see them.
+    ContextMenuLabel: ({ children }: { children?: React.ReactNode }) => (
+      <div>{children}</div>
+    ),
+    ContextMenuGroup: passthrough,
     ContextMenuSeparator: () => <hr />,
     ContextMenuSub: passthrough,
     ContextMenuSubTrigger: passthrough,
@@ -548,8 +556,10 @@ describe("Muted indicator on the workspace row", () => {
         />
       </TooltipProvider>,
     );
+    // Scoped to the row: the workspace context menu also carries a BellOff
+    // (its mute entry), and the mock renders that menu inline.
     expect(
-      muted.container.querySelector("svg.lucide-bell-off"),
+      muted.container.querySelector('[role="button"] svg.lucide-bell-off'),
     ).toBeInTheDocument();
     cleanup();
 
@@ -562,7 +572,7 @@ describe("Muted indicator on the workspace row", () => {
       </TooltipProvider>,
     );
     expect(
-      unmuted.container.querySelector("svg.lucide-bell-off"),
+      unmuted.container.querySelector('[role="button"] svg.lucide-bell-off'),
     ).not.toBeInTheDocument();
   });
 });
@@ -1207,9 +1217,12 @@ describe("Living row — work titles + shipped tally", () => {
         surfaces: [surfaceWithPane("p-rev")],
       }),
     );
-    expect(container.textContent).toContain("Scroll pinning broken on send");
+    // Scoped to the row itself — the context menu's identity header names the
+    // workspace on purpose, and the mock renders that menu inline.
+    const row = container.querySelector('[role="button"]')!;
+    expect(row.textContent).toContain("Scroll pinning broken on send");
     // The worktree name is not the title anymore (it lives in the tooltip).
-    expect(container.textContent).not.toContain("auth-refactor");
+    expect(row.textContent).not.toContain("auth-refactor");
   });
 
   it("falls back to the workspace title when a live row has no linked issue", () => {
@@ -1397,15 +1410,14 @@ describe("Workspace pin and lifecycle context-menu block", () => {
     );
     await flushDefaultBranchFetch();
 
-    const labels = screen
-      .getAllByRole("menuitem")
-      .map((el) => el.textContent)
-      .slice(0, 4);
-    expect(labels).toEqual([
-      "Pin workspace",
-      "Un-settle workspace",
-      "Wake now",
-      "Mark unread",
+    // Compared by identity against name-based lookups rather than by
+    // textContent: rows now also carry a decorative keycap, which is not part
+    // of what the entry is called.
+    expect(screen.getAllByRole("menuitem").slice(0, 4)).toEqual([
+      screen.getByRole("menuitem", { name: "Pin workspace" }),
+      screen.getByRole("menuitem", { name: "Un-settle workspace" }),
+      screen.getByRole("menuitem", { name: "Wake now" }),
+      screen.getByRole("menuitem", { name: "Mark unread" }),
     ]);
   });
 

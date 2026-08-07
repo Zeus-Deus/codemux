@@ -31,11 +31,14 @@ vi.mock("@/components/ui/context-menu", () => {
     ContextMenuItem: ({
       children,
       onClick,
+      ...rest
     }: {
       children?: React.ReactNode;
       onClick?: () => void;
-    }) => (
-      <button type="button" role="menuitem" onClick={onClick}>
+    } & React.HTMLAttributes<HTMLButtonElement>) => (
+      // Props are forwarded because the colour swatches are label-only
+      // menuitems — their accessible name comes from `aria-label`, not text.
+      <button type="button" role="menuitem" onClick={onClick} {...rest}>
         {children}
       </button>
     ),
@@ -151,13 +154,22 @@ describe("ProjectAppearanceMenu", () => {
     expect(dbSetUiState).toHaveBeenCalledWith(`project.color:${PATH}`, "");
   });
 
-  it("loads and check-marks the stored color", async () => {
+  it("loads and marks the stored color as selected", async () => {
     persisted[`project.color:${PATH}`] = "#14b8a6";
     renderMenu();
     await flushLoad();
-    const teal = screen.getByRole("menuitem", { name: /Teal/ });
-    // The check icon is the only extra child on the selected entry.
-    expect(teal.querySelector("svg")).toBeTruthy();
+    // The grid marks the chosen swatch with a ring rather than a check glyph
+    // (a check has no colour that reads on all thirteen tiles), so selection
+    // is carried by the data attribute the ring is keyed off.
+    expect(screen.getByRole("menuitem", { name: "Teal" })).toHaveAttribute(
+      "data-selected",
+      "true",
+    );
+    expect(screen.getByRole("menuitem", { name: "Cyan" })).not.toHaveAttribute(
+      "data-selected",
+    );
+    // The current colour is also named in prose under the grid.
+    expect(screen.getByText("Teal")).toBeInTheDocument();
   });
 });
 

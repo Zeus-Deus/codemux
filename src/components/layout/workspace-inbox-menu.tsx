@@ -144,6 +144,7 @@ export function WorkspaceInboxMenu({
         <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
         <WorkspaceContextMenuItems
           workspace={workspace}
+          project={repo}
           settleAction={settleAction}
           snoozeAction={snoozeAction}
           unreadAction={unreadAction}

@@ -200,6 +200,8 @@ vi.mock("./Composer", () => ({
     onProviderModelChange,
     onContextWindowChange,
     provider,
+    providerCliInstalled,
+    providerAuthenticated,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -212,8 +214,15 @@ vi.mock("./Composer", () => ({
     onProviderModelChange: (provider: "claude" | "codex" | "opencode", model: string) => void;
     onContextWindowChange: (contextWindow: string) => void;
     provider: "claude" | "codex" | "opencode";
+    providerCliInstalled?: boolean | null;
+    providerAuthenticated?: boolean | null;
   }) => (
-    <div data-testid="composer" data-provider={provider}>
+    <div
+      data-testid="composer"
+      data-provider={provider}
+      data-provider-cli-installed={String(providerCliInstalled)}
+      data-provider-authenticated={String(providerAuthenticated)}
+    >
       {/* The running-subagents strip is welded inside the real composer's
           top edge, so the mock has to render the slot for the pane's
           drill-in visibility rule to be observable. */}
@@ -386,6 +395,16 @@ vi.mock("@/tauri/commands", () => ({
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   // MCP warmup fired on the empty-state mount; no-op in tests.
   primeChatMcp: vi.fn().mockResolvedValue(undefined),
+  // Host-scoped source-control preflight behind the composer's hosting
+  // attach rows. Default to a fully usable checkout; the gating tests
+  // override per-case.
+  checkProviderAuth: vi.fn().mockResolvedValue({
+    kind: "github",
+    supported: true,
+    installed: true,
+    authenticated: true,
+    username: "test",
+  }),
   // Image staging (imported by the image-staging helper); only invoked
   // when a test stages an image, which these don't.
   stageChatImage: vi
@@ -589,8 +608,10 @@ import {
   agentChatStopSession,
   agentChatUpdateSessionConfig,
   grepCountPattern,
+  checkProviderAuth,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import { _resetProviderAuthCache } from "@/lib/provider-auth";
 
 const pane = {
   kind: "agent_chat" as const,
@@ -633,6 +654,57 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+});
+
+// ── Source-control preflight → composer gating ──
+//
+// The pane owns the probe; the composer only renders what it is handed.
+// A CLI that is not installed used to arrive as `null` ("the auth
+// question doesn't apply"), which the composer's gate read as "nothing
+// known to be wrong" and left the hosting attach rows live onto a
+// picker that could only error. It has to arrive as a plain `false`,
+// with the missing-CLI nuance carried by its own flag.
+describe("AgentChatPane source-control preflight", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    _resetProviderAuthCache();
+  });
+
+  it("reports a missing provider CLI as not authenticated", async () => {
+    vi.mocked(checkProviderAuth).mockResolvedValueOnce({
+      kind: "github",
+      supported: true,
+      installed: false,
+      authenticated: false,
+      username: null,
+    });
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      const composer = container.querySelector('[data-testid="composer"]');
+      expect(composer?.getAttribute("data-provider-cli-installed")).toBe(
+        "false",
+      );
+      expect(composer?.getAttribute("data-provider-authenticated")).toBe(
+        "false",
+      );
+    });
+  });
+
+  it("passes a usable CLI through as authenticated", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      const composer = container.querySelector('[data-testid="composer"]');
+      expect(composer?.getAttribute("data-provider-cli-installed")).toBe(
+        "true",
+      );
+      expect(composer?.getAttribute("data-provider-authenticated")).toBe(
+        "true",
+      );
+    });
   });
 });
 

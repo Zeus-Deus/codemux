@@ -115,7 +115,9 @@ export function InterfaceSection() {
             <li>• MCP server runtime and management</li>
             <li>• Cross-provider skills system with cross-device sync</li>
             <li>• Mode pills (Plan, Debug, Ask) and Shift+Tab cycling</li>
-            <li>• File / folder / GitHub issue / PR / image attachments</li>
+            {/* Brand-free: the same attachment kinds work on every
+                hosting product Codemux supports. */}
+            <li>• File / folder / issue / PR / image attachments</li>
             <li>• Multi-provider model picker with favorites</li>
             <li>• Permissions UI for tool-call rules</li>
             <li>• Home-screen chat landing on empty workspaces</li>

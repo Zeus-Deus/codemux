@@ -751,7 +751,7 @@ export function ChangesPanel({
           <div className="rounded-md border border-border/60 bg-background overflow-hidden">
             <div className="flex items-start gap-2 px-2.5 py-2 border-l-2 border-l-primary/70">
               <Sparkles className="size-3 text-primary/80 mt-0.5 shrink-0" />
-              <p className="flex-1 text-[11px] leading-snug text-foreground whitespace-pre-wrap break-words">
+              <p className="select-text flex-1 text-[11px] leading-snug text-foreground whitespace-pre-wrap break-words">
                 {generatedMsg}
               </p>
             </div>

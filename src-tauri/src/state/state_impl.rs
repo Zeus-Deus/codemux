@@ -498,6 +498,18 @@ pub struct WorkspaceSnapshot {
     /// which the frontend treats as the pre-field (matching) case.
     #[serde(default)]
     pub pr_head_branch: Option<String>,
+    /// Which hosting product this checkout's remotes point at
+    /// (`"github"`, `"gitlab"`, …), as classified by
+    /// `crate::git_provider::detect_provider`. `None` means no remote,
+    /// or a host nothing recognises — never "not checked yet in a way
+    /// the UI should distinguish".
+    ///
+    /// Snapshot-local and re-derived by the pollers alongside the PR
+    /// pill, exactly like the other derived git fields; it is never
+    /// synced across devices. Additive — old persisted state reads as
+    /// `None`, which the frontend treats as GitHub wording for back-compat.
+    #[serde(default)]
+    pub provider_kind: Option<String>,
     #[serde(default)]
     pub linked_issue: Option<crate::github::LinkedIssue>,
     /// When true, agent-completion desktop notifications for panes in this
@@ -1333,6 +1345,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -1416,6 +1429,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -1490,6 +1504,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -1595,6 +1610,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -1742,6 +1758,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -2264,6 +2281,33 @@ impl AppStateStore {
         workspace.pr_state = pr_state;
         workspace.pr_url = pr_url;
         workspace.pr_head_branch = pr_head_branch;
+        true
+    }
+
+    /// Stamp the detected hosting product on a workspace. Kept separate
+    /// from `update_workspace_pr_info` rather than folded into its
+    /// argument list because the two answer different questions: the
+    /// provider is known even when the PR lookup fails or is skipped
+    /// entirely, so it must be writable on ticks where the pill is
+    /// deliberately preserved. Same emit-gating contract — returns true
+    /// only when the stored value actually moved.
+    pub fn update_workspace_provider_kind(
+        &self,
+        workspace_id: &str,
+        provider_kind: Option<String>,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        if workspace.provider_kind == provider_kind {
+            return false;
+        }
+        workspace.provider_kind = provider_kind;
         true
     }
 
@@ -5146,6 +5190,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
             pinned_at: None,
@@ -10196,6 +10241,33 @@ mod metadata_change_tests {
                 Some("current-branch".into()),
             ),
             "the same PR re-associating to a different head branch is a change"
+        );
+    }
+
+    #[test]
+    fn provider_kind_reports_change_only_when_it_moves() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+
+        assert!(store.update_workspace_provider_kind(&id, Some("github".into())));
+        assert!(!store.update_workspace_provider_kind(&id, Some("github".into())));
+        assert_eq!(
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == id)
+                .and_then(|w| w.provider_kind.clone()),
+            Some("github".to_string()),
+        );
+        assert!(
+            store.update_workspace_provider_kind(&id, None),
+            "a repo that lost its remote clears the field"
+        );
+        assert!(!store.update_workspace_provider_kind(&id, None));
+        assert!(
+            !store.update_workspace_provider_kind("missing-workspace", Some("github".into())),
+            "an unknown workspace wrote nothing"
         );
     }
 

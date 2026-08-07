@@ -26,6 +26,7 @@ pub mod commands;
 pub mod database;
 pub mod config;
 pub mod git;
+pub mod git_provider;
 pub mod github;
 pub mod github_cache;
 pub mod control;
@@ -1124,17 +1125,24 @@ fn build_core_app<R: tauri::Runtime>(
                     // at a time anyway.
                     if let Some((workspace_id, cwd)) = active {
                         let path = std::path::PathBuf::from(&cwd);
-                        // `is_github_repo` is a pure `git remote -v` read (no
-                        // `gh`, no network), and it matches the gate the
-                        // dedicated PR poller already applies. Without it a
-                        // GitLab / local-only workspace would shell out to
-                        // `gh` every tick just to fail.
-                        if github::gh_available() && github::is_github_repo(&path) {
+                        // Detection is a pure `git remote -v` read (no CLI,
+                        // no network) behind a 60s cache, and it matches the
+                        // gate the dedicated PR poller already applies.
+                        // Without it a workspace hosted elsewhere — or with
+                        // no remote at all — would shell out every tick just
+                        // to fail.
+                        let detected = git_provider::detect_provider(&path);
+                        changed |= state.update_workspace_provider_kind(
+                            &workspace_id,
+                            git_provider::provider_kind_field(&detected),
+                        );
+                        let provider = git_provider::provider_for_detection(&detected);
+                        if provider.is_implemented() && provider.cli_available() {
                             // Branch/repository identity owns association. A
                             // failed lookup preserves the last known state;
                             // a successful empty result is authoritative and
                             // clears any stale association.
-                            let lookup = github::get_workspace_pr(&path);
+                            let lookup = provider.workspace_pull_request(&path);
                             match &lookup {
                                 Err(e) => {
                                     let message = format!(
@@ -1189,7 +1197,7 @@ fn build_core_app<R: tauri::Runtime>(
                                     .and_then(|w| w.linked_issue.as_ref().map(|li| li.number))
                             };
                             if let Some(num) = issue_number {
-                                if let Ok(issue) = github::get_github_issue(&path, num) {
+                                if let Ok(issue) = provider.get_issue_fresh(&path, num) {
                                     changed |= state.link_workspace_issue(&workspace_id, github::LinkedIssue {
                                         number: issue.number,
                                         title: issue.title,
@@ -1478,40 +1486,32 @@ fn build_core_app<R: tauri::Runtime>(
             // `gh` with N parallel children. Each call gets a 10s timeout
             // so a single hanging `gh` doesn't block subsequent workspaces.
             //
-            // Pauses the per-workspace walk when `gh` is missing or
-            // unauthenticated (status is rechecked every tick — `gh auth
-            // status` is itself a cheap fork+exec, ~50ms).
+            // Skips a workspace whose provider CLI is missing or logged
+            // out. The probe is per *instance* (product + host) rather
+            // than global: with more than one provider implemented, a
+            // logged-out GitHub would otherwise stall the GitLab
+            // workspaces too, and two self-hosted instances can have
+            // independent logins. It is memoised for the duration of a
+            // tick and re-probed on the next one, so a fresh login is
+            // picked up within a cycle without costing a fork+exec
+            // (~50ms) per workspace.
             let pr_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const TICK_SECS: u64 = 60;
                 const PER_CALL_TIMEOUT_SECS: u64 = 10;
-                let mut last_status_authed: Option<bool> = None;
+                let mut last_status_authed: std::collections::HashMap<String, bool> =
+                    std::collections::HashMap::new();
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(3))).await;
 
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
 
-                    // Check gh status outside spawn_blocking because it's a
-                    // fast call and we don't need the timeout machinery for it.
-                    let gh_status = github::check_gh_status();
-                    let authed = matches!(gh_status, github::GhStatus::Authenticated { .. });
-
-                    // Log status transitions only — avoids spamming when
-                    // the user is offline for an extended period.
-                    if last_status_authed != Some(authed) {
-                        eprintln!(
-                            "[codemux::pr-poll] gh auth status: {} (was: {:?})",
-                            if authed { "authenticated" } else { "unavailable" },
-                            last_status_authed,
-                        );
-                        last_status_authed = Some(authed);
-                    }
-
-                    if !authed {
-                        continue;
-                    }
-
                     let tick_started = std::time::Instant::now();
+                    // Auth verdicts for this tick, keyed by provider
+                    // instance. Populated lazily so a product no
+                    // workspace uses is never probed at all.
+                    let mut auth_this_tick: std::collections::HashMap<String, bool> =
+                        std::collections::HashMap::new();
 
                     let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
                     let workspaces: Vec<(String, String)> = {
@@ -1535,40 +1535,100 @@ fn build_core_app<R: tauri::Runtime>(
                     // writes actually moved a pill.
                     let mut changed = false;
                     let mut refreshed = 0usize;
-                    let mut skipped_non_github = 0usize;
+                    let mut skipped_unsupported = 0usize;
+                    let mut skipped_unauthenticated = 0usize;
                     let mut timed_out = 0usize;
 
                     for (workspace_id, cwd) in workspaces {
                         let path = std::path::PathBuf::from(&cwd);
 
-                        // Skip non-GitHub repos using the local remote config,
-                        // avoiding an unnecessary network call.
+                        // Classify from the local remote config, so a repo
+                        // hosted somewhere Codemux can't serve costs one
+                        // cached `git remote -v` instead of a network call.
                         let path_for_repo = path.clone();
-                        let is_gh = tokio::time::timeout(
+                        let detected = tokio::time::timeout(
                             std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
                             tokio::task::spawn_blocking(move || {
-                                github::is_github_repo(&path_for_repo)
+                                git_provider::detect_provider(&path_for_repo)
                             }),
                         )
                         .await;
-                        let is_gh = match is_gh {
-                            Ok(Ok(b)) => b,
-                            Ok(Err(_)) => false,
+                        let detected = match detected {
+                            Ok(Ok(detected)) => detected,
+                            Ok(Err(_)) => git_provider::DetectedProvider::unknown(),
                             Err(_) => {
                                 timed_out += 1;
                                 continue;
                             }
                         };
-                        if !is_gh {
-                            skipped_non_github += 1;
+                        changed |= state.update_workspace_provider_kind(
+                            &workspace_id,
+                            git_provider::provider_kind_field(&detected),
+                        );
+                        let provider = git_provider::provider_for_detection(&detected);
+                        if !provider.is_implemented() {
+                            skipped_unsupported += 1;
+                            continue;
+                        }
+
+                        // Auth gate, per provider instance, once per
+                        // tick. The host is part of the key because two
+                        // self-hosted instances of the same product are
+                        // two separate logins.
+                        let auth_key = format!(
+                            "{}|{}",
+                            detected.kind.as_str(),
+                            detected.host.as_deref().unwrap_or(""),
+                        );
+                        let authed = match auth_this_tick.get(&auth_key) {
+                            Some(authed) => *authed,
+                            None => {
+                                let probe = provider.clone();
+                                // Cheap (~50ms fork+exec), but it is
+                                // still a subprocess: off the async
+                                // thread like every other shell-out
+                                // here, and behind the same deadline —
+                                // a CLI hanging on TCP to an
+                                // unreachable self-hosted instance must
+                                // cost one workspace's tick, not the
+                                // whole sweep. A timeout is a
+                                // this-tick "unavailable" and is not
+                                // remembered as a verdict.
+                                let status = tokio::time::timeout(
+                                    std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
+                                    tokio::task::spawn_blocking(move || probe.auth_status()),
+                                )
+                                .await;
+                                let authed = matches!(
+                                    status,
+                                    Ok(Ok(github::GhStatus::Authenticated { .. }))
+                                );
+                                auth_this_tick.insert(auth_key.clone(), authed);
+                                // Log transitions only — avoids spamming
+                                // while the user is offline.
+                                if last_status_authed.get(&auth_key) != Some(&authed) {
+                                    eprintln!(
+                                        "[codemux::pr-poll] {} auth status: {} (was: {:?})",
+                                        auth_key,
+                                        if authed { "authenticated" } else { "unavailable" },
+                                        last_status_authed.get(&auth_key),
+                                    );
+                                    last_status_authed.insert(auth_key, authed);
+                                }
+                                authed
+                            }
+                        };
+                        if !authed {
+                            skipped_unauthenticated += 1;
                             continue;
                         }
 
                         let path_for_pr = path.clone();
+                        let provider_for_pr = provider.clone();
                         let pr_result = tokio::time::timeout(
                             std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
                             tokio::task::spawn_blocking(move || {
-                                github::get_workspace_pr(&path_for_pr)
+                                provider_for_pr.workspace_pull_request(&path_for_pr)
                             }),
                         )
                         .await;
@@ -1577,7 +1637,7 @@ fn build_core_app<R: tauri::Runtime>(
                             Ok(Ok(lookup)) => {
                                 if let Err(e) = &lookup {
                                     eprintln!(
-                                        "[codemux::pr-poll] get_workspace_pr failed for {workspace_id}: {e}"
+                                        "[codemux::pr-poll] workspace PR lookup failed for {workspace_id}: {e}"
                                     );
                                 }
                                 // Shared matrix: match -> write, successful
@@ -1641,7 +1701,10 @@ fn build_core_app<R: tauri::Runtime>(
                     // a real event instead of a heartbeat to scroll past.
                     if refreshed > 0 || timed_out > 0 {
                         eprintln!(
-                            "[codemux::pr-poll] tick — refreshed={refreshed} skipped_non_github={skipped_non_github} timed_out={timed_out}"
+                            "[codemux::pr-poll] tick — refreshed={refreshed} \
+                             skipped_unsupported={skipped_unsupported} \
+                             skipped_unauthenticated={skipped_unauthenticated} \
+                             timed_out={timed_out}"
                         );
                     }
                     let tick_ms = tick_started.elapsed().as_millis();
@@ -2086,6 +2149,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,
+            commands::discover_source_control,
+            commands::check_provider_auth,
             commands::get_branch_pull_request,
             commands::create_pull_request,
             commands::list_pull_requests,

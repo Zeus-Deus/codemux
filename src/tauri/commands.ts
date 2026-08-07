@@ -37,6 +37,8 @@ import type {
   CommitFileEntry,
   HandoffPacket,
   LaunchMode,
+  ProviderDiagnostic,
+  ProviderAuthStatus,
   ResourceMetricsSnapshot,
   PresetStoreSnapshot,
   ProjectMemorySnapshot,
@@ -581,6 +583,20 @@ export const checkGhAvailable = () =>
 
 export const checkGithubRepo = (path: string) =>
   invoke<boolean>("check_github_repo", { path });
+
+/** Probe every hosting product's CLI for the Settings → Source Control
+ *  pane. Never rejects: a wedged or missing CLI shows up as a
+ *  not-installed row rather than an error. */
+export const discoverSourceControl = () =>
+  invoke<ProviderDiagnostic[]>("discover_source_control");
+
+/** Host-scoped readiness for one checkout: which product serves it, and
+ *  whether that product's CLI is installed and signed in *to that
+ *  instance*. Never rejects — a wedged probe answers "nothing usable".
+ *  Prefer `fetchProviderAuth` in `@/lib/provider-auth`, which adds the
+ *  short-TTL cache every gate shares. */
+export const checkProviderAuth = (path: string) =>
+  invoke<ProviderAuthStatus>("check_provider_auth", { path });
 
 export const getBranchPullRequest = (path: string) =>
   invoke<PullRequestInfo | null>("get_branch_pull_request", { path });

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider } from "@/components/ui/sidebar";
@@ -59,6 +59,16 @@ vi.mock("@/hooks/use-resolved-keybinds", () => ({
 }));
 
 import { SidebarFooterBar } from "./sidebar-footer-bar";
+import {
+  useUpdateStatusStore,
+  __resetUpdateStatusStoreForTests,
+} from "@/stores/update-status-store";
+
+// This project runs Vitest without `globals`, so RTL never registers its own
+// auto-cleanup. The dropdown renders into a portal on document.body, so
+// unmounting between tests is what keeps one test's open menu out of the next
+// one's `document.querySelector('[role="menu"]')`.
+afterEach(cleanup);
 
 function renderFooter(open: boolean) {
   return render(
@@ -120,6 +130,95 @@ describe("SidebarFooterBar — expanded", () => {
     // Sanity: the dropdown really is open (other items still present).
     expect(menuText).toContain("Documentation");
     expect(menuText).toContain("Sign out");
+  });
+});
+
+describe("AppMenuFooter — update strip", () => {
+  beforeEach(() => {
+    __resetUpdateStatusStoreForTests();
+  });
+
+  /** Open the gear menu and hand back its portal content. */
+  async function openMenu() {
+    const { container } = renderFooter(true);
+    await userEvent.click(
+      container.querySelector('button[aria-label="Menu"]') as HTMLElement,
+    );
+    let menuEl: HTMLElement | null = null;
+    await waitFor(() => {
+      menuEl = document.querySelector('[role="menu"]');
+      expect(menuEl).not.toBeNull();
+    });
+    return menuEl!;
+  }
+
+  type UpdateSnapshot = Parameters<
+    ReturnType<typeof useUpdateStatusStore.getState>["publish"]
+  >[0];
+
+  function publish(overrides: Partial<UpdateSnapshot> = {}) {
+    useUpdateStatusStore.getState().publish({
+      state: "idle",
+      updateVersion: null,
+      downloadProgress: 0,
+      isRemote: false,
+      startDownload: null,
+      installAndRestart: null,
+      requestDesktopUpdate: null,
+      ...overrides,
+    });
+  }
+
+  it("claims no update status before a checker has published", async () => {
+    const menuEl = await openMenu();
+
+    // Dev builds and the window before the first check land here: the version
+    // is known, the update state is not.
+    expect(menuEl.textContent).not.toContain("Up to date");
+    await waitFor(() => expect(menuEl.textContent).toContain("v0.14.3"));
+  });
+
+  it("says 'Up to date' only once a checker publishes an idle state", async () => {
+    publish();
+    const menuEl = await openMenu();
+
+    expect(menuEl).toHaveTextContent("Up to date");
+  });
+
+  it("runs the desktop download when an update is available on desktop", async () => {
+    const startDownload = vi.fn();
+    publish({ state: "update-available", updateVersion: "9.9.9", startDownload });
+    const menuEl = await openMenu();
+
+    await userEvent.click(
+      Array.from(menuEl.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("Update available"),
+      ) as HTMLElement,
+    );
+    expect(startDownload).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks the desktop to update when the remote client clicks the strip", async () => {
+    // The remote client has no updater plugin, so `startDownload` is a no-op
+    // there — clicking must take the toast's request-the-desktop path instead.
+    const startDownload = vi.fn();
+    const requestDesktopUpdate = vi.fn();
+    publish({
+      state: "update-available",
+      updateVersion: "9.9.9",
+      isRemote: true,
+      startDownload,
+      requestDesktopUpdate,
+    });
+    const menuEl = await openMenu();
+
+    await userEvent.click(
+      Array.from(menuEl.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("Update desktop"),
+      ) as HTMLElement,
+    );
+    expect(requestDesktopUpdate).toHaveBeenCalledTimes(1);
+    expect(startDownload).not.toHaveBeenCalled();
   });
 });
 

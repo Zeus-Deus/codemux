@@ -30,6 +30,7 @@ import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import { providerForWorkspace, providerRef } from "@/lib/source-control";
 
 export interface InboxRepo {
   name: string;
@@ -213,6 +214,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       : workspace.title;
 
   const prState = normalizePrState(workspace.pr_state);
+  // `scProvider` — the *hosting* product. Distinct from `providers`
+  // above, which is the set of AI agent backends running in this
+  // workspace's panes.
+  const scProvider = providerForWorkspace(workspace);
   const hasAhead = showGitStats && workspace.git_ahead > 0;
   const hasStats =
     showGitStats &&
@@ -575,6 +580,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 </span>
                 {workspace.linked_issue && (
                   <IssueDetailPopover
+                    providerKind={workspace.provider_kind}
                     workspaceId={workspace.workspace_id}
                     issue={workspace.linked_issue}
                   />
@@ -639,8 +645,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     disabled={!workspace.pr_url}
                     aria-label={
                       workspace.pr_number
-                        ? `Pull request #${workspace.pr_number} — ${prState}`
-                        : `Pull request — ${prState}`
+                        ? `${scProvider.nounTitle} ${providerRef(scProvider, workspace.pr_number)} — ${prState}`
+                        : `${scProvider.nounTitle} — ${prState}`
                     }
                     className={cn(
                       "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-[10px] font-medium",
@@ -659,7 +665,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   >
                     <PrStatusIcon state={prState} size={3} className="shrink-0" />
                     {workspace.pr_number != null && (
-                      <span>#{workspace.pr_number}</span>
+                      <span>{providerRef(scProvider, workspace.pr_number)}</span>
                     )}
                   </button>
                 )}

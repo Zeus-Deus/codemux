@@ -47,7 +47,7 @@ export function DiffView({
           <CopyButton text={copyText} />
         </span>
       </div>
-      <div className="overflow-x-auto py-[9px] font-mono text-[12px] leading-[1.75]">
+      <div className="select-text overflow-x-auto py-[9px] font-mono text-[12px] leading-[1.75]">
         {rows.map((row, i) => {
           if (row.type === "context" || row.type === "add") lineNo += 1;
           const gutter =

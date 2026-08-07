@@ -517,6 +517,10 @@ const SYNCED_SETTINGS: UserSettings = {
   editor: { default_ide: null },
   terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
   git: { default_base_branch: "main" },
+  // One seeded self-hosted mapping so the custom-hosts editor renders a
+  // populated row (and its remove affordance) rather than only the empty
+  // state under `npm run dev`.
+  source_control: { custom_hosts: { "git.acme.internal": "gitlab" } },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
@@ -2469,6 +2473,105 @@ const handlers: Record<string, Handler> = {
   // ── GitHub / PRs (pre-seeded; never hit a real API) ──
   check_gh_available: () => true,
   check_gh_status: () => ({ status: "Authenticated", username: "mock-dev" }),
+  // Host-scoped readiness for one checkout. Answers from the seeded
+  // workspace's `provider_kind` so a GitLab workspace exercises the
+  // GitLab copy path rather than falling through to GitHub's.
+  check_provider_auth: (a) => {
+    const path = a.path as string;
+    const workspace = appState.workspaces.find(
+      (w) => w.cwd === path || w.project_root === path,
+    );
+    const kind = workspace?.provider_kind ?? "github";
+    return {
+      kind,
+      supported: kind === "github" || kind === "gitlab",
+      installed: true,
+      authenticated: true,
+      username: kind === "gitlab" ? "mock-glab" : "mock-dev",
+    };
+  },
+  // Settings → Source Control. Deliberately mixed so both diagnostic
+  // states are visible at once: GitHub ready, GitLab installed-but-
+  // missing (the case whose fix-it line points at an install URL), and
+  // the two products with no adapter rendering as dimmed rows.
+  discover_source_control: () => [
+    {
+      kind: "github",
+      supported: true,
+      cli_installed: true,
+      cli_version: "gh version 2.63.2 (2026-01-14)",
+      authenticated: true,
+      account: "mock-dev",
+      detail: null,
+      capabilities: {
+        has_pull_requests: true,
+        has_checks: true,
+        has_issues: true,
+        has_inline_comments: true,
+        has_review_threads: true,
+        has_deployments: true,
+        has_reviews: true,
+        has_fork_pr_fetch: true,
+      },
+    },
+    {
+      kind: "gitlab",
+      supported: true,
+      cli_installed: false,
+      cli_version: null,
+      authenticated: false,
+      account: null,
+      detail: "`glab` was not found on PATH, so Codemux cannot talk to GitLab.",
+      capabilities: {
+        has_pull_requests: true,
+        has_checks: true,
+        has_issues: true,
+        has_inline_comments: true,
+        has_review_threads: true,
+        has_deployments: false,
+        has_reviews: true,
+        has_fork_pr_fetch: true,
+      },
+    },
+    {
+      kind: "bitbucket",
+      supported: false,
+      cli_installed: false,
+      cli_version: null,
+      authenticated: false,
+      account: null,
+      detail: "Codemux has no Bitbucket integration yet.",
+      capabilities: {
+        has_pull_requests: false,
+        has_checks: false,
+        has_issues: false,
+        has_inline_comments: false,
+        has_review_threads: false,
+        has_deployments: false,
+        has_reviews: false,
+        has_fork_pr_fetch: false,
+      },
+    },
+    {
+      kind: "azure_devops",
+      supported: false,
+      cli_installed: false,
+      cli_version: null,
+      authenticated: false,
+      account: null,
+      detail: "Codemux has no Azure DevOps integration yet.",
+      capabilities: {
+        has_pull_requests: false,
+        has_checks: false,
+        has_issues: false,
+        has_inline_comments: false,
+        has_review_threads: false,
+        has_deployments: false,
+        has_reviews: false,
+        has_fork_pr_fetch: false,
+      },
+    },
+  ],
   refresh_workspace_pr: (a) => findWorkspace(a.workspaceId)?.pr_number ?? null,
   refresh_workspace_issue: () => null,
   // Issue detail popover (sidebar row + Agent Chat Context Row): expand

@@ -129,7 +129,7 @@ pub struct ReviewComment {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum GhStatus {
     NotInstalled,
@@ -247,51 +247,6 @@ pub fn gh_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn is_github_repo(repo_path: &Path) -> bool {
-    // Pure-git check: does any remote URL point at github.com?
-    //
-    // We deliberately do NOT shell out to `gh repo view` here — that
-    // command requires `gh` to be installed AND authenticated, so a
-    // user with a perfectly valid GitHub remote but no `gh auth login`
-    // would otherwise see the preflight return `false` and the popup
-    // surface "Not a GitHub repo" copy. Auth state is a separate
-    // signal, surfaced via `check_gh_status()`; the UI disambiguates
-    // the two failure modes (not a github repo vs. needs auth).
-    let mut cmd = crate::execution::host_command("git");
-    cmd.args(["remote", "-v"]).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
-    let Ok(output) = cmd.output() else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    remote_text_points_at_github(&text)
-}
-
-/// Pure helper so we can unit-test the URL-matching logic without
-/// spinning up a real git repo on disk. Accepts the raw stdout from
-/// `git remote -v` and returns true when any remote URL is hosted on
-/// github.com — both SSH (`git@github.com:…`) and HTTPS
-/// (`https://github.com/…`) forms count, in either fetch or push rows.
-/// We match the bare hostname rather than a full URL prefix so a stray
-/// remote-name containing "github.com" can't false-positive (the
-/// hostname always sits between protocol and path).
-pub(crate) fn remote_text_points_at_github(text: &str) -> bool {
-    text.lines().any(|line| {
-        // `git remote -v` rows look like:
-        //   origin\tgit@github.com:user/repo.git (fetch)
-        //   origin\thttps://github.com/user/repo (fetch)
-        // The URL is the second whitespace-delimited token.
-        let url = match line.split_whitespace().nth(1) {
-            Some(u) => u,
-            None => return false,
-        };
-        url.contains("github.com:") || url.contains("github.com/")
-    })
-}
-
 // ── GitHub Issues ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -362,7 +317,7 @@ pub struct LinkedIssue {
     pub labels: Vec<String>,
 }
 
-const MAX_ISSUE_BODY_BYTES: usize = 50 * 1024; // 50 KB
+pub const MAX_ISSUE_BODY_BYTES: usize = 50 * 1024; // 50 KB
 const ISSUE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Stage 4 — cap the comment list shipped to the agent so a long
 /// thread can't blow out the prompt. The full count is preserved in
@@ -391,55 +346,26 @@ fn gh_exit_result(
 
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = crate::execution::host_command("gh");
-    cmd.args(args)
-        .current_dir(repo_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.args(args).current_dir(repo_path);
     // Keep DBus available — issue list/view both pull the auth
     // token from the user's secret-service keyring on Linux. See
     // `check_gh_status` rationale.
     sanitize_gui_env_std_keep_dbus(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to run gh: {e}"))?;
 
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child.stdout.take().map(|mut s| {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                    buf
-                }).unwrap_or_default();
-
-                let stderr = if status.success() {
-                    String::new()
-                } else {
-                    child.stderr.take().map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    }).unwrap_or_default()
-                };
-                return gh_exit_result(
-                    args.first().unwrap_or(&""),
-                    status.success(),
-                    stdout,
-                    &stderr,
-                );
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("gh command timed out after {}s", timeout.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("Failed to wait for gh: {e}")),
+    let output = crate::git_provider::exec::run_timed(cmd, timeout).map_err(|e| match e {
+        crate::git_provider::exec::TimedFailure::Spawn(e) => format!("Failed to run gh: {e}"),
+        crate::git_provider::exec::TimedFailure::Wait(e) => format!("Failed to wait for gh: {e}"),
+        crate::git_provider::exec::TimedFailure::Timeout => {
+            format!("gh command timed out after {}s", timeout.as_secs())
         }
-    }
+    })?;
+
+    gh_exit_result(
+        args.first().unwrap_or(&""),
+        output.success,
+        output.stdout,
+        &output.stderr,
+    )
 }
 
 pub fn list_github_issues(
@@ -2812,80 +2738,6 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         let linked: LinkedIssue = serde_json::from_str(json).unwrap();
         assert_eq!(linked.number, 1);
         assert!(linked.labels.is_empty()); // default empty vec
-    }
-
-    #[test]
-    fn remote_text_points_at_github_ssh_form() {
-        let stdout = "\
-origin\tgit@github.com:user/repo.git (fetch)
-origin\tgit@github.com:user/repo.git (push)
-";
-        assert!(remote_text_points_at_github(stdout));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_https_form() {
-        let stdout = "\
-origin\thttps://github.com/user/repo (fetch)
-origin\thttps://github.com/user/repo.git (push)
-";
-        assert!(remote_text_points_at_github(stdout));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_mixed_remotes() {
-        // User has both an upstream (gitlab) and a fork (github). The
-        // GitHub remote alone is enough — the function only cares
-        // whether ANY remote points at github.com.
-        let stdout = "\
-upstream\thttps://gitlab.com/orig/repo (fetch)
-upstream\thttps://gitlab.com/orig/repo (push)
-fork\tgit@github.com:user/repo.git (fetch)
-fork\tgit@github.com:user/repo.git (push)
-";
-        assert!(remote_text_points_at_github(stdout));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_returns_false_for_non_github_remotes() {
-        let stdout = "\
-origin\tgit@gitlab.com:user/repo.git (fetch)
-origin\thttps://bitbucket.org/user/repo (push)
-";
-        assert!(!remote_text_points_at_github(stdout));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_returns_false_for_empty_input() {
-        assert!(!remote_text_points_at_github(""));
-        assert!(!remote_text_points_at_github("\n\n"));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_ignores_remote_names_that_contain_github() {
-        // Regression: a user could theoretically name a non-GitHub
-        // remote `github-old`. The match must look at the URL
-        // (second token), not the remote-name (first token).
-        let stdout = "\
-github-old\tgit@gitlab.com:user/repo.git (fetch)
-github-old\tgit@gitlab.com:user/repo.git (push)
-";
-        assert!(!remote_text_points_at_github(stdout));
-    }
-
-    #[test]
-    fn remote_text_points_at_github_handles_enterprise_lookalikes() {
-        // GHE on a custom hostname (e.g., `github.acme.internal`)
-        // looks like a github URL but isn't github.com — it's a
-        // separate product. We match the bare `github.com` host so
-        // GHE doesn't false-positive. Users on GHE can still attach
-        // issues via direct number entry; the popup hint is just
-        // informational.
-        let stdout = "\
-origin\thttps://github.acme.internal/user/repo (fetch)
-origin\thttps://github.acme.internal/user/repo (push)
-";
-        assert!(!remote_text_points_at_github(stdout));
     }
 
     #[test]

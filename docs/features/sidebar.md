@@ -71,7 +71,9 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (`h-8` trigger + `size-8` add-repo button, matching the action row above) —
   a flex-1 trigger showing the current filter (Folder icon + "All projects",
   or the repo's mini avatar + name) with a rotating chevron, plus the dashed
-  `+` add-repo button pinned right (Open project / New project dropdown).
+  `+` add-repo button pinned right (Open project / New project dropdown —
+  246px, two-line rows, since the two labels are one word apart and mean
+  opposite things: adopt a repo already on disk vs clone from a remote).
   The panel lists **All projects** + one row per project (avatar, dedup'd
   name, right-aligned **visible-card count** — unsettled and unsnoozed, plus
   pinned workspaces whose preserved base lifecycle is parked, so a wrapping-up
@@ -171,7 +173,11 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   one flow**: the git-local facts (branch · `↑ahead` · `+/−` diff) flow from the
   left, then a `flex-1` spacer pins the rest to the right — PR chip · provider
   logos · remote cloud icon · notification badge. The PR chip is **the same
-  borderless badge settled rows use**: a state-colored `PrStatusIcon` + `#n`
+  borderless badge settled rows use**: a state-colored `PrStatusIcon` + the
+  change request's reference (`#n` on GitHub, `!n` on GitLab — the sigil and the
+  surrounding label copy come from the workspace's `provider_kind` via
+  `src/lib/source-control.ts`; absent means GitHub, so existing cards are
+  unchanged — see `docs/features/source-control-providers.md`)
   (open green, merged violet, closed red, draft muted), no border or fill, with
   a hover tint only when there is a `pr_url` to open (dimmed and `disabled`
   otherwise, so the chip itself swallows the click instead of passing it to the
@@ -272,14 +278,47 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   is why the tests can assert a single card outright. The one card outside the
   invariant is the row's nested "n shipped" tally popover, which stays
   ungrouped precisely because it lives inside the workspace card's own trigger.
+- **Workspace menu presentation** (`sidebar-workspace-row.tsx` +
+  `src/components/ui/menu-chrome.tsx`): the right-click menu sits on the same
+  surface as the command palette — 13px radius, hairline border, one elevation
+  (`.cm-menu-surface` in `globals.css`), 32px rows with a 14px icon on every
+  row and right-aligned mono keycaps. It opens with a non-interactive
+  **identity header** (project avatar, workspace name, project name, and the
+  uncommitted `+A −D` when there is any), because a portalled menu is the one
+  surface with no visual tie back to the row it came from and half its entries
+  are destructive-adjacent. Its groups are named — **Workspace** / **Actions**
+  / **Organize** — instead of separated by bare rules; only the destructive
+  tail keeps a real divider. Keycaps render only where a binding exists:
+  Settings / Command palette / Keyboard shortcuts / Open project resolve
+  through `keybind-registry` (so a rebind shows), and Rename carries a static
+  `F2` for its row-scoped gesture. Rows with no binding get no keycap — a
+  display-only hint for a combo the registry already gives to a *different*
+  action (Ctrl+Shift+P is file search, Ctrl+Shift+N is
+  new-workspace-in-project) promises a gesture that does something else
+  entirely.
+  "Move to device…" is always a submenu, listing this device plus each
+  configured host with its state line, and saying "No other devices signed in."
+  in place of the old disabled `Move to device… (no devices configured)` row.
+  Because the menu is now tall enough to reach a screen edge, every menu
+  surface caps itself at Radix's reported available width/height, scrolls with
+  the shared `.thin-scrollbar`, and keeps an 8px `collisionPadding` — so a
+  right-click at the bottom of the window flips the panel upward and a submenu
+  with no room to its right flips left and narrows to fit, rather than either
+  one running off-screen.
 - **Project section of the workspace menu** (`project-appearance-menu.tsx`): all
   three row shapes' right-click menus (active card, settled row, snoozed row)
   carry a `Project "<name>"` submenu between the workspace actions and the
-  device actions — an image entry plus the 12-color accent palette, applying to
-  the whole project the row belongs to. This is the re-homed project-avatar
-  customization that lost its entry point when the project tree was unmounted.
-  `docs/features/project-avatars.md` is the canonical doc for the mechanism
-  (store, persistence keys, which surfaces repaint).
+  device actions — an image entry plus the 12-color accent palette as a
+  **7-across swatch grid** (Default first), applying to the whole project the
+  row belongs to. The grid replaced thirteen named colour rows: the colours are
+  the entire content of the choice, so the eye picks one directly instead of
+  reading a list of names, and the submenu no longer runs taller than its
+  parent. Each swatch is still a real menuitem (keyboard-navigable, named by
+  the colour), the chosen one carries a ring rather than a check glyph, and the
+  current colour is named in a line under the grid. This is the re-homed
+  project-avatar customization that lost its entry point when the project tree
+  was unmounted. `docs/features/project-avatars.md` is the canonical doc for
+  the mechanism (store, persistence keys, which surfaces repaint).
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
   one-line row (repo avatar · title · PR icon + `#number` when linked ·
@@ -514,7 +553,11 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   through one `branch_pr_outcome` helper (`Write` / `Clear` / `Preserve`) so the
   matrix cannot drift between the manual refresh command and the two pollers.
   These rules are what let a real `MERGED`/`CLOSED` transition reach auto-settle
-  reliably.
+  reliably. Both pollers now resolve the checkout's hosting product first and
+  ask *that* adapter (the paragraph above describes the GitHub one); a workspace
+  on an unserved host is skipped rather than shelled out to, and the auth gate is
+  keyed per product **and** host so one signed-out product cannot stall another's
+  workspaces. See `docs/features/source-control-providers.md`.
 - **Side-branch PR badges (badge only).** Strict current-branch association has
   one visible blind spot: an agent that runs `git checkout -b side-branch`,
   commits, pushes, opens a PR, and checks the worktree back leaves a workspace
@@ -740,8 +783,26 @@ scrolling list. Expanded: **Automations** and **Workspaces** as equal-width
 labeled ghost buttons (28px, 7px radius, transparent with a subtle hover
 fill), then icon-only **Ports** (`SidebarPortsPopover`, keeps its count
 badge) and the **Settings gear** (the app-menu dropdown — Settings, command
-palette, shortcuts, documentation, report issue, version, sign out; its old
+palette, shortcuts, documentation, report issue, sign out; its old
 Automations/Workspaces items were removed since they're visible buttons now).
+The gear menu shares the workspace menu's chrome (`menu-chrome.tsx`): 252px
+wide, 32px rows, resolved keycaps, external-link arrows on the two web
+destinations, and the signed-in account name beside **Sign out** when the
+frontend knows it. The version moved out of the item list into a **footer
+strip** flush to the container's bottom corners — mono `Codemux vX.Y.Z` on the
+left, a status dot + update state on the right. A version string is a fact, not
+an action, and the disabled row it replaced was the one row users tried to
+click. The update state comes from `src/stores/update-status-store.ts`, a
+mirror published by the single `useUpdateChecker` that `UpdateToast` mounts —
+the menu must not mount a second checker, which would double the 4-hour poll.
+The "update available" and "restart to update" states are clickable and drive
+the checker's own download/relaunch callbacks — except on the web remote
+client, where the mirror's `isRemote` routes the click to
+`requestDesktopUpdate` (the strip reads **Update desktop**), because a browser
+has no updater plugin and `startDownload` there is a no-op. Until a checker
+publishes, the strip shows the version and no status at all: "Up to date" is a
+claim nothing has verified yet (and never would in a dev build, where the
+check does not run).
 Collapsed: the same four, restacked vertically in the same order — Automations,
 Workspaces, and the app menu get right-side tooltips; `SidebarPortsPopover`
 hardcodes `side="top"` for both its tooltip and its popover in both states.

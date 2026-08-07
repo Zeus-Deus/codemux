@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
+import { resolveProvider } from "@/lib/source-control";
 import {
   Popover,
   PopoverContent,
@@ -25,6 +26,9 @@ interface Props {
    *  right (into the content area); the Context Row opens up. */
   side?: "top" | "right" | "bottom" | "left";
   align?: "start" | "center" | "end";
+  /** Hosting product of the issue's repo, for the "Open on …" label.
+   *  Absent means GitHub, matching the rest of the app. */
+  providerKind?: string | null;
 }
 
 export function IssueDetailPopover({
@@ -33,7 +37,9 @@ export function IssueDetailPopover({
   variant = "row",
   side = "right",
   align = "start",
+  providerKind = null,
 }: Props) {
+  const provider = resolveProvider(providerKind);
   const [open, setOpen] = useState(false);
   const [fullIssue, setFullIssue] = useState<GitHubIssue | null>(null);
   const [loading, setLoading] = useState(false);
@@ -151,7 +157,7 @@ export function IssueDetailPopover({
               {/* Body */}
               {fullIssue.body ? (
                 <div className="max-h-[300px] overflow-y-auto">
-                  <p className="text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
+                  <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
                     {fullIssue.body}
                   </p>
                 </div>
@@ -170,7 +176,7 @@ export function IssueDetailPopover({
                   onClick={() => openUrl(fullIssue.url)}
                 >
                   <ExternalLink className="h-3 w-3" />
-                  Open on GitHub
+                  Open on {provider.name}
                 </Button>
               )}
             </>

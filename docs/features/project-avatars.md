@@ -12,7 +12,8 @@ Every workspace row in the left sidebar renders a small project avatar (`Project
 
 ## Current Model
 
-- Right-click **any workspace** in the sidebar inbox — all three row shapes: active card, settled row, or snoozed row → a `Project "<name>"` submenu, sitting between the workspace actions and the device actions. It offers an image entry that opens `ProjectImageDialog` plus a fixed 12-color palette (Red, Orange, Yellow, Lime, Green, Teal, Cyan, Blue, Indigo, Purple, Pink, Slate — `PROJECT_COLORS` in `project-appearance-menu.tsx`).
+- Right-click **any workspace** in the sidebar inbox — all three row shapes: active card, settled row, or snoozed row → a `Project "<name>"` submenu, sitting between the workspace actions and the device actions. It offers an image entry that opens `ProjectImageDialog` plus a fixed 12-color palette (Red, Orange, Yellow, Lime, Green, Teal, Cyan, Blue, Indigo, Purple, Pink, Slate — `PROJECT_COLORS` in `project-appearance-menu.tsx`), rendered as a **7-across swatch grid** with Default first rather than thirteen named rows.
+  - Each swatch stays a real menuitem so arrow-key navigation works and the colour is still its accessible name; the chosen one is marked with a ring (a check glyph has no colour that reads on all thirteen tiles), and the current colour is named in a line under the grid beside an "applies to all workspaces" hint.
   - The submenu is labeled with the owning project's display name, because the setting applies to the **whole project**, not the one workspace that was right-clicked. The project is resolved from the `repo` (`{name, path}`) each inbox row already carries for its avatar.
   - This replaced the original entry point, the project-group header context menu, which went unreachable when PR #198 swapped the nested project tree for the flat workspace inbox.
 - The dialog accepts three input shapes, classified by `resolveImageUrl` in `src/lib/project-image.ts`:
@@ -29,7 +30,7 @@ Every workspace row in the left sidebar renders a small project avatar (`Project
 
 - Rendering of already-saved avatars (image → color disc → letter) on every surface
 - Per-project custom image via direct URL, data URL, or domain-derived favicon
-- Per-project accent color from a 12-color palette; color also tints the letter fallback
+- Per-project accent color from a 12-color swatch grid; color also tints the letter fallback
 - Re-saving (or re-opening the picker for) a website image re-fetches the favicon via the `&v=` cache-bust token
 - Clear/reset back to the letter fallback from the same context menu
 - Reachable by right-clicking any workspace of the project — active inbox card, settled row, or snoozed row

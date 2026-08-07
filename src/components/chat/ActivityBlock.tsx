@@ -225,7 +225,7 @@ function StepRow({
 function StepDetail({ step }: { step: ActivityStep }) {
   if (step.kind === "reasoning") {
     return (
-      <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+      <p className="select-text whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
         {step.text}
       </p>
     );

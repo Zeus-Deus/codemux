@@ -32,6 +32,11 @@ import {
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  providerHostLabel,
+  providerRef,
+} from "@/lib/source-control";
 
 /** Project identity for the hovered workspace — same shape the inbox card
  *  and the rail already resolve from the grouping pipeline. */
@@ -182,6 +187,11 @@ export function WorkspaceHoverCardBody({
 
   const providers = getWorkspaceProviders(workspace.surfaces);
   const prState = normalizePrState(workspace.pr_state);
+  // `scProvider` — the *hosting* product. Distinct from `providers`
+  // above, which is the set of AI agent backends running in this
+  // workspace's panes.
+  const scProvider = providerForWorkspace(workspace);
+  const prHost = hostOf(workspace.pr_url);
   const prHeadBranch = workspace.pr_head_branch ?? null;
   const issue = workspace.linked_issue;
 
@@ -304,19 +314,23 @@ export function WorkspaceHoverCardBody({
           )}
         {prState && (
           <DetailRow
-            label="Pull request"
-            value={`#${workspace.pr_number ?? ""} · ${prState}`}
+            label={scProvider.nounTitle}
+            value={`${providerRef(scProvider, workspace.pr_number)} · ${prState}`}
             valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
           />
         )}
-        {/* Only when the PR is NOT the checked-out branch's. This is the
+        {/* Only when the change request is NOT the checked-out branch's. This is the
             details surface, so it can afford to answer the question the badge
             raises: the workspace has a PR, yet the Branch row above says
             something else. Naming the head branch says the PR came off a side
             branch — and explains why merging it will not settle this card. On
             the ordinary matching case the row would be pure repetition. */}
         {prState && !isPrOnCurrentBranch(prHeadBranch, workspace.git_branch) && (
-          <DetailRow label="PR branch" value={prHeadBranch!} muted />
+          <DetailRow
+            label={`${scProvider.shortNoun} branch`}
+            value={prHeadBranch!}
+            muted
+          />
         )}
         {issue && (
           <DetailRow
@@ -344,6 +358,18 @@ export function WorkspaceHoverCardBody({
           valueClassName={isRemote ? "text-status-remote" : undefined}
           muted={!isRemote}
         />
+        {/* Detected hosting product. Only shown once detection has
+            actually classified this checkout: on a workspace with no
+            `provider_kind` the presentation map falls back to GitHub for
+            copy purposes, but stating "GitHub" here would be asserting a
+            detection result that does not exist. */}
+        {workspace.provider_kind && (
+          <DetailRow
+            label="Hosting"
+            value={providerHostLabel(scProvider, prHost)}
+            muted
+          />
+        )}
         {workspace.notifications_muted && (
           <DetailRow label="Notifications" value="muted" muted />
         )}
@@ -358,6 +384,21 @@ export function WorkspaceHoverCardBody({
       </div>
     </>
   );
+}
+
+/** Hostname behind a change-request link, when there is one.
+ *
+ *  The snapshot carries no instance hostname of its own, but the PR/MR
+ *  URL names it, and that is the detail worth surfacing: a self-hosted
+ *  deployment reads "GitLab · gitlab.acme.com" rather than a bare
+ *  product name that could be anything. */
+function hostOf(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname || null;
+  } catch {
+    return null;
+  }
 }
 
 function DetailRow({

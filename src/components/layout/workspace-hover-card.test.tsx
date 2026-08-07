@@ -575,3 +575,85 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(screen.getByText("beta")).toBeInTheDocument();
   });
 });
+
+// ── Provider-aware detail rows ──
+
+describe("hosting provider", () => {
+  it("keeps GitHub's label and `#` sigil", () => {
+    renderBody(
+      makeWorkspace({
+        pr_number: 42,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/acme/app/pull/42",
+        provider_kind: "github",
+      }),
+    );
+    expect(valueFor("Pull request")).toContain("#42");
+  });
+
+  it("uses GitLab's label and `!` sigil", () => {
+    renderBody(
+      makeWorkspace({
+        pr_number: 42,
+        pr_state: "OPEN",
+        pr_url: "https://gitlab.acme.com/acme/app/-/merge_requests/42",
+        provider_kind: "gitlab",
+      }),
+    );
+    expect(valueFor("Merge request")).toContain("!42");
+    expect(screen.queryByText("Pull request")).not.toBeInTheDocument();
+  });
+
+  it("names a self-hosted instance on the Hosting row", () => {
+    renderBody(
+      makeWorkspace({
+        pr_number: 42,
+        pr_state: "OPEN",
+        pr_url: "https://gitlab.acme.com/acme/app/-/merge_requests/42",
+        provider_kind: "gitlab",
+      }),
+    );
+    expect(valueFor("Hosting")).toBe("GitLab · gitlab.acme.com");
+  });
+
+  it("omits the product's own domain from the Hosting row", () => {
+    renderBody(
+      makeWorkspace({
+        pr_number: 1,
+        pr_state: "OPEN",
+        pr_url: "https://gitlab.com/acme/app/-/merge_requests/1",
+        provider_kind: "gitlab",
+      }),
+    );
+    expect(valueFor("Hosting")).toBe("GitLab");
+  });
+
+  it("shows no Hosting row when detection never classified the checkout", () => {
+    // Absent `provider_kind` means "not detected", not "GitHub". Copy
+    // falls back to GitHub wording, but asserting a detection result
+    // that does not exist would be a different claim entirely.
+    renderBody(
+      makeWorkspace({
+        pr_number: 7,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/acme/app/pull/7",
+      }),
+    );
+    expect(screen.queryByText("Hosting")).not.toBeInTheDocument();
+    expect(valueFor("Pull request")).toContain("#7");
+  });
+
+  it("labels a side-branch row with the product's abbreviation", () => {
+    renderBody(
+      makeWorkspace({
+        git_branch: "main",
+        pr_number: 9,
+        pr_state: "OPEN",
+        pr_head_branch: "feature/x",
+        pr_url: "https://gitlab.com/acme/app/-/merge_requests/9",
+        provider_kind: "gitlab",
+      }),
+    );
+    expect(screen.getByText("MR branch")).toBeInTheDocument();
+  });
+});

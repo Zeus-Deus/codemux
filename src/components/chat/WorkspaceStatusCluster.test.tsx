@@ -415,3 +415,50 @@ describe("WorkspaceStatusCluster", () => {
     expect(screen.queryByText("Issue")).not.toBeInTheDocument();
   });
 });
+
+// ── Provider-aware chip ──
+
+describe("provider-aware change-request chip", () => {
+  it("keeps GitHub's `#` sigil and wording", () => {
+    mocks.workspace = makeWorkspace({
+      pr_number: 172,
+      pr_state: "OPEN",
+      pr_url: "https://github.com/acme/app/pull/172",
+    });
+    render(<WorkspaceStatusCluster />);
+    const chip = screen.getByRole("button", {
+      name: /Open PR #172 on GitHub — Open/,
+    });
+    expect(chip).toHaveTextContent("#172");
+  });
+
+  it("uses GitLab's `!` sigil, MR noun, and product name", () => {
+    mocks.workspace = makeWorkspace({
+      pr_number: 12,
+      pr_state: "OPEN",
+      pr_url: "https://gitlab.com/acme/app/-/merge_requests/12",
+      provider_kind: "gitlab",
+    });
+    render(<WorkspaceStatusCluster />);
+    const chip = screen.getByRole("button", {
+      name: /Open MR !12 on GitLab — Open/,
+    });
+    expect(chip).toHaveTextContent("!12");
+    expect(chip).toHaveAttribute("title", expect.stringContaining("Merge request !12"));
+  });
+
+  it("falls back to GitHub wording when provider_kind is absent", () => {
+    // Back-compat: snapshots predating detection carry no kind and must
+    // render exactly what they always did.
+    mocks.workspace = makeWorkspace({
+      pr_number: 5,
+      pr_state: "OPEN",
+      pr_url: "https://github.com/acme/app/pull/5",
+      provider_kind: undefined,
+    });
+    render(<WorkspaceStatusCluster />);
+    expect(
+      screen.getByRole("button", { name: /Open PR #5 on GitHub/ }),
+    ).toBeInTheDocument();
+  });
+});

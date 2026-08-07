@@ -279,6 +279,9 @@ function makeWorkspace(seed: WorkspaceSeed): WorkspaceSnapshot {
     pr_number: seed.pr_number ?? null,
     pr_state: seed.pr_state ?? null,
     pr_url: seed.pr_url ?? null,
+    // Absent means GitHub, matching the frontend's back-compat rule, so
+    // only the deliberately-GitLab seeds set this.
+    provider_kind: seed.provider_kind ?? null,
     linked_issue: seed.linked_issue ?? null,
     notifications_muted: seed.notifications_muted ?? false,
     tabs: [tab],
@@ -688,9 +691,16 @@ const wsCodemuxWorkflowComplete = (() => {
 })();
 
 // Project 2 — vexis: 1 primary + 3 worktrees (one in `permission`).
+//
+// Seeded as a GitLab-hosted project so the provider-aware surfaces are
+// exercisable side by side with the GitHub projects above: the sidebar
+// chips read `!N` instead of `#N`, tooltips say "merge request", and the
+// review panel's copy names `glab`. Everything else in the fixture set
+// stays GitHub, which is what keeps the visual diff honest.
 
 const vexisRoot = `${PROJECTS}/vexis`;
 const vexisUid = "uid-vexis";
+const vexisWebRoot = "https://gitlab.example.com/acme/vexis";
 
 const wsVexisMain = makeWorkspace({
   workspace_id: "ws-vexis-main",
@@ -701,6 +711,7 @@ const wsVexisMain = makeWorkspace({
   workspace_kind: "main",
   protected: true,
   git_branch: "main",
+  provider_kind: "gitlab",
 });
 
 const wsVexisCuda = makeWorkspace({
@@ -714,7 +725,8 @@ const wsVexisCuda = makeWorkspace({
   git_branch: "feat/cuda-variant",
   pr_number: 88,
   pr_state: "open",
-  pr_url: "https://github.com/example/vexis/pull/88",
+  pr_url: `${vexisWebRoot}/-/merge_requests/88`,
+  provider_kind: "gitlab",
   notification_count: 1,
   status: "permission", // red pulsing dot
 });
@@ -730,7 +742,8 @@ const wsVexisBench = makeWorkspace({
   git_branch: "perf/bench-suite",
   pr_number: 90,
   pr_state: "draft",
-  pr_url: "https://github.com/example/vexis/pull/90",
+  pr_url: `${vexisWebRoot}/-/merge_requests/90`,
+  provider_kind: "gitlab",
   git_additions: 132,
   git_deletions: 9,
   git_changed_files: 4,
@@ -745,6 +758,7 @@ const wsVexisInstaller = makeWorkspace({
   project_uid: vexisUid,
   workspace_kind: "worktree",
   git_branch: "fix/installer-detect",
+  provider_kind: "gitlab",
 });
 
 // Project 3 — personal-site: 1 primary + 1 worktree (open PR + diff).

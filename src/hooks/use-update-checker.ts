@@ -12,13 +12,9 @@ import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import type { WebRemoteStatus } from "@/tauri/types";
 
-type UpdateState =
-  | "idle"
-  | "checking"
-  | "update-available"
-  | "downloading"
-  | "ready"
-  | "error";
+import { useUpdateStatusStore, type UpdateState } from "@/stores/update-status-store";
+
+export type { UpdateState };
 
 interface UpdateCheckerResult {
   state: UpdateState;
@@ -357,6 +353,36 @@ export function useUpdateChecker(): UpdateCheckerResult {
       setUpdateRequested(false);
     });
   }, []);
+
+  // ── Publish to the shared status store ────────────────────────────
+  //
+  // This hook owns the only poll, so anything else that wants to show update
+  // state (the app-menu footer strip) reads the mirror instead of mounting a
+  // second checker and doubling the round trips. `isRemote` and
+  // `requestDesktopUpdate` ride along because on the web client `startDownload`
+  // is a no-op — a reader that acts on the state needs the same remote branch
+  // the toast takes.
+  const publishUpdateStatus = useUpdateStatusStore((s) => s.publish);
+  useEffect(() => {
+    publishUpdateStatus({
+      state,
+      updateVersion,
+      downloadProgress,
+      isRemote,
+      startDownload,
+      installAndRestart,
+      requestDesktopUpdate,
+    });
+  }, [
+    publishUpdateStatus,
+    state,
+    updateVersion,
+    downloadProgress,
+    isRemote,
+    startDownload,
+    installAndRestart,
+    requestDesktopUpdate,
+  ]);
 
   return {
     state,
