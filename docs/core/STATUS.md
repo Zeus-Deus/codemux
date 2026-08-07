@@ -25,8 +25,8 @@ directly-committed side-branch PR badge fallback, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
-- **Ultracode reasoning level for Claude + Codex effort-picker polish** (branch
-  `add-ultracode-claude-provider`, unmerged). The reasoning picker now offers
+- **Ultracode reasoning level for Claude + Codex effort-picker polish**
+  (PR #261). The reasoning picker now offers
   **Ultracode** on every xhigh-capable Claude model: `ensure_ultracode_effort`
   (`agent_provider/claude/capabilities.rs`) appends the level at all three
   capability-producer paths (maintained fallback, sidecar-harvest merge — so
