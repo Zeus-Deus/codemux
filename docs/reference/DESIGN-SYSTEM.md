@@ -2,13 +2,13 @@
 
 - Purpose: The durable reference for Codemux's color tokens, theming layers, and the "no hardcoded colors" rule.
 - Audience: Anyone doing UI, component, or visual-design work.
-- Authority: Canonical theming reference. The runtime source of truth is `src/globals.css`.
+- Authority: Canonical theming reference. Runtime sources of truth are `src/lib/themes.ts` and the bridge in `src/globals.css`.
 - Update when: Token names, the base shadcn preset, palette variants, or the density scale change.
 - Read next: `docs/features/settings.md` (appearance), `docs/reference/ARCHITECTURE.md`
 
 > This reference exists because PR #115 tokenized the whole app and removed
 > the `.claude/skills/codemux-ui` skill that previously held these rules.
-> When in doubt, read `src/globals.css` — its inline comments are authoritative.
+> When in doubt, read `src/lib/themes.ts` for values and `src/globals.css` for how roles reach utilities.
 
 ## Core Rule
 
@@ -24,19 +24,19 @@ PR #115 swept ~40 components clean (176 replacements): `emerald`/`green` →
 `purple`/`violet` → `accent-violet`. Verification bar: zero
 `{prefix}-{color}-{NNN}` className utilities remain in `src/` (tests excluded).
 
-### Intentionally-hardcoded exceptions
+### Intentionally-concrete exceptions
 
 These are **not** theme colors and are left literal on purpose:
 
-- terminal ANSI palettes (`TerminalPane`, `use-terminal-theme-sync`,
-  `use-theme-colors`) — xterm's `ITheme` needs concrete colors.
+- terminal/editor/chat adapters receive concrete colors from the active theme
+  (`themes.ts` → `use-theme-colors.ts`); renderers cannot consume CSS variables.
 - the project-avatar color-picker hex list + dynamic per-project `rgba()`.
 - inspector highlight CSS injected into the foreign inspected page.
 - `BrowserPane` canvas `fillStyle` (`#000`).
 
 ## Token Layers
 
-`src/globals.css` is organized so each concern re-skins independently:
+The runtime engine and `src/globals.css` are organized so each concern re-skins independently:
 
 1. **shadcn preset tokens** (`:root` + `.dark`) — the standard shadcn role
    tokens (`--background`, `--foreground`, `--primary`, `--card`, `--muted`,
@@ -44,10 +44,16 @@ These are **not** theme colors and are left literal on purpose:
    **owned by the shadcn preset** and is rewritten wholesale when the preset
    is re-applied, so no project-specific overrides live here. Current base
    preset: **`b1HYEHloH`** (stone base, near-white `--primary`).
-2. **CodeMux custom tokens** (`:root, .dark` block) — the brand layer the
-   presets can't express. Because these are non-standard variable names,
-   switching/re-applying the shadcn preset never touches them:
-   - `--accent-ember` — primary accent (selection, links, small accents).
+2. **Codemux runtime theme namespace** (`--cm-theme-*`) — `themes.ts`
+   validates and writes all 26 role values and all 16 ANSI values atomically.
+   A root `[data-theme-id]` bridge aliases the product roles into shadcn and
+   Codemux variables. Components keep using semantic utilities while a theme
+   can replace the full application palette.
+3. **CodeMux custom tokens** (`:root, .dark` block) — product meanings the
+   shadcn preset cannot express. Status colors remain stable semantic states;
+   brand and surface roles are fed by the active theme:
+   - `--accent-ember` — compatibility name for the active theme's brand accent
+     (selection, links, small accents).
    - `--selection-background` / `--selection-foreground` — the stable DOM
      text-selection pair. The background aliases ember; the foreground is a
      dedicated dark ink that remains above 6:1 contrast across every palette,
@@ -64,24 +70,37 @@ These are **not** theme colors and are left literal on purpose:
      `--status-attention`, the one state genuinely blocked on a human.
    - Legacy aliases `--success`/`--warning`/`--danger` map onto the status
      tokens as a single value source for existing `text-success` etc.
-   - `--sidebar-primary` is overridden here to `--accent-ember`: the shadcn
-     preset ships a saturated-blue sidebar accent (also the terminal cursor),
-     but Codemux has no blue brand color, so it is routed to ember. This
-     override survives a preset re-apply.
-   - `--sidebar` is overridden per scheme (light/dark/warm) to sit **slightly
-     darker than `--background`** — the sidebar recedes so the workspace-inbox
-     cards can be flat/transparent at rest with lightness-only selection.
-     Like all custom-layer overrides, it survives a preset re-apply.
-3. **Radius scale** (`@theme inline`) — `--radius-sm..4xl` derive from the
+   - `--sidebar-primary` is the active theme's sidebar accent and terminal cursor.
+   - `--sidebar` is its own role so it can recede from the background without
+     component-local color math.
+4. **Radius scale** (`@theme inline`) — `--radius-sm..4xl` derive from the
    preset's `--radius`, so every rounded utility re-skins from one value.
 
-## Palette Variants
+## Application Themes
 
-- **Default** (`:root` / `.dark`) — stone-based neutral surfaces.
-- **`.theme-warm`** — opt-in via a `.theme-warm` class on the root. Overrides
-  only the surface/role tokens with warm-grey oklch values; `--primary` stays
-  near-white (white buttons) and the status tokens are **not** overridden
-  (shared across palettes). One component set, two token maps.
+Managed built-ins are Graphite (`default`), Warm Stone, Ember, Abyss, and
+Iris. Custom themes use the same complete role/ANSI schema. The active root is
+identified by `data-theme-id`; the former `.theme-warm` class is legacy-only
+and is migrated into the synced Warm Stone theme selection.
+
+Theme switching adds `.no-transitions`, writes the complete namespace, updates
+the boot shadow, and removes the guard after paint. `index.html` validates and
+applies that shadow before CSS and React to avoid a Graphite flash. Incomplete
+or invalid payloads fail closed to the built-in default.
+
+**A preview is the same write minus the boot shadow.** The command palette's
+theme picker calls `applyTheme(theme, { persist: false })` on the highlighted
+row, so a preview repaints every consumer of the namespace — chrome, diff
+tints, editor, terminal ANSI — while the persisted shadow keeps pointing at
+the real choice. Any surface that previews a theme owes a revert on close;
+`persist: false` is what makes the revert cheap and a crash mid-preview
+harmless.
+
+Radius, fonts, spacing, and the success/info status hues are **not** part of a
+theme. A palette may not change the geometry or the meaning of a status color.
+
+See `docs/features/theming.md` for generation, import/export, sync, and syntax
+integration, and `docs/features/command-palette.md` for the picker.
 
 ## Density Scale
 

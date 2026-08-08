@@ -4,6 +4,73 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Codemux</title>
+    <script data-codemux-theme-boot>
+      (() => {
+        const root = document.documentElement;
+        const fallback = {
+          background: "oklch(0.147 0.004 49.25)",
+          foreground: "oklch(0.985 0.001 106.423)",
+        };
+        const roleVariables = {
+          background: "--cm-theme-background",
+          foreground: "--cm-theme-foreground",
+          card: "--cm-theme-card",
+          cardForeground: "--cm-theme-card-foreground",
+          popover: "--cm-theme-popover",
+          popoverForeground: "--cm-theme-popover-foreground",
+          primary: "--cm-theme-primary",
+          primaryForeground: "--cm-theme-primary-foreground",
+          secondary: "--cm-theme-secondary",
+          secondaryForeground: "--cm-theme-secondary-foreground",
+          muted: "--cm-theme-muted",
+          mutedForeground: "--cm-theme-muted-foreground",
+          accent: "--cm-theme-accent",
+          accentForeground: "--cm-theme-accent-foreground",
+          border: "--cm-theme-border",
+          input: "--cm-theme-input",
+          ring: "--cm-theme-ring",
+          sidebar: "--cm-theme-sidebar",
+          sidebarForeground: "--cm-theme-sidebar-foreground",
+          sidebarPrimary: "--cm-theme-sidebar-primary",
+          sidebarPrimaryForeground: "--cm-theme-sidebar-primary-foreground",
+          sidebarAccent: "--cm-theme-sidebar-accent",
+          sidebarAccentForeground: "--cm-theme-sidebar-accent-foreground",
+          sidebarBorder: "--cm-theme-sidebar-border",
+          sidebarRing: "--cm-theme-sidebar-ring",
+          brandAccent: "--cm-theme-brand-accent",
+        };
+        const ansiSlots = [
+          "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+          "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue",
+          "brightMagenta", "brightCyan", "brightWhite",
+        ];
+        const validColor = (value) => typeof value === "string" && CSS.supports("color", value);
+        let stored = null;
+        try {
+          stored = JSON.parse(localStorage.getItem("codemux:appearance-theme:v1") || "null");
+        } catch {
+          stored = null;
+        }
+        const complete = stored && stored.roles &&
+          Object.keys(roleVariables).every((role) => validColor(stored.roles[role])) &&
+          stored.ansi && ansiSlots.every((slot) => validColor(stored.ansi[slot]));
+        const bootRoles = complete ? stored.roles : fallback;
+        root.style.setProperty("--cm-boot-bg", bootRoles.background);
+        root.style.setProperty("--cm-boot-fg", bootRoles.foreground);
+        if (!complete) return;
+        root.dataset.themeId = typeof stored.id === "string" ? stored.id : "default";
+        for (const [role, variable] of Object.entries(roleVariables)) {
+          root.style.setProperty(variable, stored.roles[role]);
+        }
+        for (const slot of ansiSlots) {
+          const variable = `--cm-ansi-${slot.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+          root.style.setProperty(variable, stored.ansi[slot]);
+        }
+        if (typeof stored.radius === "string" && /^\d*\.?\d+(?:px|rem|em)$/.test(stored.radius)) {
+          root.style.setProperty("--cm-theme-radius", stored.radius);
+        }
+      })();
+    </script>
     <style>
       #splash {
         position: fixed;
@@ -12,7 +79,7 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        background: #0C0C0E;
+        background: var(--cm-boot-bg, #0c0c0e);
         transition: opacity 0.4s ease-out;
       }
       #splash.fade-out {
@@ -21,10 +88,10 @@
       }
     </style>
   </head>
-  <body style="background: #0C0C0E">
+  <body style="background: var(--cm-boot-bg, #0c0c0e)">
     <div id="splash">
       <svg xmlns="http://www.w3.org/2000/svg" width="320" height="69" viewBox="78 18 204 44" fill="none">
-        <g fill="#E8E8E8" aria-label="CODEMUX"><path d="M308 -14Q188 -14 118.0 59.5Q48 133 48 272V428Q48 563 118.0 638.5Q188 714 308 714Q433 714 498.5 644.0Q564 574 564 454V436H432V454Q432 487 421.0 519.5Q410 552 383.0 573.0Q356 594 308 594Q264 594 235.5 572.5Q207 551 193.5 515.5Q180 480 180 438V262Q180 194 209.0 150.0Q238 106 308 106Q359 106 386.0 126.0Q413 146 422.5 178.0Q432 210 432 246V264H564V246Q564 122 498.5 54.0Q433 -14 308 -14Z" transform="translate(80.00, 52.00) scale(0.042000, -0.042000)" /><path d="M306 -14Q186 -14 117.0 59.5Q48 133 48 272V428Q48 563 117.0 638.5Q186 714 306 714Q426 714 495.0 638.5Q564 563 564 428V272Q564 133 495.0 59.5Q426 -14 306 -14ZM306 106Q378 106 405.0 150.0Q432 194 432 264V436Q432 480 419.0 516.0Q406 552 378.5 573.0Q351 594 306 594Q261 594 233.0 573.0Q205 552 192.5 516.0Q180 480 180 436V264Q180 194 207.0 150.0Q234 106 306 106Z" transform="translate(109.20, 52.00) scale(0.042000, -0.042000)" /><path d="M46 0V127H112V574H46V700H300Q429 700 492.5 639.0Q556 578 556 452V248Q556 122 492.5 61.0Q429 0 300 0ZM244 126H300Q369 126 396.5 158.5Q424 191 424 260V452Q424 512 396.5 543.0Q369 574 300 574H244Z" transform="translate(138.41, 52.00) scale(0.042000, -0.042000)" /><path d="M82 0V700H524V574H214V414H512V288H214V126H536V0Z" transform="translate(167.61, 52.00) scale(0.042000, -0.042000)" /><path d="M22 0V700H254L294 174V72H318V174L358 700H590V0H470V468L482 628H458L406 0H208L154 628H130L142 468V0Z" transform="translate(196.82, 52.00) scale(0.042000, -0.042000)" /><path d="M306 -14Q182 -14 118.0 54.5Q54 123 54 242V700H186V242Q186 181 215.5 145.5Q245 110 306 110Q368 110 397.0 145.5Q426 181 426 242V700H558V242Q558 123 494.5 54.5Q431 -14 306 -14Z" transform="translate(226.02, 52.00) scale(0.042000, -0.042000)" /><path d="M33 0 177 342V360L33 700H176L294 414H318L436 700H579L435 360V342L579 0H436L318 288H294L176 0Z" transform="translate(255.22, 52.00) scale(0.042000, -0.042000)" /></g>
+        <g fill="var(--cm-boot-fg, #e8e8e8)" aria-label="CODEMUX"><path d="M308 -14Q188 -14 118.0 59.5Q48 133 48 272V428Q48 563 118.0 638.5Q188 714 308 714Q433 714 498.5 644.0Q564 574 564 454V436H432V454Q432 487 421.0 519.5Q410 552 383.0 573.0Q356 594 308 594Q264 594 235.5 572.5Q207 551 193.5 515.5Q180 480 180 438V262Q180 194 209.0 150.0Q238 106 308 106Q359 106 386.0 126.0Q413 146 422.5 178.0Q432 210 432 246V264H564V246Q564 122 498.5 54.0Q433 -14 308 -14Z" transform="translate(80.00, 52.00) scale(0.042000, -0.042000)" /><path d="M306 -14Q186 -14 117.0 59.5Q48 133 48 272V428Q48 563 117.0 638.5Q186 714 306 714Q426 714 495.0 638.5Q564 563 564 428V272Q564 133 495.0 59.5Q426 -14 306 -14ZM306 106Q378 106 405.0 150.0Q432 194 432 264V436Q432 480 419.0 516.0Q406 552 378.5 573.0Q351 594 306 594Q261 594 233.0 573.0Q205 552 192.5 516.0Q180 480 180 436V264Q180 194 207.0 150.0Q234 106 306 106Z" transform="translate(109.20, 52.00) scale(0.042000, -0.042000)" /><path d="M46 0V127H112V574H46V700H300Q429 700 492.5 639.0Q556 578 556 452V248Q556 122 492.5 61.0Q429 0 300 0ZM244 126H300Q369 126 396.5 158.5Q424 191 424 260V452Q424 512 396.5 543.0Q369 574 300 574H244Z" transform="translate(138.41, 52.00) scale(0.042000, -0.042000)" /><path d="M82 0V700H524V574H214V414H512V288H214V126H536V0Z" transform="translate(167.61, 52.00) scale(0.042000, -0.042000)" /><path d="M22 0V700H254L294 174V72H318V174L358 700H590V0H470V468L482 628H458L406 0H208L154 628H130L142 468V0Z" transform="translate(196.82, 52.00) scale(0.042000, -0.042000)" /><path d="M306 -14Q182 -14 118.0 54.5Q54 123 54 242V700H186V242Q186 181 215.5 145.5Q245 110 306 110Q368 110 397.0 145.5Q426 181 426 242V700H558V242Q558 123 494.5 54.5Q431 -14 306 -14Z" transform="translate(226.02, 52.00) scale(0.042000, -0.042000)" /><path d="M33 0 177 342V360L33 700H176L294 414H318L436 700H579L435 360V342L579 0H436L318 288H294L176 0Z" transform="translate(255.22, 52.00) scale(0.042000, -0.042000)" /></g>
       </svg>
     </div>
     <div id="root"></div>

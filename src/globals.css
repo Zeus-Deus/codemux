@@ -118,8 +118,8 @@
 
 /* Dark theme tokens — owned by the shadcn preset (b1HYEHloH, stone base,
  * near-white --primary). Re-applying the preset rewrites this block, so no
- * project-specific overrides live here — those go in "CodeMux custom
- * tokens" and ".theme-warm" below. */
+ * project-specific overrides live here — those go in the Codemux custom
+ * token and runtime-theme layers below. */
 .dark {
     --background: oklch(0.147 0.004 49.25);
     --foreground: oklch(0.985 0.001 106.423);
@@ -186,7 +186,9 @@
   /* Text selection is one semantic pair rather than the current palette's
    * foreground laid over ember. A fixed dark ink keeps the contrast above
    * 6:1 in every palette, including the transparent chat composer textarea. */
-  --selection-background: var(--accent-ember);
+  /* Selection stays semantic and theme-independent. Theme palettes may move
+   * the brand accent, but selected text keeps the same known contrast pair. */
+  --selection-background: oklch(0.705 0.152 47);
   --selection-foreground: oklch(0.205 0.006 40);
   --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged             */
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
@@ -233,40 +235,50 @@
 }
 
 /*
- * Warm palette variant — opt-in via a `.theme-warm` class on the root.
- * Overrides only the surface/role tokens with warm-grey oklch values; the
- * primary stays near-white (white buttons), and the status tokens are
- * intentionally NOT overridden (shared across palettes). One component set,
- * two token maps.
+ * Runtime theme bridge. Theme definitions write only namespaced
+ * `--cm-theme-*` variables; this one guarded alias layer feeds the existing
+ * shadcn/Tailwind contract. Components never know whether the active palette
+ * is bundled, generated, pasted from shadcn/create, or imported from VS Code.
+ * Status, selection, typography, and density tokens intentionally sit outside
+ * this map.
  */
-.theme-warm {
-  --background: oklch(0.178 0.006 40);
-  --foreground: oklch(0.935 0.004 67);
-  --card: oklch(0.238 0.006 58);
-  --card-foreground: oklch(0.935 0.004 67);
-  --popover: oklch(0.238 0.006 58);
-  --popover-foreground: oklch(0.935 0.004 67);
-  --primary: oklch(0.925 0.004 70);
-  --primary-foreground: oklch(0.205 0.006 40);
-  --secondary: oklch(0.272 0.006 55);
-  --secondary-foreground: oklch(0.935 0.004 67);
-  --muted: oklch(0.272 0.006 55);
-  --muted-foreground: oklch(0.725 0.006 56);
-  --accent: oklch(0.272 0.006 55);
-  --accent-foreground: oklch(0.935 0.004 67);
-  --border: oklch(0.315 0.006 55);
-  --input: oklch(0.315 0.006 55);
-  --ring: oklch(0.55 0.009 56);
-  /* Inverted the same way: slightly darker than this palette's --background
-   * (0.178) so the warm sidebar recedes too. */
-  --sidebar: oklch(0.165 0.006 50);
-  --sidebar-foreground: oklch(0.935 0.004 67);
-  /* --sidebar-primary intentionally inherits the ember accent from the
-   * CodeMux custom-token block (no blue, consistent across palettes). */
-  --sidebar-accent: oklch(0.255 0.006 58);
-  --sidebar-accent-foreground: oklch(0.935 0.004 67);
-  --sidebar-border: oklch(0.272 0.006 55);
-  --sidebar-ring: oklch(0.55 0.009 56);
+:root[data-theme-id] {
+  --background: var(--cm-theme-background);
+  --foreground: var(--cm-theme-foreground);
+  --card: var(--cm-theme-card);
+  --card-foreground: var(--cm-theme-card-foreground);
+  --popover: var(--cm-theme-popover);
+  --popover-foreground: var(--cm-theme-popover-foreground);
+  --primary: var(--cm-theme-primary);
+  --primary-foreground: var(--cm-theme-primary-foreground);
+  --secondary: var(--cm-theme-secondary);
+  --secondary-foreground: var(--cm-theme-secondary-foreground);
+  --muted: var(--cm-theme-muted);
+  --muted-foreground: var(--cm-theme-muted-foreground);
+  --accent: var(--cm-theme-accent);
+  --accent-foreground: var(--cm-theme-accent-foreground);
+  --border: var(--cm-theme-border);
+  --input: var(--cm-theme-input);
+  --ring: var(--cm-theme-ring);
+  --sidebar: var(--cm-theme-sidebar);
+  --sidebar-foreground: var(--cm-theme-sidebar-foreground);
+  --sidebar-primary: var(--cm-theme-sidebar-primary);
+  --sidebar-primary-foreground: var(--cm-theme-sidebar-primary-foreground);
+  --sidebar-accent: var(--cm-theme-sidebar-accent);
+  --sidebar-accent-foreground: var(--cm-theme-sidebar-accent-foreground);
+  --sidebar-border: var(--cm-theme-sidebar-border);
+  --sidebar-ring: var(--cm-theme-sidebar-ring);
+  --accent-ember: var(--cm-theme-brand-accent);
+  --radius: var(--cm-theme-radius, 0.625rem);
+}
+
+/* A palette swap should read as one repaint, never as dozens of controls
+ * independently tweening through invalid intermediate contrast states. */
+:root.no-transitions *,
+:root.no-transitions *::before,
+:root.no-transitions *::after {
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
 }
 
 .pane-drop-overlay {

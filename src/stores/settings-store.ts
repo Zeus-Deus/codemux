@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { dbGetAllSettings, dbSetSetting } from "@/tauri/commands";
 import { useSyncedSettingsStore } from "./synced-settings-store";
+import { setTerminalThemeMode } from "@/lib/terminal-theme-mode";
 
 /** Machine-local settings only. Per-user settings live in synced-settings-store. */
 export const SETTINGS_DEFAULTS: Record<string, string> = {
@@ -14,9 +15,8 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_model: "",
   ai_resolver_strategy: "smart_merge",
   auto_mcp_config: "true",
-  // Color palette variant — "cool" (neutral graphite, default) or "warm".
-  // Applied via a `.theme-warm` class on the root that overrides the
-  // surface tokens (see globals.css). Cool = the default token map.
+  // Legacy migration input only. AppShell maps an explicitly persisted
+  // "warm" value to the synced Warm Stone theme; new writes use appearance.theme.
   "appearance.palette": "cool",
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
@@ -81,6 +81,7 @@ export const useSettingsStore = create<SettingsStore>()((setState, getState) => 
   load: async () => {
     try {
       const all = await dbGetAllSettings();
+      setTerminalThemeMode(all["terminal.color_theme"] ?? SETTINGS_DEFAULTS["terminal.color_theme"]);
       setState({ settings: all, loaded: true });
     } catch {
       setState({ loaded: true });
@@ -92,6 +93,7 @@ export const useSettingsStore = create<SettingsStore>()((setState, getState) => 
   },
 
   set: (key: string, value: string) => {
+    if (key === "terminal.color_theme") setTerminalThemeMode(value);
     setState((s) => ({
       settings: { ...s.settings, [key]: value },
     }));

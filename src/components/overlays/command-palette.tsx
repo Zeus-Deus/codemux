@@ -3,6 +3,7 @@ import { Command as CommandPrimitive } from "cmdk";
 import {
   ArrowLeft,
   ArrowRight,
+  ClipboardPaste,
   Columns2,
   FolderOpen,
   Globe,
@@ -20,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
+import { ThemeAnsiDots, ThemeCoins } from "@/components/settings/theme-swatches";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import {
   useAppStore,
@@ -54,6 +56,14 @@ import {
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import {
+  applyTheme,
+  BUILT_IN_THEMES,
+  parseCustomThemes,
+  resolveTheme,
+  type ThemeDefinition,
+} from "@/lib/themes";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   COMMAND_MODE_PREFIX,
@@ -61,8 +71,11 @@ import {
   compareWorkspaceOrder,
   groupCountLabel,
   parsePaletteQuery,
+  previewedThemeId,
   rankByQuery,
   resultCountLabel,
+  rankThemeGroup,
+  themeRowValue,
   workspacePathText,
   workspaceRowSubtitle,
   workspaceSearchText,
@@ -81,6 +94,10 @@ const WORKSPACE_CAP_RESTING = 8;
 const WORKSPACE_CAP_SEARCH = 24;
 const PROJECT_CAP_RESTING = 4;
 const PROJECT_CAP_SEARCH = 8;
+
+/** Kept out of the render so the synced-settings selector below is referentially
+ *  stable while the store has no appearance blob yet. */
+const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
 // ── Command catalogue ────────────────────────────────────────────────────
 
@@ -225,6 +242,23 @@ interface CommandRow {
   keys: string;
 }
 
+interface ThemeRow {
+  kind: "theme";
+  key: string;
+  theme: ThemeDefinition;
+}
+
+/** The two studio doors at the foot of the theme list. They are not themes —
+ *  nothing previews when they are highlighted — so they carry their own row
+ *  shape rather than a nullable field on {@link ThemeRow}. */
+interface ThemeStudioRow {
+  kind: "theme-studio";
+  key: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  open: () => void;
+}
+
 export function CommandPalette({ open, onOpenChange }: Props) {
   return (
     <CommandDialog
@@ -242,7 +276,12 @@ export function CommandPalette({ open, onOpenChange }: Props) {
 }
 
 function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }) {
-  const [rawQuery, setRawQuery] = useState("");
+  // Surfaces that mean "change the theme" hand the palette its own entry
+  // query rather than reimplementing the list. Read-and-cleared on mount, so
+  // the next plain ⌘K opens empty.
+  const [rawQuery, setRawQuery] = useState(
+    () => useUIStore.getState().takeCommandPaletteQuery() ?? "",
+  );
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -258,6 +297,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const hosts = useHosts();
   const { getKeysForAction } = useResolvedKeybinds();
   const now = useCoarseClock(true);
+
+  const openThemeStudio = useUIStore((s) => s.openThemeStudio);
+  const syncedThemeId = useSyncedSettingsStore(
+    (s) => s.settings?.appearance?.theme ?? "default",
+  );
+  const customThemePayloads = useSyncedSettingsStore(
+    (s) => s.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS,
+  );
+  const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
 
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
@@ -357,6 +405,52 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [activeWorkspace, getKeysForAction],
   );
 
+  // ── Theme rows ─────────────────────────────────────────────────────────
+  const customThemes = useMemo(
+    () => parseCustomThemes(customThemePayloads),
+    [customThemePayloads],
+  );
+  const allThemes = useMemo(
+    () => [...BUILT_IN_THEMES, ...customThemes],
+    [customThemes],
+  );
+  /** What the app is wearing for real — the row tagged `current`, and what Esc
+   *  (or arrowing off the theme list) puts back. */
+  const appliedTheme = useMemo(
+    () => resolveTheme(syncedThemeId, customThemes),
+    [syncedThemeId, customThemes],
+  );
+
+  const themeRows = useMemo<ThemeRow[]>(
+    () =>
+      allThemes.map((theme) => ({
+        kind: "theme" as const,
+        key: themeRowValue(theme.id),
+        theme,
+      })),
+    [allThemes],
+  );
+
+  const themeStudioRows = useMemo<ThemeStudioRow[]>(
+    () => [
+      {
+        kind: "theme-studio" as const,
+        key: "theme-studio:generate",
+        label: "Make a theme from two colors…",
+        icon: Plus,
+        open: () => openThemeStudio({ mode: "generate" }),
+      },
+      {
+        kind: "theme-studio" as const,
+        key: "theme-studio:import",
+        label: "Paste a VS Code or shadcn theme…",
+        icon: ClipboardPaste,
+        open: () => openThemeStudio({ mode: "import" }),
+      },
+    ],
+    [openThemeStudio],
+  );
+
   // ── Filter + rank ──────────────────────────────────────────────────────
   const commandsOnly = query.mode === "commands";
 
@@ -401,6 +495,22 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
 
   const searching = query.needle !== "";
+
+  // Themes are search-only. The resting palette answers "where was I?", and
+  // six colour rows there would both bury that answer and put a live preview
+  // one arrow key away from someone who only meant to switch workspaces.
+  // A path query is asking "where", and a palette has no location.
+  const themesEligible = searching && !commandsOnly && !query.pathMode;
+  const matchedThemes = useMemo(
+    () => (themesEligible ? rankThemeGroup(themeRows, query, (r) => r.theme.label) : []),
+    [themeRows, query, themesEligible],
+  );
+  const matchedThemeStudio = useMemo(
+    () =>
+      themesEligible ? rankThemeGroup(themeStudioRows, query, (r) => r.label) : [],
+    [themeStudioRows, query, themesEligible],
+  );
+
   const shownWorkspaces = matchedWorkspaces.slice(
     0,
     searching ? WORKSPACE_CAP_SEARCH : WORKSPACE_CAP_RESTING,
@@ -410,7 +520,53 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     searching ? PROJECT_CAP_SEARCH : PROJECT_CAP_RESTING,
   );
   const totalShown =
-    shownWorkspaces.length + shownProjects.length + matchedCommands.length;
+    shownWorkspaces.length +
+    shownProjects.length +
+    matchedThemes.length +
+    matchedThemeStudio.length +
+    matchedCommands.length;
+
+  // ── Live preview ───────────────────────────────────────────────────────
+  //
+  // The picker's whole argument: the choice is made by looking at the app you
+  // were already working in, so highlighting a row repaints the shell, the
+  // diff tints, the editor and the terminal ANSI at once. `applyTheme` writes
+  // the same runtime variables the applied theme uses — the only difference is
+  // `persist: false`, which keeps the boot shadow pointing at the real choice
+  // so a crash mid-preview still reopens on the applied theme.
+  const [selectedValue, setSelectedValue] = useState("");
+  const previewTheme = useMemo(() => {
+    const id = previewedThemeId(selectedValue);
+    return id === null ? null : allThemes.find((theme) => theme.id === id) ?? null;
+  }, [selectedValue, allThemes]);
+
+  const previewingRef = useRef(false);
+  const committedRef = useRef(false);
+  // Read by the unmount cleanup, which must not close over a stale value.
+  const appliedThemeRef = useRef(appliedTheme);
+  appliedThemeRef.current = appliedTheme;
+
+  useEffect(() => {
+    if (previewTheme) {
+      previewingRef.current = true;
+      applyTheme(previewTheme, { persist: false });
+    } else if (previewingRef.current) {
+      previewingRef.current = false;
+      applyTheme(appliedTheme, { persist: false });
+    }
+  }, [previewTheme, appliedTheme]);
+
+  // Esc, a click outside, or any other close: put back what the user had.
+  // Radix unmounts the body on close, so this is the single revert path — and
+  // it fires whether or not the palette was showing themes at the time.
+  useEffect(
+    () => () => {
+      if (previewingRef.current && !committedRef.current) {
+        applyTheme(appliedThemeRef.current, { persist: false });
+      }
+    },
+    [],
+  );
 
   // ── Actions ────────────────────────────────────────────────────────────
   const close = () => onOpenChange(false);
@@ -446,10 +602,32 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     if (command.actionId) dispatch(command.actionId);
   };
 
+  /** Enter on a theme row: keep what is already on screen. The theme is
+   *  already applied as a preview, so this only promotes it — persisting the
+   *  boot shadow and writing the synced `appearance.theme` field. */
+  const keepTheme = (theme: ThemeDefinition) => {
+    committedRef.current = true;
+    applyTheme(theme);
+    updateSyncedSetting("appearance", "theme", theme.id).catch(console.error);
+    close();
+  };
+
+  const openStudio = (row: ThemeStudioRow) => {
+    close();
+    row.open();
+  };
+
   return (
     <CommandPrimitive
       shouldFilter={false}
       loop
+      // Controlled selection: cmdk only reports the highlighted row through
+      // `onValueChange` when `value` is supplied, and the highlighted row is
+      // what the preview follows. cmdk still drives it — arrow keys, hover,
+      // and re-selecting the top row after a re-rank all come back through
+      // here; the state below is only where the value is parked.
+      value={selectedValue}
+      onValueChange={setSelectedValue}
       className="flex w-full flex-col overflow-hidden bg-popover text-popover-foreground"
     >
       {/* Header */}
@@ -458,6 +636,11 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         {commandsOnly && (
           <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-[10px] tracking-wide text-accent-ember">
             Commands
+          </span>
+        )}
+        {previewTheme && (
+          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-[10px] tracking-wide text-accent-ember">
+            Themes
           </span>
         )}
         <CommandPrimitive.Input
@@ -524,11 +707,34 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <ProjectItem key={row.key} row={row} homeDir={homeDir} onSelect={() => openProject(row)} />
           ))}
 
+          {matchedThemes.length + matchedThemeStudio.length > 0 && (
+            <GroupHeader
+              label="Themes"
+              count={`${matchedThemes.length}`}
+              first={shownWorkspaces.length === 0 && shownProjects.length === 0}
+            />
+          )}
+          {matchedThemes.map((row) => (
+            <ThemeItemRow
+              key={row.key}
+              row={row}
+              applied={row.theme.id === appliedTheme.id}
+              onSelect={() => keepTheme(row.theme)}
+            />
+          ))}
+          {matchedThemeStudio.map((row) => (
+            <ThemeStudioItemRow key={row.key} row={row} onSelect={() => openStudio(row)} />
+          ))}
+
           {matchedCommands.length > 0 && (
             <GroupHeader
               label="Commands"
               count={`${matchedCommands.length}`}
-              first={shownWorkspaces.length === 0 && shownProjects.length === 0}
+              first={
+                shownWorkspaces.length === 0 &&
+                shownProjects.length === 0 &&
+                matchedThemes.length + matchedThemeStudio.length === 0
+              }
             />
           )}
           {matchedCommands.map((row) => (
@@ -538,15 +744,31 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-5 bg-gradient-to-b from-transparent to-popover" />
       </div>
 
-      {/* Footer */}
+      {/* Footer — while a theme is previewing it explains the preview instead
+          of the palette, because that is the only moment Esc does something
+          other than close. */}
       <div className="flex h-[34px] flex-none items-center gap-3.5 border-t border-border/60 bg-muted/30 px-3.5">
-        <FooterHint keys="↑↓" label="navigate" />
-        <FooterHint keys="↵" label="open" />
-        <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
-        <span className="flex-1" />
-        <span className="font-mono text-[10px] text-muted-foreground/70">
-          {resultCountLabel(totalShown)}
-        </span>
+        {previewTheme ? (
+          <>
+            <FooterHint keys="↑↓" label="preview" />
+            <FooterHint keys="↵" label="keep it" />
+            <FooterHint keys="esc" label={`back to ${appliedTheme.label}`} />
+            <span className="flex-1" />
+            <span className="font-mono text-[10px] text-muted-foreground/70">
+              syncs to your account
+            </span>
+          </>
+        ) : (
+          <>
+            <FooterHint keys="↑↓" label="navigate" />
+            <FooterHint keys="↵" label="open" />
+            <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
+            <span className="flex-1" />
+            <span className="font-mono text-[10px] text-muted-foreground/70">
+              {resultCountLabel(totalShown)}
+            </span>
+          </>
+        )}
       </div>
     </CommandPrimitive>
   );
@@ -701,6 +923,58 @@ function ProjectItem({
       </span>
       <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
         {row.activeCount > 0 ? `${row.activeCount} active` : "idle"}
+      </span>
+      <EnterBadge />
+    </PaletteItem>
+  );
+}
+
+/**
+ * A theme row. Everything on it is evidence rather than decoration: the two
+ * discs are the theme's own surface and accent, and the four squares are the
+ * ANSI hues the terminal and code blocks will pick up.
+ */
+function ThemeItemRow({
+  row,
+  applied,
+  onSelect,
+}: {
+  row: ThemeRow;
+  applied: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <PaletteItem value={row.key} onSelect={onSelect}>
+      <ThemeCoins theme={row.theme} size={22} />
+      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground/90">
+        {row.theme.label}
+      </span>
+      {applied && (
+        <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
+          current
+        </span>
+      )}
+      <ThemeAnsiDots theme={row.theme} />
+      <EnterBadge />
+    </PaletteItem>
+  );
+}
+
+function ThemeStudioItemRow({
+  row,
+  onSelect,
+}: {
+  row: ThemeStudioRow;
+  onSelect: () => void;
+}) {
+  const Icon = row.icon;
+  return (
+    <PaletteItem value={row.key} onSelect={onSelect}>
+      <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
+        <Icon className="size-[11px]" />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
+        {row.label}
       </span>
       <EnterBadge />
     </PaletteItem>

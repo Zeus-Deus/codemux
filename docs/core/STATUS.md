@@ -26,6 +26,94 @@ source-control seam, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
+- **Application theming is now a first-class system.** Five managed dark
+  themes plus a Theme Studio for contrast-aware two-color generation, Codemux
+  JSON/shadcn/VS Code import, file or paste input, export, preview, and
+  deletion. A complete semantic role + ANSI schema is applied atomically
+  through namespaced root variables; a validated boot shadow runs before
+  CSS/React to prevent a default-theme flash. Selected and custom themes sync,
+  an explicit legacy warm preference migrates, and one shared syntax store
+  drives xterm, CodeMirror, and Shiki in app or system mode. See
+  `docs/features/theming.md`.
+
+- **The Theme Studio became a modal in Appearance** (Theming design handoff,
+  turn 4). Three things were wrong: the palette action navigated you out of
+  Settings, the studio opened in the right-hand `Sheet` that belongs to agent
+  panes, and a 380px column cannot show a theme — so the form floated in a
+  mostly empty tube. The studio is now a **centered 1000px `Dialog`** with two
+  tabs, **Generate** and **Import**, a 330px control column, and a live
+  preview filling the rest. `SettingsView` mounts its own `CommandPalette` and
+  `openCommandPaletteWith` no longer closes Settings, so Change → palette →
+  "Make a theme…" keeps you on the page and Esc lands back on Appearance.
+  **The studio no longer touches the running app**: the candidate is painted
+  by `ThemePreviewShell` (a miniature app — sidebar, chat, diff card, terminal
+  strip — every color an inline style read off the candidate), so cancelling
+  has nothing to undo and the preview shows surfaces the settings page does
+  not contain. The palette picker still previews against the real app; that is
+  turn 3 and is unchanged. Role editing was demoted from a third tab to an
+  **Edit roles by hand** link — as a peer it made a three-way decision out of a
+  two-way one — and a seedless theme reopens straight into it.
+  **Import gained three named sources** (VS Code / shadcn / a `.codemux-theme`
+  file) and lost its Parse button: `importThemeDetailed` runs on every change
+  and returns the format, the roles the source carried and the roles Codemux
+  solved, so the panel states the first two as a sentence and *lists* the
+  third. Choosing **VS Code** swaps the paste box for a Marketplace search —
+  new Rust module `vscode_marketplace.rs` with `vscode_marketplace_search`
+  (public gallery `extensionquery`, ≤12 hits that ship a `.vsix`) and
+  `vscode_marketplace_fetch_themes` (streams the `.vsix` under a 60 MB
+  ceiling, reads `extension/package.json`, returns the raw JSONC of every
+  **dark** `contributes.themes` entry; zip-slip-guarded, per-member capped,
+  all archive work in `spawn_blocking`; `zip` pinned to 4.x deflate-only so it
+  unifies with the copy `tauri-plugin-updater` already pulls in). Payloads are
+  snake_case, the repo convention for command results.
+  **Two engine fixes the design's own example exposed.** (1) Generated
+  surfaces and text now follow the **background's** hue with chroma bounded by
+  the canvas's own — every surface used to be derived from the *accent's* hue,
+  so a blue-black canvas with a warm accent produced a brown app and the
+  chosen background survived only in the role literally named `background`.
+  (2) The VS Code accent heuristic is reordered with `focusBorder` **last** and
+  a 3:1-against-canvas gate: it is very often a translucent grey (Tokyo
+  Night's is `#545c7e33`), which flattened to a mud accent for a theme
+  everyone recognises as blue. See `docs/features/theming.md` § The studio.
+
+- **The theme picker lives in the command palette** (Theming design handoff,
+  turn 3). ⌘K → "theme" surfaces a
+  **Themes** group between Projects and Commands; **highlighting** a row calls
+  `applyTheme(theme, { persist: false })`, so arrowing repaints the shell, the
+  diff tints, the editor and the terminal ANSI at once and the choice is made
+  by looking at the app rather than at a swatch grid. Enter promotes the
+  preview (boot shadow + synced `appearance.theme`); Esc, a click outside, or
+  arrowing off the group reverts — the unmount cleanup is the single revert
+  path, so no close route can leave a preview stranded. The footer swaps to
+  `↑↓ preview · ⏎ keep it · esc back to <applied>` while a theme is
+  highlighted. Themes are **search-only** (excluded at rest, in `>` command
+  mode and in `/` path mode), and `rankThemeGroup` scores each row against its
+  **label alone**, falling back to the whole set in registry order when the
+  query is one of the group's generic words — folding those keywords into each
+  row's haystack made "theme" match everything with a score that differed only
+  by name length, sorting the list by how short each theme was called. Reading
+  the highlighted row needs cmdk's **controlled** `value`; it only fires
+  `onValueChange` when `value` is supplied. Settings → Appearance lost the
+  **swatch grid** — and only that — for a single theme row (applied theme +
+  **Change**, which hands the palette a seed query via `commandPaletteQuery`
+  and leaves Settings since the palette does not mount inside that
+  full-screen surface, + **Customize**). Every other control on the page
+  stayed exactly where it was: typography, radius, resource monitor, density,
+  wrap-code-in-chat, smooth scrolling, and the Sidebar and Agents
+  subsections. The handoff's 3b mock also relocated typography/sidebar to
+  Interface, scrolling to Terminal, and terminal colors onto Appearance; that
+  part was **deliberately not taken** — the canvas only designed the theming
+  surface, and nothing else was to move yet. The Theme Studio *was* hoisted
+  out of the Appearance page into an **app-level** overlay
+  (`theme-studio.tsx`, driven by `useUIStore.themeStudio`, mounted in
+  `App.tsx`) because its three doors — the palette's two studio rows and
+  Appearance's Customize — live on surfaces that replace each other;
+  custom-theme export and delete moved from the deleted cards into its
+  footer. Colors only: radius, fonts, spacing and the success/info status
+  hues stay fixed. See
+  `docs/features/command-palette.md`, `docs/features/theming.md`,
+  `docs/features/settings.md`.
+
 - **The agent activity indicator is now one orb everywhere** (Canvas-3 design handoff, change 1 of 3). The configurable working-indicator glyph (braille / ring / blink / sweep / typing) and its six color swatches are **deleted** — `WorkingIndicator`, `AsciiSpinner`, `sidebar.working_indicator`, and `sidebar.working_indicator_color` are all gone. Every working/running indicator now renders `AgentOrb` (`src/components/ui/agent-orb.tsx`) over the MIT `thinking-orbs` library: sidebar workspace cards, the in-flight turn (the Activity block header, with `StreamingMarker` covering the dead time either side), subagent rows, the docked composer strip, and the workflow/orchestration run headers. Always monochrome — the library inks from `theme="auto"` off the root `dark` class, so no call site passes a color and red stays reserved for state needing a human. Sizes are 20 (inline) and 64 only. A single shared helper, `src/lib/orb-state.ts`, maps the agent's current tool to a state (searching / composing / working / solving / connecting / weaving / listening / breathing, neutral `working` fallback), fed by `src/lib/agent-chat/orb-activity.ts` from tool-call name + input + status the reducer already stamps — no new backend plumbing. Shell tools read their command string, so `git push` reads as connecting and `cargo test` as working. Design rule enforced by tests: **one orb per live thing** — aggregate headers and the composer strip stay neutral, each running row owns its own, and finished rows revert to the flat check. Settings → Appearance → Agents lost both pickers and gained a **Match the orb to the activity** toggle (`agents.orb_match_activity`, default on); off pins every orb to `working`. Migration is a **drop, not a map**: the machine-local settings table is a free-form `Record<string, string>` with no Rust-side schema, so old keys are simply never read and never written back. See `docs/features/agent-chat.md` § "Agent activity orb", `docs/features/sidebar.md`, `docs/features/settings.md`.
 
 - **Subagents lost their box and their orange** (Canvas-3 design handoff, change 3 of 3). The bordered Subagents card, the tinted rows, and the per-row `Enter ›` buttons are **deleted**. A spawn group now renders as a 1.5px vertical gradient **rail** carrying the group's state (`accent-ember` running → `status-open`/`status-attention` settled, each fading to ~10–12%) with the header line, plain hover rows and footer caption to its right, so the block reads as transcript rather than as a widget. Clicking a row expands it inline — the subagent's full latest output (mono, `pre-wrap`), an accent **"Open thread ›"** text button routing to the unchanged drill-in, and the mono model label — one row at a time. Once nothing is running the whole group **collapses to a single 30px line** (glyph · "Ran N subagents" · mono rollup · View), re-expandable on click; the rollup reports only real data — the longest row's elapsed rather than the parallel sum, and no `Σ` segment at all unless a provider actually reported usage. The docked `SubagentActivityBar` moved **inside the composer**: `Composer` gained a `topStripSlot` that renders it flush on the card's top edge, so the composer keeps one border and one radius, and the old saturated progress bar is replaced by a 1px `accent-ember` sweep (2.4s, reduced-motion-aware via the shared `cm-sweep` keyframe) plus the neutral run orb. The right panel's Subagents pane renders the same component, so the two placements can't drift. See `docs/features/agent-chat.md` § "Subagent view (cross-provider)", § "Composer running strip".

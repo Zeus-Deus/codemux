@@ -11,6 +11,9 @@ export interface FeatureFlags {
 
 export interface AppearanceSettings {
   theme: string;
+  /** Versioned Codemux theme files. The frontend validates their extensible
+   * role schema so older clients can retain roles added by newer clients. */
+  custom_themes?: unknown[];
   shell_font: string | null;
   terminal_font_size: number;
   show_resource_monitor: boolean;

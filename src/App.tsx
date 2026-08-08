@@ -13,6 +13,7 @@ import { useWebNotifications } from "@/hooks/use-web-notifications";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
 import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
+import { ThemeStudio } from "@/components/settings/theme-studio";
 import { RemotePathPicker } from "@/components/remote/remote-path-picker";
 import { RemoteConnectionBanner } from "@/components/remote/remote-connection-indicator";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
@@ -96,6 +97,10 @@ function App() {
   return (
     <>
       <AppShell />
+      {/* App-level, not a child of the Appearance page: both of its doors —
+          the palette's create/paste rows and Appearance's Customize button —
+          live on surfaces that replace each other. */}
+      <ThemeStudio />
       <UpdateToast />
       {/* Web remote client only: the in-app path browser that stands in for
           the native OS file dialog. Never mounted on desktop. */}

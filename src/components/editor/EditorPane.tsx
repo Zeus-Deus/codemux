@@ -9,7 +9,7 @@ import { useEditorStore } from "@/stores/editor-store";
 import { readFile, writeFile } from "@/tauri/commands";
 import { buildEditorTheme } from "@/lib/codemirror-theme";
 import { loadLanguage, isBinaryExtension, isImageExtension } from "@/lib/editor-languages";
-import { useThemeColors } from "@/hooks/use-theme-colors";
+import { useSyntaxThemeColors } from "@/hooks/use-theme-colors";
 import { MarkdownRendered } from "./MarkdownRendered";
 import { ImageViewer } from "./ImageViewer";
 
@@ -43,7 +43,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
   const wrapCompartment = useRef(new Compartment());
   const isLoadingRef = useRef(false);
 
-  const { theme } = useThemeColors();
+  const theme = useSyntaxThemeColors();
 
   const tab = useEditorStore((s) => s.getTab(tabId));
   const initTab = useEditorStore((s) => s.initTab);
