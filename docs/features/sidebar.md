@@ -1146,3 +1146,19 @@ quietly rather than loudly.
 - The inbox was implemented from the `Sidebar Inbox.dc.html` design handoff
   (flat inbox of workspace cards); colors map to the existing status/accent
   tokens — no hardcoded palette values.
+
+## Screenshots
+
+Dev-mock captures in `docs/features/assets/menu-restyle/` and
+`docs/features/assets/settled-row-dimming/`:
+
+- `menu-restyle/before-*.png` / `menu-restyle/after-*.png` — the workspace
+  right-click menu, the project submenu, the footer gear menu and the projects
+  `+` menu before and after they adopted the shared command-palette surface
+  (`menu-chrome.tsx` / `.cm-menu-surface`): 32px rows, an icon on every row,
+  right-aligned mono keycaps, named groups, and the gear menu's version/update
+  footer strip.
+- `settled-row-dimming/before.png` / `settled-row-dimming/after.png` — the
+  Settled shelf as a list of full-color rows versus one grey block at rest, with
+  hover/focus restoring avatar saturation, title tone and PR-badge state color
+  together.

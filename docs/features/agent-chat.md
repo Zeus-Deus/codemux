@@ -3011,7 +3011,9 @@ title-bar chat tab). See `docs/features/gui-chrome.md`.
 
 ### Context Row (running-thread status)
 
-Design: `.design-import/Context Row.dc.html` (claude.ai/design handoff).
+Design: the `Context Row.dc.html` claude.ai/design handoff (not committed —
+cited by name like the other uncommitted handoffs; the ones that are in the
+repo live in `.design/` or `docs/plans/assets/`).
 `AgentChatPane` never renders `ThreadScopeRow`; its `belowComposerSlot`
 is the read-only **Context Row** from the pane's FIRST render, at every
 message count (`AgentChatPane.tsx:2626`) — the same tucked
@@ -3803,3 +3805,19 @@ plumbing / the AskUserQuestion answer flow, and the `supportedModels` /
   flag is a capability advertisement, not an entitlement check. Re-enabling
   requires an entitlement-feedback loop first — see
   `docs/research/opus-5-agent-chat-support.md`.
+
+## Screenshots
+
+Dev-mock captures in `docs/features/assets/right-panel-deck/` and
+`docs/features/assets/local-screenshot-links/`:
+
+- `right-panel-deck/01-*` … `13-*` — the pane-deck rebuild, before/after per
+  surface: the panel's tab row becoming the titlebar band and the fixed
+  top-right control cluster (`01`), the Settings → Appearance → Agents pickers
+  replaced by the orb toggle (`02`), sidebar and composer orbs (`03`, `04`), the
+  requieted subagent block (`05`), the "Open a surface" picker (`06`), the
+  docked browser (`07`), full expand (`08`), and the file-search / max-width /
+  pane-menu / file-tree / changes panes (`09`–`13`).
+- `local-screenshot-links/before.png` / `local-screenshot-links/after.png` — an
+  absolute PNG path in assistant Markdown as a dead underlined filesystem anchor
+  versus the labelled inline preview card.
