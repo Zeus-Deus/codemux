@@ -8,7 +8,7 @@
 - Update when: A phase lands, a gated deploy happens, or the command surface changes.
 - Read next: `docs/features/web-remote-access.md`, `docs/plans/web-remote-account-mode.md`,
   `docs/plans/app-codemux-org-hosting.md`, `docs/features/auth.md`
-- Status: MOSTLY LANDED — installer, CLI auth/connect, persistent Linux service, docs, and Ubuntu/Fedora Docker coverage are in-repo; release publication and hosted infrastructure are still gated.
+- Status: MOSTLY LANDED — installer, CLI auth/connect, persistent Linux service, docs, and Ubuntu/Fedora Docker coverage are in-repo, and the hosted infrastructure is now live: `get.codemux.org/install.sh` serves the real installer, `api.codemux.org/health` returns `{"status":"ok"}` with `/api/devices` returning `401` unauthenticated, and `app.codemux.org` serves the hosted client (probed 2026-08-08). An end-to-end from-anywhere round trip against the deployed service has not been re-verified here.
 
 ## Goal
 

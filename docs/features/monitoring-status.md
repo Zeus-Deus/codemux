@@ -365,3 +365,13 @@ when the pane does:
 - Nothing that carries `--status-monitoring` animates. If a future surface adds
   a monitoring affordance, keep it steady — the pulse belongs to `permission`
   alone.
+
+## Screenshots
+
+Dev-mock captures in `docs/features/assets/monitoring-status/`:
+
+- `before-sidebar.png` / `after-sidebar.png` — a watch-loop workspace pinned at
+  the pulsing `Working` dot, versus the calm steady-cyan `Monitoring` dot.
+- `before-chat.png` / `after-chat.png` — the chat pane before and after the
+  docked `MonitoringBar` (reason line + **Stop** button) appears between
+  transcript and composer.
