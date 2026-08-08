@@ -123,8 +123,10 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   rather than re-stamping "now"). A pin suppresses Settle/Snooze actions,
   excludes the workspace from bulk parking and auto-settle, and overrides any
   existing shelf presentation without deleting it. The card eyebrow carries a
-  pin glyph and exposes a direct **Unpin** action on hover/focus; every
-  workspace context menu begins with **Pin workspace** or **Unpin workspace**.
+  static pin marker at rest and a direct **Pin / Unpin** glyph on hover/focus
+  (see "The hover-revealed action cluster" below) — pinning is reachable from
+  every card, not only from a menu; every workspace context menu still begins
+  with **Pin workspace** or **Unpin workspace**.
 - **Card order — newest first, and static** (`compareNewestFirst` in
   `sidebar-inbox.tsx`): within the pinned and normal blocks, cards sort by
   **stored snapshot index, descending**.
@@ -191,10 +193,22 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   happened to end, so chips landed at a different x on every card and the column
   read as ragged. Right-aligning also makes the chip's variable width
   (`#7` vs `#1234`) harmless. The
-  trailing indicator cluster owns the far-right column and reserves a
-  `min-w-[15px]` slot — sized to the *widest* single indicator (the notification
-  pill, not the 13px provider logo) so neither a bare card nor a card showing a
-  different indicator can shift the chip. The invariant is guarded by the
+  trailing indicator cluster owns the far-right column and reserves a slot the
+  **inbox computes once per render and hands to every card**
+  (`metaClusterWidth(maxProviderMarks, anyRunIndicator)` in
+  `sidebar-inbox-card.tsx`): the widest provider-mark count across the visible
+  cards, plus the 12px run indicator if *any* visible card shows one. Reserving
+  per list rather than per card is what keeps the PR column stable — a card with
+  one logo and a card with three would otherwise start their chips at different
+  x positions — while measuring the list rather than a fixed worst case means a
+  sidebar of single-provider workspaces with nothing listening pays no permanent
+  indent for indicators none of its cards show. Its floor is
+  `META_CLUSTER_MIN_WIDTH` (15px), the *widest* single indicator (the
+  notification pill, not the 13px provider logo), so a bare card can't shift the
+  chip either. It is applied as a `min-width`, not a fixed width: this cluster
+  can also carry a remote-host icon and a notification pill, and those are rare
+  and per-card, so they are allowed to push past the reservation rather than
+  make every card pay for them. The invariant is guarded by the
   "meta line alignment" tests in `sidebar-inbox-card.test.tsx`, which assert DOM
   order around the spacer (jsdom does not lay out, so pixels cannot be asserted).
   The blocker line is a fixed string
@@ -203,12 +217,39 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   the agent state — Working (the `AgentOrb`, amber text) /
   Needs you (pulsing red dot) / Monitoring (steady cyan dot, never animated —
   see `docs/features/monitoring-status.md`) / Done · review (green ✓) /
-  elapsed since the workspace last settled into review — and swaps to a
-  **"✓ Settle"** + **"Snooze"** action pair on hover or focus for a normal
-  card, or a direct **"Unpin"** action for a pinned card (CSS-only swap, plus
-  an action-visible
-  state while the Snooze dropdown is open, since Radix portals the menu out of
-  the card and would otherwise lose its own trigger). The selected card
+  elapsed since the workspace last settled into review.
+- **The hover-revealed action cluster.** Hover or focus slides a borderless
+  glyph cluster into the eyebrow's right edge (`row-in`, a 130ms fade + 5px
+  drop; the reveal is CSS `display`, and an element leaving `display: none`
+  restarts its animation, so the ease replays on every hover with no state and
+  no re-render). The actions are, in order: **Pin** (a bare 12px pin glyph,
+  slashed and labeled "Unpin" once the card is pinned), then **Snooze** (a bare
+  12px alarm glyph) and **Settle** (an 11px check + the word, the only action
+  here that keeps its label). All three are transparent and unbordered, muted
+  ink resolving to full foreground on their own hover, and all three
+  `stopPropagation` so filing a card never also navigates into it.
+  - **Pin is unconditional**; Snooze and Settle ride the settle guardrail
+    together, so a working, blocked or already-pinned card reveals the pin
+    glyph and nothing else. Pinning no longer requires the context menu — it
+    is the one action that changes *where* a card lives, so burying it made
+    the list hardest to tame for the users who most needed to. The
+    Pin/Unpin context-menu entries stay.
+  - **The state readout keeps its place** unless Snooze and Settle are actually
+    showing. It yields to the wide pair, not merely to the pointer: a
+    guardrailed card reveals only the narrow pin glyph, which fits beside the
+    readout, so a live agent never trades its status for chrome the user
+    can't act on.
+  - While a card is pinned and *not* revealed, a small static pin marker
+    (11px, muted) sits beside the repo name. It hides under the pointer,
+    because the revealed cluster carries its own pin glyph and showing both
+    would draw two pins on one row.
+  - The cluster is also pinned open by state while the Snooze dropdown is
+    open, since Radix portals the menu out of the card and would otherwise
+    lose its own trigger.
+  - This replaced bordered pill buttons. Three fills and three outlines were
+    too much furniture for a strip meant to read as chrome until aimed at —
+    a hovered card looked busier than one with a live agent.
+- **Card emphasis and recede.** The selected card
   gets a neutral border + clearly lighter fill (selection is lightness, not
   accent color — the sidebar surface is darker than the main pane, so cards
   sit flat/transparent at rest and lift on hover); needs-you cards a
@@ -360,8 +401,14 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   opens the PR without also yanking the main pane onto the workspace. Because it is
   DOM-identity based, any inner interactive element added later is exempt
   automatically. Hover/focus
-  reveals **Un-settle**, which reverses it (the returning card eases back in
-  via the shared `rise-in` keyframe). Settling is **visual only** — nothing is
+  reveals **Un-settle** in the slot the elapsed time occupies at rest, which
+  reverses the settle (the returning card eases back in via the shared
+  `rise-in` keyframe). It is a **borderless icon + word**, matching the cards'
+  action cluster: a settled row is 30px tall and mostly negative space, and a
+  bordered pill inside it read as a second object competing with the row rather
+  than as the row's own affordance. The word stays — this is the one control on
+  the shelf that changes a lifecycle, and an undo arrow alone is too close to
+  "go back" to carry it. Settling is **visual only** — nothing is
   archived, closed, or deleted; a settle still mid-animation is flushed to the
   store on unmount, so collapsing the sidebar mid-gesture doesn't drop it. The
   shelf persists via UI-state key `sidebar.inbox.settled`, pruned when a
@@ -747,6 +794,28 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   agent-chat provider active in that workspace (Claude / Codex / OpenCode) via
   `ProviderLogo` + `getWorkspaceProviders` (pane-status). Terminal-only agent
   panes carry no provider metadata and contribute nothing.
+- **Running-process indicator**: a 12px terminal glyph on the meta line's
+  trailing cluster, *before* the provider marks — green (`--status-open`) and
+  pulsing on a 2s cycle, labeled `Long-running process on :<port>`. It is a
+  deliberately different claim from the eyebrow's agent state: that says
+  whether an *agent* is doing something, this says a dev server or watcher the
+  user started is still holding a port — the thing that is easy to forget and
+  expensive to leave running. Shown whenever the port scan attributed at least
+  one listening port to the workspace.
+  - **Data source**: `appState.detected_ports` (see `docs/features/ports.md`) —
+    no new Tauri command and no backend change; the attribution already exists,
+    it was only reachable via the hover card and the footer's Ports popover.
+  - **Subscribed once, in `sidebar-inbox.tsx`**, and handed to each card as a
+    plain port number. A subscription per row would wake the whole list on
+    every port scan; the reduced form only changes when a workspace gains or
+    loses its first port, so the cards' memo boundary still bails out on an
+    ordinary scan tick. The `detected_ports` case in
+    `sidebar-inbox-delta.test.tsx` pins this.
+  - Ports with `workspace_id: null` (the OS scan reaches processes belonging to
+    no open worktree) are ignored — badging every card for those would make the
+    indicator meaningless. When a workspace holds several ports the **lowest**
+    is named, so the tooltip can't flip as the scanner reorders its results;
+    the full list stays on the hover card.
 - **Status derivation**: agent state comes from `getWorkspaceStatus`
   (pane-status) — covering terminal and Agent Chat panes alike. The **card's**
   idle elapsed label still comes from the non-persisted `sidebar-density-store`

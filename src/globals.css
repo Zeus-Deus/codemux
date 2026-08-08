@@ -719,6 +719,28 @@ body.pane-resizing iframe {
   animation: cm-rise-in 0.2s ease;
 }
 
+/* The sidebar card's hover-revealed action cluster (Pin · Snooze · Settle)
+ * drops into place from just above the eyebrow instead of hard-cutting in.
+ * Deliberately shorter and shallower than `rise-in`: that one announces a row
+ * arriving, this one only softens chrome appearing under the pointer, and
+ * anything longer feels like lag on a control the user is already aiming at.
+ * The cluster is toggled by `display`, and an element leaving `display: none`
+ * restarts its animation — so the reveal replays on every hover with no state
+ * and no re-render. */
+@keyframes cm-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.row-in {
+  animation: cm-row-in 0.13s ease;
+}
+
 /* Live-status text shimmer for the agent-chat streaming marker
  * ("Working…", "Running <tool>…") and the reasoning block header while
  * thinking (design D9 / D5). A soft light band sweeps across the glyphs

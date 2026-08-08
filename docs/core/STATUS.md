@@ -23,7 +23,38 @@ Codemux is past Linux MVP and shipping cross-platform binaries. The workspace sh
 
 Unreleased after `v0.17.1` — five merged PRs (#257–#261), grouped by subsystem
 below. Everything in this block is on `main` and has not shipped in a published
-build:
+build, **except** the first entry, which is in flight on
+`import-workspace-chrome-design` and not yet merged:
+
+- **The inbox card's hover chrome became bare glyphs, and a running process now
+  shows on the card** (Workspace Chrome design handoff, variant 1b — *in
+  flight, not yet merged*). The active card's bordered Settle / Snooze / Unpin
+  pills are **deleted**. Hover or focus now slides a borderless cluster into the
+  eyebrow's right edge (`row-in`, a 130ms fade + 5px drop in `globals.css`):
+  a bare **Pin** glyph on every card, plus a bare **Snooze** glyph and a
+  **✓ Settle** text button on cards that can settle. Pin is unconditional and
+  toggles `setWorkspacePinned` straight from the card, so pinning — the one
+  action that changes where a card lives — no longer requires the context menu
+  (the menu entries stay). The guardrail is unchanged (`canSettle = !pinned &&
+  !working && !permission`), but the **state readout now keeps its place**
+  whenever Settle/Snooze are withheld, so a working or blocked card shows its
+  status *and* a pin glyph instead of trading one for the other. A pinned,
+  unhovered card carries a small static pin marker beside the repo name, which
+  hides under the pointer so the row never draws two pins. The settled shelf's
+  **Un-settle** lost its pill for the same borderless icon + word.
+  **New:** a 12px pulsing green terminal glyph on the meta line marks a
+  **long-running process** (`Long-running process on :<port>`), wired to the
+  existing `appState.detected_ports` attribution — no new Tauri command, no Rust
+  change. It is subscribed **once** in `sidebar-inbox.tsx` and passed down as a
+  port number, so the ports domain still can't wake the card list (the
+  `detected_ports` case in `sidebar-inbox-delta.test.tsx` passes unchanged).
+  The meta line's trailing indicator column is now sized per list render by
+  `metaClusterWidth(maxProviderMarks, anyRunIndicator)` rather than by a flat
+  `min-w-[15px]`, so the PR chip column stays stable across cards that carry
+  different numbers of indicators. No new color tokens: the design's palette
+  maps onto the existing `--status-*` set (its green is already
+  `--status-open`). See `docs/features/sidebar.md` § "The hover-revealed action
+  cluster", § "Running-process indicator".
 
 - **The agent activity indicator is now one orb everywhere** (PR #260, Canvas-3 design handoff, change 1 of 3). The configurable working-indicator glyph (braille / ring / blink / sweep / typing) and its six color swatches are **deleted** — `WorkingIndicator`, `AsciiSpinner`, `sidebar.working_indicator`, and `sidebar.working_indicator_color` are all gone. Every working/running indicator now renders `AgentOrb` (`src/components/ui/agent-orb.tsx`) over the MIT `thinking-orbs` library: sidebar workspace cards, the in-flight turn (the Activity block header, with `StreamingMarker` covering the dead time either side), subagent rows, the docked composer strip, and the workflow/orchestration run headers. Always monochrome — the library inks from `theme="auto"` off the root `dark` class, so no call site passes a color and red stays reserved for state needing a human. Sizes are 20 (inline) and 64 only. A single shared helper, `src/lib/orb-state.ts`, maps the agent's current tool to a state (searching / composing / working / solving / connecting / weaving / listening / breathing, neutral `working` fallback), fed by `src/lib/agent-chat/orb-activity.ts` from tool-call name + input + status the reducer already stamps — no new backend plumbing. Shell tools read their command string, so `git push` reads as connecting and `cargo test` as working. Design rule enforced by tests: **one orb per live thing** — aggregate headers and the composer strip stay neutral, each running row owns its own, and finished rows revert to the flat check. Settings → Appearance → Agents lost both pickers and gained a **Match the orb to the activity** toggle (`agents.orb_match_activity`, default on); off pins every orb to `working`. Migration is a **drop, not a map**: the machine-local settings table is a free-form `Record<string, string>` with no Rust-side schema, so old keys are simply never read and never written back. See `docs/features/agent-chat.md` § "Agent activity orb", `docs/features/sidebar.md`, `docs/features/settings.md`.
 

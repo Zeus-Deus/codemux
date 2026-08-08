@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
   AppStateSnapshot,
   PaneStatus,
+  PortInfoSnapshot,
   SurfaceSnapshot,
   WorkspaceSnapshot,
 } from "@/tauri/types";
@@ -91,6 +92,7 @@ vi.mock("@/stores/hosts-store", () => ({
 let workspaces: WorkspaceSnapshot[] = [];
 let paneStatuses: Record<string, PaneStatus> = {};
 let activeWorkspaceId = "";
+let detectedPorts: PortInfoSnapshot[] = [];
 
 function appStoreState() {
   return {
@@ -98,6 +100,7 @@ function appStoreState() {
       workspaces,
       pane_statuses: paneStatuses,
       active_workspace_id: activeWorkspaceId,
+      detected_ports: detectedPorts,
     } as unknown as AppStateSnapshot,
     homeDir: "/home/u",
     workspacePushPullInFlight: null,
@@ -160,6 +163,7 @@ import {
   shouldAutoSettle,
   MAX_TIMER_DELAY_MS,
 } from "./sidebar-inbox";
+import { META_CLUSTER_MIN_WIDTH } from "./sidebar-inbox-card";
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import {
   __resetSidebarInboxStoreForTests,
@@ -284,6 +288,7 @@ beforeEach(() => {
   workspaces = [];
   paneStatuses = {};
   activeWorkspaceId = "";
+  detectedPorts = [];
   wsCounter = 0;
   hoverCardStatus = {};
 });
@@ -3037,5 +3042,83 @@ describe("SidebarInbox — bulk actions across cards", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Settle (2)")).not.toBeInTheDocument();
     expect(useSidebarInboxStore.getState().settled).toEqual([]);
+  });
+});
+
+describe("SidebarInbox — running-process indicator", () => {
+  function port(overrides: Partial<PortInfoSnapshot>): PortInfoSnapshot {
+    return {
+      port: 3000,
+      pid: 42,
+      process_name: "node",
+      workspace_id: null,
+      label: null,
+      source: null,
+      ...overrides,
+    };
+  }
+
+  it("marks the workspace the port scan attributed a listener to", async () => {
+    const ws = makeWorkspace({ title: "Has a dev server" });
+    workspaces = [ws, makeWorkspace({ title: "Quiet one" })];
+    detectedPorts = [port({ port: 5173, workspace_id: ws.workspace_id })];
+    await flushRender();
+
+    expect(
+      screen.getByRole("img", { name: "Long-running process on :5173" }),
+    ).toBeInTheDocument();
+    // One indicator, on one card — the quiet workspace stays quiet.
+    expect(screen.getAllByRole("img", { name: /Long-running process/ })).toHaveLength(
+      1,
+    );
+  });
+
+  it("ignores ports the scan could not attribute to a workspace", async () => {
+    // The OS scan reaches processes that belong to no open worktree at all.
+    // Badging every card for those would make the indicator meaningless.
+    workspaces = [makeWorkspace({ title: "Only one" })];
+    detectedPorts = [port({ port: 8080, workspace_id: null })];
+    await flushRender();
+
+    expect(
+      screen.queryByRole("img", { name: /Long-running process/ }),
+    ).toBeNull();
+  });
+
+  it("names one stable port when a workspace holds several", async () => {
+    // Which port is named is arbitrary; that it does not flip as the scanner
+    // reorders its results is not. The hover card carries the full list.
+    const ws = makeWorkspace({ title: "Busy" });
+    workspaces = [ws];
+    detectedPorts = [
+      port({ port: 5173, workspace_id: ws.workspace_id }),
+      port({ port: 3000, workspace_id: ws.workspace_id }),
+    ];
+    await flushRender();
+
+    expect(
+      screen.getByRole("img", { name: "Long-running process on :3000" }),
+    ).toBeInTheDocument();
+  });
+
+  it("reserves one trailing column for every card, indicator or not", async () => {
+    // The reservation is per list, not per card: without it the card carrying
+    // the indicator would push its PR chip left of its neighbours'. (A lone
+    // 12px run glyph still fits inside the 15px floor, so the shared value
+    // here IS the floor — what matters is that both cards quote the same one.
+    // The arithmetic that grows it is unit-tested on `metaClusterWidth`.)
+    const ws = makeWorkspace({ title: "Serving" });
+    workspaces = [ws, makeWorkspace({ title: "Not serving" })];
+    detectedPorts = [port({ port: 4173, workspace_id: ws.workspace_id })];
+    const { container } = await flushRender();
+
+    const widths = [...container.querySelectorAll("[data-meta-line]")].map(
+      (line) =>
+        (line.lastElementChild as HTMLElement | null)?.style.minWidth ?? "",
+    );
+    expect(widths).toEqual([
+      `${META_CLUSTER_MIN_WIDTH}px`,
+      `${META_CLUSTER_MIN_WIDTH}px`,
+    ]);
   });
 });
