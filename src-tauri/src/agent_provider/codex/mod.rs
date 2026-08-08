@@ -209,6 +209,7 @@ impl AgentProvider for CodexAgentProvider {
             input.env,
             self.spawn_config(),
             self.event_tx.clone(),
+            input.recorded_usage_baseline,
         )
         .await?;
 

@@ -40,3 +40,59 @@ export function SubsectionHeader({
     </div>
   );
 }
+
+/** Segmented control — a bordered pill of mutually-exclusive options
+ *  with a neutral foreground-filled active segment (the design system's
+ *  "white is the baseline" rule for toggles/selection).
+ *
+ *  Lifted out of `settings-view.tsx` when the Usage section needed the
+ *  same control for its period and metric pickers. Importing it back
+ *  out of the shell would make the two files a cycle — the reason this
+ *  module exists. */
+export function SegmentedControl<T extends string>({
+  value,
+  onChange,
+  options,
+  ariaLabel,
+  size = "md",
+}: {
+  value: T;
+  onChange: (value: T) => void;
+  options: { value: T; label: string }[];
+  ariaLabel?: string;
+  /** `sm` is the in-card variant (the Cost/Tokens metric toggle), which
+   *  sits beside content rather than titling it. */
+  size?: "sm" | "md";
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5"
+    >
+      {options.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "rounded-md font-medium transition-colors",
+              size === "sm"
+                ? "px-2.5 py-0.5 text-[11px]"
+                : "px-3 py-1 text-[12px]",
+              active
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

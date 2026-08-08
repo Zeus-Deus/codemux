@@ -69,6 +69,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         context_window: None,
         fast_mode: false,
         additional_directories: vec![],
+        recorded_usage_baseline: None,
         env: None,
         extra: serde_json::Value::Null,
     }
@@ -1132,6 +1133,7 @@ mod auto_resume {
                 context_window: None,
                 fast_mode: false,
                 additional_directories: vec![],
+                recorded_usage_baseline: None,
                 env: None,
                 extra: Value::Null,
             })

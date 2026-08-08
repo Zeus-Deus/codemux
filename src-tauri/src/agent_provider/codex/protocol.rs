@@ -346,6 +346,56 @@ pub struct AccountInfo {
     pub plan_type: Option<String>,
 }
 
+/// One rate-limit window from `account/rateLimits/*`.
+///
+/// `usedPercent` is already a percent (0–100) — unlike Claude's 0..1
+/// `utilization`. The window's *kind* is not stated; it is inferred from
+/// `windowDurationMins` (see `plan_window_kind`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitWindow {
+    #[serde(default)]
+    pub used_percent: f64,
+    #[serde(default)]
+    pub window_duration_mins: Option<f64>,
+    /// Epoch **seconds** when the window rolls over, when stated.
+    #[serde(default)]
+    pub resets_at: Option<f64>,
+}
+
+/// The full rate-limit picture for the signed-in account.
+///
+/// `primary` is the short rolling window (5h on current plans) and
+/// `secondary` the weekly one. Every field is optional: older
+/// app-servers omit most of it, and a metered API-key account has no
+/// windows at all.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitSnapshot {
+    #[serde(default)]
+    pub limit_name: Option<String>,
+    #[serde(default)]
+    pub primary: Option<RateLimitWindow>,
+    #[serde(default)]
+    pub secondary: Option<RateLimitWindow>,
+}
+
+/// Push payload for `account/rateLimits/updated`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRateLimitsUpdatedParams {
+    #[serde(default)]
+    pub rate_limits: RateLimitSnapshot,
+}
+
+/// Response shape of the `account/rateLimits/read` request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountRateLimitsResponse {
+    #[serde(default)]
+    pub rate_limits: RateLimitSnapshot,
+}
+
 // ---------------------------------------------------------------------------
 // model/list
 // ---------------------------------------------------------------------------
@@ -490,6 +540,10 @@ pub enum NotificationMessage {
     PlanDelta(DeltaParams),
     /// `turn/plan/updated` — complete structured plan replacement.
     TurnPlanUpdated(TurnPlanUpdatedParams),
+    /// `account/rateLimits/updated` — the signed-in account's plan quota
+    /// moved. Account-scoped, not thread-scoped, despite arriving on a
+    /// session's notification stream.
+    AccountRateLimitsUpdated(AccountRateLimitsUpdatedParams),
     /// `item/started` — an item has just been created. The `item.type`
     /// tag indicates whether it's a tool call, reasoning block, etc.
     ItemStarted(ItemEnvelope),
@@ -543,6 +597,7 @@ impl NotificationMessage {
             "item/mcpToolCall/progress" => decode!(McpToolCallProgress),
             "item/plan/delta" => decode!(PlanDelta),
             "turn/plan/updated" => decode!(TurnPlanUpdated),
+            "account/rateLimits/updated" => decode!(AccountRateLimitsUpdated),
             "item/started" => decode!(ItemStarted),
             "item/completed" => decode!(ItemCompleted),
             _ => Self::Unknown {

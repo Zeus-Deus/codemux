@@ -13,14 +13,15 @@ pub mod errors;
 pub mod events;
 pub mod instance;
 pub mod opencode;
+pub mod pricing;
 pub mod provider;
 pub mod types;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
-    child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot,
-    ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,
+    child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
+    PlanAuthMode, PlanUsageWindow, PlanWindowKind, ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,
     SubagentTaskKind, TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus, TurnUsage,
     UserMessageImage, WorkflowPhaseSnapshot, WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
     WATCH_LOOP_TASK_TYPES,
@@ -31,5 +32,5 @@ pub use types::{
     ApprovalDecision, ChatModelInfo, ContextWindowOption, EffortGranularity, ImageInput,
     PermissionModeOption, ProviderCapabilities, ProviderChatCapabilities, ProviderKind,
     ProviderSession, ProviderSessionId, RequestId, SendOutcome, SendTurnInput, SessionStatus,
-    StartSessionInput, ThreadId, TurnId, TurnStartResult,
+    StartSessionInput, ThreadId, TurnId, TurnStartResult, UsageBaseline,
 };

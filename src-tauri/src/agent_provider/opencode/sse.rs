@@ -518,6 +518,7 @@ mod tests {
                 provider_session_id: ProviderSessionId(session_id.to_string()),
                 turn_active: false,
                 context_window_tokens: None,
+                model_cost: None,
             })),
             router: Arc::new(Mutex::new(SseRouter::new(session_id))),
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),

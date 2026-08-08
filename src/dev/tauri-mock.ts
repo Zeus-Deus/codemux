@@ -49,6 +49,8 @@ import {
   mockListDirectory,
   mockReadFile,
   mockWebRemoteEndpoints,
+  mockUsageSummary,
+  mockUsageExportCsv,
   mockWebRemotePairing,
   mockWebRemoteSessions,
   richChatTurnEnvelopes,
@@ -1887,6 +1889,23 @@ const handlers: Record<string, Handler> = {
   get_sync_status: () => ({ syncAvailable: true, authMethod: "github" }),
   sign_out: () => undefined,
   skills_sync_status: () => ({ state: "idle", lastSyncAtMillis: null }),
+  // ── Usage ──
+  // `tzOffsetMinutes` is accepted and ignored: the fixture derives its
+  // buckets from the local `Date` already, so it is local by construction.
+  usage_summary: (args: Args) =>
+    mockUsageSummary(String(args.period ?? "7d")),
+  usage_export_csv: (args: Args) =>
+    mockUsageExportCsv(String(args.period ?? "7d")),
+  // The dev mock has no logs to read; report a plausible scan. The
+  // footer's session count comes from the summary, not from here.
+  usage_scan_cli_logs: () => ({
+    files_scanned: 34,
+    sessions_found: 12,
+    rows_added: 0,
+    sessions_skipped_own: 7,
+    reimported: false,
+  }),
+
   skills_sync_now: () => ({
     pushedCount: 0,
     pulledCount: 0,

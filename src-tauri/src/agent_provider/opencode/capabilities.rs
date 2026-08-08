@@ -240,6 +240,7 @@ mod tests {
             context_window,
             supports_images,
             is_free: false,
+            cost: None,
         }
     }
 
@@ -377,6 +378,7 @@ mod tests {
                     context_window: None,
                     supports_images: false,
                     is_free: false,
+                    cost: None,
                 },
             )],
         );
@@ -448,6 +450,7 @@ mod tests {
                     context_window: None,
                     supports_images: false,
                     is_free: true,
+                    cost: None,
                 },
             )],
         );
@@ -465,6 +468,7 @@ mod tests {
                     context_window: None,
                     supports_images: false,
                     is_free: true,
+                    cost: None,
                 },
             )],
         );
@@ -484,6 +488,7 @@ mod tests {
                     // Copilot is subscription-billed; cost-zero is a
                     // false positive at the wire layer.
                     is_free: true,
+                    cost: None,
                 },
             )],
         );
@@ -504,6 +509,7 @@ mod tests {
                     // because it doesn't track the user's billing
                     // tier. False positive.
                     is_free: true,
+                    cost: None,
                 },
             )],
         );

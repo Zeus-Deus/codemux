@@ -50,6 +50,7 @@ import {
   Sparkles,
   MonitorSmartphone,
   GitPullRequest,
+  ChartColumn,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -142,7 +143,21 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "source_control" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "usage" | "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "source_control" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+
+/** Sections that render in the wide content column instead of the
+ *  shared reading measure.
+ *
+ *  Every other section is a form or prose, where a ~768px measure is
+ *  what keeps it readable on a large monitor. Usage is a dashboard: its
+ *  stacked bar chart, provider lanes, quota meters and per-model rows
+ *  are all laid out to consume horizontal space, and squeezing them into
+ *  the reading column left two thirds of a 2560px window empty. The
+ *  design canvas for the page is a 1320px content area, so the cap sits
+ *  just above that — a max-width rather than a fixed width, so narrower
+ *  windows simply behave as before, and capped rather than fluid so an
+ *  ultrawide monitor doesn't stretch the bars into abstraction. */
+const WIDE_SECTIONS: ReadonlySet<Section> = new Set<Section>(["usage"]);
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -177,6 +192,9 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     { id: "agent", label: "Agent", icon: Bot },
     ...(agentChatEnabled
       ? ([
+          // Usage sits with the other chat-only rows: it reads the
+          // agent-chat usage ledger, which only fills when the GUI is on.
+          { id: "usage", label: "Usage", icon: ChartColumn },
           { id: "permissions", label: "Permissions", icon: ShieldCheck },
           { id: "skills", label: "Skills", icon: BookOpen },
           { id: "mcp", label: "MCP Servers", icon: Server },
@@ -222,7 +240,7 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "interface",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "archive", "git", "source_control", "agent", "permissions", "skills", "mcp",
+  "archive", "git", "source_control", "agent", "usage", "permissions", "skills", "mcp",
   "hosts", "remote_access", "browser", "shortcuts", "notifications",
   "session_restore",
 ];
@@ -232,10 +250,11 @@ import { ArchiveSection } from "./archive-section";
 import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
 import { SourceControlSection } from "./source-control-section";
-import { SubsectionHeader } from "./settings-primitives";
+import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
+import { UsageSection } from "./usage-section";
 import { SkillsSection } from "./skills-section";
 import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { SyncSection } from "./sync-section";
@@ -345,50 +364,6 @@ function FormField({
           {caption}
         </p>
       )}
-    </div>
-  );
-}
-
-/** Segmented control — a bordered pill of mutually-exclusive options
- *  with a neutral foreground-filled active segment (the design system's
- *  "white is the baseline" rule for toggles/selection). */
-function SegmentedControl<T extends string>({
-  value,
-  onChange,
-  options,
-  ariaLabel,
-}: {
-  value: T;
-  onChange: (value: T) => void;
-  options: { value: T; label: string }[];
-  ariaLabel?: string;
-}) {
-  return (
-    <div
-      role="radiogroup"
-      aria-label={ariaLabel}
-      className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5"
-    >
-      {options.map((opt) => {
-        const active = opt.value === value;
-        return (
-          <button
-            key={opt.value}
-            type="button"
-            role="radio"
-            aria-checked={active}
-            onClick={() => onChange(opt.value)}
-            className={cn(
-              "rounded-md px-3 py-1 text-[12px] font-medium transition-colors",
-              active
-                ? "bg-foreground text-background"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {opt.label}
-          </button>
-        );
-      })}
     </div>
   );
 }
@@ -2143,6 +2118,12 @@ export function SettingsView() {
       case "interface":
         return <InterfaceSection />;
 
+      case "usage":
+        // Same defensive guard as Permissions below: the nav row is
+        // hidden when the Agent Chat GUI is off, but a stale URL hash
+        // can still route here.
+        return enableAgentChat ? <UsageSection /> : <InterfaceSection />;
+
       case "permissions":
         // Defensive guard: the nav row is hidden when the Agent Chat
         // GUI is off, but a stale URL hash can still route here.
@@ -2493,7 +2474,12 @@ export function SettingsView() {
 
         {/* Content */}
         <ScrollArea className="flex-1 bg-card">
-          <div className="mx-auto max-w-3xl px-11 pt-8 pb-20">
+          <div
+            className={cn(
+              "mx-auto px-11 pt-8 pb-20",
+              WIDE_SECTIONS.has(activeSection) ? "max-w-[1400px]" : "max-w-3xl",
+            )}
+          >
             {renderSection()}
           </div>
         </ScrollArea>

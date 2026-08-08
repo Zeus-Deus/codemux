@@ -127,6 +127,10 @@ vi.mock("@/tauri/commands", () => ({
   setPresetBarVisible: vi.fn().mockResolvedValue(undefined),
   deletePreset: vi.fn().mockResolvedValue(undefined),
   updatePreset: vi.fn().mockResolvedValue(undefined),
+  // Usage section — needed so switching to it renders rather than
+  // throwing on an undefined command wrapper.
+  usageSummary: vi.fn().mockResolvedValue(null),
+  usageExportCsv: vi.fn().mockResolvedValue(""),
 }));
 
 vi.mock("@/tauri/events", () => ({
@@ -237,6 +241,36 @@ describe("SettingsPanel", () => {
     const terminalButtons = screen.getAllByRole("button", { name: /Terminal/i });
     fireEvent.click(terminalButtons[0]);
     expect(screen.getAllByText("Cursor style").length).toBeGreaterThan(0);
+  });
+
+  it("gives Usage a wide content column and everything else the reading measure", () => {
+    const { container } = render(<SettingsView />);
+
+    // The shell is one tree with a per-section width, so locate the
+    // content wrapper by the padding it always carries.
+    const wrapper = () =>
+      container.querySelector("div.mx-auto.px-11.pt-8.pb-20") as HTMLElement;
+
+    // Default section (Account) is a form — reading measure.
+    expect(wrapper()).toHaveClass("max-w-3xl");
+
+    // Scope every query to THIS render: the file has no per-test
+    // cleanup, so earlier renders are still mounted and a `screen`
+    // lookup would drive one of those instead.
+    const usageButtons = within(container).getAllByRole("button", {
+      name: /^Usage$/i,
+    });
+    fireEvent.click(usageButtons[0]);
+    // Usage is a dashboard — wide column.
+    expect(wrapper()).toHaveClass("max-w-[1400px]");
+    expect(wrapper()).not.toHaveClass("max-w-3xl");
+
+    // Switching away restores the reading measure.
+    const terminalButtons = within(container).getAllByRole("button", {
+      name: /^Terminal$/i,
+    });
+    fireEvent.click(terminalButtons[0]);
+    expect(wrapper()).toHaveClass("max-w-3xl");
   });
 
   it("back button closes settings overlay", () => {

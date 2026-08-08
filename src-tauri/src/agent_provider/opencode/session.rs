@@ -40,7 +40,7 @@ use super::protocol::{
     PermissionRespondRequest, SessionCreateRequest, SessionResponse,
 };
 use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
-use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeProviderEntry};
+use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeModelCost, OpenCodeProviderEntry};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
     OpenCodeUsageState,
@@ -95,6 +95,10 @@ impl OpenCodeSession {
         initial_variant: Option<String>,
         resume_session_id: Option<String>,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+        // Usage state carried over from a previous session object that
+        // used this same OpenCode session id, when there is one. `None`
+        // starts fresh. See `OpenCodeAgentProvider::usage_states`.
+        carried_usage: Option<Arc<Mutex<OpenCodeUsageState>>>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
             if err == "opencode_not_installed" {
@@ -132,6 +136,10 @@ impl OpenCodeSession {
             }
             _ => None,
         };
+        // Captured before `resumed_id` is consumed below: whether this
+        // build readopted an existing OpenCode session decides whether the
+        // carried usage state applies.
+        let did_resume = resumed_id.is_some();
         let session_id = match resumed_id {
             Some(id) => id,
             None => {
@@ -170,6 +178,7 @@ impl OpenCodeSession {
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
             context_window_tokens: None,
+            model_cost: None,
         }));
         // Best-effort: the numeric context window lives only in the
         // upstream provider catalogue, so resolve it off the hot path.
@@ -188,7 +197,12 @@ impl OpenCodeSession {
         // `ensure_live_session` rather than POSTing to a corpse.
         let dead = Arc::new(AtomicBool::new(false));
         let router = Arc::new(Mutex::new(SseRouter::new(session_id.clone())));
-        let usage = Arc::new(Mutex::new(OpenCodeUsageState::default()));
+        // Reuse the carried state when this rebuild readopted the same
+        // OpenCode session id; a genuinely new session starts clean.
+        let usage = match carried_usage {
+            Some(carried) if did_resume => carried,
+            _ => Arc::new(Mutex::new(OpenCodeUsageState::default())),
+        };
         let peer = SsePeer {
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
@@ -248,6 +262,15 @@ impl OpenCodeSession {
     /// Whether the SSE listener has declared this session's server
     /// unreachable (reconnect budget exhausted). A dead session is
     /// treated as absent by the provider so the next send auto-resumes.
+    /// The token-accounting handle this session drives.
+    ///
+    /// Exposed so the provider can key it by OpenCode session id and hand
+    /// it back to a later rebuild that readopts the same id — see
+    /// `OpenCodeAgentProvider::usage_states`.
+    pub fn usage_state(&self) -> Arc<Mutex<OpenCodeUsageState>> {
+        Arc::clone(&self.usage)
+    }
+
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
     }
@@ -439,7 +462,15 @@ impl OpenCodeSession {
         // is a deliberate no-op. Re-publishing the current occupancy
         // without a denominator makes the meter degrade to a bare token
         // count now rather than at the next assistant message.
-        self.event_ctx.lock().await.context_window_tokens = None;
+        {
+            let mut ctx = self.event_ctx.lock().await;
+            ctx.context_window_tokens = None;
+            // The price belongs to the old model too. Dropping it falls
+            // the ledger back to the static table until the re-probe
+            // lands, which is right: an unpriced row is recoverable,
+            // a row billed at another model's rate is not.
+            ctx.model_cost = None;
+        }
         for event in self.usage.lock().await.model_changed(&self.thread_id) {
             let _ = self.event_tx.send(event);
         }
@@ -559,10 +590,38 @@ fn spawn_context_window_probe(
         let Ok(providers) = client.list_models().await else {
             return;
         };
-        if let Some(window) = lookup_context_window(&providers, &model_slug) {
-            event_ctx.lock().await.context_window_tokens = Some(window);
+        let window = lookup_context_window(&providers, &model_slug);
+        let cost = lookup_model_cost(&providers, &model_slug);
+        if window.is_none() && cost.is_none() {
+            return;
+        }
+        let mut ctx = event_ctx.lock().await;
+        if let Some(window) = window {
+            ctx.context_window_tokens = Some(window);
+        }
+        if let Some(cost) = cost {
+            ctx.model_cost = Some(cost);
         }
     });
+}
+
+/// Find the active model's upstream list price in the catalogue.
+///
+/// Mirrors [`lookup_context_window`] — same `provider/model` slug, same
+/// "unknown means leave it alone" contract. `None` when the catalogue
+/// reports no `cost` block, which leaves the ledger on the static
+/// fallback table rather than pricing the model at zero.
+pub(crate) fn lookup_model_cost(
+    providers: &[OpenCodeProviderEntry],
+    model_slug: &str,
+) -> Option<OpenCodeModelCost> {
+    let (provider_id, model_id) = model_slug.split_once('/')?;
+    providers
+        .iter()
+        .find(|p| p.id == provider_id)?
+        .models
+        .get(model_id)
+        .and_then(|m| m.cost)
 }
 
 #[cfg(test)]
@@ -600,6 +659,7 @@ mod tests {
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
             context_window_tokens: None,
+            model_cost: None,
         }));
         let session = Arc::new(OpenCodeSession {
             thread_id: ThreadId("t1".into()),
@@ -897,6 +957,7 @@ mod tests {
             None,
             Some("ses_keep".into()),
             tx,
+            None,
         )
         .await;
 
@@ -1002,11 +1063,16 @@ mod tests {
                 None,
                 &mut usage,
             );
-            assert!(matches!(
-                seeded.as_slice(),
-                [ProviderRuntimeEvent::ContextUsageUpdated { usage, .. }]
-                    if usage.max_tokens == Some(1_000_000)
-            ));
+            // The message also produces a `UsageRecorded` ledger row, so
+            // match on the meter event rather than on a one-element slice.
+            let meter = seeded
+                .iter()
+                .find_map(|e| match e {
+                    ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => Some(usage),
+                    _ => None,
+                })
+                .expect("the parent message seeds the meter");
+            assert_eq!(meter.max_tokens, Some(1_000_000));
         }
         while rx.try_recv().is_ok() {}
 
@@ -1044,6 +1110,7 @@ mod tests {
                 context_window: Some(200_000),
                 supports_images: false,
                 is_free: false,
+                cost: None,
             },
         );
         models.insert(
@@ -1056,6 +1123,7 @@ mod tests {
                 context_window: None,
                 supports_images: false,
                 is_free: false,
+                cost: None,
             },
         );
         vec![OpenCodeProviderEntry {
