@@ -3351,11 +3351,11 @@ inside `AgentOrb`, so no call site can opt out of it.
 ## Sidebar status indicators
 
 Chat sessions publish into the same `pane_statuses` snapshot the left
-sidebar reads, so a chat workspace shows the working orb / red
-needs-input pulse / green ready-for-review dot exactly like a terminal
+sidebar reads, so a chat workspace shows the static amber working mark / red
+needs-input pulse / green ready-for-review mark exactly like a terminal
 agent (previously chat panes showed nothing). `pane_statuses` is a
-five-value enum carrying **no tool name**, which is why a sidebar card's
-orb is deliberately neutral while a thread's is activity-matched. `forward_event` in
+five-value enum carrying **no tool name**, which is why a sidebar card uses a
+static lifecycle mark while a thread's orb is activity-matched. `forward_event` in
 `commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
 `PaneStatus` (`map_event_to_pane_status`) and writes it through
 `AppStateStore::set_pane_status_by_thread`, which resolves the
@@ -3386,7 +3386,7 @@ per-thread `ThreadSubagentState` (running `subagent_id`s + a
 (`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
 `Review` only when no subagents are tracked — otherwise it *holds
 `Working`* and marks `review_pending`, and the deferred `Review` fires
-when the last subagent goes terminal. The working orb therefore
+when the last subagent goes terminal. The working mark therefore
 persists until the turn **and** all tracked subagents finish, matching the
 still-running `SubagentsCard` in the drill-in.
 
