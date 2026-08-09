@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Terminal } from "lucide-react";
 import {
   HoverCard,
   HoverCardContent,
@@ -177,6 +178,10 @@ export function WorkspaceHoverCardBody({
         (p) => p.workspace_id === workspace.workspace_id,
       ),
     [detectedPorts, workspace.workspace_id],
+  );
+  const runningProcessCount = useMemo(
+    () => new Set(ports.map((port) => port.pid)).size,
+    [ports],
   );
   const statusSince = useSidebarDensityStore(
     (s) => s.statusSince[workspace.workspace_id],
@@ -373,6 +378,24 @@ export function WorkspaceHoverCardBody({
         {workspace.notifications_muted && (
           <DetailRow label="Notifications" value="muted" muted />
         )}
+        {runningProcessCount > 0 && (
+          <DetailRow
+            label={runningProcessCount === 1 ? "Process" : "Processes"}
+            value={
+              <span
+                aria-label={`${runningProcessCount} running ${runningProcessCount === 1 ? "process" : "processes"}`}
+                className="inline-flex items-center justify-end gap-1.5 text-status-open"
+              >
+                <Terminal
+                  aria-hidden="true"
+                  className="size-3 shrink-0 animate-pulse"
+                  strokeWidth={1.7}
+                />
+                <span>{runningProcessCount} running</span>
+              </span>
+            }
+          />
+        )}
       </div>
 
       {/* Real path on disk, last: the least-scannable line, and the one users
@@ -408,7 +431,7 @@ function DetailRow({
   muted,
 }: {
   label: string;
-  value: string;
+  value: React.ReactNode;
   /** Explicit tone class for the value (warning/success/PR-state).
    *  Falls back to `muted` when omitted. */
   valueClassName?: string;
