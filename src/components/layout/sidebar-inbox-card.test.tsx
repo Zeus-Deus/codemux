@@ -70,6 +70,7 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
 // Late imports so the mocks above apply.
 import { SidebarInboxCard } from "./sidebar-inbox-card";
 import { activateWorkspace } from "@/tauri/commands";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 
 const HOUR = 3_600_000;
 
@@ -140,6 +141,12 @@ function renderCard(overrides: Partial<CardProps> = {}) {
 
 beforeEach(() => {
   vi.mocked(activateWorkspace).mockClear();
+  useSidebarDensityStore.setState({
+    statusSince: {},
+    settledAt: {},
+    lastSeenAt: {},
+    workHistory: {},
+  });
 });
 afterEach(cleanup);
 
@@ -456,6 +463,30 @@ describe("SidebarInboxCard — memo boundary", () => {
     expect(
       (SidebarInboxCard as unknown as { $$typeof?: symbol }).$$typeof,
     ).toBe(Symbol.for("react.memo"));
+  });
+});
+
+describe("SidebarInboxCard — working duration", () => {
+  it("shows the elapsed working time beside the status", () => {
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "working", at: 0 } },
+    });
+
+    renderCard({ status: "working", now: 12 * 60_000 });
+
+    expect(screen.getByRole("status")).toHaveTextContent("Working");
+    expect(screen.getByText("12m")).toHaveClass("font-mono", "tabular-nums");
+    expect(screen.getByText("12m")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("does not reuse a timestamp from another agent state", () => {
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "permission", at: 0 } },
+    });
+
+    renderCard({ status: "working", now: 12 * 60_000 });
+
+    expect(screen.queryByText("12m")).not.toBeInTheDocument();
   });
 });
 

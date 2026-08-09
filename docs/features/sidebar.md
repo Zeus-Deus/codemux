@@ -763,14 +763,19 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   grouping setting was removed with the tree.
 - **Working indicator**: a working card shows the shared **agent orb**
   (`src/components/ui/agent-orb.tsx`, wrapping the `thinking-orbs` library) in
-  place of its leading icon. It is always monochrome — the library inks white
-  on dark and black on light — so it never competes with the accent, and red
-  stays reserved for cards that need a human. The orb is **neutral here on
-  purpose**: the sidebar reads `pane_statuses`, a five-value enum carrying no
-  tool name, so a card can honestly say "something is alive" but not what. The
-  activity-matched states appear where the tool is actually visible (the thread
-  and its subagents — see `docs/features/agent-chat.md`). This replaced the
-  configurable glyph picker: `sidebar.working_indicator` (braille / ring /
+  place of its leading icon. The `Working` label is followed by a compact,
+  tabular elapsed value (`42s`, `12m`, `1h12m`) derived from the card's
+  client-observed working transition and advanced by the sidebar's shared
+  coarse clock. Only the stable `Working` label is announced as live status;
+  the ticking value is presentation-only so assistive technology is not
+  interrupted on every update. The orb is always monochrome — the library
+  inks white on dark and black on light — so it never competes with the accent,
+  and red stays reserved for cards that need a human. The orb is **neutral here
+  on purpose**: the sidebar reads `pane_statuses`, a five-value enum carrying
+  no tool name, so a card can honestly say "something is alive" but not what.
+  The activity-matched states appear where the tool is actually visible (the
+  thread and its subagents — see `docs/features/agent-chat.md`). This replaced
+  the configurable glyph picker: `sidebar.working_indicator` (braille / ring /
   blink / sweep / typing) and `sidebar.working_indicator_color` are **deleted**,
   along with `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on
   read, not migrated — the settings table is free-form key/value, so a leftover
