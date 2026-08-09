@@ -59,6 +59,11 @@ export function AppShell() {
     () => parseCustomThemes(customThemePayloads),
     [customThemePayloads],
   );
+  // Both stores must have answered before the synced theme id means anything:
+  // until then `syncedThemeId` is the DEFAULT_SETTINGS placeholder ("default")
+  // and `legacyPalette` is undefined, so acting on either would be acting on a
+  // value the user never chose.
+  const appearanceReady = settingsLoaded && !syncedLoading;
   const effectiveThemeId =
     legacyPalette === "warm" &&
     (syncedThemeId === "system" || syncedThemeId === "dark" || syncedThemeId === "default")
@@ -73,22 +78,36 @@ export function AppShell() {
     useSettingsStore.getState().load();
   }, []);
 
-  // Layout effect keeps the first React paint on the same variables the
-  // inline boot script chose, then swaps atomically if synced settings differ.
+  // The inline boot script already painted the last applied theme, so until the
+  // stores load there is nothing to do: applying here would repaint the shell
+  // to Graphite and — because `applyTheme` persists by default — overwrite the
+  // boot shadow with it, so a crash (or a failed load) during that window would
+  // open the *next* launch on Graphite too. Density is a layout attribute, not
+  // a color, and stays unconditional.
   useLayoutEffect(() => {
     const root = document.documentElement;
-    applyTheme(activeTheme, { animate: settingsLoaded && !syncedLoading });
+    if (appearanceReady) applyTheme(activeTheme);
     delete root.dataset.pal;
     root.dataset.density = density;
-  }, [activeTheme, density, settingsLoaded, syncedLoading]);
+  }, [activeTheme, density, appearanceReady]);
 
   // One-time migration from the machine-local Cool/Warm axis to the unified,
-  // synced theme id. Only an explicitly stored legacy value participates.
+  // synced theme id. Only an explicitly stored legacy value participates, and
+  // only once the real settings are in hand — reading the placeholder id would
+  // stamp "warm" over whatever theme the account actually holds. The local key
+  // is rewritten as soon as the synced write lands, which both retires the
+  // `default → warm` display mapping above and stops the migration from firing
+  // again the next time the user deliberately picks Graphite.
   useEffect(() => {
+    if (!appearanceReady) return;
     if (legacyPalette !== "warm") return;
     if (syncedThemeId !== "system" && syncedThemeId !== "dark" && syncedThemeId !== "default") return;
-    updateSyncedSetting("appearance", "theme", "warm").catch(console.error);
-  }, [legacyPalette, syncedThemeId, updateSyncedSetting]);
+    updateSyncedSetting("appearance", "theme", "warm")
+      .then(() => {
+        useSettingsStore.getState().set("appearance.palette", "cool");
+      })
+      .catch(console.error);
+  }, [appearanceReady, legacyPalette, syncedThemeId, updateSyncedSetting]);
 
   useWorktreeIncludeToast();
 

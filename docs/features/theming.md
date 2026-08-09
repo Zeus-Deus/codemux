@@ -20,6 +20,24 @@ Applying a theme writes namespaced `--cm-theme-*` variables and a `data-theme-id
 
 The active theme and custom theme payloads are synced settings. A machine-local terminal preference can choose either the app palette or the operating-system terminal palette. One module-level syntax-theme store feeds CodeMirror, Shiki, and xterm, avoiding duplicate native theme listeners.
 
+### Activation waits for the stores
+
+`app-shell.tsx` applies the synced theme only once **both** settings stores have
+loaded. Before that, the synced store still holds its `DEFAULT_SETTINGS`
+placeholder (`appearance.theme: "default"`), and applying it would both repaint
+away from what the boot script just painted and — since `applyTheme` persists by
+default — overwrite the boot shadow with Graphite, so a crash or a failed load
+during that window would carry the wrong theme into the next launch. Doing
+nothing is correct: the boot script has already painted. Density is a layout
+attribute rather than a color and is written unconditionally.
+
+The legacy machine-local Cool/Warm axis migrates on the same gate, and exactly
+once: an explicitly stored `appearance.palette: "warm"` is mapped to the synced
+`warm` theme, and the local key is rewritten to `cool` as soon as that write
+lands. Retiring the key is what ends the migration — it also retires the
+`default → warm` display mapping, so a legacy-warm user who later picks Graphite
+keeps it instead of being rewritten back to Warm Stone on every render.
+
 ### Where the UI lives
 
 - **Picking** — the command palette's Themes group. Highlight previews

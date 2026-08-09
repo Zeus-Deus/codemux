@@ -30,10 +30,13 @@ checkout behavior and has not shipped in a published build:
   JSON/shadcn/VS Code import, file or paste input, export, preview, and
   deletion. A complete semantic role + ANSI schema is applied atomically
   through namespaced root variables; a validated boot shadow runs before
-  CSS/React to prevent a default-theme flash. Selected and custom themes sync,
-  an explicit legacy warm preference migrates, and one shared syntax store
-  drives xterm, CodeMirror, and Shiki in app or system mode. See
-  `docs/features/theming.md`.
+  CSS/React to prevent a default-theme flash — React re-applies only once both
+  settings stores have loaded, so the placeholder default is never painted or
+  persisted over the shadow. Selected and custom themes sync, an explicit
+  legacy warm preference migrates exactly once (the machine-local key is
+  retired on the first successful write, so picking Graphite afterwards
+  sticks), and one shared syntax store drives xterm, CodeMirror, and Shiki in
+  app or system mode. See `docs/features/theming.md`.
 
 - **The Theme Studio became a modal in Appearance** (Theming design handoff,
   turn 4). Three things were wrong: the palette action navigated you out of
