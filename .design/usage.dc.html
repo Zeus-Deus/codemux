@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --sans:'DM Sans',ui-sans-serif,system-ui,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --bg:oklch(0.163 0.004 59); --bg2:oklch(0.198 0.005 59); --card:oklch(0.230 0.005 59);
+    --bd:oklch(0.303 0.006 59); --bd-soft:oklch(0.256 0.005 59);
+    --fg:oklch(0.972 0.003 70); --fg2:oklch(0.735 0.007 59); --fg3:oklch(0.578 0.008 59);
+    --primary:oklch(0.935 0.006 75); --primary-fg:oklch(0.205 0.01 60);
+    --ember:oklch(0.705 0.152 47);
+    --open:oklch(0.74 0.14 156); --silver:oklch(0.86 0.004 250); --gold:oklch(0.79 0.12 84);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+  html,body{margin:0}
+  body{font-family:var(--sans);background:#e8e6e1;-webkit-text-size-adjust:100%;text-size-adjust:100%;}
+  .sc-interp{font-size:inherit;font-weight:inherit;line-height:inherit;color:inherit}
+  a{color:#8a4a2c;text-decoration:underline}
+  a:hover{color:#5b2f1a}
+</style>
+<template id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="18" fill="#1a1815"/><g fill="#d97757"><rect x="24" y="52" width="10" height="26" rx="3"/><rect x="42" y="38" width="10" height="40" rx="3"/><rect x="60" y="26" width="10" height="52" rx="3"/></g></svg></template>
+</helmet>
+
+<section style="width:2794px;padding:40px 40px 10px;display:flex;flex-direction:column;gap:22px;">
+  <div style="max-width:960px;display:flex;flex-direction:column;gap:8px;">
+    <h1 style="margin:0;font-size:23px;font-weight:700;letter-spacing:-.02em;color:#1c1a17;">Merged — cards that hold lanes</h1>
+    <p style="margin:0;font-size:13.5px;line-height:1.6;color:#5b564e;text-wrap:pretty;">The card idiom stays, because the rest of Settings uses it. What goes away is the <em>grid</em> of boxes: nine surfaces become two. One overview card carries the four numbers and the chart; one provider card carries 1b's lanes, with the plan meters folded into the row they belong to instead of sitting in cards of their own.</p>
+  </div>
+
+  <div style="display:flex;align-items:center;gap:9px;">
+    <span style="font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#8a857c;">Turn 2</span>
+    <span style="flex:1;height:1px;background:rgba(0,0,0,.14);"></span>
+  </div>
+
+  <div id="2a" style="display:flex;flex-direction:column;gap:10px;width:1320px;flex:none;">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:#fff;background:#1c1a17;padding:2px 7px;border-radius:5px;">2a</span>
+      <span style="font-size:13px;font-weight:600;color:#3a352e;">Two cards, lanes inside</span>
+    </div>
+
+    <div style="border-radius:14px;border:1px solid rgba(0,0,0,.24);box-shadow:0 18px 46px rgba(0,0,0,.22);overflow:hidden;background:var(--bg);display:flex;font-family:var(--sans);color:var(--fg);">
+
+      <nav style="width:212px;flex:none;background:oklch(0.185 0.004 59);border-right:1px solid var(--bd-soft);padding:18px 12px;display:flex;flex-direction:column;gap:18px;">
+        <div style="display:flex;align-items:center;gap:8px;padding:0 6px 2px;">
+          <span style="width:8px;height:8px;border-radius:2px;background:var(--ember);"></span>
+          <span style="font-size:13px;font-weight:700;letter-spacing:-.01em;">Settings</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">AI Tools</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Providers</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;font-weight:600;color:var(--fg);background:oklch(0.255 0.006 56);">Usage</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Permissions</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Skills</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">MCP Servers</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">Workspace</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Devices</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Source control</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">App</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Appearance</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Sync</span>
+        </div>
+      </nav>
+
+      <div style="flex:1;min-width:0;padding:24px 28px 28px;display:flex;flex-direction:column;gap:16px;">
+
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:20px;">
+          <div style="display:flex;flex-direction:column;gap:5px;min-width:0;">
+            <h2 style="margin:0;font-size:17px;font-weight:700;letter-spacing:-.015em;">Usage</h2>
+            <p style="margin:0;font-size:12px;color:var(--fg3);">{{ rangeLabel }} · last synced {{ syncedAt }}</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex:none;">
+            <div style="display:flex;padding:2px;border-radius:9px;background:var(--bg2);border:1px solid var(--bd-soft);">
+              <sc-for list="{{ periods }}" as="p" hint-placeholder-count="3">
+                <button type="button" onClick="{{ p.pick }}" style="border:0;cursor:pointer;font-family:var(--sans);height:26px;padding:0 12px;border-radius:7px;font-size:11.5px;font-weight:600;background:{{ p.bg }};color:{{ p.fg }};">{{ p.label }}</button>
+              </sc-for>
+            </div>
+            <button type="button" onClick="{{ exportCsv }}" style="cursor:pointer;height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--fg2);font-family:var(--sans);font-size:11.5px;font-weight:600;">Export CSV</button>
+          </div>
+        </div>
+
+        <div style="border:1px solid var(--bd-soft);border-radius:13px;background:var(--bg2);padding:20px 20px 15px;display:flex;flex-direction:column;gap:18px;">
+          <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:24px;">
+            <div style="display:flex;align-items:flex-end;gap:44px;">
+              <sc-for list="{{ heroStats }}" as="h" hint-placeholder-count="4">
+                <div style="display:flex;flex-direction:column;gap:6px;">
+                  <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">{{ h.label }}</span>
+                  <span style="font-size:27px;font-weight:700;letter-spacing:-.035em;line-height:1;color:{{ h.tone }};">{{ h.value }}</span>
+                  <span style="font-size:11px;color:var(--fg3);">{{ h.note }}</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="display:flex;padding:2px;border-radius:9px;background:var(--bg);border:1px solid var(--bd-soft);flex:none;">
+              <sc-for list="{{ metrics }}" as="m" hint-placeholder-count="2">
+                <button type="button" onClick="{{ m.pick }}" style="border:0;cursor:pointer;font-family:var(--sans);height:25px;padding:0 11px;border-radius:7px;font-size:11px;font-weight:600;background:{{ m.bg }};color:{{ m.fg }};">{{ m.label }}</button>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:baseline;gap:12px;border-top:1px solid var(--bd-soft);padding-top:13px;">
+            <span style="font-size:12px;color:var(--fg3);">{{ readoutLabel }}</span>
+            <span style="font-size:15px;font-weight:700;letter-spacing:-.02em;">{{ readoutValue }}</span>
+            <span style="font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ readoutBreakdown }}</span>
+          </div>
+
+          <div style="display:flex;align-items:flex-end;gap:{{ barGap }}px;height:150px;padding:0 2px;" onMouseLeave="{{ clearHover }}">
+            <sc-for list="{{ bars }}" as="b" hint-placeholder-count="30">
+              <div onMouseEnter="{{ b.hover }}" style="flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;gap:1.5px;cursor:default;opacity:{{ b.dim }};">
+                <sc-for list="{{ b.segs }}" as="s" hint-placeholder-count="2">
+                  <div style="width:100%;border-radius:3px;height:{{ s.h }}px;background:{{ s.fill }};"></div>
+                </sc-for>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;">
+            <div style="display:flex;align-items:center;gap:16px;">
+              <sc-for list="{{ legend }}" as="l" hint-placeholder-count="3">
+                <span style="display:inline-flex;align-items:center;gap:7px;font-size:11.5px;color:var(--fg2);">
+                  <span style="width:9px;height:9px;border-radius:3px;background:{{ l.fill }};"></span>
+                  <span style="font-weight:600;color:var(--fg);">{{ l.name }}</span>
+                  <span style="font-family:var(--mono);font-size:11px;color:var(--fg3);">{{ l.value }}</span>
+                </span>
+              </sc-for>
+            </div>
+            <span style="font-family:var(--mono);font-size:10.5px;color:var(--fg3);">{{ axisNote }}</span>
+          </div>
+        </div>
+
+        <div style="border:1px solid var(--bd-soft);border-radius:13px;background:var(--bg2);padding:4px 20px;">
+          <sc-for list="{{ lanes }}" as="l" hint-placeholder-count="3">
+            <div style="border-top:1px solid var(--bd-soft);">
+              <div onClick="{{ l.toggle }}" style="display:flex;align-items:center;gap:24px;padding:17px 0;cursor:pointer;">
+                <span style="width:196px;flex:none;display:flex;align-items:center;gap:11px;min-width:0;">
+                  <img src="{{ l.logo }}" alt="" style="width:19px;height:19px;object-fit:contain;display:block;flex:none;">
+                  <span style="display:flex;flex-direction:column;gap:3px;min-width:0;">
+                    <span style="font-size:13.5px;font-weight:600;letter-spacing:-.01em;">{{ l.name }}</span>
+                    <span style="font-size:10.5px;color:var(--fg3);">{{ l.plan }}</span>
+                  </span>
+                </span>
+                <span style="flex:1;min-width:0;display:flex;align-items:flex-end;gap:2px;height:38px;">
+                  <sc-for list="{{ l.spark }}" as="s" hint-placeholder-count="30">
+                    <span style="flex:1;min-width:0;border-radius:2px;height:{{ s.h }}px;background:{{ s.fill }};"></span>
+                  </sc-for>
+                </span>
+                <span style="width:186px;flex:none;display:flex;flex-direction:column;gap:8px;">
+                  <sc-for list="{{ l.meters }}" as="q" hint-placeholder-count="2">
+                    <span style="display:flex;align-items:center;gap:9px;">
+                      <span style="font-size:10.5px;color:var(--fg3);width:34px;flex:none;">{{ q.label }}</span>
+                      <span style="flex:1;height:4px;border-radius:99px;background:oklch(0.27 0.005 59);overflow:hidden;display:block;">
+                        <span style="display:block;height:100%;border-radius:99px;width:{{ q.pct }}%;background:{{ q.tone }};"></span>
+                      </span>
+                      <span style="font-family:var(--mono);font-size:10.5px;color:var(--fg2);width:30px;text-align:right;flex:none;">{{ q.pctText }}</span>
+                    </span>
+                  </sc-for>
+                  <span style="font-size:10.5px;color:var(--fg3);">{{ l.meterNote }}</span>
+                </span>
+                <span style="width:92px;flex:none;text-align:right;display:flex;flex-direction:column;gap:3px;">
+                  <span style="font-family:var(--mono);font-size:14px;">{{ l.tokens }}</span>
+                  <span style="font-size:10.5px;color:var(--fg3);">tokens</span>
+                </span>
+                <span style="width:112px;flex:none;text-align:right;display:flex;flex-direction:column;gap:3px;">
+                  <span style="font-family:var(--mono);font-size:18px;font-weight:600;letter-spacing:-.02em;color:{{ l.costTone }};">{{ l.cost }}</span>
+                  <span style="font-size:10.5px;color:var(--fg3);">{{ l.costNote }}</span>
+                </span>
+                <span style="width:14px;flex:none;text-align:right;font-size:10px;color:var(--fg3);">{{ l.caret }}</span>
+              </div>
+              <sc-if value="{{ l.open }}" hint-placeholder-val="{{ false }}">
+                <div style="padding:0 0 18px 222px;display:flex;flex-direction:column;">
+                  <sc-for list="{{ l.models }}" as="m" hint-placeholder-count="3">
+                    <div style="display:flex;align-items:center;gap:24px;padding:7px 0;border-top:1px solid oklch(0.235 0.005 59);">
+                      <span style="flex:1;min-width:0;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.id }}</span>
+                      <span style="width:186px;flex:none;font-size:10.5px;color:var(--fg3);">{{ m.share }}</span>
+                      <span style="width:92px;flex:none;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.tokens }}</span>
+                      <span style="width:112px;flex:none;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.cost }}</span>
+                      <span style="width:14px;flex:none;"></span>
+                    </div>
+                  </sc-for>
+                </div>
+              </sc-if>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:16px;padding:0 2px;">
+          <span style="flex:1;min-width:0;font-size:11.5px;line-height:1.5;color:var(--fg3);"><span style="color:var(--fg2);font-weight:600;">Terminal-launched CLI sessions.</span> A PTY tab streams no usage events. Codemux can read the CLIs' own logs — <span style="font-family:var(--mono);font-size:11px;">~/.claude/projects</span>, <span style="font-family:var(--mono);font-size:11px;">~/.codex/sessions</span> — and fold them in.</span>
+          <span style="display:flex;align-items:center;gap:10px;flex:none;">
+            <span style="font-family:var(--mono);font-size:11px;color:var(--fg3);">{{ terminalNote }}</span>
+            <button type="button" onClick="{{ toggleTerminal }}" style="cursor:pointer;border:0;padding:0;width:38px;height:22px;border-radius:99px;background:{{ terminalTrack }};display:flex;align-items:center;">
+              <span style="width:16px;height:16px;border-radius:99px;background:var(--fg);margin-left:{{ terminalKnob }}px;transition:margin-left .16s ease;"></span>
+            </button>
+          </span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<section style="width:2794px;padding:20px 40px 60px;display:flex;flex-direction:column;gap:22px;">
+  <div style="display:flex;align-items:center;gap:9px;">
+    <span style="font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#8a857c;">Turn 1</span>
+    <span style="flex:1;height:1px;background:rgba(0,0,0,.14);"></span>
+  </div>
+  <div style="max-width:960px;display:flex;flex-direction:column;gap:8px;">
+    <h1 style="margin:0;font-size:23px;font-weight:700;letter-spacing:-.02em;color:#1c1a17;">Settings → Usage</h1>
+    <p style="margin:0;font-size:13.5px;line-height:1.6;color:#5b564e;text-wrap:pretty;">One dashboard for the three chat providers Codemux drives itself — Claude, Codex, OpenCode. Plan-covered usage and metered API spend stay in separate rails, because summing them would invent a number neither bill contains; the plan rail instead prices what the subscription absorbed. Terminal-launched CLI sessions are reconciled separately, off by default.</p>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:34px;align-items:flex-start;">
+
+  <div id="1a" style="display:flex;flex-direction:column;gap:10px;width:1320px;flex:none;">
+  <div style="display:flex;align-items:center;gap:10px;">
+    <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:#fff;background:#1c1a17;padding:2px 7px;border-radius:5px;">1a</span>
+    <span style="font-size:13px;font-weight:600;color:#3a352e;">Cards — aggregate first, stacked chart</span>
+  </div>
+
+  <div style="border-radius:14px;border:1px solid rgba(0,0,0,.24);box-shadow:0 18px 46px rgba(0,0,0,.22);overflow:hidden;background:var(--bg);display:flex;font-family:var(--sans);color:var(--fg);">
+
+    <nav style="width:212px;flex:none;background:oklch(0.185 0.004 59);border-right:1px solid var(--bd-soft);padding:18px 12px;display:flex;flex-direction:column;gap:18px;">
+      <div style="display:flex;align-items:center;gap:8px;padding:0 6px 2px;">
+        <span style="width:8px;height:8px;border-radius:2px;background:var(--ember);"></span>
+        <span style="font-size:13px;font-weight:700;letter-spacing:-.01em;">Settings</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">AI Tools</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Providers</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;font-weight:600;color:var(--fg);background:oklch(0.255 0.006 56);">Usage</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Permissions</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Skills</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">MCP Servers</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">Workspace</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Devices</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Source control</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">App</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Appearance</span>
+        <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Sync</span>
+      </div>
+    </nav>
+
+    <div style="flex:1;min-width:0;padding:24px 28px 30px;display:flex;flex-direction:column;gap:20px;">
+
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:20px;">
+        <div style="display:flex;flex-direction:column;gap:5px;min-width:0;">
+          <h2 style="margin:0;font-size:17px;font-weight:700;letter-spacing:-.015em;">Usage</h2>
+          <p style="margin:0;font-size:12px;color:var(--fg3);">{{ rangeLabel }} · last synced {{ syncedAt }}</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex:none;">
+          <div style="display:flex;padding:2px;border-radius:9px;background:var(--bg2);border:1px solid var(--bd-soft);">
+            <sc-for list="{{ periods }}" as="p" hint-placeholder-count="3">
+              <button type="button" onClick="{{ p.pick }}" style="border:0;cursor:pointer;font-family:var(--sans);height:26px;padding:0 12px;border-radius:7px;font-size:11.5px;font-weight:600;background:{{ p.bg }};color:{{ p.fg }};">{{ p.label }}</button>
+            </sc-for>
+          </div>
+          <button type="button" onClick="{{ exportCsv }}" style="cursor:pointer;height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--fg2);font-family:var(--sans);font-size:11.5px;font-weight:600;" style-hover="border-color:var(--fg3);color:var(--fg);">Export CSV</button>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+        <div style="border:1px solid var(--bd-soft);border-radius:12px;background:var(--bg2);padding:14px 15px;display:flex;flex-direction:column;gap:7px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">Metered API spend</span>
+          <span style="font-size:25px;font-weight:700;letter-spacing:-.03em;line-height:1;">{{ apiSpend }}</span>
+          <span style="font-size:11.5px;color:{{ deltaColor }};font-weight:600;">{{ apiDelta }}</span>
+        </div>
+        <div style="border:1px solid var(--bd-soft);border-radius:12px;background:var(--bg2);padding:14px 15px;display:flex;flex-direction:column;gap:7px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">Covered by plans</span>
+          <span style="font-size:25px;font-weight:700;letter-spacing:-.03em;line-height:1;color:var(--ember);">{{ planValue }}</span>
+          <span style="font-size:11.5px;color:var(--fg3);">list price on {{ planCost }} of subs</span>
+        </div>
+        <div style="border:1px solid var(--bd-soft);border-radius:12px;background:var(--bg2);padding:14px 15px;display:flex;flex-direction:column;gap:7px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">Tokens</span>
+          <span style="font-size:25px;font-weight:700;letter-spacing:-.03em;line-height:1;">{{ totalTokens }}</span>
+          <span style="font-size:11.5px;color:var(--fg3);">{{ cacheShare }} served from cache</span>
+        </div>
+        <div style="border:1px solid var(--bd-soft);border-radius:12px;background:var(--bg2);padding:14px 15px;display:flex;flex-direction:column;gap:7px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">Chat sessions</span>
+          <span style="font-size:25px;font-weight:700;letter-spacing:-.03em;line-height:1;">{{ sessionCount }}</span>
+          <span style="font-size:11.5px;color:var(--fg3);">across {{ workspaceCount }} workspaces</span>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--bd-soft);border-radius:13px;background:var(--bg2);padding:18px 18px 14px;display:flex;flex-direction:column;gap:16px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;">
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:0;">
+            <span style="font-size:12px;color:var(--fg3);">{{ readoutLabel }}</span>
+            <div style="display:flex;align-items:baseline;gap:12px;">
+              <span style="font-size:22px;font-weight:700;letter-spacing:-.025em;">{{ readoutValue }}</span>
+              <span style="font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ readoutBreakdown }}</span>
+            </div>
+          </div>
+          <div style="display:flex;padding:2px;border-radius:9px;background:var(--bg);border:1px solid var(--bd-soft);flex:none;">
+            <sc-for list="{{ metrics }}" as="m" hint-placeholder-count="2">
+              <button type="button" onClick="{{ m.pick }}" style="border:0;cursor:pointer;font-family:var(--sans);height:25px;padding:0 11px;border-radius:7px;font-size:11px;font-weight:600;background:{{ m.bg }};color:{{ m.fg }};">{{ m.label }}</button>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:flex-end;gap:{{ barGap }}px;height:172px;padding:0 2px;" onMouseLeave="{{ clearHover }}">
+          <sc-for list="{{ bars }}" as="b" hint-placeholder-count="30">
+            <div onMouseEnter="{{ b.hover }}" style="flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;gap:1.5px;cursor:default;opacity:{{ b.dim }};">
+              <sc-for list="{{ b.segs }}" as="s" hint-placeholder-count="2">
+                <div style="width:100%;border-radius:3px;height:{{ s.h }}px;background:{{ s.fill }};"></div>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;border-top:1px solid var(--bd-soft);padding-top:11px;">
+          <div style="display:flex;align-items:center;gap:16px;">
+            <sc-for list="{{ legend }}" as="l" hint-placeholder-count="3">
+              <span style="display:inline-flex;align-items:center;gap:7px;font-size:11.5px;color:var(--fg2);">
+                <span style="width:9px;height:9px;border-radius:3px;background:{{ l.fill }};"></span>
+                <span style="font-weight:600;color:var(--fg);">{{ l.name }}</span>
+                <span style="font-family:var(--mono);font-size:11px;color:var(--fg3);">{{ l.value }}</span>
+              </span>
+            </sc-for>
+          </div>
+          <span style="font-family:var(--mono);font-size:10.5px;color:var(--fg3);">{{ axisNote }}</span>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <sc-for list="{{ planCards }}" as="c" hint-placeholder-count="2">
+          <div style="border:1px solid var(--bd-soft);border-radius:13px;background:var(--bg2);padding:15px 16px;display:flex;flex-direction:column;gap:13px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+              <span style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;">
+                <img src="{{ c.logo }}" alt="" style="width:14px;height:14px;object-fit:contain;display:block;">
+                {{ c.name }}
+              </span>
+              <span style="font-family:var(--mono);font-size:10.5px;color:var(--fg3);">{{ c.plan }}</span>
+            </div>
+            <sc-for list="{{ c.limits }}" as="q" hint-placeholder-count="2">
+              <div style="display:flex;flex-direction:column;gap:6px;">
+                <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
+                  <span style="font-size:11.5px;color:var(--fg2);">{{ q.label }}</span>
+                  <span style="font-family:var(--mono);font-size:11px;color:{{ q.tone }};font-weight:600;">{{ q.pctText }}</span>
+                </div>
+                <div style="height:6px;border-radius:99px;background:oklch(0.27 0.005 59);overflow:hidden;">
+                  <div style="height:100%;border-radius:99px;width:{{ q.pct }}%;background:{{ q.tone }};"></div>
+                </div>
+                <span style="font-size:10.5px;color:var(--fg3);">{{ q.note }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="border:1px solid var(--bd-soft);border-radius:13px;background:var(--bg2);overflow:hidden;">
+        <div style="display:grid;grid-template-columns:1.5fr .8fr .7fr .7fr .8fr 34px;gap:12px;padding:11px 16px;border-bottom:1px solid var(--bd-soft);font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">
+          <span>Provider</span><span>Billing</span><span style="text-align:right;">Tokens</span><span style="text-align:right;">Sessions</span><span style="text-align:right;">Cost</span><span></span>
+        </div>
+        <sc-for list="{{ rows }}" as="r" hint-placeholder-count="3">
+          <div style="border-bottom:1px solid var(--bd-soft);">
+            <div onClick="{{ r.toggle }}" style="display:grid;grid-template-columns:1.5fr .8fr .7fr .7fr .8fr 34px;gap:12px;align-items:center;padding:13px 16px;cursor:pointer;" style-hover="background:oklch(0.245 0.005 59);">
+              <span style="display:inline-flex;align-items:center;gap:10px;min-width:0;">
+                <span style="width:22px;height:22px;border-radius:7px;flex:none;display:flex;align-items:center;justify-content:center;background:{{ r.chipBg }};">
+                  <img src="{{ r.logo }}" alt="" style="width:14px;height:14px;object-fit:contain;display:block;">
+                </span>
+                <span style="display:flex;flex-direction:column;gap:2px;min-width:0;">
+                  <span style="font-size:13px;font-weight:600;">{{ r.name }}</span>
+                  <span style="font-size:10.5px;color:var(--fg3);">{{ r.sub }}</span>
+                </span>
+              </span>
+              <span style="display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:6px;font-size:10.5px;font-weight:600;color:{{ r.badgeFg }};background:{{ r.badgeBg }};justify-self:start;">{{ r.billing }}</span>
+              <span style="text-align:right;font-family:var(--mono);font-size:12px;">{{ r.tokens }}</span>
+              <span style="text-align:right;font-family:var(--mono);font-size:12px;color:var(--fg2);">{{ r.sessions }}</span>
+              <span style="text-align:right;display:flex;flex-direction:column;gap:2px;">
+                <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:{{ r.costTone }};">{{ r.cost }}</span>
+                <span style="font-size:10px;color:var(--fg3);">{{ r.costNote }}</span>
+              </span>
+              <span style="text-align:right;font-size:11px;color:var(--fg3);">{{ r.caret }}</span>
+            </div>
+            <sc-if value="{{ r.open }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:4px 16px 14px 68px;display:flex;flex-direction:column;gap:2px;background:oklch(0.212 0.004 59);">
+                <sc-for list="{{ r.models }}" as="m" hint-placeholder-count="3">
+                  <div style="display:grid;grid-template-columns:1.5fr .8fr .7fr .7fr .8fr 34px;gap:12px;align-items:center;padding:7px 0;">
+                    <span style="font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.id }}</span>
+                    <span style="font-size:10.5px;color:var(--fg3);">{{ m.share }}</span>
+                    <span style="text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.tokens }}</span>
+                    <span style="text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg3);">{{ m.sessions }}</span>
+                    <span style="text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.cost }}</span>
+                    <span></span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="border:1px dashed var(--bd);border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:16px;">
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:4px;">
+          <span style="font-size:12.5px;font-weight:600;">Terminal-launched CLI sessions</span>
+          <span style="font-size:11.5px;line-height:1.5;color:var(--fg3);">A PTY tab streams no usage events. Codemux can instead read the CLIs' own session logs — <span style="font-family:var(--mono);font-size:11px;">~/.claude/projects</span>, <span style="font-family:var(--mono);font-size:11px;">~/.codex/sessions</span> — and fold them into the figures above.</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex:none;">
+          <span style="font-family:var(--mono);font-size:11px;color:var(--fg3);">{{ terminalNote }}</span>
+          <button type="button" onClick="{{ toggleTerminal }}" style="cursor:pointer;border:0;padding:0;width:38px;height:22px;border-radius:99px;background:{{ terminalTrack }};display:flex;align-items:center;">
+            <span style="width:16px;height:16px;border-radius:99px;background:var(--fg);margin-left:{{ terminalKnob }}px;transition:margin-left .16s ease;"></span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  </div>
+
+  <div id="1b" style="display:flex;flex-direction:column;gap:10px;width:1320px;flex:none;">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:#fff;background:#1c1a17;padding:2px 7px;border-radius:5px;">1b</span>
+      <span style="font-size:13px;font-weight:600;color:#3a352e;">Ledger — one lane per provider, no boxes</span>
+    </div>
+
+    <div style="border-radius:14px;border:1px solid rgba(0,0,0,.24);box-shadow:0 18px 46px rgba(0,0,0,.22);overflow:hidden;background:var(--bg);display:flex;font-family:var(--sans);color:var(--fg);">
+
+      <nav style="width:212px;flex:none;background:oklch(0.185 0.004 59);border-right:1px solid var(--bd-soft);padding:18px 12px;display:flex;flex-direction:column;gap:18px;">
+        <div style="display:flex;align-items:center;gap:8px;padding:0 6px 2px;">
+          <span style="width:8px;height:8px;border-radius:2px;background:var(--ember);"></span>
+          <span style="font-size:13px;font-weight:700;letter-spacing:-.01em;">Settings</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">AI Tools</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Providers</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;font-weight:600;color:var(--fg);background:oklch(0.255 0.006 56);">Usage</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Permissions</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Skills</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">MCP Servers</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">Workspace</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Devices</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Source control</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--fg3);padding:0 6px 5px;">App</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Appearance</span>
+          <span style="display:flex;align-items:center;gap:9px;height:30px;padding:0 8px;border-radius:7px;font-size:12.5px;color:var(--fg2);">Sync</span>
+        </div>
+      </nav>
+
+      <div style="flex:1;min-width:0;padding:26px 32px 30px;display:flex;flex-direction:column;">
+
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:20px;padding-bottom:22px;">
+          <div style="display:flex;flex-direction:column;gap:5px;min-width:0;">
+            <h2 style="margin:0;font-size:17px;font-weight:700;letter-spacing:-.015em;">Usage</h2>
+            <p style="margin:0;font-size:12px;color:var(--fg3);">{{ rangeLabel }} · last synced {{ syncedAt }}</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex:none;">
+            <div style="display:flex;padding:2px;border-radius:9px;background:var(--bg2);border:1px solid var(--bd-soft);">
+              <sc-for list="{{ periods }}" as="p" hint-placeholder-count="3">
+                <button type="button" onClick="{{ p.pick }}" style="border:0;cursor:pointer;font-family:var(--sans);height:26px;padding:0 12px;border-radius:7px;font-size:11.5px;font-weight:600;background:{{ p.bg }};color:{{ p.fg }};">{{ p.label }}</button>
+              </sc-for>
+            </div>
+            <button type="button" onClick="{{ exportCsv }}" style="cursor:pointer;height:30px;padding:0 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--fg2);font-family:var(--sans);font-size:11.5px;font-weight:600;">Export CSV</button>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:flex-end;gap:40px;padding:4px 0 18px;border-top:1px solid var(--bd-soft);padding-top:22px;">
+          <sc-for list="{{ heroStats }}" as="h" hint-placeholder-count="4">
+            <div style="display:flex;flex-direction:column;gap:6px;">
+              <span style="font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--fg3);">{{ h.label }}</span>
+              <span style="font-size:29px;font-weight:700;letter-spacing:-.035em;line-height:1;color:{{ h.tone }};">{{ h.value }}</span>
+              <span style="font-size:11px;color:var(--fg3);">{{ h.note }}</span>
+            </div>
+          </sc-for>
+          <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px;align-self:flex-end;">
+            <div style="display:flex;align-items:flex-end;gap:{{ barGap }}px;height:52px;">
+              <sc-for list="{{ stripBars }}" as="s" hint-placeholder-count="30">
+                <div style="flex:1;min-width:0;border-radius:2px;height:{{ s.h }}px;background:{{ s.fill }};"></div>
+              </sc-for>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--fg3);">
+              <span>{{ stripStart }}</span>
+              <span>combined, all providers</span>
+              <span>{{ stripEnd }}</span>
+            </div>
+          </div>
+        </div>
+
+        <sc-for list="{{ lanes }}" as="l" hint-placeholder-count="3">
+          <div style="border-top:1px solid var(--bd-soft);">
+            <div onClick="{{ l.toggle }}" style="display:flex;align-items:center;gap:26px;padding:18px 2px;cursor:pointer;">
+              <span style="width:200px;flex:none;display:flex;align-items:center;gap:11px;min-width:0;">
+                <img src="{{ l.logo }}" alt="" style="width:19px;height:19px;object-fit:contain;display:block;flex:none;">
+                <span style="display:flex;flex-direction:column;gap:3px;min-width:0;">
+                  <span style="font-size:13.5px;font-weight:600;letter-spacing:-.01em;">{{ l.name }}</span>
+                  <span style="font-size:10.5px;color:var(--fg3);">{{ l.plan }}</span>
+                </span>
+              </span>
+
+              <span style="flex:1;min-width:0;display:flex;align-items:flex-end;gap:2px;height:38px;">
+                <sc-for list="{{ l.spark }}" as="s" hint-placeholder-count="30">
+                  <span style="flex:1;min-width:0;border-radius:2px;height:{{ s.h }}px;background:{{ s.fill }};"></span>
+                </sc-for>
+              </span>
+
+              <span style="width:186px;flex:none;display:flex;flex-direction:column;gap:8px;">
+                <sc-for list="{{ l.meters }}" as="q" hint-placeholder-count="2">
+                  <span style="display:flex;align-items:center;gap:9px;">
+                    <span style="font-size:10.5px;color:var(--fg3);width:34px;flex:none;">{{ q.label }}</span>
+                    <span style="flex:1;height:4px;border-radius:99px;background:oklch(0.27 0.005 59);overflow:hidden;display:block;">
+                      <span style="display:block;height:100%;border-radius:99px;width:{{ q.pct }}%;background:{{ q.tone }};"></span>
+                    </span>
+                    <span style="font-family:var(--mono);font-size:10.5px;color:var(--fg2);width:30px;text-align:right;flex:none;">{{ q.pctText }}</span>
+                  </span>
+                </sc-for>
+                <span style="font-size:10.5px;color:var(--fg3);">{{ l.meterNote }}</span>
+              </span>
+
+              <span style="width:96px;flex:none;text-align:right;display:flex;flex-direction:column;gap:3px;">
+                <span style="font-family:var(--mono);font-size:14px;">{{ l.tokens }}</span>
+                <span style="font-size:10.5px;color:var(--fg3);">tokens</span>
+              </span>
+
+              <span style="width:112px;flex:none;text-align:right;display:flex;flex-direction:column;gap:3px;">
+                <span style="font-family:var(--mono);font-size:18px;font-weight:600;letter-spacing:-.02em;color:{{ l.costTone }};">{{ l.cost }}</span>
+                <span style="font-size:10.5px;color:var(--fg3);">{{ l.costNote }}</span>
+              </span>
+
+              <span style="width:14px;flex:none;text-align:right;font-size:10px;color:var(--fg3);">{{ l.caret }}</span>
+            </div>
+
+            <sc-if value="{{ l.open }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:0 2px 20px 226px;display:flex;flex-direction:column;gap:1px;">
+                <sc-for list="{{ l.models }}" as="m" hint-placeholder-count="3">
+                  <div style="display:flex;align-items:center;gap:26px;padding:7px 0;border-top:1px solid oklch(0.235 0.005 59);">
+                    <span style="flex:1;min-width:0;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.id }}</span>
+                    <span style="width:186px;flex:none;font-size:10.5px;color:var(--fg3);">{{ m.share }}</span>
+                    <span style="width:96px;flex:none;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.tokens }}</span>
+                    <span style="width:112px;flex:none;text-align:right;font-family:var(--mono);font-size:11.5px;color:var(--fg2);">{{ m.cost }}</span>
+                    <span style="width:14px;flex:none;"></span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+
+        <div style="border-top:1px solid var(--bd-soft);display:flex;align-items:center;gap:16px;padding:18px 2px 0;">
+          <span style="flex:1;min-width:0;font-size:11.5px;line-height:1.5;color:var(--fg3);"><span style="color:var(--fg2);font-weight:600;">Terminal-launched CLI sessions.</span> A PTY tab streams no usage events. Codemux can read the CLIs' own logs — <span style="font-family:var(--mono);font-size:11px;">~/.claude/projects</span>, <span style="font-family:var(--mono);font-size:11px;">~/.codex/sessions</span> — and fold them in.</span>
+          <span style="display:flex;align-items:center;gap:10px;flex:none;">
+            <span style="font-family:var(--mono);font-size:11px;color:var(--fg3);">{{ terminalNote }}</span>
+            <button type="button" onClick="{{ toggleTerminal }}" style="cursor:pointer;border:0;padding:0;width:38px;height:22px;border-radius:99px;background:{{ terminalTrack }};display:flex;align-items:center;">
+              <span style="width:16px;height:16px;border-radius:99px;background:var(--fg);margin-left:{{ terminalKnob }}px;transition:margin-left .16s ease;"></span>
+            </button>
+          </span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:1500},&quot;defaultPeriod&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;today&quot;,&quot;7d&quot;,&quot;30d&quot;],&quot;default&quot;:&quot;30d&quot;,&quot;tsType&quot;:&quot;\&quot;today\&quot; | \&quot;7d\&quot; | \&quot;30d\&quot;&quot;},&quot;includeTerminal&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;}}">
+const P = {
+  claude: { name: "Claude Code", fill: "oklch(0.705 0.152 47)", chip: "oklch(0.705 0.152 47 / .14)", logo: "./src/assets/preset-icons/claude.svg" },
+  codex: { name: "Codex", fill: "oklch(0.86 0.004 250)", chip: "oklch(0.86 0.004 250 / .12)", logo: "./src/assets/preset-icons/codex.svg" },
+  opencode: { name: "OpenCode", fill: "oklch(0.74 0.14 156)", chip: "oklch(0.74 0.14 156 / .14)", logo: "./src/assets/preset-icons/opencode.svg" },
+};
+const KEYS = ["claude", "codex", "opencode"];
+const RATE = { claude: 9.4, codex: 7.1, opencode: 4.6 };
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+function rnd(s) { const x = Math.sin(s * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+function money(n) { return "$" + n.toFixed(2); }
+function money0(n) { return "$" + Math.round(n); }
+function toks(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return Math.round(n / 1e3) + "K";
+  return String(Math.round(n));
+}
+
+class Component extends DCLogic {
+  state = { period: null, metric: "cost", hover: null, open: "claude", terminal: null };
+
+  buckets(period) {
+    const out = [];
+    const end = new Date(2026, 7, 8);
+    if (period === "today") {
+      for (let h = 0; h < 24; h++) {
+        const active = h >= 8 && h <= 22 ? 1 : 0.12;
+        const b = { label: h + ":00", sub: "Today " + h + ":00" };
+        for (const k of KEYS) {
+          const base = k === "claude" ? 90e3 : k === "codex" ? 34e3 : 22e3;
+          b[k] = base * active * (0.35 + rnd(h * 7 + KEYS.indexOf(k) * 31) * 1.5);
+        }
+        out.push(b);
+      }
+      return out;
+    }
+    const days = period === "7d" ? 7 : 30;
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(end.getTime() - i * 86400000);
+      const weekend = d.getDay() === 0 || d.getDay() === 6;
+      const f = weekend ? 0.28 : 1;
+      const seed = d.getDate() + d.getMonth() * 31;
+      const b = {
+        label: String(d.getDate()),
+        sub: MONTHS[d.getMonth()] + " " + d.getDate(),
+      };
+      for (const k of KEYS) {
+        const base = k === "claude" ? 0.62e6 : k === "codex" ? 0.3e6 : 0.19e6;
+        const span = k === "claude" ? 0.95e6 : k === "codex" ? 0.42e6 : 0.36e6;
+        b[k] = (base + rnd(seed * 3 + KEYS.indexOf(k) * 97) * span) * f;
+      }
+      out.push(b);
+    }
+    return out;
+  }
+
+  renderVals() {
+    const period = this.state.period ?? (this.props.defaultPeriod || "30d");
+    const metric = this.state.metric;
+    const cost = metric === "cost";
+    const terminal = this.state.terminal ?? (this.props.includeTerminal ?? false);
+    const data = this.buckets(period);
+    const mult = terminal ? 1.22 : 1;
+
+    const val = (b, k) => (cost ? (b[k] * mult) / 1e6 * RATE[k] : b[k] * mult);
+    const totals = {};
+    for (const k of KEYS) totals[k] = data.reduce((s, b) => s + b[k] * mult, 0);
+    const tokenTotal = KEYS.reduce((s, k) => s + totals[k], 0);
+    const listTotal = {};
+    for (const k of KEYS) listTotal[k] = totals[k] / 1e6 * RATE[k];
+    const billed = listTotal.opencode;
+    const covered = listTotal.claude + listTotal.codex;
+
+    const max = Math.max(...data.map((b) => KEYS.reduce((s, k) => s + val(b, k), 0))) || 1;
+    const H = 168;
+    const hover = this.state.hover;
+    const bars = data.map((b, i) => ({
+      dim: hover === null || hover === i ? 1 : 0.42,
+      hover: () => this.setState({ hover: i }),
+      segs: KEYS.slice().reverse().map((k) => ({
+        h: Math.max(1.5, (val(b, k) / max) * H),
+        fill: cost && k !== "opencode"
+          ? "color-mix(in oklch, " + P[k].fill + " 46%, transparent)"
+          : P[k].fill,
+      })),
+    }));
+
+    const periodLabels = { today: "Today", "7d": "7 days", "30d": "30 days" };
+    const periods = ["today", "7d", "30d"].map((p) => ({
+      label: periodLabels[p],
+      bg: p === period ? "var(--card)" : "transparent",
+      fg: p === period ? "var(--fg)" : "var(--fg3)",
+      pick: () => this.setState({ period: p, hover: null }),
+    }));
+    const metrics = [
+      { key: "cost", label: "Cost" },
+      { key: "tokens", label: "Tokens" },
+    ].map((m) => ({
+      label: m.label,
+      bg: m.key === metric ? "var(--card)" : "transparent",
+      fg: m.key === metric ? "var(--fg)" : "var(--fg3)",
+      pick: () => this.setState({ metric: m.key }),
+    }));
+
+    const hb = hover === null ? null : data[hover];
+    const readoutValue = hb
+      ? cost ? money(KEYS.reduce((s, k) => s + val(hb, k), 0)) : toks(KEYS.reduce((s, k) => s + val(hb, k), 0))
+      : cost ? money(billed + covered) : toks(tokenTotal);
+    const readoutBreakdown = hb
+      ? KEYS.map((k) => P[k].name.split(" ")[0] + " " + (cost ? money(val(hb, k)) : toks(val(hb, k)))).join("   ")
+      : cost ? money(billed) + " metered  ·  " + money(covered) + " plan-covered" : "input + output + cache";
+
+    const sessionsFor = (k) => Math.max(1, Math.round(totals[k] / 1e6 * (k === "claude" ? 3.1 : k === "codex" ? 3.6 : 2.4)));
+    const sessionTotal = KEYS.reduce((s, k) => s + sessionsFor(k), 0);
+
+    const models = {
+      claude: [
+        { id: "claude-opus-4.5", share: "72% of turns" },
+        { id: "claude-sonnet-4.5", share: "24% of turns" },
+        { id: "claude-haiku-4.5", share: "4% · subagents" },
+      ],
+      codex: [
+        { id: "gpt-5.2-codex · xhigh", share: "38% of turns" },
+        { id: "gpt-5.2-codex · medium", share: "62% of turns" },
+      ],
+      opencode: [
+        { id: "anthropic/claude-sonnet-4.5", share: "own API key" },
+        { id: "openrouter/kimi-k2", share: "own API key" },
+        { id: "openai/gpt-5.2-mini", share: "own API key" },
+      ],
+    };
+    const rowMeta = {
+      claude: { sub: "Agent chat · Max 20× plan", plan: "Max 20×", billing: "Subscription", badgeFg: "var(--ember)", badgeBg: "oklch(0.705 0.152 47 / .14)" },
+      codex: { sub: "Agent chat · ChatGPT Pro", plan: "ChatGPT Pro", billing: "Subscription", badgeFg: "var(--silver)", badgeBg: "oklch(0.86 0.004 250 / .12)" },
+      opencode: { sub: "Agent chat · 3 keys, 2 upstreams", plan: "Metered", billing: "API keys", badgeFg: "var(--open)", badgeBg: "oklch(0.74 0.14 156 / .14)" },
+    };
+    const rows = KEYS.map((k) => {
+      const open = this.state.open === k;
+      const share = models[k];
+      const weights = share.map((_, i) => 1 / (i + 1.35));
+      const wsum = weights.reduce((a, b) => a + b, 0);
+      return {
+        name: P[k].name,
+        sub: rowMeta[k].sub,
+        fill: P[k].fill,
+        logo: P[k].logo,
+        chipBg: P[k].chip,
+        billing: rowMeta[k].billing,
+        badgeFg: rowMeta[k].badgeFg,
+        badgeBg: rowMeta[k].badgeBg,
+        tokens: toks(totals[k]),
+        sessions: String(sessionsFor(k)),
+        cost: k === "opencode" ? money(listTotal[k]) : money(listTotal[k]),
+        costTone: k === "opencode" ? "var(--fg)" : "var(--fg3)",
+        costNote: k === "opencode" ? "billed" : "plan-covered",
+        caret: open ? "▲" : "▼",
+        open,
+        toggle: () => this.setState({ open: open ? null : k }),
+        models: share.map((m, i) => ({
+          id: m.id,
+          share: m.share,
+          tokens: toks(totals[k] * weights[i] / wsum),
+          sessions: String(Math.max(1, Math.round(sessionsFor(k) * weights[i] / wsum))),
+          cost: money(listTotal[k] * weights[i] / wsum),
+        })),
+      };
+    });
+
+    const weekTokens = this.buckets("7d").reduce((s, b) => s + b.claude, 0);
+    const claudeWeekPct = Math.min(99, Math.round(weekTokens / 9.4e6 * 100));
+    const codexWeekPct = Math.min(99, Math.round(this.buckets("7d").reduce((s, b) => s + b.codex, 0) / 5.2e6 * 100));
+    const tone = (p) => (p >= 85 ? "var(--gold)" : p >= 60 ? "var(--ember)" : "var(--open)");
+    const planCards = [
+      {
+        name: "Claude Code", plan: "Max 20× · $200/mo", fill: P.claude.fill, logo: P.claude.logo,
+        limits: [
+          { label: "Current 5-hour window", pct: 41, pctText: "41%", tone: tone(41), note: "resets in 2h 14m" },
+          { label: "Weekly limit", pct: claudeWeekPct, pctText: claudeWeekPct + "%", tone: tone(claudeWeekPct), note: "resets Monday 09:00" },
+        ],
+      },
+      {
+        name: "Codex", plan: "ChatGPT Pro · $200/mo", fill: P.codex.fill, logo: P.codex.logo,
+        limits: [
+          { label: "Current 5-hour window", pct: 18, pctText: "18%", tone: tone(18), note: "resets in 3h 40m" },
+          { label: "Weekly limit", pct: codexWeekPct, pctText: codexWeekPct + "%", tone: tone(codexWeekPct), note: "resets Thursday 14:00" },
+        ],
+      },
+    ];
+
+    const SH = 38;
+    const laneMeta = {
+      claude: { plan: "Max 20× · $200/mo", meterNote: "5h window resets 16:40", meters: [
+        { label: "5h", pct: 41 }, { label: "week", pct: claudeWeekPct } ] },
+      codex: { plan: "ChatGPT Pro · $200/mo", meterNote: "5h window resets 18:06", meters: [
+        { label: "5h", pct: 18 }, { label: "week", pct: codexWeekPct } ] },
+      opencode: { plan: "3 API keys · 2 upstreams", meterNote: "no quota — billed per token", meters: [] },
+    };
+    const lanes = KEYS.map((k, i) => {
+      const laneMax = Math.max(...data.map((b) => b[k])) || 1;
+      return {
+        name: P[k].name,
+        logo: P[k].logo,
+        plan: laneMeta[k].plan,
+        spark: data.map((b) => ({
+          h: Math.max(1.5, (b[k] * mult / laneMax) * SH),
+          fill: k === "opencode" ? P[k].fill : "color-mix(in oklch, " + P[k].fill + " 62%, transparent)",
+        })),
+        meters: laneMeta[k].meters.map((q) => ({
+          label: q.label, pct: q.pct, pctText: q.pct + "%", tone: tone(q.pct),
+        })),
+        meterNote: laneMeta[k].meterNote,
+        tokens: toks(totals[k]),
+        cost: money(listTotal[k]),
+        costTone: k === "opencode" ? "var(--fg)" : "var(--fg3)",
+        costNote: k === "opencode" ? "billed to your keys" : "covered by plan · at list",
+        caret: rows[i].caret,
+        open: rows[i].open,
+        toggle: rows[i].toggle,
+        models: rows[i].models,
+      };
+    });
+    const stripMax = Math.max(...data.map((b) => KEYS.reduce((s, k) => s + b[k], 0))) || 1;
+    const stripBars = data.map((b) => ({
+      h: Math.max(1.5, (KEYS.reduce((s, k) => s + b[k], 0) * mult / stripMax) * 52),
+      fill: "color-mix(in oklch, var(--ember) 42%, transparent)",
+    }));
+
+    const prev = billed * (period === "today" ? 0.82 : period === "7d" ? 1.19 : 0.86);
+    const deltaPct = Math.round((billed - prev) / prev * 100);
+    const rangeText = { today: "Today, 00:00 – now", "7d": "Aug 2 – Aug 8, 2026", "30d": "Jul 10 – Aug 8, 2026" };
+
+    return {
+      periods, metrics, bars,
+      barGap: period === "30d" ? 4 : period === "7d" ? 10 : 5,
+      legend: KEYS.map((k) => ({
+        name: P[k].name,
+        fill: P[k].fill,
+        value: cost ? money(listTotal[k]) : toks(totals[k]),
+      })),
+      axisNote: cost
+        ? "faded = plan-covered, priced at list · solid = billed"
+        : "input + output + cache read",
+      rangeLabel: rangeText[period],
+      syncedAt: "2 min ago",
+      apiSpend: money(billed),
+      apiDelta: (deltaPct >= 0 ? "+" : "") + deltaPct + "% vs previous " + (period === "today" ? "day" : period === "7d" ? "week" : "month"),
+      deltaColor: deltaPct >= 0 ? "var(--gold)" : "var(--open)",
+      planValue: money0(covered),
+      planCost: "$400",
+      totalTokens: toks(tokenTotal),
+      cacheShare: "68%",
+      sessionCount: String(sessionTotal),
+      workspaceCount: "9",
+      readoutLabel: hb ? hb.sub : (cost ? "Total for period" : "Tokens for period"),
+      readoutValue, readoutBreakdown,
+      clearHover: () => this.setState({ hover: null }),
+      rows, planCards, lanes, stripBars,
+      stripStart: data[0] ? data[0].sub : "",
+      stripEnd: data[data.length - 1] ? data[data.length - 1].sub : "",
+      heroStats: [
+        { label: "Metered", value: money(billed), note: "billed to your API keys", tone: "var(--fg)" },
+        { label: "Plan-covered", value: money0(covered), note: "at list price, on $400 subs", tone: "var(--ember)" },
+        { label: "Tokens", value: toks(tokenTotal), note: "68% served from cache", tone: "var(--fg)" },
+        { label: "Sessions", value: String(sessionTotal), note: "across 9 workspaces", tone: "var(--fg)" },
+      ],
+      terminalNote: terminal ? "12 sessions folded in" : "12 sessions excluded",
+      terminalTrack: terminal ? "var(--ember)" : "oklch(0.32 0.005 59)",
+      terminalKnob: terminal ? 19 : 3,
+      toggleTerminal: () => this.setState({ terminal: !terminal }),
+      exportCsv: () => {},
+    };
+  }
+}
+
+</script>
+</body>
+</html>

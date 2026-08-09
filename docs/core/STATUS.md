@@ -21,9 +21,14 @@ not shipped in a published build. Older per-release implementation notes were mo
 
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.17.1` (2026-08-07)**, a sidebar-and-settlement release: a fifth `Monitoring` agent status for background watch loops, durable workspace pinning, a run that can no longer stay stuck on "Working", side-branch PR badges, the dimmed Settled shelf, and AppImage child-process environment hygiene. `v0.17.0` (2026-08-05) was the app-chrome and chat-navigation release: the GUI title bar became frameless floating islands, the full-width workspace context bar was deleted, the chat transcript gained an explicit new-turn scroll contract, cross-provider skills became provider-correct, text-selection colors were standardized onto two tokens, and the legacy standalone orchestration runtime was deleted outright. Release notes for `v0.16.0` and earlier live in `docs/archive/release-notes-v0.16.md`, `docs/archive/release-notes-v0.14-v0.15.md`, and `docs/archive/release-notes-v0.6-v0.13.md`.
 
-Unreleased after `v0.17.1` — the current Canvas-6 work plus six merged PRs
-(#257–#261, #264), grouped by subsystem below. Everything in this block is
-current checkout behavior and has not shipped in a published build:
+Unreleased after `v0.17.1` — the current Canvas-6 work, the Settings → Usage
+dashboard, plus six merged PRs (#257–#261, #264), grouped by subsystem below.
+Everything in this block is current checkout behavior and has not shipped in a
+published build:
+
+- **Settings → Usage: provider-wide local history for Claude Code, Codex, and OpenCode.** Provider-owned durable history is now the single accounting source regardless of launcher: Claude and Codex JSONL transcripts plus OpenCode's read-only SQLite message history (with legacy JSON fallback). The ledger is a rebuildable materialized cache keyed by provider-native record ids; growing responses upsert instead of freezing partial counts, resumed/forked records deduplicate, and importer v3 clears the legacy runtime/import hybrid so Codemux-launched work cannot double-count. Subagent attribution and the four-way non-overlapping token split remain. The page reports one clearly labelled API/list-price-equivalent estimate—never guessed “billed” or “plan-covered” spend—plus tokens, sessions, model breakdown, confidence, CSV, and an honest this-machine-only source note. Open/manual/30-second refreshes all scan provider history first. See `docs/features/usage-dashboard.md`.
+
+- **Settings → Usage: live quota is independent from historical cost.** `ProviderRuntimeEvent::PlanUsageUpdated` still carries fresh account-level quota windows and provider plan labels into an in-memory newest-snapshot store. It is never persisted or used to classify historical dollars. Claude/Codex lanes show up to two provider-reported windows when available; a provider with no current reading shows no meter. See `docs/features/usage-dashboard.md`.
 
 - **The inbox card's hover chrome became bare glyphs, and a running process now
   shows on the card** (PR #264, Workspace Chrome design handoff, variant 1b).

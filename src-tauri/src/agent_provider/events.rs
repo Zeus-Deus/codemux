@@ -11,7 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{ApprovalDecision, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId};
+use super::types::{
+    ApprovalDecision, ProviderKind, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId,
+};
 
 /// Lifecycle status of a subagent, as merged into the frontend's
 /// per-subagent state.
@@ -384,6 +386,88 @@ pub struct UserMessageImage {
     pub media_type: String,
 }
 
+/// Where a legacy runtime usage estimate came from.
+///
+/// The distinction matters because the two are not equally trustworthy:
+/// a catalogue rate is the upstream's own published price for that exact
+/// model, while a table rate is Codemux's static guess matched by
+/// model-id substring. Recording which one was used lets the dashboard
+/// say how much of a total is measured versus estimated instead of
+/// presenting every figure with the same confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    /// The provider's own catalogue rates (OpenCode).
+    Provider,
+    /// Codemux's static list-price table (`agent_provider::pricing`).
+    Table,
+}
+
+impl CostSource {
+    /// The matching provider-history cache value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Table => "table",
+        }
+    }
+}
+
+/// Which quota window a [`PlanUsageWindow`] describes.
+///
+/// Mirrors the union both providers report, plus an `Other` escape so an
+/// unrecognized window is surfaced with whatever label the provider gave
+/// it rather than dropped. Claude names its windows directly; Codex is
+/// mapped from `windowDurationMins`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanWindowKind {
+    /// The rolling 5-hour window both vendors meter on.
+    FiveHour,
+    /// The weekly (7-day) window.
+    SevenDay,
+    /// Claude's per-model weekly windows, reported alongside `SevenDay`.
+    SevenDayOpus,
+    SevenDaySonnet,
+    /// Claude's paid-overage bucket, metered separately from the plan.
+    Overage,
+    /// A window neither adapter recognized. Carries the provider's own
+    /// label so the UI can still name it.
+    Other,
+}
+
+/// How the user is paying the provider, as *detected* rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanAuthMode {
+    /// A subscription login (claude.ai, ChatGPT). Tokens are covered by
+    /// the plan; their list price is value delivered, not money owed.
+    Subscription,
+    /// Metered API keys. Tokens are a real bill.
+    ApiKey,
+}
+
+/// One quota window's current occupancy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanUsageWindow {
+    pub kind: PlanWindowKind,
+    /// Percent consumed, **0–100 and clamped**.
+    ///
+    /// Deliberately normalized at the adapter boundary because the two
+    /// providers disagree: Claude reports a 0..1 fraction (`utilization`)
+    /// while Codex reports an already-scaled percent (`usedPercent`).
+    /// Storing the vendor-native number here would push that trap onto
+    /// every consumer.
+    pub used_pct: f64,
+    /// When the window rolls over, unix **milliseconds**. `None` when the
+    /// provider did not say. (Claude reports epoch *seconds*; the adapter
+    /// converts.)
+    pub resets_at_ms: Option<i64>,
+    /// Provider-supplied name, kept for `Other` windows and tooltips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// The canonical event stream produced by every provider.
 ///
 /// Downstream consumers pattern-match on the top-level tag. New variants are
@@ -602,6 +686,102 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         /// Seconds since the last observed runtime event for this thread.
         silent_for_secs: u64,
+    },
+    /// Legacy adapter-side usage delta.
+    ///
+    /// **This is not [`ContextUsageUpdated`].** That event answers "how
+    /// full is the context window right now": it is a *snapshot*, it is
+    /// suppressed when nothing meaningful changed, and every adapter
+    /// deliberately excludes subagent activity so the composer meter
+    /// tracks the conversation the user is looking at. All three
+    /// properties make it useless as an accounting record. This event is
+    /// the opposite in each respect — a *delta*, never suppressed, and
+    /// explicitly inclusive of subagents (flagged, not filtered).
+    ///
+    /// The four token fields are **non-overlapping**: each token of work
+    /// is counted in exactly one of them. Providers report overlapping
+    /// figures in their own way (Codex nests cached-input inside input;
+    /// OpenCode keeps cache tiers as siblings), so each adapter
+    /// normalizes to this shape before emitting. That invariant is what
+    /// lets the sink sum the four fields for a token total and lets
+    /// [`pricing`](super::pricing) price the split as a dot product.
+    ///
+    /// Not persisted or fanned out. Provider-owned durable history is the
+    /// Settings → Usage source of truth, so the command layer discards this
+    /// signal; writing both would double-count Codemux-launched work.
+    ///
+    /// [`ContextUsageUpdated`]: ProviderRuntimeEvent::ContextUsageUpdated
+    UsageRecorded {
+        thread_id: ThreadId,
+        provider: ProviderKind,
+        /// The model that did the work, as the provider spells it. `None`
+        /// when the provider did not report one — the row still counts
+        /// tokens, it just cannot be priced or attributed to a model.
+        model: Option<String>,
+        /// Whether this increment came from a subagent / child thread
+        /// rather than the main conversation. Recorded, never filtered:
+        /// subagent tokens are real spend, and the dashboard surfaces
+        /// them as a share of each model's total.
+        subagent: bool,
+        /// Fresh input tokens — cache hits and cache writes excluded.
+        input_tokens: u64,
+        /// Output tokens, reasoning included (providers bill it as
+        /// output, so splitting it out here would misprice the row).
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        /// Reasoning tokens, an **informational subset of
+        /// `output_tokens`** — NOT a fifth disjoint bucket.
+        ///
+        /// Deliberately kept inside `output_tokens` for every total and
+        /// every price: that is how providers bill it, and pulling it
+        /// out would break the "four non-overlapping fields" invariant
+        /// the whole ledger rests on. It rides alongside purely so the
+        /// dashboard can say "of which N was reasoning". `0` when the
+        /// provider reports no split (Claude).
+        #[serde(default)]
+        reasoning_tokens: u64,
+        /// List-price cost computed at record time, or `None` for a model
+        /// with no known price. Frozen at emission on purpose: a ledger
+        /// re-priced by a later table edit would silently rewrite history.
+        cost_usd: Option<f64>,
+        /// Where `cost_usd` came from, so the UI can show how much of a
+        /// bill is measured versus estimated. `None` iff `cost_usd` is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_source: Option<CostSource>,
+    },
+    /// The provider's plan-quota occupancy changed.
+    ///
+    /// **Level state, not history.** Like
+    /// [`ContextUsageUpdated`](ProviderRuntimeEvent::ContextUsageUpdated)
+    /// and unlike [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded),
+    /// each event is a complete snapshot that supersedes the last — the
+    /// sink keeps the newest per provider and never accumulates.
+    ///
+    /// It is **provider-scoped**, not thread-scoped: a Claude 5-hour
+    /// window is an account-level fact that every thread shares. The
+    /// `thread_id` is carried only because that is how the event reaches
+    /// the bridge; the sink keys the state by `provider`.
+    ///
+    /// Not persisted anywhere. Quota is a live reading whose meaning
+    /// decays in minutes, so a stale snapshot replayed after a restart
+    /// would be worse than none — the UI renders nothing until a session
+    /// runs and repopulates it.
+    PlanUsageUpdated {
+        thread_id: ThreadId,
+        provider: ProviderKind,
+        /// Every window the provider reported this time. Replaces the
+        /// previous list wholesale.
+        windows: Vec<PlanUsageWindow>,
+        /// Short human label for the plan ("Max 20×", "ChatGPT Pro").
+        /// `None` when the provider did not say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_label: Option<String>,
+        /// Detected billing mode. Drives the Usage dashboard's
+        /// plan-covered / metered split in preference to the hardcoded
+        /// per-provider guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_mode: Option<PlanAuthMode>,
     },
 }
 

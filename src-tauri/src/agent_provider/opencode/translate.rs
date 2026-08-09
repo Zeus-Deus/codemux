@@ -19,11 +19,12 @@ use std::collections::HashMap;
 
 use crate::agent_provider::context_usage::ContextUsageTracker;
 use crate::agent_provider::events::{
-    CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus,
+    CompletedItem, ContentDelta, CostSource, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus,
     TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus,
 };
+use crate::agent_provider::pricing;
 use crate::agent_provider::types::{
-    ApprovalDecision, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId,
+    ApprovalDecision, ProviderKind, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId,
 };
 
 use super::protocol::{
@@ -129,6 +130,15 @@ pub struct EventContext {
     /// `None` until (or unless) that lands — the meter then renders a
     /// bare token count rather than a guessed percentage.
     pub context_window_tokens: Option<u64>,
+    /// The active model's upstream list price, when the background
+    /// catalogue probe has resolved it.
+    ///
+    /// Harvested the same way as `context_window_tokens`, and for the
+    /// same reason: OpenCode states prices only in the provider
+    /// catalogue, never on the event stream. `None` falls the ledger
+    /// back to the static [`pricing`] table, which covers models whose
+    /// id names a known family and leaves the rest unpriced.
+    pub model_cost: Option<crate::agent_provider::opencode::client::OpenCodeModelCost>,
     /// Active turn id Codemux assigned when the user hit send.
     pub turn_id: TurnId,
     /// OpenCode's session id for the active session — used to
@@ -180,6 +190,65 @@ pub struct OpenCodeUsageState {
     tracker: ContextUsageTracker,
     /// Assistant message id → the largest token figure seen for it.
     seen_per_message: HashMap<String, u64>,
+    /// Assistant message id → the largest usage *split* already written
+    /// to the ledger for it.
+    ///
+    /// Same high-water idea as `seen_per_message`, but kept separately
+    /// for two reasons: it is per-field rather than a single total (the
+    /// ledger prices each bucket differently), and it covers **subagent**
+    /// messages, which `seen_per_message` never sees because the context
+    /// meter drops them before they reach it.
+    ledger_per_message: HashMap<String, UsageSplit>,
+}
+
+/// A non-overlapping token split, in the shape
+/// [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded) expects.
+///
+/// OpenCode's buckets are already disjoint — its two cache tiers are
+/// siblings of `input`, not carve-outs of it (the exact opposite of
+/// Codex), and `reasoning` sits beside `output`. Reasoning is folded
+/// into `output` here because that is how upstreams bill it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageSplit {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    /// Informational SUBSET of `output` (OpenCode reports it beside
+    /// `output`, and it is folded in there for billing). Deltaed through
+    /// the same per-message high-water mark as everything else.
+    reasoning: u64,
+}
+
+impl UsageSplit {
+    fn from_tokens(tokens: &super::protocol::MessageTokens) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output.saturating_add(tokens.reasoning),
+            cache_read: tokens.cache.read,
+            cache_write: tokens.cache.write,
+            reasoning: tokens.reasoning,
+        }
+    }
+
+    /// This split minus `previous`, per field. Saturating so a partial
+    /// re-send that reports lower figures contributes zero rather than
+    /// wrapping into a bogus charge.
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(previous.input),
+            output: self.output.saturating_sub(previous.output),
+            cache_read: self.cache_read.saturating_sub(previous.cache_read),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
+            reasoning: self.reasoning.saturating_sub(previous.reasoning),
+        }
+    }
+
+    /// Judged on the four billable fields; `reasoning` is a subset of
+    /// `output` and cannot move alone.
+    fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
 }
 
 impl OpenCodeUsageState {
@@ -789,15 +858,19 @@ fn translate_message_tokens(
     subagent_id: Option<&str>,
     usage: &mut OpenCodeUsageState,
 ) -> Vec<ProviderRuntimeEvent> {
+    // Ledger first, and for subagent messages too — the early return
+    // below is a context-meter hygiene rule, not an accounting one.
+    let mut events = record_usage(info, ctx, subagent_id.is_some(), usage);
+
     if subagent_id.is_some() {
-        return vec![];
+        return events;
     }
     let Some(tokens) = info.tokens.as_ref() else {
-        return vec![];
+        return events;
     };
     let used = tokens.total();
     if used == 0 {
-        return vec![];
+        return events;
     }
     // Add only this message's growth since its last report, so the
     // repeated incremental updates of one message don't compound. The
@@ -813,7 +886,87 @@ fn translate_message_tokens(
     // OpenCode does not advertise whether the upstream compacts
     // automatically, and it varies by upstream provider — so it stays
     // unknown rather than being asserted either way.
-    usage.tracker.events(&ctx.thread_id, used, None, None)
+    events.extend(usage.tracker.events(&ctx.thread_id, used, None, None));
+    events
+}
+
+/// Emit the ledger delta for one assistant message envelope.
+///
+/// OpenCode re-broadcasts the same message id with a growing `tokens`
+/// block, so the row is the growth since that id's last report — the
+/// same shape as the context meter's high-water map, but per-field and
+/// including subagent messages.
+///
+/// Cost is left to the sink: the model catalogue that carries OpenCode's
+/// real per-token prices is an HTTP resource the translator cannot
+/// reach, and inventing a static price for an arbitrary upstream model
+/// would be worse than reporting none. The static table is applied as a
+/// fallback where the id happens to name a known family.
+fn record_usage(
+    info: &super::protocol::MessageInfo,
+    ctx: &EventContext,
+    subagent: bool,
+    usage: &mut OpenCodeUsageState,
+) -> Vec<ProviderRuntimeEvent> {
+    let Some(tokens) = info.tokens.as_ref() else {
+        return Vec::new();
+    };
+    let current = UsageSplit::from_tokens(tokens);
+    let previous = usage
+        .ledger_per_message
+        .get(&info.id)
+        .copied()
+        .unwrap_or_default();
+    let delta = current.delta_since(&previous);
+    usage.ledger_per_message.insert(info.id.clone(), current);
+
+    if delta.is_empty() {
+        return Vec::new();
+    }
+
+    let model = info.qualified_model_id();
+    // Catalogue price wins: it is the upstream's own rate for this exact
+    // model, whereas the static table can only recognize families it has
+    // heard of. The fallback still matters — the probe is fire-and-forget
+    // and may not have landed yet.
+    let (cost_usd, cost_source) = match ctx.model_cost.as_ref() {
+        Some(rates) => (Some(
+            pricing::ModelRates {
+                input: rates.input,
+                output: rates.output,
+                cache_read: rates.cache_read,
+                cache_write: rates.cache_write,
+                // The OpenCode catalogue publishes one cache-write rate
+                // per model, with no TTL tiers to distinguish.
+                cache_write_1h: rates.cache_write,
+            }
+            .cost_usd(delta.input, delta.output, delta.cache_read, delta.cache_write),
+        ), Some(CostSource::Provider)),
+        None => {
+            let cost = pricing::cost_for(
+                model.as_deref(),
+                delta.input,
+                delta.output,
+                delta.cache_read,
+                delta.cache_write,
+            );
+            let source = cost.map(|_| CostSource::Table);
+            (cost, source)
+        }
+    };
+    vec![ProviderRuntimeEvent::UsageRecorded {
+        thread_id: ctx.thread_id.clone(),
+        provider: ProviderKind::OpenCode,
+        model,
+        subagent,
+        input_tokens: delta.input,
+        output_tokens: delta.output,
+        cache_read_tokens: delta.cache_read,
+        cache_write_tokens: delta.cache_write,
+        reasoning_tokens: delta.reasoning,
+        cost_usd,
+        cost_source,
+    }]
 }
 
 fn translate_session_error(
@@ -867,6 +1020,7 @@ mod tests {
             provider_session_id: ProviderSessionId("sess_1".into()),
             turn_active: true,
             context_window_tokens: None,
+            model_cost: None,
         }
     }
 
@@ -1896,5 +2050,283 @@ mod tests {
             }
             other => panic!("expected TasksUpdated, got {other:?}"),
         }
+    }
+}
+
+// ── usage ledger ──
+
+#[cfg(test)]
+mod usage_ledger_tests {
+    use super::*;
+    use crate::agent_provider::types::{ProviderSessionId, ThreadId, TurnId};
+    use serde_json::json;
+
+    fn ctx() -> EventContext {
+        EventContext {
+            thread_id: ThreadId("thread_1".into()),
+            turn_id: TurnId("turn_1".into()),
+            provider_session_id: ProviderSessionId("sess_1".into()),
+            turn_active: true,
+            context_window_tokens: None,
+            model_cost: None,
+        }
+    }
+
+    fn info(
+        id: &str,
+        tokens: serde_json::Value,
+        model: Option<(&str, &str)>,
+    ) -> super::super::protocol::MessageInfo {
+        let mut payload = json!({
+            "id": id,
+            "sessionID": "sess_1",
+            "role": "assistant",
+            "tokens": tokens,
+        });
+        if let Some((provider, model)) = model {
+            payload["providerID"] = json!(provider);
+            payload["modelID"] = json!(model);
+        }
+        serde_json::from_value(payload).unwrap()
+    }
+
+    fn tokens(input: u64, output: u64, reasoning: u64, read: u64, write: u64) -> serde_json::Value {
+        json!({
+            "input": input,
+            "output": output,
+            "reasoning": reasoning,
+            "cache": {"read": read, "write": write},
+        })
+    }
+
+    fn rows(
+        events: &[ProviderRuntimeEvent],
+    ) -> Vec<(u64, u64, u64, u64, bool, Option<String>, Option<f64>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    subagent,
+                    model,
+                    cost_usd,
+                    ..
+                } => Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                    *subagent,
+                    model.clone(),
+                    *cost_usd,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// OpenCode's cache tiers are SIBLINGS of input (the opposite of
+    /// Codex), and `reasoning` is billed as output.
+    #[test]
+    fn normalization_keeps_cache_tiers_as_siblings_and_folds_reasoning() {
+        let split = UsageSplit::from_tokens(
+            &serde_json::from_value(tokens(100, 40, 60, 500, 25)).unwrap(),
+        );
+        assert_eq!(split.input, 100, "input is NOT reduced by the cache tiers");
+        assert_eq!(split.output, 100, "output + reasoning");
+        assert_eq!(split.cache_read, 500);
+        assert_eq!(split.cache_write, 25);
+    }
+
+    /// OpenCode re-broadcasts one message id with growing counters.
+    #[test]
+    fn growing_message_records_only_the_growth() {
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+        let first = translate_message_tokens(
+            &info("msg_1", tokens(100, 10, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5"))),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        assert_eq!(rows(&first)[0].0, 100);
+
+        let second = translate_message_tokens(
+            &info("msg_1", tokens(100, 60, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5"))),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let r = rows(&second);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 0, "input must not be re-billed");
+        assert_eq!(r[0].1, 50, "only the output growth");
+    }
+
+    /// The high-water map must cover SUBAGENT messages, which the
+    /// context meter never sees — the gap this feature had to close.
+    #[test]
+    fn subagent_messages_are_recorded_deduped_and_flagged() {
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+
+        let first = translate_message_tokens(
+            &info("msg_child", tokens(200, 20, 0, 0, 0), Some(("anthropic", "claude-haiku-4-5"))),
+            &ctx,
+            Some("child_session"),
+            &mut usage,
+        );
+        let r = rows(&first);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].4, "subagent flag must be set");
+        assert_eq!(r[0].0, 200);
+        assert!(
+            !first
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::ContextUsageUpdated { .. })),
+            "subagent usage must not move the composer meter"
+        );
+
+        // Re-broadcast of the SAME child message: growth only.
+        let second = translate_message_tokens(
+            &info("msg_child", tokens(200, 90, 0, 0, 0), Some(("anthropic", "claude-haiku-4-5"))),
+            &ctx,
+            Some("child_session"),
+            &mut usage,
+        );
+        let r2 = rows(&second);
+        assert_eq!(r2[0].0, 0);
+        assert_eq!(r2[0].1, 70);
+    }
+
+    /// OpenCode re-broadcasts a growing message, so reasoning needs the
+    /// same per-message delta as everything else — and stays folded into
+    /// output for billing.
+    #[test]
+    fn reasoning_is_deltaed_per_message_and_folded_into_output() {
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+        let first = translate_message_tokens(
+            &info("m1", tokens(10, 30, 20, 0, 0), Some(("openai", "gpt-5-mini"))),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let e = first
+            .iter()
+            .find_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    output_tokens,
+                    reasoning_tokens,
+                    ..
+                } => Some((*output_tokens, *reasoning_tokens)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(e, (50, 20), "output = 30 + 20 reasoning; reasoning reported alongside");
+
+        let second = translate_message_tokens(
+            &info("m1", tokens(10, 30, 55, 0, 0), Some(("openai", "gpt-5-mini"))),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let e2 = second
+            .iter()
+            .find_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    reasoning_tokens, ..
+                } => Some(*reasoning_tokens),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(e2, 35, "growth only");
+    }
+
+    /// Catalogue pricing is flagged `provider`; the static fallback
+    /// `table`. That distinction drives the Cost-confidence block.
+    #[test]
+    fn cost_source_records_which_price_list_was_used() {
+        let mut usage = OpenCodeUsageState::default();
+        let known = info("m1", tokens(1_000, 0, 0, 0, 0), Some(("anthropic", "claude-sonnet-4-5")));
+        let table = translate_message_tokens(&known, &ctx(), None, &mut usage);
+        let src = |events: &[ProviderRuntimeEvent]| {
+            events.iter().find_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded { cost_source, .. } => Some(*cost_source),
+                _ => None,
+            })
+        };
+        assert_eq!(src(&table), Some(Some(CostSource::Table)));
+
+        let mut usage = OpenCodeUsageState::default();
+        let priced = EventContext {
+            model_cost: Some(crate::agent_provider::opencode::client::OpenCodeModelCost {
+                input: 2.0,
+                output: 8.0,
+                cache_read: 0.2,
+                cache_write: 2.5,
+            }),
+            ..ctx()
+        };
+        let catalogue = translate_message_tokens(&known, &priced, None, &mut usage);
+        assert_eq!(src(&catalogue), Some(Some(CostSource::Provider)));
+
+        // Unpriced model with no catalogue → no cost, no source.
+        let mut usage = OpenCodeUsageState::default();
+        let unknown = info("m2", tokens(10, 0, 0, 0, 0), Some(("openrouter", "kimi-k2")));
+        let none = translate_message_tokens(&unknown, &ctx(), None, &mut usage);
+        assert_eq!(src(&none), Some(None));
+    }
+
+    #[test]
+    fn model_is_the_qualified_provider_slash_model_pair() {
+        let mut usage = OpenCodeUsageState::default();
+        let events = translate_message_tokens(
+            &info("m", tokens(10, 10, 0, 0, 0), Some(("openrouter", "kimi-k2"))),
+            &ctx(),
+            None,
+            &mut usage,
+        );
+        assert_eq!(rows(&events)[0].5.as_deref(), Some("openrouter/kimi-k2"));
+    }
+
+    /// A model the static table has never heard of is recorded with
+    /// tokens but no cost — until the catalogue price lands.
+    #[test]
+    fn catalogue_price_beats_the_static_fallback() {
+        let mut usage = OpenCodeUsageState::default();
+        let unknown = info("m1", tokens(1_000_000, 0, 0, 0, 0), Some(("openrouter", "kimi-k2")));
+        let without = translate_message_tokens(&unknown, &ctx(), None, &mut usage);
+        assert_eq!(rows(&without)[0].6, None, "unknown model has no static price");
+
+        let mut usage = OpenCodeUsageState::default();
+        let priced = EventContext {
+            model_cost: Some(crate::agent_provider::opencode::client::OpenCodeModelCost {
+                input: 2.0,
+                output: 8.0,
+                cache_read: 0.2,
+                cache_write: 2.5,
+            }),
+            ..ctx()
+        };
+        let with = translate_message_tokens(&unknown, &priced, None, &mut usage);
+        // 1M input tokens at $2/Mtok.
+        assert_eq!(rows(&with)[0].6, Some(2.0));
+    }
+
+    #[test]
+    fn missing_tokens_block_records_nothing() {
+        let mut usage = OpenCodeUsageState::default();
+        let bare: super::super::protocol::MessageInfo = serde_json::from_value(json!({
+            "id": "m",
+            "sessionID": "s",
+            "role": "assistant",
+        }))
+        .unwrap();
+        let events = translate_message_tokens(&bare, &ctx(), None, &mut usage);
+        assert!(rows(&events).is_empty());
     }
 }

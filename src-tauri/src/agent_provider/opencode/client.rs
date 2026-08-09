@@ -262,7 +262,7 @@ pub struct OpenCodeSkill {
 ///   picker uses this as a filter.
 /// * `models` — keyed by model id, values pulled from OpenCode's
 ///   `Provider.models[]` map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCodeProviderEntry {
     pub id: String,
     pub name: String,
@@ -296,7 +296,8 @@ pub struct OpenCodeProviderEntry {
 ///   rotate which models are free month-to-month, so the picker
 ///   surfaces this dynamically rather than hardcoding any model
 ///   list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is deliberately absent: `cost` carries f64 rates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCodeModel {
     pub id: String,
     pub name: String,
@@ -310,6 +311,25 @@ pub struct OpenCodeModel {
     pub supports_images: bool,
     #[serde(default)]
     pub is_free: bool,
+    /// Upstream list price for this model, in USD per million tokens.
+    ///
+    /// `None` when the upstream reports no `cost` block. Retained (as
+    /// opposed to being collapsed into `is_free`, which is all this
+    /// carried before) because OpenCode is the one provider Codemux
+    /// treats as metered: the Usage dashboard's headline "billed to your
+    /// keys" figure is only real if it uses the upstream's own prices
+    /// rather than a guess from the model's name.
+    #[serde(default)]
+    pub cost: Option<OpenCodeModelCost>,
+}
+
+/// Upstream per-token pricing for one model, USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeModelCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 // ── Wire-format decoders for the OpenCode HTTP API ──────────────────
@@ -397,6 +417,22 @@ struct RawModelCost {
     /// (input cached, output billed).
     #[serde(default)]
     output: f64,
+    /// Cached-prompt pricing, when the upstream reports it. Sibling of
+    /// `input`/`output` in the wire payload; absent for upstreams that
+    /// do not price caching separately, which reads as 0.0 and simply
+    /// makes cache tokens free in the ledger.
+    #[serde(default)]
+    cache: RawModelCacheCost,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawModelCacheCost {
+    /// USD-per-million-tokens for tokens served from a cache hit.
+    #[serde(default)]
+    read: f64,
+    /// USD-per-million-tokens for tokens written into the cache.
+    #[serde(default)]
+    write: f64,
 }
 
 /// Convert the raw `GET /provider` envelope into the public
@@ -444,6 +480,12 @@ fn flatten_model(raw: RawModel) -> OpenCodeModel {
         .as_ref()
         .map(|c| c.input == 0.0 && c.output == 0.0)
         .unwrap_or(false);
+    let cost = raw.cost.as_ref().map(|c| OpenCodeModelCost {
+        input: c.input,
+        output: c.output,
+        cache_read: c.cache.read,
+        cache_write: c.cache.write,
+    });
     OpenCodeModel {
         id: raw.id,
         name: raw.name,
@@ -452,6 +494,7 @@ fn flatten_model(raw: RawModel) -> OpenCodeModel {
         context_window,
         supports_images,
         is_free,
+        cost,
     }
 }
 

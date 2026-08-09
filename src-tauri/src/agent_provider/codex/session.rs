@@ -18,12 +18,13 @@ use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
     ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome, SendTurnInput,
-    SessionStatus, ThreadId, TurnId,
+    PlanAuthMode, SessionStatus, ThreadId, TurnId, UsageBaseline,
 };
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
-    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, InitializeParams,
+    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo,
+    GetAccountRateLimitsResponse, InitializeParams,
     NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadStartParams,
     ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
     RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
@@ -175,6 +176,10 @@ pub(crate) struct CodexSession {
     /// child is gone. Only the watchdog (a confirmed dead child) sets this, so
     /// a recoverable error stays recoverable in place without a rebuild.
     dead: Arc<AtomicBool>,
+    /// Ledger totals already recorded for this thread at build time.
+    /// Handed to the notification task's demux so a resumed thread does
+    /// not re-record its history. Zero for a fresh thread.
+    recorded_usage_baseline: UsageBaseline,
 }
 
 impl CodexSession {
@@ -196,6 +201,10 @@ impl CodexSession {
         caller_env: Option<HashMap<String, String>>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+        // Usage already in the ledger for this thread. Seeded into the
+        // demux so a resumed thread's lifetime counter is not
+        // re-recorded from zero — see `CodexSubagentDemux`.
+        recorded_usage_baseline: Option<UsageBaseline>,
     ) -> Result<Arc<Self>, ProviderError> {
         // Start from the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
         // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
@@ -282,7 +291,35 @@ impl CodexSession {
                         hint: "Run `codex login` and try again.".into(),
                     });
                 }
-                Ok(_) => {}
+                Ok(info) => {
+                    // The account block was already being fetched and then
+                    // thrown away apart from the login gate. It is the
+                    // authoritative answer to "is this a subscription or an
+                    // API key", which the Usage dashboard needs to decide
+                    // whether Codex tokens are a bill or plan-covered value.
+                    if let Some(account) = info.account.as_ref() {
+                        let auth_mode = match account.account_type.as_deref() {
+                            Some("apiKey") => Some(PlanAuthMode::ApiKey),
+                            Some("chatgpt") | Some("chatgptDeviceCode") => {
+                                Some(PlanAuthMode::Subscription)
+                            }
+                            _ => None,
+                        };
+                        let plan_label = codex_plan_label(account.plan_type.as_deref());
+                        if auth_mode.is_some() || plan_label.is_some() {
+                            // No windows yet — the push (or the read below)
+                            // supplies those. The sink merges the two
+                            // halves rather than letting either clobber.
+                            let _ = event_tx.send(ProviderRuntimeEvent::PlanUsageUpdated {
+                                thread_id: thread_id.clone(),
+                                provider: crate::agent_provider::ProviderKind::Codex,
+                                windows: Vec::new(),
+                                plan_label,
+                                auth_mode,
+                            });
+                        }
+                    }
+                }
                 Err(e) => {
                     let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(thread_id.clone()),
@@ -297,6 +334,34 @@ impl CodexSession {
                     message: format!("account/read probe failed: {e}"),
                     original_payload: None,
                 });
+            }
+        }
+
+        // Pull the plan quota once at init so the Usage dashboard's meters
+        // populate immediately instead of waiting for the first
+        // `account/rateLimits/updated` push (which may not arrive until the
+        // user actually spends something). Entirely best-effort: older
+        // app-servers do not implement the method, and a metered API-key
+        // account has no windows to report — both are log-and-continue, and
+        // an absent quota simply renders no meters.
+        match child.request("account/rateLimits/read", json!({})).await {
+            Ok(resp) => match serde_json::from_value::<GetAccountRateLimitsResponse>(resp) {
+                Ok(limits) => {
+                    for event in super::translate::plan_usage_from_rate_limits(
+                        &thread_id,
+                        &limits.rate_limits,
+                    ) {
+                        let _ = event_tx.send(event);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[codemux::codex] account/rateLimits/read decode failed: {e}");
+                }
+            },
+            Err(e) => {
+                // Expected on builds predating the method — not surfaced to
+                // the user, since nothing is broken.
+                eprintln!("[codemux::codex] account/rateLimits/read unavailable: {e}");
             }
         }
 
@@ -379,6 +444,7 @@ impl CodexSession {
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
+            recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -928,6 +994,33 @@ fn is_recoverable_resume_error(err_msg: &str) -> bool {
 /// by this adapter or CodeMux's provider-neutral persisted resume shape.
 /// `ThreadResumeParams::thread_id` still serializes to the official `threadId`
 /// field at the app-server RPC boundary.
+/// Short display label for a Codex `planType`.
+///
+/// The wire values are lowercase tags (`"pro"`, `"plus"`); the dashboard
+/// wants something a human recognizes. Unknown tags are title-cased and
+/// passed through rather than dropped, so a new plan still shows a name.
+fn codex_plan_label(plan_type: Option<&str>) -> Option<String> {
+    let plan = plan_type?.trim();
+    if plan.is_empty() {
+        return None;
+    }
+    Some(match plan.to_ascii_lowercase().as_str() {
+        "pro" => "ChatGPT Pro".to_string(),
+        "plus" => "ChatGPT Plus".to_string(),
+        "team" => "ChatGPT Team".to_string(),
+        "enterprise" => "ChatGPT Enterprise".to_string(),
+        "edu" => "ChatGPT Edu".to_string(),
+        "free" => "ChatGPT Free".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => format!("ChatGPT {}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => return None,
+            }
+        }
+    })
+}
+
 fn codex_thread_id_from_resume_cursor(cursor: &Value) -> Option<String> {
     cursor
         .get("threadId")
@@ -953,6 +1046,11 @@ fn spawn_notifications_task(
             state.codex_thread_id.clone()
         };
         let mut demux = CodexSubagentDemux::new(parent_codex_thread_id);
+        // Codex's `total` is a lifetime counter that survives
+        // `thread/resume`, but this demux is rebuilt with the session.
+        // Seed what the ledger already holds so the first report after a
+        // rebuild records only genuinely new work.
+        demux.set_recorded_usage_baseline(session.recorded_usage_baseline);
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -963,6 +1061,16 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
+                            // Codex never states a model on the usage
+                            // notification, so the ledger has to learn it
+                            // from session state. Refreshed only on the
+                            // usage notification itself — reading it on
+                            // every notification would take a mutex on the
+                            // per-token `item/updated` stream for nothing.
+                            if matches!(msg, NotificationMessage::ThreadTokenUsageUpdated(_)) {
+                                let model = session.state.lock().await.model.clone();
+                                demux.set_active_model(model);
+                            }
                             let events =
                                 translate_notification_with(&mut demux, &session.thread_id, msg);
                             for ev in events {
@@ -1151,6 +1259,21 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_plan_labels_are_humanized_and_unknowns_pass_through() {
+        assert_eq!(codex_plan_label(Some("pro")).as_deref(), Some("ChatGPT Pro"));
+        assert_eq!(codex_plan_label(Some("plus")).as_deref(), Some("ChatGPT Plus"));
+        assert_eq!(codex_plan_label(Some("Team")).as_deref(), Some("ChatGPT Team"));
+        // A plan tag we have never seen still gets a readable name
+        // rather than being dropped.
+        assert_eq!(
+            codex_plan_label(Some("ultra")).as_deref(),
+            Some("ChatGPT Ultra")
+        );
+        assert!(codex_plan_label(None).is_none());
+        assert!(codex_plan_label(Some("  ")).is_none());
+    }
 
     #[test]
     fn recoverable_resume_error_matches_snippets() {

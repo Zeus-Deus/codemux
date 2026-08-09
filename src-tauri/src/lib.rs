@@ -302,6 +302,9 @@ fn build_core_app<R: tauri::Runtime>(
         // display-coupled behavior on it.
         .manage(mode)
         .manage(state::AppStateStore::default())
+        // Live plan-quota readings for Settings → Usage. In-memory only;
+        // see `commands::usage::PlanQuotaStore`.
+        .manage(commands::usage::PlanQuotaStore::default())
         .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
         .manage(observability::load_observability_store())
@@ -2078,6 +2081,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::opencode_check_availability,
             commands::opencode_ping,
             commands::opencode_list_models,
+            commands::usage_summary,
+            commands::usage_export_csv,
+            commands::usage_scan_provider_history,
             commands::list_tool_permissions,
             commands::remove_tool_permission,
             commands::list_skills,

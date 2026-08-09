@@ -32,6 +32,7 @@ use crate::agent_provider::{
 use crate::database::{
     AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
 };
+use crate::commands::usage::PlanQuotaStore;
 use crate::observability::ObservabilityStore;
 use crate::state::{AppStateStore, PaneStatus};
 
@@ -549,6 +550,8 @@ pub async fn agent_chat_start_session<R: Runtime>(
         );
     }
     input.permission_mode = resolved_permission_mode;
+    // Provider history, not runtime deltas, owns accounting.
+    input.recorded_usage_baseline = None;
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
@@ -1191,6 +1194,7 @@ pub async fn ensure_live_session<R: Runtime>(
         additional_directories: vec![],
         env: env.clone(),
         extra: serde_json::Value::Null,
+        recorded_usage_baseline: None,
     };
 
     eprintln!(
@@ -3211,6 +3215,46 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // what lets a resuming pane tell "already replayed from the tail"
     // apart from "new".
     let mut persisted_id: Option<i64> = None;
+
+    // Plan quota is provider-scoped level state, not transcript or
+    // history: intercept it, update the in-memory store, and return. Like
+    // `UsageRecorded` it is never persisted and never fanned out — but
+    // unlike it, nothing accumulates; each snapshot supersedes the last.
+    if let ProviderRuntimeEvent::PlanUsageUpdated {
+        provider,
+        windows,
+        plan_label,
+        auth_mode,
+        ..
+    } = &event
+    {
+        let quota: State<'_, PlanQuotaStore> = app.state();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let provider_id = serde_json::to_value(*provider)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{provider:?}").to_lowercase());
+        quota.record(
+            &provider_id,
+            windows.clone(),
+            plan_label.clone(),
+            *auth_mode,
+            now_ms,
+        );
+        return;
+    }
+
+    // Adapters still compute a per-turn usage delta, but it is intentionally
+    // discarded here: provider-owned history (the JSONL/SQLite scan) is the
+    // sole accounting source, and writing both streams would count every
+    // Codemux-launched turn twice.
+    if matches!(event, ProviderRuntimeEvent::UsageRecorded { .. }) {
+        return;
+    }
+
     if let ProviderRuntimeEvent::ResumeCursorUpdated {
         thread_id,
         resume_cursor,
@@ -4229,7 +4273,11 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::TasksUpdated { .. } => None,
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
-        ProviderRuntimeEvent::ContextUsageUpdated { .. } => None,
+        // Ledger rows are the same: pure accounting, no liveness signal.
+        ProviderRuntimeEvent::ContextUsageUpdated { .. }
+        | ProviderRuntimeEvent::UsageRecorded { .. }
+        // Plan quota is an account-level reading, not thread liveness.
+        | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
         // A fanned-out user turn is an INPUT echo, not provider liveness.
         // `agent_chat_send_turn` already owns the send's status transition
         // (and it runs on the sending client's command, before any of this),
@@ -4836,6 +4884,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
+        | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
+        | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }

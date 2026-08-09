@@ -329,6 +329,36 @@ pub struct MessageInfo {
     /// user messages and on early partial assistant envelopes.
     #[serde(default)]
     pub tokens: Option<MessageTokens>,
+    /// The upstream provider that served this message (`"anthropic"`,
+    /// `"openrouter"`, …). Assistant messages only.
+    #[serde(default, rename = "providerID")]
+    pub provider_id: Option<String>,
+    /// The model that served this message. Assistant messages only.
+    ///
+    /// Decoded alongside `tokens` on purpose: the usage ledger needs the
+    /// model that produced *these* tokens, and OpenCode lets the model
+    /// change mid-thread and lets a subagent run a different one than
+    /// its parent. Reading it off the same envelope as the token counts
+    /// is the only source that stays correct through both.
+    #[serde(default, rename = "modelID")]
+    pub model_id: Option<String>,
+}
+
+impl MessageInfo {
+    /// The `"providerID/modelID"` join Codemux uses as a model id
+    /// everywhere else (see [`TaskModelRef::as_model_id`]).
+    ///
+    /// `None` unless both halves are present — a bare model id with no
+    /// provider would collide across upstreams that serve the same
+    /// model under the same name.
+    pub fn qualified_model_id(&self) -> Option<String> {
+        match (self.provider_id.as_deref(), self.model_id.as_deref()) {
+            (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+                Some(format!("{provider}/{model}"))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The assistant `tokens` block: `{ input, output, reasoning, cache: {

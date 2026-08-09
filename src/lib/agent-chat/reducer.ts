@@ -1703,6 +1703,13 @@ function applyEventInner(
       return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
     }
 
+    // Legacy usage events are discarded by `forward_event` before fan-out,
+    // so one should never reach here. Ignored
+    // explicitly rather than falling through to `default`, which would
+    // log it as an unknown variant if the interception ever regressed.
+    case "usage_recorded":
+      return state;
+
     default: {
       warnOnce((event as { type: string }).type ?? "unknown", event);
       return state;

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_core::Stream;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::agent_provider::events::ProviderRuntimeEvent;
 use crate::agent_provider::provider::{AgentProvider, ProviderEventStream};
@@ -31,6 +31,7 @@ use crate::agent_provider::ProviderError;
 
 use super::manager::OpenCodeServerManager;
 use super::session::OpenCodeSession;
+use super::translate::OpenCodeUsageState;
 
 /// Configuration knobs for the OpenCode provider. Defaults are
 /// fine for production; tests may override `event_channel_capacity`
@@ -67,6 +68,25 @@ pub struct OpenCodeAgentProvider {
     manager: Arc<OpenCodeServerManager>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<OpenCodeSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    /// Token accounting keyed by **OpenCode session id**, outliving the
+    /// `OpenCodeSession` objects that use it.
+    ///
+    /// `OpenCodeUsageState` holds the per-message high-water marks that
+    /// stop OpenCode's incremental re-broadcasts of one assistant message
+    /// from being counted twice. Those marks used to die with the session
+    /// object — but a session rebuild (the SSE listener exhausting its
+    /// reconnect attempts against a still-live server, then the next send
+    /// resuming) **readopts the same OpenCode session id** with a virgin
+    /// usage state. Any `message.updated` for a still-growing assistant
+    /// message then re-billed its whole cumulative block.
+    ///
+    /// Keying by session id instead of by session object closes that: a
+    /// readopted id gets its own marks back. An app restart cannot reach
+    /// the bug at all — the OpenCode server is `kill_on_drop` and dies
+    /// with the process, so no in-flight message survives to be
+    /// re-broadcast — which is why this in-memory map is sufficient and
+    /// no durable per-message baseline is needed.
+    usage_states: Arc<RwLock<HashMap<String, Arc<Mutex<OpenCodeUsageState>>>>>,
 }
 
 impl OpenCodeAgentProvider {
@@ -77,6 +97,7 @@ impl OpenCodeAgentProvider {
             manager,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            usage_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -187,6 +208,12 @@ impl AgentProvider for OpenCodeAgentProvider {
             .resume_cursor
             .as_ref()
             .and_then(super::session::resume_session_id_from_cursor);
+        // Hand the rebuilt session the usage state its OpenCode session id
+        // already had, when resuming a known id. See `usage_states`.
+        let carried_usage = match resume_session_id.as_ref() {
+            Some(id) => self.usage_states.read().await.get(id).cloned(),
+            None => None,
+        };
         let session = OpenCodeSession::start(
             self.manager.clone(),
             thread_id.clone(),
@@ -194,9 +221,17 @@ impl AgentProvider for OpenCodeAgentProvider {
             input.effort.clone(),
             resume_session_id,
             self.event_tx.clone(),
+            carried_usage,
         )
         .await?;
         let provider_session_id = session.provider_session_id.clone();
+        // Register under the id the session actually adopted — which is the
+        // resumed id when readoption succeeded, and a fresh one when it
+        // did not.
+        {
+            let mut usage_states = self.usage_states.write().await;
+            usage_states.insert(provider_session_id.0.clone(), session.usage_state());
+        }
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(thread_id.clone(), Arc::clone(&session));
@@ -296,6 +331,15 @@ impl AgentProvider for OpenCodeAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: thread_id.clone(),
         })?;
+        // Drop the carried usage state too — this is an explicit teardown,
+        // not the dead-session eviction the carry-over exists for, and the
+        // shutdown below closes the server session, so nothing survives
+        // that could be re-broadcast. Keeps `usage_states` bounded by live
+        // sessions rather than by everything the app has ever opened.
+        {
+            let mut usage_states = self.usage_states.write().await;
+            usage_states.remove(&session.provider_session_id.0);
+        }
         session.shutdown().await;
         Ok(())
     }

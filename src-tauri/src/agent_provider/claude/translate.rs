@@ -26,10 +26,12 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent_provider::{
-    classify_task_kind, CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent,
-    ProviderSessionId, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, SubagentTaskKind,
-    TaskSnapshotItem, TaskStatus, TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage,
-    WorkflowPhaseSnapshot, WorkflowSnapshot,
+    classify_task_kind, pricing, CompletedItem, ContentDelta, ContextUsageTracker, CostSource,
+    PlanAuthMode,
+    PlanUsageWindow, PlanWindowKind, ProviderKind, ProviderRuntimeEvent, ProviderSessionId,
+    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, SubagentTaskKind, TaskSnapshotItem,
+    TaskStatus, TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage, WorkflowPhaseSnapshot,
+    WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -80,6 +82,83 @@ pub struct SubagentDemux {
     task_tools: HashMap<String, (String, serde_json::Value)>,
     /// Current task state accumulated from Claude's modern Task* tools.
     claude_tasks: Vec<TaskSnapshotItem>,
+    /// Anthropic `message.id` → the largest usage split already written
+    /// to the ledger for that message.
+    ///
+    /// The Claude Code CLI emits one `assistant` SDK message per
+    /// committed content-block group, and every one of them repeats the
+    /// **same** `message.id` carrying the **same cumulative**
+    /// `message.usage` block for the API turn so far. A per-message emit
+    /// would therefore bill a text-then-tool_use turn twice. Recording
+    /// only the positive delta against this high-water mark makes the
+    /// ledger correct whether the id appears once or five times, which
+    /// is why it is preferred over "record on the final occurrence" —
+    /// nothing in the stream marks which occurrence is final.
+    ///
+    /// The context meter never needed this because it treats usage as an
+    /// occupancy *level* it overwrites, not a sum.
+    usage_by_message: HashMap<String, UsageSplit>,
+}
+
+/// A non-overlapping token split, in the shape
+/// [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded) expects.
+///
+/// Anthropic's `usage` block is already disjoint — `input_tokens`
+/// excludes both cache tiers — so unlike Codex there is nothing to carve
+/// out here; the fields only need renaming.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageSplit {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    /// Subset of `cache_write`: the part written at the 1-hour TTL,
+    /// which bills at 2x input rather than the 5-minute tier's 1.25x.
+    /// Carried for pricing only — it is never reported as a fifth token
+    /// bucket, so the four-way non-overlapping invariant is untouched.
+    cache_write_1h: u64,
+}
+
+impl UsageSplit {
+    fn from_usage_block(usage: &serde_json::Value) -> Self {
+        let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        let ephemeral = usage.get("cache_creation");
+        let ephemeral_field = |key: &str| {
+            ephemeral
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let cache_write_1h = ephemeral_field("ephemeral_1h_input_tokens");
+        Self {
+            input: field("input_tokens"),
+            output: field("output_tokens"),
+            cache_read: field("cache_read_input_tokens"),
+            // The top-level counter under-reports when one response ran
+            // several server-side iterations; the per-TTL tiers are then
+            // the complete figure. Same rule as the log importer, and
+            // for the same measured reason.
+            cache_write: field("cache_creation_input_tokens")
+                .max(cache_write_1h + ephemeral_field("ephemeral_5m_input_tokens")),
+            cache_write_1h,
+        }
+    }
+
+    /// This split minus `previous`, per field. Saturating so a report
+    /// that comes back lower contributes zero rather than wrapping.
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(previous.input),
+            output: self.output.saturating_sub(previous.output),
+            cache_read: self.cache_read.saturating_sub(previous.cache_read),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
+            cache_write_1h: self.cache_write_1h.saturating_sub(previous.cache_write_1h),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
 }
 
 impl SubagentDemux {
@@ -610,11 +689,121 @@ pub fn translate_sdk_message_with(
         "tool_progress" | "tool_use_summary" => {
             warning(thread_id, &format!("sdk {ty}"), msg)
         }
-        "rate_limit_event" => warning(thread_id, "rate limit event", msg),
+        "rate_limit_event" => translate_rate_limit_event(thread_id, msg),
         "prompt_suggestion" => warning(thread_id, "prompt suggestion", msg),
         _ => warning(thread_id, &format!("unknown sdk message type: {ty}"), msg),
     }
 }
+
+/// Decode an SDK `rate_limit_event` into a plan-quota snapshot.
+///
+/// The CLI builds this from the `anthropic-ratelimit-unified-*` response
+/// headers and emits it **only for claude.ai subscription logins** — an
+/// API-key user never sees one. Its mere presence is therefore a reliable
+/// "this Claude session is plan-covered" signal, which is why
+/// `auth_mode` is set unconditionally here rather than inferred from the
+/// payload's contents.
+///
+/// Two unit conversions happen at this boundary, both easy to get wrong:
+/// `utilization` is a **0..1 fraction** (the CLI multiplies by 100 for
+/// display) and `resetsAt` is in **epoch seconds**.
+fn translate_rate_limit_event(
+    thread_id: &ThreadId,
+    msg: &serde_json::Value,
+) -> Vec<ProviderRuntimeEvent> {
+    let Some(info) = msg.get("rate_limit_info") else {
+        // Shape we don't recognize — keep the old behavior rather than
+        // silently reporting an empty quota.
+        return warning(thread_id, RATE_LIMIT_WARNING_MESSAGE, msg);
+    };
+
+    let raw_kind = info.get("rateLimitType").and_then(|v| v.as_str());
+    let kind = match raw_kind {
+        Some("five_hour") => PlanWindowKind::FiveHour,
+        Some("seven_day") => PlanWindowKind::SevenDay,
+        Some("seven_day_opus") => PlanWindowKind::SevenDayOpus,
+        Some("seven_day_sonnet") => PlanWindowKind::SevenDaySonnet,
+        Some("overage") => PlanWindowKind::Overage,
+        _ => PlanWindowKind::Other,
+    };
+
+    // 0..1 → 0..100. Clamped defensively: an out-of-range value would
+    // otherwise render as a bar overflowing its track.
+    let used_pct = info
+        .get("utilization")
+        .and_then(|v| v.as_f64())
+        .map(|fraction| (fraction * 100.0).clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+
+    // Epoch seconds → milliseconds, matching every other timestamp on
+    // the wire.
+    let resets_at_ms = info
+        .get("resetsAt")
+        .and_then(|v| v.as_f64())
+        .map(|secs| (secs * 1000.0) as i64);
+
+    let mut windows = vec![PlanUsageWindow {
+        kind,
+        used_pct,
+        resets_at_ms,
+        label: raw_kind.map(|s| s.to_string()),
+    }];
+
+    // The overage bucket rides along on the same event when the account
+    // has one, with its own reset clock. Surfaced as a separate window so
+    // the UI can show it beside the plan windows.
+    if info
+        .get("isUsingOverage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && kind != PlanWindowKind::Overage
+    {
+        windows.push(PlanUsageWindow {
+            kind: PlanWindowKind::Overage,
+            // The SDK reports no separate overage utilization — only
+            // that it is in use — so the bar is left at zero and the
+            // label carries the meaning.
+            used_pct: 0.0,
+            resets_at_ms: info
+                .get("overageResetsAt")
+                .and_then(|v| v.as_f64())
+                .map(|secs| (secs * 1000.0) as i64),
+            label: Some("overage".to_string()),
+        });
+    }
+
+    let mut events = vec![ProviderRuntimeEvent::PlanUsageUpdated {
+        thread_id: thread_id.clone(),
+        provider: ProviderKind::Claude,
+        windows,
+        // Filled in later from the account info the sidecar reports; the
+        // rate-limit event itself carries no plan name.
+        plan_label: None,
+        auth_mode: Some(PlanAuthMode::Subscription),
+    }];
+
+    // A `rejected` status is the one rate-limit reading the user must see in
+    // the transcript: the provider refused the turn. `PlanUsageUpdated` alone
+    // cannot say it — `forward_event` intercepts that variant for the quota
+    // store and returns before persistence and fan-out — so the legacy
+    // warning is emitted ALONGSIDE it. `src/lib/agent-chat/runtime-notice.ts`
+    // keys the "Usage limit reached" notice off exactly this pair
+    // (`message == "rate limit event"` plus
+    // `original_payload.rate_limit_info.status == "rejected"`); changing
+    // either string here silently deletes that notice.
+    if info.get("status").and_then(|v| v.as_str()) == Some(RATE_LIMIT_REJECTED_STATUS) {
+        events.extend(warning(thread_id, RATE_LIMIT_WARNING_MESSAGE, msg));
+    }
+
+    events
+}
+
+/// Warning text the transcript-notice classifier matches on. See
+/// `src/lib/agent-chat/runtime-notice.ts`.
+const RATE_LIMIT_WARNING_MESSAGE: &str = "rate limit event";
+
+/// `rate_limit_info.status` value meaning the provider stopped the run.
+const RATE_LIMIT_REJECTED_STATUS: &str = "rejected";
 
 fn warning(
     thread_id: &ThreadId,
@@ -793,7 +982,83 @@ fn translate_assistant(
             ));
         }
     }
+
+    // The ledger, by contrast, counts subagent work — flagged, not
+    // dropped. Deliberately NOT inside the guard above.
+    out.extend(record_usage(
+        thread_id,
+        msg,
+        demux,
+        subagent_id.is_some(),
+    ));
     out
+}
+
+/// Emit the ledger delta for one assistant SDK message, if it moved.
+///
+/// The model comes from `message.model` — the in-band value, which is
+/// the model that actually produced *these* tokens. That matters more
+/// than it sounds: a subagent may run a different model than its parent,
+/// and a per-turn model override never reaches session state, so any
+/// out-of-band source would misattribute both cases.
+fn record_usage(
+    thread_id: &ThreadId,
+    msg: &serde_json::Value,
+    demux: &mut SubagentDemux,
+    subagent: bool,
+) -> Vec<ProviderRuntimeEvent> {
+    let Some(message) = msg.get("message") else {
+        return Vec::new();
+    };
+    let Some(usage) = message.get("usage") else {
+        return Vec::new();
+    };
+    let current = UsageSplit::from_usage_block(usage);
+
+    // A message with no id cannot be deduped, so it is recorded as-is:
+    // under-counting a turn is worse than the (unobserved) risk of
+    // double-counting one that omits the field.
+    let delta = match message.get("id").and_then(|v| v.as_str()) {
+        Some(id) => {
+            let previous = demux.usage_by_message.get(id).copied().unwrap_or_default();
+            let delta = current.delta_since(&previous);
+            demux.usage_by_message.insert(id.to_string(), current);
+            delta
+        }
+        None => current,
+    };
+    if delta.is_empty() {
+        return Vec::new();
+    }
+
+    let model = message
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cost_usd = pricing::cost_for_with_1h(
+        model.as_deref(),
+        delta.input,
+        delta.output,
+        delta.cache_read,
+        delta.cache_write,
+        delta.cache_write_1h,
+    );
+    vec![ProviderRuntimeEvent::UsageRecorded {
+        thread_id: thread_id.clone(),
+        provider: ProviderKind::Claude,
+        model,
+        subagent,
+        input_tokens: delta.input,
+        output_tokens: delta.output,
+        cache_read_tokens: delta.cache_read,
+        cache_write_tokens: delta.cache_write,
+        // The Anthropic usage block carries no reasoning split — thinking
+        // tokens are billed as, and reported as, plain output.
+        reasoning_tokens: 0,
+        cost_usd,
+        // Claude has no rate catalogue; every priced row is table-priced.
+        cost_source: cost_usd.map(|_| CostSource::Table),
+    }]
 }
 
 /// Claude Code compacts the context automatically once the window
@@ -2285,14 +2550,188 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_event_emits_warning() {
+    /// Was `rate_limit_event_emits_warning`: the payload used to be
+    /// dropped into an untyped warning. It now decodes into plan-quota
+    /// state, and a rate-limit event at all means a subscription login
+    /// (the CLI only builds these from claude.ai response headers).
+    fn rate_limit_event_decodes_into_plan_usage() {
         let msg = json!({
             "type": "rate_limit_event",
             "rate_limit_info": {"status": "rejected"}
         });
         let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::PlanUsageUpdated {
+                provider,
+                auth_mode,
+                windows,
+                ..
+            } => {
+                assert_eq!(*provider, ProviderKind::Claude);
+                assert_eq!(*auth_mode, Some(PlanAuthMode::Subscription));
+                // No utilization stated → a zero bar, not a missing one.
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].used_pct, 0.0);
+                assert_eq!(windows[0].kind, PlanWindowKind::Other);
+            }
+            other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the "Usage limit reached" transcript notice.
+    ///
+    /// `forward_event` intercepts `PlanUsageUpdated` for the quota store and
+    /// returns BEFORE persistence and fan-out, so a rejected rate-limit event
+    /// that decoded into nothing else would never reach the transcript. The
+    /// assertions below are the full wire contract
+    /// `src/lib/agent-chat/runtime-notice.ts` reads — event tag, warning
+    /// message, and the nested `rate_limit_info.status` — checked on the
+    /// SERIALIZED payload, which is what the frontend actually receives.
+    #[test]
+    fn rejected_rate_limit_event_also_emits_the_transcript_notice_warning() {
+        let msg = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert_eq!(
+            events.len(),
+            2,
+            "a rejected event carries BOTH quota state and a user-facing notice"
+        );
+        assert!(
+            matches!(&events[0], ProviderRuntimeEvent::PlanUsageUpdated { .. }),
+            "quota state still flows to the meter"
+        );
+
+        let wire = serde_json::to_value(&events[1]).expect("serialize warning");
+        assert_eq!(wire["type"], "runtime_warning");
+        assert_eq!(wire["message"], "rate limit event");
+        assert_eq!(wire["original_payload"]["rate_limit_info"]["status"], "rejected");
+    }
+
+    /// The mirror case: an informational reading must NOT spam the transcript.
+    /// The classifier would drop it anyway, but emitting one warning per
+    /// rate-limit tick would put a row through persistence and fan-out.
+    #[test]
+    fn non_rejected_rate_limit_event_emits_quota_state_only() {
+        for status in ["allowed", "allowed_warning"] {
+            let msg = json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": status, "utilization": 0.5}
+            });
+            let events = translate_sdk_message(&tid(), &msg);
+            assert_eq!(events.len(), 1, "for {status}");
+            assert!(matches!(
+                &events[0],
+                ProviderRuntimeEvent::PlanUsageUpdated { .. }
+            ));
+        }
+    }
+
+    /// The two unit conversions this boundary owns: `utilization` is a
+    /// 0..1 FRACTION (not a percent) and `resetsAt` is epoch SECONDS.
+    #[test]
+    fn rate_limit_scales_fraction_to_percent_and_seconds_to_ms() {
+        let msg = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed_warning",
+                "rateLimitType": "five_hour",
+                "utilization": 0.41,
+                "resetsAt": 1_800_000_000_i64,
+            }
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        match &events[0] {
+            ProviderRuntimeEvent::PlanUsageUpdated { windows, .. } => {
+                assert_eq!(windows[0].kind, PlanWindowKind::FiveHour);
+                assert!((windows[0].used_pct - 41.0).abs() < 1e-9, "0.41 → 41%");
+                assert_eq!(windows[0].resets_at_ms, Some(1_800_000_000_000));
+            }
+            other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// An out-of-range utilization must not render a bar overflowing its
+    /// track.
+    #[test]
+    fn rate_limit_utilization_is_clamped() {
+        let over = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "utilization": 1.4}
+        });
+        let under = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "allowed", "utilization": -0.2}
+        });
+        for (msg, expected) in [(over, 100.0), (under, 0.0)] {
+            match &translate_sdk_message(&tid(), &msg)[0] {
+                ProviderRuntimeEvent::PlanUsageUpdated { windows, .. } => {
+                    assert_eq!(windows[0].used_pct, expected);
+                }
+                other => panic!("expected PlanUsageUpdated, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_maps_every_known_window_kind() {
+        for (raw, expected) in [
+            ("five_hour", PlanWindowKind::FiveHour),
+            ("seven_day", PlanWindowKind::SevenDay),
+            ("seven_day_opus", PlanWindowKind::SevenDayOpus),
+            ("seven_day_sonnet", PlanWindowKind::SevenDaySonnet),
+            ("overage", PlanWindowKind::Overage),
+            ("something_new", PlanWindowKind::Other),
+        ] {
+            let msg = json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "allowed", "rateLimitType": raw}
+            });
+            match &translate_sdk_message(&tid(), &msg)[0] {
+                ProviderRuntimeEvent::PlanUsageUpdated { windows, .. } => {
+                    assert_eq!(windows[0].kind, expected, "for {raw}");
+                    // The raw name is retained so an `Other` window can
+                    // still be named in the UI.
+                    assert_eq!(windows[0].label.as_deref(), Some(raw));
+                }
+                other => panic!("expected PlanUsageUpdated, got {other:?}"),
+            }
+        }
+    }
+
+    /// An account spending into overage gets a second window alongside
+    /// the plan one.
+    #[test]
+    fn rate_limit_surfaces_overage_as_its_own_window() {
+        let msg = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+                "utilization": 0.9,
+                "isUsingOverage": true,
+                "overageResetsAt": 1_800_000_000_i64,
+            }
+        });
+        match &translate_sdk_message(&tid(), &msg)[0] {
+            ProviderRuntimeEvent::PlanUsageUpdated { windows, .. } => {
+                assert_eq!(windows.len(), 2);
+                assert_eq!(windows[1].kind, PlanWindowKind::Overage);
+                assert_eq!(windows[1].resets_at_ms, Some(1_800_000_000_000));
+            }
+            other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// A payload without the block we expect falls back to the old
+    /// warning rather than reporting an empty quota.
+    #[test]
+    fn rate_limit_without_info_block_still_warns() {
+        let msg = json!({"type": "rate_limit_event"});
         assert!(matches!(
-            &events[0],
+            &translate_sdk_message(&tid(), &msg)[0],
             ProviderRuntimeEvent::RuntimeWarning { .. }
         ));
     }
@@ -3867,5 +4306,247 @@ async function run() {
         }).expect("tasks snapshot");
         assert_eq!(tasks.tasks[0].task_id, "42");
         assert_eq!(tasks.tasks[0].title, "Test the panel");
+    }
+}
+
+// ── usage ledger ──
+
+#[cfg(test)]
+mod usage_ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tid() -> ThreadId {
+        ThreadId("thread-1".into())
+    }
+
+    /// One assistant SDK message as the sidecar forwards it.
+    fn assistant(
+        id: &str,
+        model: &str,
+        usage: serde_json::Value,
+        parent_tool_use_id: Option<&str>,
+    ) -> serde_json::Value {
+        json!({
+            "type": "assistant",
+            "parent_tool_use_id": parent_tool_use_id,
+            "message": {
+                "id": id,
+                "model": model,
+                "usage": usage,
+                "content": [{"type": "text", "text": "hi"}],
+            }
+        })
+    }
+
+    fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> serde_json::Value {
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+        })
+    }
+
+    fn rows(
+        events: &[ProviderRuntimeEvent],
+    ) -> Vec<(u64, u64, u64, u64, bool, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    subagent,
+                    model,
+                    ..
+                } => Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                    *subagent,
+                    model.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Anthropic's usage block is already disjoint, so the four fields
+    /// map straight across — this pins the field NAMES, which is the
+    /// part that silently breaks.
+    #[test]
+    fn usage_block_maps_onto_the_four_disjoint_fields() {
+        let mut demux = SubagentDemux::default();
+        let events = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_1", "claude-opus-4-5", usage(100, 20, 3_000, 500), None),
+            &mut demux,
+        );
+        let r = rows(&events);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 100, "input_tokens");
+        assert_eq!(r[0].1, 20, "output_tokens");
+        assert_eq!(r[0].2, 3_000, "cache_read_input_tokens");
+        assert_eq!(r[0].3, 500, "cache_creation_input_tokens");
+        assert_eq!(r[0].5.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    /// THE dedup invariant this design rests on.
+    ///
+    /// The CLI emits one `assistant` message per committed content-block
+    /// group, all repeating the same `message.id` and the same
+    /// **cumulative** usage. Recording the raw block per message would
+    /// bill this turn twice; recording the delta bills it once.
+    #[test]
+    fn repeated_message_id_carrying_cumulative_usage_bills_once() {
+        let mut demux = SubagentDemux::default();
+        let first = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_same", "claude-opus-4-5", usage(100, 10, 0, 0), None),
+            &mut demux,
+        );
+        assert_eq!(rows(&first)[0].0, 100);
+        assert_eq!(rows(&first)[0].1, 10);
+
+        // Same id, usage grown to include the second content block.
+        let second = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_same", "claude-opus-4-5", usage(100, 45, 0, 0), None),
+            &mut demux,
+        );
+        let r = rows(&second);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 0, "input must not be re-billed");
+        assert_eq!(r[0].1, 35, "only the output growth is new");
+    }
+
+    /// An exact repeat (no growth) is not work.
+    #[test]
+    fn identical_repeat_records_nothing() {
+        let mut demux = SubagentDemux::default();
+        let msg = assistant("msg_same", "claude-opus-4-5", usage(100, 10, 0, 0), None);
+        assert_eq!(rows(&translate_sdk_message_with(&tid(), &msg, &mut demux)).len(), 1);
+        assert_eq!(rows(&translate_sdk_message_with(&tid(), &msg, &mut demux)).len(), 0);
+    }
+
+    /// Different ids are different turns and must each bill in full.
+    #[test]
+    fn distinct_message_ids_each_bill_in_full() {
+        let mut demux = SubagentDemux::default();
+        let a = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_a", "claude-opus-4-5", usage(100, 10, 0, 0), None),
+            &mut demux,
+        );
+        let b = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_b", "claude-opus-4-5", usage(80, 20, 0, 0), None),
+            &mut demux,
+        );
+        assert_eq!(rows(&a)[0].0, 100);
+        assert_eq!(rows(&b)[0].0, 80);
+    }
+
+    /// The context meter drops subagent messages; the ledger records
+    /// them with the flag set. Both behaviours asserted together
+    /// because the whole point is that they diverge.
+    #[test]
+    fn subagent_messages_are_recorded_flagged_but_move_no_meter() {
+        let mut demux = SubagentDemux::default();
+        let events = translate_sdk_message_with(
+            &tid(),
+            &assistant(
+                "msg_child",
+                "claude-haiku-4-5",
+                usage(50, 5, 0, 0),
+                Some("toolu_parent"),
+            ),
+            &mut demux,
+        );
+        let r = rows(&events);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].4, "subagent flag must be set");
+        assert_eq!(r[0].5.as_deref(), Some("claude-haiku-4-5"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::ContextUsageUpdated { .. })),
+            "subagent usage must not move the composer meter"
+        );
+    }
+
+    /// A parent message still drives the meter — the ledger addition
+    /// must not have disturbed the existing hygiene path.
+    #[test]
+    fn parent_messages_still_drive_the_context_meter() {
+        let mut demux = SubagentDemux::default();
+        let events = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_p", "claude-opus-4-5", usage(100, 10, 0, 0), None),
+            &mut demux,
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::ContextUsageUpdated { .. })));
+    }
+
+    #[test]
+    fn zero_usage_records_nothing() {
+        let mut demux = SubagentDemux::default();
+        let events = translate_sdk_message_with(
+            &tid(),
+            &assistant("msg_z", "claude-opus-4-5", usage(0, 0, 0, 0), None),
+            &mut demux,
+        );
+        assert!(rows(&events).is_empty());
+    }
+
+    /// Reconciliation check against the turn-end `result` message.
+    ///
+    /// Per-message recording is the source of truth, so this asserts the
+    /// two agree rather than adding a second recording path (which would
+    /// double-count). `modelUsage` is keyed by model id and carries the
+    /// same four counters.
+    #[test]
+    fn per_message_totals_reconcile_with_result_model_usage() {
+        let mut demux = SubagentDemux::default();
+        let mut recorded = (0u64, 0u64, 0u64, 0u64);
+        for (id, u) in [
+            ("msg_a", usage(1_000, 200, 5_000, 800)),
+            // Same message growing — must contribute only the growth.
+            ("msg_a", usage(1_000, 500, 5_000, 800)),
+            ("msg_b", usage(300, 100, 2_000, 0)),
+        ] {
+            let events = translate_sdk_message_with(
+                &tid(),
+                &assistant(id, "claude-opus-4-5", u, None),
+                &mut demux,
+            );
+            for r in rows(&events) {
+                recorded.0 += r.0;
+                recorded.1 += r.1;
+                recorded.2 += r.2;
+                recorded.3 += r.3;
+            }
+        }
+        // What the turn-end result would report for this model.
+        let model_usage = json!({
+            "claude-opus-4-5": {
+                "inputTokens": 1_300,
+                "outputTokens": 600,
+                "cacheReadInputTokens": 7_000,
+                "cacheCreationInputTokens": 800,
+                "contextWindow": 200_000,
+            }
+        });
+        let entry = &model_usage["claude-opus-4-5"];
+        assert_eq!(recorded.0, entry["inputTokens"].as_u64().unwrap());
+        assert_eq!(recorded.1, entry["outputTokens"].as_u64().unwrap());
+        assert_eq!(recorded.2, entry["cacheReadInputTokens"].as_u64().unwrap());
+        assert_eq!(recorded.3, entry["cacheCreationInputTokens"].as_u64().unwrap());
     }
 }

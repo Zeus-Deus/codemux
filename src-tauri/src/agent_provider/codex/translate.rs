@@ -27,17 +27,19 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::agent_provider::{
-    CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
-    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
-    TasksSnapshot, ThreadId, TurnId, TurnStatus,
+    pricing, CompletedItem, ContentDelta, ContextUsageTracker, CostSource, ProviderKind, ProviderRuntimeEvent,
+    ProviderSessionId, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem,
+    PlanUsageWindow, PlanWindowKind, TaskStatus, TasksSnapshot, ThreadId, TurnId, TurnStatus,
+    UsageBaseline,
 };
 
 use super::protocol::{
     CollabAgentToolCallItem, DeltaParams, ErrorParams, FileChangePatchUpdatedParams, ItemEnvelope,
     McpToolCallProgressParams, NotificationMessage, ReasoningSummaryPartAddedParams,
     ReasoningSummaryTextDeltaParams, ReasoningTextDeltaParams, ServerRequestMessage,
-    SubAgentActivityItem, TerminalInteractionParams, ThreadStartedParams,
-    ThreadTokenUsageUpdatedParams, TurnCompletedParams, TurnStartedParams,
+    RateLimitSnapshot, RateLimitWindow, SubAgentActivityItem, TerminalInteractionParams,
+    ThreadStartedParams, ThreadTokenUsageUpdatedParams, TokenUsageBreakdown, TurnCompletedParams,
+    TurnStartedParams,
 };
 
 /// Per-session subagent demux state.
@@ -74,6 +76,139 @@ pub struct CodexSubagentDemux {
     /// mutated across messages, exactly like the sub-agent maps, so it
     /// rides the `&mut` the translator already receives.
     context: ContextUsageTracker,
+    /// Codex wire thread id → the last cumulative usage split recorded
+    /// for it, so the usage ledger can emit deltas.
+    ///
+    /// `thread/tokenUsage/updated` carries a *lifetime running total* per
+    /// thread, re-sent on every update. Keyed by the Codex thread id (not
+    /// the runtime one) because each subagent runs as its own Codex
+    /// thread with its own independent total — sharing one counter across
+    /// them would make every child's first report look like a huge
+    /// parent-side jump.
+    usage_totals: HashMap<String, UsageSplit>,
+    /// Ledger totals already recorded for the ROOT thread, seeded from
+    /// the database at session build and consumed on that thread's first
+    /// usage report.
+    ///
+    /// Exists because Codex's `total` is a provider-maintained lifetime
+    /// counter that survives `thread/resume`, while the delta bookkeeping
+    /// above lives only in this (rebuilt) adapter instance. A session is
+    /// rebuilt both across app restarts and mid-lifetime — the child-exit
+    /// watchdog marks the session dead and the next send resumes it — so
+    /// without a baseline the first report after any rebuild would look
+    /// like the whole thread history arriving at once.
+    ///
+    /// Only the root thread gets one: subagent child threads are never
+    /// resumed, so their counters genuinely start at zero and seeding
+    /// against them would suppress real work.
+    pending_baseline: Option<UsageSplit>,
+    /// The model the session is currently configured with, pushed in by
+    /// the session layer.
+    ///
+    /// Codex never states a model on the usage notification itself, and
+    /// the translator has no route to session state, so the value has to
+    /// arrive out-of-band. `None` until the session sets one; a usage row
+    /// with no model still counts tokens, it just cannot be priced.
+    active_model: Option<String>,
+}
+
+/// A non-overlapping token split, in the shape
+/// [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded) expects.
+///
+/// Used both as the per-thread cumulative high-water mark and as the
+/// delta computed against it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageSplit {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    /// Informational SUBSET of `output` — never added into a total.
+    /// Tracked here (rather than read straight off each report) because
+    /// Codex reports it cumulatively like everything else, so it needs
+    /// the same delta and resume-baseline treatment or a resumed thread
+    /// would re-report its whole reasoning history.
+    reasoning: u64,
+}
+
+impl UsageSplit {
+    /// Normalize one Codex [`TokenUsageBreakdown`] into disjoint buckets.
+    ///
+    /// Codex reports *overlapping* figures: `cachedInputTokens` and
+    /// `cacheWriteInputTokens` are both carved out of `inputTokens`, and
+    /// `reasoningOutputTokens` out of `outputTokens` (protocol.rs names
+    /// the first and last explicitly). The decode fixture pins the
+    /// arithmetic for cache-write, which the doc leaves implicit:
+    /// `inputTokens 23_863 + outputTokens 679 == totalTokens 24_542`
+    /// while `cacheWriteInputTokens` is 2_715 — a sibling term would
+    /// have to appear in that sum to balance it, so it must already be
+    /// inside `inputTokens`.
+    ///
+    /// Subtracting both carve-outs therefore preserves Codex's own
+    /// total: `input + output + cache_read + cache_write ==
+    /// total_tokens`. Reasoning stays folded into `output` because that
+    /// is how it is billed.
+    fn from_breakdown(b: &TokenUsageBreakdown) -> Self {
+        Self {
+            input: b
+                .input_tokens
+                .saturating_sub(b.cached_input_tokens)
+                .saturating_sub(b.cache_write_input_tokens),
+            output: b.output_tokens,
+            cache_read: b.cached_input_tokens,
+            cache_write: b.cache_write_input_tokens,
+            reasoning: b.reasoning_output_tokens,
+        }
+    }
+
+    /// This split minus `previous`, per field.
+    ///
+    /// Saturating on purpose: a cumulative counter that comes back
+    /// *lower* than the last one (a thread restart, or a partial
+    /// re-send) must contribute zero rather than wrap into a colossal
+    /// bogus charge.
+    fn delta_since(&self, previous: &Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(previous.input),
+            output: self.output.saturating_sub(previous.output),
+            cache_read: self.cache_read.saturating_sub(previous.cache_read),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
+            reasoning: self.reasoning.saturating_sub(previous.reasoning),
+        }
+    }
+
+    /// Resolve `self` (a seeded baseline) against the provider's first
+    /// reported total, per field.
+    ///
+    /// * **baseline <= current** — the counter survived the resume, so the
+    ///   baseline is the right starting point and `current - baseline` is
+    ///   exactly the new work.
+    /// * **baseline > current** — the provider reset its counter, so the
+    ///   baseline is stale. Falling back to zero records this report in
+    ///   full instead of letting a stale high-water mark swallow it.
+    ///
+    /// A plain `min` would *look* like a clamp but is a no-op here:
+    /// [`delta_since`](Self::delta_since) already saturates, so clamping
+    /// the baseline down to `current` yields a zero delta either way and
+    /// the fresh usage would still be lost. The reset branch has to drop
+    /// to zero to actually recover it.
+    ///
+    /// Resolving per field rather than per split keeps a partial
+    /// mismatch (one counter carried over, another reset) graceful.
+    fn baseline_against(&self, current: &Self) -> Self {
+        let pick = |baseline: u64, current: u64| if baseline <= current { baseline } else { 0 };
+        Self {
+            input: pick(self.input, current.input),
+            output: pick(self.output, current.output),
+            cache_read: pick(self.cache_read, current.cache_read),
+            cache_write: pick(self.cache_write, current.cache_write),
+            reasoning: pick(self.reasoning, current.reasoning),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
 }
 
 impl CodexSubagentDemux {
@@ -84,7 +219,37 @@ impl CodexSubagentDemux {
             subagents: HashSet::new(),
             child_to_parent: HashMap::new(),
             context: ContextUsageTracker::default(),
+            usage_totals: HashMap::new(),
+            pending_baseline: None,
+            active_model: None,
         }
+    }
+
+    /// Seed the ledger baseline for this session's root thread.
+    ///
+    /// Called once at session build with the totals already written to
+    /// `agent_usage_ledger` for this thread. A zero baseline is stored as
+    /// `None`: a fresh thread needs no clamping, and keeping the state
+    /// would only obscure the resumed case.
+    pub fn set_recorded_usage_baseline(&mut self, baseline: UsageBaseline) {
+        self.pending_baseline = if baseline.is_zero() {
+            None
+        } else {
+            Some(UsageSplit {
+                input: baseline.input_tokens,
+                output: baseline.output_tokens,
+                cache_read: baseline.cache_read_tokens,
+                cache_write: baseline.cache_write_tokens,
+                reasoning: baseline.reasoning_tokens,
+            })
+        };
+    }
+
+    /// Tell the demux which model the session is running, so usage rows
+    /// can be attributed and priced. Called by the session layer on
+    /// start and on every mid-session model change.
+    pub fn set_active_model(&mut self, model: Option<String>) {
+        self.active_model = model;
     }
 
     /// Register `child` as a sub-agent spawned by `parent`.
@@ -166,6 +331,11 @@ pub fn translate_notification_with(
         }
         NotificationMessage::ThreadTokenUsageUpdated(p) => {
             return handle_thread_token_usage(demux, thread_id, p);
+        }
+        // Account-scoped plan quota. Not routed through the subagent
+        // demux at all — it describes the login, not a thread.
+        NotificationMessage::AccountRateLimitsUpdated(p) => {
+            return plan_usage_from_rate_limits(thread_id, &p.rate_limits);
         }
         // The right-panel plan belongs to the orchestrator. A child may
         // maintain its own plan, but projecting it over the parent would
@@ -259,6 +429,9 @@ fn translate_parent(
             text_delta(thread_id, p, ContentStream::FileChange)
         }
         NotificationMessage::PlanDelta(p) => text_delta(thread_id, p, ContentStream::Plan),
+        // Consumed by the account-scoped arm in the outer dispatch above;
+        // this arm exists only to keep the match exhaustive.
+        NotificationMessage::AccountRateLimitsUpdated(_) => vec![],
         NotificationMessage::TurnPlanUpdated(p) => {
             let tasks = p
                 .plan
@@ -648,8 +821,16 @@ fn handle_thread_token_usage(
     thread_id: &ThreadId,
     params: &ThreadTokenUsageUpdatedParams,
 ) -> Vec<ProviderRuntimeEvent> {
-    if demux.is_subagent(&params.thread_id) {
-        return Vec::new();
+    let is_subagent = demux.is_subagent(&params.thread_id);
+
+    // Ledger first, and for *every* thread. The context-meter early
+    // return below is a deliberate hygiene rule for the composer gauge;
+    // accounting has the opposite requirement, so it runs before that
+    // return rather than after it.
+    let mut events = record_usage(demux, thread_id, params, is_subagent);
+
+    if is_subagent {
+        return events;
     }
     let usage = &params.token_usage;
     let (last, total, window) = (
@@ -659,14 +840,177 @@ fn handle_thread_token_usage(
     );
     demux.context.observe_max_tokens(window);
     demux.context.observe_lifetime_total(total);
-    demux.context.events(
+    events.extend(demux.context.events(
         thread_id,
         last,
         None,
         // Codex compacts automatically as the window fills, and
         // Codemux exposes no toggle for it.
         Some(true),
-    )
+    ));
+    events
+}
+
+/// Turn one cumulative `thread/tokenUsage/updated` report into at most
+/// one [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded) delta.
+///
+/// Codex hands us a running lifetime total per thread and re-sends it on
+/// every update, so the ledger row is `total - previously_recorded`. The
+/// high-water map is keyed by the Codex thread id, which makes subagent
+/// threads self-isolating: each keeps its own counter and its rows are
+/// flagged rather than dropped.
+/// Classify a Codex rate-limit window from its duration.
+///
+/// Codex states a duration in minutes rather than naming the window, so
+/// the mapping is by proximity: ~300 minutes is the 5-hour window and
+/// ~10080 the weekly one. Anything else (or a missing duration) becomes
+/// [`PlanWindowKind::Other`] and keeps a generic label — an unfamiliar
+/// plan should surface a bar the user can read, not vanish.
+fn plan_window_kind(duration_mins: Option<f64>) -> (PlanWindowKind, Option<String>) {
+    match duration_mins {
+        // Generous bands: the exact figure has drifted between plans.
+        Some(mins) if (240.0..=420.0).contains(&mins) => (PlanWindowKind::FiveHour, None),
+        Some(mins) if (8_640.0..=11_520.0).contains(&mins) => (PlanWindowKind::SevenDay, None),
+        Some(mins) => (
+            PlanWindowKind::Other,
+            Some(humanize_window_duration(mins)),
+        ),
+        None => (PlanWindowKind::Other, None),
+    }
+}
+
+/// A short human name for an unrecognized window length.
+fn humanize_window_duration(mins: f64) -> String {
+    if mins >= 1_440.0 {
+        let days = (mins / 1_440.0).round() as i64;
+        format!("{days}d")
+    } else if mins >= 60.0 {
+        let hours = (mins / 60.0).round() as i64;
+        format!("{hours}h")
+    } else {
+        format!("{}m", mins.round() as i64)
+    }
+}
+
+/// Build a [`PlanUsageWindow`] from one Codex window, if present.
+fn codex_window(window: Option<&RateLimitWindow>) -> Option<PlanUsageWindow> {
+    let window = window?;
+    let (kind, label) = plan_window_kind(window.window_duration_mins);
+    Some(PlanUsageWindow {
+        kind,
+        // Already a percent here — no ×100, unlike Claude.
+        used_pct: window.used_percent.clamp(0.0, 100.0),
+        // Epoch seconds → ms.
+        resets_at_ms: window.resets_at.map(|secs| (secs * 1000.0) as i64),
+        label,
+    })
+}
+
+/// Translate an `account/rateLimits/updated` push into a plan snapshot.
+///
+/// Emitted with no `auth_mode`: the presence of rate limits does not by
+/// itself prove a subscription on Codex the way it does on Claude, and
+/// the session's `account/read` already supplies an authoritative
+/// answer. Leaving it `None` lets the sink keep the better value.
+pub(crate) fn plan_usage_from_rate_limits(
+    thread_id: &ThreadId,
+    snapshot: &RateLimitSnapshot,
+) -> Vec<ProviderRuntimeEvent> {
+    let windows: Vec<PlanUsageWindow> = [
+        codex_window(snapshot.primary.as_ref()),
+        codex_window(snapshot.secondary.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    vec![ProviderRuntimeEvent::PlanUsageUpdated {
+        thread_id: thread_id.clone(),
+        provider: ProviderKind::Codex,
+        windows,
+        plan_label: snapshot.limit_name.clone(),
+        auth_mode: None,
+    }]
+}
+
+/// Whether `thread_id` is this session's root (parent) Codex thread.
+///
+/// A default-constructed demux (unit tests, the stateless
+/// `translate_notification` wrapper) has an empty parent id and carries
+/// no baseline, so this reports false and the seeding path is simply
+/// never taken.
+fn is_root_thread(demux: &CodexSubagentDemux, thread_id: &str) -> bool {
+    !demux.parent_thread_id.is_empty() && demux.parent_thread_id == thread_id
+}
+
+fn record_usage(
+    demux: &mut CodexSubagentDemux,
+    thread_id: &ThreadId,
+    params: &ThreadTokenUsageUpdatedParams,
+    is_subagent: bool,
+) -> Vec<ProviderRuntimeEvent> {
+    let current = UsageSplit::from_breakdown(&params.token_usage.total);
+    let previous = match demux.usage_totals.get(&params.thread_id).copied() {
+        // Already tracking this thread in-process — ordinary delta.
+        Some(previous) => previous,
+        // First sighting. If a baseline was seeded for the ROOT thread,
+        // this is a resumed session and `current` already includes work
+        // sitting in the ledger, so start from what we recorded rather
+        // than from zero.
+        //
+        // `baseline_against` resolves the branch we cannot observe from
+        // here — whether Codex carried its counters across the resume or
+        // reset them — per field. Worst case is a bounded single-report
+        // error in the rare mismatch, instead of re-recording the whole
+        // thread on every resume.
+        None if is_root_thread(demux, &params.thread_id) => {
+            match demux.pending_baseline.take() {
+                Some(baseline) => baseline.baseline_against(&current),
+                None => UsageSplit::default(),
+            }
+        }
+        None => UsageSplit::default(),
+    };
+    let delta = current.delta_since(&previous);
+
+    // Store even when the delta is empty: `current` may have moved
+    // backwards, and keeping the *observed* value (rather than the old
+    // high-water) means a later genuine increase is measured from where
+    // the provider actually is.
+    demux
+        .usage_totals
+        .insert(params.thread_id.clone(), current);
+
+    if delta.is_empty() {
+        return Vec::new();
+    }
+
+    let model = demux.active_model.clone();
+    let cost_usd = pricing::cost_for(
+        model.as_deref(),
+        delta.input,
+        delta.output,
+        delta.cache_read,
+        delta.cache_write,
+    );
+    vec![ProviderRuntimeEvent::UsageRecorded {
+        thread_id: thread_id.clone(),
+        provider: ProviderKind::Codex,
+        model,
+        subagent: is_subagent,
+        input_tokens: delta.input,
+        output_tokens: delta.output,
+        cache_read_tokens: delta.cache_read,
+        cache_write_tokens: delta.cache_write,
+        reasoning_tokens: delta.reasoning,
+        cost_usd,
+        // Codex has no rate catalogue — every priced Codex row comes
+        // from the static table.
+        cost_source: cost_usd.map(|_| CostSource::Table),
+    }]
 }
 
 fn generic_wire_thread_id(msg: &NotificationMessage) -> Option<&str> {
@@ -2100,5 +2444,585 @@ mod tests {
             }
             other => panic!("expected TasksUpdated, got {other:?}"),
         }
+    }
+}
+
+// ── usage ledger ──
+
+#[cfg(test)]
+mod usage_ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn breakdown(
+        total: u64,
+        input: u64,
+        cached: u64,
+        cache_write: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> TokenUsageBreakdown {
+        serde_json::from_value(json!({
+            "totalTokens": total,
+            "inputTokens": input,
+            "cachedInputTokens": cached,
+            "cacheWriteInputTokens": cache_write,
+            "outputTokens": output,
+            "reasoningOutputTokens": reasoning,
+        }))
+        .unwrap()
+    }
+
+    /// The exact numbers from the protocol decode fixture. They are the
+    /// evidence that both cache figures are carved OUT of `inputTokens`:
+    /// `23_863 + 679 == 24_542`, the app-server's own total.
+    #[test]
+    fn normalization_carves_both_cache_tiers_out_of_input() {
+        let split = UsageSplit::from_breakdown(&breakdown(24_542, 23_863, 21_144, 2_715, 679, 512));
+        assert_eq!(split.cache_read, 21_144);
+        assert_eq!(split.cache_write, 2_715);
+        assert_eq!(split.input, 23_863 - 21_144 - 2_715);
+        // Reasoning stays folded into output — that is how it is billed.
+        assert_eq!(split.output, 679);
+        // The whole point: the disjoint buckets reproduce Codex's total.
+        let sum = split.input + split.output + split.cache_read + split.cache_write;
+        assert_eq!(sum, 24_542);
+    }
+
+    #[test]
+    fn normalization_saturates_rather_than_wrapping() {
+        // Nonsense payload where the carve-outs exceed the input figure.
+        let split = UsageSplit::from_breakdown(&breakdown(0, 10, 50, 50, 5, 0));
+        assert_eq!(split.input, 0);
+        assert_eq!(split.output, 5);
+    }
+
+    fn usage_params(thread: &str, total: TokenUsageBreakdown) -> ThreadTokenUsageUpdatedParams {
+        serde_json::from_value(json!({
+            "threadId": thread,
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {"totalTokens": total.total_tokens},
+                "total": {
+                    "totalTokens": total.total_tokens,
+                    "inputTokens": total.input_tokens,
+                    "cachedInputTokens": total.cached_input_tokens,
+                    "cacheWriteInputTokens": total.cache_write_input_tokens,
+                    "outputTokens": total.output_tokens,
+                    "reasoningOutputTokens": total.reasoning_output_tokens,
+                },
+                "modelContextWindow": 200_000,
+            }
+        }))
+        .unwrap()
+    }
+
+    fn reasoning_of(events: &[ProviderRuntimeEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    reasoning_tokens, ..
+                } => Some(*reasoning_tokens),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn recorded(events: &[ProviderRuntimeEvent]) -> Vec<(u64, u64, u64, u64, bool, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::UsageRecorded {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    subagent,
+                    model,
+                    ..
+                } => Some((
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                    *subagent,
+                    model.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Codex re-sends a cumulative lifetime total, so consecutive
+    /// reports must yield the growth between them — never the total
+    /// again.
+    #[test]
+    fn cumulative_totals_become_deltas() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_active_model(Some("gpt-5-codex".into()));
+        let tid = ThreadId("local".into());
+
+        let first = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 0)),
+        );
+        assert_eq!(recorded(&first)[0].0, 800);
+        assert_eq!(recorded(&first)[0].1, 200);
+
+        let second = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_500, 1_100, 0, 0, 400, 0)),
+        );
+        let rows = recorded(&second);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 300, "input delta");
+        assert_eq!(rows[0].1, 200, "output delta");
+    }
+
+    /// An unchanged total is not work — it must not create a row.
+    #[test]
+    fn repeated_identical_total_records_nothing() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        let tid = ThreadId("local".into());
+        let params = usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 0));
+        assert_eq!(recorded(&handle_thread_token_usage(&mut demux, &tid, &params)).len(), 1);
+        assert_eq!(recorded(&handle_thread_token_usage(&mut demux, &tid, &params)).len(), 0);
+    }
+
+    /// A total that goes backwards contributes zero rather than
+    /// wrapping into a colossal charge.
+    #[test]
+    fn regressing_total_records_nothing() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        let tid = ThreadId("local".into());
+        handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 0)),
+        );
+        let back = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(400, 300, 0, 0, 100, 0)),
+        );
+        assert!(recorded(&back).is_empty());
+    }
+
+    /// The context-meter guard drops subagent threads; the ledger must
+    /// not. This is the whole reason the two paths are separate.
+    #[test]
+    fn subagent_threads_are_recorded_and_flagged_but_move_no_meter() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.register("thr-child", "thr-parent");
+        let tid = ThreadId("local".into());
+
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-child", breakdown(500, 400, 0, 0, 100, 0)),
+        );
+        let rows = recorded(&events);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].4, "subagent flag must be set");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::ContextUsageUpdated { .. })),
+            "subagent usage must not touch the composer meter"
+        );
+    }
+
+    /// Parent and child threads keep independent counters, so a child's
+    /// first (large) total is not read as a parent-side jump.
+    #[test]
+    fn parent_and_child_totals_do_not_interfere() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.register("thr-child", "thr-parent");
+        let tid = ThreadId("local".into());
+
+        handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(10_000, 9_000, 0, 0, 1_000, 0)),
+        );
+        let child = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-child", breakdown(100, 80, 0, 0, 20, 0)),
+        );
+        let rows = recorded(&child);
+        assert_eq!(rows[0].0, 80, "child starts from its own zero");
+    }
+
+    // ── resume baseline (min-clamp) ──
+
+    /// The bug this guards: Codex's `total` is a provider-maintained
+    /// LIFETIME counter that survives `thread/resume`, but the demux is
+    /// rebuilt with the session. Unseeded, the first post-resume report
+    /// re-records the whole thread.
+    #[test]
+    fn resumed_thread_with_surviving_totals_records_only_new_work() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        // 900 in + 100 out already written to the ledger before the restart.
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 900,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        let tid = ThreadId("local".into());
+
+        // Codex reports the surviving lifetime total plus one new turn.
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_250, 1_050, 0, 0, 200, 0)),
+        );
+        let r = recorded(&events);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 150, "only input beyond the baseline");
+        assert_eq!(r[0].1, 100, "only output beyond the baseline");
+    }
+
+    /// A baseline is consumed once. After it applies, the thread keeps
+    /// producing ordinary in-process deltas.
+    #[test]
+    fn baseline_applies_once_then_normal_deltas_resume() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 900,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        let tid = ThreadId("local".into());
+        handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_250, 1_050, 0, 0, 200, 0)),
+        );
+        let second = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_400, 1_150, 0, 0, 250, 0)),
+        );
+        let r = recorded(&second);
+        assert_eq!(r[0].0, 100);
+        assert_eq!(r[0].1, 50);
+    }
+
+    /// The resolver's reason for existing: if Codex RESET its counters
+    /// instead of carrying them, a stale baseline would act as a
+    /// high-water mark and swallow the fresh usage entirely. Note a bare
+    /// `min` does NOT fix this — `delta_since` already saturates — which
+    /// is why the reset branch drops the baseline to zero.
+    #[test]
+    fn reset_counters_below_the_baseline_still_record() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 900,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        let tid = ThreadId("local".into());
+        // Fresh counters: far below the baseline.
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(60, 50, 0, 0, 10, 0)),
+        );
+        let r = recorded(&events);
+        assert_eq!(r.len(), 1, "the work must not be swallowed");
+        assert_eq!(r[0].0, 50, "min() clamped the baseline down to current");
+        assert_eq!(r[0].1, 10);
+    }
+
+    /// One counter carrying over while another resets must be handled
+    /// per field, not by classifying the whole split one way.
+    #[test]
+    fn partial_counter_reset_is_resolved_per_field() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 900,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        let tid = ThreadId("local".into());
+        // input carried over (1_000 >= 900); output reset (40 < 100).
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_040, 1_000, 0, 0, 40, 0)),
+        );
+        let r = recorded(&events);
+        assert_eq!(r[0].0, 100, "input measured from the surviving baseline");
+        assert_eq!(r[0].1, 40, "output recorded in full after its reset");
+    }
+
+    /// Reasoning is cumulative like everything else, so it must be
+    /// deltaed — and it must stay INSIDE output, never added on top.
+    #[test]
+    fn reasoning_is_deltaed_and_stays_inside_output() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        let tid = ThreadId("local".into());
+        let first = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 120)),
+        );
+        let r = reasoning_of(&first);
+        assert_eq!(r, vec![120]);
+        assert_eq!(recorded(&first)[0].1, 200, "output still the full 200");
+
+        let second = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_400, 1_000, 0, 0, 400, 260)),
+        );
+        assert_eq!(reasoning_of(&second), vec![140], "delta, not the total");
+    }
+
+    /// The resume baseline needs a reasoning term for the same reason
+    /// the other columns do: without it a resumed thread re-reports its
+    /// whole reasoning history on the first post-resume notification.
+    #[test]
+    fn resume_baseline_covers_reasoning_too() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 800,
+            output_tokens: 200,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 120,
+        });
+        let tid = ThreadId("local".into());
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_400, 1_000, 0, 0, 400, 260)),
+        );
+        assert_eq!(
+            reasoning_of(&events),
+            vec![140],
+            "only the reasoning beyond the baseline"
+        );
+        assert_eq!(recorded(&events)[0].1, 200, "output delta unaffected");
+    }
+
+    /// An unseeded thread behaves exactly as before the baseline existed.
+    #[test]
+    fn unseeded_threads_are_unaffected() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        let tid = ThreadId("local".into());
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 0)),
+        );
+        let r = recorded(&events);
+        assert_eq!(r[0].0, 800, "full first total, as before");
+        assert_eq!(r[0].1, 200);
+    }
+
+    /// A zero baseline is a no-op — a fresh thread needs no clamping.
+    #[test]
+    fn zero_baseline_is_not_stored() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline::default());
+        assert!(demux.pending_baseline.is_none());
+    }
+
+    /// The baseline is for the ROOT thread only. Subagent child threads
+    /// are never resumed, so seeding against them would suppress real
+    /// work on the child's very first report.
+    #[test]
+    fn baseline_never_applies_to_subagent_threads() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.register("thr-child", "thr-parent");
+        demux.set_recorded_usage_baseline(UsageBaseline {
+            input_tokens: 10_000,
+            output_tokens: 10_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        });
+        let tid = ThreadId("local".into());
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-child", breakdown(500, 400, 0, 0, 100, 0)),
+        );
+        let r = recorded(&events);
+        assert_eq!(r[0].0, 400, "child records in full");
+        assert!(r[0].4, "and is still flagged as a subagent");
+        assert!(
+            demux.pending_baseline.is_some(),
+            "the root's baseline must still be waiting for the root"
+        );
+    }
+
+    #[test]
+    fn model_comes_from_session_state_and_prices_the_row() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.set_active_model(Some("gpt-5-codex".into()));
+        let tid = ThreadId("local".into());
+        let events = handle_thread_token_usage(
+            &mut demux,
+            &tid,
+            &usage_params("thr-parent", breakdown(1_000, 800, 0, 0, 200, 0)),
+        );
+        let cost = events.iter().find_map(|e| match e {
+            ProviderRuntimeEvent::UsageRecorded { cost_usd, .. } => *cost_usd,
+            _ => None,
+        });
+        assert_eq!(recorded(&events)[0].5.as_deref(), Some("gpt-5-codex"));
+        assert!(cost.unwrap() > 0.0);
+    }
+}
+
+// ── plan quota (account/rateLimits) ──
+
+#[cfg(test)]
+mod plan_quota_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snapshot(value: serde_json::Value) -> RateLimitSnapshot {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Codex names windows only by duration, so the mapping is by band.
+    #[test]
+    fn window_kind_is_inferred_from_duration() {
+        assert_eq!(plan_window_kind(Some(300.0)).0, PlanWindowKind::FiveHour);
+        assert_eq!(plan_window_kind(Some(10_080.0)).0, PlanWindowKind::SevenDay);
+        // Bands are generous — the exact figure has drifted between plans.
+        assert_eq!(plan_window_kind(Some(240.0)).0, PlanWindowKind::FiveHour);
+        assert_eq!(plan_window_kind(Some(10_000.0)).0, PlanWindowKind::SevenDay);
+    }
+
+    /// An unfamiliar window must still surface, with a readable name —
+    /// not vanish.
+    #[test]
+    fn unknown_durations_degrade_to_other_with_a_label() {
+        let (kind, label) = plan_window_kind(Some(1_440.0));
+        assert_eq!(kind, PlanWindowKind::Other);
+        assert_eq!(label.as_deref(), Some("1d"));
+        assert_eq!(plan_window_kind(Some(90.0)).1.as_deref(), Some("2h"));
+        assert_eq!(plan_window_kind(Some(30.0)).1.as_deref(), Some("30m"));
+        // No duration at all is still `Other`, just unnamed.
+        assert_eq!(plan_window_kind(None), (PlanWindowKind::Other, None));
+    }
+
+    /// `usedPercent` is ALREADY a percent here — the opposite of Claude's
+    /// 0..1 `utilization`. No scaling, only clamping.
+    #[test]
+    fn used_percent_is_not_rescaled_but_is_clamped() {
+        let events = plan_usage_from_rate_limits(
+            &ThreadId("t".into()),
+            &snapshot(json!({
+                "primary": {"usedPercent": 41.0, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 143.0, "windowDurationMins": 10080},
+            })),
+        );
+        match &events[0] {
+            ProviderRuntimeEvent::PlanUsageUpdated { windows, provider, .. } => {
+                assert_eq!(*provider, ProviderKind::Codex);
+                assert_eq!(windows[0].used_pct, 41.0, "no x100");
+                assert_eq!(windows[1].used_pct, 100.0, "clamped");
+            }
+            other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// `primary` is the 5h window, `secondary` the weekly one, and
+    /// `resetsAt` is epoch seconds.
+    #[test]
+    fn primary_and_secondary_map_to_five_hour_and_weekly() {
+        let events = plan_usage_from_rate_limits(
+            &ThreadId("t".into()),
+            &snapshot(json!({
+                "limitName": "ChatGPT Pro",
+                "primary": {
+                    "usedPercent": 12.0,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_800_000_000_i64,
+                },
+                "secondary": {"usedPercent": 60.0, "windowDurationMins": 10080},
+            })),
+        );
+        match &events[0] {
+            ProviderRuntimeEvent::PlanUsageUpdated {
+                windows,
+                plan_label,
+                auth_mode,
+                ..
+            } => {
+                assert_eq!(windows[0].kind, PlanWindowKind::FiveHour);
+                assert_eq!(windows[0].resets_at_ms, Some(1_800_000_000_000));
+                assert_eq!(windows[1].kind, PlanWindowKind::SevenDay);
+                assert_eq!(plan_label.as_deref(), Some("ChatGPT Pro"));
+                // The push says nothing authoritative about auth mode —
+                // `account/read` does — so it must not overwrite it.
+                assert!(auth_mode.is_none());
+            }
+            other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// A metered API-key account reports no windows; emitting an event
+    /// with an empty list would blank the store's merged state.
+    #[test]
+    fn no_windows_emits_nothing() {
+        assert!(plan_usage_from_rate_limits(&ThreadId("t".into()), &snapshot(json!({}))).is_empty());
+    }
+
+    /// The notification decodes off the wire (camelCase) rather than
+    /// falling through to `Unknown`, which is what used to happen.
+    #[test]
+    fn notification_decodes_instead_of_falling_through_to_unknown() {
+        let msg = NotificationMessage::from_raw(
+            "account/rateLimits/updated",
+            json!({"rateLimits": {
+                "primary": {"usedPercent": 5.0, "windowDurationMins": 300}
+            }}),
+        );
+        match msg {
+            NotificationMessage::AccountRateLimitsUpdated(p) => {
+                assert_eq!(p.rate_limits.primary.unwrap().used_percent, 5.0);
+            }
+            other => panic!("expected AccountRateLimitsUpdated, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through the dispatcher, and NOT routed via the subagent
+    /// demux — quota describes the login, not a thread.
+    #[test]
+    fn dispatch_emits_plan_usage_for_any_thread() {
+        let mut demux = CodexSubagentDemux::new("thr-parent");
+        demux.register("thr-child", "thr-parent");
+        let events = translate_notification_with(
+            &mut demux,
+            &ThreadId("t".into()),
+            NotificationMessage::from_raw(
+                "account/rateLimits/updated",
+                json!({"rateLimits": {
+                    "primary": {"usedPercent": 7.0, "windowDurationMins": 300}
+                }}),
+            ),
+        );
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::PlanUsageUpdated { .. }
+        ));
     }
 }

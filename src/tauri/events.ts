@@ -2,6 +2,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type { UnlistenFn };
 import type {
+  AgentChatProviderKind,
   AppStateSnapshot,
   AuthStatePayload,
   PresetStoreSnapshot,
@@ -381,6 +382,26 @@ export type ProviderRuntimeEvent =
       type: "context_usage_updated";
       thread_id: string;
       usage: ContextUsageSnapshot;
+    }
+  | {
+      /** Legacy adapter-side usage delta. Distinct from
+       *  `context_usage_updated`: a delta rather than a snapshot.
+       *
+       *  Provider history is the accounting source, so the backend discards
+       *  this in `forward_event`; it never reaches persistence or a pane. It is
+       *  declared here only so the union stays a faithful mirror of the
+       *  Rust enum, and so the reducer can ignore it explicitly rather
+       *  than logging it as an unknown variant. */
+      type: "usage_recorded";
+      thread_id: string;
+      provider: AgentChatProviderKind;
+      model: string | null;
+      subagent: boolean;
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_tokens: number;
+      cache_write_tokens: number;
+      cost_usd: number | null;
     }
   | {
       type: "tasks_updated";

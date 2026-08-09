@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 13;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -277,6 +277,64 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Usage ledger behind Settings → Usage. This is a materialized
+        -- local cache of provider-owned history (Claude/Codex transcripts
+        -- and OpenCode storage), not a second runtime accounting stream.
+        --
+        -- Deliberately carries NO foreign key to `agent_chat_sessions`.
+        -- Every other chat-adjacent table cascades on session delete,
+        -- which is right for transcript state and wrong for accounting:
+        -- deleting a chat from the history dropdown must not silently
+        -- rewrite last month's spend. `thread_id` and `workspace_id` are
+        -- therefore denormalized copies, valid after their sources are
+        -- gone.
+        --
+        -- The four token columns are non-overlapping, so a token total is
+        -- their plain sum. `cost_usd` is the provider-reported or static
+        -- API-equivalent estimate frozen when the cache row is derived.
+        CREATE TABLE IF NOT EXISTS agent_usage_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,     -- unix ms
+            thread_id TEXT NOT NULL,
+            workspace_id TEXT,
+            provider TEXT NOT NULL,
+            model TEXT,
+            subagent INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            -- Informational SUBSET of output_tokens, never added into a
+            -- total. Present so the dashboard can report how much of the
+            -- output was reasoning; 0 when the provider reports no split.
+            reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL,
+            -- provider (upstream catalogue rates) | table (our static
+            -- price list) | NULL (unpriced). Lets the UI show how much of
+            -- a total is measured rather than estimated.
+            cost_source TEXT,
+            -- `provider_history`: derived from the provider's durable local
+            -- history and safe to rebuild whenever parsing or prices change.
+            source TEXT NOT NULL DEFAULT 'provider_history',
+            -- Provider-native idempotency key. Every history row has one.
+            import_key TEXT
+        );
+
+
+        -- Signatures of provider history sources, so unchanged files and
+        -- databases can be skipped. Keyed by absolute path.
+        CREATE TABLE IF NOT EXISTS usage_import_state (
+            path TEXT PRIMARY KEY,
+            mtime_ms INTEGER NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            consumed_bytes INTEGER NOT NULL,
+            scanned_at INTEGER NOT NULL
+        );
+
+        -- Every dashboard query is a time-range scan.
+        CREATE INDEX IF NOT EXISTS idx_agent_usage_ledger_created
+            ON agent_usage_ledger(created_at);
 
         -- Run-start rollback checkpoints (issue #80). One row per
         -- thread: the background snapshot taken when the agent-chat
@@ -582,6 +640,28 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
              WHERE permission_mode = 'bypassPermissions' AND provider = 'codex'",
         "UPDATE agent_chat_sessions SET permission_mode = 'bypassPermissions' \
              WHERE permission_mode = 'danger-full-access' AND provider = 'claude'",
+        // Usage-ledger v12: reasoning split + cost provenance.
+        "ALTER TABLE agent_usage_ledger ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_usage_ledger ADD COLUMN cost_source TEXT",
+        // Backfill provenance for rows written before the column existed.
+        // Conservatively labels everything 'table' — including OpenCode
+        // rows that were actually catalogue-priced, which cannot be
+        // distinguished after the fact. It slightly understates the
+        // "provider reported" share for pre-upgrade history and corrects
+        // itself as new rows land.
+        "UPDATE agent_usage_ledger SET cost_source = 'table' \
+             WHERE cost_usd IS NOT NULL AND cost_source IS NULL",
+        // Usage-ledger v13: CLI-log import provenance.
+        "ALTER TABLE agent_usage_ledger ADD COLUMN source TEXT NOT NULL DEFAULT 'provider_history'",
+        "ALTER TABLE agent_usage_ledger ADD COLUMN import_key TEXT",
+        // Created HERE rather than in the CREATE batch above: on an
+        // upgraded database `import_key` does not exist until the ALTER
+        // immediately above runs, and a failed statement inside
+        // `execute_batch` would abort every remaining CREATE with it.
+        // Partial so the many live rows (import_key NULL) are not forced
+        // to be distinct from one another.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_usage_ledger_import_key \
+             ON agent_usage_ledger(import_key) WHERE import_key IS NOT NULL",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -2362,6 +2442,454 @@ fn row_to_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation
     })
 }
 
+// ── Agent Usage Ledger ──
+//
+// Append-only accounting behind Settings → Usage. See the
+// `agent_usage_ledger` DDL in `create_schema` for why it has no foreign
+// key to `agent_chat_sessions`.
+
+/// One row of the usage ledger, as read back for aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageLedgerRow {
+    /// Unix milliseconds.
+    pub created_at: i64,
+    pub thread_id: String,
+    pub workspace_id: Option<String>,
+    pub provider: String,
+    pub model: Option<String>,
+    pub subagent: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// Informational subset of `output_tokens` — excluded from
+    /// [`total_tokens`](Self::total_tokens) by design.
+    #[serde(default)]
+    pub reasoning_tokens: i64,
+    pub cost_usd: Option<f64>,
+    /// `"provider"` | `"table"` | `None`.
+    #[serde(default)]
+    pub cost_source: Option<String>,
+    /// `"provider_history"` for current rows; older installs may contain
+    /// legacy `"live"` / `"cli_import"` values until importer v3 rebuilds.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// One normalized provider-history record ready for the materialized cache.
+#[derive(Debug, Clone)]
+pub struct ProviderUsageCacheRow {
+    pub import_key: String,
+    pub created_at: i64,
+    pub thread_id: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub subagent: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub cost_source: Option<String>,
+}
+
+const UPSERT_PROVIDER_USAGE_SQL: &str =
+    "INSERT INTO agent_usage_ledger (
+         created_at, thread_id, workspace_id, provider, model, subagent,
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+         reasoning_tokens, cost_usd, cost_source, source, import_key
+     ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13)
+     ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
+         created_at = excluded.created_at,
+         thread_id = excluded.thread_id,
+         provider = excluded.provider,
+         model = COALESCE(excluded.model, agent_usage_ledger.model),
+         subagent = MAX(agent_usage_ledger.subagent, excluded.subagent),
+         input_tokens = MAX(agent_usage_ledger.input_tokens, excluded.input_tokens),
+         output_tokens = MAX(agent_usage_ledger.output_tokens, excluded.output_tokens),
+         cache_read_tokens = MAX(agent_usage_ledger.cache_read_tokens, excluded.cache_read_tokens),
+         cache_write_tokens = MAX(agent_usage_ledger.cache_write_tokens, excluded.cache_write_tokens),
+         reasoning_tokens = MAX(agent_usage_ledger.reasoning_tokens, excluded.reasoning_tokens),
+         cost_usd = CASE
+             WHEN excluded.cost_source = 'provider' THEN excluded.cost_usd
+             WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_usd
+             WHEN agent_usage_ledger.cost_usd IS NULL THEN excluded.cost_usd
+             WHEN excluded.cost_usd IS NULL THEN agent_usage_ledger.cost_usd
+             ELSE MAX(agent_usage_ledger.cost_usd, excluded.cost_usd)
+         END,
+         cost_source = CASE
+             WHEN excluded.cost_source = 'provider' THEN excluded.cost_source
+             WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_source
+             ELSE COALESCE(excluded.cost_source, agent_usage_ledger.cost_source)
+         END,
+         source = excluded.source
+     WHERE agent_usage_ledger.created_at IS NOT excluded.created_at
+        OR agent_usage_ledger.thread_id IS NOT excluded.thread_id
+        OR agent_usage_ledger.provider IS NOT excluded.provider
+        OR agent_usage_ledger.model IS NOT excluded.model
+        OR agent_usage_ledger.subagent IS NOT excluded.subagent
+        OR agent_usage_ledger.input_tokens IS NOT excluded.input_tokens
+        OR agent_usage_ledger.output_tokens IS NOT excluded.output_tokens
+        OR agent_usage_ledger.cache_read_tokens IS NOT excluded.cache_read_tokens
+        OR agent_usage_ledger.cache_write_tokens IS NOT excluded.cache_write_tokens
+        OR agent_usage_ledger.reasoning_tokens IS NOT excluded.reasoning_tokens
+        OR agent_usage_ledger.cost_usd IS NOT excluded.cost_usd
+        OR agent_usage_ledger.cost_source IS NOT excluded.cost_source
+        OR agent_usage_ledger.source IS NOT excluded.source";
+
+impl UsageLedgerRow {
+    /// All four token buckets summed. Sound because the buckets are
+    /// non-overlapping by construction in the provider-history importers.
+    ///
+    /// `reasoning_tokens` is deliberately NOT added: it is a subset of
+    /// `output_tokens` and counting it would double-bill.
+    pub fn total_tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    /// Observed input — every token that entered the prompt, cached or
+    /// not. The denominator for "cached input is N% of input".
+    pub fn observed_input(&self) -> i64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+impl DatabaseStore {
+    /// Insert a synthetic usage row for aggregation tests.
+    ///
+    /// `created_at` is supplied by the caller rather than defaulted in
+    /// SQL so tests can write rows at chosen timestamps and exercise the
+    /// bucketing without waiting for wall-clock time to pass.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_usage_row(
+        &self,
+        created_at: i64,
+        thread_id: &str,
+        workspace_id: Option<&str>,
+        provider: &str,
+        model: Option<&str>,
+        subagent: bool,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        reasoning_tokens: i64,
+        cost_usd: Option<f64>,
+        cost_source: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO agent_usage_ledger (
+                 created_at, thread_id, workspace_id, provider, model, subagent,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 reasoning_tokens, cost_usd, cost_source
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                created_at,
+                thread_id,
+                workspace_id,
+                provider,
+                model,
+                subagent as i64,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                cost_usd,
+                cost_source,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert usage row: {e}"))?;
+        Ok(())
+    }
+
+    /// Token totals for a synthetic test thread + provider.
+    ///
+    /// Retained only to verify that reasoning remains a subset of output and
+    /// never enters the four-way total. Returns
+    /// `(input, output, cache_read, cache_write, reasoning)`.
+    #[cfg(test)]
+    pub fn recorded_usage_totals(
+        &self,
+        thread_id: &str,
+        provider: &str,
+    ) -> Result<(i64, i64, i64, i64, i64), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
+                    COALESCE(SUM(reasoning_tokens), 0)
+             FROM agent_usage_ledger
+             WHERE thread_id = ?1 AND provider = ?2 AND subagent = 0",
+            params![thread_id, provider],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .map_err(|e| format!("Failed to sum usage rows: {e}"))
+    }
+
+    /// Materialize one provider-history record.
+    ///
+    /// A provider can append several snapshots for the same response while
+    /// it is active. The stable `import_key` therefore upserts rather than
+    /// ignoring a row forever: unchanged records are no-ops, while a growing
+    /// response replaces its earlier partial snapshot. Token counters are
+    /// high-water marks so an older overlapping OpenCode store cannot shrink
+    /// a newer SQLite record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_provider_usage_row(
+        &self,
+        import_key: &str,
+        created_at: i64,
+        thread_id: &str,
+        provider: &str,
+        model: Option<&str>,
+        subagent: bool,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        reasoning_tokens: i64,
+        cost_usd: Option<f64>,
+        cost_source: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "INSERT INTO agent_usage_ledger (
+                     created_at, thread_id, workspace_id, provider, model, subagent,
+                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, cost_usd, cost_source, source, import_key
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13)
+                 ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
+                     created_at = excluded.created_at,
+                     thread_id = excluded.thread_id,
+                     provider = excluded.provider,
+                     model = COALESCE(excluded.model, agent_usage_ledger.model),
+                     subagent = MAX(agent_usage_ledger.subagent, excluded.subagent),
+                     input_tokens = MAX(agent_usage_ledger.input_tokens, excluded.input_tokens),
+                     output_tokens = MAX(agent_usage_ledger.output_tokens, excluded.output_tokens),
+                     cache_read_tokens = MAX(agent_usage_ledger.cache_read_tokens, excluded.cache_read_tokens),
+                     cache_write_tokens = MAX(agent_usage_ledger.cache_write_tokens, excluded.cache_write_tokens),
+                     reasoning_tokens = MAX(agent_usage_ledger.reasoning_tokens, excluded.reasoning_tokens),
+                     cost_usd = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_usd
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_usd
+                         WHEN agent_usage_ledger.cost_usd IS NULL THEN excluded.cost_usd
+                         WHEN excluded.cost_usd IS NULL THEN agent_usage_ledger.cost_usd
+                         ELSE MAX(agent_usage_ledger.cost_usd, excluded.cost_usd)
+                     END,
+                     cost_source = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_source
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_source
+                         ELSE COALESCE(excluded.cost_source, agent_usage_ledger.cost_source)
+                     END,
+                     source = excluded.source
+                 WHERE agent_usage_ledger.created_at IS NOT excluded.created_at
+                    OR agent_usage_ledger.thread_id IS NOT excluded.thread_id
+                    OR agent_usage_ledger.provider IS NOT excluded.provider
+                    OR agent_usage_ledger.model IS NOT excluded.model
+                    OR agent_usage_ledger.subagent IS NOT excluded.subagent
+                    OR agent_usage_ledger.input_tokens IS NOT excluded.input_tokens
+                    OR agent_usage_ledger.output_tokens IS NOT excluded.output_tokens
+                    OR agent_usage_ledger.cache_read_tokens IS NOT excluded.cache_read_tokens
+                    OR agent_usage_ledger.cache_write_tokens IS NOT excluded.cache_write_tokens
+                    OR agent_usage_ledger.reasoning_tokens IS NOT excluded.reasoning_tokens
+                    OR agent_usage_ledger.cost_usd IS NOT excluded.cost_usd
+                    OR agent_usage_ledger.cost_source IS NOT excluded.cost_source
+                    OR agent_usage_ledger.source IS NOT excluded.source",
+                params![
+                    created_at,
+                    thread_id,
+                    provider,
+                    model,
+                    subagent as i64,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    cost_usd,
+                    cost_source,
+                    import_key,
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert provider usage row: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Materialize many provider records in one transaction. The first scan
+    /// can contain tens of thousands of OpenCode messages, so one fsync per
+    /// row would make an otherwise read-only history scan unreasonably slow.
+    pub fn upsert_provider_usage_rows(
+        &self,
+        rows: &[ProviderUsageCacheRow],
+    ) -> Result<usize, String> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        {
+            let mut stmt = tx
+                .prepare_cached(UPSERT_PROVIDER_USAGE_SQL)
+                .map_err(|e| format!("Failed to prepare provider usage upsert: {e}"))?;
+            for row in rows {
+                changed += stmt
+                    .execute(params![
+                        row.created_at,
+                        row.thread_id,
+                        row.provider,
+                        row.model,
+                        row.subagent as i64,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read_tokens,
+                        row.cache_write_tokens,
+                        row.reasoning_tokens,
+                        row.cost_usd,
+                        row.cost_source,
+                        row.import_key,
+                    ])
+                    .map_err(|e| format!("Failed to upsert provider usage row: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    }
+
+    /// How much of `path` a previous scan already consumed, if any.
+    /// Returns `(mtime_ms, size_bytes, consumed_bytes)`.
+    pub fn usage_import_state(&self, path: &str) -> Result<Option<(i64, i64, i64)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT mtime_ms, size_bytes, consumed_bytes FROM usage_import_state WHERE path = ?1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to read import state: {e}"))
+    }
+
+    /// Record how far `path` has now been consumed.
+    pub fn set_usage_import_state(
+        &self,
+        path: &str,
+        mtime_ms: i64,
+        size_bytes: i64,
+        consumed_bytes: i64,
+        scanned_at: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO usage_import_state (path, mtime_ms, size_bytes, consumed_bytes, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET
+                 mtime_ms = ?2, size_bytes = ?3, consumed_bytes = ?4, scanned_at = ?5",
+            params![path, mtime_ms, size_bytes, consumed_bytes, scanned_at],
+        )
+        .map_err(|e| format!("Failed to write import state: {e}"))?;
+        Ok(())
+    }
+
+    /// Record signatures for a completed provider-history batch.
+    pub fn set_usage_import_states(
+        &self,
+        states: &[(String, i64, i64)],
+        scanned_at: i64,
+    ) -> Result<(), String> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO usage_import_state
+                         (path, mtime_ms, size_bytes, consumed_bytes, scanned_at)
+                     VALUES (?1, ?2, ?3, ?3, ?4)
+                     ON CONFLICT(path) DO UPDATE SET
+                         mtime_ms = ?2, size_bytes = ?3,
+                         consumed_bytes = ?3, scanned_at = ?4",
+                )
+                .map_err(|e| format!("Failed to prepare import-state upsert: {e}"))?;
+            for (path, mtime_ms, size_bytes) in states {
+                stmt.execute(params![path, mtime_ms, size_bytes, scanned_at])
+                    .map_err(|e| format!("Failed to write import state: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Drop the materialized usage cache and its source signatures.
+    /// Provider history remains authoritative, so the next scan can rebuild
+    /// every row after a parser or pricing change. This intentionally also
+    /// removes legacy runtime-ledger rows from older app versions; retaining
+    /// them beside provider history would double-count Codemux-launched work.
+    pub fn reset_usage_history(&self) -> Result<usize, String> {
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let removed = tx
+            .execute("DELETE FROM agent_usage_ledger", [])
+            .map_err(|e| format!("Failed to clear usage cache: {e}"))?;
+        tx.execute("DELETE FROM usage_import_state", [])
+            .map_err(|e| format!("Failed to clear import state: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
+    /// Every ledger row at or after `since_ms`, oldest first.
+    ///
+    /// The range filter and ordering are pushed into SQL (that is what
+    /// `idx_agent_usage_ledger_created` exists for); the grouping into
+    /// buckets / providers / models is done in Rust. Splitting it that
+    /// way keeps the aggregation a pure function over a `Vec` — the
+    /// dashboard needs the same rows sliced three different ways, and
+    /// three GROUP BY round-trips would have to agree with each other by
+    /// hand.
+    pub fn usage_rows_since(&self, since_ms: i64) -> Result<Vec<UsageLedgerRow>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, thread_id, workspace_id, provider, model, subagent,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                        reasoning_tokens, cost_usd, cost_source, source
+                 FROM agent_usage_ledger
+                 WHERE created_at >= ?1
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![since_ms], |row| {
+                Ok(UsageLedgerRow {
+                    created_at: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    provider: row.get(3)?,
+                    model: row.get(4)?,
+                    subagent: row.get::<_, i64>(5)? != 0,
+                    input_tokens: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                    cache_read_tokens: row.get(8)?,
+                    cache_write_tokens: row.get(9)?,
+                    reasoning_tokens: row.get(10)?,
+                    cost_usd: row.get(11)?,
+                    cost_source: row.get(12)?,
+                    source: row.get(13)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+}
+
 // ── Agent Chat Sessions ──
 //
 // Persistence for the chat-history dropdown. One row per thread the
@@ -3325,6 +3853,293 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 0);
+    }
+
+    #[test]
+    fn usage_ledger_round_trip_and_range_filter() {
+        let db = init_test_database();
+        let day = 86_400_000i64;
+        let now = 1_800_000_000_000i64;
+
+        db.insert_usage_row(
+            now, "t1", Some("ws1"), "claude", Some("claude-opus-4-5"), false,
+            100, 20, 3_000, 500, 0, Some(1.25), Some("table"),
+        )
+        .unwrap();
+        // A subagent row on the same thread.
+        db.insert_usage_row(
+            now, "t1", Some("ws1"), "claude", Some("claude-haiku-4-5"), true,
+            40, 10, 0, 0, 0, Some(0.01), Some("table"),
+        )
+        .unwrap();
+        // A metered row in another workspace.
+        db.insert_usage_row(
+            now, "t2", Some("ws2"), "opencode", Some("openrouter/kimi-k2"), false,
+            5, 5, 0, 0, 0, None, None,
+        )
+        .unwrap();
+        // Well outside any window the dashboard asks for.
+        db.insert_usage_row(
+            now - 90 * day, "t9", Some("ws9"), "codex", None, false,
+            999, 999, 0, 0, 0, Some(50.0), Some("table"),
+        )
+        .unwrap();
+
+        let rows = db.usage_rows_since(now - 7 * day).unwrap();
+        assert_eq!(rows.len(), 3, "the 90-day-old row is filtered out in SQL");
+
+        let first = &rows[0];
+        assert_eq!(first.thread_id, "t1");
+        assert_eq!(first.workspace_id.as_deref(), Some("ws1"));
+        assert_eq!(first.provider, "claude");
+        assert_eq!(first.model.as_deref(), Some("claude-opus-4-5"));
+        assert!(!first.subagent);
+        assert_eq!(first.input_tokens, 100);
+        assert_eq!(first.cache_read_tokens, 3_000);
+        assert_eq!(first.cost_usd, Some(1.25));
+        // The four buckets are disjoint, so the total is their sum.
+        assert_eq!(first.total_tokens(), 3_620);
+
+        // The subagent flag and a NULL model/cost both survive the trip.
+        assert!(rows[1].subagent);
+        assert!(rows[2].model.is_some());
+        assert_eq!(rows[2].cost_usd, None);
+    }
+
+    /// The ledger must OUTLIVE the chat it came from. `agent_chat_messages`
+    /// cascades on session delete; deleting a chat from the history
+    /// dropdown must not rewrite last month's spend.
+    /// v12 backfill: rows written before `cost_source` existed get
+    /// labeled 'table'. Conservative by construction — an OpenCode row
+    /// that was actually catalogue-priced is indistinguishable after the
+    /// fact, so it is labeled 'table' too.
+    #[test]
+    fn migration_backfills_cost_source_for_priced_rows_only() {
+        let db = init_test_database();
+        let now = 1_800_000_000_000i64;
+        {
+            let conn = db.conn.lock().unwrap();
+            // Simulate pre-v12 rows: written with a NULL cost_source.
+            conn.execute(
+                "INSERT INTO agent_usage_ledger
+                   (created_at, thread_id, provider, model, subagent,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    cost_usd, cost_source)
+                 VALUES (?1, 'legacy-priced', 'claude', 'm', 0, 10, 10, 0, 0, 1.5, NULL)",
+                params![now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_usage_ledger
+                   (created_at, thread_id, provider, model, subagent,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    cost_usd, cost_source)
+                 VALUES (?1, 'legacy-unpriced', 'opencode', 'm', 0, 10, 10, 0, 0, NULL, NULL)",
+                params![now],
+            )
+            .unwrap();
+            // Re-run the migrations (idempotent) to fire the backfill.
+            create_schema(&conn).unwrap();
+        }
+
+        let rows = db.usage_rows_since(0).unwrap();
+        let priced = rows.iter().find(|r| r.thread_id == "legacy-priced").unwrap();
+        let unpriced = rows
+            .iter()
+            .find(|r| r.thread_id == "legacy-unpriced")
+            .unwrap();
+        assert_eq!(priced.cost_source.as_deref(), Some("table"));
+        // A row with no cost must stay unlabeled — labeling it would
+        // claim a price that was never computed.
+        assert!(unpriced.cost_source.is_none());
+        // The new column defaults to 0 for pre-existing rows.
+        assert_eq!(priced.reasoning_tokens, 0);
+    }
+
+    /// `reasoning_tokens` is a subset of output and must never inflate a
+    /// total or the resume baseline's four billable terms.
+    #[test]
+    fn reasoning_round_trips_without_entering_the_total() {
+        let db = init_test_database();
+        db.insert_usage_row(
+            1_800_000_000_000, "t1", Some("ws"), "codex", Some("gpt-5-codex"), false,
+            10, 40, 0, 0, 25, Some(1.0), Some("table"),
+        )
+        .unwrap();
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows[0].reasoning_tokens, 25);
+        assert_eq!(rows[0].total_tokens(), 50, "reasoning excluded from the sum");
+        assert_eq!(rows[0].observed_input(), 10);
+
+        // …but the baseline DOES carry it, so a resumed Codex thread
+        // does not re-record its reasoning history.
+        let (i, o, cr, cw, reasoning) = db.recorded_usage_totals("t1", "codex").unwrap();
+        assert_eq!((i, o, cr, cw), (10, 40, 0, 0));
+        assert_eq!(reasoning, 25);
+    }
+
+    /// Re-scanning provider history is a no-op, while a growing response
+    /// updates the same natural record instead of freezing a partial row.
+    #[test]
+    fn provider_rows_are_idempotent_and_growing_rows_update() {
+        let db = init_test_database();
+        let insert = || {
+            db.upsert_provider_usage_row(
+                "claude:sess-1:msg_A", 1_800_000_000_000, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
+            )
+        };
+        assert!(insert().unwrap(), "first scan writes the row");
+        assert!(!insert().unwrap(), "second scan is a no-op");
+        assert_eq!(db.usage_rows_since(0).unwrap().len(), 1);
+
+        assert!(db
+            .upsert_provider_usage_row(
+                "claude:sess-1:msg_A", 1_800_000_000_001, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 80, 0, 0, 0, Some(2.0), Some("table"),
+            )
+            .unwrap());
+        let grown = db.usage_rows_since(0).unwrap();
+        assert_eq!(grown.len(), 1, "same provider record, still one row");
+        assert_eq!(grown[0].output_tokens, 80);
+        assert_eq!(grown[0].cost_usd, Some(2.0));
+
+        // A different key is a different row.
+        db.upsert_provider_usage_row(
+            "claude:sess-1:msg_B", 1_800_000_000_000, "claude:sess-1", "claude",
+            Some("claude-opus-4-5"), false, 5, 5, 0, 0, 0, None, None,
+        )
+        .unwrap();
+        assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
+    }
+
+    /// A corrected importer rebuilds the entire derived cache, including
+    /// legacy runtime rows that would otherwise double-count.
+    #[test]
+    fn resetting_usage_history_clears_all_rows_and_state() {
+        let db = init_test_database();
+        db.upsert_provider_usage_row(
+            "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
+            Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
+        )
+        .unwrap();
+        db.insert_usage_row(
+            1_800_000_000_000, "thread-live", None, "claude",
+            Some("claude-opus-4-5"), false, 10, 40, 0, 0, 0, Some(2.0), Some("table"),
+        )
+        .unwrap();
+        db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3).unwrap();
+        assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
+
+        assert_eq!(db.reset_usage_history().unwrap(), 2, "both cache generations");
+
+        let rows = db.usage_rows_since(0).unwrap();
+        assert!(rows.is_empty());
+        // The per-file state must go with it, or the rebuild scan would
+        // skip every unchanged file and import nothing.
+        assert!(db.usage_import_state("/logs/a.jsonl").unwrap().is_none());
+
+        // And the same key can be re-imported afterwards.
+        assert!(db
+            .upsert_provider_usage_row(
+                "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(3.0), Some("table"),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn provider_rows_are_tagged_and_carry_no_workspace() {
+        let db = init_test_database();
+        db.upsert_provider_usage_row(
+            "codex:roll-1", 1_800_000_000_000, "codex:roll-1", "codex",
+            Some("gpt-5-codex"), false, 10, 40, 0, 0, 25, Some(2.0), Some("table"),
+        )
+        .unwrap();
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows[0].source, "provider_history");
+        assert!(rows[0].workspace_id.is_none());
+        assert_eq!(rows[0].reasoning_tokens, 25);
+        assert_eq!(rows[0].cost_source.as_deref(), Some("table"));
+    }
+
+    #[test]
+    fn provider_rows_batch_in_one_transaction() {
+        let db = init_test_database();
+        let make = |key: &str, output: i64| ProviderUsageCacheRow {
+            import_key: key.to_string(),
+            created_at: 1_800_000_000_000,
+            thread_id: "opencode:session-1".into(),
+            provider: "opencode".into(),
+            model: Some("openai/gpt-5".into()),
+            subagent: false,
+            input_tokens: 10,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.25),
+            cost_source: Some("provider".into()),
+        };
+        let rows = [make("opencode:a", 2), make("opencode:b", 3)];
+        assert_eq!(db.upsert_provider_usage_rows(&rows).unwrap(), 2);
+        assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
+        assert_eq!(db.upsert_provider_usage_rows(&rows).unwrap(), 0);
+    }
+
+    #[test]
+    fn import_state_tracks_file_growth() {
+        let db = init_test_database();
+        assert!(db.usage_import_state("/tmp/a.jsonl").unwrap().is_none());
+        db.set_usage_import_state("/tmp/a.jsonl", 111, 500, 500, 999)
+            .unwrap();
+        assert_eq!(
+            db.usage_import_state("/tmp/a.jsonl").unwrap(),
+            Some((111, 500, 500))
+        );
+        // Upsert, not a second row.
+        db.set_usage_import_state("/tmp/a.jsonl", 222, 900, 900, 1000)
+            .unwrap();
+        assert_eq!(
+            db.usage_import_state("/tmp/a.jsonl").unwrap(),
+            Some((222, 900, 900))
+        );
+    }
+
+    #[test]
+    fn usage_rows_survive_deleting_their_chat_session() {
+        let db = init_test_database();
+        let now = 1_800_000_000_000i64;
+
+        db.upsert_agent_chat_session("t1", "ws1", Some("/tmp"), "claude")
+            .unwrap();
+        db.insert_usage_row(
+            now, "t1", Some("ws1"), "claude", Some("claude-opus-4-5"), false,
+            10, 10, 0, 0, 0, Some(0.5), Some("table"),
+        )
+        .unwrap();
+
+        db.delete_agent_chat_session("t1").unwrap();
+
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows.len(), 1, "usage history must not cascade away");
+        assert_eq!(rows[0].thread_id, "t1");
+        assert_eq!(rows[0].cost_usd, Some(0.5));
+    }
+
+    /// A row for a thread that never had a session row is still valid —
+    /// `workspace_id` is nullable and there is no foreign key.
+    #[test]
+    fn usage_row_accepts_a_null_workspace() {
+        let db = init_test_database();
+        db.insert_usage_row(
+            1_800_000_000_000, "orphan", None, "opencode", None, false,
+            1, 1, 0, 0, 0, None, None,
+        )
+        .unwrap();
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].workspace_id.is_none());
     }
 
     #[test]

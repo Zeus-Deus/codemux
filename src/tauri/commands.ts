@@ -1831,6 +1831,173 @@ export const removeToolPermission = (
 ) =>
   invoke<void>("remove_tool_permission", { rule, projectRoot });
 
+// ── Usage ──
+
+export interface UsageBucketSlice {
+  tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageBucket {
+  start_ms: number;
+  /** Short axis label. */
+  label: string;
+  /** Full label for the hover readout. */
+  sub_label: string;
+  /** Provider id → this bucket's slice. Providers with no activity in
+   *  the bucket are absent rather than zero-valued. */
+  providers: Record<string, UsageBucketSlice>;
+}
+
+export interface UsageModel {
+  model: string;
+  tokens: number;
+  cost_usd: number;
+  /** Tokens produced by subagent work; `0` when none. */
+  subagent_tokens: number;
+}
+
+export interface UsageProvider {
+  provider: AgentChatProviderKind | string;
+  tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+  session_count: number;
+  models: UsageModel[];
+}
+
+export interface UsageTotals {
+  /** API/list-price equivalent, not necessarily money charged. */
+  estimated_cost_usd: number;
+  total_tokens: number;
+  /** Cache-read share of all tokens, 0–1. */
+  cache_read_share: number;
+  session_count: number;
+}
+
+/** Which quota window a meter describes. */
+export type PlanWindowKind =
+  | "five_hour"
+  | "seven_day"
+  | "seven_day_opus"
+  | "seven_day_sonnet"
+  | "overage"
+  | "other";
+
+/** How the user pays a provider, as detected rather than assumed. */
+export type PlanAuthMode = "subscription" | "api_key";
+
+export interface PlanUsageWindow {
+  kind: PlanWindowKind;
+  /** Percent consumed, 0–100 (already normalized backend-side: Claude
+   *  reports a 0..1 fraction, Codex an already-scaled percent). */
+  used_pct: number;
+  /** Unix ms when the window rolls over, when the provider said. */
+  resets_at_ms: number | null;
+  label?: string | null;
+}
+
+/** One provider's live plan-quota reading. Absent for providers that
+ *  expose no quota (OpenCode) or that have not run this session. */
+export interface ProviderQuota {
+  windows: PlanUsageWindow[];
+  plan_label?: string | null;
+  auth_mode?: PlanAuthMode | null;
+  received_at_ms: number;
+}
+
+/** Where the period's tokens went. */
+export interface UsageComposition {
+  processed_tokens: number;
+  cache_read_tokens: number;
+  /** Cache reads as a share of observed input (input + reads + writes). */
+  cache_read_share_of_input: number;
+  input_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+  /** Subset of output_tokens; 0 when no provider reported a split. */
+  reasoning_tokens: number;
+  cache_savings_usd: number;
+  cache_savings_multiplier: number | null;
+}
+
+/** How measured-vs-estimated the period's cost figures are. */
+export interface CostConfidence {
+  provider_reported_share: number;
+  table_priced_share: number;
+  /** Share of TOKENS from unpriced rows (a cost share would always be 0). */
+  unpriced_token_share: number;
+  cache_savings_usd: number;
+}
+
+/** One row of the flat, cross-provider model breakdown. */
+export interface FlatModelUsage {
+  provider: string;
+  model: string;
+  tokens: number;
+  cost_usd: number;
+  priced: boolean;
+  provider_reported: boolean;
+}
+
+export interface UsageSummary {
+  period: UsagePeriod;
+  start_ms: number;
+  end_ms: number;
+  buckets: UsageBucket[];
+  providers: UsageProvider[];
+  totals: UsageTotals;
+  composition: UsageComposition;
+  confidence: CostConfidence;
+  /** Flat cross-provider model breakdown, most expensive first. */
+  models: FlatModelUsage[];
+  /** Live plan quota keyed by provider id; providers with no reading are
+   *  simply absent and render no meters. */
+  quota: Record<string, ProviderQuota>;
+  synced_at_ms: number;
+}
+
+export type UsagePeriod = "today" | "7d" | "30d" | "90d";
+
+/** Minutes EAST of UTC for this machine — the sign convention the
+ *  backend expects. `Date.prototype.getTimezoneOffset()` returns minutes
+ *  WEST (it reports +300 for UTC-5), so it is negated here. Read at call
+ *  time rather than cached so a machine that crosses a DST boundary while
+ *  the page is open re-buckets correctly on the next poll. */
+function localTzOffsetMinutes(): number {
+  return -new Date().getTimezoneOffset();
+}
+
+/** Usage is read from each provider's durable local history. */
+export const usageSummary = (period: UsagePeriod) =>
+  invoke<UsageSummary>("usage_summary", {
+    period,
+    tzOffsetMinutes: localTzOffsetMinutes(),
+  });
+
+export const usageExportCsv = (period: UsagePeriod) =>
+  invoke<string>("usage_export_csv", {
+    period,
+    tzOffsetMinutes: localTzOffsetMinutes(),
+  });
+
+/** What one provider-history scan did. */
+export interface UsageImportReport {
+  files_scanned: number;
+  sessions_found: number;
+  rows_updated: number;
+  /** True when the scan rebuilt its materialized cache. */
+  reimported: boolean;
+}
+
+/** Scan Claude, Codex, and OpenCode history on this machine. Incremental
+ *  and safe to call repeatedly. */
+export const usageScanProviderHistory = () =>
+  invoke<UsageImportReport>("usage_scan_provider_history");
+
 // ── Skills ──
 
 export type SkillProvider = "claude" | "codex" | "opencode" | "codemux";

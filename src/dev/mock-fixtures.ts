@@ -2296,3 +2296,254 @@ export function mockWebRemotePairing(): WebRemotePairingInfo {
     expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
   };
 }
+
+// ── Settings → Usage ──
+
+/** Deterministic value hash, the design script's `rnd()`. Seeded rather
+ *  than `Math.random()` so the dev mock renders identically on every
+ *  reload — a chart that reshuffles between hot-reloads makes visual
+ *  regressions impossible to spot. */
+function usageRnd(seed: number): number {
+  const x = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+const USAGE_PROVIDERS = ["claude", "codex", "opencode"] as const;
+
+/** Rough $/Mtok blend per provider, used to derive a plausible cost
+ *  from a token count. */
+const USAGE_RATE: Record<string, number> = {
+  claude: 9.4,
+  codex: 7.1,
+  opencode: 4.6,
+};
+
+const USAGE_MODELS: Record<string, { model: string; weight: number; subagent?: boolean }[]> = {
+  claude: [
+    { model: "claude-opus-4-5", weight: 0.62 },
+    { model: "claude-sonnet-4-5", weight: 0.29 },
+    { model: "claude-haiku-4-5", weight: 0.09, subagent: true },
+  ],
+  codex: [
+    { model: "gpt-5-codex", weight: 0.64 },
+    { model: "gpt-5-codex-mini", weight: 0.36 },
+  ],
+  opencode: [
+    { model: "anthropic/claude-sonnet-4-5", weight: 0.48 },
+    { model: "openrouter/kimi-k2", weight: 0.31 },
+    { model: "openai/gpt-5-mini", weight: 0.21 },
+  ],
+};
+
+const USAGE_MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/** Realistic fixture for `usage_summary`.
+ *
+ *  Mirrors the shapes the real aggregation produces: Claude dominates,
+ *  Codex is second, OpenCode is third, weekends dip,
+ *  and one Claude model carries all the subagent tokens. */
+export function mockUsageSummary(period: string): unknown {
+  const hourly = period === "today";
+  const bucketMs = hourly ? 3_600_000 : 86_400_000;
+  const count = hourly
+    ? 24
+    : period === "90d"
+      ? 90
+      : period === "30d"
+        ? 30
+        : 7;
+  const now = Date.now();
+  const newestStart = Math.floor(now / bucketMs) * bucketMs;
+  const startMs = newestStart - (count - 1) * bucketMs;
+
+  const buckets = [];
+  // Per-provider running totals, accumulated from the same numbers the
+  // buckets render so the lanes and the chart always agree.
+  const totals: Record<string, number> = { claude: 0, codex: 0, opencode: 0 };
+
+  for (let i = 0; i < count; i++) {
+    const start = startMs + i * bucketMs;
+    const date = new Date(start);
+    let shape: number;
+    let label: string;
+    let subLabel: string;
+    if (hourly) {
+      const hour = date.getHours();
+      // Work happens during the day; nights are near-idle.
+      shape = hour >= 8 && hour <= 22 ? 1 : 0.12;
+      label = `${hour}:00`;
+      // "Today" is a trailing 24-hour window, so its older buckets belong
+      // to yesterday — the same naming `bucket_labels` applies in Rust.
+      const isToday = date.toDateString() === new Date(now).toDateString();
+      subLabel = `${isToday ? "Today" : "Yesterday"} ${hour}:00`;
+    } else {
+      const day = date.getDay();
+      shape = day === 0 || day === 6 ? 0.28 : 1;
+      label = String(date.getDate());
+      subLabel = `${USAGE_MONTHS[date.getMonth()]} ${date.getDate()}`;
+    }
+
+    const providers: Record<string, { tokens: number; cost_usd: number }> = {};
+    USAGE_PROVIDERS.forEach((provider, index) => {
+      const base = hourly
+        ? provider === "claude" ? 90e3 : provider === "codex" ? 34e3 : 22e3
+        : provider === "claude" ? 620e3 : provider === "codex" ? 300e3 : 190e3;
+      const span = hourly ? base * 1.5 : base * 1.4;
+      const seed = Math.floor(start / bucketMs) * 3 + index * 97;
+      const tokens = Math.round((base + usageRnd(seed) * span) * shape);
+      totals[provider] += tokens;
+      providers[provider] = {
+        tokens,
+        cost_usd: (tokens / 1e6) * USAGE_RATE[provider],
+      };
+    });
+
+    buckets.push({ start_ms: start, label, sub_label: subLabel, providers });
+  }
+
+  const providers = USAGE_PROVIDERS.map((provider) => {
+    const tokens = totals[provider];
+    const cost = (tokens / 1e6) * USAGE_RATE[provider];
+    return {
+      provider,
+      tokens,
+      // A plausible non-overlapping split: cache reads dominate a
+      // long-running agent session, which is the point of the
+      // "% served from cache" hero note.
+      input_tokens: Math.round(tokens * 0.18),
+      output_tokens: Math.round(tokens * 0.12),
+      cache_read_tokens: Math.round(tokens * 0.64),
+      cache_write_tokens: Math.round(tokens * 0.06),
+      cost_usd: cost,
+      session_count: Math.max(1, Math.round(tokens / 1e6 * 3.1)),
+      models: USAGE_MODELS[provider].map((entry) => ({
+        model: entry.model,
+        tokens: Math.round(tokens * entry.weight),
+        cost_usd: cost * entry.weight,
+        subagent_tokens: entry.subagent ? Math.round(tokens * entry.weight) : 0,
+      })),
+    };
+  }).sort((a, b) => b.tokens - a.tokens);
+
+  const totalTokens = providers.reduce((sum, p) => sum + p.tokens, 0);
+  const cacheRead = providers.reduce((sum, p) => sum + p.cache_read_tokens, 0);
+
+  // Plan quota for the two providers that actually report it. OpenCode
+  // has no quota API at all, so it stays absent and its lane renders
+  // meter-less — the same shape the real backend produces.
+  const resetIn = (mins: number) => now + mins * 60_000;
+  const quota = {
+    claude: {
+      windows: [
+        { kind: "five_hour", used_pct: 41, resets_at_ms: resetIn(134) },
+        { kind: "seven_day", used_pct: 88, resets_at_ms: resetIn(3_400) },
+        // A per-model weekly window, to exercise the "shown in the note,
+        // not as a bar" path.
+        { kind: "seven_day_opus", used_pct: 72, resets_at_ms: resetIn(3_400) },
+      ],
+      plan_label: "Max 20×",
+      auth_mode: "subscription",
+      received_at_ms: now,
+    },
+    codex: {
+      windows: [
+        { kind: "five_hour", used_pct: 18, resets_at_ms: resetIn(220) },
+        { kind: "seven_day", used_pct: 63, resets_at_ms: resetIn(5_000) },
+      ],
+      plan_label: "ChatGPT Pro",
+      auth_mode: "subscription",
+      received_at_ms: now,
+    },
+  };
+
+  // Composition + confidence + flat models, derived from the same
+  // totals the lanes use so the mock stays internally consistent.
+  const inputTokens = providers.reduce((n, p) => n + p.input_tokens, 0);
+  const outputTokens = providers.reduce((n, p) => n + p.output_tokens, 0);
+  const cacheWrite = providers.reduce((n, p) => n + p.cache_write_tokens, 0);
+  const observedInput = inputTokens + cacheRead + cacheWrite;
+  // Codex + OpenCode report a reasoning split; Claude does not.
+  const reasoningTokens = Math.round(
+    providers
+      .filter((p) => p.provider !== "claude")
+      .reduce((n, p) => n + p.output_tokens, 0) * 0.38,
+  );
+  const providerPricedCost = providers
+    .filter((p) => p.provider === "opencode")
+    .reduce((n, p) => n + p.cost_usd, 0);
+  const allCost = providers.reduce((n, p) => n + p.cost_usd, 0);
+  const savings = allCost * 2.2;
+
+  const models = providers
+    .flatMap((p) =>
+      p.models.map((m) => ({
+        provider: p.provider,
+        model: m.model,
+        tokens: m.tokens,
+        cost_usd: m.cost_usd,
+        // One deliberately unpriced model so the em-dash / token-share
+        // path renders in the dev mock.
+        priced: m.model !== "openrouter/kimi-k2",
+        provider_reported: p.provider === "opencode",
+      })),
+    )
+    .sort((a, b) =>
+      a.priced === b.priced ? b.cost_usd - a.cost_usd : Number(b.priced) - Number(a.priced),
+    );
+
+  return {
+    period,
+    start_ms: startMs,
+    end_ms: newestStart + bucketMs,
+    buckets,
+    providers,
+    composition: {
+      processed_tokens: totalTokens,
+      cache_read_tokens: cacheRead,
+      cache_read_share_of_input: observedInput > 0 ? cacheRead / observedInput : 0,
+      input_tokens: inputTokens,
+      cache_write_tokens: cacheWrite,
+      output_tokens: outputTokens,
+      reasoning_tokens: reasoningTokens,
+      cache_savings_usd: savings,
+      cache_savings_multiplier: 3.2,
+    },
+    confidence: {
+      provider_reported_share: allCost > 0 ? providerPricedCost / allCost : 0,
+      table_priced_share: allCost > 0 ? 1 - providerPricedCost / allCost : 0,
+      unpriced_token_share: 0.041,
+      cache_savings_usd: savings,
+    },
+    models,
+    quota,
+    totals: {
+      estimated_cost_usd: allCost,
+      total_tokens: totalTokens,
+      cache_read_share: totalTokens > 0 ? cacheRead / totalTokens : 0,
+      session_count: providers.reduce((sum, p) => sum + p.session_count, 0),
+    },
+    synced_at_ms: now,
+  };
+}
+
+/** CSV matching `mockUsageSummary`, one row per bucket × provider × model. */
+export function mockUsageExportCsv(period: string): string {
+  const summary = mockUsageSummary(period) as {
+    buckets: { sub_label: string; providers: Record<string, { tokens: number }> }[];
+    providers: { provider: string; models: { model: string }[] }[];
+  };
+  let out =
+    "bucket_start,provider,model,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost_usd\n";
+  for (const bucket of summary.buckets) {
+    for (const provider of summary.providers) {
+      const tokens = bucket.providers[provider.provider]?.tokens ?? 0;
+      for (const model of provider.models) {
+        out += `${bucket.sub_label},${provider.provider},${model.model},0,0,0,0,${tokens},0.0000\n`;
+      }
+    }
+  }
+  return out;
+}

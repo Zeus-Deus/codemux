@@ -130,6 +130,50 @@ pub struct StartSessionInput {
     /// keys here when both are present.
     #[serde(default)]
     pub extra: serde_json::Value,
+    /// Usage already written to `agent_usage_ledger` for this thread, so
+    /// an adapter that reads a provider-maintained *lifetime* counter can
+    /// avoid re-recording history after a session rebuild.
+    ///
+    /// Only Codex needs this today (see
+    /// [`UsageBaseline`]). Adapters that derive their own deltas from
+    /// per-message counters ignore it.
+    #[serde(default)]
+    pub recorded_usage_baseline: Option<UsageBaseline>,
+}
+
+/// Token totals already recorded in the usage ledger for one thread.
+///
+/// Codex's `thread/tokenUsage/updated` reports a **provider-maintained
+/// lifetime total** for the thread, and that total survives a
+/// `thread/resume`. The delta bookkeeping that turns it into ledger rows
+/// lives in adapter memory, which does *not* survive — a session is
+/// rebuilt both across app restarts and mid-lifetime, whenever the
+/// child dies and the next send resumes it.
+///
+/// Without a baseline the first report after a rebuild would see a
+/// previous total of zero and re-record the thread's entire history as
+/// one delta, double-counting on every resume. Seeding from what the
+/// ledger already holds closes that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageBaseline {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// Subset of `output_tokens`. Carried because Codex reports it
+    /// cumulatively too, so a baseline without it would let a resumed
+    /// thread re-record its whole reasoning history.
+    pub reasoning_tokens: u64,
+}
+
+impl UsageBaseline {
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+            && self.reasoning_tokens == 0
+    }
 }
 
 /// Parameters for queueing a user turn on an existing session.

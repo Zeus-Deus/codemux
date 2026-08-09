@@ -2021,7 +2021,12 @@ backend `SubagentTracker`; pure helpers in `subagents.ts`, unit-tested):
   rejection (`rate_limit_info.status === "rejected"`), the SDK's
   enumerated `assistant error: …` — into a compact muted-amber inline
   `runtime_notice` transcript row; all other `runtime_warning`s stay
-  console-only debug noise.
+  console-only debug noise. A Claude `rate_limit_event` decodes into
+  `plan_usage_updated` for the Settings → Usage meters, and `forward_event`
+  intercepts that variant before persistence and fan-out — so a `rejected`
+  reading additionally emits the `"rate limit event"` warning this
+  classifier reads. Both halves of that contract are pinned by tests
+  (`translate.rs`, `runtime-notice.test.ts`).
 
 The dev mock seeds one subagent turn in the demo transcript and exposes
 `window.__codemuxChatMock.streamSubagents()` for a live two-subagent
