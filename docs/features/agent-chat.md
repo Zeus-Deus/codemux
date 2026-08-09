@@ -244,10 +244,14 @@ favicon attached to their protocol; labelled links keep it attached to the
 first character, preventing an icon from wrapping onto a line by itself.
 
 `rehypeRichExternalLinks` (`src/lib/agent-chat/rich-links.ts`) decorates the HAST
-children rather than replacing Streamdown's anchor component. This preserves
-Streamdown's safe-link confirmation behavior. `MarkdownLinkFavicon` requests a
-32px image from the same Google favicon service already used for project
-avatars and falls back to a token-colored globe.
+children without changing the anchor destination. `ChatMarkdownLink` owns the
+safe-link interaction: an external link remains a real anchor, opens a
+shadcn/Radix confirmation dialog portalled to the document body, then delegates
+the confirmed URL to Tauri's system-browser opener. The body-level portal is a
+hard requirement because LegendList rows use paint/layout containment; a modal
+mounted beside a transcript link is clipped to its virtualized row.
+`MarkdownLinkFavicon` requests a 32px image from the same Google favicon service
+already used for project avatars and falls back to a token-colored globe.
 
 Three cases render that globe with no network request at all: while the
 message is still streaming (a bare URL is autolinked on every frame, so

@@ -1,11 +1,34 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+
+const mocks = vi.hoisted(() => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
+  toastError: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mocks.openUrl(...args),
+}));
+
+vi.mock("@/lib/toast", () => ({
+  toast: { error: (...args: unknown[]) => mocks.toastError(...args) },
+}));
 
 import { ChatMarkdown } from "./ChatMarkdown";
 import { resetFaviconFailureCache } from "./MarkdownLinkFavicon";
 
-beforeEach(() => resetFaviconFailureCache());
+beforeEach(() => {
+  resetFaviconFailureCache();
+  mocks.openUrl.mockReset().mockResolvedValue(undefined);
+  mocks.toastError.mockReset();
+});
 afterEach(() => cleanup());
 
 describe("ChatMarkdown rich external links", () => {
@@ -24,6 +47,71 @@ describe("ChatMarkdown rich external links", () => {
       "https://www.google.com/s2/favicons?domain=github.com&sz=32",
     );
     expect(link?.querySelector(".chat-markdown-link-leading")).toHaveTextContent("P");
+  });
+
+  it("confirms external links in a body-level portal before opening the system browser", async () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[OpenAI documentation](https://platform.openai.com/docs)"}
+      </ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link?.tagName).toBe("A");
+    expect(link).toHaveAttribute("href", "https://platform.openai.com/docs");
+
+    fireEvent.click(link as HTMLAnchorElement);
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.parentElement).toBe(document.body);
+    expect(
+      screen.getByText("https://platform.openai.com/docs"),
+    ).toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+
+    await waitFor(() =>
+      expect(mocks.openUrl).toHaveBeenCalledWith(
+        "https://platform.openai.com/docs",
+      ),
+    );
+  });
+
+  it("does not open an external link when its confirmation is cancelled", () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[Reference](https://example.com/reference)"}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(
+      container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an opener failure after confirmation", async () => {
+    mocks.openUrl.mockRejectedValueOnce(new Error("opener unavailable"));
+    const { container } = render(
+      <ChatMarkdown>
+        {"[Reference](https://example.com/reference)"}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(
+      container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+
+    await waitFor(() =>
+      expect(mocks.toastError).toHaveBeenCalledWith("Could not open the link", {
+        description: "opener unavailable",
+      }),
+    );
   });
 
   it("keeps a bare URL's protocol with the favicon and leaves local links plain", () => {
