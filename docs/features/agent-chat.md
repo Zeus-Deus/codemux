@@ -1049,13 +1049,13 @@ carries the split/unified toggle and "Open in a tab" (which promotes the
 current file to a full main-area diff tab, where hunk/file navigation and
 focus mode have room), and the status foot names the file being diffed.
 Clicking a row in the Changes pane targets this pane rather
-than jumping to the main area. *Subagents* renders the same
-`SubagentsCard` the transcript renders, from the same
-`subagentRunItems(messages)` derivation — a placement, not a second
-presentation. Entering a subagent still belongs to `AgentChatPane` (the
-drill-in replaces its transcript), so the row raises a one-shot
-`subagentEnterRequest` in `ui-store` that the chat pane consumes and
-clears.
+than jumping to the main area. *Subagents* is the focused **watch surface**
+behind the transcript work-log row: aggregate `done / total` progress and
+elapsed time, one compact live card per active subagent, then settled rows.
+Its data is still the same `subagentRunItems(messages)` derivation. Entering
+a subagent still belongs to `AgentChatPane` (the drill-in replaces its
+transcript), so "Open thread" raises a one-shot `subagentEnterRequest` in
+`ui-store` that the chat pane consumes and clears.
 
 **Doc panes** mount the existing `EditorPane` with `embedded`, so
 editing, `Ctrl+S`, syntax highlighting, images and rendered markdown are
@@ -1709,11 +1709,12 @@ already flag-gated pane and simply hides on short threads.
 ## Subagent view (cross-provider)
 
 When a provider session delegates to subagents, the chat pane shows a
-**Subagents orchestration card** in the transcript and lets the user
+compact **subagent work-log row** in the transcript and lets the user
 **enter** a subagent for a read-only, in-pane drill-in of its own stream.
-One canonical model drives all three providers. Design spec:
-`docs/plans/assets/Subagents.dc.html`; locked decisions:
-`docs/archive/subagent-view.md`.
+One canonical model drives all three providers. The current transcript
+presentation is Claude Design `Canvas-6.dc.html`, Turn 2; the foundational
+model spec remains `docs/plans/assets/Subagents.dc.html`, with locked event
+decisions in `docs/archive/subagent-view.md`.
 
 ### Canonical event model (`agent_provider/events.rs`)
 
@@ -1789,50 +1790,39 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
   (`kind: "subagent_run"`) `ChatViewItem`; `reducer.ts` merges snapshots
   (non-null wins, status is monotonic and never regresses to pending) and
   routes `subagent_id`-tagged events into the subagent's own `items` via
-  shared item-builders (one card per contiguous spawn group; a new turn
-  ⇒ a new card; per-subagent cap 500). Pure helpers live in
-  `subagents.ts`; `subagent_run` is a standalone unfoldable transcript
-  slot.
-- `SubagentsCard.tsx` — the in-thread spawn group. **There is no card any
-  more**: the bordered box, the tinted rows and the `Enter ›` buttons were
-  deleted so the block reads as part of the transcript rather than a widget
-  dropped into it (`Canvas-3.dc.html` §1b). What renders instead:
-  - a **group rail** — 1.5px wide, fully rounded, a vertical gradient from
-    the state token to a ~10–12% fade: `accent-ember` while anything runs,
-    `status-open` when it settled clean, `status-attention` on a failure,
-    dimmed `status-working` when something was halted. Content sits 15px to
-    its right. Status is a rail or a glyph, never a filled row.
-  - a **header line** (24px): "Subagents" + muted caption
-    ("N tasks · running in parallel" / "· complete") + right-aligned mono
-    rollup ("X done · Y active"). It carries **no orb** — one orb per live
-    thing, and the whole run's orb lives on the composer strip.
-  - **rows as plain hover targets** (radius 8, `foreground/[0.05]` hover):
-    20px status slot (`AgentOrb` with the row's own activity while running,
-    flat check / ✕ / ⊘ once settled), name (132px, ellipsized), muted task
-    summary (flex, ellipsized), mono `elapsed · N tools`, and a chevron that
-    rotates 90° when open. Clicking **expands inline**: an indented block
-    (34px, 1.5px muted left border) with the subagent's latest output
-    (`subagentLatestOutput`, mono, `pre-wrap`, full multi-line result), an
-    accent **"Open thread ›"** text button routing to the same drill-in the
-    old `Enter ›` did, and the mono model/effort label. One row open at a
-    time.
-  - a **footer caption** (11px muted) about reporting back / steering going
-    to the orchestrator.
-  - **settled groups collapse to one line.** Once nothing is running the
-    whole group renders as a single 30px hover row: flat glyph ·
-    "Ran N subagents" · mono rollup · "View" + chevron. Clicking expands
-    back to the rail view with settled styling. The rollup
-    (`subagentGroupRollup` in `subagents.ts`) uses **real data only**: the
-    **longest** row's elapsed rather than the sum (the group ran in
-    parallel), summed usage only when at least one provider reported any —
-    otherwise the `Σ` segment is dropped rather than faked — and a tool
-    count that falls back to counted child tool calls.
-
-  The root still carries `data-subagent-card={item.id}` so the composer
-  strip (below) can locate + scroll to + flash-highlight it by plain DOM
-  query — no prop plumbing through `MessageList`/`ChatTranscript` needed.
-  The right panel's Subagents pane renders this same component, so the two
-  placements can never drift (see `right-panel/subagents-pane.tsx`).
+  shared item-builders (one canonical run per contiguous spawn group; a new
+  turn ⇒ a new run; per-subagent cap 500). Pure helpers live in
+  `subagents.ts`. Persistence and event routing stay per-run.
+- `transcript-slots.ts` + `SubagentsCard.tsx` implement Canvas-6 Turn 2's
+  **one work log per stretch**. After non-rendering `turn_ended` markers are
+  removed, adjacent `subagent_run` items merge into one
+  `subagent_stretch` presentation slot. Any rendered prose, user turn,
+  tool/result, approval, or error splits the stretch. This is deliberately
+  a presentation-only merge: canonical ids, persistence, and drill-in
+  routing do not change.
+  - The transcript always spends one labelled **32px line**, whether the
+    stretch ran 1 or 40 subagents: neutral 20px `AgentOrb` while live (flat
+    bot/status glyph once settled), `Ran N subagents`, up to three task
+    names as a muted preview, real-data rollup, and `View ›`.
+  - The row **never expands inline**. `View` opens the right-panel Subagents
+    watch surface and `aria-pressed` plus a faint foreground tint marks the
+    selected row. This preserves the timeline's *when* without duplicating
+    the panel's live detail.
+  - Settled rollups use the longest subagent elapsed time (parallel work is
+    not summed), counted/reported tools, and summed tokens only when usage
+    exists. Failure and halted stretches use the existing status tokens.
+  - The visual root keeps `data-subagent-card` for LegendList jump/highlight
+    and contains zero-size `data-subagent-run-id` anchors for **every**
+    canonical run it merged, so any composer jump still resolves to the
+    correct row.
+  - A lone successful `Read`, `Grep`, or `Glob` is silent: it carries no
+    failure, approval, or human-action signal. Running/error/image-bearing
+    calls stay visible, and consecutive observational calls still collapse
+    into one Activity summary rather than disappearing as a meaningful burst.
+- `right-panel/subagents-pane.tsx` owns detail: aggregate progress, elapsed,
+  live activity-matched orbs, current activity/output, compact finished rows,
+  and `Open thread`. It raises the unchanged `subagentEnterRequest` consumed
+  by `AgentChatPane`.
 - `SubagentView.tsx` + `SubagentBreadcrumb.tsx` — the read-only drill-in:
   a `← Orchestrator › ⟨ordinal⟩ Name` breadcrumb with model chip and
   right-aligned blinking status, a tone-tinted read-only banner, the
@@ -1849,8 +1839,11 @@ Replaces the old pane-header / title-bar "N subagents running" pills
 (removed — they read as a broken tab strip entry once the drill-in and
 the in-thread group already say the same thing). One strip per thread,
 hidden while `enteredSubagentId` is set (the strip only shows in the
-conversation view) and rendered as `null` entirely while idle — no
-resting state.
+conversation view), while the matching transcript work-log row is visible,
+and entirely while idle — no resting state. An `IntersectionObserver`
+tracks the merged row; a `MutationObserver` reconnects when LegendList
+virtualizes it out/in. The strip is therefore an off-screen tether, never a
+second simultaneous live surface.
 
 **It is welded inside the composer, not docked above it.** `AgentChatPane`
 passes it through `Composer`'s `topStripSlot`, which renders it as the
@@ -1881,7 +1874,7 @@ running" · mono current-activity label · flex · mono elapsed · the
 
 - **Whole-thread rollup.** `runningSubagentEntries(messages, streaming)`
   (`subagents.ts`) flattens every `running`/`pending` subagent across
-  **every** `subagent_run` card in the thread, tagging each with its card
+  **every** canonical `subagent_run` in the thread, tagging each with its run
   id and a `from task N` label (omitted when the thread has only one card
   — there is nothing to disambiguate). The strip's count, mono activity
   label and expand-list all key off this list, so scattered work from
@@ -1899,13 +1892,13 @@ running" · mono current-activity label · flex · mono elapsed · the
   are persisted and hydrate-replayed). `AgentChatPane` passes the thread's
   streaming flag; mid-run nothing changes.
 - **1 running** → the whole strip is one click target labelled "View";
-  clicking jumps straight to that subagent's group.
+  clicking jumps straight to that subagent's work-log stretch.
 - **>1 running** → the action reads "Show all" / "Hide" with a rotating
   caret; clicking the strip toggles the overlay list (`rise-in`): a header
   ("N subagents running · across this thread · tap one to jump") and one
   row per running subagent (its own activity-matched orb, name, shimmering
   activity, mono elapsed, `from <label>`, chevron) — clicking a row
-  collapses the list and jumps to that subagent's group.
+  collapses the list and jumps to that subagent's work-log stretch.
 - **Just finished** (the running count is observed transitioning from
   `>0` to `0` — never on initial mount or a thread hydrate): the strip
   holds the same 32px shape for ~2.5s in a `status-open/[0.06]` tint
@@ -1914,16 +1907,17 @@ running" · mono current-activity label · flex · mono elapsed · the
   composer's own top edge. The flash is itself clickable: it jumps to the
   group of the last subagent that was still running before the
   transition.
-- **Jump + highlight.** `AgentChatPane.tsx` sends a keyed jump request through
-  `ChatTranscript` to `MessageList`. The list resolves the matching slot and
+- **Jump + highlight.** `AgentChatPane.tsx` sends a keyed canonical-run jump
+  request through `ChatTranscript` to `MessageList`. The list resolves the
+  merged stretch containing that run and
   calls LegendList's `scrollToIndex`, then applies `subagent-card-highlight`
   after the destination row mounts
   (ember `box-shadow` ring, ~1100ms, token-driven per the design-system
   no-hardcoded-color rule) via plain `classList`. The strip itself never
   touches the DOM directly; off-screen targets are valid because navigation
   is index-based.
-- All tones consume design-system tokens (running rail + sweep =
-  `accent-ember`, settled rail + finished flash = `status-open`, failure =
+- All tones consume design-system tokens (progress + sweep =
+  `accent-ember`, settled mark + finished flash = `status-open`, failure =
   `status-attention`, highlight ring = `accent-ember`); no tint anywhere in
   the block exceeds ~6% foreground-mix. The sweep animation (`cm-sweep` in
   `globals.css`) and `.cm-blink` (still used by the breadcrumb's status
@@ -3322,15 +3316,17 @@ currently moving:
   `shouldShowThinkingIndicator` stands the tail marker down whenever the
   last item is a running tool call, so the thread shows exactly one orb.
   Individual tool-call rows and step glyphs stay still.
-- **Subagent rows** — `SubagentsCard`, the `SubagentActivityBar` expand
-  list, `SubagentView`'s live tail, and the Orchestration panel's agent
-  drill-in. A finished row reverts to the existing flat check.
+- **Subagent activity** — the merged `SubagentWorkLogRow` carries one neutral
+  orb for the whole uninterrupted stretch; the right-panel live cards,
+  `SubagentActivityBar` expand list, `SubagentView` live tail, and the
+  Orchestration panel's agent drill-in use one activity-matched orb per child.
+  Finished rows revert to the existing flat check.
 - **The composer running strip** — `SubagentActivityBar`'s orb stands for
   the *whole* run, so it stays neutral even when a single subagent is
   doing something more specific. Same for aggregate headers
-  (`WorkflowRunCard`, a workflow phase). The in-thread subagent group's
-  header line carries no orb at all: the strip already owns the run, and
-  each running row owns itself.
+  (`WorkflowRunCard`, a workflow phase). The composer aggregate is hidden
+  while the matching transcript work-log orb is in view, so those two never
+  describe the same live stretch at once.
 
 The activity → orb-state mapping is the single shared helper
 `src/lib/orb-state.ts` (`resolveOrbState` / `orbStateForTool`); the
@@ -3351,11 +3347,11 @@ inside `AgentOrb`, so no call site can opt out of it.
 ## Sidebar status indicators
 
 Chat sessions publish into the same `pane_statuses` snapshot the left
-sidebar reads, so a chat workspace shows the working orb / red
-needs-input pulse / green ready-for-review dot exactly like a terminal
+sidebar reads, so a chat workspace shows the static amber working mark / red
+needs-input pulse / green ready-for-review mark exactly like a terminal
 agent (previously chat panes showed nothing). `pane_statuses` is a
-five-value enum carrying **no tool name**, which is why a sidebar card's
-orb is deliberately neutral while a thread's is activity-matched. `forward_event` in
+five-value enum carrying **no tool name**, which is why a sidebar card uses a
+static lifecycle mark while a thread's orb is activity-matched. `forward_event` in
 `commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
 `PaneStatus` (`map_event_to_pane_status`) and writes it through
 `AppStateStore::set_pane_status_by_thread`, which resolves the
@@ -3386,30 +3382,40 @@ per-thread `ThreadSubagentState` (running `subagent_id`s + a
 (`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
 `Review` only when no subagents are tracked — otherwise it *holds
 `Working`* and marks `review_pending`, and the deferred `Review` fires
-when the last subagent goes terminal. The working orb therefore
+when the last subagent goes terminal. The working mark therefore
 persists until the turn **and** all tracked subagents finish, matching the
-still-running `SubagentsCard` in the drill-in.
+still-running work-log row and its focused panel detail.
 
-**A new user turn resets the thread's tracker** (both `running` and
-`review_pending`). The authoritative, provider-agnostic anchor is the
+**A new user turn resets turn-scoped tracker state but carries confirmed
+monitors forward.** The authoritative, provider-agnostic anchor is the
 send-message command path: `agent_chat_send_turn` calls
-`SubagentTracker::clear_thread` before dispatching the turn. This matters
-because a provider can leave a subagent non-terminal — Claude's background
-`async_launched` task stays `Running` until a later `task_notification`
-that may never arrive — and without the reset that stale `running` id
-would hold `Working` and suppress `Review` for *every* later turn until
-session close. `SessionStateChanged::Running` also resets the tracker
-(reliably per-turn for Codex's `turn/started` and OpenCode's
-`session.status = busy`; Claude does not fire it per user turn, hence the
-command-path clear). A genuinely-still-alive background subagent
-re-inserts itself on its next `Running` snapshot — Claude re-emits these
-via `task_progress` ticks — so clearing at turn start is safe. Crucially,
-parent-scoped `content_delta`/`item_completed` (`subagent_id == None`) do
-**not** clear `review_pending`: such output can trickle in after a deferred
-`TurnCompleted`, and dropping the owed `Review` there would strand the
-pane at `Working`. `review_pending` is cleared only by publishing the
-owed/normal `Review`, a new-turn reset, session `Closed`/`Error`, or
-`agent_chat_close_pane`.
+`SubagentTracker::begin_turn` before dispatching the turn. It drops ordinary
+agent entries, `review_pending`/watchdog state, the forced-settle tombstone,
+and the previous run's Stop blocklist. This matters because a provider can
+leave a subagent non-terminal — Claude's background `async_launched` task
+stays `Running` until a later `task_notification` that may never arrive — and
+carrying that stale agent id would hold `Working` and suppress `Review` for
+*every* later turn until session close.
+
+Only entries already classified as `TaskClass::Monitor` survive. A watch loop
+is explicitly allowed to outlive its parent turn, and providers do not
+guarantee a fresh progress event merely because the user sends a follow-up;
+Claude's `TaskOutput` can confirm the task is still running without producing
+another `task_progress`. During the follow-up the parent still owns `Working`;
+when it settles, the retained monitor makes the pane return to `Monitoring`
+without waiting for another provider snapshot. `SessionStateChanged::Running`
+uses the same partial reset (reliably per-turn for Codex's `turn/started` and
+OpenCode's `session.status = busy`; Claude does not fire it per user turn,
+hence the command-path boundary). The tracker and event shape are
+provider-neutral, so any adapter that emits `task_kind: monitor` gets the same
+continuity; manual monitors already live outside this tracker and are likewise
+unaffected by a new turn. Session close/error and pane teardown still perform
+a full clear. Crucially, parent-scoped `content_delta`/`item_completed`
+(`subagent_id == None`) do **not** clear `review_pending`: such output can
+trickle in after a deferred `TurnCompleted`, and dropping the owed `Review`
+there would strand the pane at `Working`. `review_pending` is cleared only by
+publishing the owed/normal `Review`, a new-turn boundary, session
+`Closed`/`Error`, or `agent_chat_close_pane`.
 
 **Background tasks are excluded from all of that.** Claude emits the same
 `system.task_started` / `task_progress` / `task_updated` /
@@ -3490,7 +3496,7 @@ perfectly alive. The forced path is therefore deliberately
   Removing the entry at settle time instead would leave that snapshot to
   recreate a husk that nothing ever collects. The tombstone is cleared by
   every genuine turn boundary — a new `SessionStatus::Running`, session
-  teardown, or the send-message `clear_thread`.
+  teardown, or the send-message `begin_turn`.
 
 The sweep still runs under the tracker lock, and the mutex is released
 before any `AppStateStore` call. It can never cut a live *turn* short:

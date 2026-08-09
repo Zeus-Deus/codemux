@@ -33,9 +33,10 @@ interface Props extends OrbActivity {
 }
 
 /**
- * The agent activity indicator — the one animated mark shown wherever an
- * agent is currently moving: sidebar workspace cards, the in-flight turn in
- * a thread, running subagent rows, and the docked composer strip.
+ * The agent activity indicator — the animated mark shown where an agent's
+ * activity has context: the in-flight turn in a thread, running subagent
+ * rows, and the docked composer strip. Workspace navigation uses a static
+ * lifecycle mark instead.
  *
  * Always monochrome. The orb inks white on dark and black on light from the
  * library's own palette (`theme="auto"` reads the `dark`/`light` root class

@@ -85,6 +85,14 @@ export function SubagentView({
           <div key={slot.key} className={slot.turnStart ? "mt-4" : "mt-3"}>
             {slot.body.kind === "activity" ? (
               <ActivityBlock items={slot.body.items} working={slot.body.working} />
+            ) : slot.body.kind === "subagent_stretch" ? (
+              <div className="h-8 text-[11px] text-muted-foreground">
+                Ran {slot.body.runs.reduce(
+                  (count, run) => count + run.subagents.length,
+                  0,
+                )}{" "}
+                nested subagents
+              </div>
             ) : (
               <SubItem item={slot.body.item} />
             )}
