@@ -2097,8 +2097,8 @@ function stressWorkspaces(target: number): WorkspaceSnapshot[] {
     const kept = ALL_WORKSPACES.slice(0, target);
     // The seed's active workspace must survive any cut, or the snapshot
     // points `active_workspace_id` at a workspace that isn't in the list.
-    if (!kept.some((w) => w.workspace_id === wsCodemuxMock.workspace_id)) {
-      kept[kept.length - 1] = wsCodemuxMock;
+    if (!kept.some((w) => w.workspace_id === wsCodemuxChat.workspace_id)) {
+      kept[kept.length - 1] = wsCodemuxChat;
     }
     stressWorkspacesCache = kept;
     return kept;
@@ -2149,7 +2149,9 @@ export function createSeedAppState(): AppStateSnapshot {
   const workspaces = fixture ? stressWorkspaces(fixture.workspaces) : ALL_WORKSPACES;
   return structuredClone({
     schema_version: 1,
-    active_workspace_id: wsCodemuxMock.workspace_id,
+    // Agent Chat is the default interface, so the plain-browser mock should
+    // open on its hydrated transcript instead of a legacy terminal fixture.
+    active_workspace_id: wsCodemuxChat.workspace_id,
     workspaces,
     terminal_sessions: terminalSessions,
     browser_sessions: [],
