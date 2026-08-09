@@ -2919,6 +2919,7 @@ pub async fn agent_chat_list_messages(
 pub struct AgentChatMessageRow {
     pub id: i64,
     pub payload: String,
+    pub created_at_ms: i64,
 }
 
 /// Cursor read of a thread's transcript: every row with `id > after_id`
@@ -2941,9 +2942,10 @@ pub async fn agent_chat_list_messages_after(
     Ok(db
         .list_agent_chat_messages_after(&thread_id, after_id)
         .into_iter()
-        .map(|(id, payload)| AgentChatMessageRow {
+        .map(|(id, payload, created_at_ms)| AgentChatMessageRow {
             payload: shape_persisted_payload(id, &payload),
             id,
+            created_at_ms,
         })
         .collect())
 }

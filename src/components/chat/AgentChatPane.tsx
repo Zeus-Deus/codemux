@@ -3019,6 +3019,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 <SubagentView
                   subagent={enteredSubagent}
                   requests={enteredSubagentRequests}
+                  workspaceId={workspaceIdForPane}
+                  cwd={cwd}
                 />
               </div>
             </>
@@ -3041,6 +3043,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onSendQueuedNow={handleSendQueuedNow}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
+              cwd={cwd}
             />
           )}
           {/* The running-subagents strip used to dock here, between the

@@ -54,6 +54,7 @@ export function resetFaviconFailureCache() {
  */
 export const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon({
   host,
+  href,
 }: Record<string, unknown>) {
   const streaming = useChatMarkdownStreaming();
   const hostname = typeof host === "string" ? host : "";
@@ -65,7 +66,11 @@ export const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon({
     hasRecentlyFailed(hostname);
 
   return (
-    <span className="chat-markdown-link-favicon" aria-hidden="true">
+    <span
+      className="chat-markdown-link-favicon"
+      title={typeof href === "string" ? href : undefined}
+      aria-hidden="true"
+    >
       {fallback ? (
         <Globe2 className="block size-full" />
       ) : (

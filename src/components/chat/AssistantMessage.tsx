@@ -14,14 +14,24 @@ import { StreamingIndicator } from "./streaming-indicator";
  */
 export const AssistantMessage = memo(function AssistantMessage({
   item,
+  workspaceId,
+  cwd,
 }: {
   item: AssistantMessageItem;
+  workspaceId?: string | null;
+  cwd?: string | null;
 }) {
   const showIndicator = item.streaming && item.text.length === 0;
 
   return (
     <div className="text-sm leading-relaxed text-foreground break-words">
-      <ChatMarkdown streaming={item.streaming}>{item.text}</ChatMarkdown>
+      <ChatMarkdown
+        streaming={item.streaming}
+        workspaceId={workspaceId}
+        cwd={cwd}
+      >
+        {item.text}
+      </ChatMarkdown>
       {item.streaming && !showIndicator && (
         <StreamingIndicator className="ml-0.5" />
       )}

@@ -81,11 +81,10 @@ The chat pane stack:
   chat primitives, June 2026): `AgentChatPane`, `Composer` (with `+`
   popup, `@` mention popup, slash command popup, image paste/drop),
   `ChatTranscript`, `MessageList` (LegendList virtualized transcript),
-  `transcript-slots.ts` (pure turn-grouping/tool-folding slot builder),
-  `AssistantAvatar`, `ReasoningBlock` (collapsible thinking),
-  `ToolCallCard` + per-tool bodies, `ActivityBlock` (one folded run of
-  reasoning + tool calls, working/settled — see "Activity block" below;
-  `activity-steps.ts` holds its pure step/summary/duration derivations),
+  `transcript-slots.ts` (pure turn settlement + compact-work derivation),
+  `ReasoningBlock` (collapsible thinking), `ToolCallCard` + per-tool bodies,
+  `ActivityBlock` (flat newest-work log — see "Turn settlement and compact
+  work log" below), `MarkdownFileLink` (worktree-safe source navigation),
   `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
   receipt line — see "Thread receipt" under the Agent Tasks panel),
   `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
@@ -350,12 +349,13 @@ and lightbox stay visually testable.
     synthesizes `<Version>[ with 1M context] · <blurb>`). Model *selection*
     itself passes the picked id through unchanged; alias ids are resolved to
     the latest concrete model by the Claude CLI/SDK, not by Codemux.
-- **Streaming chat UX**: Streamdown-rendered messages, tool approvals
+- **Streaming chat UX**: final-answer-first Streamdown messages, tool approvals
   (per-tool body rendering), collapsible reasoning blocks (thinking
   deltas reduce into a `reasoning` ChatViewItem that seals on any
   non-thinking boundary and finalizes with a "Thought for Ns"
-  duration), **Activity blocks** (one folded run of reasoning + tool
-  calls — see "Activity block" below), red/green diff cards for edits,
+  duration), a **compact work log** while active and one turn-level
+  **`Worked…` disclosure** when settled (see "Turn settlement and compact work
+  log" below), red/green diff cards for edits,
   TodoWrite task checklists, plan proposals (`ExitPlanMode`),
   AskUserQuestion panels, shimmer streaming marker, debug-mode banner
   + exit dialog.
@@ -1085,6 +1085,11 @@ compartment, so flipping it doesn't reload the file), copy, and a file
 tree that opens as a 196px column inside the pane with a "Search files"
 header wired to the same dialog. That state is held per pane id in the
 deck, so switching tabs and coming back restores it.
+`openRightPanelDoc` is the shared entry point used by the file search, file
+tree, and chat source references. A chat citation can additionally issue a
+transient line/column reveal request; CodeMirror applies it after the requested
+file finishes loading and repeated clicks increment a nonce so the same line is
+re-centered reliably.
 
 ## Agent Tasks panel
 
@@ -1326,9 +1331,12 @@ content width stays `min(760px, paneWidth - 32px)`, with the horizontal
 gutter outside the max-width box.
 
 Layout derivation lives in the pure `buildTranscriptSlots`
-(`transcript-slots.ts`): turn grouping (avatar once per assistant
-turn), Activity-run folding (reasoning + tool calls → one `activity`
-slot — see "Activity block" below), and per-slot identity.
+(`transcript-slots.ts`). It first groups source items by user turn, preserves
+the terminal assistant answer, and replaces foldable work in a completed turn
+with one `turn_fold` slot. An expanded fold restores the original items in
+chronological order. The second level groups contiguous reasoning + routine
+tool calls into compact `activity` slots. Fold expansion is keyed by provider
+turn id above the virtualized rows, so recycling never loses it.
 
 Contract preserved from the pre-redesign renderer:
 
@@ -1514,8 +1522,8 @@ Contract preserved from the pre-redesign renderer:
   cancelling it, and it glides (`scrollToEnd({ animated: true })`) for the
   same reason the send positioning does.
 - **Variable heights.** LegendList measures rows and observes layout changes;
-  Activity blocks can expand in place while retaining the correct scroll
-  position and cached size model.
+  turn folds, compact work details, and prior-work disclosures can expand in
+  place while retaining the correct scroll position and cached size model.
 - **Live-control rows never unmount** (`alwaysRender={{ keys }}`). Windowing
   would otherwise discard transient local interaction state when the reader
   scrolls away. `deriveAlwaysRenderKeys` (`always-render-keys.ts`, pure and
@@ -1527,10 +1535,10 @@ Contract preserved from the pre-redesign renderer:
 - **Streaming marker** (shimmer status) renders as the last row inside
   the list footer so footer-layout following keeps it visible while streaming;
   the jump-to-latest pill calls the same list `scrollToEnd` API. **A working
-  Activity block already shows the single live line, so the marker is
+  compact-work row already shows the single live line, so the marker is
   suppressed when one is the transcript tail** — `MessageList` passes
   the thread `streaming` flag into `buildTranscriptSlots`, and the
-  marker only renders when the tail slot is not a working Activity block
+  marker only renders when the tail slot is not a working compact-work row
   (it still fills the gap right after send, before any step arrives).
   The marker carries a **live elapsed-time suffix** ("Writing… · 40s"):
   `StreamingMarker` derives the active turn's start with
@@ -1632,54 +1640,83 @@ structural wins:
   the UI by the `get_renderer_mode` command, and the transcript edge-fade mask
   disables itself automatically in compatibility (CPU) mode.
 
-### Activity block (Activity Stream)
+### Turn settlement and compact work log
 
-`ActivityBlock.tsx` replaces the old per-tool "Thought / Thought /
-Ran…" spam with **one card per contiguous run of mechanical steps**
-(reasoning items + tool calls). `buildTranscriptSlots` folds a run of
-`reasoning` and groupable `tool_call` items into a single `activity`
-slot; `activity-steps.ts` holds the pure step/summary/counter/duration
-derivations (unit-tested in `activity-steps.test.ts`).
+`transcript-slots.ts` and `ActivityBlock.tsx` implement a two-level timeline.
+The durable reducer state remains an append-ordered account of every message,
+thought, tool, approval, workflow, and subagent update; compactness is a pure
+presentation decision and never deletes transcript data.
 
-- **Working vs settled is derived.** A run is *working* when the thread
-  is `streaming` and the run is the tail run of the active turn;
-  everything else *settles*. Working shows a collapsed row — amber
-  spinner (`status-working`), bold "Working", a shimmering mono live
-  action, a `N done · M running` counter, a rotating chevron. Settled
-  rolls up to a green circled check + a derived summary sentence
-  (`deriveActivitySummary`: read-heavy → "Explored the codebase",
-  command-heavy → "Ran commands", edit-heavy → "Edited files", mixed →
-  sensible; its "Worked through N steps" fallback counts **all**
-  non-reasoning steps including `other`-family tools — Task/agent spawns,
-  MCP tools — so it never claims fewer steps than the header meta) + a
-  mono `N steps · 1m 12s` meta (duration from step
-  `started_at`/`completed_at`, omitted when < 1s / not derivable, e.g.
-  hydrated transcripts) + a Details/Hide toggle. On settle the block
-  re-renders collapsed (any mid-stream expansion resets).
-- **Shared step rows.** Both states expand to the same mono rows: a dim
-  short verb (`read`/`grep`/`edit`/`run`/`think`), a truncating summary
-  (from `describeToolCall` / the thought's first line), and a dim
-  right-aligned meta (`2 hits`, `+9 −1`, `ok`, `running`, `failed`).
-  Working dims completed steps (~0.6) and keeps the running one full
-  opacity; settled shows all green checks. Clicking a step row expands
-  its full detail inline (`ToolCallBody` / `DiffView` for tools, the
-  thought text for reasoning) — there is no side panel for tool output.
-- **What stays standalone (breaks the run).** Approval-gated tool calls
-  (`approval_request_id` set — the inline approval footer must render),
-  TodoWrite / task-summary tools (`TaskSummaryCard` stays a visible
-  receipt row), `permission_request`/plan/AskUserQuestion rows, assistant
-  and user prose. Errored tool calls **do** fold in but stay
-  discoverable: a red ✕ step row, and the settled header appends a
-  subtle red `· N failed` to the meta. A lone reasoning run with no
-  tools keeps rendering as `ReasoningBlock`s (its live streaming text is
-  better served there); a lone settled tool call keeps rendering as a
-  single `ToolCallCard` (GROUP_MIN is 2 for settled runs, relaxed to 1
-  only for a single live working step). `ToolGroupCard` is retired.
-- **Timestamps.** `ToolCallItem` gained optional `started_at` /
-  `completed_at`, stamped by the pure reducer from its injectable
-  `Clock` (backward-compatible optionals so persisted transcripts still
-  parse); these plus `ReasoningItem`'s `started_at`/`duration_ms` feed
-  the settled duration.
+- **Completed turns are final-answer first.** A successful or interrupted
+  `turn_ended` boundary lets the slot builder identify the last non-empty
+  assistant message as the terminal answer. Earlier assistant commentary,
+  reasoning, routine tools, and settled workflow/subagent rows collapse behind
+  one hairline `Worked for …` / `You stopped after …` button inserted at the
+  first hidden item. Expanding it restores those exact source items in order.
+  Failed work is called out as `· N failed` on the fold. Pending approvals,
+  questions, plans, active workflows/subagents, runtime notices, and the
+  terminal error line remain visible and actionable.
+- **Active work is a flat log, not a card stack.** A contiguous reasoning/tool
+  run shows only its newest step by default: one 20px glyph slot, a muted
+  12px verb, an 11px mono summary, optional result meta, and a chevron for its
+  inline detail. Older steps sit behind `+N previous tool calls` (or `log
+  entries` when reasoning is mixed in). There is no tinted outer card, bold
+  status banner, shimmer, step counter, or repeated assistant avatar rail.
+  Only the newest live step receives the shared monochrome `AgentOrb`.
+- **Routine detail stays diagnostic.** Expanding a step still mounts the
+  existing `ToolCallBody` / `DiffView` or reasoning text. Approval-gated tools
+  and TodoWrite receipts remain standalone. A lone tool uses the same compact
+  row, preventing the large-card fallback that previously made short runs look
+  heavier than long ones.
+- **Durations survive hydration.** User dispatch and completion rows carry
+  reducer timestamps. Cursor reads also return each SQLite row's insertion
+  timestamp (new writes preserve milliseconds), so cold and warm replay stamp
+  the same lifecycle boundaries. A queued follow-up resets its start boundary
+  when it is dispatched; queue wait is not agent work. Older rows without
+  timing render the honest fallback `Worked`.
+
+### Source references in chat
+
+`ChatMarkdown` recognizes explicit Markdown destinations, inline-code paths,
+and resolvable fenced-code titles in absolute or worktree-relative form,
+including `:line[:column]` and `#L…` locations. `file-links.ts` rejects web
+schemes, version/package lookalikes, traversal outside the active worktree, and
+unsafe/ambiguous values. A destination that does not resolve — no workspace
+root, or a path outside it — falls back to `ChatMarkdownLink`, so it gets the
+same inert treatment as any other non-web destination: no live `href`, the
+path on hover, nothing that looks clickable.
+
+Inline code is held to a stricter rule than an href: `resolveChatFileLink`
+takes `allowSpaces: false` for that source, so a span whose path portion
+carries unencoded whitespace never becomes a chip. Agents write commands in
+code spans constantly — `cargo check --manifest-path src-tauri/Cargo.toml`,
+`cat src/foo.ts` — and every one of those ends in a file-like token. A plain
+inline-code token is preferable to a confident chip that opens the wrong file.
+Hrefs keep spaces allowed because a legitimate `%20` decodes into one.
+
+Recognized references render through `MarkdownFileLink` with the existing
+language/file icon and resolved-path tooltip. The same component is used by
+Read/Grep/Edit details and diff headers. Clicking calls the shared
+`openRightPanelDoc` action, which creates or focuses the existing `doc:<path>`
+pane; a transient nonce-bearing editor request then focuses and centers the
+cited CodeMirror line/column. The pane id remains path-only, so repeated clicks
+reuse one syntax-highlighted doc pane while still re-running reveal.
+
+Two rules keep that reveal honest:
+
+- **It is consumed once applied.** `EditorPane` calls `clearReveal(tabId,
+  nonce)` right after dispatching the scroll, and the store only drops a
+  request whose nonce still matches (a citation that landed in between
+  survives). The right panel mounts only the *active* pane, so a doc pane
+  remounts on every tab switch and `loadedFilePath` flips back to the current
+  file each time — an unconsumed request would replay, resetting the cursor,
+  re-centring the scroll you had moved, and stealing focus.
+- **A line always lands in source.** Markdown doc panes open rendered, where
+  the CodeMirror container is hidden, so `DocPane` asks the deck to flip its
+  `raw` flag when a line-bearing request arrives (keeping the pane bar's
+  rendered/source toggle in sync with what the pane shows), and `EditorPane`
+  holds the reveal until raw is actually on. A pane that owns its own view
+  mode flips itself.
 
 `ChatTranscript` is a thin shell that derives `showThinking`, forwards
 the optional `sessionStartedAt` (top session-start divider), and sizes
@@ -3329,13 +3366,13 @@ and red stays reserved for state a human must act on. Only two sizes ship
 **One orb per live thing.** An orb never sits next to text that is not
 currently moving:
 
-- **The turn in flight** — the Activity block's working header
-  (`ActivityBlock.tsx`) owns the thread while a tool runs; the
+- **The turn in flight** — the compact newest-step row
+  (`ActivityBlock.tsx`) owns the thread while a routine tool runs; the
   transcript-tail `StreamingMarker` fills the dead time either side. These
   are mutually exclusive by construction, because
   `shouldShowThinkingIndicator` stands the tail marker down whenever the
   last item is a running tool call, so the thread shows exactly one orb.
-  Individual tool-call rows and step glyphs stay still.
+  Previous work rows and settled step glyphs stay still.
 - **Subagent activity** — the merged `SubagentWorkLogRow` carries one neutral
   orb for the whole uninterrupted stretch; the right-panel live cards,
   `SubagentActivityBar` expand list, `SubagentView` live tail, and the

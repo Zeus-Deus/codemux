@@ -1,4 +1,9 @@
-import { ArrowDown, TriangleAlert } from "lucide-react";
+import {
+  ArrowDown,
+  ChevronDown,
+  ChevronRight,
+  TriangleAlert,
+} from "lucide-react";
 import {
   LegendList,
   type AnchoredEndSpaceConfig,
@@ -33,7 +38,6 @@ import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { ActivityBlock } from "./ActivityBlock";
-import { AssistantAvatar } from "./AssistantAvatar";
 import { AssistantMessage } from "./AssistantMessage";
 import { BackgroundBrowserChip } from "./BackgroundBrowserChip";
 import { MessageTrail } from "./MessageTrail";
@@ -47,6 +51,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
+import { ChatFileLinkContext } from "./chat-file-link-context";
 import {
   deriveAlwaysRenderKeys,
   lookupApproval,
@@ -147,6 +152,8 @@ interface Props {
    *  (legacy / non-workspace-scoped callers keep byte-identical
    *  output) rather than throwing. */
   workspaceId?: string | null;
+  /** Active worktree root used to resolve relative source references. */
+  cwd?: string | null;
 }
 
 /**
@@ -180,6 +187,7 @@ export const MessageList = memo(function MessageList({
   onCancelQueued,
   onSendQueuedNow,
   workspaceId,
+  cwd,
 }: Props) {
   // GUI-mode background browser session for this pane's workspace (see
   // docs/features/browser.md "Background browser in GUI mode"). Gated on
@@ -195,6 +203,10 @@ export const MessageList = memo(function MessageList({
     !!workspaceId &&
     enableAgentChat &&
     !!backgroundBrowserSession;
+  const fileLinkContext = useMemo(
+    () => ({ workspaceId, cwd }),
+    [cwd, workspaceId],
+  );
 
   // Viewport edge fade. Read through an external store rather than called
   // inline: the decision depends on the renderer mode, which the backend
@@ -214,6 +226,23 @@ export const MessageList = memo(function MessageList({
     copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
     return copy;
   }, [messages]);
+
+  // Turn-fold expansion lives above the virtualized rows so recycling or
+  // measurement churn never loses the user's disclosure choice.
+  const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    setExpandedTurnIds(new Set());
+  }, [threadKey]);
+  const toggleTurnFold = useCallback((turnId: string) => {
+    setExpandedTurnIds((current) => {
+      const next = new Set(current);
+      if (next.has(turnId)) next.delete(turnId);
+      else next.add(turnId);
+      return next;
+    });
+  }, []);
 
   // Subagent-id → display name, for the "from subagent X" label on a
   // bubbled approval request (locked decision 4).
@@ -250,11 +279,11 @@ export const MessageList = memo(function MessageList({
   const slots = useMemo(() => {
     const next = reuseTranscriptSlots(
       prevSlotsRef.current,
-      buildTranscriptSlots(ordered, streaming),
+      buildTranscriptSlots(ordered, streaming, expandedTurnIds),
     );
     prevSlotsRef.current = next;
     return next;
-  }, [ordered, streaming]);
+  }, [expandedTurnIds, ordered, streaming]);
 
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
@@ -979,7 +1008,6 @@ export const MessageList = memo(function MessageList({
       <div className={CHAT_COLUMN}>
         <SlotRowMemo
           slot={slot}
-          provider={provider}
           approval={
             slot.body.kind === "item"
               ? lookupApproval(slot.body.item, requestsById)
@@ -991,11 +1019,13 @@ export const MessageList = memo(function MessageList({
               : null
           }
           workspaceId={workspaceId}
+          cwd={cwd}
           onRespondToRequest={onRespondToRequest}
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
+          onToggleTurnFold={toggleTurnFold}
         />
       </div>
     ),
@@ -1005,10 +1035,11 @@ export const MessageList = memo(function MessageList({
       onRejectPlan,
       onRespondToRequest,
       onSendQueuedNow,
-      provider,
       requestsById,
       subagentNames,
+      toggleTurnFold,
       workspaceId,
+      cwd,
     ],
   );
 
@@ -1075,7 +1106,11 @@ export const MessageList = memo(function MessageList({
   );
 
   return (
-    <div className="group/transcript-list relative size-full min-h-0 overflow-hidden">
+    <ChatFileLinkContext.Provider value={fileLinkContext}>
+      <div
+        className="group/transcript-list relative size-full min-h-0 overflow-hidden"
+        data-provider={provider ?? undefined}
+      >
       <MessageTrail
         slots={slots}
         listRef={listRef}
@@ -1139,7 +1174,8 @@ export const MessageList = memo(function MessageList({
           <ArrowDown className="h-3.5 w-3.5" aria-hidden />
         </Button>
       )}
-    </div>
+      </div>
+    </ChatFileLinkContext.Provider>
   );
 });
 
@@ -1325,6 +1361,7 @@ function transcriptSlotsAreEqual(
 /** Stable row type lets LegendList keep separate measured-size averages. */
 function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
+  if (slot.body.kind === "turn_fold") return "turn_fold";
   if (slot.body.kind === "subagent_stretch") return "subagent_stretch";
   return slot.body.item.kind;
 }
@@ -1333,31 +1370,8 @@ function transcriptSlotType(slot: TranscriptSlot): string {
 // Rows
 // ---------------------------------------------------------------------------
 
-/** Assistant-side rows share a 29px avatar gutter (drawn once per turn) so
- *  their content aligns under the first row. */
-function AssistantGutter({
-  showAvatar,
-  provider,
-  children,
-}: {
-  showAvatar: boolean;
-  provider?: AgentChatProviderKind | null;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex gap-[13px]">
-      <div className="w-[29px] shrink-0">
-        {showAvatar ? <AssistantAvatar provider={provider} /> : null}
-      </div>
-      <div className="min-w-0 flex-1">{children}</div>
-    </div>
-  );
-}
-
 function ItemRow({
   item,
-  showAvatar,
-  provider,
   approval,
   subagentName,
   onRespondToRequest,
@@ -1366,10 +1380,9 @@ function ItemRow({
   onCancelQueued,
   onSendQueuedNow,
   workspaceId,
+  cwd,
 }: {
   item: ChatViewItem;
-  showAvatar: boolean;
-  provider?: AgentChatProviderKind | null;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
@@ -1378,6 +1391,7 @@ function ItemRow({
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
   workspaceId?: string | null;
+  cwd?: string | null;
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -1429,18 +1443,15 @@ function ItemRow({
     );
   }
 
-  return (
-    <AssistantGutter showAvatar={showAvatar} provider={provider}>
-      {renderAssistantBody(item, {
-        approval,
-        subagentName,
-        workspaceId,
-        handleDecide,
-        handleAcceptPlan,
-        handleRejectPlan,
-      })}
-    </AssistantGutter>
-  );
+  return renderAssistantBody(item, {
+    approval,
+    subagentName,
+    workspaceId,
+    cwd,
+    handleDecide,
+    handleAcceptPlan,
+    handleRejectPlan,
+  });
 }
 
 function renderAssistantBody(
@@ -1449,6 +1460,7 @@ function renderAssistantBody(
     approval: PermissionRequestItem | null;
     subagentName: string | null;
     workspaceId?: string | null;
+    cwd?: string | null;
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -1456,7 +1468,13 @@ function renderAssistantBody(
 ) {
   switch (item.kind) {
     case "assistant_message":
-      return <AssistantMessage item={item} />;
+      return (
+        <AssistantMessage
+          item={item}
+          workspaceId={handlers.workspaceId}
+          cwd={handlers.cwd}
+        />
+      );
     case "reasoning":
       return <ReasoningBlock item={item} />;
     case "tool_call":
@@ -1548,25 +1566,51 @@ function renderAssistantBody(
 function ActivityRow({
   items,
   working,
-  showAvatar,
-  provider,
 }: {
   items: ActivityStep[];
   working: boolean;
-  showAvatar: boolean;
-  provider?: AgentChatProviderKind | null;
 }) {
+  return <ActivityBlock items={items} working={working} />;
+}
+
+function TurnFoldRow({
+  turnId,
+  label,
+  expanded,
+  failedCount,
+  onToggleTurnFold,
+}: {
+  turnId: string;
+  label: string;
+  expanded: boolean;
+  failedCount: number;
+  onToggleTurnFold: (turnId: string) => void;
+}) {
+  const Icon = expanded ? ChevronDown : ChevronRight;
   return (
-    <AssistantGutter showAvatar={showAvatar} provider={provider}>
-      <ActivityBlock items={items} working={working} />
-    </AssistantGutter>
+    <div className="border-b border-border/60 pb-2 pt-1">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => onToggleTurnFold(turnId)}
+        className="flex items-center gap-1 rounded-md px-1 text-xs tabular-nums text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+      >
+        <span>{label}</span>
+        {failedCount > 0 ? (
+          <span className="text-status-attention">
+            · {failedCount} failed
+          </span>
+        ) : null}
+        <Icon className="size-3.5" aria-hidden />
+      </button>
+    </div>
   );
 }
 
 // Two-level memoization (issue #129). Level 1 is `SlotRowMemo`, the whole-row
 // wrapper below owns the activity/item branch. `reuseTranscriptSlots` keeps an untouched slot's object
 // identity across store rebuilds, so with the reducer's stable `item` /
-// `approval` references and a per-session-stable `provider` the wrapper's props
+// `approval` references the wrapper's props
 // stay shallow-equal and its default `memo` comparison skips the row entirely —
 // including the virtualized row re-render. Level 2 is these leaves
 // (`ItemRowMemo` / `ActivityRowMemo`), which independently skip when their own
@@ -1586,38 +1630,58 @@ const SubagentWorkLogRowMemo = memo(SubagentWorkLogRow);
  */
 function SlotRow({
   slot,
-  provider,
   approval,
   subagentName,
   workspaceId,
+  cwd,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  onToggleTurnFold,
 }: {
   slot: TranscriptSlot;
-  provider?: AgentChatProviderKind | null;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   workspaceId?: string | null;
+  cwd?: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  onToggleTurnFold: (turnId: string) => void;
 }) {
+  const marginClass =
+    slot.body.kind === "activity"
+      ? "mt-2"
+      : slot.body.kind === "turn_fold"
+        ? "mt-4"
+        : slot.body.kind === "subagent_stretch"
+          ? "mt-2"
+          : slot.body.item.kind === "user_message"
+            ? "mt-5"
+            : slot.turnStart
+              ? "mt-4"
+              : "mt-2.5";
   return (
     <div
       data-message-id={slot.messageId}
-      className={cn(slot.turnStart ? "mt-5" : "mt-[13px]")}
+      className={marginClass}
     >
       {slot.body.kind === "activity" ? (
         <ActivityRowMemo
           items={slot.body.items}
           working={slot.body.working}
-          showAvatar={slot.showAvatar}
-          provider={provider}
+        />
+      ) : slot.body.kind === "turn_fold" ? (
+        <TurnFoldRow
+          turnId={slot.body.turnId}
+          label={slot.body.label}
+          expanded={slot.body.expanded}
+          failedCount={slot.body.failedCount}
+          onToggleTurnFold={onToggleTurnFold}
         />
       ) : slot.body.kind === "subagent_stretch" ? (
         <SubagentWorkLogRowMemo
@@ -1627,8 +1691,6 @@ function SlotRow({
       ) : (
         <ItemRowMemo
           item={slot.body.item}
-          showAvatar={slot.showAvatar}
-          provider={provider}
           approval={approval}
           subagentName={subagentName}
           onRespondToRequest={onRespondToRequest}
@@ -1637,6 +1699,7 @@ function SlotRow({
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
           workspaceId={workspaceId}
+          cwd={cwd}
         />
       )}
     </div>

@@ -330,6 +330,7 @@ function appendTextDelta(
     turn_id: turnId,
     text,
     streaming: true,
+    created_at: now(),
   };
   return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
 }
@@ -393,6 +394,7 @@ function applyCompletedItemToList(
         turn_id: turnId,
         text: item.text,
         streaming: false,
+        created_at: now(),
       };
       return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
     }
@@ -434,6 +436,7 @@ function applyCompletedItemToList(
       if (found) {
         const next: ToolCallItem = {
           ...found.item,
+          turn_id: turnId,
           tool_name: item.tool_name,
           input: item.input,
           // Result-first ordering already stamped `completed_at`; only
@@ -456,6 +459,7 @@ function applyCompletedItemToList(
         kind: "tool_call",
         id: nextId("tool"),
         seq,
+        turn_id: turnId,
         tool_use_id: item.tool_use_id,
         tool_name: item.tool_name,
         input: item.input,
@@ -495,6 +499,7 @@ function applyCompletedItemToList(
         kind: "tool_call",
         id: nextId("tool"),
         seq,
+        turn_id: turnId,
         tool_use_id: item.tool_use_id,
         tool_name: "(pending)",
         input: null,
@@ -843,7 +848,13 @@ function applyWorkflowUpdated(
   }
   const { seq, next: seqBumped } = takeSeq(sealed);
   const item = newWorkflowRunItem(nextId("workflow"), seq, now(), snap);
-  return { ...seqBumped, messages: [...seqBumped.messages, item] };
+  return {
+    ...seqBumped,
+    messages: [
+      ...seqBumped.messages,
+      { ...item, turn_id: trailingTurnId(seqBumped.messages) },
+    ],
+  };
 }
 
 /** Route a `subagent_id`-tagged content/item event into its subagent's
@@ -986,6 +997,7 @@ function appendUserMessageLocal(
     id: nextId("user"),
     seq,
     text,
+    created_at: now(),
     ...(clientNonce ? { clientNonce } : {}),
     // Only stamp `images` when there actually are some, so a text-only
     // turn's item stays byte-identical to the pre-images shape (keeps
@@ -1355,9 +1367,10 @@ function applyEventInner(
         };
         messages = replaceItem(messages, existing.index, sealed);
       }
-      // On error status, surface a single turn_ended item so the user
-      // sees the failure in-flow. Success/max_turns/max_budget are
-      // silent — the absent streaming + completed content is enough.
+      // Retain one invisible lifecycle boundary for EVERY completion. The
+      // timeline uses it to settle the whole turn and derive an honest
+      // "Worked for …" duration; successful markers remain visually silent.
+      // Error markers still render their existing in-flow failure line.
       if (event.status.kind === "error") {
         // A workflow still running/pending-approval when its turn dies
         // has no other terminal signal coming (the sidecar tears the
@@ -1383,6 +1396,7 @@ function applyEventInner(
               seq,
               turn_id: event.turn_id,
               status: event.status,
+              completed_at: now(),
             },
           ],
         };
@@ -1394,7 +1408,23 @@ function applyEventInner(
       // only synthesizes while `active_turn` is still set, which the result
       // message clears), so clearing here — live AND on hydrate replay — keeps
       // a genuinely-finished run from being mislabelled "Run interrupted".
-      return { ...state, streaming: false, interrupted: false, messages };
+      const { seq, next: seqBumped } = takeSeq({ ...state, messages });
+      return {
+        ...seqBumped,
+        streaming: false,
+        interrupted: false,
+        messages: [
+          ...seqBumped.messages,
+          {
+            kind: "turn_ended",
+            id: nextId("turn-end"),
+            seq,
+            turn_id: event.turn_id,
+            status: event.status,
+            completed_at: now(),
+          },
+        ],
+      };
     }
 
     case "request_opened": {
@@ -1632,6 +1662,7 @@ function applyEventInner(
         id: nextId("queued"),
         seq: QUEUED_SEQ_BASE + seq,
         text: event.text,
+        created_at: now(),
         queued: { queuedId: event.queued_id },
         ...(nonce != null ? { clientNonce: nonce } : {}),
       };
@@ -1648,7 +1679,13 @@ function applyEventInner(
       const existing = state.messages[idx] as UserMessageItem;
       const { seq, next } = takeSeq(state);
       const { queued: _dropped, ...rest } = existing;
-      const promoted: UserMessageItem = { ...rest, seq };
+      const promoted: UserMessageItem = {
+        ...rest,
+        seq,
+        // Queue wait is not agent work. Start the visible duration at the
+        // moment the follow-up actually becomes the active provider turn.
+        created_at: now(),
+      };
       // A dispatched follow-up means a live turn is starting — clear any
       // interrupted flag so the Continue chip / divider drop.
       return {

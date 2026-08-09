@@ -7,6 +7,7 @@ import {
   type LazyToolResultStub,
 } from "@/lib/agent-chat/lazy-tool-result";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
+import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
 import {
   extractToolResultImages,
   isRenderableImageBlock,
@@ -17,6 +18,8 @@ import { agentChatGetToolResult } from "@/tauri/commands";
 import { DiffView } from "./DiffView";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolResultImages } from "./ToolResultImages";
+import { MarkdownFileLink } from "./MarkdownFileLink";
+import { useChatFileLinkContext } from "./chat-file-link-context";
 
 const BASH_TAIL_LINES = 10;
 const READ_PREVIEW_LINES = 5;
@@ -147,7 +150,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
     <div className="space-y-2">
       {path && (
         <div className="select-text font-mono text-[12px] text-foreground">
-          {path}
+          <ToolSourcePath path={path} line={offset ?? undefined} />
           {(offset != null || limit != null) && (
             <span className="ml-2 text-muted-foreground/70">
               {rangeLabel(offset, limit)}
@@ -185,7 +188,9 @@ export function GrepToolBody({ item, input }: BodyProps) {
         <div className="select-text font-mono text-[12px] text-foreground">
           {pattern && <span>{pattern}</span>}
           {path && (
-            <span className="ml-2 text-muted-foreground/70">in {path}</span>
+            <span className="ml-2 text-muted-foreground/70">
+              in <ToolSourcePath path={path} />
+            </span>
           )}
         </div>
       )}
@@ -200,7 +205,9 @@ export function GrepToolBody({ item, input }: BodyProps) {
                 key={i}
                 className="font-mono text-[12px] leading-5 text-foreground break-words"
               >
-                <span className="text-muted-foreground/70">{m.location}</span>
+                <span className="text-muted-foreground/70">
+                  <ToolSourcePath path={m.location} />
+                </span>
                 {m.text && <span className="ml-2">{m.text}</span>}
               </li>
             ))}
@@ -295,7 +302,9 @@ export function EditToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-1">
       {path && (
-        <div className="select-text font-mono text-[12px] text-foreground">{path}</div>
+        <div className="select-text font-mono text-[12px] text-foreground">
+          <ToolSourcePath path={path} />
+        </div>
       )}
       {result && <ToolCallBlock content={result} />}
     </div>
@@ -422,6 +431,19 @@ function GenericToolBody({ item }: { item: ToolCallItem }) {
     return <ToolCallBlock content={null} text={safeStringify(item.input)} />;
   }
   return null;
+}
+
+function ToolSourcePath({ path, line }: { path: string; line?: number }) {
+  const { cwd } = useChatFileLinkContext();
+  const candidate = line != null ? `${path}:${line}` : path;
+  const meta = resolveChatFileLink(candidate, cwd);
+  if (!meta) return <>{path}</>;
+  return (
+    <MarkdownFileLink meta={meta}>
+      {meta.basename}
+      {meta.line ? ` · L${meta.line}` : ""}
+    </MarkdownFileLink>
+  );
 }
 
 // ---------------------------------------------------------------------------

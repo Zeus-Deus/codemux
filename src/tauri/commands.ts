@@ -1662,6 +1662,8 @@ export const agentChatListMessages = (threadId: string) =>
 export interface AgentChatMessageRow {
   id: number;
   payload: string;
+  /** SQLite insertion time, used to rebuild stable turn durations. */
+  created_at_ms?: number;
 }
 
 /**

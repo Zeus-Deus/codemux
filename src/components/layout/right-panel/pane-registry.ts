@@ -118,6 +118,11 @@ export function docPaneId(filePath: string): RightPanelTab {
   return `${DOC_PREFIX}${filePath}`;
 }
 
+/** Stable editor-store key for a file shown in a workspace's deck. */
+export function docEditorTabId(workspaceId: string, filePath: string): string {
+  return `right-panel:${workspaceId}:${filePath}`;
+}
+
 /** The file path behind a `doc:` pane, or null for a core pane. */
 export function docPanePath(id: RightPanelTab): string | null {
   return id.startsWith(DOC_PREFIX) ? id.slice(DOC_PREFIX.length) : null;

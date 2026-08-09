@@ -73,6 +73,7 @@ import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useEditorStore } from "@/stores/editor-store";
+import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { useDiffStore } from "@/stores/diff-store";
 import {
   selectShowHiddenFiles,
@@ -102,7 +103,7 @@ import {
   BrowserPaneActions,
   RightPanelBrowserPane,
 } from "./right-panel/browser-pane";
-import { DocPane, docEditorTabId } from "./right-panel/doc-pane";
+import { DocPane } from "./right-panel/doc-pane";
 import { PaneActionButton } from "./right-panel/pane-actions";
 import { PanePicker } from "./right-panel/pane-picker";
 import { PaneStatusFoot } from "./right-panel/pane-status-foot";
@@ -111,7 +112,7 @@ import {
   CONDITIONAL_PANES,
   PANE_REGISTRY,
   baseName,
-  docPaneId,
+  docEditorTabId,
   docPanePath,
   isCorePane,
   paneMeta,
@@ -419,6 +420,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
       })),
     [],
   );
+  const showActiveDocSource = useCallback(() => {
+    if (activePane) patchDocView(activePane, { raw: true });
+  }, [activePane, patchDocView]);
 
   // ── Deck actions ──
   // The file the tree draws as selected. The tree lost its size column and
@@ -428,15 +432,10 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
 
   const openDocPane = useCallback(
     (filePath: string) => {
-      // Seed the editor store before the pane mounts so the body never
-      // flashes the editor's "open a file" empty state.
-      useEditorStore.getState().initTab(docEditorTabId(workspaceId, filePath), {
-        filePath,
-      });
+      openRightPanelDoc(workspaceId, filePath);
       setSelectedDocPath(filePath);
-      setRightPanelTab(workspaceId, docPaneId(filePath));
     },
-    [workspaceId, setRightPanelTab],
+    [workspaceId],
   );
 
   const diffTabId = `right-panel:${workspaceId}:diff`;
@@ -826,6 +825,7 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
             treeOpen={docView.tree}
             onOpenFile={openDocPane}
             onSearchFiles={handleOpenFile}
+            onRequestRawView={showActiveDocSource}
             treeRefreshKey={treeRefreshKey}
           />
         ) : activePane === "files" ? (
