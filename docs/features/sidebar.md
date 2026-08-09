@@ -684,9 +684,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   claim from "Done · review", and it must survive the hover swap. The focused
   workspace is never unread whatever the stamps say. A **"Mark unread"** context
   entry adds a session-only override (there is no read flag to flip), offered
-  only on cards that don't already read as unread; a real visit — which moves
-  `last_visited_at` — is what clears it, so the override can't outlive the truth
-  it overrides.
+  only on cards that don't already read as unread. When opening the workspace
+  had acknowledged and cleared a `review` status, this inverse gesture also
+  restores **Done · review** alongside the unread dot; any later working,
+  permission, monitoring, or fresh review status supersedes that remembered
+  completion. A real visit — which moves `last_visited_at` — clears the manual
+  override, so it can't outlive the truth it overrides.
 - **Multi-select and bulk parking**: Cmd/Ctrl-click toggles a row into the
   selection; Shift-click selects the range **over rendered rows only**
   (`selectRange` walks the visible id list — active cards in rendered order,
