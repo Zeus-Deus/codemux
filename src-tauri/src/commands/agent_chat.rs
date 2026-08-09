@@ -1448,24 +1448,25 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         client_nonce: input.client_nonce.clone(),
     };
     // A genuine new user turn is the authoritative, provider-agnostic
-    // anchor for resetting subagent tracking. Clear the thread's tracker
-    // entry here so a subagent left non-terminal by the previous turn
+    // anchor for resetting turn-scoped subagent tracking. Start a new
+    // tracker turn here so a subagent left non-terminal by the previous turn
     // (e.g. Claude's background `async_launched` task that never emits a
     // terminal `task_notification`) cannot pin `review_pending`/`running`
     // and suppress `Review` for this turn and every one after (Finding 1).
-    // A genuinely-still-alive background subagent re-inserts itself via its
-    // next `Running` snapshot (Claude re-emits these through `task_progress`
-    // ticks). Unlike `SessionStateChanged::Running`, which Claude does not
-    // fire per user turn, this fires on every turn for all three providers.
+    // Confirmed monitor-class tasks are deliberately carried forward: a
+    // follow-up turn temporarily owns the Working dot, but the still-live
+    // watch loop must reappear as Monitoring when that turn settles even if
+    // the provider emits no fresh progress tick. Unlike
+    // `SessionStateChanged::Running`, which Claude does not fire per user
+    // turn, this path runs on every turn for all three providers.
     //
     // Follow-up queueing note: for a send that gets QUEUED behind an
-    // active turn this clear runs at enqueue time (not at dispatch) —
-    // live subagents of the in-flight turn re-insert on their next
-    // Running snapshot, and the stale non-terminal entries this exists
-    // to purge are gone by the time the queued turn dispatches.
+    // active turn this reset runs at enqueue time (not at dispatch). Stale
+    // agent entries are gone by the time the queued turn dispatches, while a
+    // confirmed monitor remains truthful across the queue boundary.
     {
         let tracker: State<'_, SubagentTracker> = app.state();
-        tracker.clear_thread(&thread_id_for_persist);
+        tracker.begin_turn(&thread_id_for_persist);
     }
     let result = impl_
         .send_turn(provider_input)
@@ -3598,7 +3599,7 @@ struct ThreadSubagentState {
     ///
     /// Cleared by every genuine turn boundary (a new
     /// `SessionStatus::Running`, session teardown, or the send-message
-    /// `clear_thread`), so it never outlives the run it describes.
+    /// `begin_turn`), so it never outlives the run it describes.
     forced_settled: bool,
     /// Monitor ids the user explicitly stopped this run.
     ///
@@ -3610,8 +3611,9 @@ struct ThreadSubagentState {
     /// next turn boundary is what makes the button mean something.
     ///
     /// Bounded by the run, exactly like [`Self::forced_settled`]: cleared
-    /// by [`Self::reset`] on a new turn / session close, and by
-    /// `clear_thread` on send. It does keep the entry alive until then,
+    /// by [`Self::begin_turn`] on a new turn, by [`Self::reset`] on session
+    /// close, and by the tracker-level `begin_turn` on send. It does keep the
+    /// entry alive until then,
     /// which is the price of the guarantee.
     stopped_monitors: std::collections::BTreeSet<String>,
 }
@@ -3708,7 +3710,23 @@ impl ThreadSubagentState {
         self.tasks.remove(id);
     }
 
-    /// Forget everything (new turn, session close).
+    /// Start a new parent turn without forgetting confirmed live monitors.
+    ///
+    /// Ordinary agent entries are turn-scoped: carrying a missed terminal
+    /// snapshot forward would suppress Review forever. A monitor is different:
+    /// it is explicitly allowed to outlive the parent turn, and providers do
+    /// not guarantee another progress snapshot merely because the user sent a
+    /// follow-up. Retaining only monitor-class entries keeps the badge truthful
+    /// without reviving the stale-agent bug this reset originally fixed.
+    fn begin_turn(&mut self) {
+        self.tasks.retain(|_, class| *class == TaskClass::Monitor);
+        self.turn_settled = false;
+        self.forced_settled = false;
+        self.review_owed_since = None;
+        self.stopped_monitors.clear();
+    }
+
+    /// Forget everything (session close / error or explicit pane teardown).
     fn reset(&mut self) {
         self.tasks.clear();
         self.turn_settled = false;
@@ -3901,6 +3919,22 @@ impl SubagentTracker {
         threads.remove(thread_id);
     }
 
+    /// Begin a new parent turn, dropping stale agent work while preserving
+    /// confirmed live monitors. Unlike [`Self::clear_thread`], this is a turn
+    /// boundary rather than a session/pane teardown.
+    pub fn begin_turn(&self, thread_id: &str) {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        let should_remove = if let Some(state) = threads.get_mut(thread_id) {
+            state.begin_turn();
+            state.is_clear()
+        } else {
+            false
+        };
+        if should_remove {
+            threads.remove(thread_id);
+        }
+    }
+
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane
     /// should settle to, backing `agent_chat_stop_monitoring`.
     ///
@@ -4054,15 +4088,16 @@ impl SubagentTracker {
 /// A background bash watch loop is *both* things at once, which is the
 /// point: it settles the run (background) and shows the calm badge
 /// (monitor). There is no TTL — monitoring ends only via a terminal task
-/// row, a new turn, session close, or the explicit stop paths.
+/// row, session close, or the explicit stop paths.
 ///
-/// A genuine **new user turn** resets the thread's tracker wholesale. The
-/// authoritative, provider-agnostic anchor is the send-message command path
-/// ([`agent_chat_send_turn`] calls [`SubagentTracker::clear_thread`]);
-/// `SessionStateChanged::Running` also resets here (reliably per-turn for
-/// Codex/OpenCode). The settled state is therefore cleared only by: a
-/// new-turn reset, session `Closed`/`Error`, or `agent_chat_close_pane` —
-/// never by a stray streaming delta.
+/// A genuine **new user turn** resets turn-scoped tracker state while
+/// retaining confirmed monitor entries. The authoritative, provider-agnostic
+/// anchor is the send-message command path ([`agent_chat_send_turn`] calls
+/// [`SubagentTracker::begin_turn`]); `SessionStateChanged::Running` applies the
+/// same rule here (reliably per-turn for Codex/OpenCode). The settled flag is
+/// cleared at the boundary, so the parent owns `Working` during the follow-up;
+/// its `TurnCompleted` reveals any retained monitor again. Session
+/// `Closed`/`Error` and `agent_chat_close_pane` still perform a full clear.
 ///
 /// Everything else leaves the indicator alone. In particular
 /// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
@@ -4080,7 +4115,7 @@ fn map_event_to_pane_status(
         // result item) while subagents keep running; clearing `turn_settled`
         // here would silently drop the owed `Review` and strand the pane at
         // `Working`. A genuine new turn is what resets it — via the
-        // send-message command clear (authoritative, provider-agnostic) or a
+        // send-message command boundary (authoritative, provider-agnostic) or a
         // `SessionStateChanged::Running` snapshot — never a stray delta.
         ProviderRuntimeEvent::ContentDelta { .. }
         | ProviderRuntimeEvent::ItemCompleted { .. }
@@ -4144,23 +4179,17 @@ fn map_event_to_pane_status(
         }
         ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
             SessionStatus::Running { .. } => {
-                // A fresh turn started: reset the whole tracker. Every part of
-                // the previous turn's state is stale — a leftover id would
-                // otherwise hold `Working` and suppress `Review` for every
-                // future turn until session close (Finding 1). A
-                // genuinely-alive background subagent re-inserts itself on its
-                // next `Running` snapshot (Claude re-emits these via
-                // `task_progress` ticks), so clearing here is safe. Reliable
-                // per-turn for Codex (`turn/started`) and OpenCode
-                // (`session.status = busy`); Claude's authoritative reset is
-                // the send-message command clear (see `agent_chat_send_turn`).
-                //
-                // Monitors and the stop-blocklist go with the rest: a
-                // genuinely-alive watch loop re-inserts itself, and a new turn
-                // is the user's own signal that the previous turn's background
-                // bookkeeping is no longer what this pane is about. The
-                // forced-settle tombstone is superseded for the same reason.
-                state.reset();
+                // A fresh turn started: drop stale agent work, the owed-review
+                // clock, forced-settle state, and the prior run's Stop
+                // blocklist. A confirmed monitor is intentionally retained:
+                // it can outlive the parent turn, and a provider may not emit
+                // another progress snapshot just because the user followed up.
+                // The parent owns Working during this turn; once it settles,
+                // the retained monitor makes the pane return to Monitoring.
+                // This generic event path covers Codex (`turn/started`) and
+                // OpenCode (`session.status = busy`); Claude's authoritative
+                // boundary is the send command above.
+                state.begin_turn();
                 Some(PaneStatus::Working)
             }
             SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
@@ -6606,32 +6635,36 @@ mod tests {
     }
 
     #[test]
-    fn a_new_turn_and_a_session_close_both_clear_monitors() {
-        for (label, event, expected) in [
-            (
-                "new turn",
-                ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: tid(),
-                    status: SessionStatus::Running { active_turn: turn() },
-                },
-                PaneStatus::Working,
-            ),
-            (
-                "session close",
-                ProviderRuntimeEvent::SessionStateChanged {
+    fn a_new_turn_preserves_monitors_but_session_close_clears_them() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+
+        assert_eq!(
+            map_event_to_pane_status(&session_running(), &mut st),
+            Some(PaneStatus::Working),
+            "the follow-up turn temporarily owns the dot"
+        );
+        assert_eq!(st.tasks.get("m1"), Some(&TaskClass::Monitor));
+        assert!(!st.turn_settled);
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Monitoring),
+            "the still-live monitor must reappear without a fresh provider tick"
+        );
+
+        assert_eq!(
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: tid(),
                     status: SessionStatus::Closed,
                 },
-                PaneStatus::Idle,
+                &mut st,
             ),
-        ] {
-            let mut st = ThreadSubagentState::default();
-            map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
-            map_event_to_pane_status(&turn_completed(), &mut st);
-            assert_eq!(map_event_to_pane_status(&event, &mut st), Some(expected), "{label}");
-            assert!(st.tasks.is_empty(), "{label} must drop the watch loops");
-            assert!(st.is_clear(), "{label}");
-        }
+            Some(PaneStatus::Idle)
+        );
+        assert!(st.tasks.is_empty(), "session close must drop watch loops");
+        assert!(st.is_clear());
     }
 
     // Finding 7: a `Running` snapshot with an empty subagent_id is
@@ -7405,25 +7438,55 @@ mod tests {
     }
 
     // Same regression via the authoritative anchor: the send-message
-    // command path clears the tracker entry. Model it with
-    // `SubagentTracker::clear_thread` between the two turns.
+    // command starts a fresh tracker turn. Stale agent work is discarded.
     #[test]
-    fn send_command_clear_resets_tracking_across_turns() {
+    fn send_command_turn_boundary_resets_agent_tracking_across_turns() {
         let tracker = SubagentTracker::default();
         // Turn 1: subagent outlives the turn, Review deferred.
-        tracker.decide("t", &subagent_event("bg", SubagentStatus::Running), SystemTime::now());
+        tracker.decide(
+            "t",
+            &subagent_event("bg", SubagentStatus::Running),
+            SystemTime::now(),
+        );
         assert_eq!(
             tracker.decide("t", &turn_completed(), SystemTime::now()),
             Some(PaneStatus::Working)
         );
 
-        // agent_chat_send_turn clears the thread's tracker before turn 2.
-        tracker.clear_thread("t");
+        // agent_chat_send_turn starts a new tracker turn before turn 2.
+        tracker.begin_turn("t");
 
         // Turn 2 completes clean → Review, not a stuck Working.
         assert_eq!(
             tracker.decide("t", &turn_completed(), SystemTime::now()),
             Some(PaneStatus::Review)
+        );
+    }
+
+    // Production regression: Claude's `TaskOutput` can prove the original
+    // monitor is still running without emitting another `task_progress`
+    // snapshot. The command-path turn boundary therefore has to retain the
+    // known monitor by itself; waiting for a provider tick loses the badge.
+    // The tracker is provider-neutral, so this also covers any future Codex or
+    // OpenCode adapter that classifies a `SubagentSnapshot` as a monitor.
+    #[test]
+    fn send_command_turn_boundary_preserves_monitor_without_a_new_snapshot() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &monitor_event("watch", SubagentStatus::Running), now);
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), now),
+            Some(PaneStatus::Monitoring)
+        );
+
+        // User sends a follow-up. No SubagentUpdated event arrives for the
+        // still-running watch task during this turn.
+        tracker.begin_turn("t");
+        assert_eq!(tracker.tracked_thread_count(), 1);
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), now),
+            Some(PaneStatus::Monitoring),
+            "the monitor reappears when the follow-up settles"
         );
     }
 

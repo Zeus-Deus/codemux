@@ -3355,11 +3355,11 @@ inside `AgentOrb`, so no call site can opt out of it.
 ## Sidebar status indicators
 
 Chat sessions publish into the same `pane_statuses` snapshot the left
-sidebar reads, so a chat workspace shows the working orb / red
-needs-input pulse / green ready-for-review dot exactly like a terminal
+sidebar reads, so a chat workspace shows the static amber working mark / red
+needs-input pulse / green ready-for-review mark exactly like a terminal
 agent (previously chat panes showed nothing). `pane_statuses` is a
-five-value enum carrying **no tool name**, which is why a sidebar card's
-orb is deliberately neutral while a thread's is activity-matched. `forward_event` in
+five-value enum carrying **no tool name**, which is why a sidebar card uses a
+static lifecycle mark while a thread's orb is activity-matched. `forward_event` in
 `commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
 `PaneStatus` (`map_event_to_pane_status`) and writes it through
 `AppStateStore::set_pane_status_by_thread`, which resolves the
@@ -3390,30 +3390,40 @@ per-thread `ThreadSubagentState` (running `subagent_id`s + a
 (`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
 `Review` only when no subagents are tracked — otherwise it *holds
 `Working`* and marks `review_pending`, and the deferred `Review` fires
-when the last subagent goes terminal. The working orb therefore
+when the last subagent goes terminal. The working mark therefore
 persists until the turn **and** all tracked subagents finish, matching the
 still-running `SubagentsCard` in the drill-in.
 
-**A new user turn resets the thread's tracker** (both `running` and
-`review_pending`). The authoritative, provider-agnostic anchor is the
+**A new user turn resets turn-scoped tracker state but carries confirmed
+monitors forward.** The authoritative, provider-agnostic anchor is the
 send-message command path: `agent_chat_send_turn` calls
-`SubagentTracker::clear_thread` before dispatching the turn. This matters
-because a provider can leave a subagent non-terminal — Claude's background
-`async_launched` task stays `Running` until a later `task_notification`
-that may never arrive — and without the reset that stale `running` id
-would hold `Working` and suppress `Review` for *every* later turn until
-session close. `SessionStateChanged::Running` also resets the tracker
-(reliably per-turn for Codex's `turn/started` and OpenCode's
-`session.status = busy`; Claude does not fire it per user turn, hence the
-command-path clear). A genuinely-still-alive background subagent
-re-inserts itself on its next `Running` snapshot — Claude re-emits these
-via `task_progress` ticks — so clearing at turn start is safe. Crucially,
-parent-scoped `content_delta`/`item_completed` (`subagent_id == None`) do
-**not** clear `review_pending`: such output can trickle in after a deferred
-`TurnCompleted`, and dropping the owed `Review` there would strand the
-pane at `Working`. `review_pending` is cleared only by publishing the
-owed/normal `Review`, a new-turn reset, session `Closed`/`Error`, or
-`agent_chat_close_pane`.
+`SubagentTracker::begin_turn` before dispatching the turn. It drops ordinary
+agent entries, `review_pending`/watchdog state, the forced-settle tombstone,
+and the previous run's Stop blocklist. This matters because a provider can
+leave a subagent non-terminal — Claude's background `async_launched` task
+stays `Running` until a later `task_notification` that may never arrive — and
+carrying that stale agent id would hold `Working` and suppress `Review` for
+*every* later turn until session close.
+
+Only entries already classified as `TaskClass::Monitor` survive. A watch loop
+is explicitly allowed to outlive its parent turn, and providers do not
+guarantee a fresh progress event merely because the user sends a follow-up;
+Claude's `TaskOutput` can confirm the task is still running without producing
+another `task_progress`. During the follow-up the parent still owns `Working`;
+when it settles, the retained monitor makes the pane return to `Monitoring`
+without waiting for another provider snapshot. `SessionStateChanged::Running`
+uses the same partial reset (reliably per-turn for Codex's `turn/started` and
+OpenCode's `session.status = busy`; Claude does not fire it per user turn,
+hence the command-path boundary). The tracker and event shape are
+provider-neutral, so any adapter that emits `task_kind: monitor` gets the same
+continuity; manual monitors already live outside this tracker and are likewise
+unaffected by a new turn. Session close/error and pane teardown still perform
+a full clear. Crucially, parent-scoped `content_delta`/`item_completed`
+(`subagent_id == None`) do **not** clear `review_pending`: such output can
+trickle in after a deferred `TurnCompleted`, and dropping the owed `Review`
+there would strand the pane at `Working`. `review_pending` is cleared only by
+publishing the owed/normal `Review`, a new-turn boundary, session
+`Closed`/`Error`, or `agent_chat_close_pane`.
 
 **Background tasks are excluded from all of that.** Claude emits the same
 `system.task_started` / `task_progress` / `task_updated` /
@@ -3494,7 +3504,7 @@ perfectly alive. The forced path is therefore deliberately
   Removing the entry at settle time instead would leave that snapshot to
   recreate a husk that nothing ever collects. The tombstone is cleared by
   every genuine turn boundary — a new `SessionStatus::Running`, session
-  teardown, or the send-message `clear_thread`.
+  teardown, or the send-message `begin_turn`.
 
 The sweep still runs under the tracker lock, and the mutex is released
 before any `AppStateStore` call. It can never cut a live *turn* short:
