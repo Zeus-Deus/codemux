@@ -236,6 +236,14 @@ pub fn parse_claude_transcript(lines: impl Iterator<Item = String>) -> Vec<Impor
         entry.usage.cache_read = entry.usage.cache_read.max(observed.cache_read);
         entry.usage.cache_write = entry.usage.cache_write.max(observed.cache_write);
         entry.usage.cache_write_1h = entry.usage.cache_write_1h.max(observed.cache_write_1h);
+        // An unparseable (or absent) timestamp on the FIRST record of a
+        // message leaves a 1970 placeholder that no later duplicate could
+        // repair, which drops the row out of every dashboard window. Any
+        // duplicate carrying a real one supersedes it; a real timestamp is
+        // never overwritten, so the earliest reading still wins.
+        if entry.created_at_ms == 0 && timestamp != 0 {
+            entry.created_at_ms = timestamp;
+        }
         if entry.model.is_none() {
             entry.model = model;
         }
@@ -695,12 +703,23 @@ fn sqlite_signature(path: &Path) -> Option<(i64, i64)> {
     found.then_some((mtime_ms, size))
 }
 
-/// Milliseconds since the epoch for an ISO-8601 UTC timestamp.
+/// Milliseconds since the epoch for an ISO-8601 timestamp.
 ///
 /// Hand-rolled for the same reason `civil_from_days` is: pulling in a
 /// date crate to read `2026-07-10T12:33:12.425Z` would be the larger
 /// dependency. Anything unparseable yields `None` and the record falls
 /// back to a zero timestamp rather than being dropped.
+///
+/// Accepts the three suffixes providers actually write: `Z`, a numeric
+/// offset (`+02:00`, `-0500`, `+05`), and nothing at all. A numeric offset
+/// is SUBTRACTED, since the civil fields it trails are local to that zone —
+/// reading `12:33:12+02:00` as UTC would file a record two hours late and
+/// can move it across a day boundary in the bucketing above. An
+/// unrecognized suffix is treated as UTC rather than failing the whole
+/// record, matching the previous lenient behavior.
+///
+/// Fractional seconds may be any number of digits; the first three are
+/// milliseconds and the rest is discarded.
 pub fn parse_iso8601_ms(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
     if bytes.len() < 19 {
@@ -713,13 +732,57 @@ pub fn parse_iso8601_ms(raw: &str) -> Option<i64> {
     let hour = num(11, 13)?;
     let minute = num(14, 16)?;
     let second = num(17, 19)?;
-    let millis = if bytes.len() >= 23 && bytes[19] == b'.' {
-        num(20, 23).unwrap_or(0)
-    } else {
-        0
-    };
+
+    let mut millis = 0_i64;
+    let mut cursor = 19;
+    if bytes.get(19) == Some(&b'.') {
+        let mut digits = 0;
+        cursor = 20;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            if digits < 3 {
+                millis = millis * 10 + (bytes[cursor] - b'0') as i64;
+                digits += 1;
+            }
+            cursor += 1;
+        }
+        // ".5" is 500ms, not 5ms.
+        while digits < 3 {
+            millis *= 10;
+            digits += 1;
+        }
+    }
+
+    // `Z`, nothing, or anything we can't read → already UTC.
+    let offset_minutes = raw
+        .get(cursor..)
+        .and_then(parse_utc_offset_minutes)
+        .unwrap_or(0);
+
     let days = days_from_civil(year, month, day);
-    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+    let civil_ms = ((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis;
+    Some(civil_ms - offset_minutes * 60_000)
+}
+
+/// Minutes EAST of UTC for an ISO-8601 zone designator (`+02:00`,
+/// `-0500`, `+05`). `Z`, an empty suffix, and anything unrecognized yield
+/// `None`, which the caller reads as "already UTC" — a suffix we cannot
+/// parse must not cost the record its whole timestamp.
+fn parse_utc_offset_minutes(suffix: &str) -> Option<i64> {
+    let sign = match suffix.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits: String = suffix[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+    let (hours, minutes) = match digits.len() {
+        2 => (digits.parse::<i64>().ok()?, 0),
+        4 => (
+            digits.get(0..2)?.parse::<i64>().ok()?,
+            digits.get(2..4)?.parse::<i64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(sign * (hours * 60 + minutes))
 }
 
 /// Howard Hinnant's `days_from_civil` — the inverse of the
@@ -1432,5 +1495,74 @@ mod tests {
         );
         assert!(parse_iso8601_ms("not a date").is_none());
         assert!(parse_iso8601_ms("").is_none());
+    }
+
+    /// A numeric offset states that the civil fields before it are LOCAL.
+    /// Reading them as UTC files the record hours away from when it
+    /// happened, which can move it into the wrong day bucket entirely.
+    #[test]
+    fn iso8601_honors_numeric_timezone_offsets() {
+        let utc = parse_iso8601_ms("2026-07-10T12:33:12.425Z").unwrap();
+        for (raw, delta_hours) in [
+            ("2026-07-10T14:33:12.425+02:00", 2),
+            ("2026-07-10T14:33:12.425+0200", 2),
+            ("2026-07-10T14:33:12.425+02", 2),
+            ("2026-07-10T07:33:12.425-05:00", -5),
+        ] {
+            assert_eq!(
+                parse_iso8601_ms(raw),
+                Some(utc),
+                "{raw} is the same instant as the Z form ({delta_hours}h shift)"
+            );
+        }
+        // Half-hour zones are real (India is UTC+05:30).
+        assert_eq!(
+            parse_iso8601_ms("2026-07-10T18:03:12.425+05:30"),
+            Some(utc)
+        );
+        // No suffix at all — and any suffix we can't read — keeps the old
+        // UTC assumption rather than costing the record its timestamp.
+        assert_eq!(parse_iso8601_ms("2026-07-10T12:33:12.425"), Some(utc));
+        assert_eq!(parse_iso8601_ms("2026-07-10T12:33:12.425 UTC"), Some(utc));
+        assert_eq!(parse_iso8601_ms("2026-07-10T12:33:12.425+"), Some(utc));
+    }
+
+    /// Fractional seconds are not always three digits.
+    #[test]
+    fn iso8601_accepts_any_fractional_precision() {
+        let whole = parse_iso8601_ms("2026-07-10T12:33:12Z").unwrap();
+        assert_eq!(parse_iso8601_ms("2026-07-10T12:33:12.5Z"), Some(whole + 500));
+        assert_eq!(parse_iso8601_ms("2026-07-10T12:33:12.05Z"), Some(whole + 50));
+        assert_eq!(
+            parse_iso8601_ms("2026-07-10T12:33:12.425999Z"),
+            Some(whole + 425),
+            "sub-millisecond digits are discarded, not misread"
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-10T12:33:12.425999+02:00"),
+            Some(whole + 425 - 2 * 3_600_000),
+            "an offset after a long fraction is still found"
+        );
+    }
+
+    /// A message whose first record has no usable timestamp must not stay
+    /// pinned to 1970 when a later duplicate carries one — the ledger row
+    /// would otherwise fall outside every dashboard window.
+    #[test]
+    fn a_later_duplicate_repairs_an_unparseable_first_timestamp() {
+        let usage = r#""usage":{"input_tokens":10,"output_tokens":5}"#;
+        let rows = parse_claude_transcript(
+            [
+                format!(
+                    r#"{{"sessionId":"s1","type":"assistant","timestamp":"bogus","message":{{"id":"m1","model":"claude-opus-5",{usage}}}}}"#
+                ),
+                format!(
+                    r#"{{"sessionId":"s1","type":"assistant","timestamp":"2026-07-10T12:33:12.425Z","message":{{"id":"m1","model":"claude-opus-5",{usage}}}}}"#
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(rows.len(), 1, "both records are the same message");
+        assert_eq!(rows[0].created_at_ms, 1_783_686_792_425);
     }
 }

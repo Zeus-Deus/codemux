@@ -73,6 +73,8 @@ total = fresh input + output (reasoning included) + cache read + cache write
 
 Synthetic Claude messages and tokenless records are ignored.
 
+Record timestamps are parsed by a hand-rolled ISO-8601 reader (`parse_iso8601_ms`) that honours `Z`, a numeric offset (`+02:00`, `-0500`, `+05`), and no suffix at all, with any fractional-second precision. An offset is subtracted rather than ignored, so a locally-stamped record is not filed hours — possibly a day bucket — late. A Claude record whose timestamp is unreadable keeps a zero placeholder that a later duplicate of the same `message.id` repairs.
+
 ## Cost semantics
 
 Every dollar figure is labelled as an estimate or API equivalent. It does not mean “billed,” “owed,” “plan-covered,” or “saved by a subscription.” Codemux cannot reconstruct the user's actual settlement arrangement from historical token records.
@@ -103,6 +105,8 @@ The page shows:
 - provider/model/subagent breakdowns;
 - live quota bars when available;
 - CSV export.
+
+Buckets are aligned in the user's local time: hourly for **Today**, daily otherwise. "Today" is a trailing 24-hour window rather than a calendar day, so its older buckets are labelled `Yesterday {hour}:00` — in the hover readout, the header range, and the CSV's `bucket_start` column alike.
 
 The page scans provider history before its first summary query. Manual refresh and the 30-second open-page poll both scan before querying, so a running provider session becomes visible without restarting Codemux.
 
