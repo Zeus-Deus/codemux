@@ -200,7 +200,7 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   The blocker line is a fixed string
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
-  the agent state — Working (the `AgentOrb`, amber text) /
+  the agent state — Working (a static dashed-circle mark, amber text) /
   Needs you (pulsing red dot) / Monitoring (steady cyan dot, never animated —
   see `docs/features/monitoring-status.md`) / Done · review (green ✓) /
   elapsed since the workspace last settled into review — and swaps to a
@@ -761,20 +761,20 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (`sidebar.show_git_stats`, default on) hides the `↑ahead` and `+/−` numbers
   on cards when off; the branch name always shows. The `sidebar.live_agents`
   grouping setting was removed with the tree.
-- **Working indicator**: a working card shows the shared **agent orb**
-  (`src/components/ui/agent-orb.tsx`, wrapping the `thinking-orbs` library) in
-  place of its leading icon. It is always monochrome — the library inks white
-  on dark and black on light — so it never competes with the accent, and red
-  stays reserved for cards that need a human. The orb is **neutral here on
-  purpose**: the sidebar reads `pane_statuses`, a five-value enum carrying no
-  tool name, so a card can honestly say "something is alive" but not what. The
-  activity-matched states appear where the tool is actually visible (the thread
-  and its subagents — see `docs/features/agent-chat.md`). This replaced the
-  configurable glyph picker: `sidebar.working_indicator` (braille / ring /
-  blink / sweep / typing) and `sidebar.working_indicator_color` are **deleted**,
-  along with `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on
-  read, not migrated — the settings table is free-form key/value, so a leftover
-  row is inert and is never written back.
+- **Working indicator**: a working card uses a static amber
+  `CircleDotDashed` beside **Working**. The incomplete ring communicates
+  in-progress lifecycle, while the center point keeps the mark legible at
+  sidebar scale. It deliberately does not render `AgentOrb`: the agent is
+  acting inside a thread, while the sidebar is workspace navigation and only
+  knows the coarse `pane_statuses` lifecycle. Activity-matched orbs remain
+  where the tool is actually visible (the thread and its subagents — see
+  `docs/features/agent-chat.md`). The collapsed rail remains even denser and
+  uses its existing amber status dot. The old configurable glyph picker,
+  `sidebar.working_indicator` (braille / ring / blink / sweep / typing), and
+  `sidebar.working_indicator_color` remain **deleted**, along with
+  `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on read, not
+  migrated — the settings table is free-form key/value, so a leftover row is
+  inert and is never written back.
 
 ### Footer nav (fixed chrome, both states)
 

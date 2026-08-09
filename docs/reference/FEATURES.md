@@ -15,7 +15,7 @@
 - Rename workspaces by double-clicking the active workspace name in the sidebar
 - Archive local workspaces non-destructively with all child sessions closed; attach-in-place and host-bound workspaces use non-destructive Close instead
 - Auto-transition to main workspace after merge+delete
-- Sidebar workspace inbox — the expanded sidebar is one flat list of workspace cards (repo eyebrow · work title + issue chip · blocker line when the agent needs you · mono meta line with branch/↑ahead/+−/PR chip/remote/notifications) with agent state on the right (agent orb / pulsing "Needs you" / "Done · review" / idle time)
+- Sidebar workspace inbox — the expanded sidebar is one flat list of workspace cards (repo eyebrow · work title + issue chip · blocker line when the agent needs you · mono meta line with branch/↑ahead/+−/PR chip/remote/notifications) with agent state on the right (static in-progress mark / pulsing "Needs you" / "Done · review" / idle time)
 - Project filter dropdown (All projects + per-repo rows with active-workspace counts, pinned add-repo button) above the inbox filters both active cards and settled rows; search box opens the command palette
 - Settle/un-settle — hover a card for "✓ Settle" to sweep it into a persisted one-line "Settled" section (violet merge icon for merged PRs); hover a settled row to Un-settle. Purely visual: nothing is archived or deleted
 - Work-based card naming — while an agent is live and an issue is linked, the card titles itself after the issue (+ `#n` chip) and keeps the branch on the meta line
@@ -151,7 +151,7 @@
 - Shell font family customization via backend config
 - Fallback Tokyonight-inspired theme when Omarchy unavailable
 - Color palette variant (cool / warm) and spacing density (comfortable / compact) in Settings → Appearance
-- Agent activity orb — one monochrome indicator (`thinking-orbs`) wherever an agent is running: sidebar cards, the in-flight turn, subagent rows, the composer strip. Settings → Appearance → Agents has a single "Match the orb to the activity" toggle (default on); the old glyph picker and color swatches are gone
+- Agent activity orb — one monochrome indicator (`thinking-orbs`) wherever agent activity has local context: the in-flight turn, subagent rows, and the composer strip. Sidebar workspace navigation uses a static lifecycle mark instead. Settings → Appearance → Agents has a single "Match the orb to the activity" toggle (default on); the old glyph picker and color swatches are gone
 
 ## Persistence
 
