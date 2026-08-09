@@ -147,6 +147,11 @@ describe("WorkspaceStatusCluster", () => {
     const chip = screen.getByRole("button", { name: /Open PR #172 on GitHub/ });
     expect(chip).toHaveTextContent("#172");
     expect(chip).toHaveClass("text-status-open");
+    expect(chip).not.toHaveClass("border", "bg-status-open/10");
+    const icon = chip.querySelector("svg");
+    expect(icon).toHaveClass("text-status-open");
+    expect(icon).toHaveAttribute("width", "14");
+    expect(icon).toHaveAttribute("stroke-width", "1.75");
     await userEvent.click(chip);
     expect(mocks.openUrl).toHaveBeenCalledWith(
       "https://github.com/org/repo/pull/172",
@@ -282,6 +287,11 @@ describe("WorkspaceStatusCluster", () => {
       name: /Browser running in background/,
     });
     expect(indicator).toBeInTheDocument();
+    expect(indicator).not.toHaveClass("border", "bg-status-remote/10");
+    expect(indicator.querySelector(".cm-blink")).not.toBeInTheDocument();
+    const icon = indicator.querySelector("svg");
+    expect(icon).toHaveClass("size-3.5");
+    expect(icon).toHaveAttribute("stroke-width", "1.75");
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
     await userEvent.click(indicator);
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
