@@ -4,9 +4,21 @@ import { runtimeNoticeFromWarning } from "./runtime-notice";
 
 describe("runtimeNoticeFromWarning", () => {
   it("promotes a rejected rate-limit event to a usage-limit notice", () => {
+    // The payload below is the whole SDK message the Claude adapter
+    // forwards verbatim — see `rejected_rate_limit_event_also_emits_the_
+    // transcript_notice_warning` in
+    // `src-tauri/src/agent_provider/claude/translate.rs`, which asserts the
+    // same three fields on the serialized event. The adapter emits this
+    // warning ALONGSIDE `PlanUsageUpdated`, because that variant is
+    // intercepted for the quota store and never reaches the transcript.
     expect(
       runtimeNoticeFromWarning("rate limit event", {
-        rate_limit_info: { status: "rejected" },
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "rejected",
+          rateLimitType: "five_hour",
+          utilization: 1,
+        },
       }),
     ).toBe("Usage limit reached — the provider stopped the run.");
   });

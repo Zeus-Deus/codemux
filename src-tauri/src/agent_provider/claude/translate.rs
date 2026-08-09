@@ -714,7 +714,7 @@ fn translate_rate_limit_event(
     let Some(info) = msg.get("rate_limit_info") else {
         // Shape we don't recognize — keep the old behavior rather than
         // silently reporting an empty quota.
-        return warning(thread_id, "rate limit event", msg);
+        return warning(thread_id, RATE_LIMIT_WARNING_MESSAGE, msg);
     };
 
     let raw_kind = info.get("rateLimitType").and_then(|v| v.as_str());
@@ -772,7 +772,7 @@ fn translate_rate_limit_event(
         });
     }
 
-    vec![ProviderRuntimeEvent::PlanUsageUpdated {
+    let mut events = vec![ProviderRuntimeEvent::PlanUsageUpdated {
         thread_id: thread_id.clone(),
         provider: ProviderKind::Claude,
         windows,
@@ -780,8 +780,30 @@ fn translate_rate_limit_event(
         // rate-limit event itself carries no plan name.
         plan_label: None,
         auth_mode: Some(PlanAuthMode::Subscription),
-    }]
+    }];
+
+    // A `rejected` status is the one rate-limit reading the user must see in
+    // the transcript: the provider refused the turn. `PlanUsageUpdated` alone
+    // cannot say it — `forward_event` intercepts that variant for the quota
+    // store and returns before persistence and fan-out — so the legacy
+    // warning is emitted ALONGSIDE it. `src/lib/agent-chat/runtime-notice.ts`
+    // keys the "Usage limit reached" notice off exactly this pair
+    // (`message == "rate limit event"` plus
+    // `original_payload.rate_limit_info.status == "rejected"`); changing
+    // either string here silently deletes that notice.
+    if info.get("status").and_then(|v| v.as_str()) == Some(RATE_LIMIT_REJECTED_STATUS) {
+        events.extend(warning(thread_id, RATE_LIMIT_WARNING_MESSAGE, msg));
+    }
+
+    events
 }
+
+/// Warning text the transcript-notice classifier matches on. See
+/// `src/lib/agent-chat/runtime-notice.ts`.
+const RATE_LIMIT_WARNING_MESSAGE: &str = "rate limit event";
+
+/// `rate_limit_info.status` value meaning the provider stopped the run.
+const RATE_LIMIT_REJECTED_STATUS: &str = "rejected";
 
 fn warning(
     thread_id: &ThreadId,
@@ -2553,6 +2575,57 @@ mod tests {
                 assert_eq!(windows[0].kind, PlanWindowKind::Other);
             }
             other => panic!("expected PlanUsageUpdated, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the "Usage limit reached" transcript notice.
+    ///
+    /// `forward_event` intercepts `PlanUsageUpdated` for the quota store and
+    /// returns BEFORE persistence and fan-out, so a rejected rate-limit event
+    /// that decoded into nothing else would never reach the transcript. The
+    /// assertions below are the full wire contract
+    /// `src/lib/agent-chat/runtime-notice.ts` reads — event tag, warning
+    /// message, and the nested `rate_limit_info.status` — checked on the
+    /// SERIALIZED payload, which is what the frontend actually receives.
+    #[test]
+    fn rejected_rate_limit_event_also_emits_the_transcript_notice_warning() {
+        let msg = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert_eq!(
+            events.len(),
+            2,
+            "a rejected event carries BOTH quota state and a user-facing notice"
+        );
+        assert!(
+            matches!(&events[0], ProviderRuntimeEvent::PlanUsageUpdated { .. }),
+            "quota state still flows to the meter"
+        );
+
+        let wire = serde_json::to_value(&events[1]).expect("serialize warning");
+        assert_eq!(wire["type"], "runtime_warning");
+        assert_eq!(wire["message"], "rate limit event");
+        assert_eq!(wire["original_payload"]["rate_limit_info"]["status"], "rejected");
+    }
+
+    /// The mirror case: an informational reading must NOT spam the transcript.
+    /// The classifier would drop it anyway, but emitting one warning per
+    /// rate-limit tick would put a row through persistence and fan-out.
+    #[test]
+    fn non_rejected_rate_limit_event_emits_quota_state_only() {
+        for status in ["allowed", "allowed_warning"] {
+            let msg = json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": status, "utilization": 0.5}
+            });
+            let events = translate_sdk_message(&tid(), &msg);
+            assert_eq!(events.len(), 1, "for {status}");
+            assert!(matches!(
+                &events[0],
+                ProviderRuntimeEvent::PlanUsageUpdated { .. }
+            ));
         }
     }
 

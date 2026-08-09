@@ -3245,9 +3245,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         return;
     }
 
-    // Runtime usage events from older adapters are intentionally discarded.
-    // Provider-owned history is the sole accounting source; writing both
-    // streams would count every Codemux-launched turn twice.
+    // Adapters still compute a per-turn usage delta, but it is intentionally
+    // discarded here: provider-owned history (the JSONL/SQLite scan) is the
+    // sole accounting source, and writing both streams would count every
+    // Codemux-launched turn twice.
     if matches!(event, ProviderRuntimeEvent::UsageRecorded { .. }) {
         return;
     }
