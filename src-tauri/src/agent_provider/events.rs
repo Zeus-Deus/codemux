@@ -386,7 +386,7 @@ pub struct UserMessageImage {
     pub media_type: String,
 }
 
-/// Where a ledger row's cost figure came from.
+/// Where a legacy runtime usage estimate came from.
 ///
 /// The distinction matters because the two are not equally trustworthy:
 /// a catalogue rate is the upstream's own published price for that exact
@@ -404,7 +404,7 @@ pub enum CostSource {
 }
 
 impl CostSource {
-    /// The string form stored in `agent_usage_ledger.cost_source`.
+    /// The matching provider-history cache value.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Provider => "provider",
@@ -687,8 +687,7 @@ pub enum ProviderRuntimeEvent {
         /// Seconds since the last observed runtime event for this thread.
         silent_for_secs: u64,
     },
-    /// An increment of billable work completed — one row for the usage
-    /// ledger behind Settings → Usage.
+    /// Legacy adapter-side usage delta.
     ///
     /// **This is not [`ContextUsageUpdated`].** That event answers "how
     /// full is the context window right now": it is a *snapshot*, it is
@@ -707,10 +706,9 @@ pub enum ProviderRuntimeEvent {
     /// lets the sink sum the four fields for a token total and lets
     /// [`pricing`](super::pricing) price the split as a dot product.
     ///
-    /// Not persisted to `agent_chat_messages`: it carries no transcript
-    /// state, and replaying it on hydrate would double-count every row.
-    /// The command layer intercepts it and writes `agent_usage_ledger`
-    /// instead.
+    /// Not persisted or fanned out. Provider-owned durable history is the
+    /// Settings → Usage source of truth, so the command layer discards this
+    /// signal; writing both would double-count Codemux-launched work.
     ///
     /// [`ContextUsageUpdated`]: ProviderRuntimeEvent::ContextUsageUpdated
     UsageRecorded {

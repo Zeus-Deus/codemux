@@ -1,55 +1,40 @@
-//! Import token usage from the coding CLIs' own local logs.
+//! Materialize usage from each provider's durable local history.
 //!
-//! A PTY tab streams no runtime events, so a terminal-launched
-//! `claude` or `codex` session is invisible to the live ledger. Both
-//! CLIs, however, write a complete JSONL transcript to disk, and those
-//! transcripts carry the same usage blocks the SDK reports. Reading them
-//! is the honest maximum: no provider exposes subscription history over
-//! an API, so **this machine's logs are the only complete record that
-//! exists**, and only for the machine the app is running on.
+//! Claude Code and Codex write JSONL transcripts; OpenCode stores the
+//! equivalent assistant-message records in SQLite (with legacy JSON files
+//! on older installs). Those provider-owned records are the single source of
+//! truth for every session on this machine, regardless of whether Codemux,
+//! another app, or a terminal launched it.
 //!
-//! Two hazards shape the design:
-//!
-//! 1. **Codemux's own sessions write these logs too.** Every
-//!    Codemux-driven turn already has a live ledger row, so an import
-//!    that did not exclude them would double-count the entire history
-//!    the moment the toggle is switched on. Sessions whose id matches a
-//!    persisted `sdk_session_id` are skipped — see [`ScanContext`].
-//! 2. **Re-scanning must be idempotent.** Every imported row carries an
-//!    `import_key`, unique-indexed, and insertion is `INSERT OR IGNORE`.
-//!    A second scan of an unchanged file adds nothing even if the
-//!    offset bookkeeping is lost.
-//!
-//! Scans are incremental: `usage_import_state` remembers each file's
-//! size and how much was consumed, so a warm re-scan reads only what
-//! grew.
+//! Every record has a provider-native `import_key`. Re-scanning is
+//! idempotent, but an active response may grow, so the cache uses a null-safe
+//! upsert instead of freezing the first partial snapshot it sees.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::agent_provider::pricing;
-use crate::database::DatabaseStore;
+use crate::database::{DatabaseStore, ProviderUsageCacheRow};
 
 /// Bump this whenever a change would make previously-imported rows
 /// wrong — a parse fix, a new field, a price correction.
 ///
-/// Imported rows freeze `cost_usd` at insert and are keyed by
-/// `import_key`, so without a version gate a corrected importer would
-/// leave every existing install showing figures produced by the old,
-/// wrong code forever: `INSERT OR IGNORE` sees the same keys and does
-/// nothing. On a mismatch the scan drops every `source = 'cli_import'`
-/// row, clears the per-file state, and rebuilds from the logs, which are
-/// still on disk. Live rows are never touched.
+/// The ledger is a cache, so a mismatch clears it and rebuilds from the
+/// histories that remain on disk. Version 3 also removes old live-ledger
+/// rows; otherwise Codemux-launched work would appear once from runtime
+/// events and once from provider history.
 ///
 /// | v | why |
 /// |---|---|
 /// | 1 | initial import (implicit — installs predating this constant) |
-/// | 2 | gpt-5.6-sol/-terra/-luna priced specifically instead of falling through to `gpt-5` (a 4x under-report); Claude 1-hour cache writes billed at 2x input; Codex imported per turn instead of one aggregate per rollout; Codex `cache_write_input_tokens` read; Claude `import_key` moved to ccusage's global `message.id`+`requestId` |
-pub const IMPORT_VERSION: i64 = 2;
+/// | 2 | per-turn Codex, Claude cache TTLs, corrected model prices |
+/// | 3 | provider history authoritative; growing rows upsert; OpenCode imported |
+pub const IMPORT_VERSION: i64 = 3;
 
 /// Settings key holding the [`IMPORT_VERSION`] the current rows were
 /// produced by.
@@ -57,14 +42,13 @@ const IMPORT_VERSION_KEY: &str = "usage.import_version";
 
 /// What one scan did, for the footer note.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CliImportReport {
+pub struct UsageImportReport {
     pub files_scanned: i64,
     pub sessions_found: i64,
-    pub rows_added: i64,
-    /// Sessions skipped because Codemux itself drove them.
-    pub sessions_skipped_own: i64,
+    /// New or changed materialized records.
+    pub rows_updated: i64,
     /// True when this scan found a stale [`IMPORT_VERSION`] and rebuilt
-    /// the imported half of the ledger from scratch.
+    /// the materialized cache from scratch.
     pub reimported: bool,
 }
 
@@ -103,12 +87,8 @@ pub struct ImportedRow {
     pub model: Option<String>,
     pub subagent: bool,
     pub usage: ImportedUsage,
-}
-
-/// Everything a scan needs that is not the file itself.
-pub struct ScanContext {
-    /// Provider-native session ids Codemux already has live rows for.
-    pub own_session_ids: HashSet<String>,
+    /// Upstream-computed cost when the history includes one (OpenCode).
+    pub reported_cost_usd: Option<f64>,
 }
 
 // ── Claude: ~/.claude/projects/**/*.jsonl ──
@@ -146,15 +126,11 @@ pub struct ScanContext {
 /// same response can legitimately appear in two transcripts. (Unobserved
 /// here — 0 of 9,537 distinct ids appeared in more than one file — but
 /// the index makes the protection free.)
-pub fn parse_claude_transcript(
-    lines: impl Iterator<Item = String>,
-    ctx: &ScanContext,
-) -> (Vec<ImportedRow>, bool) {
+pub fn parse_claude_transcript(lines: impl Iterator<Item = String>) -> Vec<ImportedRow> {
     // message.id -> (usage high-water, first timestamp, model, subagent,
     //                requestId)
     let mut by_message: HashMap<String, ClaudeMessageAcc> = HashMap::new();
     let mut session_id: Option<String> = None;
-    let mut skipped_own = false;
 
     for line in lines {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -167,10 +143,6 @@ pub fn parse_claude_transcript(
         }
         let sid = record.get("sessionId").and_then(|v| v.as_str());
         if let Some(sid) = sid {
-            if ctx.own_session_ids.contains(sid) {
-                // Codemux drove this session; the live ledger already has it.
-                return (Vec::new(), true);
-            }
             session_id.get_or_insert_with(|| sid.to_string());
         }
         let Some(message) = record.get("message") else {
@@ -273,9 +245,8 @@ pub fn parse_claude_transcript(
     }
 
     let Some(session_id) = session_id else {
-        return (Vec::new(), skipped_own);
+        return Vec::new();
     };
-    skipped_own = false;
 
     let mut rows: Vec<ImportedRow> = by_message
         .into_iter()
@@ -295,10 +266,11 @@ pub fn parse_claude_transcript(
             model: acc.model,
             subagent: acc.subagent,
             usage: acc.usage,
+            reported_cost_usd: None,
         })
         .collect();
     rows.sort_by_key(|r| r.created_at_ms);
-    (rows, skipped_own)
+    rows
 }
 
 /// Per-`message.id` accumulator for [`parse_claude_transcript`].
@@ -350,10 +322,7 @@ struct ClaudeMessageAcc {
 ///
 /// Rollouts predating `last_token_usage` (2 of 148 files here) fall back
 /// to the old single-aggregate behavior rather than importing nothing.
-pub fn parse_codex_rollout(
-    lines: impl Iterator<Item = String>,
-    ctx: &ScanContext,
-) -> (Vec<ImportedRow>, bool) {
+pub fn parse_codex_rollout(lines: impl Iterator<Item = String>) -> Vec<ImportedRow> {
     let mut session_id: Option<String> = None;
     let mut model: Option<String> = None;
     let mut rows: Vec<ImportedRow> = Vec::new();
@@ -369,6 +338,7 @@ pub fn parse_codex_rollout(
     let mut created_at_ms: i64 = 0;
     let mut last_ts: i64 = 0;
     let mut saw_delta = false;
+    let mut subagent = false;
 
     for line in lines {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -386,11 +356,17 @@ pub fn parse_codex_rollout(
                     .and_then(|p| p.get("id"))
                     .and_then(|v| v.as_str())
                 {
-                    if ctx.own_session_ids.contains(id) {
-                        return (Vec::new(), true);
-                    }
                     session_id.get_or_insert_with(|| id.to_string());
                 }
+                let payload = record.get("payload");
+                subagent = payload
+                    .and_then(|p| p.get("source"))
+                    .and_then(|source| source.get("subagent"))
+                    .is_some()
+                    || payload
+                        .and_then(|p| p.get("parent_thread_id"))
+                        .and_then(|v| v.as_str())
+                        .is_some();
                 if created_at_ms == 0 {
                     created_at_ms = ts;
                 }
@@ -441,10 +417,9 @@ pub fn parse_codex_rollout(
                         session_id: session.to_string(),
                         provider: "codex",
                         model: model.clone(),
-                        // A rollout is one agent's transcript; subagent
-                        // attribution is not recoverable from it.
-                        subagent: false,
+                        subagent,
                         usage: delta,
+                        reported_cost_usd: None,
                     });
                     turn_index += 1;
                     continue;
@@ -472,25 +447,30 @@ pub fn parse_codex_rollout(
     }
 
     let Some(session_id) = session_id else {
-        return (Vec::new(), false);
+        return Vec::new();
     };
     if saw_delta {
-        return (rows, false);
+        return rows;
     }
     if best.is_empty() {
-        return (Vec::new(), false);
+        return Vec::new();
     }
     let row = ImportedRow {
         // One row per rollout, so the rollout id alone is a stable key.
         import_key: format!("codex:{session_id}"),
-        created_at_ms: if created_at_ms > 0 { created_at_ms } else { last_ts },
+        created_at_ms: if created_at_ms > 0 {
+            created_at_ms
+        } else {
+            last_ts
+        },
         session_id,
         provider: "codex",
         model,
-        subagent: false,
+        subagent,
         usage: best,
+        reported_cost_usd: None,
     };
-    (vec![row], false)
+    vec![row]
 }
 
 /// Normalize either Codex usage object into the disjoint ledger split.
@@ -516,6 +496,203 @@ fn split_from_codex_usage(usage: &serde_json::Value) -> ImportedUsage {
         cache_write_1h: 0,
         reasoning: field("reasoning_output_tokens"),
     }
+}
+
+// ── OpenCode: ~/.local/share/opencode/opencode*.db + legacy JSON ──
+
+/// Normalize one OpenCode assistant-message record.
+///
+/// OpenCode's buckets are disjoint. `reasoning` sits beside `output`, but is
+/// billed as output, so it is folded into the output total and also retained
+/// as its informational subset. Message ids are stable while a streaming
+/// response grows, which is why the database layer upserts this key.
+fn parse_opencode_message(
+    data: &serde_json::Value,
+    fallback_message_id: &str,
+    session_id: &str,
+    fallback_created_at_ms: i64,
+    subagent: bool,
+) -> Option<ImportedRow> {
+    if data.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    let tokens = data.get("tokens")?;
+    let field = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_i64()).unwrap_or(0).max(0)
+    };
+    let reasoning = field(tokens, "reasoning");
+    let cache = tokens.get("cache").unwrap_or(&serde_json::Value::Null);
+    let usage = ImportedUsage {
+        input: field(tokens, "input"),
+        output: field(tokens, "output").saturating_add(reasoning),
+        cache_read: field(cache, "read"),
+        cache_write: field(cache, "write"),
+        cache_write_1h: 0,
+        reasoning,
+    };
+    if usage.is_empty() {
+        return None;
+    }
+
+    let message_id = data
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_message_id);
+    let created_at_ms = data
+        .get("time")
+        .and_then(|v| v.get("created"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(fallback_created_at_ms);
+    let provider_id = data.get("providerID").and_then(|v| v.as_str());
+    let model_id = data.get("modelID").and_then(|v| v.as_str());
+    let model = match (provider_id, model_id) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (None, Some(model)) => Some(model.to_string()),
+        _ => None,
+    };
+
+    Some(ImportedRow {
+        import_key: format!("opencode:{message_id}"),
+        created_at_ms,
+        session_id: session_id.to_string(),
+        provider: "opencode",
+        model,
+        subagent,
+        usage,
+        reported_cost_usd: data.get("cost").and_then(|v| v.as_f64()),
+    })
+}
+
+fn read_opencode_db(path: &Path) -> Result<Vec<ImportedRow>, String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
+
+    // Parent sessions are OpenCode's subagents. Older schemas may not have
+    // `parent_id`; in that case the usage is still valid, just unclassified.
+    let mut child_sessions = HashSet::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT id FROM session WHERE parent_id IS NOT NULL AND parent_id != ''")
+    {
+        if let Ok(ids) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            child_sessions.extend(ids.filter_map(Result::ok));
+        }
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id, session_id, time_created, data FROM message")
+        .map_err(|e| {
+            format!(
+                "Could not read OpenCode messages in {}: {e}",
+                path.display()
+            )
+        })?;
+    let messages = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| {
+            format!(
+                "Could not query OpenCode messages in {}: {e}",
+                path.display()
+            )
+        })?;
+
+    let mut rows = Vec::new();
+    for message in messages {
+        let Ok((message_id, session_id, created_at_ms, raw)) = message else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if let Some(row) = parse_opencode_message(
+            &data,
+            &message_id,
+            &session_id,
+            created_at_ms,
+            child_sessions.contains(&session_id),
+        ) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn find_files_with_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            find_files_with_extension(&path, extension, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+            out.push(path);
+        }
+    }
+}
+
+fn opencode_storage_root() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|root| root.join("opencode"))
+}
+
+fn opencode_databases(root: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = HashSet::new();
+    if let Some(explicit) = std::env::var_os("OPENCODE_DB") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            paths.insert(path);
+        }
+    }
+    if let Some(root) = root {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                if path.is_file() && name.starts_with("opencode") && name.ends_with(".db") {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
+    let mut paths: Vec<_> = paths.into_iter().collect();
+    paths.sort();
+    paths
+}
+
+/// A SQLite database's observable content signature. Include the WAL because
+/// active OpenCode sessions may not have checkpointed their newest messages
+/// into the main database file yet.
+fn sqlite_signature(path: &Path) -> Option<(i64, i64)> {
+    let mut mtime_ms = 0;
+    let mut size = 0_i64;
+    let mut files = vec![path.to_path_buf()];
+    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    files.push(wal);
+    let mut found = false;
+    for file in files {
+        let Ok(meta) = std::fs::metadata(file) else {
+            continue;
+        };
+        found = true;
+        size = size.saturating_add(meta.len() as i64);
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        mtime_ms = mtime_ms.max(modified);
+    }
+    found.then_some((mtime_ms, size))
 }
 
 /// Milliseconds since the epoch for an ISO-8601 UTC timestamp.
@@ -579,72 +756,49 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Scan both CLIs' logs and import anything new.
-///
-/// Incremental by file size: a file whose size is unchanged since the
-/// last scan is skipped outright. A file that grew is re-read **in
-/// full** rather than from the stored offset, because both formats need
-/// whole-file context — Claude's per-message maxima and Codex's session
-/// meta both live earlier in the file than the tail. The offset is
-/// still recorded so an unchanged file costs a single `stat`, and the
-/// `import_key` index makes the re-read free of duplicates.
-#[tauri::command]
-pub async fn usage_scan_cli_logs(
-    db: State<'_, DatabaseStore>,
-) -> Result<CliImportReport, String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let own_session_ids = db.known_sdk_session_ids().unwrap_or_default();
-    let ctx = ScanContext { own_session_ids };
-    let mut report = CliImportReport::default();
+fn file_signature(path: &Path) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Some((mtime_ms, meta.len() as i64))
+}
 
-    let stale_version = purge_if_importer_changed(&db)?;
-    report.reimported = stale_version;
+fn tree_signature(files: &[PathBuf]) -> Option<(i64, i64)> {
+    let mut mtime_ms = 0;
+    let mut size = files.len() as i64;
+    for path in files {
+        let Some((modified, bytes)) = file_signature(path) else {
+            continue;
+        };
+        mtime_ms = mtime_ms.max(modified);
+        size = size.saturating_add(bytes);
+    }
+    (!files.is_empty()).then_some((mtime_ms, size))
+}
 
-    let targets: [(PathBuf, &'static str); 2] = [
-        (home.join(".claude").join("projects"), "claude"),
-        (home.join(".codex").join("sessions"), "codex"),
-    ];
+fn source_changed(db: &DatabaseStore, key: &str, signature: (i64, i64)) -> bool {
+    !matches!(
+        db.usage_import_state(key),
+        Ok(Some((mtime, size, _))) if (mtime, size) == signature
+    )
+}
 
-    for (root, provider) in targets {
-        let mut files = Vec::new();
-        find_jsonl(&root, &mut files);
-        for path in files {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            let size = meta.len() as i64;
-            let mtime_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let key = path.to_string_lossy().to_string();
-            if let Ok(Some((_, prev_size, _))) = db.usage_import_state(&key) {
-                if prev_size == size {
-                    // Nothing appended since the last scan.
-                    continue;
-                }
-            }
-            report.files_scanned += 1;
-
-            let Ok(file) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let mut reader = BufReader::new(file);
-            let _ = reader.seek(SeekFrom::Start(0));
-            let lines = reader.lines().map_while(Result::ok);
-
-            let (rows, skipped_own) = match provider {
-                "claude" => parse_claude_transcript(lines, &ctx),
-                _ => parse_codex_rollout(lines, &ctx),
-            };
-            if skipped_own {
-                report.sessions_skipped_own += 1;
-            } else if !rows.is_empty() {
-                report.sessions_found += 1;
-            }
-            for row in rows {
+fn materialize_rows(
+    db: &DatabaseStore,
+    rows: Vec<ImportedRow>,
+    report: &mut UsageImportReport,
+    sessions: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut cache_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        sessions.insert(format!("{}:{}", row.provider, row.session_id));
+        let (cost, cost_source) = match row.reported_cost_usd {
+            Some(cost) if cost.is_finite() && cost >= 0.0 => (Some(cost), Some("provider")),
+            _ => {
                 let cost = pricing::cost_for_with_1h(
                     row.model.as_deref(),
                     row.usage.input.max(0) as u64,
@@ -653,43 +807,177 @@ pub async fn usage_scan_cli_logs(
                     row.usage.cache_write.max(0) as u64,
                     row.usage.cache_write_1h.max(0) as u64,
                 );
-                match db.insert_imported_usage_row(
-                    &row.import_key,
-                    row.created_at_ms,
-                    &format!("cli:{}", row.session_id),
-                    row.provider,
-                    row.model.as_deref(),
-                    row.subagent,
-                    row.usage.input,
-                    row.usage.output,
-                    row.usage.cache_read,
-                    row.usage.cache_write,
-                    row.usage.reasoning,
-                    cost,
-                ) {
-                    Ok(true) => report.rows_added += 1,
-                    Ok(false) => {}
-                    Err(error) => {
-                        eprintln!("[codemux::usage_import] insert failed: {error}");
-                    }
-                }
+                let source = cost.map(|_| "table");
+                (cost, source)
             }
-            let _ = db.set_usage_import_state(&key, mtime_ms, size, size, now_ms());
+        };
+        cache_rows.push(ProviderUsageCacheRow {
+            import_key: row.import_key,
+            created_at: row.created_at_ms,
+            thread_id: format!("{}:{}", row.provider, row.session_id),
+            provider: row.provider.to_string(),
+            model: row.model,
+            subagent: row.subagent,
+            input_tokens: row.usage.input,
+            output_tokens: row.usage.output,
+            cache_read_tokens: row.usage.cache_read,
+            cache_write_tokens: row.usage.cache_write,
+            reasoning_tokens: row.usage.reasoning,
+            cost_usd: cost,
+            cost_source: cost_source.map(str::to_string),
+        });
+    }
+    report.rows_updated += db.upsert_provider_usage_rows(&cache_rows)? as i64;
+    Ok(())
+}
+
+/// Scan Claude, Codex, and OpenCode provider histories.
+///
+/// JSONL files are re-read in full when their size or mtime changes because
+/// the metadata needed to interpret a tail record may occur at the start.
+/// SQLite scans include the WAL in their signature. Provider-native keys make
+/// overlapping databases, migrated legacy JSON, and repeated scans harmless.
+#[tauri::command]
+pub async fn usage_scan_provider_history(
+    db: State<'_, DatabaseStore>,
+) -> Result<UsageImportReport, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let mut report = UsageImportReport::default();
+    let mut sessions = HashSet::new();
+    let mut completed_states = Vec::new();
+    let mut pending_rows = Vec::new();
+
+    let stale_version = purge_if_importer_changed(&db)?;
+    report.reimported = stale_version;
+
+    let targets: [(PathBuf, &'static str); 2] = [
+        (home.join(".claude").join("projects"), "claude"),
+        (home.join(".codex").join("sessions"), "codex"),
+    ];
+    for (root, provider) in targets {
+        let mut files = Vec::new();
+        find_jsonl(&root, &mut files);
+        for path in files {
+            let Some(signature) = file_signature(&path) else {
+                continue;
+            };
+            let key = path.to_string_lossy().to_string();
+            if !source_changed(&db, &key, signature) {
+                continue;
+            }
+            report.files_scanned += 1;
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let lines = BufReader::new(file).lines().map_while(Result::ok);
+            let rows = match provider {
+                "claude" => parse_claude_transcript(lines),
+                _ => parse_codex_rollout(lines),
+            };
+            pending_rows.extend(rows);
+            completed_states.push((key, signature.0, signature.1));
         }
     }
 
-    // Only after a full successful pass — recording it earlier would let
-    // a scan that died halfway leave a half-rebuilt ledger looking
-    // current.
-    if stale_version {
-        let _ = db.set_setting(IMPORT_VERSION_KEY, &IMPORT_VERSION.to_string());
+    let opencode_root = opencode_storage_root();
+    for path in opencode_databases(opencode_root.as_deref()) {
+        let Some(signature) = sqlite_signature(&path) else {
+            continue;
+        };
+        let key = path.to_string_lossy().to_string();
+        if !source_changed(&db, &key, signature) {
+            continue;
+        }
+        report.files_scanned += 1;
+        match read_opencode_db(&path) {
+            Ok(rows) => {
+                pending_rows.extend(rows);
+                completed_states.push((key, signature.0, signature.1));
+            }
+            Err(error) => eprintln!("[codemux::usage_import] {error}"),
+        }
     }
 
+    // Older OpenCode versions used one JSON file per message. Scan this even
+    // when SQLite exists: migrations can leave orphaned history, and the
+    // global message key deduplicates rows present in both stores.
+    if let Some(root) = opencode_root.as_deref() {
+        let storage = root.join("storage");
+        let mut session_files = Vec::new();
+        find_files_with_extension(&storage.join("session"), "json", &mut session_files);
+        let mut message_files = Vec::new();
+        find_files_with_extension(&storage.join("message"), "json", &mut message_files);
+        let mut legacy_files = session_files.clone();
+        legacy_files.extend(message_files.iter().cloned());
+        if let Some(signature) = tree_signature(&legacy_files) {
+            let key = format!("{}::legacy-tree", storage.to_string_lossy());
+            if source_changed(&db, &key, signature) {
+                report.files_scanned += legacy_files.len() as i64;
+                let mut child_sessions = HashSet::new();
+                for path in session_files {
+                    let Ok(raw) = std::fs::read_to_string(path) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    if value.get("parentID").and_then(|v| v.as_str()).is_some() {
+                        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                            child_sessions.insert(id.to_string());
+                        }
+                    }
+                }
+
+                let mut rows = Vec::new();
+                for path in message_files {
+                    let Ok(raw) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    let message_id = value
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| path.file_stem().and_then(|v| v.to_str()))
+                        .unwrap_or("unknown");
+                    let session_id = value
+                        .get("sessionID")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            path.parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|v| v.to_str())
+                        })
+                        .unwrap_or("unknown");
+                    if let Some(row) = parse_opencode_message(
+                        &value,
+                        message_id,
+                        session_id,
+                        signature.0,
+                        child_sessions.contains(session_id),
+                    ) {
+                        rows.push(row);
+                    }
+                }
+                pending_rows.extend(rows);
+                completed_states.push((key, signature.0, signature.1));
+            }
+        }
+    }
+
+    materialize_rows(&db, pending_rows, &mut report, &mut sessions)?;
+    report.sessions_found = sessions.len() as i64;
+    db.set_usage_import_states(&completed_states, now_ms())?;
+    // Record the version only after a complete pass so an interrupted rebuild
+    // is retried instead of being accepted as current.
+    if stale_version {
+        db.set_setting(IMPORT_VERSION_KEY, &IMPORT_VERSION.to_string())?;
+    }
     Ok(report)
 }
 
-/// Drop imported rows produced by an older importer, so this scan
-/// rebuilds them.
+/// Drop a cache produced by an older importer, so this scan rebuilds it.
 ///
 /// Returns whether a purge happened, which is also the caller's signal
 /// that the new version still needs recording — deliberately *after* the
@@ -710,10 +998,10 @@ fn purge_if_importer_changed(db: &DatabaseStore) -> Result<bool, String> {
     }
     // A failed purge propagates rather than being swallowed: continuing
     // would append new-format rows beside stale ones and double-count.
-    let removed = db.reset_cli_imports()?;
+    let removed = db.reset_usage_history()?;
     eprintln!(
         "[codemux::usage_import] importer v{recorded} → v{IMPORT_VERSION}: \
-         dropped {removed} imported rows, re-importing from the logs"
+         dropped {removed} cached rows, rebuilding from provider history"
     );
     Ok(true)
 }
@@ -721,12 +1009,6 @@ fn purge_if_importer_changed(db: &DatabaseStore) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ctx(own: &[&str]) -> ScanContext {
-        ScanContext {
-            own_session_ids: own.iter().map(|s| s.to_string()).collect(),
-        }
-    }
 
     fn lines(raw: &str) -> impl Iterator<Item = String> + '_ {
         raw.lines().map(|l| l.to_string())
@@ -752,7 +1034,7 @@ mod tests {
 
     #[test]
     fn claude_repeated_message_ids_collapse_to_their_maximum() {
-        let (rows, _) = parse_claude_transcript(lines(CLAUDE_JSONL), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(CLAUDE_JSONL));
         assert_eq!(rows.len(), 2, "two distinct message ids");
         let a = find(&rows, "msg_A");
         // NOT 255 + 812 — the records are cumulative snapshots.
@@ -765,7 +1047,7 @@ mod tests {
 
     #[test]
     fn claude_marks_sidechain_records_as_subagents() {
-        let (rows, _) = parse_claude_transcript(lines(CLAUDE_JSONL), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(CLAUDE_JSONL));
         let b = find(&rows, "msg_B");
         assert!(b.subagent, "isSidechain drives the subagent flag");
         assert_eq!(b.usage.cache_read, 900);
@@ -775,7 +1057,7 @@ mod tests {
     /// the split has to survive the parse or the row is mispriced.
     #[test]
     fn claude_reads_the_one_hour_cache_write_subset() {
-        let (rows, _) = parse_claude_transcript(lines(CLAUDE_JSONL), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(CLAUDE_JSONL));
         let a = find(&rows, "msg_A");
         assert_eq!(a.usage.cache_write, 25661);
         assert_eq!(a.usage.cache_write_1h, 25661, "all of it is 1-hour");
@@ -792,7 +1074,7 @@ mod tests {
     #[test]
     fn claude_prefers_the_ephemeral_sum_when_the_total_under_reports() {
         let raw = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-07-31T10:00:00.000Z","requestId":"r","message":{"id":"m","model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":660934,"cache_creation":{"ephemeral_1h_input_tokens":700000,"ephemeral_5m_input_tokens":26864}}}}"#;
-        let (rows, _) = parse_claude_transcript(lines(raw), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(raw));
         assert_eq!(rows[0].usage.cache_write, 726_864, "the larger of the two");
         assert_eq!(rows[0].usage.cache_write_1h, 700_000);
     }
@@ -802,17 +1084,16 @@ mod tests {
     #[test]
     fn claude_skips_synthetic_records() {
         let raw = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-07-31T10:00:00.000Z","message":{"id":"m","model":"<synthetic>","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
-        let (rows, _) = parse_claude_transcript(lines(raw), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(raw));
         assert!(rows.is_empty());
     }
 
-    /// Without this the whole live ledger double-counts the instant the
-    /// toggle is switched on.
+    /// Codemux-launched sessions are present in the same provider history as
+    /// terminal-launched sessions and must be counted exactly once there.
     #[test]
-    fn claude_skips_sessions_codemux_itself_drove() {
-        let (rows, skipped) = parse_claude_transcript(lines(CLAUDE_JSONL), &ctx(&["sess-1"]));
-        assert!(rows.is_empty());
-        assert!(skipped, "and reports why");
+    fn claude_includes_sessions_regardless_of_launcher() {
+        let rows = parse_claude_transcript(lines(CLAUDE_JSONL));
+        assert_eq!(rows.len(), 2);
     }
 
     /// The key is ccusage's — `message.id` + `requestId` — and crucially
@@ -820,7 +1101,7 @@ mod tests {
     /// forked transcript dedups against the unique index.
     #[test]
     fn claude_import_keys_are_global_and_carry_the_request_id() {
-        let (rows, _) = parse_claude_transcript(lines(CLAUDE_JSONL), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(CLAUDE_JSONL));
         let keys: HashSet<&str> = rows.iter().map(|r| r.import_key.as_str()).collect();
         assert_eq!(keys.len(), rows.len());
         assert!(keys.contains("claude:msg_A:req_1"), "got {keys:?}");
@@ -829,7 +1110,7 @@ mod tests {
         // The same response under a different session id produces the
         // SAME key, which is the whole point.
         let forked = CLAUDE_JSONL.replace("sess-1", "sess-2");
-        let (forked_rows, _) = parse_claude_transcript(lines(&forked), &ctx(&[]));
+        let forked_rows = parse_claude_transcript(lines(&forked));
         let forked_keys: HashSet<&str> =
             forked_rows.iter().map(|r| r.import_key.as_str()).collect();
         assert_eq!(keys, forked_keys);
@@ -838,7 +1119,7 @@ mod tests {
     #[test]
     fn claude_rows_without_a_request_id_still_get_a_stable_key() {
         let raw = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-07-31T10:00:00.000Z","message":{"id":"m","model":"claude-fable-5","usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
-        let (rows, _) = parse_claude_transcript(lines(raw), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(raw));
         assert_eq!(rows[0].import_key, "claude:m:-");
     }
 
@@ -849,7 +1130,7 @@ mod tests {
             "{}\n{{\"type\":\"assistant\",\"broken\n\nnot json at all\n",
             CLAUDE_JSONL.trim()
         );
-        let (rows, _) = parse_claude_transcript(lines(&raw), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(&raw));
         assert_eq!(rows.len(), 2, "good records still land");
     }
 
@@ -857,7 +1138,7 @@ mod tests {
     fn claude_transcript_without_usage_yields_nothing() {
         let raw = r#"{"type":"user","sessionId":"s"}
 {"type":"summary"}"#;
-        let (rows, _) = parse_claude_transcript(lines(raw), &ctx(&[]));
+        let rows = parse_claude_transcript(lines(raw));
         assert!(rows.is_empty());
     }
 
@@ -875,7 +1156,7 @@ mod tests {
     /// turn's own timestamp and priced at the model that served it.
     #[test]
     fn codex_imports_one_row_per_turn_from_the_delta_counter() {
-        let (rows, _) = parse_codex_rollout(lines(CODEX_JSONL), &ctx(&[]));
+        let rows = parse_codex_rollout(lines(CODEX_JSONL));
         assert_eq!(rows.len(), 2, "one row per token_count event");
 
         let first = &rows[0];
@@ -920,7 +1201,7 @@ mod tests {
 {"timestamp":"2026-07-21T13:17:54.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"total_tokens":110}}}}
 {"timestamp":"2026-07-21T13:17:55.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":0,"output_tokens":20,"total_tokens":220}}}}
 "#;
-        let (rows, _) = parse_codex_rollout(lines(repeated), &ctx(&[]));
+        let rows = parse_codex_rollout(lines(repeated));
         assert_eq!(rows.len(), 2, "the repeat is dropped");
         assert_eq!(rows[0].usage.output, 10);
         assert_eq!(rows[1].usage.output, 20);
@@ -936,7 +1217,7 @@ mod tests {
 {"timestamp":"2026-07-21T13:17:46.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
 {"timestamp":"2026-07-21T13:17:53.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":300,"output_tokens":50,"total_tokens":1050}}}}
 "#;
-        let (rows, _) = parse_codex_rollout(lines(raw), &ctx(&[]));
+        let rows = parse_codex_rollout(lines(raw));
         assert_eq!(rows[0].usage.cache_write, 300);
         assert_eq!(rows[0].usage.cache_read, 600);
         assert_eq!(rows[0].usage.input, 100, "1000 - 600 cached - 300 written");
@@ -953,7 +1234,7 @@ mod tests {
 {"timestamp":"2026-07-21T13:17:59.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":40,"output_tokens":25,"total_tokens":325}}}}
 {"timestamp":"2026-07-21T13:18:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5,"cached_input_tokens":0,"output_tokens":1,"total_tokens":6}}}}
 "#;
-        let (rows, _) = parse_codex_rollout(lines(legacy), &ctx(&[]));
+        let rows = parse_codex_rollout(lines(legacy));
         assert_eq!(rows.len(), 1, "one aggregate row per legacy rollout");
         // A truncated tail must not shrink an already-observed total.
         assert_eq!(rows[0].usage.output, 25, "kept the larger reading");
@@ -961,27 +1242,121 @@ mod tests {
     }
 
     #[test]
-    fn codex_skips_rollouts_codemux_itself_drove() {
-        let (rows, skipped) = parse_codex_rollout(
-            lines(CODEX_JSONL),
-            &ctx(&["019f84d2-5235-7aa1-98dc-3ac160d00a32"]),
-        );
-        assert!(rows.is_empty());
-        assert!(skipped);
+    fn codex_includes_rollouts_regardless_of_launcher() {
+        let rows = parse_codex_rollout(lines(CODEX_JSONL));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn codex_marks_child_rollouts_as_subagents() {
+        let raw = r#"
+{"timestamp":"2026-07-21T13:17:45.999Z","type":"session_meta","payload":{"id":"child-1","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1}}},"parent_thread_id":"parent-1"}}
+{"timestamp":"2026-07-21T13:17:46.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"timestamp":"2026-07-21T13:17:53.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"total_tokens":110}}}}
+"#;
+        let rows = parse_codex_rollout(lines(raw));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].subagent);
     }
 
     #[test]
     fn codex_rollout_without_token_counts_yields_nothing() {
         let raw = r#"{"timestamp":"2026-07-21T13:17:45.999Z","type":"session_meta","payload":{"id":"abc"}}"#;
-        let (rows, _) = parse_codex_rollout(lines(raw), &ctx(&[]));
+        let rows = parse_codex_rollout(lines(raw));
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn opencode_normalizes_assistant_messages_and_preserves_reported_cost() {
+        let data = serde_json::json!({
+            "id": "msg-1",
+            "sessionID": "ses-1",
+            "role": "assistant",
+            "providerID": "anthropic",
+            "modelID": "claude-sonnet-4-6",
+            "cost": 1.25,
+            "tokens": {
+                "input": 100,
+                "output": 40,
+                "reasoning": 10,
+                "cache": {"read": 700, "write": 20}
+            },
+            "time": {"created": 1_800_000_000_000_i64}
+        });
+        let row = parse_opencode_message(&data, "fallback", "ses-1", 1, true).unwrap();
+        assert_eq!(row.import_key, "opencode:msg-1");
+        assert_eq!(row.model.as_deref(), Some("anthropic/claude-sonnet-4-6"));
+        assert_eq!(row.usage.input, 100);
+        assert_eq!(row.usage.output, 50, "plain output + reasoning");
+        assert_eq!(row.usage.reasoning, 10);
+        assert_eq!(row.usage.cache_read, 700);
+        assert_eq!(row.usage.cache_write, 20);
+        assert_eq!(row.reported_cost_usd, Some(1.25));
+        assert!(row.subagent);
+    }
+
+    #[test]
+    fn opencode_ignores_user_and_tokenless_messages() {
+        let user = serde_json::json!({"role": "user", "tokens": {"input": 10}});
+        assert!(parse_opencode_message(&user, "m", "s", 1, false).is_none());
+        let empty = serde_json::json!({
+            "role": "assistant",
+            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}
+        });
+        assert!(parse_opencode_message(&empty, "m", "s", 1, false).is_none());
+    }
+
+    #[test]
+    fn opencode_sqlite_reader_uses_messages_and_parent_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_id) VALUES ('child', 'parent')",
+            [],
+        )
+        .unwrap();
+        let data = serde_json::json!({
+            "role": "assistant",
+            "providerID": "openai",
+            "modelID": "gpt-5",
+            "cost": 0.75,
+            "tokens": {"input": 12, "output": 4, "reasoning": 1,
+                       "cache": {"read": 8, "write": 0}}
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data)
+             VALUES ('msg-db', 'child', 1800000000000, ?1)",
+            [data],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_db(&path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].import_key, "opencode:msg-db");
+        assert!(rows[0].subagent);
+        assert_eq!(rows[0].usage.output, 5);
+        assert_eq!(rows[0].reported_cost_usd, Some(0.75));
     }
 
     // ── importer versioning ──
 
     fn seeded_db() -> DatabaseStore {
         let db = DatabaseStore::new_in_memory();
-        db.insert_imported_usage_row(
+        db.upsert_provider_usage_row(
             "claude:msg_A:req_1",
             1_800_000_000_000,
             "cli:sess-1",
@@ -994,23 +1369,27 @@ mod tests {
             0,
             0,
             Some(1.0),
+            Some("table"),
         )
         .unwrap();
-        db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3).unwrap();
+        db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3)
+            .unwrap();
         db
     }
 
     /// An install predating the version constant carries rows priced by
     /// the old table (`gpt-5.6-sol` at a quarter of its real rate) and
-    /// keyed by the old `import_key`. Because insertion is
-    /// `INSERT OR IGNORE`, a plain re-scan would change nothing — so a
-    /// version mismatch has to purge first.
+    /// keyed by the old `import_key`, so a version mismatch rebuilds the
+    /// materialized cache from provider history.
     #[test]
     fn a_stale_importer_version_purges_and_rebuilds() {
         let db = seeded_db();
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 1);
 
-        assert!(purge_if_importer_changed(&db).unwrap(), "version 1 is stale");
+        assert!(
+            purge_if_importer_changed(&db).unwrap(),
+            "version 1 is stale"
+        );
         assert!(db.usage_rows_since(0).unwrap().is_empty());
         assert!(
             db.usage_import_state("/logs/a.jsonl").unwrap().is_none(),

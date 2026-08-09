@@ -1,8 +1,8 @@
 //! Read side of the usage ledger — the query surface behind
 //! Settings → Usage.
 //!
-//! The ledger is written from `ProviderRuntimeEvent::UsageRecorded` (see
-//! `commands::agent_chat::record_usage_row`); this module only reads it.
+//! The ledger is a materialized cache of provider-owned local history; this
+//! module only reads and aggregates it.
 //! Aggregation is a pure function over the rows so it can be unit-tested
 //! without a database, and so the three views the dashboard needs
 //! (time buckets, provider lanes, headline totals) are guaranteed to be
@@ -95,45 +95,6 @@ impl PlanQuotaStore {
     }
 }
 
-/// How a provider's spend is settled.
-///
-/// v1 is a hardcoded mapping (see [`billing_kind_for`]). It is a
-/// function rather than a table so a future per-provider setting has one
-/// obvious place to override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BillingKind {
-    /// Covered by a subscription. Cost is still computed at list price,
-    /// as the *value* the plan delivered — not as money owed.
-    PlanCovered,
-    /// Billed per token against the user's own API keys.
-    Metered,
-}
-
-/// Billing classification, v1.
-///
-/// Claude and Codex are driven through their subscription CLIs, so their
-/// tokens cost nothing marginal; OpenCode talks to upstreams with the
-/// user's own keys, so its tokens are real money. Codemux has no way to
-/// *detect* this — a user could equally be running Claude on a raw API
-/// key — which is exactly why it is stated here as an assumption rather
-/// than inferred, and why the follow-up is a user-facing setting.
-pub fn billing_kind_for(provider: &str, detected: Option<PlanAuthMode>) -> BillingKind {
-    // A detected auth mode is ground truth and always wins: the user
-    // really might be running Claude on a raw API key, or Codex on a
-    // ChatGPT plan. The hardcoded map below is only the guess we fall
-    // back to before any provider has told us.
-    match detected {
-        Some(PlanAuthMode::Subscription) => return BillingKind::PlanCovered,
-        Some(PlanAuthMode::ApiKey) => return BillingKind::Metered,
-        None => {}
-    }
-    match provider {
-        "claude" | "codex" => BillingKind::PlanCovered,
-        _ => BillingKind::Metered,
-    }
-}
-
 /// One bar in the overview chart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageBucket {
@@ -177,32 +138,20 @@ pub struct ProviderUsage {
     pub cost_usd: f64,
     /// Distinct threads that produced any usage in range.
     pub session_count: i64,
-    pub billing: BillingKind,
     /// Per-model rows, largest first.
     pub models: Vec<ModelUsage>,
 }
 
-/// The four hero stats plus the numbers the sub-notes need.
+/// Headline totals for the selected period.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageTotals {
-    /// Cost from metered providers — money actually owed.
-    pub metered_cost_usd: f64,
-    /// Cost from plan-covered providers, priced at list. The value a
-    /// subscription delivered, not a bill.
-    pub plan_covered_cost_usd: f64,
+    /// API/list-price equivalent. This is an estimate of the work's token
+    /// value, never a claim about what the user was actually charged.
+    pub estimated_cost_usd: f64,
     pub total_tokens: i64,
     /// Share of `total_tokens` served from cache reads, 0.0–1.0.
     pub cache_read_share: f64,
     pub session_count: i64,
-    pub workspace_count: i64,
-    /// Distinct `source = 'cli_import'` threads inside `session_count` —
-    /// the terminal-launched CLI sessions folded into this period.
-    ///
-    /// Computed here rather than taken from the last scan's report: a
-    /// scan reports only what it *newly* imported, so an incremental
-    /// re-scan that found one new file would claim "1 session" beside a
-    /// hero reading 430. This is the total for the visible window.
-    pub cli_session_count: i64,
 }
 
 /// The token-composition strip: where the period's tokens went.
@@ -390,8 +339,6 @@ fn summarize(
     // Provider accumulators, keyed for stable output ordering later.
     let mut provider_acc: BTreeMap<String, ProviderAcc> = BTreeMap::new();
     let mut all_threads: HashSet<&str> = HashSet::new();
-    let mut cli_threads: HashSet<&str> = HashSet::new();
-    let mut all_workspaces: HashSet<&str> = HashSet::new();
     let mut totals = UsageTotals::default();
     let mut cache_read_total: i64 = 0;
     let mut flat_acc: BTreeMap<(String, String), FlatAcc> = BTreeMap::new();
@@ -404,10 +351,6 @@ fn summarize(
         if row.created_at < start_ms || row.created_at >= end_ms {
             continue;
         }
-        // Imported CLI rows always count. The `source` column is kept so
-        // a Codemux-only filter can return later, but the dashboard's
-        // claim is "everything this machine spent", and a row that is in
-        // the ledger is spend that happened.
         let tokens = row.total_tokens();
         let cost = row.cost_usd.unwrap_or(0.0);
 
@@ -444,13 +387,15 @@ fn summarize(
             .or_default();
         flat.tokens += tokens;
         flat.cost += cost;
-        flat.observed_input += row.observed_input();
-        flat.output += row.output_tokens;
         if row.cost_usd.is_some() {
             flat.priced = true;
         }
         if row.cost_source.as_deref() == Some("provider") {
             flat.provider_reported = true;
+        } else if row.cost_source.as_deref() == Some("table") {
+            flat.table_observed_input += row.observed_input();
+            flat.table_output += row.output_tokens;
+            flat.table_cost += cost;
         }
 
         // Composition strip.
@@ -469,23 +414,12 @@ fn summarize(
         }
 
         all_threads.insert(row.thread_id.as_str());
-        if row.source == "cli_import" {
-            cli_threads.insert(row.thread_id.as_str());
-        }
-        if let Some(ws) = row.workspace_id.as_deref() {
-            all_workspaces.insert(ws);
-        }
         totals.total_tokens += tokens;
+        totals.estimated_cost_usd += cost;
         cache_read_total += row.cache_read_tokens;
-        match billing_kind_for(&row.provider, detected_auth(&quota, &row.provider)) {
-            BillingKind::Metered => totals.metered_cost_usd += cost,
-            BillingKind::PlanCovered => totals.plan_covered_cost_usd += cost,
-        }
     }
 
     totals.session_count = all_threads.len() as i64;
-    totals.cli_session_count = cli_threads.len() as i64;
-    totals.workspace_count = all_workspaces.len() as i64;
     totals.cache_read_share = if totals.total_tokens > 0 {
         cache_read_total as f64 / totals.total_tokens as f64
     } else {
@@ -496,10 +430,7 @@ fn summarize(
     // puts the dominant provider at the top.
     let mut providers: Vec<ProviderUsage> = provider_acc
         .into_iter()
-        .map(|(provider, acc)| {
-            let detected = detected_auth(&quota, &provider);
-            acc.finish(provider, detected)
-        })
+        .map(|(provider, acc)| acc.finish(provider))
         .collect();
     providers.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.provider.cmp(&b.provider)));
 
@@ -518,15 +449,15 @@ fn summarize(
         let Some(rates) = crate::agent_provider::pricing::lookup(model) else {
             continue;
         };
-        let raw = (acc.observed_input as f64 * rates.input
-            + acc.output as f64 * rates.output)
+        let raw = (acc.table_observed_input as f64 * rates.input
+            + acc.table_output as f64 * rates.output)
             / 1_000_000.0;
         raw_total += raw;
-        actual_for_savings += acc.cost;
+        actual_for_savings += acc.table_cost;
         // Clamp per model: a model whose actual cost exceeds the
         // no-cache hypothetical (possible with odd rate tables) must not
         // subtract from another model's genuine saving.
-        savings += (raw - acc.cost).max(0.0);
+        savings += (raw - acc.table_cost).max(0.0);
     }
     composition.cache_savings_usd = savings;
     composition.cache_savings_multiplier = if actual_for_savings > 0.005 {
@@ -604,14 +535,6 @@ fn summarize(
     }
 }
 
-/// The detected auth mode for `provider`, if any quota reading has one.
-fn detected_auth(
-    quota: &HashMap<String, ProviderQuota>,
-    provider: &str,
-) -> Option<PlanAuthMode> {
-    quota.get(provider).and_then(|q| q.auth_mode)
-}
-
 #[derive(Default)]
 struct ProviderAcc {
     tokens: i64,
@@ -637,16 +560,16 @@ struct ModelAcc {
 struct FlatAcc {
     tokens: i64,
     cost: f64,
-    /// Prompt tokens however they arrived — the quantity a
-    /// no-cache world would have paid full input rate for.
-    observed_input: i64,
-    output: i64,
+    /// Savings only compare rows priced by the same static table.
+    table_observed_input: i64,
+    table_output: i64,
+    table_cost: f64,
     priced: bool,
     provider_reported: bool,
 }
 
 impl ProviderAcc {
-    fn finish(self, provider: String, detected: Option<PlanAuthMode>) -> ProviderUsage {
+    fn finish(self, provider: String) -> ProviderUsage {
         let mut models: Vec<ModelUsage> = self
             .models
             .into_iter()
@@ -659,7 +582,6 @@ impl ProviderAcc {
             .collect();
         models.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.model.cmp(&b.model)));
         ProviderUsage {
-            billing: billing_kind_for(&provider, detected),
             provider,
             tokens: self.tokens,
             input_tokens: self.input,
@@ -922,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn billing_splits_metered_from_plan_covered() {
+    fn estimated_cost_sums_every_provider_without_guessing_billing() {
         let s = summarize(
             &[
                 row(NOW, "claude", "claude-opus-4-5", [100, 0, 0, 0], 2.0),
@@ -934,14 +856,7 @@ mod tests {
             0,
             HashMap::new(),
         );
-        assert_eq!(s.totals.metered_cost_usd, 4.0);
-        assert_eq!(s.totals.plan_covered_cost_usd, 5.0);
-        assert_eq!(billing_kind_for("claude", None), BillingKind::PlanCovered);
-        assert_eq!(billing_kind_for("opencode", None), BillingKind::Metered);
-        // An unrecognized provider must default to metered — showing an
-        // unknown cost as "free, covered by a plan" would understate a
-        // real bill.
-        assert_eq!(billing_kind_for("something-new", None), BillingKind::Metered);
+        assert_eq!(s.totals.estimated_cost_usd, 9.0);
     }
 
     #[test]
@@ -965,19 +880,15 @@ mod tests {
     }
 
     #[test]
-    fn distinct_threads_and_workspaces_are_counted_once() {
+    fn distinct_provider_sessions_are_counted_once() {
         let mut a = row(NOW, "claude", "m", [10, 0, 0, 0], 0.0);
         a.thread_id = "t1".into();
-        a.workspace_id = Some("ws1".into());
         let mut b = row(NOW, "claude", "m", [10, 0, 0, 0], 0.0);
         b.thread_id = "t1".into(); // same thread, second increment
-        b.workspace_id = Some("ws1".into());
         let mut c = row(NOW, "codex", "m", [10, 0, 0, 0], 0.0);
         c.thread_id = "t2".into();
-        c.workspace_id = Some("ws2".into());
         let s = summarize(&[a, b, c], Period::Today, NOW, 0, HashMap::new());
         assert_eq!(s.totals.session_count, 2);
-        assert_eq!(s.totals.workspace_count, 2);
         assert_eq!(s.providers.iter().find(|p| p.provider == "claude").unwrap().session_count, 1);
     }
 
@@ -1189,29 +1100,9 @@ mod tests {
         assert!(store.auth_mode_for("claude").is_none());
     }
 
-    /// Detected auth beats the hardcoded guess in BOTH directions —
-    /// that is the whole point of detecting it.
+    /// Cost estimation and subscription quota are deliberately independent.
     #[test]
-    fn detected_auth_mode_overrides_the_hardcoded_mapping() {
-        // Claude on a raw API key is a real bill, not plan-covered.
-        assert_eq!(
-            billing_kind_for("claude", Some(PlanAuthMode::ApiKey)),
-            BillingKind::Metered
-        );
-        // OpenCode against a subscription-backed upstream is covered.
-        assert_eq!(
-            billing_kind_for("opencode", Some(PlanAuthMode::Subscription)),
-            BillingKind::PlanCovered
-        );
-        // With nothing detected, the hardcoded guess stands.
-        assert_eq!(billing_kind_for("claude", None), BillingKind::PlanCovered);
-        assert_eq!(billing_kind_for("opencode", None), BillingKind::Metered);
-    }
-
-    /// The summary's totals must follow the detected mode too, not just
-    /// the per-lane badge.
-    #[test]
-    fn summary_totals_follow_detected_auth_mode() {
+    fn summary_reports_api_equivalent_cost_alongside_quota() {
         let mut quota = HashMap::new();
         quota.insert(
             "claude".to_string(),
@@ -1229,10 +1120,7 @@ mod tests {
             0,
             quota,
         );
-        assert_eq!(s.providers[0].billing, BillingKind::Metered);
-        assert_eq!(s.totals.metered_cost_usd, 3.0);
-        assert_eq!(s.totals.plan_covered_cost_usd, 0.0);
-        // And the quota rides along for the UI.
+        assert_eq!(s.totals.estimated_cost_usd, 3.0);
         assert_eq!(s.quota["claude"].windows.len(), 1);
         assert_eq!(s.quota["claude"].plan_label.as_deref(), Some("Max 20x"));
     }
@@ -1425,68 +1313,25 @@ mod tests {
         assert!(lines[1].ends_with("table"));
     }
 
-    // ── CLI-import inclusion ──
+    // ── provider-history inclusion ──
 
-    /// CLI folding is unconditional — there is no longer a toggle, and
-    /// an imported row counts exactly like a live one.
+    /// Every provider-history row counts independent of which app launched it.
     #[test]
     fn imported_rows_always_count() {
         let mut imported = row(NOW, "claude", "claude-opus-4-5", [100, 0, 0, 0], 2.0);
-        imported.source = "cli_import".into();
-        imported.thread_id = "cli:sess-9".into();
+        imported.source = "provider_history".into();
+        imported.thread_id = "claude:sess-9".into();
         let live = row(NOW, "claude", "claude-opus-4-5", [10, 0, 0, 0], 0.5);
 
         let s = summarize(&[imported, live], Period::Today, NOW, 0, HashMap::new());
         assert_eq!(s.totals.total_tokens, 110);
-        // The CLI session joins the session count…
         assert_eq!(s.totals.session_count, 2);
-        // …but contributes no workspace (imports have none).
-        assert_eq!(s.totals.workspace_count, 1);
-    }
-
-    /// The footer's "N terminal CLI sessions" figure. It must be the
-    /// distinct imported threads **in the period**, not the last scan's
-    /// new-session count — that bug put "8 sessions folded in" beside a
-    /// hero reading 430.
-    #[test]
-    fn cli_session_count_is_the_distinct_imported_threads_in_range() {
-        let imported = |thread: &str, at: i64| {
-            let mut r = row(at, "claude", "claude-opus-4-5", [10, 0, 0, 0], 0.1);
-            r.source = "cli_import".into();
-            r.thread_id = thread.to_string();
-            r
-        };
-        let rows = [
-            // Two rows for one session — one session, not two.
-            imported("cli:sess-a", NOW),
-            imported("cli:sess-a", NOW - 1000),
-            imported("cli:sess-b", NOW),
-            // Live rows never count toward the CLI figure.
-            row(NOW, "claude", "claude-opus-4-5", [10, 0, 0, 0], 0.1),
-            // Out of range entirely.
-            imported("cli:sess-old", NOW - 40 * DAY_MS),
-        ];
-
-        let s = summarize(&rows, Period::Today, NOW, 0, HashMap::new());
-        assert_eq!(s.totals.cli_session_count, 2);
-        assert_eq!(s.totals.session_count, 3, "CLI sessions plus the live one");
-
-        // A period with no imports at all reports zero rather than
-        // inheriting the last scan's number.
-        let live_only = summarize(
-            &[row(NOW, "claude", "claude-opus-4-5", [10, 0, 0, 0], 0.1)],
-            Period::Today,
-            NOW,
-            0,
-            HashMap::new(),
-        );
-        assert_eq!(live_only.totals.cli_session_count, 0);
     }
 
     #[test]
     fn imported_rows_blend_into_the_existing_provider_lane() {
         let mut imported = row(NOW, "claude", "claude-opus-4-5", [100, 0, 0, 0], 2.0);
-        imported.source = "cli_import".into();
+        imported.source = "provider_history".into();
         let s = summarize(
             &[imported, row(NOW, "claude", "claude-opus-4-5", [10, 0, 0, 0], 0.5)],
             Period::Today,
@@ -1501,7 +1346,7 @@ mod tests {
     #[test]
     fn csv_includes_imported_rows_too() {
         let mut imported = row(NOW, "claude", "cli-model", [100, 0, 0, 0], 2.0);
-        imported.source = "cli_import".into();
+        imported.source = "provider_history".into();
         let rows = [imported, row(NOW, "claude", "live-model", [10, 0, 0, 0], 0.5)];
         let csv = to_csv(&rows, Period::Days7, NOW, 0);
         assert!(csv.contains("cli-model"));

@@ -2341,7 +2341,7 @@ const USAGE_MONTHS = [
 /** Realistic fixture for `usage_summary`.
  *
  *  Mirrors the shapes the real aggregation produces: Claude dominates,
- *  Codex is second, OpenCode is the only metered provider, weekends dip,
+ *  Codex is second, OpenCode is third, weekends dip,
  *  and one Claude model carries all the subagent tokens. */
 export function mockUsageSummary(period: string): unknown {
   const hourly = period === "today";
@@ -2414,7 +2414,6 @@ export function mockUsageSummary(period: string): unknown {
       cache_write_tokens: Math.round(tokens * 0.06),
       cost_usd: cost,
       session_count: Math.max(1, Math.round(tokens / 1e6 * 3.1)),
-      billing: provider === "opencode" ? "metered" : "plan_covered",
       models: USAGE_MODELS[provider].map((entry) => ({
         model: entry.model,
         tokens: Math.round(tokens * entry.weight),
@@ -2467,8 +2466,8 @@ export function mockUsageSummary(period: string): unknown {
       .filter((p) => p.provider !== "claude")
       .reduce((n, p) => n + p.output_tokens, 0) * 0.38,
   );
-  const meteredCost = providers
-    .filter((p) => p.billing === "metered")
+  const providerPricedCost = providers
+    .filter((p) => p.provider === "opencode")
     .reduce((n, p) => n + p.cost_usd, 0);
   const allCost = providers.reduce((n, p) => n + p.cost_usd, 0);
   const savings = allCost * 2.2;
@@ -2508,27 +2507,18 @@ export function mockUsageSummary(period: string): unknown {
       cache_savings_multiplier: 3.2,
     },
     confidence: {
-      provider_reported_share: allCost > 0 ? meteredCost / allCost : 0,
-      table_priced_share: allCost > 0 ? 1 - meteredCost / allCost : 0,
+      provider_reported_share: allCost > 0 ? providerPricedCost / allCost : 0,
+      table_priced_share: allCost > 0 ? 1 - providerPricedCost / allCost : 0,
       unpriced_token_share: 0.041,
       cache_savings_usd: savings,
     },
     models,
     quota,
     totals: {
-      metered_cost_usd: providers
-        .filter((p) => p.billing === "metered")
-        .reduce((sum, p) => sum + p.cost_usd, 0),
-      plan_covered_cost_usd: providers
-        .filter((p) => p.billing === "plan_covered")
-        .reduce((sum, p) => sum + p.cost_usd, 0),
+      estimated_cost_usd: allCost,
       total_tokens: totalTokens,
       cache_read_share: totalTokens > 0 ? cacheRead / totalTokens : 0,
       session_count: providers.reduce((sum, p) => sum + p.session_count, 0),
-      workspace_count: 9,
-      // The imported share of `session_count` — terminal-launched CLI
-      // sessions the dev mock pretends to have folded in.
-      cli_session_count: 12,
     },
     synced_at_ms: now,
   };

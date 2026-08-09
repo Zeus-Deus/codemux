@@ -1831,10 +1831,6 @@ export const removeToolPermission = (
 
 // ── Usage ──
 
-/** How a provider's spend is settled. `plan_covered` costs are real
- *  list-price value delivered by a subscription, not money owed. */
-export type BillingKind = "plan_covered" | "metered";
-
 export interface UsageBucketSlice {
   tokens: number;
   cost_usd: number;
@@ -1868,23 +1864,16 @@ export interface UsageProvider {
   cache_write_tokens: number;
   cost_usd: number;
   session_count: number;
-  billing: BillingKind;
   models: UsageModel[];
 }
 
 export interface UsageTotals {
-  metered_cost_usd: number;
-  plan_covered_cost_usd: number;
+  /** API/list-price equivalent, not necessarily money charged. */
+  estimated_cost_usd: number;
   total_tokens: number;
   /** Cache-read share of all tokens, 0–1. */
   cache_read_share: number;
   session_count: number;
-  workspace_count: number;
-  /** Distinct terminal-launched CLI sessions inside `session_count`.
-   *  Computed over the visible period — NOT the last scan's new-session
-   *  count, which is what the footer used to show (and why it read "8"
-   *  beside a hero of 430). */
-  cli_session_count: number;
 }
 
 /** Which quota window a meter describes. */
@@ -1980,9 +1969,7 @@ function localTzOffsetMinutes(): number {
   return -new Date().getTimezoneOffset();
 }
 
-/** Imported CLI-log rows are always folded in — there is no toggle. The
- *  `source` column still distinguishes them in the database, so a
- *  Codemux-only filter could return without a re-import. */
+/** Usage is read from each provider's durable local history. */
 export const usageSummary = (period: UsagePeriod) =>
   invoke<UsageSummary>("usage_summary", {
     period,
@@ -1995,21 +1982,19 @@ export const usageExportCsv = (period: UsagePeriod) =>
     tzOffsetMinutes: localTzOffsetMinutes(),
   });
 
-/** What one CLI-log scan did. */
-export interface CliImportReport {
+/** What one provider-history scan did. */
+export interface UsageImportReport {
   files_scanned: number;
   sessions_found: number;
-  rows_added: number;
-  sessions_skipped_own: number;
-  /** True when the scan found a stale importer version and rebuilt the
-   *  imported half of the ledger from the logs. */
+  rows_updated: number;
+  /** True when the scan rebuilt its materialized cache. */
   reimported: boolean;
 }
 
-/** Scan ~/.claude/projects and ~/.codex/sessions for usage Codemux did
- *  not drive. Incremental; safe to call repeatedly. */
-export const usageScanCliLogs = () =>
-  invoke<CliImportReport>("usage_scan_cli_logs");
+/** Scan Claude, Codex, and OpenCode history on this machine. Incremental
+ *  and safe to call repeatedly. */
+export const usageScanProviderHistory = () =>
+  invoke<UsageImportReport>("usage_scan_provider_history");
 
 // ── Skills ──
 

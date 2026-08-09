@@ -2,9 +2,9 @@
 //!
 //! The Settings → Usage dashboard reports what a turn *would* cost at
 //! published list prices, regardless of how the user actually pays for it
-//! (a Claude Max subscription, a ChatGPT plan, or metered API keys). That
-//! makes "plan-covered value" comparable against "metered spend" in one
-//! number, which is the whole point of the overview card.
+//! (a Claude Max subscription, a ChatGPT plan, or metered API keys). It is an
+//! API-equivalent estimate, not a claim about what a plan covered or what the
+//! provider billed.
 //!
 //! Matching is by **model-id substring**, deliberately: every provider
 //! spells its ids differently and they gain suffixes over time
@@ -14,9 +14,9 @@
 //! tokens but no cost — the UI shows the tokens and simply omits them from
 //! the money column.
 //!
-//! OpenCode is the exception: its model catalogue ships real per-model
-//! pricing from the upstream provider, so the adapter prefers that and
-//! only falls back to this table when the catalogue is unavailable.
+//! OpenCode is the exception: its durable message records can carry a cost
+//! calculated from the upstream model catalogue, so the history importer
+//! prefers that and only falls back to this table when it is absent.
 
 /// List price for one model family, in **USD per million tokens**.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,8 +96,8 @@ impl ModelRates {
     /// Cost in USD for one non-overlapping token split.
     ///
     /// The four counts must be disjoint — that invariant is established by
-    /// each adapter before it emits `UsageRecorded`, precisely so this
-    /// function can be a plain dot product.
+    /// each history importer before materialization, so this function can be
+    /// a plain dot product.
     pub fn cost_usd(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
         self.cost_usd_with_1h(input, output, cache_read, cache_write, 0)
     }

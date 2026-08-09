@@ -2080,7 +2080,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::opencode_list_models,
             commands::usage_summary,
             commands::usage_export_csv,
-            commands::usage_scan_cli_logs,
+            commands::usage_scan_provider_history,
             commands::list_tool_permissions,
             commands::remove_tool_permission,
             commands::list_skills,

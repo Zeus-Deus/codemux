@@ -1896,13 +1896,12 @@ const handlers: Record<string, Handler> = {
     mockUsageSummary(String(args.period ?? "7d")),
   usage_export_csv: (args: Args) =>
     mockUsageExportCsv(String(args.period ?? "7d")),
-  // The dev mock has no logs to read; report a plausible scan. The
+  // The dev mock has no provider history to read; report a plausible scan. The
   // footer's session count comes from the summary, not from here.
-  usage_scan_cli_logs: () => ({
+  usage_scan_provider_history: () => ({
     files_scanned: 34,
     sessions_found: 12,
-    rows_added: 0,
-    sessions_skipped_own: 7,
+    rows_updated: 0,
     reimported: false,
   }),
 

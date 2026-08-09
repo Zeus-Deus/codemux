@@ -26,8 +26,7 @@ use tokio::io::AsyncReadExt;
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
     ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    CostSource, SerializableProviderError, StartSessionInput, SubagentTaskKind, ThreadId, TurnId,
-    UsageBaseline,
+    SerializableProviderError, StartSessionInput, SubagentTaskKind, ThreadId, TurnId,
     UserMessageImage,
 };
 use crate::database::{
@@ -551,11 +550,8 @@ pub async fn agent_chat_start_session<R: Runtime>(
         );
     }
     input.permission_mode = resolved_permission_mode;
-    // Seed the ledger baseline. A brand-new thread has no rows, so this is
-    // zero; a thread being re-started against an existing id (provider
-    // handoff, silent restart) gets its recorded totals so a lifetime
-    // counter is not replayed into the ledger.
-    input.recorded_usage_baseline = recorded_usage_baseline(&app, &input.thread_id, provider);
+    // Provider history, not runtime deltas, owns accounting.
+    input.recorded_usage_baseline = None;
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
@@ -1186,7 +1182,6 @@ pub async fn ensure_live_session<R: Runtime>(
         }
     }
 
-    let usage_baseline = recorded_usage_baseline(&app, &thread_id, provider_kind);
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
@@ -1199,8 +1194,7 @@ pub async fn ensure_live_session<R: Runtime>(
         additional_directories: vec![],
         env: env.clone(),
         extra: serde_json::Value::Null,
-        // A rebuild is exactly the case the baseline exists for.
-        recorded_usage_baseline: usage_baseline,
+        recorded_usage_baseline: None,
     };
 
     eprintln!(
@@ -3219,11 +3213,6 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // apart from "new".
     let mut persisted_id: Option<i64> = None;
 
-    // The usage ledger is a sink, not a transcript event: intercept it
-    // here, write the row, and return. It deliberately does NOT continue
-    // into the persistence / fan-out path below —
-    // `agent_chat_messages` would replay it on hydrate and double-count
-    // every row, and no frontend reducer consumes it.
     // Plan quota is provider-scoped level state, not transcript or
     // history: intercept it, update the in-memory store, and return. Like
     // `UsageRecorded` it is never persisted and never fanned out — but
@@ -3255,36 +3244,10 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         return;
     }
 
-    if let ProviderRuntimeEvent::UsageRecorded {
-        thread_id,
-        provider,
-        model,
-        subagent,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        reasoning_tokens,
-        cost_usd,
-        cost_source,
-    } = &event
-    {
-        record_usage_row(
-            app,
-            thread_id,
-            *provider,
-            model.as_deref(),
-            *subagent,
-            [
-                *input_tokens,
-                *output_tokens,
-                *cache_read_tokens,
-                *cache_write_tokens,
-            ],
-            *reasoning_tokens,
-            *cost_usd,
-            *cost_source,
-        );
+    // Runtime usage events from older adapters are intentionally discarded.
+    // Provider-owned history is the sole accounting source; writing both
+    // streams would count every Codemux-launched turn twice.
+    if matches!(event, ProviderRuntimeEvent::UsageRecorded { .. }) {
         return;
     }
 
@@ -4717,102 +4680,6 @@ pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
 /// Whether a canonical provider event should be written to
 /// `agent_chat_messages`. Extracted so the policy is unit-testable
 /// without an `AppHandle`.
-/// Ledger totals already recorded for `thread_id` under `provider`.
-///
-/// Handed to the adapter as `StartSessionInput::recorded_usage_baseline`
-/// so a provider whose token counter is a **lifetime total that survives
-/// resume** (Codex) does not re-record the thread's history when its
-/// session is rebuilt. Only Codex reads it today; the query is cheap and
-/// provider-scoped, so it is computed for whichever provider is starting.
-///
-/// A failure here is not fatal — the baseline degrades to `None`, which
-/// is exactly the pre-existing behavior.
-fn recorded_usage_baseline<R: Runtime>(
-    app: &AppHandle<R>,
-    thread_id: &ThreadId,
-    provider: ProviderKind,
-) -> Option<UsageBaseline> {
-    let provider = serde_json::to_value(provider)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))?;
-    let db: State<'_, DatabaseStore> = app.state();
-    match db.recorded_usage_totals(&thread_id.0, &provider) {
-        Ok((input, output, cache_read, cache_write, reasoning)) => Some(UsageBaseline {
-            input_tokens: input.max(0) as u64,
-            output_tokens: output.max(0) as u64,
-            cache_read_tokens: cache_read.max(0) as u64,
-            cache_write_tokens: cache_write.max(0) as u64,
-            reasoning_tokens: reasoning.max(0) as u64,
-        }),
-        Err(error) => {
-            eprintln!("[codemux::agent_chat] failed to read usage baseline: {error}");
-            None
-        }
-    }
-}
-
-/// Write one [`UsageRecorded`](ProviderRuntimeEvent::UsageRecorded)
-/// increment into `agent_usage_ledger`.
-///
-/// Two filters apply:
-///
-/// * **Tokenless rows are dropped.** An adapter can legitimately emit a
-///   zero split (a provider re-sending an unchanged cumulative total),
-///   and a row that costs nothing and counts nothing only dilutes the
-///   `COUNT(DISTINCT thread_id)` session figure.
-/// * **`workspace_id` is resolved from the session**, not carried on the
-///   event, because the provider layer has no notion of workspaces. It
-///   is denormalized into the row so the figure survives the chat being
-///   deleted later.
-///
-/// Failures are logged and swallowed: losing an accounting row is bad,
-/// but killing the event bridge — and with it the live transcript —
-/// over one failed insert is much worse.
-fn record_usage_row<R: Runtime>(
-    app: &AppHandle<R>,
-    thread_id: &ThreadId,
-    provider: ProviderKind,
-    model: Option<&str>,
-    subagent: bool,
-    tokens: [u64; 4],
-    reasoning_tokens: u64,
-    cost_usd: Option<f64>,
-    cost_source: Option<CostSource>,
-) {
-    if tokens.iter().all(|t| *t == 0) {
-        return;
-    }
-    let db: State<'_, DatabaseStore> = app.state();
-    let workspace_id = db
-        .get_agent_chat_session(&thread_id.0)
-        .map(|session| session.workspace_id);
-    let provider = serde_json::to_value(provider)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| format!("{provider:?}").to_lowercase());
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    if let Err(error) = db.insert_usage_row(
-        now_ms,
-        &thread_id.0,
-        workspace_id.as_deref(),
-        &provider,
-        model,
-        subagent,
-        tokens[0] as i64,
-        tokens[1] as i64,
-        tokens[2] as i64,
-        tokens[3] as i64,
-        reasoning_tokens as i64,
-        cost_usd,
-        cost_source.map(|s| s.as_str()),
-    ) {
-        eprintln!("[codemux::agent_chat] failed to record usage row: {error}");
-    }
-}
-
 pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
     matches!(
         event,

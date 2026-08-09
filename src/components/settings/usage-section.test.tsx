@@ -15,12 +15,12 @@ vi.mock("@/lib/toast", () => ({
 vi.mock("@/tauri/commands", () => ({
   usageSummary: vi.fn(),
   usageExportCsv: vi.fn(),
-  usageScanCliLogs: vi.fn(),
+  usageScanProviderHistory: vi.fn(),
 }));
 
 import {
   usageExportCsv,
-  usageScanCliLogs,
+  usageScanProviderHistory,
   usageSummary,
 } from "@/tauri/commands";
 import type { PlanUsageWindow, UsageSummary } from "@/tauri/commands";
@@ -28,7 +28,6 @@ import type { PlanUsageWindow, UsageSummary } from "@/tauri/commands";
 import {
   UsageSection,
   formatMoney,
-  formatMoney0,
   formatResetAt,
   formatTokens,
   meterTone,
@@ -64,7 +63,6 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
         cache_write_tokens: 300_000,
         cost_usd: 65.8,
         session_count: 12,
-        billing: "plan_covered",
         models: [
           {
             model: "claude-opus-4-5",
@@ -89,7 +87,6 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
         cache_write_tokens: 100_000,
         cost_usd: 6.44,
         session_count: 3,
-        billing: "metered",
         models: [
           {
             model: "openrouter/kimi-k2",
@@ -101,13 +98,10 @@ function summary(overrides: Partial<UsageSummary> = {}): UsageSummary {
       },
     ],
     totals: {
-      metered_cost_usd: 6.44,
-      plan_covered_cost_usd: 65.8,
+      estimated_cost_usd: 72.24,
       total_tokens: 8_421_000,
       cache_read_share: 0.7,
       session_count: 15,
-      workspace_count: 4,
-      cli_session_count: 6,
     },
     composition: {
       processed_tokens: 8_421_000,
@@ -158,7 +152,7 @@ describe("number formatting", () => {
     expect(formatTokens(0)).toBe("0");
   });
 
-  /// Folding in this machine's CLI history puts the 30-day figure into
+  /// Provider history on a busy machine puts the 30-day figure into
   /// the billions; without a B tier the hero read "7961.5M".
   it("carries a billions tier", () => {
     expect(formatTokens(7_961_500_000)).toBe("8.0B");
@@ -169,21 +163,16 @@ describe("number formatting", () => {
     expect(formatTokens(Number.POSITIVE_INFINITY)).toBe("0");
   });
 
-  it("renders owed money with cents and plan value in whole dollars", () => {
+  it("renders estimated money with cents", () => {
     expect(formatMoney(12.345)).toBe("$12.35");
     expect(formatMoney(0)).toBe("$0.00");
-    // Plan-covered value is an estimate — cents would imply precision
-    // it does not have.
-    expect(formatMoney0(65.8)).toBe("$66");
   });
 
-  /// Five-figure dollar amounts are normal once CLI history is folded
+  /// Five-figure estimates are normal once provider history is included
   /// in, and `$36999.88` misreads at a glance.
   it("groups thousands in large money figures", () => {
     expect(formatMoney(36_999.88)).toBe("$36,999.88");
     expect(formatMoney(1_234_567.891)).toBe("$1,234,567.89");
-    expect(formatMoney0(36_999.88)).toBe("$37,000");
-    expect(formatMoney0(1_234_567)).toBe("$1,234,567");
     // Small figures are untouched.
     expect(formatMoney(999.5)).toBe("$999.50");
   });
@@ -197,22 +186,19 @@ describe("UsageSection", () => {
     vi.mocked(usageExportCsv).mockResolvedValue("bucket_start,provider\n");
   });
 
-  it("renders the four hero stats from the totals", async () => {
+  it("renders the simple headline totals", async () => {
     render(<UsageSection />);
     await waitFor(() => {
-      expect(screen.getByText("Metered")).toBeInTheDocument();
+      expect(screen.getByText("Estimated cost")).toBeInTheDocument();
     });
-    // $6.44 is the metered hero AND the OpenCode lane/legend figure —
-    // the same number by design, so assert presence, not uniqueness.
-    expect(screen.getAllByText("$6.44").length).toBeGreaterThan(0);
-    expect(screen.getByText("Plan-covered")).toBeInTheDocument();
-    expect(screen.getByText("$66")).toBeInTheDocument();
+    expect(screen.getAllByText("$72.24").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("API/list-price equivalent").length).toBeGreaterThan(0);
     // 8.4M is both the hero Tokens stat and the composition strip's
     // Processed figure — the same number by design.
     expect(screen.getAllByText("8.4M").length).toBeGreaterThan(0);
     expect(screen.getByText("15")).toBeInTheDocument();
     expect(screen.getByText("70% served from cache")).toBeInTheDocument();
-    expect(screen.getByText("across 4 workspaces")).toBeInTheDocument();
+    expect(screen.getByText("provider history on this machine")).toBeInTheDocument();
   });
 
   it("defaults to 7 days and refetches when the period changes", async () => {
@@ -231,24 +217,23 @@ describe("UsageSection", () => {
     await waitFor(() => {
       expect(screen.getByText("Total for period")).toBeInTheDocument();
     });
-    // Cost mode distinguishes the two billing kinds in the breakdown.
-    expect(screen.getByText(/metered/)).toBeInTheDocument();
+    expect(screen.getAllByText("API/list-price equivalent").length).toBeGreaterThan(0);
 
     await userEvent.click(screen.getByRole("radio", { name: "Tokens" }));
     await waitFor(() => {
       expect(screen.getByText("Tokens for period")).toBeInTheDocument();
     });
-    expect(screen.getAllByText("input + output + cache read").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("input + output + cache read + cache write").length,
+    ).toBeGreaterThan(0);
   });
 
-  it("labels each lane with its billing kind", async () => {
+  it("labels lane costs as API equivalents", async () => {
     render(<UsageSection />);
     await waitFor(() => {
-      expect(screen.getByText("Metered · your API keys")).toBeInTheDocument();
+      expect(screen.getAllByText("Provider history").length).toBeGreaterThan(0);
     });
-    expect(screen.getByText("Covered by plan")).toBeInTheDocument();
-    expect(screen.getByText("billed to your keys")).toBeInTheDocument();
-    expect(screen.getByText("covered by plan · at list")).toBeInTheDocument();
+    expect(screen.getAllByText("API equivalent").length).toBe(2);
   });
 
   it("reveals per-model rows only when a lane is expanded", async () => {
@@ -289,13 +274,10 @@ describe("UsageSection", () => {
         buckets: [],
         providers: [],
         totals: {
-          metered_cost_usd: 0,
-          plan_covered_cost_usd: 0,
+          estimated_cost_usd: 0,
           total_tokens: 0,
           cache_read_share: 0,
           session_count: 0,
-          workspace_count: 0,
-          cli_session_count: 0,
         },
       }),
     );
@@ -305,7 +287,7 @@ describe("UsageSection", () => {
         screen.getByText("No agent activity in this period."),
       ).toBeInTheDocument();
     });
-    expect(screen.queryByText("Metered")).not.toBeInTheDocument();
+    expect(screen.queryByText("Estimated cost")).not.toBeInTheDocument();
   });
 
   it("surfaces a load failure inline", async () => {
@@ -413,14 +395,14 @@ describe("plan quota meters", () => {
     expect(screen.getByText("88%")).toBeInTheDocument();
     expect(screen.getByText("5h")).toBeInTheDocument();
     expect(screen.getByText("week")).toBeInTheDocument();
-    expect(screen.getByText("Max 20× · covered by plan")).toBeInTheDocument();
+    expect(screen.getByText("Max 20×")).toBeInTheDocument();
     expect(screen.getByText(/5h resets 16:40/)).toBeInTheDocument();
   });
 
   it("leaves a lane with no quota exactly as before", async () => {
     render(<UsageSection />);
     await waitFor(() => {
-      expect(screen.getByText("Metered · your API keys")).toBeInTheDocument();
+      expect(screen.getAllByText("Provider history").length).toBeGreaterThan(0);
     });
     // No meters anywhere — an empty bar would imply a limit that does
     // not exist for OpenCode.
@@ -428,17 +410,9 @@ describe("plan quota meters", () => {
     expect(screen.queryByText("week")).not.toBeInTheDocument();
   });
 
-  it("follows a detected api_key auth mode in the lane's cost note", async () => {
+  it("does not turn auth mode into a billing claim", async () => {
     vi.mocked(usageSummary).mockResolvedValue(
       summary({
-        providers: [
-          {
-            ...summary().providers[0],
-            // Backend detected a raw API key, so it classified Claude
-            // as metered — the note must agree.
-            billing: "metered",
-          },
-        ],
         quota: {
           claude: {
             windows: [],
@@ -451,9 +425,9 @@ describe("plan quota meters", () => {
     );
     render(<UsageSection />);
     await waitFor(() => {
-      expect(screen.getByText("billed to your keys")).toBeInTheDocument();
+      expect(screen.getAllByText("API equivalent").length).toBeGreaterThan(0);
     });
-    expect(screen.getByText("Metered · your API keys")).toBeInTheDocument();
+    expect(screen.queryByText(/billed to/)).not.toBeInTheDocument();
   });
 });
 
@@ -573,88 +547,76 @@ describe("composition, breakdown and cost confidence", () => {
   });
 });
 
-describe("terminal CLI folding", () => {
+describe("provider history", () => {
   beforeEach(() => {
     vi.mocked(usageSummary).mockReset();
     vi.mocked(usageExportCsv).mockReset();
-    vi.mocked(usageScanCliLogs).mockReset();
+    vi.mocked(usageScanProviderHistory).mockReset();
     vi.mocked(usageSummary).mockResolvedValue(summary());
     vi.mocked(usageExportCsv).mockResolvedValue("bucket_start,provider\n");
-    vi.mocked(usageScanCliLogs).mockResolvedValue({
+    vi.mocked(usageScanProviderHistory).mockResolvedValue({
       files_scanned: 34,
       sessions_found: 12,
-      rows_added: 5,
-      sessions_skipped_own: 7,
+      rows_updated: 5,
       reimported: false,
     });
   });
 
-  it("renders the footer note with the CLIs' log paths", async () => {
+  it("renders the footer note with all provider histories", async () => {
     render(<UsageSection />);
     await waitFor(() => {
       expect(
-        screen.getByText(/read from this machine's logs/),
+        screen.getByText(/from this machine's Claude Code, Codex, and OpenCode histories/),
       ).toBeInTheDocument();
     });
     expect(screen.getByText("~/.claude/projects")).toBeInTheDocument();
     expect(screen.getByText("~/.codex/sessions")).toBeInTheDocument();
   });
 
-  /// There is no toggle any more: folding is unconditional, so the page
-  /// scans on open and every query includes the imported rows.
-  it("scans on open and always includes imports, with no toggle", async () => {
+  it("scans provider history on open with no launcher-specific toggle", async () => {
     render(<UsageSection />);
-    await waitFor(() => expect(usageScanCliLogs).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("7d"));
     expect(screen.queryByRole("switch")).not.toBeInTheDocument();
     expect(screen.queryByText("excluded")).not.toBeInTheDocument();
   });
 
-  /// THE count bug: the footer used to render the last scan's
-  /// `sessions_found` (12 here, and far smaller on a warm incremental
-  /// re-scan), not the period's real total.
-  it("reports the period's total CLI sessions, not the last scan's new ones", async () => {
+  it("reports the period's total sessions, not the last scan's changed ones", async () => {
     vi.mocked(usageSummary).mockResolvedValue(
       summary({
         totals: {
-          metered_cost_usd: 6.44,
-          plan_covered_cost_usd: 65.8,
+          estimated_cost_usd: 72.24,
           total_tokens: 8_421_000,
           cache_read_share: 0.7,
           session_count: 430,
-          workspace_count: 4,
-          cli_session_count: 430,
         },
       }),
     );
     render(<UsageSection />);
     await waitFor(() => {
       expect(
-        screen.getByText(/Includes 430 terminal CLI sessions/),
+        screen.getByText(/Includes 430 provider sessions/),
       ).toBeInTheDocument();
     });
     // Emphatically not the scan report's figure.
     expect(screen.queryByText(/Includes 12 /)).not.toBeInTheDocument();
   });
 
-  it("singularizes a lone CLI session", async () => {
+  it("singularizes a lone provider session", async () => {
     vi.mocked(usageSummary).mockResolvedValue(
       summary({
         totals: {
-          metered_cost_usd: 0,
-          plan_covered_cost_usd: 1,
+          estimated_cost_usd: 1,
           total_tokens: 100,
           cache_read_share: 0,
           session_count: 1,
-          workspace_count: 0,
-          cli_session_count: 1,
         },
       }),
     );
     render(<UsageSection />);
     await waitFor(() => {
       expect(
-        screen.getByText(/Includes 1 terminal CLI session$/),
+        screen.getByText(/Includes 1 provider session/),
       ).toBeInTheDocument();
     });
   });
@@ -670,12 +632,11 @@ describe("terminal CLI folding", () => {
     await waitFor(() => expect(usageExportCsv).toHaveBeenCalledWith("7d"));
   });
 
-  /// A refresh must re-scan too, or a session that ran in a PTY tab
-  /// since the page opened stays invisible until the next app start.
+  /// A refresh must re-scan too, or new provider records stay invisible.
   it("re-scans on refresh", async () => {
     render(<UsageSection />);
-    await waitFor(() => expect(usageScanCliLogs).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(1));
     await userEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
-    await waitFor(() => expect(usageScanCliLogs).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(usageScanProviderHistory).toHaveBeenCalledTimes(2));
   });
 });

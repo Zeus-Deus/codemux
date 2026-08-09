@@ -278,8 +278,9 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
 
-        -- Usage ledger behind Settings → Usage. One row per increment of
-        -- billable work, written from `ProviderRuntimeEvent::UsageRecorded`.
+        -- Usage ledger behind Settings → Usage. This is a materialized
+        -- local cache of provider-owned history (Claude/Codex transcripts
+        -- and OpenCode storage), not a second runtime accounting stream.
         --
         -- Deliberately carries NO foreign key to `agent_chat_sessions`.
         -- Every other chat-adjacent table cascades on session delete,
@@ -290,8 +291,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         -- gone.
         --
         -- The four token columns are non-overlapping, so a token total is
-        -- their plain sum. `cost_usd` is list price frozen at record time
-        -- (NULL for a model with no known price).
+        -- their plain sum. `cost_usd` is the provider-reported or static
+        -- API-equivalent estimate frozen when the cache row is derived.
         CREATE TABLE IF NOT EXISTS agent_usage_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at INTEGER NOT NULL,     -- unix ms
@@ -313,18 +314,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             -- price list) | NULL (unpriced). Lets the UI show how much of
             -- a total is measured rather than estimated.
             cost_source TEXT,
-            -- 'live' (the runtime event pipeline) | 'cli_import' (scraped
-            -- from a CLI's own local logs). Lets the dashboard include or
-            -- exclude terminal-launched sessions without deleting rows.
-            source TEXT NOT NULL DEFAULT 'live',
-            -- Idempotency key for imported rows only. NULL for live rows,
-            -- which have no natural key and are never re-imported.
+            -- `provider_history`: derived from the provider's durable local
+            -- history and safe to rebuild whenever parsing or prices change.
+            source TEXT NOT NULL DEFAULT 'provider_history',
+            -- Provider-native idempotency key. Every history row has one.
             import_key TEXT
         );
 
 
-        -- How far each CLI log file has been consumed, so an incremental
-        -- scan only reads what grew. Keyed by absolute path.
+        -- Signatures of provider history sources, so unchanged files and
+        -- databases can be skipped. Keyed by absolute path.
         CREATE TABLE IF NOT EXISTS usage_import_state (
             path TEXT PRIMARY KEY,
             mtime_ms INTEGER NOT NULL,
@@ -653,7 +652,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "UPDATE agent_usage_ledger SET cost_source = 'table' \
              WHERE cost_usd IS NOT NULL AND cost_source IS NULL",
         // Usage-ledger v13: CLI-log import provenance.
-        "ALTER TABLE agent_usage_ledger ADD COLUMN source TEXT NOT NULL DEFAULT 'live'",
+        "ALTER TABLE agent_usage_ledger ADD COLUMN source TEXT NOT NULL DEFAULT 'provider_history'",
         "ALTER TABLE agent_usage_ledger ADD COLUMN import_key TEXT",
         // Created HERE rather than in the CREATE batch above: on an
         // upgraded database `import_key` does not exist until the ALTER
@@ -2471,14 +2470,77 @@ pub struct UsageLedgerRow {
     /// `"provider"` | `"table"` | `None`.
     #[serde(default)]
     pub cost_source: Option<String>,
-    /// `"live"` | `"cli_import"`.
+    /// `"provider_history"` for current rows; older installs may contain
+    /// legacy `"live"` / `"cli_import"` values until importer v3 rebuilds.
     #[serde(default)]
     pub source: String,
 }
 
+/// One normalized provider-history record ready for the materialized cache.
+#[derive(Debug, Clone)]
+pub struct ProviderUsageCacheRow {
+    pub import_key: String,
+    pub created_at: i64,
+    pub thread_id: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub subagent: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub cost_source: Option<String>,
+}
+
+const UPSERT_PROVIDER_USAGE_SQL: &str =
+    "INSERT INTO agent_usage_ledger (
+         created_at, thread_id, workspace_id, provider, model, subagent,
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+         reasoning_tokens, cost_usd, cost_source, source, import_key
+     ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13)
+     ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
+         created_at = excluded.created_at,
+         thread_id = excluded.thread_id,
+         provider = excluded.provider,
+         model = COALESCE(excluded.model, agent_usage_ledger.model),
+         subagent = MAX(agent_usage_ledger.subagent, excluded.subagent),
+         input_tokens = MAX(agent_usage_ledger.input_tokens, excluded.input_tokens),
+         output_tokens = MAX(agent_usage_ledger.output_tokens, excluded.output_tokens),
+         cache_read_tokens = MAX(agent_usage_ledger.cache_read_tokens, excluded.cache_read_tokens),
+         cache_write_tokens = MAX(agent_usage_ledger.cache_write_tokens, excluded.cache_write_tokens),
+         reasoning_tokens = MAX(agent_usage_ledger.reasoning_tokens, excluded.reasoning_tokens),
+         cost_usd = CASE
+             WHEN excluded.cost_source = 'provider' THEN excluded.cost_usd
+             WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_usd
+             WHEN agent_usage_ledger.cost_usd IS NULL THEN excluded.cost_usd
+             WHEN excluded.cost_usd IS NULL THEN agent_usage_ledger.cost_usd
+             ELSE MAX(agent_usage_ledger.cost_usd, excluded.cost_usd)
+         END,
+         cost_source = CASE
+             WHEN excluded.cost_source = 'provider' THEN excluded.cost_source
+             WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_source
+             ELSE COALESCE(excluded.cost_source, agent_usage_ledger.cost_source)
+         END,
+         source = excluded.source
+     WHERE agent_usage_ledger.created_at IS NOT excluded.created_at
+        OR agent_usage_ledger.thread_id IS NOT excluded.thread_id
+        OR agent_usage_ledger.provider IS NOT excluded.provider
+        OR agent_usage_ledger.model IS NOT excluded.model
+        OR agent_usage_ledger.subagent IS NOT excluded.subagent
+        OR agent_usage_ledger.input_tokens IS NOT excluded.input_tokens
+        OR agent_usage_ledger.output_tokens IS NOT excluded.output_tokens
+        OR agent_usage_ledger.cache_read_tokens IS NOT excluded.cache_read_tokens
+        OR agent_usage_ledger.cache_write_tokens IS NOT excluded.cache_write_tokens
+        OR agent_usage_ledger.reasoning_tokens IS NOT excluded.reasoning_tokens
+        OR agent_usage_ledger.cost_usd IS NOT excluded.cost_usd
+        OR agent_usage_ledger.cost_source IS NOT excluded.cost_source
+        OR agent_usage_ledger.source IS NOT excluded.source";
+
 impl UsageLedgerRow {
     /// All four token buckets summed. Sound because the buckets are
-    /// non-overlapping by construction (see `UsageRecorded`).
+    /// non-overlapping by construction in the provider-history importers.
     ///
     /// `reasoning_tokens` is deliberately NOT added: it is a subset of
     /// `output_tokens` and counting it would double-bill.
@@ -2494,11 +2556,12 @@ impl UsageLedgerRow {
 }
 
 impl DatabaseStore {
-    /// Append one usage row.
+    /// Insert a synthetic usage row for aggregation tests.
     ///
     /// `created_at` is supplied by the caller rather than defaulted in
     /// SQL so tests can write rows at chosen timestamps and exercise the
     /// bucketing without waiting for wall-clock time to pass.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn insert_usage_row(
         &self,
@@ -2543,19 +2606,12 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Token totals already recorded for one thread + provider.
+    /// Token totals for a synthetic test thread + provider.
     ///
-    /// Feeds `StartSessionInput::recorded_usage_baseline` so an adapter
-    /// reading a provider-maintained *lifetime* counter (Codex) can
-    /// resume without re-recording history. Subagent rows are excluded:
-    /// child threads do not survive a resume, so their counters always
-    /// start fresh and seeding against them would suppress real work.
-    /// Returns `(input, output, cache_read, cache_write, reasoning)`.
-    ///
-    /// `reasoning` is included because Codex reports it cumulatively like
-    /// every other counter, so a resumed thread whose baseline omitted it
-    /// would re-record the thread's whole reasoning history on its first
-    /// post-resume report. It does not participate in any total.
+    /// Retained only to verify that reasoning remains a subset of output and
+    /// never enters the four-way total. Returns
+    /// `(input, output, cache_read, cache_write, reasoning)`.
+    #[cfg(test)]
     pub fn recorded_usage_totals(
         &self,
         thread_id: &str,
@@ -2574,14 +2630,16 @@ impl DatabaseStore {
         .map_err(|e| format!("Failed to sum usage rows: {e}"))
     }
 
-    /// Append a row scraped from a CLI's own log.
+    /// Materialize one provider-history record.
     ///
-    /// `INSERT OR IGNORE` against the partial unique index on
-    /// `import_key`: re-scanning a file that has already been imported
-    /// is a no-op rather than a duplicate. Returns whether a row was
-    /// actually written, so a scan can report how much was new.
+    /// A provider can append several snapshots for the same response while
+    /// it is active. The stable `import_key` therefore upserts rather than
+    /// ignoring a row forever: unchanged records are no-ops, while a growing
+    /// response replaces its earlier partial snapshot. Token counters are
+    /// high-water marks so an older overlapping OpenCode store cannot shrink
+    /// a newer SQLite record.
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_imported_usage_row(
+    pub fn upsert_provider_usage_row(
         &self,
         import_key: &str,
         created_at: i64,
@@ -2595,15 +2653,53 @@ impl DatabaseStore {
         cache_write_tokens: i64,
         reasoning_tokens: i64,
         cost_usd: Option<f64>,
+        cost_source: Option<&str>,
     ) -> Result<bool, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let changed = conn
             .execute(
-                "INSERT OR IGNORE INTO agent_usage_ledger (
+                "INSERT INTO agent_usage_ledger (
                      created_at, thread_id, workspace_id, provider, model, subagent,
                      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, cost_usd, cost_source, source, import_key
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'cli_import', ?13)",
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'provider_history', ?13)
+                 ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
+                     created_at = excluded.created_at,
+                     thread_id = excluded.thread_id,
+                     provider = excluded.provider,
+                     model = COALESCE(excluded.model, agent_usage_ledger.model),
+                     subagent = MAX(agent_usage_ledger.subagent, excluded.subagent),
+                     input_tokens = MAX(agent_usage_ledger.input_tokens, excluded.input_tokens),
+                     output_tokens = MAX(agent_usage_ledger.output_tokens, excluded.output_tokens),
+                     cache_read_tokens = MAX(agent_usage_ledger.cache_read_tokens, excluded.cache_read_tokens),
+                     cache_write_tokens = MAX(agent_usage_ledger.cache_write_tokens, excluded.cache_write_tokens),
+                     reasoning_tokens = MAX(agent_usage_ledger.reasoning_tokens, excluded.reasoning_tokens),
+                     cost_usd = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_usd
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_usd
+                         WHEN agent_usage_ledger.cost_usd IS NULL THEN excluded.cost_usd
+                         WHEN excluded.cost_usd IS NULL THEN agent_usage_ledger.cost_usd
+                         ELSE MAX(agent_usage_ledger.cost_usd, excluded.cost_usd)
+                     END,
+                     cost_source = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_source
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_source
+                         ELSE COALESCE(excluded.cost_source, agent_usage_ledger.cost_source)
+                     END,
+                     source = excluded.source
+                 WHERE agent_usage_ledger.created_at IS NOT excluded.created_at
+                    OR agent_usage_ledger.thread_id IS NOT excluded.thread_id
+                    OR agent_usage_ledger.provider IS NOT excluded.provider
+                    OR agent_usage_ledger.model IS NOT excluded.model
+                    OR agent_usage_ledger.subagent IS NOT excluded.subagent
+                    OR agent_usage_ledger.input_tokens IS NOT excluded.input_tokens
+                    OR agent_usage_ledger.output_tokens IS NOT excluded.output_tokens
+                    OR agent_usage_ledger.cache_read_tokens IS NOT excluded.cache_read_tokens
+                    OR agent_usage_ledger.cache_write_tokens IS NOT excluded.cache_write_tokens
+                    OR agent_usage_ledger.reasoning_tokens IS NOT excluded.reasoning_tokens
+                    OR agent_usage_ledger.cost_usd IS NOT excluded.cost_usd
+                    OR agent_usage_ledger.cost_source IS NOT excluded.cost_source
+                    OR agent_usage_ledger.source IS NOT excluded.source",
                 params![
                     created_at,
                     thread_id,
@@ -2616,35 +2712,53 @@ impl DatabaseStore {
                     cache_write_tokens,
                     reasoning_tokens,
                     cost_usd,
-                    cost_usd.map(|_| "table"),
+                    cost_source,
                     import_key,
                 ],
             )
-            .map_err(|e| format!("Failed to insert imported usage row: {e}"))?;
+            .map_err(|e| format!("Failed to upsert provider usage row: {e}"))?;
         Ok(changed > 0)
     }
 
-    /// Every provider-native session id Codemux itself drove.
-    ///
-    /// The CLIs write their logs for Codemux-driven sessions too, so an
-    /// import that did not exclude these would double-count every turn
-    /// the moment the toggle is switched on. Both providers' ids land in
-    /// the same column: Claude persists its `sessionId` and Codex its
-    /// rollout/thread id, both via `set_agent_chat_sdk_session_id`.
-    pub fn known_sdk_session_ids(&self) -> Result<std::collections::HashSet<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT sdk_session_id FROM agent_chat_sessions
-                 WHERE sdk_session_id IS NOT NULL AND sdk_session_id != ''",
-            )
-            .map_err(|e| e.to_string())?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<std::collections::HashSet<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(ids)
+    /// Materialize many provider records in one transaction. The first scan
+    /// can contain tens of thousands of OpenCode messages, so one fsync per
+    /// row would make an otherwise read-only history scan unreasonably slow.
+    pub fn upsert_provider_usage_rows(
+        &self,
+        rows: &[ProviderUsageCacheRow],
+    ) -> Result<usize, String> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        {
+            let mut stmt = tx
+                .prepare_cached(UPSERT_PROVIDER_USAGE_SQL)
+                .map_err(|e| format!("Failed to prepare provider usage upsert: {e}"))?;
+            for row in rows {
+                changed += stmt
+                    .execute(params![
+                        row.created_at,
+                        row.thread_id,
+                        row.provider,
+                        row.model,
+                        row.subagent as i64,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read_tokens,
+                        row.cache_write_tokens,
+                        row.reasoning_tokens,
+                        row.cost_usd,
+                        row.cost_source,
+                        row.import_key,
+                    ])
+                    .map_err(|e| format!("Failed to upsert provider usage row: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 
     /// How much of `path` a previous scan already consumed, if any.
@@ -2681,32 +2795,48 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Drop every imported row and forget every scanned file, so the
-    /// next scan rebuilds the CLI-import half of the ledger from source.
-    ///
-    /// This exists because `cost_usd` is **frozen at insert**. That is
-    /// the right call for live rows — re-pricing a ledger from a later
-    /// table edit would silently rewrite history — but an imported row
-    /// is a derived artifact of a file that is still on disk, so when the
-    /// importer's own logic or price table changes, the honest move is to
-    /// re-derive rather than to keep a figure computed by code that no
-    /// longer exists. Live rows (`source = 'live'`) are never touched:
-    /// their source events are long gone and cannot be re-derived.
-    ///
-    /// Both halves must go together. Clearing the ledger while leaving
-    /// `usage_import_state` populated would make the next scan skip every
-    /// unchanged file and silently import nothing.
-    ///
-    /// Returns the number of ledger rows removed.
-    pub fn reset_cli_imports(&self) -> Result<usize, String> {
+    /// Record signatures for a completed provider-history batch.
+    pub fn set_usage_import_states(
+        &self,
+        states: &[(String, i64, i64)],
+        scanned_at: i64,
+    ) -> Result<(), String> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO usage_import_state
+                         (path, mtime_ms, size_bytes, consumed_bytes, scanned_at)
+                     VALUES (?1, ?2, ?3, ?3, ?4)
+                     ON CONFLICT(path) DO UPDATE SET
+                         mtime_ms = ?2, size_bytes = ?3,
+                         consumed_bytes = ?3, scanned_at = ?4",
+                )
+                .map_err(|e| format!("Failed to prepare import-state upsert: {e}"))?;
+            for (path, mtime_ms, size_bytes) in states {
+                stmt.execute(params![path, mtime_ms, size_bytes, scanned_at])
+                    .map_err(|e| format!("Failed to write import state: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Drop the materialized usage cache and its source signatures.
+    /// Provider history remains authoritative, so the next scan can rebuild
+    /// every row after a parser or pricing change. This intentionally also
+    /// removes legacy runtime-ledger rows from older app versions; retaining
+    /// them beside provider history would double-count Codemux-launched work.
+    pub fn reset_usage_history(&self) -> Result<usize, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let removed = tx
-            .execute(
-                "DELETE FROM agent_usage_ledger WHERE source = 'cli_import'",
-                [],
-            )
-            .map_err(|e| format!("Failed to clear imported usage: {e}"))?;
+            .execute("DELETE FROM agent_usage_ledger", [])
+            .map_err(|e| format!("Failed to clear usage cache: {e}"))?;
         tx.execute("DELETE FROM usage_import_state", [])
             .map_err(|e| format!("Failed to clear import state: {e}"))?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -3842,41 +3972,49 @@ mod tests {
         assert_eq!(reasoning, 25);
     }
 
-    /// Re-scanning a log must add nothing the second time. The partial
-    /// unique index on `import_key` is what guarantees it, independent
-    /// of the offset bookkeeping.
+    /// Re-scanning provider history is a no-op, while a growing response
+    /// updates the same natural record instead of freezing a partial row.
     #[test]
-    fn imported_rows_are_idempotent_on_import_key() {
+    fn provider_rows_are_idempotent_and_growing_rows_update() {
         let db = init_test_database();
         let insert = || {
-            db.insert_imported_usage_row(
-                "claude:sess-1:msg_A", 1_800_000_000_000, "cli:sess-1", "claude",
-                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0),
+            db.upsert_provider_usage_row(
+                "claude:sess-1:msg_A", 1_800_000_000_000, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
             )
         };
         assert!(insert().unwrap(), "first scan writes the row");
         assert!(!insert().unwrap(), "second scan is a no-op");
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 1);
 
+        assert!(db
+            .upsert_provider_usage_row(
+                "claude:sess-1:msg_A", 1_800_000_000_001, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 80, 0, 0, 0, Some(2.0), Some("table"),
+            )
+            .unwrap());
+        let grown = db.usage_rows_since(0).unwrap();
+        assert_eq!(grown.len(), 1, "same provider record, still one row");
+        assert_eq!(grown[0].output_tokens, 80);
+        assert_eq!(grown[0].cost_usd, Some(2.0));
+
         // A different key is a different row.
-        db.insert_imported_usage_row(
-            "claude:sess-1:msg_B", 1_800_000_000_000, "cli:sess-1", "claude",
-            Some("claude-opus-4-5"), false, 5, 5, 0, 0, 0, None,
+        db.upsert_provider_usage_row(
+            "claude:sess-1:msg_B", 1_800_000_000_000, "claude:sess-1", "claude",
+            Some("claude-opus-4-5"), false, 5, 5, 0, 0, 0, None, None,
         )
         .unwrap();
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
     }
 
-    /// The self-healing re-import: imported rows freeze `cost_usd` at
-    /// insert, so a corrected importer or price table has to be able to
-    /// throw them away and rebuild. Live rows must survive — their
-    /// source events are gone and cannot be re-derived.
+    /// A corrected importer rebuilds the entire derived cache, including
+    /// legacy runtime rows that would otherwise double-count.
     #[test]
-    fn resetting_cli_imports_clears_imports_and_state_but_spares_live_rows() {
+    fn resetting_usage_history_clears_all_rows_and_state() {
         let db = init_test_database();
-        db.insert_imported_usage_row(
-            "claude:msg_A:req_1", 1_800_000_000_000, "cli:sess-1", "claude",
-            Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0),
+        db.upsert_provider_usage_row(
+            "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
+            Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
         )
         .unwrap();
         db.insert_usage_row(
@@ -3887,68 +4025,60 @@ mod tests {
         db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3).unwrap();
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
 
-        assert_eq!(db.reset_cli_imports().unwrap(), 1, "one imported row");
+        assert_eq!(db.reset_usage_history().unwrap(), 2, "both cache generations");
 
         let rows = db.usage_rows_since(0).unwrap();
-        assert_eq!(rows.len(), 1, "the live row survives");
-        assert_eq!(rows[0].source, "live");
+        assert!(rows.is_empty());
         // The per-file state must go with it, or the rebuild scan would
         // skip every unchanged file and import nothing.
         assert!(db.usage_import_state("/logs/a.jsonl").unwrap().is_none());
 
         // And the same key can be re-imported afterwards.
         assert!(db
-            .insert_imported_usage_row(
-                "claude:msg_A:req_1", 1_800_000_000_000, "cli:sess-1", "claude",
-                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(3.0),
+            .upsert_provider_usage_row(
+                "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
+                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(3.0), Some("table"),
             )
             .unwrap());
     }
 
     #[test]
-    fn imported_rows_are_tagged_and_carry_no_workspace() {
+    fn provider_rows_are_tagged_and_carry_no_workspace() {
         let db = init_test_database();
-        db.insert_imported_usage_row(
-            "codex:roll-1", 1_800_000_000_000, "cli:roll-1", "codex",
-            Some("gpt-5-codex"), false, 10, 40, 0, 0, 25, Some(2.0),
+        db.upsert_provider_usage_row(
+            "codex:roll-1", 1_800_000_000_000, "codex:roll-1", "codex",
+            Some("gpt-5-codex"), false, 10, 40, 0, 0, 25, Some(2.0), Some("table"),
         )
         .unwrap();
         let rows = db.usage_rows_since(0).unwrap();
-        assert_eq!(rows[0].source, "cli_import");
+        assert_eq!(rows[0].source, "provider_history");
         assert!(rows[0].workspace_id.is_none());
         assert_eq!(rows[0].reasoning_tokens, 25);
-        // Imports are priced from the static table.
         assert_eq!(rows[0].cost_source.as_deref(), Some("table"));
-
-        // Live rows keep the default source.
-        db.insert_usage_row(
-            1_800_000_000_000, "t", Some("ws"), "claude", Some("m"), false,
-            1, 1, 0, 0, 0, None, None,
-        )
-        .unwrap();
-        let live = db
-            .usage_rows_since(0)
-            .unwrap()
-            .into_iter()
-            .find(|r| r.thread_id == "t")
-            .unwrap();
-        assert_eq!(live.source, "live");
     }
 
-    /// Sessions Codemux drove are the ones an import must skip.
     #[test]
-    fn known_sdk_session_ids_lists_what_codemux_drove() {
+    fn provider_rows_batch_in_one_transaction() {
         let db = init_test_database();
-        db.upsert_agent_chat_session("t1", "ws", Some("/tmp"), "claude")
-            .unwrap();
-        db.set_agent_chat_sdk_session_id("t1", "sess-abc").unwrap();
-        db.upsert_agent_chat_session("t2", "ws", Some("/tmp"), "codex")
-            .unwrap();
-
-        let ids = db.known_sdk_session_ids().unwrap();
-        assert!(ids.contains("sess-abc"));
-        // A session with no persisted id contributes nothing.
-        assert_eq!(ids.len(), 1);
+        let make = |key: &str, output: i64| ProviderUsageCacheRow {
+            import_key: key.to_string(),
+            created_at: 1_800_000_000_000,
+            thread_id: "opencode:session-1".into(),
+            provider: "opencode".into(),
+            model: Some("openai/gpt-5".into()),
+            subagent: false,
+            input_tokens: 10,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.25),
+            cost_source: Some("provider".into()),
+        };
+        let rows = [make("opencode:a", 2), make("opencode:b", 3)];
+        assert_eq!(db.upsert_provider_usage_rows(&rows).unwrap(), 2);
+        assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
+        assert_eq!(db.upsert_provider_usage_rows(&rows).unwrap(), 0);
     }
 
     #[test]

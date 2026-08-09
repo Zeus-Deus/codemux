@@ -384,14 +384,11 @@ export type ProviderRuntimeEvent =
       usage: ContextUsageSnapshot;
     }
   | {
-      /** One increment of billable work, for the Settings → Usage
-       *  ledger. Distinct from `context_usage_updated`: a delta rather
-       *  than a snapshot, never suppressed, and inclusive of subagent
-       *  activity (flagged via `subagent`, not filtered out).
+      /** Legacy adapter-side usage delta. Distinct from
+       *  `context_usage_updated`: a delta rather than a snapshot.
        *
-       *  The backend intercepts this in `forward_event` and writes it to
-       *  `agent_usage_ledger` — it is never persisted to
-       *  `agent_chat_messages` and never reaches a live pane. It is
+       *  Provider history is the accounting source, so the backend discards
+       *  this in `forward_event`; it never reaches persistence or a pane. It is
        *  declared here only so the union stays a faithful mirror of the
        *  Rust enum, and so the reducer can ignore it explicitly rather
        *  than logging it as an unknown variant. */

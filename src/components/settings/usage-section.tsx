@@ -5,7 +5,11 @@ import { ChevronDown, ChevronUp, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { SegmentedControl } from "./settings-primitives";
-import { usageExportCsv, usageScanCliLogs, usageSummary } from "@/tauri/commands";
+import {
+  usageExportCsv,
+  usageScanProviderHistory,
+  usageSummary,
+} from "@/tauri/commands";
 import type {
   CostConfidence,
   FlatModelUsage,
@@ -37,7 +41,7 @@ const PERIOD_OPTIONS: { value: UsagePeriod; label: string }[] = [
 type Metric = "cost" | "tokens";
 
 const METRIC_OPTIONS: { value: Metric; label: string }[] = [
-  { value: "cost", label: "Cost" },
+  { value: "cost", label: "Est. cost" },
   { value: "tokens", label: "Tokens" },
 ];
 
@@ -78,7 +82,7 @@ function isKnownProvider(provider: string): provider is AgentChatProviderKind {
 
 /** 8.0B / 1.4M / 82K / 640 — the design's `toks`.
  *
- *  The B tier is not hypothetical: folding in this machine's CLI history
+ *  The B tier is not hypothetical: provider history on a busy machine
  *  puts the 30-day figure in the billions, and without it the hero read
  *  "7961.5M" — technically correct, unreadable, and visibly wider than
  *  the stat next to it. */
@@ -90,25 +94,14 @@ export function formatTokens(n: number): string {
   return String(Math.round(n));
 }
 
-/** Thousands separators, because folding in CLI history routinely puts
- *  plan-covered value into five figures and `$36999.88` reads as a
- *  different order of magnitude at a glance than `$36,999.88`. */
+/** Thousands separators keep large API-equivalent estimates readable. */
 const MONEY = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 });
-const MONEY_0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
-
-/** $12.34 / $36,999.88 — two decimals, for money the user actually owes. */
+/** $12.34 / $36,999.88 — an API/list-price equivalent, not an invoice. */
 export function formatMoney(n: number): string {
   return `$${MONEY.format(Number.isFinite(n) ? n : 0)}`;
-}
-
-/** $12 / $36,999 — whole dollars, for plan-covered *value*. Cents on a
- *  number that is an estimate of what a subscription saved would imply a
- *  precision it does not have. */
-export function formatMoney0(n: number): string {
-  return `$${MONEY_0.format(Number.isFinite(n) ? n : 0)}`;
 }
 
 /** Short name for each quota window, for the meter's row label. */
@@ -188,10 +181,9 @@ function formatPercent(fraction: number): string {
  * "Usage" settings section — token and cost accounting per provider,
  * model, and session, read from the local `agent_usage_ledger`.
  *
- * Every figure is computed at published list prices. For metered
- * providers (OpenCode, on the user's own API keys) that is money owed;
- * for plan-covered ones (Claude, Codex) it is the value a subscription
- * delivered, which is why the two are never summed into one headline.
+ * Cost is always an API/list-price equivalent. Subscription quota is shown
+ * separately when a provider reports it; the page never guesses what was
+ * actually billed.
  */
 export function UsageSection() {
   const [period, setPeriod] = useState<UsagePeriod>("7d");
@@ -204,8 +196,7 @@ export function UsageSection() {
   const [refreshing, setRefreshing] = useState(false);
   const [breakdown, setBreakdown] = useState<BreakdownView>("model");
   const [scanning, setScanning] = useState(false);
-  /// Whether the open-time CLI-log scan has settled. The first fetch
-  /// waits on it so the page never renders a pre-import figure.
+  /// Whether the open-time provider-history scan has settled.
   const [scanned, setScanned] = useState(false);
 
   const refresh = useCallback(() => {
@@ -223,9 +214,9 @@ export function UsageSection() {
   const scan = useCallback(async () => {
     setScanning(true);
     try {
-      await usageScanCliLogs();
+      await usageScanProviderHistory();
     } catch (err) {
-      toast.error("Could not read CLI logs", { description: String(err) });
+      toast.error("Could not read provider history", { description: String(err) });
     } finally {
       setScanning(false);
     }
@@ -237,14 +228,10 @@ export function UsageSection() {
     await refresh();
   }, [scan, refresh]);
 
-  // A scan on page open keeps the folded figures current without the
-  // user having to press refresh. Unconditional now that folding is
-  // always on; the scan itself is incremental (an unchanged file costs
-  // one `stat`), so this is cheap on every open but the first.
+  // A scan on page open keeps provider history current. The scan is
+  // incremental, so unchanged sources are cheap.
   //
-  // Deliberately mount-only: re-scanning the disk every time the user
-  // clicks "30 days" would be work for data a period change cannot
-  // affect.
+  // Deliberately mount-only: a period change cannot affect source data.
   useEffect(() => {
     void scan().finally(() => setScanned(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -259,15 +246,14 @@ export function UsageSection() {
     refresh();
   }, [refresh, scanned]);
 
-  // Light polling so a settings tab left open beside a running agent
-  // does not go stale. Re-created on period change, which also clears
-  // the previous interval.
+  // Poll the histories too: without runtime accounting, refreshing only the
+  // summary would leave an open page stale while a provider app is active.
   useEffect(() => {
     const id = window.setInterval(() => {
-      refresh();
+      void scanThenRefresh();
     }, POLL_MS);
     return () => window.clearInterval(id);
-  }, [refresh]);
+  }, [scanThenRefresh]);
 
   // A hovered bucket index is only meaningful for the period it was
   // taken in — a stale index would read out the wrong bar.
@@ -375,10 +361,7 @@ export function UsageSection() {
             view={breakdown}
             onViewChange={setBreakdown}
           />
-          <TerminalCliFooter
-            busy={scanning}
-            sessionCount={summary.totals.cli_session_count}
-          />
+          <ProviderHistoryFooter busy={scanning} sessionCount={summary.totals.session_count} />
         </div>
       )}
     </div>
@@ -449,7 +432,7 @@ function OverviewCard({
         metric,
       )
     : metric === "cost"
-      ? formatMoney(totals.metered_cost_usd + totals.plan_covered_cost_usd)
+      ? formatMoney(totals.estimated_cost_usd)
       : formatTokens(totals.total_tokens);
 
   const readoutBreakdown = hoveredBucket
@@ -463,10 +446,8 @@ function OverviewCard({
         )
         .join("   ")
     : metric === "cost"
-      ? `${formatMoney(totals.metered_cost_usd)} metered · ${formatMoney0(
-          totals.plan_covered_cost_usd,
-        )} plan-covered`
-      : "input + output + cache read";
+      ? "API/list-price equivalent"
+      : "input + output + cache read + cache write";
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
@@ -477,15 +458,9 @@ function OverviewCard({
             column needs. */}
         <div className="flex flex-wrap items-end gap-x-8 gap-y-4 xl:gap-x-11">
           <HeroStat
-            label="Metered"
-            value={formatMoney(totals.metered_cost_usd)}
-            note="billed to your API keys"
-          />
-          <HeroStat
-            label="Plan-covered"
-            value={formatMoney0(totals.plan_covered_cost_usd)}
-            note="at list price"
-            tone="ember"
+            label="Estimated cost"
+            value={formatMoney(totals.estimated_cost_usd)}
+            note="API/list-price equivalent"
           />
           <HeroStat
             label="Tokens"
@@ -494,12 +469,8 @@ function OverviewCard({
           />
           <HeroStat
             label="Sessions"
-            // Grouped like the money stats beside it: folding in CLI
-            // history pushes this into five figures on a 90-day window.
             value={totals.session_count.toLocaleString()}
-            note={`across ${totals.workspace_count} workspace${
-              totals.workspace_count === 1 ? "" : "s"
-            }`}
+            note="provider history on this machine"
           />
         </div>
         <div className="shrink-0">
@@ -553,19 +524,10 @@ function OverviewCard({
             {[...order].reverse().map((provider) => {
               const value = bucketValue(bucket, provider, metric);
               if (value <= 0) return null;
-              const billing = providers.find((p) => p.provider === provider)?.billing;
-              // In cost mode, plan-covered series render faded: their
-              // dollars are list-price value, not a bill, and showing
-              // them at equal weight would read as spend.
-              const faded = metric === "cost" && billing === "plan_covered";
               return (
                 <div
                   key={provider}
-                  className={cn(
-                    "w-full rounded-[2px]",
-                    seriesFill(provider),
-                    faded && "opacity-45",
-                  )}
+                  className={cn("w-full rounded-[2px]", seriesFill(provider))}
                   style={{
                     height: Math.max(2, (value / max) * (CHART_HEIGHT_PX - 8)),
                   }}
@@ -603,8 +565,8 @@ function OverviewCard({
         </div>
         <span className="font-mono text-[10px] text-muted-foreground/80">
           {metric === "cost"
-            ? "faded = plan-covered, priced at list · solid = billed"
-            : "input + output + cache read"}
+            ? "API/list-price equivalent · not an invoice"
+            : "input + output + cache read + cache write"}
         </span>
       </div>
     </div>
@@ -615,12 +577,10 @@ function HeroStat({
   label,
   value,
   note,
-  tone,
 }: {
   label: string;
   value: string;
   note: string;
-  tone?: "ember";
 }) {
   return (
     <div className="flex flex-col gap-1.5">
@@ -630,7 +590,7 @@ function HeroStat({
       <span
         className={cn(
           "select-text font-mono text-[22px] font-semibold leading-none tabular-nums tracking-tight xl:text-[27px]",
-          tone === "ember" ? "text-accent-ember" : "text-foreground",
+          "text-foreground",
         )}
       >
         {value}
@@ -896,28 +856,9 @@ function CostConfidenceBlock({ confidence }: { confidence: CostConfidence }) {
   );
 }
 
-// ── terminal-CLI footer ──
+// ── provider-history footer ──
 
-/** The design mock's footer row (variant 2a): the honest note about
- *  what a PTY tab does and does not report, plus the opt-in.
- *
- *  Default off, deliberately: folding these in means reading the user's
- *  local CLI logs, which is a bigger promise than the live pipeline
- *  makes. The copy keeps the mock's wording. */
-/** The quiet note under the dashboard explaining where the non-Codemux
- *  half of these figures came from.
- *
- *  This used to carry a toggle. Folding is now unconditional: the page
- *  claims to answer "what am I actually spending", and a switch that
- *  silently halves the answer made every figure above it ambiguous. The
- *  `source` column still marks imported rows in the database, so a
- *  Codemux-only *filter* can come back later without a re-import.
- *
- *  `sessionCount` comes from the summary, not from the last scan's
- *  report. The scan reports what it newly imported, which on a warm
- *  incremental re-scan is nearly always a handful — that is how the
- *  footer came to read "8 sessions folded in" beside a hero of 430. */
-function TerminalCliFooter({
+function ProviderHistoryFooter({
   busy,
   sessionCount,
 }: {
@@ -928,14 +869,14 @@ function TerminalCliFooter({
     <div className="flex items-baseline gap-4 px-1 pt-1">
       <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-muted-foreground">
         <span className="font-medium text-foreground">
-          Includes {sessionCount.toLocaleString()} terminal CLI session
+          Includes {sessionCount.toLocaleString()} provider session
           {sessionCount === 1 ? "" : "s"}
         </span>{" "}
-        read from this machine&apos;s logs —{" "}
+        from this machine&apos;s Claude Code, Codex, and OpenCode histories,
+        regardless of which app launched them. Sources include{" "}
         <span className="font-mono text-[10px]">~/.claude/projects</span>,{" "}
-        <span className="font-mono text-[10px]">~/.codex/sessions</span>. A PTY
-        tab streams no usage events, so these are recovered from the CLIs&apos;
-        own transcripts. This machine only.
+        <span className="font-mono text-[10px]">~/.codex/sessions</span>, and
+        OpenCode&apos;s local data directory. This machine only.
       </p>
       {busy && (
         <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
@@ -993,7 +934,6 @@ function ProviderLane({
   onToggle: () => void;
   divided: boolean;
 }) {
-  const metered = provider.billing === "metered";
   const bars = quota ? meterWindows(quota.windows) : [];
   const note = quota ? meterNote(quota) : "";
   const laneMax = useMemo(
@@ -1013,9 +953,8 @@ function ProviderLane({
         aria-expanded={open}
         className="flex w-full items-center gap-4 py-3.5 text-left transition-colors hover:bg-accent/20"
       >
-        {/* Widens with the column so the plan sub-label ("ChatGPT Pro ·
-            covered by plan") stops truncating; the model rows below
-            indent to match. */}
+        {/* Widens with the column so provider plan labels do not truncate;
+            the model rows below indent to match. */}
         <span className="flex w-[150px] shrink-0 items-center gap-2.5 xl:w-[200px]">
           {isKnownProvider(provider.provider) ? (
             <ProviderLogo provider={provider.provider} className="h-[18px] w-[18px]" />
@@ -1027,11 +966,7 @@ function ProviderLane({
               {seriesLabel(provider.provider)}
             </span>
             <span className="truncate text-[10px] text-muted-foreground">
-              {quota?.plan_label
-                ? `${quota.plan_label} · ${metered ? "your API keys" : "covered by plan"}`
-                : metered
-                  ? "Metered · your API keys"
-                  : "Covered by plan"}
+              {quota?.plan_label ?? "Provider history"}
             </span>
           </span>
         </span>
@@ -1078,7 +1013,6 @@ function ProviderLane({
                 className={cn(
                   "min-w-0 flex-1 rounded-[1px]",
                   seriesFill(provider.provider),
-                  !metered && "opacity-60",
                 )}
                 style={{
                   height: Math.max(2, (tokens / laneMax) * SPARK_HEIGHT_PX),
@@ -1097,16 +1031,11 @@ function ProviderLane({
 
         <span className="flex w-[96px] shrink-0 flex-col gap-0.5 text-right">
           <span
-            className={cn(
-              "select-text font-mono text-[15px] font-semibold tabular-nums tracking-tight",
-              metered ? "text-foreground" : "text-muted-foreground",
-            )}
+            className="select-text font-mono text-[15px] font-semibold tabular-nums tracking-tight"
           >
             {formatMoney(provider.cost_usd)}
           </span>
-          <span className="text-[10px] text-muted-foreground">
-            {metered ? "billed to your keys" : "covered by plan · at list"}
-          </span>
+          <span className="text-[10px] text-muted-foreground">API equivalent</span>
         </span>
 
         <span className="shrink-0 text-muted-foreground" aria-hidden>
