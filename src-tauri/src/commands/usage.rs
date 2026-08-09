@@ -325,7 +325,7 @@ fn summarize(
     let mut buckets: Vec<UsageBucket> = (0..count)
         .map(|i| {
             let local = local_start + i * bucket_ms;
-            let (label, sub_label) = bucket_labels(local, period);
+            let (label, sub_label) = bucket_labels(local, period, local_now);
             UsageBucket {
                 // Epoch ms, like every other timestamp on the wire.
                 start_ms: local - offset_ms,
@@ -603,17 +603,33 @@ impl ProviderAcc {
 /// conversion) — the alternative is a date library dependency for two
 /// label strings.
 ///
-/// **`start_ms` is a LOCAL-shifted timestamp**, not epoch ms: the caller
-/// has already added the timezone offset, so the hour and date read here
-/// are the user's.
-fn bucket_labels(start_ms: i64, period: Period) -> (String, String) {
+/// **`start_ms` and `local_now_ms` are LOCAL-shifted timestamps**, not
+/// epoch ms: the caller has already added the timezone offset, so the hour
+/// and date read here are the user's.
+///
+/// `local_now_ms` exists because the `Today` period is a trailing 24-hour
+/// window, not a calendar day: at 09:00 its oldest fourteen buckets belong
+/// to *yesterday*, and calling them all "Today" mislabels them in the hover
+/// readout, the header range, and the CSV's `bucket_start` column.
+fn bucket_labels(start_ms: i64, period: Period, local_now_ms: i64) -> (String, String) {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     match period {
         Period::Today => {
             let hour = (start_ms.rem_euclid(DAY_MS)) / HOUR_MS;
-            (format!("{hour}:00"), format!("Today {hour}:00"))
+            let days_ago = local_now_ms.div_euclid(DAY_MS) - start_ms.div_euclid(DAY_MS);
+            let day_name = match days_ago {
+                0 => "Today".to_string(),
+                1 => "Yesterday".to_string(),
+                // Unreachable for a 24-bucket hourly window, but a dated
+                // label beats a wrong one if the period ever widens.
+                _ => {
+                    let (_, month, day) = civil_from_days(start_ms.div_euclid(DAY_MS));
+                    format!("{} {}", MONTHS[(month - 1) as usize], day)
+                }
+            };
+            (format!("{hour}:00"), format!("{day_name} {hour}:00"))
         }
         _ => {
             let days = start_ms.div_euclid(DAY_MS);
@@ -738,7 +754,7 @@ fn to_csv(
         "bucket_start,provider,model,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,total_tokens,cost_usd,cost_source\n",
     );
     for ((bucket, provider, model), counts) in &grouped {
-        let (_, sub_label) = bucket_labels(*bucket, period);
+        let (_, sub_label) = bucket_labels(*bucket, period, now + offset_ms);
         let cost = costs.get(&(*bucket, provider.clone(), model.clone())).copied().unwrap_or(0.0);
         let source = sources
             .get(&(*bucket, provider.clone(), model.clone()))
@@ -1008,6 +1024,34 @@ mod tests {
         // UTC-5 → 19:00 local, on the previous day.
         let west = summarize(&[], Period::Today, NOW, -300, HashMap::new());
         assert_eq!(west.buckets.last().unwrap().label, "19:00");
+    }
+
+    /// "Today" is a trailing 24-hour window, so most of it is usually
+    /// yesterday. Labelling every bucket "Today" mislabels the hover
+    /// readout, the header range, and the CSV's `bucket_start` column.
+    #[test]
+    fn today_window_names_the_previous_day_correctly() {
+        // NOW is local midnight at UTC+0, so the newest bucket is the only
+        // one belonging to the current day.
+        let s = summarize(&[], Period::Today, NOW, 0, HashMap::new());
+        assert_eq!(s.buckets.last().unwrap().sub_label, "Today 0:00");
+        assert_eq!(s.buckets[0].sub_label, "Yesterday 1:00");
+        assert_eq!(s.buckets[22].sub_label, "Yesterday 23:00");
+        assert_eq!(
+            s.buckets.iter().filter(|b| b.sub_label.starts_with("Today")).count(),
+            1,
+        );
+
+        // Midday: the split lands mid-window, and both halves are named.
+        let noon = NOW + 12 * HOUR_MS;
+        let s = summarize(&[], Period::Today, noon, 0, HashMap::new());
+        assert_eq!(s.buckets[0].sub_label, "Yesterday 13:00");
+        assert_eq!(s.buckets.last().unwrap().sub_label, "Today 12:00");
+        assert_eq!(
+            s.buckets.iter().filter(|b| b.sub_label.starts_with("Today")).count(),
+            13,
+            "hours 0:00–12:00 are today",
+        );
     }
 
     /// The window bounds stay in real epoch ms, so row filtering and the

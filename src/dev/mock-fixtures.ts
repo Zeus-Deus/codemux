@@ -2373,7 +2373,10 @@ export function mockUsageSummary(period: string): unknown {
       // Work happens during the day; nights are near-idle.
       shape = hour >= 8 && hour <= 22 ? 1 : 0.12;
       label = `${hour}:00`;
-      subLabel = `Today ${hour}:00`;
+      // "Today" is a trailing 24-hour window, so its older buckets belong
+      // to yesterday — the same naming `bucket_labels` applies in Rust.
+      const isToday = date.toDateString() === new Date(now).toDateString();
+      subLabel = `${isToday ? "Today" : "Yesterday"} ${hour}:00`;
     } else {
       const day = date.getDay();
       shape = day === 0 || day === 6 ? 0.28 : 1;

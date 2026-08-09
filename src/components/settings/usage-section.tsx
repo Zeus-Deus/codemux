@@ -368,8 +368,11 @@ export function UsageSection() {
   );
 }
 
+/** First bucket to last, in the backend's own words. "Today" is a
+ *  trailing 24-hour window rather than a calendar day, so it reads
+ *  "Yesterday 13:00 – Today 12:00" — naming it "Today, 00:00 – now" would
+ *  claim a range the chart does not show. */
 function rangeLabel(summary: UsageSummary): string {
-  if (summary.period === "today") return "Today, 00:00 – now";
   const first = summary.buckets[0];
   const last = summary.buckets[summary.buckets.length - 1];
   if (!first || !last) return "";

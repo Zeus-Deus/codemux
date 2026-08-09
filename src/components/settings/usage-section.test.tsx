@@ -212,6 +212,34 @@ describe("UsageSection", () => {
     await waitFor(() => expect(usageSummary).toHaveBeenCalledWith("today"));
   });
 
+  /// "Today" is a TRAILING 24-hour window, so the header must read the
+  /// backend's own first/last bucket names rather than claiming
+  /// "Today, 00:00 – now" — most of the chart is usually yesterday.
+  it("names the today range from its real first and last buckets", async () => {
+    const HOUR = 3_600_000;
+    vi.mocked(usageSummary).mockResolvedValue(
+      summary({
+        period: "today",
+        buckets: Array.from({ length: 24 }, (_, i) => ({
+          start_ms: START + i * HOUR,
+          label: `${(13 + i) % 24}:00`,
+          sub_label:
+            i < 11
+              ? `Yesterday ${13 + i}:00`
+              : `Today ${i - 11}:00`,
+          providers: { claude: { tokens: 1_000, cost_usd: 0.1 } },
+        })),
+      }),
+    );
+
+    render(<UsageSection />);
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Yesterday 13:00 – Today 12:00/),
+      ).toBeInTheDocument();
+    });
+  });
+
   it("switches the readout between cost and tokens", async () => {
     render(<UsageSection />);
     await waitFor(() => {
