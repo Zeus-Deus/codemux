@@ -132,3 +132,13 @@ Everything else is covered by ordinary unit tests: remote parsing and the multi-
 - `src/lib/provider-auth.ts` — cached host-scoped auth gate
 - `src/components/settings/source-control-section.tsx`, `settings-primitives.tsx` — Settings → Source Control
 - `src-tauri/tests/gitlab_live.rs` — the ignored live round trip
+
+## Screenshots
+
+Dev-mock captures in `docs/features/assets/source-control-providers/`:
+
+- `before-settings-git.png` / `after-settings-source-control.png` — Settings
+  before and after the **Source Control** section (per-product diagnostics rows,
+  Rescan, and the self-hosted host→product editor).
+- `before-sidebar.png` / `after-sidebar-mr-chips.png` — sidebar badges under
+  GitHub-only copy versus provider-aware GitLab `!` merge-request chips.

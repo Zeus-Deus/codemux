@@ -23,6 +23,7 @@ Use this file when:
 - Keep `WORKFLOW.md` short and stable.
 - Keep `docs/core/*` durable, `docs/features/*` factual, `docs/plans/*` active, `docs/reference/*` stable, and `docs/archive/*` historical.
 - When creating new docs, start from `docs/templates/FEATURE_TEMPLATE.md` or `docs/templates/PLAN_TEMPLATE.md`.
+- Doc screenshots live in exactly one place: `docs/features/assets/<topic>/`. Every such directory must be referenced from the feature doc that owns it (a `## Screenshots` section, as in `docs/features/workflow-orchestration.md`); an unreferenced directory is orphaned evidence and should be wired up or deleted. Do not add a second assets root outside `docs/` — `assets/` at the repo root is for README and branding images only.
 
 ## Reindex Procedure
 

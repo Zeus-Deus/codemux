@@ -981,10 +981,10 @@ function mockChatTranscript(): string[] {
       usage: null,
     });
   }
-  // Final showcase turn: the subagents orchestration card (design
-  // fixture) — one completed subagent, one still running — so the card,
-  // the "1 subagent running" pane pill, and the drill-in all render on
-  // open. Landing last keeps it visible the moment the thread hydrates.
+  // Final showcase turn: the subagent work-log fixture — one completed
+  // subagent, one still running — so the compact transcript row, panel
+  // watch surface, and drill-in all render on open. Landing last keeps it
+  // visible the moment the thread hydrates.
   const subTurnId = "seed-subagents";
   push({
     type: "user_message",

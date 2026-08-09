@@ -148,10 +148,18 @@ from an owed transition:
   that has genuinely gone quiet.
 
 Mid-turn nothing changes — the parent owns `Working`, and `Monitoring` only
-ever appears once the turn has settled. A new user turn, a
-`SessionStateChanged::Running` reset, and session `Closed`/`Error` all clear
-the whole tracker (`ThreadSubagentState::reset`). There is no TTL: monitoring
-ends only via terminal task rows, a new turn, session end, or an explicit stop.
+ever appears once the turn has settled. A new user turn resets turn-scoped
+agent work, owed-review/watchdog state, and Stop tombstones, but retains every
+confirmed live `Monitor` entry (`ThreadSubagentState::begin_turn`). This is
+necessary because a provider can keep a watch task alive without emitting a
+fresh `task_progress` during the follow-up; when that turn settles, the retained
+entry restores `Monitoring` immediately. The send-command boundary and
+`SessionStateChanged::Running` share this provider-neutral rule. Manual monitor
+flags already live outside the tracker and are unchanged. Session
+`Closed`/`Error` and pane teardown still clear the whole tracker
+(`ThreadSubagentState::reset` / `SubagentTracker::clear_thread`). There is no
+TTL: monitoring ends only via terminal task rows, session end, or an explicit
+stop.
 
 A watch-loop row keeps its transcript card — the user should be able to see
 *what* is being watched — but is excluded from the docked
@@ -226,9 +234,10 @@ would walk straight back into the monitor set on its next `task_progress` and
 drift the pane back to `Monitoring` after the next turn. So the stopped ids are
 **blocklisted** (`ThreadSubagentState::stopped_monitors`) and their later
 snapshots are no-ops. The blocklist is scoped to the run that recorded it: a
-new turn (`SessionStateChanged::Running` or the send-message `clear_thread`) or
+new turn (`SessionStateChanged::Running` or the send-message `begin_turn`) or
 session close drops it, so a watch loop the *next* turn starts counts normally
-— including one with the same id.
+— including one with the same id. Existing non-stopped monitor entries are the
+one class deliberately carried across that boundary.
 
 **Known limitation — the interrupt is a *turn* interrupt.** With a turn in
 flight it cancels the run and the watch loops die with it. With the turn
@@ -365,3 +374,13 @@ when the pane does:
 - Nothing that carries `--status-monitoring` animates. If a future surface adds
   a monitoring affordance, keep it steady — the pulse belongs to `permission`
   alone.
+
+## Screenshots
+
+Dev-mock captures in `docs/features/assets/monitoring-status/`:
+
+- `before-sidebar.png` / `after-sidebar.png` — a watch-loop workspace pinned at
+  the pulsing `Working` dot, versus the calm steady-cyan `Monitoring` dot.
+- `before-chat.png` / `after-chat.png` — the chat pane before and after the
+  docked `MonitoringBar` (reason line + **Stop** button) appears between
+  transcript and composer.

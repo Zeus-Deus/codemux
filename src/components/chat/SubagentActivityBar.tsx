@@ -34,7 +34,7 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 /**
- * The composer's running strip (design 1b, "COMPOSER · RUNNING STRIP").
+ * The composer's off-screen running tether (Canvas-6 Turn 2).
  * One strip for the whole thread: counts every live (running|pending)
  * subagent across every `subagent_run` card, no matter which reply
  * spawned it.
@@ -44,17 +44,18 @@ const SWEEP_STYLE = {
  * and the strip is a 32px band with a hairline bottom border and a faint
  * foreground tint. There is no saturated filled bar: liveness is carried
  * by the orb plus a 1px accent light sweeping the top edge. Renders
- * nothing while idle — no resting state.
+ * nothing while idle or while the matching transcript row is visible — no
+ * resting state and no duplicate live surface.
  *
  * - 1 running -> action chip is "View"; clicking the bar jumps straight
- *   to that subagent's card.
+ *   to that subagent's merged work-log stretch.
  * - >1 running -> action chip is "Show all" / "Hide"; clicking the bar
  *   toggles an expand list (opens upward) with one row per running
- *   subagent, each jumping to its own card.
+ *   subagent, each jumping to its own work-log stretch.
  * - Just finished (running count observed transitioning >0 -> 0): the
  *   bar flashes green for {@link FINISHED_FLASH_MS}, then unmounts.
  *   The flash itself is clickable (design gallery "Jump" CTA) and jumps
- *   to the card of the last subagent that was still running.
+ *   to the stretch of the last subagent that was still running.
  *
  * Self-contained: owns its own open/finished-flash state and the 1s
  * elapsed-time tick. The actual transcript scroll + highlight is done by
@@ -85,6 +86,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   const listId = useId();
   const [open, setOpen] = useState(false);
   const [finishedFlash, setFinishedFlash] = useState(false);
+  const [transcriptRowVisible, setTranscriptRowVisible] = useState(false);
   const prevCountRef = useRef(count);
   const prevThreadRef = useRef(threadId);
   // Card of the most recent still-running subagent, captured every render
@@ -96,6 +98,43 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   if (count > 0) {
     lastRunningCardIdRef.current = entries[entries.length - 1].cardId;
   }
+
+  const runningCardIds = entries.map((entry) => entry.cardId).join("\u0000");
+  useEffect(() => {
+    if (count === 0 || typeof IntersectionObserver === "undefined") {
+      setTranscriptRowVisible(false);
+      return;
+    }
+
+    const ids = new Set(runningCardIds.split("\u0000"));
+    let observed: Element | null = null;
+    let intersection: IntersectionObserver | null = null;
+
+    const findRow = () => {
+      const marker = [...document.querySelectorAll("[data-subagent-run-id]")]
+        .find((node) => ids.has(node.getAttribute("data-subagent-run-id") ?? ""));
+      const row = marker?.closest("[data-subagent-card]") ?? null;
+      if (row === observed) return;
+      intersection?.disconnect();
+      observed = row;
+      if (!row) {
+        setTranscriptRowVisible(false);
+        return;
+      }
+      intersection = new IntersectionObserver(([entry]) => {
+        setTranscriptRowVisible(entry?.isIntersecting === true);
+      });
+      intersection.observe(row);
+    };
+
+    findRow();
+    const mutations = new MutationObserver(findRow);
+    mutations.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      intersection?.disconnect();
+      mutations.disconnect();
+    };
+  }, [count, runningCardIds]);
 
   useEffect(() => {
     // A thread switch is not an "observed transition" — reset silently so
@@ -133,6 +172,10 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   }, [count, threadId]);
 
   if (count === 0 && !finishedFlash) return null;
+
+  // The transcript row is the primary live surface while it is on screen.
+  // The composer strip is only the off-screen tether back to that row.
+  if (count > 0 && transcriptRowVisible) return null;
 
   if (count === 0 && finishedFlash) {
     const finishedCardId = lastRunningCardIdRef.current;

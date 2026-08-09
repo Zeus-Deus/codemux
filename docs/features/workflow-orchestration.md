@@ -238,7 +238,7 @@ replay real `WorkflowUpdated` event sequences, guarded by
 ## Screenshots
 
 Desktop-view captures from the dev-mock runtime (the three seeded
-`workflow-*` workspaces), in `assets/docs/workflow-orchestration/`:
+`workflow-*` workspaces), in `docs/features/assets/workflow-orchestration/`:
 
 - `01-approval.png` — approval card (Run once / Always for this project /
   View script / Deny).

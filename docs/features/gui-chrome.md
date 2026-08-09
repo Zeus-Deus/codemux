@@ -57,7 +57,7 @@ bar in normal document flow. Workspace GUI chrome is absolutely positioned
 over the full app shell and composes four independent control clusters on
 desktop (the native-controls cluster is absent on a web remote client):
 
-`[sidebar toggle]    [tabs | + launcher | pinned preset tiles] …drag region… [RunButton split | ResourceMonitor | IdeLauncher compact]  ‖  [right-panel tab row] …drag gap… [pane actions]    [⤢ | right-panel toggle]  [WindowControls]`
+`[sidebar toggle]    [tabs | + launcher | pinned preset tiles] …drag region… [RunButton split | IdeLauncher compact | ResourceMonitor]  ‖  [right-panel tab row] …drag gap… [pane actions]    [⤢ | right-panel toggle]  [WindowControls]`
 
 The `‖` is the right panel's left edge. Everything left of it belongs to the
 workspace column; everything right of it is the panel's own tab row, which
