@@ -21,16 +21,15 @@ not shipped in a published build. Older per-release implementation notes were mo
 
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.17.1` (2026-08-07)**, a sidebar-and-settlement release: a fifth `Monitoring` agent status for background watch loops, durable workspace pinning, a run that can no longer stay stuck on "Working", side-branch PR badges, the dimmed Settled shelf, and AppImage child-process environment hygiene. `v0.17.0` (2026-08-05) was the app-chrome and chat-navigation release: the GUI title bar became frameless floating islands, the full-width workspace context bar was deleted, the chat transcript gained an explicit new-turn scroll contract, cross-provider skills became provider-correct, text-selection colors were standardized onto two tokens, and the legacy standalone orchestration runtime was deleted outright. Release notes for `v0.16.0` and earlier live in `docs/archive/release-notes-v0.16.md`, `docs/archive/release-notes-v0.14-v0.15.md`, and `docs/archive/release-notes-v0.6-v0.13.md`.
 
-Unreleased after `v0.17.1` — five merged PRs (#257–#261), grouped by subsystem
-below. Everything in this block is on `main` and has not shipped in a published
-build, **except** the first entry, which is in flight on
-`import-workspace-chrome-design` and not yet merged:
+Unreleased after `v0.17.1` — six merged PRs (#257–#261, #264), grouped by
+subsystem below. Everything in this block is on `main` and has not shipped in a
+published build:
 
 - **The inbox card's hover chrome became bare glyphs, and a running process now
-  shows on the card** (Workspace Chrome design handoff, variant 1b — *in
-  flight, not yet merged*). The active card's bordered Settle / Snooze / Unpin
-  pills are **deleted**. Hover or focus now slides a borderless cluster into the
-  eyebrow's right edge (`row-in`, a 130ms fade + 5px drop in `globals.css`):
+  shows on the card** (PR #264, Workspace Chrome design handoff, variant 1b).
+  The active card's bordered Settle / Snooze / Unpin pills are **deleted**.
+  Hover or focus now slides a borderless cluster into the eyebrow's right edge
+  (`row-in`, a 130ms fade + 5px drop in `globals.css`):
   a bare **Pin** glyph on every card, plus a bare **Snooze** glyph and a
   **✓ Settle** text button on cards that can settle. Pin is unconditional and
   toggles `setWorkspacePinned` straight from the card, so pinning — the one

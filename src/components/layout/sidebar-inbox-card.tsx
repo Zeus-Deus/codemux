@@ -614,8 +614,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         stoppers every preset click and every Enter inside the
                         menu would also hit the card's activate handlers and
                         navigate away while snoozing. The width override undoes
-                        the default "match the trigger", which here is a 60px
-                        button. */}
+                        the default "match the trigger", which here is a bare
+                        12px alarm-clock glyph. */}
                     <DropdownMenuContent
                       align="end"
                       className="w-auto min-w-[132px]"
