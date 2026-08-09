@@ -200,7 +200,7 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   The blocker line is a fixed string
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
-  the agent state — Working (the `AgentOrb`, amber text) /
+  the agent state — Working (a static dashed-circle mark, amber text) /
   Needs you (pulsing red dot) / Monitoring (steady cyan dot, never animated —
   see `docs/features/monitoring-status.md`) / Done · review (green ✓) /
   elapsed since the workspace last settled into review — and swaps to a
@@ -684,9 +684,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   claim from "Done · review", and it must survive the hover swap. The focused
   workspace is never unread whatever the stamps say. A **"Mark unread"** context
   entry adds a session-only override (there is no read flag to flip), offered
-  only on cards that don't already read as unread; a real visit — which moves
-  `last_visited_at` — is what clears it, so the override can't outlive the truth
-  it overrides.
+  only on cards that don't already read as unread. When opening the workspace
+  had acknowledged and cleared a `review` status, this inverse gesture also
+  restores **Done · review** alongside the unread dot; any later working,
+  permission, monitoring, or fresh review status supersedes that remembered
+  completion. A real visit — which moves `last_visited_at` — clears the manual
+  override, so it can't outlive the truth it overrides.
 - **Multi-select and bulk parking**: Cmd/Ctrl-click toggles a row into the
   selection; Shift-click selects the range **over rendered rows only**
   (`selectRange` walks the visible id list — active cards in rendered order,
@@ -761,25 +764,25 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (`sidebar.show_git_stats`, default on) hides the `↑ahead` and `+/−` numbers
   on cards when off; the branch name always shows. The `sidebar.live_agents`
   grouping setting was removed with the tree.
-- **Working indicator**: a working card shows the shared **agent orb**
-  (`src/components/ui/agent-orb.tsx`, wrapping the `thinking-orbs` library) in
-  place of its leading icon. The `Working` label is followed by a compact,
+- **Working indicator**: a working card uses a static amber
+  `CircleDotDashed` beside **Working**. The incomplete ring communicates
+  in-progress lifecycle, while the center point keeps the mark legible at
+  sidebar scale. It deliberately does not render `AgentOrb`: the agent is
+  acting inside a thread, while the sidebar is workspace navigation and only
+  knows the coarse `pane_statuses` lifecycle. Activity-matched orbs remain
+  where the tool is actually visible (the thread and its subagents — see
+  `docs/features/agent-chat.md`). The `Working` label is followed by a compact,
   tabular elapsed value (`42s`, `12m`, `1h12m`) derived from the card's
   client-observed working transition and advanced by the sidebar's shared
   coarse clock. Only the stable `Working` label is announced as live status;
   the ticking value is presentation-only so assistive technology is not
-  interrupted on every update. The orb is always monochrome — the library
-  inks white on dark and black on light — so it never competes with the accent,
-  and red stays reserved for cards that need a human. The orb is **neutral here
-  on purpose**: the sidebar reads `pane_statuses`, a five-value enum carrying
-  no tool name, so a card can honestly say "something is alive" but not what.
-  The activity-matched states appear where the tool is actually visible (the
-  thread and its subagents — see `docs/features/agent-chat.md`). This replaced
-  the configurable glyph picker: `sidebar.working_indicator` (braille / ring /
-  blink / sweep / typing) and `sidebar.working_indicator_color` are **deleted**,
-  along with `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on
-  read, not migrated — the settings table is free-form key/value, so a leftover
-  row is inert and is never written back.
+  interrupted on every update. The collapsed rail remains even denser and
+  uses its existing amber status dot. The old configurable glyph picker,
+  `sidebar.working_indicator` (braille / ring / blink / sweep / typing), and
+  `sidebar.working_indicator_color` remain **deleted**, along with
+  `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on read, not
+  migrated — the settings table is free-form key/value, so a leftover row is
+  inert and is never written back.
 
 ### Footer nav (fixed chrome, both states)
 
