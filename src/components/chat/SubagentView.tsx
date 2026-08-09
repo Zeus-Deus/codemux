@@ -24,6 +24,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { buildTranscriptSlots } from "./transcript-slots";
 import { CHAT_COLUMN } from "./chat-column";
+import { ChatFileLinkContext } from "./chat-file-link-context";
 
 const NOOP = () => {};
 
@@ -42,9 +43,13 @@ const NOOP = () => {};
 export function SubagentView({
   subagent,
   requests = [],
+  workspaceId,
+  cwd,
 }: {
   subagent: SubagentViewModel;
   requests?: PermissionRequestItem[];
+  workspaceId?: string | null;
+  cwd?: string | null;
 }) {
   const tone = statusTone(subagent.status);
   const running = isRunning(subagent);
@@ -60,7 +65,8 @@ export function SubagentView({
   }, [subagent.items, requests]);
 
   return (
-    <div className={cn(CHAT_COLUMN, "pb-[30px] pt-[26px]")}>
+    <ChatFileLinkContext.Provider value={{ workspaceId, cwd }}>
+      <div className={cn(CHAT_COLUMN, "pb-[30px] pt-[26px]")}>
       {/* Read-only banner */}
       <div
         className={cn(
@@ -85,8 +91,12 @@ export function SubagentView({
           <div key={slot.key} className={slot.turnStart ? "mt-4" : "mt-3"}>
             {slot.body.kind === "activity" ? (
               <ActivityBlock items={slot.body.items} working={slot.body.working} />
+            ) : slot.body.kind === "turn_fold" ? (
+              <div className="border-b border-border/60 pb-2 text-xs text-muted-foreground">
+                {slot.body.label}
+              </div>
             ) : (
-              <SubItem item={slot.body.item} />
+              <SubItem item={slot.body.item} workspaceId={workspaceId} cwd={cwd} />
             )}
           </div>
         ))}
@@ -94,11 +104,7 @@ export function SubagentView({
         {/* Live tail while running */}
         {running && (
           <div
-            className={cn(
-              "mt-4 flex items-center gap-2.5 rounded-[11px] border px-3.5 py-3",
-              tone.softBg,
-              tone.border,
-            )}
+            className="mt-3 flex items-center gap-1.5 px-1 py-1 text-[12px] leading-5 text-muted-foreground"
           >
             <span className="flex h-5 w-5 shrink-0 items-center justify-center">
               <AgentOrb
@@ -107,24 +113,33 @@ export function SubagentView({
                 aria-hidden
               />
             </span>
-            <span className="shimmer font-mono text-[12px]">
+            <span className="min-w-0 truncate font-mono text-[11px]">
               {subagentActivityLine(subagent)}
             </span>
           </div>
         )}
       </div>
-    </div>
+      </div>
+    </ChatFileLinkContext.Provider>
   );
 }
 
 /** Render one sub-transcript item through the existing renderers.
  *  Tool cards are inert (read-only): approvals happen in the parent. */
-function SubItem({ item }: { item: ChatViewItem }) {
+function SubItem({
+  item,
+  workspaceId,
+  cwd,
+}: {
+  item: ChatViewItem;
+  workspaceId?: string | null;
+  cwd?: string | null;
+}) {
   switch (item.kind) {
     case "user_message":
       return <UserMessage item={item} />;
     case "assistant_message":
-      return <AssistantMessage item={item} />;
+      return <AssistantMessage item={item} workspaceId={workspaceId} cwd={cwd} />;
     case "reasoning":
       return <ReasoningBlock item={item} />;
     case "tool_call":

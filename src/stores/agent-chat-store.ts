@@ -1,9 +1,9 @@
 import { create } from "zustand";
 
 import {
-  applyReplayTail,
-  parseReplayPayloads,
-  replayParsed,
+  applyTimedReplayTail,
+  parseTimedReplayPayloads,
+  replayTimed,
 } from "@/lib/agent-chat/hydrate";
 import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
@@ -685,10 +685,7 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
 
   hydrateThread: (threadId, rows, opts) =>
     set((state) => {
-      const replayed = replayParsed(
-        parseReplayPayloads(rows.map((row) => row.payload)),
-        opts,
-      );
+      const replayed = replayTimed(parseTimedReplayPayloads(rows), opts);
       const existing = state.threads[threadId] ?? emptySlice();
       // Spread `replayed` last so its `messages`, `nextSeq`,
       // `streaming`, `pendingRequestIds` overwrite the empty slice's
@@ -722,9 +719,10 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         const fresh =
           cursor == null ? rows : rows.filter((row) => row.id > cursor);
         if (fresh.length === 0) return slice;
-        const merged = applyReplayTail(
+        const timed = parseTimedReplayPayloads(fresh);
+        const merged = applyTimedReplayTail(
           slice,
-          parseReplayPayloads(fresh.map((row) => row.payload)),
+          timed,
           {
             ...opts,
             // Summarizes the prefix for the unsettled-tail scan: a slice

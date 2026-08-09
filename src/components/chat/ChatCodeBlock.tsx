@@ -32,6 +32,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
+
+import { useChatFileLinkContext } from "./chat-file-link-context";
+import { MarkdownFileLink } from "./MarkdownFileLink";
 
 interface ChatCodeRendererContextValue {
   defaultWrap: boolean;
@@ -305,11 +309,21 @@ function CodeBlockTitle({
   fenceTitle: string | null;
   language: string;
 }) {
+  const { cwd, workspaceId } = useChatFileLinkContext();
+  const source = fenceTitle ? resolveChatFileLink(fenceTitle, cwd) : null;
   if (fenceTitle) {
     return (
       <span data-chat-code-title="" title={fenceTitle}>
-        <FileTypeIcon filename={fenceTitle} className="size-3.5" />
-        <span className="truncate">{fenceTitle}</span>
+        {source && workspaceId ? (
+          <MarkdownFileLink meta={source} variant="plain">
+            {fenceTitle}
+          </MarkdownFileLink>
+        ) : (
+          <>
+            <FileTypeIcon filename={fenceTitle} className="size-3.5" />
+            <span className="truncate">{fenceTitle}</span>
+          </>
+        )}
       </span>
     );
   }

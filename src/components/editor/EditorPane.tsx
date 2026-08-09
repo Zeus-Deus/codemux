@@ -53,8 +53,10 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
   const filePath = tab?.filePath ?? null;
   const isDirty = tab?.isDirty ?? false;
   const baselineContent = tab?.baselineContent ?? "";
+  const revealRequest = tab?.revealRequest;
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [content, setContent] = useState("");
+  const [loadedFilePath, setLoadedFilePath] = useState<string | null>(null);
 
   const isMd = filePath != null && isMarkdownFile(filePath);
   const isImage = filePath != null && isImageExtension(filePath);
@@ -192,6 +194,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
 
     isLoadingRef.current = true;
     setErrorMsg(null);
+    setLoadedFilePath(null);
 
     // Fire the file read IPC and the language-module dynamic import
     // concurrently. They are independent \u2014 `readFile` does Tauri IPC
@@ -211,6 +214,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
         });
         setBaselineContent(tabId, c);
         setContent(c);
+        setLoadedFilePath(filePath);
       })
       .catch((err) => {
         setErrorMsg(String(err));
@@ -233,6 +237,25 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
       }
     });
   }, [filePath, tabId, setBaselineContent]);
+
+  // A source-reference click can target an already-open doc pane. Requests
+  // carry a nonce so clicking the same citation twice still re-centres it.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !revealRequest || loadedFilePath !== filePath) return;
+    const lineNumber = Math.min(
+      Math.max(1, revealRequest.line),
+      view.state.doc.lines,
+    );
+    const line = view.state.doc.line(lineNumber);
+    const columnOffset = Math.max(0, (revealRequest.column ?? 1) - 1);
+    const position = Math.min(line.to, line.from + columnOffset);
+    view.dispatch({
+      selection: { anchor: position },
+      effects: EditorView.scrollIntoView(position, { y: "center" }),
+    });
+    view.focus();
+  }, [filePath, loadedFilePath, revealRequest]);
 
   // When switching back to raw, sync content from store in case it changed
   useEffect(() => {

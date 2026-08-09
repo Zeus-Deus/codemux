@@ -64,6 +64,9 @@ export interface UserMessageItem {
   id: ChatItemId;
   seq: number;
   text: string;
+  /** Wall-clock boundary for turn-duration presentation. Optional for
+   *  transcripts persisted before timed replay rows were introduced. */
+  created_at?: number;
   /** Follow-up queueing: present while this message is parked behind an
    *  active turn (rendered greyed-out with a "Queued" pill + cancel X).
    *  Removed when the turn dispatches (`queued_turn_dispatched`) and the
@@ -89,6 +92,8 @@ export interface AssistantMessageItem {
   turn_id: string | null;
   text: string;
   streaming: boolean;
+  /** First-observed wall-clock time for this assistant block. */
+  created_at?: number;
 }
 
 /**
@@ -124,6 +129,8 @@ export interface ToolCallItem {
   kind: "tool_call";
   id: ChatItemId;
   seq: number;
+  /** Provider turn that owns this call. Older hydrated rows may omit it. */
+  turn_id?: string | null;
   tool_use_id: string;
   tool_name: string;
   input: unknown;
@@ -181,6 +188,8 @@ export interface TurnEndedItem {
   seq: number;
   turn_id: string;
   status: TurnStatus;
+  /** Wall-clock completion boundary used by the settled-turn disclosure. */
+  completed_at?: number;
 }
 
 /**
@@ -289,6 +298,8 @@ export interface WorkflowRunItem {
   kind: "workflow_run";
   id: ChatItemId;
   seq: number;
+  /** Best-effort provider turn attribution for settled-turn folding. */
+  turn_id?: string | null;
   /** Demux key — the wire `workflow_id` (the `Workflow` tool call's
    *  `tool_use_id`). */
   workflowId: string;

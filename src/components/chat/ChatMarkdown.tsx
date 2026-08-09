@@ -1,4 +1,10 @@
-import { useMemo } from "react";
+import {
+  isValidElement,
+  useMemo,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
+import type { ExtraProps } from "streamdown";
 import { defaultRemarkPlugins, Streamdown, type Components } from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
@@ -10,6 +16,11 @@ import {
   CHAT_LOCAL_IMAGE_TAG,
   rehypeLocalImageLinks,
 } from "@/lib/agent-chat/local-image-links";
+import {
+  CHAT_FILE_LINK_TAG,
+  rehypeChatFileLinks,
+  resolveChatFileLink,
+} from "@/lib/agent-chat/file-links";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
 import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
@@ -19,6 +30,11 @@ import {
 } from "./ChatCodeBlock";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 import { MarkdownLocalImage } from "./MarkdownLocalImage";
+import { MarkdownFileLink } from "./MarkdownFileLink";
+import {
+  ChatFileLinkContext,
+  useChatFileLinkContext,
+} from "./chat-file-link-context";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -122,18 +138,70 @@ const controls = {
 // GFM is likewise upstream's; math/KaTeX stays out.
 const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
-const rehypePlugins = [rehypeRichExternalLinks, rehypeLocalImageLinks];
-
 // The fenced/inline code shells plus the custom element `rehypeRichExternalLinks`
 // emits for decorated links. Code blocks never grow favicons (a fence's contents
 // are never parsed as links), so the two override sets are disjoint — they just
 // have to travel in one module-level object, because Streamdown keys its
 // processor cache on the identity of this map.
+function FileLinkElement(props: Record<string, unknown>) {
+  const { cwd } = useChatFileLinkContext();
+  const meta = resolveChatFileLink(String(props.sourceHref ?? ""), cwd);
+  // A common agent pattern is [`path/to/file.ts:42`](path/to/file.ts:42).
+  // Streamdown has already rendered that label through our inline-code
+  // override by the time the transformed link reaches this component. Keep
+  // only its text so the explicit source link owns the single interactive
+  // element instead of producing an invalid button-inside-button tree.
+  const label = plainText(props.children as ReactNode) || meta?.displayPath;
+  if (!meta) {
+    return (
+      <code data-streamdown="inline-code">
+        {props.children as ReactNode}
+      </code>
+    );
+  }
+  return <MarkdownFileLink meta={meta}>{label}</MarkdownFileLink>;
+}
+
+function InlineSourceReference({
+  children,
+  className,
+  node: _node,
+  ...props
+}: ComponentProps<"code"> & ExtraProps) {
+  void _node;
+  const { cwd } = useChatFileLinkContext();
+  const text = plainText(children);
+  const meta = resolveChatFileLink(text, cwd);
+  if (meta) return <MarkdownFileLink meta={meta}>{text}</MarkdownFileLink>;
+  return (
+    <code {...props} className={className} data-streamdown="inline-code">
+      {children}
+    </code>
+  );
+}
+
+function plainText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(plainText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return plainText(node.props.children);
+  }
+  return "";
+}
+
 const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
+  inlineCode: InlineSourceReference,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
   [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
+  [CHAT_FILE_LINK_TAG]: FileLinkElement,
 };
+
+const rehypePlugins = [
+  rehypeRichExternalLinks,
+  rehypeLocalImageLinks,
+  rehypeChatFileLinks,
+];
 
 /**
  * `streaming` marks markdown that is still arriving token by token. Only the
@@ -144,31 +212,45 @@ const markdownComponents: Components = {
 export function ChatMarkdown({
   children,
   streaming = false,
+  workspaceId,
+  cwd,
 }: {
   children: string;
   streaming?: boolean;
+  workspaceId?: string | null;
+  cwd?: string | null;
 }) {
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
+  const inheritedFileContext = useChatFileLinkContext();
+  const fileContext = useMemo(
+    () => ({
+      workspaceId: workspaceId ?? inheritedFileContext.workspaceId,
+      cwd: cwd ?? inheritedFileContext.cwd,
+    }),
+    [cwd, inheritedFileContext.cwd, inheritedFileContext.workspaceId, workspaceId],
+  );
 
   return (
-    <ChatMarkdownStreamingContext.Provider value={streaming}>
-      <div className={cn("chat-markdown", proseClasses)}>
-        <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
-          <Streamdown
-            parseIncompleteMarkdown
-            remarkPlugins={remarkPlugins}
-            rehypePlugins={rehypePlugins}
-            plugins={plugins}
-            components={markdownComponents}
-            controls={controls}
-            lineNumbers={false}
-          >
-            {children}
-          </Streamdown>
-        </ChatCodeRendererProvider>
-      </div>
-    </ChatMarkdownStreamingContext.Provider>
+    <ChatFileLinkContext.Provider value={fileContext}>
+      <ChatMarkdownStreamingContext.Provider value={streaming}>
+        <div className={cn("chat-markdown", proseClasses)}>
+          <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
+            <Streamdown
+              parseIncompleteMarkdown
+              remarkPlugins={remarkPlugins}
+              rehypePlugins={rehypePlugins}
+              plugins={plugins}
+              components={markdownComponents}
+              controls={controls}
+              lineNumbers={false}
+            >
+              {children}
+            </Streamdown>
+          </ChatCodeRendererProvider>
+        </div>
+      </ChatMarkdownStreamingContext.Provider>
+    </ChatFileLinkContext.Provider>
   );
 }

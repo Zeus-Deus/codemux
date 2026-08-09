@@ -2,10 +2,22 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
+import {
+  docEditorTabId,
+  docPaneId,
+} from "@/components/layout/right-panel/pane-registry";
+import { useEditorStore } from "@/stores/editor-store";
+import { useUIStore } from "@/stores/ui-store";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
 import { ChatMarkdown } from "./ChatMarkdown";
 import { resetFaviconFailureCache } from "./MarkdownLinkFavicon";
 
-beforeEach(() => resetFaviconFailureCache());
+beforeEach(() => {
+  resetFaviconFailureCache();
+  useEditorStore.setState({ tabs: {} });
+  useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
+});
 afterEach(() => cleanup());
 
 describe("ChatMarkdown rich external links", () => {
@@ -19,6 +31,10 @@ describe("ChatMarkdown rich external links", () => {
     const link = container.querySelector('[data-streamdown="link"]');
     const favicon = link?.querySelector(".chat-markdown-link-favicon img");
     expect(link).toHaveTextContent("PR #235");
+    expect(link?.querySelector(".chat-markdown-link-favicon")).toHaveAttribute(
+      "title",
+      "https://github.com/example/repo/pull/235",
+    );
     expect(favicon).toHaveAttribute(
       "src",
       "https://www.google.com/s2/favicons?domain=github.com&sz=32",
@@ -163,14 +179,96 @@ describe("ChatMarkdown local image links", () => {
     ).toBeInTheDocument();
   });
 
-  it("leaves ordinary local file links as links", () => {
+  it("keeps a local file reference inert when no workspace root is available", () => {
     const { container } = render(
       <ChatMarkdown>{"[implementation](/home/me/src/app.tsx)"}</ChatMarkdown>,
     );
 
     expect(container.querySelector("[data-chat-local-image]")).toBeNull();
-    expect(container.querySelector('[data-streamdown="link"]')).toHaveTextContent(
+    expect(container.querySelector('[data-streamdown="link"]')).toBeNull();
+    expect(container.querySelector('code[data-streamdown="inline-code"]')).toHaveTextContent(
       "implementation",
     );
+  });
+});
+
+describe("ChatMarkdown source references", () => {
+  const workspaceId = "ws-source-link";
+  const cwd = "/work/codemux";
+
+  it("opens an explicit Markdown file reference in the right panel at its line", () => {
+    const { getByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {"See [types.ts:42](src/lib/types.ts:42) for the contract."}
+      </ChatMarkdown>,
+    );
+
+    const sourceLink = getByRole("button", { name: "types.ts:42" });
+    fireEvent.click(sourceLink);
+
+    const filePath = "/work/codemux/src/lib/types.ts";
+    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+      docPaneId(filePath),
+    );
+    expect(
+      useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
+    ).toMatchObject({
+      filePath,
+      revealRequest: { line: 42, nonce: 1 },
+    });
+
+    fireEvent.click(sourceLink);
+    expect(
+      useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
+    ).toMatchObject({ revealRequest: { line: 42, nonce: 2 } });
+  });
+
+  it("keeps an inline-code file label as one accessible source button", () => {
+    const { getAllByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {"See [`types.ts:42`](src/lib/types.ts:42) for the contract."}
+      </ChatMarkdown>,
+    );
+
+    const sourceLinks = getAllByRole("button", { name: "types.ts:42" });
+    expect(sourceLinks).toHaveLength(1);
+    expect(sourceLinks[0]?.querySelector("button")).toBeNull();
+    expect(sourceLinks[0]).not.toHaveClass("border");
+    expect(sourceLinks[0]?.className).not.toContain("bg-muted");
+  });
+
+  it("upgrades inline-code file references but leaves version-like code plain", () => {
+    const { container, getByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {"Changed `src/main.rs:18` while retaining `v1.2.3`."}
+      </ChatMarkdown>,
+    );
+
+    expect(getByRole("button", { name: "src/main.rs:18" })).toBeInTheDocument();
+    expect(container.querySelectorAll('code[data-streamdown="inline-code"]')).toHaveLength(1);
+    expect(container.querySelector('code[data-streamdown="inline-code"]')).toHaveTextContent(
+      "v1.2.3",
+    );
+  });
+
+  it("makes a resolvable fenced-code title open the same source pane", () => {
+    const { getByRole } = render(
+      <TooltipProvider>
+        <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+          {"```ts title=src/lib/types.ts:7\nexport type Item = string;\n```"}
+        </ChatMarkdown>
+      </TooltipProvider>,
+    );
+
+    fireEvent.click(getByRole("button", { name: "src/lib/types.ts:7" }));
+
+    const filePath = "/work/codemux/src/lib/types.ts";
+    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+      docPaneId(filePath),
+    );
+    expect(
+      useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath))
+        ?.revealRequest?.line,
+    ).toBe(7);
   });
 });

@@ -506,37 +506,76 @@ describe("MessageList dispatch", () => {
 });
 
 describe("MessageList activity blocks", () => {
-  it("folds a run of ≥2 completed tool calls into one settled activity block", () => {
+  it("settles a completed turn to one fold plus its final answer", () => {
+    renderList([
+      {
+        kind: "user_message",
+        id: "user-settled",
+        seq: 0,
+        text: "Inspect the renderer",
+        created_at: 1_000,
+      },
+      {
+        kind: "assistant_message",
+        id: "commentary-settled",
+        seq: 1,
+        turn_id: "turn-settled",
+        text: "I’ll inspect the implementation first.",
+        streaming: false,
+      },
+      { ...readCall(2, "src/components/chat/MessageList.tsx"), turn_id: "turn-settled" },
+      {
+        kind: "assistant_message",
+        id: "final-settled",
+        seq: 3,
+        turn_id: "turn-settled",
+        text: "The final answer is now the primary surface.",
+        streaming: false,
+      },
+      {
+        kind: "turn_ended",
+        id: "ended-settled",
+        seq: 4,
+        turn_id: "turn-settled",
+        status: { kind: "success" },
+        completed_at: 6_000,
+      },
+    ]);
+
+    expect(screen.getByText("Worked for 5s")).toBeInTheDocument();
+    expect(screen.getByText("The final answer is now the primary surface.")).toBeInTheDocument();
+    expect(screen.queryByText("I’ll inspect the implementation first.")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 5s" }));
+    expect(screen.getByText("I’ll inspect the implementation first.")).toBeInTheDocument();
+    expect(screen.getByText("src/components/chat/MessageList.tsx")).toBeInTheDocument();
+  });
+
+  it("shows only the newest completed tool call until earlier work is requested", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
       readCall(1, "/b"),
       readCall(2, "/c"),
     ];
     renderList(messages);
-    // Settled header: derived summary + step meta + Details toggle. Step
-    // rows stay hidden until expand.
-    expect(screen.getByText("Explored the codebase")).toBeInTheDocument();
-    expect(screen.getByText("3 steps")).toBeInTheDocument();
-    expect(screen.getByText("Details")).toBeInTheDocument();
+    expect(screen.getByText("/c")).toBeInTheDocument();
+    expect(screen.getByText("+2 previous tool calls")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
 
-    // Expand → per-step rows appear; the toggle flips to "Hide".
-    fireEvent.click(screen.getByText("Explored the codebase"));
+    fireEvent.click(screen.getByText("+2 previous tool calls"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByText("Hide")).toBeInTheDocument();
+    expect(screen.getByText("Show fewer work entries")).toBeInTheDocument();
   });
 
-  it("renders a lone completed tool call as a single card, not an activity block", () => {
+  it("renders a lone completed tool call as one compact row", () => {
     renderList([readCall(0, "/only")]);
-    expect(screen.queryByText(/steps/)).toBeNull();
-    expect(screen.queryByText("Details")).toBeNull();
-    // Single card shows the mono summary via ToolCallStatus.
-    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(screen.queryByText(/previous tool call/)).toBeNull();
+    expect(screen.getByText("read")).toBeInTheDocument();
     expect(screen.getByText("/only")).toBeInTheDocument();
   });
 
-  it("shows a WORKING header (live action + counter) for the streaming tail run", () => {
+  it("shows one live orb beside the newest streaming action", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
       {
@@ -551,11 +590,14 @@ describe("MessageList activity blocks", () => {
         approval_request_id: null,
       },
     ];
-    renderList(messages, { streaming: true, showThinking: false });
-    expect(screen.getByText("Working")).toBeInTheDocument();
-    // Live action = the running step; counter = 1 done · 1 running.
-    expect(screen.getByText("1 done · 1 running")).toBeInTheDocument();
-    expect(screen.getByText("run cargo test")).toBeInTheDocument();
+    const { container } = renderList(messages, {
+      streaming: true,
+      showThinking: false,
+    });
+    expect(container.querySelector('canvas[data-orb-state="working"]')).not.toBeNull();
+    expect(screen.getByText("run")).toBeInTheDocument();
+    expect(screen.getByText("cargo test")).toBeInTheDocument();
+    expect(screen.getByText("+1 previous tool call")).toBeInTheDocument();
   });
 
   it("a non-tool row breaks the run into two independent activity blocks", () => {
@@ -574,7 +616,7 @@ describe("MessageList activity blocks", () => {
       readCall(4, "/y1"),
     ];
     renderList(messages);
-    expect(screen.getAllByText("Explored the codebase")).toHaveLength(2);
+    expect(screen.getAllByText("+1 previous tool call")).toHaveLength(2);
     expect(screen.getByText("between bursts")).toBeInTheDocument();
   });
 
@@ -602,15 +644,15 @@ describe("MessageList activity blocks", () => {
       resolution: { state: "pending" },
     };
     renderList([readCall(0, "/a"), readCall(1, "/b"), pending, approval]);
-    // Two completed reads fold into an activity block; the gated Bash call
-    // stays a standalone card with its approval footer visible.
-    expect(screen.getByText("Explored the codebase")).toBeInTheDocument();
+    // Two completed reads stay in one compact log; the gated Bash call stays
+    // a standalone actionable card with its approval footer visible.
+    expect(screen.getByText("+1 previous tool call")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
   });
 });
 
-describe("MessageList provider avatar", () => {
+describe("MessageList provider identity", () => {
   const assistantTurn: ChatViewItem[] = [
     {
       kind: "assistant_message",
@@ -622,24 +664,19 @@ describe("MessageList provider avatar", () => {
     },
   ];
 
-  it("threads the provider through to the assistant-turn avatar mark", () => {
+  it("keeps provider identity on the transcript without adding an avatar rail", () => {
     const { container } = render(
       <MessageList messages={assistantTurn} provider="codex" {...noopHandlers} />,
     );
-    const img = container.querySelector(
-      "img[data-provider]",
-    ) as HTMLImageElement;
-    expect(img).not.toBeNull();
-    expect(img.getAttribute("data-provider")).toBe("codex");
-    expect(img.getAttribute("src")).toContain("codex.svg");
+    expect(container.querySelector('[data-provider="codex"]')).not.toBeNull();
+    expect(container.querySelector("img[data-provider]")).toBeNull();
   });
 
-  it("falls back to the sparkle avatar when no provider is passed", () => {
+  it("omits provider metadata when no provider is passed", () => {
     const { container } = render(
       <MessageList messages={assistantTurn} {...noopHandlers} />,
     );
-    // No branded mark image; the ember sparkle (inline svg) shows instead.
-    expect(container.querySelector("img[data-provider]")).toBeNull();
+    expect(container.querySelector("[data-provider]")).toBeNull();
   });
 });
 

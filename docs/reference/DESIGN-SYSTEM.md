@@ -211,6 +211,28 @@ treatment to controls small enough for a ring to read cleanly.
   overrides: they thin DM Sans in WebKitGTK and render differently from the
   Chromium dev mock.
 
+## Agent transcript hierarchy
+
+Agent Chat treats provider process output as supporting material, not a stack
+of peer cards. The active state may show one compact mechanical-work row per
+contiguous burst; earlier steps live behind a small text disclosure. Once a
+turn completes, routine commentary, reasoning, tools, and settled orchestration
+collapse behind one hairline `Worked…` row while the terminal assistant answer
+stays on the reading rail.
+
+- Do not add an outer card, tinted background, success badge, shimmer, or step
+  counter to routine work rows. A muted 11–12px metadata line and the one shared
+  20px `AgentOrb` for the live tail are sufficient.
+- Keep pending decisions, questions, plans, errors, and active orchestration
+  visible. Calm hierarchy never means hiding something the user must act on.
+- Source paths in assistant prose, inline code, code-fence titles, and tool
+  detail use `MarkdownFileLink`: existing `FileTypeIcon`, borderless inline-link
+  styling, resolved-path tooltip, and right-panel line reveal. Keep the resting
+  state free of a border or fill; color and the keyboard focus ring carry the
+  interaction feedback. Do not introduce a second file-preview surface.
+- Assistant prose and the final answer use the main chat column directly. Do
+  not recreate a repeated avatar gutter around mechanical rows.
+
 ## Notes
 
 - `.thin-scrollbar` (in `globals.css`) is the shared opt-in for overlay lists

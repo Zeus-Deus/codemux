@@ -1,4 +1,4 @@
-import { Check, ChevronDown, CircleCheck, LoaderCircle, X } from "lucide-react";
+import { Check, ChevronDown, LoaderCircle, X } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
@@ -7,35 +7,13 @@ import { cn } from "@/lib/utils";
 
 import type { ActivityStep } from "./transcript-slots";
 import { ToolCallBody } from "./ToolCallBodies";
-import {
-  deriveActivityDurationMs,
-  deriveActivitySummary,
-  deriveActivityCounts,
-  deriveLiveAction,
-  deriveWorkingCounter,
-  formatActivityDuration,
-  toStepView,
-  type StepStatus,
-} from "./activity-steps";
+import { stepStatus, toStepView, type StepStatus } from "./activity-steps";
 
 /**
- * Activity block (Activity Stream design). ONE card per contiguous run of
- * mechanical steps (reasoning + tool calls). Two derived states share the
- * same step list:
- *
- *  - **Working** (live tail of an active turn): a collapsed row — amber
- *    spinner, bold "Working", a shimmering mono live action, a mono
- *    `N done · M running` counter, a rotating chevron. Expanding shows the
- *    steps in place; completed steps dim (~0.6) with green checks, the
- *    running step full-opacity with an amber spinner.
- *  - **Settled**: rolls up to a green one-liner — circled check, a derived
- *    summary sentence, mono `N steps · 1m 12s` meta (duration when
- *    derivable), and a Details/Hide toggle. Collapsed by default; expanding
- *    shows the identical list (all green checks, full opacity).
- *
- * Clicking a step row expands the full tool detail inline beneath it
- * (`ToolCallBody` reuses `DiffView` for edits; thoughts show their text).
- * Modeled on ToolGroupCard's card idiom.
+ * Compact mechanical work log. The newest step is the default surface; older
+ * contiguous work stays one click away. There is deliberately no surrounding
+ * card, status banner, shimmer, counter, or settled-success header—the turn
+ * fold owns completion and the final assistant answer owns the hierarchy.
  */
 export const ActivityBlock = memo(function ActivityBlock({
   items,
@@ -44,211 +22,161 @@ export const ActivityBlock = memo(function ActivityBlock({
   items: ActivityStep[];
   working: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [showPrevious, setShowPrevious] = useState(false);
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+  const previousWorking = useRef(working);
 
-  // On settle (working → false) reset any mid-stream expansion so the run
-  // re-renders as the collapsed settled header (design contract).
-  const prevWorking = useRef(working);
   useEffect(() => {
-    if (prevWorking.current && !working) {
-      setOpen(false);
+    if (previousWorking.current && !working) {
+      setShowPrevious(false);
       setExpandedStepId(null);
     }
-    prevWorking.current = working;
+    previousWorking.current = working;
   }, [working]);
 
+  const visible = showPrevious ? items : items.slice(-1);
+  const hiddenCount = Math.max(0, items.length - 1);
+  const hiddenItems = items.slice(0, -1);
+  const hiddenFailedCount = hiddenItems.filter(
+    (item) => stepStatus(item) === "error",
+  ).length;
+  const hiddenAreTools = hiddenItems.every((item) => item.kind === "tool_call");
+  const hiddenLabel = hiddenAreTools
+    ? `tool call${hiddenCount === 1 ? "" : "s"}`
+    : `log entr${hiddenCount === 1 ? "y" : "ies"}`;
+
   return (
-    <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
-      {working ? (
-        <WorkingHeader steps={items} open={open} onToggle={() => setOpen((v) => !v)} />
-      ) : (
-        <SettledHeader steps={items} open={open} onToggle={() => setOpen((v) => !v)} />
-      )}
-      {open && (
-        <div className="flex flex-col gap-px border-t border-border/60 px-3 py-2">
-          {items.map((step) => (
+    <div className="-mx-1 select-text px-1 py-0.5">
+      <div className="space-y-px">
+        {visible.map((step) => {
+          const isLive = working && step.id === items[items.length - 1]?.id;
+          return (
             <StepRow
               key={step.id}
               step={step}
-              working={working}
+              live={isLive}
+              orbActivity={isLive ? turnOrbActivity(items) : undefined}
               expanded={expandedStepId === step.id}
               onToggle={() =>
-                setExpandedStepId((cur) => (cur === step.id ? null : step.id))
+                setExpandedStepId((current) =>
+                  current === step.id ? null : step.id,
+                )
               }
             />
-          ))}
-        </div>
+          );
+        })}
+      </div>
+
+      {hiddenCount > 0 && (
+        <button
+          type="button"
+          aria-expanded={showPrevious}
+          onClick={() => setShowPrevious((current) => !current)}
+          className="flex w-full items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 text-foreground/80 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        >
+          <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground/65">
+            <ChevronDown
+              className={cn(
+                "size-3.5 transition-transform duration-150",
+                showPrevious && "rotate-180",
+              )}
+              aria-hidden
+            />
+          </span>
+          <span className="font-medium">
+            {showPrevious
+              ? "Show fewer work entries"
+              : `+${hiddenCount} previous ${hiddenLabel}`}
+          </span>
+          {hiddenFailedCount > 0 && !showPrevious ? (
+            <span className="text-status-attention">
+              · {hiddenFailedCount} failed
+            </span>
+          ) : null}
+        </button>
       )}
     </div>
   );
 });
 
-function WorkingHeader({
-  steps,
-  open,
-  onToggle,
-}: {
-  steps: ActivityStep[];
-  open: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={open}
-      className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left"
-    >
-      {/* The turn's live orb. While a tool is running this block owns the
-          thread's "in progress" signal — the transcript-tail marker stands
-          down (see `shouldShowThinkingIndicator`) — so there is never a
-          second orb competing with this one. */}
-      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-        <AgentOrb size={20} {...turnOrbActivity(steps)} aria-hidden />
-      </span>
-      <span className="shrink-0 text-[13px] font-bold text-foreground">
-        Working
-      </span>
-      <span className="min-w-0 flex-1 truncate">
-        <span className="shimmer font-mono text-[11px]">
-          {deriveLiveAction(steps)}
-        </span>
-      </span>
-      <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-        {deriveWorkingCounter(steps)}
-      </span>
-      <ChevronDown
-        className={cn(
-          "h-3 w-3 shrink-0 text-muted-foreground/70 transition-transform",
-          open && "rotate-180",
-        )}
-        aria-hidden
-      />
-    </button>
-  );
-}
-
-function SettledHeader({
-  steps,
-  open,
-  onToggle,
-}: {
-  steps: ActivityStep[];
-  open: boolean;
-  onToggle: () => void;
-}) {
-  const { total, failed } = deriveActivityCounts(steps);
-  const durationMs = deriveActivityDurationMs(steps);
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={open}
-      className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left"
-    >
-      <CircleCheck
-        className="h-4 w-4 shrink-0 text-status-open"
-        strokeWidth={1.8}
-        aria-hidden
-      />
-      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-muted-foreground">
-        {deriveActivitySummary(steps)}
-      </span>
-      <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-        {total} step{total === 1 ? "" : "s"}
-        {durationMs != null ? ` · ${formatActivityDuration(durationMs)}` : ""}
-        {failed > 0 ? (
-          <span className="text-status-attention"> · {failed} failed</span>
-        ) : null}
-      </span>
-      <span className="flex shrink-0 items-center gap-1.5 text-[12px] font-semibold text-muted-foreground/70">
-        {open ? "Hide" : "Details"}
-        <ChevronDown
-          className={cn("h-3 w-3 transition-transform", open && "rotate-180")}
-          aria-hidden
-        />
-      </span>
-    </button>
-  );
-}
-
 function StepRow({
   step,
-  working,
+  live,
+  orbActivity,
   expanded,
   onToggle,
 }: {
   step: ActivityStep;
-  working: boolean;
+  live: boolean;
+  orbActivity?: ReturnType<typeof turnOrbActivity>;
   expanded: boolean;
   onToggle: () => void;
 }) {
   const view = toStepView(step);
-  // Working expanded list dims completed steps so the live (running) one
-  // reads as the focus; settled shows every step at full opacity.
-  const dim = working && view.status !== "running";
-
   return (
-    <div className={cn(dim && "opacity-60")}>
+    <div>
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="flex w-full min-w-0 items-center gap-2.5 rounded-md px-1.5 py-1 text-left font-mono text-[11px] hover:bg-foreground/[0.04]"
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
       >
-        <StepGlyph status={view.status} />
-        <span className="shrink-0 text-muted-foreground/60">{view.verb}</span>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          {live ? (
+            <AgentOrb size={20} {...(orbActivity ?? {})} aria-hidden />
+          ) : (
+            <StepGlyph status={view.status} />
+          )}
+        </span>
+        <span className="shrink-0 text-muted-foreground/65">{view.verb}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
           {view.summary}
         </span>
-        {view.meta && (
+        {view.meta && !live ? (
           <span
             className={cn(
-              "shrink-0 text-muted-foreground/60",
+              "shrink-0 font-mono text-[10px] text-muted-foreground/55",
               view.status === "error" && "text-status-attention",
             )}
           >
             {view.meta}
           </span>
-        )}
+        ) : null}
+        <ChevronDown
+          className={cn(
+            "size-3 shrink-0 text-muted-foreground/45 transition-transform",
+            expanded && "rotate-180",
+          )}
+          aria-hidden
+        />
       </button>
       {expanded && (
-        <div className="border-l border-border/60 py-1.5 pl-3 ml-[9px] mt-0.5">
-          <StepDetail step={step} />
+        <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
+          {step.kind === "reasoning" ? (
+            <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+              {step.text}
+            </p>
+          ) : (
+            <ToolCallBody item={step} />
+          )}
         </div>
       )}
     </div>
   );
-}
-
-function StepDetail({ step }: { step: ActivityStep }) {
-  if (step.kind === "reasoning") {
-    return (
-      <p className="select-text whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
-        {step.text}
-      </p>
-    );
-  }
-  return <ToolCallBody item={step} />;
 }
 
 function StepGlyph({ status }: { status: StepStatus }) {
   if (status === "running") {
     return (
       <LoaderCircle
-        className="h-3 w-3 shrink-0 animate-spin text-status-working"
-        strokeWidth={2}
+        className="size-3 animate-spin text-muted-foreground/70"
+        strokeWidth={1.8}
         aria-hidden
       />
     );
   }
   if (status === "error") {
-    return (
-      <X className="h-3 w-3 shrink-0 text-status-attention" strokeWidth={2} aria-hidden />
-    );
+    return <X className="size-3 text-status-attention" strokeWidth={2} aria-hidden />;
   }
-  return (
-    <Check className="h-3 w-3 shrink-0 text-status-open" strokeWidth={2} aria-hidden />
-  );
+  return <Check className="size-3 text-status-open" strokeWidth={2} aria-hidden />;
 }

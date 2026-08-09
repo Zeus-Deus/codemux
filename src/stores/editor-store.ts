@@ -5,6 +5,8 @@ export interface EditorTabState {
   filePath: string | null;
   baselineContent: string;
   isDirty: boolean;
+  /** Transient request from a source reference. Omitted from persistence. */
+  revealRequest?: { line: number; column?: number; nonce: number };
 }
 
 const DEFAULT_TAB: EditorTabState = {
@@ -20,6 +22,7 @@ interface EditorStore {
   setFilePath: (tabId: string, filePath: string) => void;
   setBaselineContent: (tabId: string, content: string) => void;
   setDirty: (tabId: string, dirty: boolean) => void;
+  requestReveal: (tabId: string, line: number, column?: number) => void;
   removeTab: (tabId: string) => void;
 }
 
@@ -69,6 +72,26 @@ export const useEditorStore = create<EditorStore>()(
             [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), isDirty: dirty },
           },
         })),
+
+      requestReveal: (tabId, line, column) =>
+        set((s) => {
+          const current = s.tabs[tabId] ?? DEFAULT_TAB;
+          return {
+            tabs: {
+              ...s.tabs,
+              [tabId]: {
+                ...current,
+                revealRequest: {
+                  line: Math.max(1, Math.floor(line)),
+                  ...(column != null
+                    ? { column: Math.max(1, Math.floor(column)) }
+                    : {}),
+                  nonce: (current.revealRequest?.nonce ?? 0) + 1,
+                },
+              },
+            },
+          };
+        }),
 
       removeTab: (tabId) =>
         set((s) => {

@@ -29,6 +29,13 @@ export type UserMessageEnvelope = Extract<
 
 export type ReplayPayload = ProviderRuntimeEvent;
 
+/** Parsed history row with the SQLite insertion time that owned it. The
+ *  timestamp is optional for compatibility with older callers/tests. */
+export interface TimedReplayPayload {
+  event: ReplayPayload;
+  createdAtMs?: number;
+}
+
 const STALE_REQUEST_MESSAGE =
   "This request expired when the provider session restarted. Continue to have the agent repeat it.";
 
@@ -104,7 +111,20 @@ export function replayParsed(
   parsed: ReplayPayload[],
   opts?: ReplayOptions,
 ): ChatThreadState {
-  const state = foldReplayPayloads(createEmptyThreadState(), parsed);
+  return replayTimed(
+    parsed.map((event) => ({ event })),
+    opts,
+  );
+}
+
+/** Replay rows using their durable insertion times so restored turn durations
+ *  are identical to the live transcript instead of being stamped at mount. */
+export function replayTimed(
+  timed: TimedReplayPayload[],
+  opts?: ReplayOptions,
+): ChatThreadState {
+  const parsed = timed.map((row) => row.event);
+  const state = foldReplayPayloads(createEmptyThreadState(), timed);
   return finalizeReplay(state, parsed, opts, false, false);
 }
 
@@ -135,7 +155,20 @@ export function applyReplayTail(
   parsed: ReplayPayload[],
   opts: ReplayOptions & { previousUnsettled: boolean },
 ): ChatThreadState {
-  const merged = foldReplayPayloads(base, parsed);
+  return applyTimedReplayTail(
+    base,
+    parsed.map((event) => ({ event })),
+    opts,
+  );
+}
+
+export function applyTimedReplayTail(
+  base: ChatThreadState,
+  timed: TimedReplayPayload[],
+  opts: ReplayOptions & { previousUnsettled: boolean },
+): ChatThreadState {
+  const parsed = timed.map((row) => row.event);
+  const merged = foldReplayPayloads(base, timed);
   return finalizeReplay(
     merged,
     parsed,
@@ -154,11 +187,15 @@ export function applyReplayTail(
  *  `images` path→`src` mapping live in the reducer's case. */
 function foldReplayPayloads(
   base: ChatThreadState,
-  parsed: ReplayPayload[],
+  timed: TimedReplayPayload[],
 ): ChatThreadState {
   let state = base;
-  for (const row of parsed) {
-    state = applyEvent(state, row);
+  for (const row of timed) {
+    state = applyEvent(
+      state,
+      row.event,
+      row.createdAtMs == null ? undefined : () => row.createdAtMs!,
+    );
   }
   return state;
 }
@@ -320,6 +357,25 @@ export function parseReplayPayloads(payloads: string[]): ReplayPayload[] {
   for (const raw of payloads) {
     const row = parsePayload(raw);
     if (row) parsed.push(row);
+  }
+  return parsed;
+}
+
+/** Parse cursor/history rows while preserving their durable timestamps. */
+export function parseTimedReplayPayloads(
+  rows: ReadonlyArray<{ payload: string; created_at_ms?: number }>,
+): TimedReplayPayload[] {
+  const parsed: TimedReplayPayload[] = [];
+  for (const source of rows) {
+    const event = parsePayload(source.payload);
+    if (!event) continue;
+    const createdAtMs = source.created_at_ms;
+    parsed.push({
+      event,
+      ...(typeof createdAtMs === "number" && Number.isFinite(createdAtMs)
+        ? { createdAtMs }
+        : {}),
+    });
   }
   return parsed;
 }

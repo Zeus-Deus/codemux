@@ -18,11 +18,7 @@ import { EditorPane } from "@/components/editor/EditorPane";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import { useEditorStore } from "@/stores/editor-store";
 import type { WorkspaceSnapshot } from "@/tauri/types";
-
-/** Stable editor-store key for a file shown in this workspace's deck. */
-export function docEditorTabId(workspaceId: string, filePath: string): string {
-  return `right-panel:${workspaceId}:${filePath}`;
-}
+import { docEditorTabId } from "./pane-registry";
 
 export function DocPane({
   workspace,

@@ -55,56 +55,59 @@ function renderBlock(items: ActivityStep[], working: boolean) {
   return render(<ActivityBlock items={items} working={working} />);
 }
 
-describe("ActivityBlock — working header", () => {
-  it("shows the Working label, live action and done/running counter", () => {
+describe("ActivityBlock — compact work log", () => {
+  it("shows only the newest action and one quiet history disclosure", () => {
     renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
-    expect(screen.getByText("Working")).toBeInTheDocument();
-    // Live action reflects the running step; counter reads N done · M running.
-    expect(screen.getByText("run cargo test")).toBeInTheDocument();
-    expect(screen.getByText("1 done · 1 running")).toBeInTheDocument();
+    expect(screen.getByText("run")).toBeInTheDocument();
+    expect(screen.getByText("cargo test")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\+1 previous tool call/ })).toBeInTheDocument();
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.queryByText("Working")).toBeNull();
   });
 
-  it("dims completed steps and keeps the running step full opacity when expanded", () => {
+  it("restores previous rows without replacing the newest row", () => {
     renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
-    fireEvent.click(screen.getByText("Working"));
-    // The running step row exposes a "running" meta; the done step shows "done".
-    expect(screen.getByText("running")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    expect(screen.getByText("cargo test")).toBeInTheDocument();
     expect(screen.getByText("done")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Show fewer work entries/ })).toBeInTheDocument();
   });
-});
 
-describe("ActivityBlock — settled header", () => {
-  it("rolls up to a summary sentence, a step count and a Details toggle", () => {
+  it("uses the same latest-first treatment after settlement", () => {
     renderBlock([read(0, "/a"), read(1, "/b"), read(2, "/c")], false);
-    expect(screen.getByText("Explored the codebase")).toBeInTheDocument();
-    expect(screen.getByText("3 steps")).toBeInTheDocument();
-    expect(screen.getByText("Details")).toBeInTheDocument();
-    // Collapsed by default — step rows are hidden.
+    expect(screen.getByText("/c")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /\+2 previous tool calls/ })).toBeInTheDocument();
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.queryByText("Explored the codebase")).toBeNull();
+    expect(screen.queryByText("Details")).toBeNull();
+  });
+
+  it("reveals all rows in chronology and can compact them again", () => {
+    renderBlock([read(0, "/a"), read(1, "/b")], false);
+    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
+    expect(screen.getByText("/a")).toBeInTheDocument();
+    expect(screen.getByText("/b")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Show fewer work entries/ }));
     expect(screen.queryByText("/a")).toBeNull();
   });
 
-  it("reveals the step rows and flips to Hide on expand", () => {
-    renderBlock([read(0, "/a"), read(1, "/b")], false);
-    fireEvent.click(screen.getByText("Explored the codebase"));
-    expect(screen.getByText("/a")).toBeInTheDocument();
-    expect(screen.getByText("/b")).toBeInTheDocument();
-    expect(screen.getByText("Hide")).toBeInTheDocument();
-  });
-
-  it("derives a duration from step timestamps when available", () => {
-    const first = read(0, "/a", { started_at: 1_000, completed_at: 5_000 });
-    const last = read(1, "/b", { started_at: 6_000, completed_at: 73_000 });
-    renderBlock([first, last], false);
-    // 73_000 − 1_000 = 72s = 1m 12s.
-    expect(screen.getByText(/1m 12s/)).toBeInTheDocument();
-  });
-
-  it("appends a red failed count when a step errored", () => {
-    renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "error" })], false);
-    expect(screen.getByText(/1 failed/)).toBeInTheDocument();
-    // The errored step row surfaces as a "failed" meta on expand.
-    fireEvent.click(screen.getByText("Ran commands and inspected the code"));
+  it("keeps a latest failure visible and flags a hidden earlier failure", () => {
+    const { rerender } = renderBlock(
+      [read(0, "/a"), bash(1, "cargo test", { status: "error" })],
+      false,
+    );
     expect(screen.getByText("failed")).toBeInTheDocument();
+    rerender(
+      <ActivityBlock
+        items={[
+          bash(0, "cargo test", { status: "error" }),
+          read(1, "/fixed"),
+        ]}
+        working={false}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /\+1 previous tool call · 1 failed/ })).toBeInTheDocument();
   });
 });
 
@@ -114,7 +117,7 @@ describe("ActivityBlock — step-row inline detail", () => {
       result_content: "hello world content",
     });
     renderBlock([withResult, read(1, "/b")], false);
-    fireEvent.click(screen.getByText("Explored the codebase"));
+    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
     // Detail hidden until the row is clicked.
     expect(screen.queryByText("hello world content")).toBeNull();
     fireEvent.click(screen.getByText("/a"));
@@ -123,7 +126,7 @@ describe("ActivityBlock — step-row inline detail", () => {
 
   it("expands a thought's full text beneath a reasoning step row", () => {
     renderBlock([think(0, "short first\nhidden detail line"), read(1, "/b")], false);
-    fireEvent.click(screen.getByText("Explored the codebase"));
+    fireEvent.click(screen.getByRole("button", { name: /\+1 previous log entry/ }));
     expect(screen.queryByText(/hidden detail line/)).toBeNull();
     // Row shows only the first line; clicking reveals the full thought.
     fireEvent.click(screen.getByText("short first"));
