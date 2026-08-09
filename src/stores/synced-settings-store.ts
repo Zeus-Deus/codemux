@@ -9,7 +9,8 @@ import {
 
 const DEFAULT_SETTINGS: UserSettings = {
   appearance: {
-    theme: "system",
+    theme: "default",
+    custom_themes: [],
     shell_font: null,
     terminal_font_size: 13,
     show_resource_monitor: true,
@@ -43,6 +44,8 @@ interface SyncedSettingsActions {
 type SyncedSettingsStore = SyncedSettingsState & SyncedSettingsActions;
 
 export { DEFAULT_SETTINGS };
+
+const EMPTY_CUSTOM_THEMES: unknown[] = [];
 
 // Each optimistic write increments this. Async responses only apply if
 // the generation matches, preventing stale backend responses from
@@ -151,6 +154,12 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
 
 export const selectTerminalFontSize = (s: SyncedSettingsState): number =>
   s.settings.appearance.terminal_font_size;
+
+export const selectAppearanceTheme = (s: SyncedSettingsState): string =>
+  s.settings.appearance.theme || "default";
+
+export const selectCustomThemes = (s: SyncedSettingsState): unknown[] =>
+  s.settings.appearance.custom_themes ?? EMPTY_CUSTOM_THEMES;
 
 export const selectTerminalCursorStyle = (s: SyncedSettingsState): string =>
   s.settings.terminal.cursor_style;

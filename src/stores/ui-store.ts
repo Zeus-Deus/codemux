@@ -32,6 +32,13 @@ export type RightPanelCorePane =
  */
 export const RIGHT_PANEL_EMPTY = "empty";
 
+/** What the Theme Studio should open on — one of its two tabs, or an
+ *  existing custom theme to reopen. */
+export type ThemeStudioRequest =
+  | { mode: "generate" }
+  | { mode: "import" }
+  | { editThemeId: string };
+
 /** A pane id in the right-panel deck. `doc:<absolute path>` panes are
  *  opened per file, so the id carries its own payload — that keeps the
  *  open-pane list a plain, persistable string array. */
@@ -120,6 +127,22 @@ interface UIStore {
    *  restores the user's pick instead of resetting to Default. */
   lastModelSelections: Record<string, ModelSelection>;
   showCommandPalette: boolean;
+  /**
+   * Seed text the palette should open with, consumed once on mount.
+   *
+   * The theme picker lives behind a query (`⌘K → theme`), so the surfaces
+   * that mean "let me change the theme" — Settings ▸ Appearance's Change
+   * button — have to hand the palette the word rather than reimplement the
+   * list. Transient; never persisted.
+   */
+  commandPaletteQuery: string | null;
+  /**
+   * Theme Studio request, or null while it is closed. `"generate"` and
+   * `"import"` open the two tabs the palette's last two rows point at; a
+   * `{ editThemeId }` request reopens a saved custom theme.
+   * Transient; never persisted.
+   */
+  themeStudio: ThemeStudioRequest | null;
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
   onboardingProjectDir: string | null;
@@ -180,6 +203,12 @@ interface UIStore {
   setLastModelSelection: (family: string, selection: ModelSelection) => void;
   setShowCommandPalette: (show: boolean) => void;
   toggleCommandPalette: () => void;
+  /** Open the palette pre-filled with `query` (see {@link commandPaletteQuery}). */
+  openCommandPaletteWith: (query: string) => void;
+  /** Read-and-clear the seed query, so reopening the palette starts empty. */
+  takeCommandPaletteQuery: () => string | null;
+  openThemeStudio: (request: ThemeStudioRequest) => void;
+  closeThemeStudio: () => void;
   setShowCloneDialog: (show: boolean) => void;
   setShowNewProjectScreen: (show: boolean) => void;
   setOnboardingProjectDir: (dir: string | null) => void;
@@ -218,6 +247,8 @@ export const useUIStore = create<UIStore>()(
       lastSelectedAgentId: null,
       lastModelSelections: {},
       showCommandPalette: false,
+      commandPaletteQuery: null,
+      themeStudio: null,
       showCloneDialog: false,
       showNewProjectScreen: false,
       onboardingProjectDir: null,
@@ -398,6 +429,24 @@ export const useUIStore = create<UIStore>()(
 
       setShowCommandPalette: (show) => set({ showCommandPalette: show }),
       toggleCommandPalette: () => set((s) => ({ showCommandPalette: !s.showCommandPalette })),
+
+      // Deliberately does NOT close Settings. Settings is a full-screen
+      // destination, so this used to have to leave it for the palette to
+      // mount at all — which meant Change ejected you from Appearance, and
+      // Esc out of the studio landed you on the home screen. `SettingsView`
+      // now mounts its own `CommandPalette`, so the palette (and the studio
+      // opened from it) layers over Settings and Esc returns you to the page
+      // you were on.
+      openCommandPaletteWith: (query) =>
+        set({ commandPaletteQuery: query, showCommandPalette: true }),
+      takeCommandPaletteQuery: () => {
+        const { commandPaletteQuery } = get();
+        if (commandPaletteQuery !== null) set({ commandPaletteQuery: null });
+        return commandPaletteQuery;
+      },
+
+      openThemeStudio: (request) => set({ themeStudio: request }),
+      closeThemeStudio: () => set({ themeStudio: null }),
 
       setShowCloneDialog: (show) => set({ showCloneDialog: show }),
 

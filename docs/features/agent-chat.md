@@ -157,15 +157,15 @@ two read as one surface.
 
 - **Syntax highlighting** is Streamdown's Shiki `code` plugin
   (`@streamdown/code`), enabled via `plugins={{ code }}`. Token colors come
-  from a theme built out of the **terminal ANSI palette**
+  from a theme built out of the **shared app/system ANSI palette**
   (`src/lib/shiki-chat-theme.ts`), whose scope map mirrors the Lezer tag map
   in `src/lib/codemirror-theme.ts` — so a keyword is the same color in chat,
   the file editor, and the terminal. Keep the two maps in sync.
 - The plugin is supplied by `useChatCodePlugin()`
-  (`src/hooks/use-chat-code-plugin.ts`), a **module-level store** rather than
-  a per-component hook: a transcript mounts one `ChatMarkdown` per assistant
-  message, so a per-hook fetch would fire one `get_current_theme` IPC call and
-  one `theme-changed` listener per message. The plugin instance is memoized on
+  (`src/hooks/use-chat-code-plugin.ts`) from the module-level syntax store in
+  `src/hooks/use-theme-colors.ts`, rather than opening a native listener per
+  message. A transcript mounts one `ChatMarkdown` per assistant message. The
+  plugin instance is memoized on
   palette identity to avoid **render churn** — a fresh plugin identity on every
   streamed keystroke would propagate through the whole markdown tree. It is
   *not* about cache preservation: Shiki's highlighter and token caches live in

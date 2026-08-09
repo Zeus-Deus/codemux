@@ -59,7 +59,7 @@ describe("document selection contract", () => {
   });
 
   it("keeps the selection pair as dedicated tokens rather than palette foreground", () => {
-    expect(globalsCss).toContain("--selection-background: var(--accent-ember)");
+    expect(globalsCss).toMatch(/--selection-background:\s*oklch\(/);
     expect(globalsCss).toMatch(/--selection-foreground:\s*oklch\(/);
   });
 });

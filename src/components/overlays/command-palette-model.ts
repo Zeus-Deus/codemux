@@ -152,6 +152,55 @@ export function commandSearchText(command: {
   return command.keywords ? `${command.label} ${command.keywords}` : command.label;
 }
 
+// ── Themes ───────────────────────────────────────────────────────────────
+
+/**
+ * The generic words the whole theme group answers to, alongside each row's
+ * own name. The picker's advertised entry point is the word itself —
+ * ⌘K → "theme" has to surface the set.
+ */
+export const THEME_KEYWORDS = "theme colors palette appearance";
+
+/**
+ * Rank the theme group: by name when the query names one, otherwise the whole
+ * set in registry order.
+ *
+ * Folding the generic keywords into each row's haystack — the obvious first
+ * try — makes "theme" match every row with a score that differs only by name
+ * length, so the list comes back sorted by how short each theme is called.
+ * The keywords are a group-level gate instead: they decide *whether* the
+ * group shows, and registry order (built-ins as declared, then custom) decides
+ * the order. `rankByQuery` still handles the case that matters, a real name.
+ */
+export function rankThemeGroup<T>(
+  items: readonly T[],
+  query: PaletteQuery,
+  nameText: (item: T) => string,
+): T[] {
+  if (query.needle === "") return [];
+  const byName = rankByQuery(items, query, nameText, nameText);
+  if (byName.length > 0) return byName;
+  return fuzzyScore(THEME_KEYWORDS, query.needle) === null ? [] : [...items];
+}
+
+/**
+ * Theme rows are addressed by a prefixed cmdk value so the palette can tell,
+ * from the selected value alone, whether the highlighted row is a theme — and
+ * therefore whether the app should currently be wearing a preview.
+ */
+export const THEME_ROW_PREFIX = "theme:";
+
+export function themeRowValue(themeId: string): string {
+  return `${THEME_ROW_PREFIX}${themeId}`;
+}
+
+/** The theme id the palette should be previewing, or null for any other row. */
+export function previewedThemeId(selectedValue: string): string | null {
+  if (!selectedValue.startsWith(THEME_ROW_PREFIX)) return null;
+  const id = selectedValue.slice(THEME_ROW_PREFIX.length);
+  return id === "" ? null : id;
+}
+
 /**
  * Group-header count. When a group is capped, say so rather than printing a
  * number that silently under-reports what matched.

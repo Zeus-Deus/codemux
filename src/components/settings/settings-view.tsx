@@ -64,17 +64,17 @@ import {
 } from "@/stores/synced-settings-store";
 import {
   useSettingsStore,
-  SETTINGS_DEFAULTS,
   selectTerminalColorTheme,
-  selectPalette,
   selectDensity,
   selectChatCodeWrap,
+  SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
   selectOrbMatchActivity,
-  type AppearancePalette,
   type AppearanceDensity,
   type AutoSettleDays,
 } from "@/stores/settings-store";
+import { ThemeSettings } from "./theme-settings";
+import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
 import {
@@ -248,10 +248,10 @@ function SettingRow({ label, description, children }: {
 }) {
   return (
     <div className="flex items-center justify-between gap-8 py-4">
-      <div className="space-y-1 min-w-0">
-        <p className="text-[14px] font-semibold leading-tight text-foreground">{label}</p>
+      <div className="min-w-0 space-y-1">
+        <p className="text-[14px] leading-tight font-semibold text-foreground">{label}</p>
         {description && (
-          <p className="text-[12px] text-muted-foreground/80 leading-relaxed">{description}</p>
+          <p className="text-[12px] leading-relaxed text-muted-foreground/80">{description}</p>
         )}
       </div>
       <div className="shrink-0">{children}</div>
@@ -349,6 +349,11 @@ function FormField({
   );
 }
 
+
+/** One preview row in the Agents section: an orb doing a specific thing,
+ *  next to the kind of label it sits beside in the real sidebar. Reads the
+ *  live setting through AgentOrb, so toggling pins both rows to the same
+ *  working orb without any extra wiring here. */
 /** Segmented control — a bordered pill of mutually-exclusive options
  *  with a neutral foreground-filled active segment (the design system's
  *  "white is the baseline" rule for toggles/selection). */
@@ -393,10 +398,6 @@ function SegmentedControl<T extends string>({
   );
 }
 
-/** One preview row in the Agents section: an orb doing a specific thing,
- *  next to the kind of label it sits beside in the real sidebar. Reads the
- *  live setting through AgentOrb, so toggling pins both rows to the same
- *  working orb without any extra wiring here. */
 function OrbPreviewRow({
   activity,
   label,
@@ -414,9 +415,7 @@ function OrbPreviewRow({
       <span className="flex-1 truncate text-[13px] font-semibold text-foreground">
         {label}
       </span>
-      <span className="font-mono text-[11px] text-muted-foreground">
-        {elapsed}
-      </span>
+      <span className="font-mono text-[11px] text-muted-foreground">{elapsed}</span>
     </div>
   );
 }
@@ -1278,6 +1277,8 @@ function PresetEditorSheet({
 
 export function SettingsView() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
+  const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const settingsSection = useUIStore((s) => s.settingsSection);
   const config = useAppStore((s) => s.appState?.config);
   const storeSet = useSettingsStore((s) => s.set);
@@ -1287,7 +1288,6 @@ export function SettingsView() {
   const fontSize = useSyncedSettingsStore(selectTerminalFontSize);
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
-  const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
   const chatCodeWrap = useSettingsStore(selectChatCodeWrap);
@@ -1304,6 +1304,9 @@ export function SettingsView() {
   const signOut = useAuthStore((s) => s.signOut);
   const syncedSettings = useSyncedSettingsStore((s) => s.settings);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
+  const liveRadius = typeof document === "undefined"
+    ? "0.625rem"
+    : getComputedStyle(document.documentElement).getPropertyValue("--radius").trim() || "0.625rem";
 
   const activeWorkspace = useAppStore((s) => {
     const st = s.appState;
@@ -1583,6 +1586,12 @@ export function SettingsView() {
         );
 
       case "appearance":
+        // Unchanged from before the Theming handoff, with one exception: the
+        // theme *grid* is gone. Picking a theme now lives in the command
+        // palette (⌘K → "theme"), where the whole app repaints behind the list
+        // — so `ThemeSettings` is a single row stating what is on, and the
+        // studio it opens is an app-level overlay. Everything else on this
+        // page stayed exactly where it was.
         return (
           <div>
             <SectionHeader
@@ -1590,26 +1599,14 @@ export function SettingsView() {
               description="Customize how Codemux looks. Theme changes apply immediately."
             />
             <div className="space-y-1">
-              <SettingRow label="Theme preset" description="shadcn preset code used to generate the color system.">
-                <Badge variant="secondary" className="font-mono text-xs px-3 py-1">b1HYEHloH</Badge>
+              <SettingRow label="Typography" description="Fixed across themes so every palette keeps Codemux's visual rhythm.">
+                <span className="text-right text-[12px] text-muted-foreground">
+                  DM Sans <span className="px-1 text-border">·</span> JetBrains Mono
+                </span>
               </SettingRow>
               <Separator />
-              <SettingRow label="Font family" description="Applied to the entire app shell and terminal.">
-                {/* FLAG: display-only — the app shell font is fixed to DM Sans
-                    today. Rendered as the design's Select for visual parity;
-                    onValueChange is a no-op until a font-swap backend exists. */}
-                <Select value="dm-sans" onValueChange={() => {}}>
-                  <SelectTrigger className="w-48 h-9">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="dm-sans">DM Sans Variable</SelectItem>
-                  </SelectContent>
-                </Select>
-              </SettingRow>
-              <Separator />
-              <SettingRow label="Border radius" description="Controls the roundness of all UI elements.">
-                <span className="text-sm text-muted-foreground">0.45rem</span>
+              <SettingRow label="Border radius" description="Fixed across themes so a palette can't change the geometry.">
+                <span className="font-mono text-[12px] text-muted-foreground">{liveRadius}</span>
               </SettingRow>
               <Separator />
               <SettingRow
@@ -1632,23 +1629,10 @@ export function SettingsView() {
             <SectionGroup>
               <SubsectionHeader
                 title="Theme"
-                description="Switch the surface palette and overall spacing density. Changes apply immediately across the app."
+                description="One palette drives the app shell, terminal ANSI colors, chat code, and the file editor. Pick one from the command palette — ⌘K, then type a theme name — where the whole app repaints as you arrow through the list. Your selection and custom themes sync between devices."
               />
-              <div className="space-y-1">
-                <SettingRow
-                  label="Color palette"
-                  description="Cool keeps a neutral graphite tone (recommended). Warm is the previous ember-tinted surface."
-                >
-                  <SegmentedControl<AppearancePalette>
-                    ariaLabel="Color palette"
-                    value={palette}
-                    onChange={(value) => storeSet("appearance.palette", value)}
-                    options={[
-                      { value: "cool", label: "Cool" },
-                      { value: "warm", label: "Warm" },
-                    ]}
-                  />
-                </SettingRow>
+              <ThemeSettings />
+              <div className="mt-4 space-y-1">
                 <SettingRow
                   label="Density"
                   description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
@@ -1745,7 +1729,7 @@ export function SettingsView() {
                   different things, so the toggle's effect is visible: with
                   it on they animate differently, with it off they match. */}
               <div className="mt-4">
-                <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55">
+                <p className="mb-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
                   Preview
                 </p>
                 <div className="flex max-w-[300px] flex-col gap-0.5 rounded-[11px] border border-border/60 bg-muted/30 p-1.5">
@@ -1858,7 +1842,7 @@ export function SettingsView() {
               <Separator />
               <SettingRow label="Color theme" description="How the terminal gets its colors.">
                 <Select value={terminalThemeMode} onValueChange={setTerminalThemeMode}>
-                  <SelectTrigger className="w-44 h-9">
+                  <SelectTrigger className="h-9 w-44">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -2498,6 +2482,12 @@ export function SettingsView() {
           </div>
         </ScrollArea>
       </div>
+
+      {/* Settings replaces the whole shell, so the shell's palette isn't
+          mounted here. Appearance's "Change" opens the theme picker, and that
+          must not eject you from the page you were reading — so Settings
+          carries its own instance and the picker layers over it. */}
+      <CommandPalette open={commandPaletteOpen} onOpenChange={setCommandPaletteOpen} />
     </div>
   );
 }
