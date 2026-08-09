@@ -27,3 +27,13 @@ When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For U
 - Use a concise conventional-commit title in plain language.
 - Body: the problem in a sentence or two, then how you fixed it. End with the model and harness that did the work.
 - UI changes need before/after screenshots in the pull request. Use mock data and exclude sensitive or personal information.
+
+## Port Allocation
+
+When working on a project with multiple concurrent worktrees (agents), each agent must use the Codemux port allocator to avoid conflicts on shared host ports (e.g., 4200, 8000, 5432).
+
+- Run `codemux ports allocate <name>` to get a deterministic, globally-aware free port.
+- Reuse the same `<name>` across runs to get the same port.
+- If done, run `codemux ports release <name>` to free it.
+- Run `codemux ports list` to see current allocations for this worktree.
+- Never ask the user to stop another agent's stack; use `codemux ports allocate` instead.
