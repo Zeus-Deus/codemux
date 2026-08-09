@@ -44,6 +44,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Installer unit tests
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/install-sh.test.sh
+
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -62,6 +67,14 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Install sidecar dependencies
+        shell: bash
+        run: cd sidecar/claude-agent && bun install --frozen-lockfile
+
+      - name: Sidecar typecheck
+        shell: bash
+        run: cd sidecar/claude-agent && bun run typecheck
+
       - name: Sidecar ToS boundary check
         # Static check that forbids the sidecar from reading Claude
         # credential files, hitting Anthropic URLs directly, spawning
@@ -73,13 +86,44 @@ jobs:
 
       - name: Sidecar unit tests
         shell: bash
-        run: cd sidecar/claude-agent && bun install --frozen-lockfile && bun test
+        run: cd sidecar/claude-agent && bun test
 
       - name: TypeScript typecheck
         run: npm run check
 
       - name: Frontend tests
         run: npm run test
+
+  # ---------------------------------------------------------------------------
+  # The browser relay client is a standalone Rust crate and is not part of the
+  # Tauri Cargo graph. Check its real wasm32 target in parallel so changes to
+  # that optional transport cannot silently break while keeping it off the
+  # already-long desktop Rust critical path.
+  # ---------------------------------------------------------------------------
+  iroh-wasm:
+    name: iroh-wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: iroh-wasm -> target
+          key: wasm32-unknown-unknown
+
+      - name: Check iroh-wasm
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: cargo check --locked --target wasm32-unknown-unknown --manifest-path iroh-wasm/Cargo.toml
 
   # ---------------------------------------------------------------------------
   # Heavy Rust job: this is the critical path. tauri-build validates
@@ -98,11 +142,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Healthy runs finish in ~6 min on Linux and ~9 min on Windows. The
-    # GitHub-default ceiling is 6 hours per job, so a single hung test on
-    # Windows can pin a runner for that long (see PR #28's post-merge CI).
-    # 30 min is a comfortable 3× headroom over the slow side; anything
-    # past that is a hang, not slowness.
+    # Linux normally finishes well below 15 min, while the larger Windows test
+    # build is the critical path and can approach 30 min on a poor cache. Keep
+    # a tight ceiling so a hung test cannot pin a runner for GitHub's six-hour
+    # default (see PR #28's post-merge CI).
     timeout-minutes: 30
 
     steps:

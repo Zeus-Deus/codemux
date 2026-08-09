@@ -1,62 +1,26 @@
 # Codemux
 
-## Session Bootstrap
+Codemux is a Tauri-based agentic development environment (ADE) with a React/TypeScript frontend and Rust backend.
 
-1. Read `WORKFLOW.md` and `docs/INDEX.md` at the start of every session.
-2. Read the relevant canonical docs under `docs/core/`, `docs/features/`, `docs/plans/`, and `docs/reference/` before making assumptions.
+## Aim
 
-## Docs System
-
-- Treat `docs/` as the single source of truth for project documentation.
-- Use `docs/templates/FEATURE_TEMPLATE.md` and `docs/templates/PLAN_TEMPLATE.md` when creating new docs.
-- If the docs feel stale, scattered, or contradictory, read `docs/reference/DOCS_REINDEX.md` and follow that cleanup process from code evidence.
+Make Codemux performant, reliable, and easy to use. Do not preserve complexity just because it already exists. Treat these instructions as defaults; the user's explicit direction takes precedence.
 
 ## Verification
 
-- Default to `npm run verify` after meaningful changes.
-- Limit Cargo compilation to two jobs (`CARGO_BUILD_JOBS=2`).
-- Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
+- Use the smallest relevant check while iterating. Do not run repository-wide test suites unless requested; CI owns full verification.
+- For frontend changes, run `npm run check` and only affected tests with `npm run test -- <test-file>`.
+- For Rust changes, run `cargo check -j 2 --manifest-path src-tauri/Cargo.toml`.
+- Run only relevant Rust tests with `cargo test -j 2 --manifest-path src-tauri/Cargo.toml <filter> -- --test-threads=2`.
 
-## Visual Verification
+## UI Verification
 
-### Visual verification (UI work)
+When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For UI changes, run `npm run dev`, inspect `http://localhost:1420`, and capture visual evidence with `codemux browser screenshot`. The development server uses the Tauri mock; use `npm run tauri:dev` when real IPC is required. Run `codemux browser --help` to discover commands.
 
-When iterating on UI:
+## Process Safety
 
-1. `npm run dev` — boots Vite with the Tauri mock auto-installed.
-2. `codemux browser open http://localhost:1420` — the real Codemux UI loads with seed data.
-3. `codemux browser screenshot` — capture visual proof.
+- Never kill processes by name or pattern; stop only processes you started.
 
-The mock lives in `src/dev/` and only loads when no real Tauri runtime is detected. For real-IPC testing, use `npm run tauri:dev` (desktop window, not browser-pane-visible).
+## Pull Requests
 
-## UI & Feature Work
-
-- For visual and component work, read `docs/reference/DESIGN-SYSTEM.md` (color tokens, theming layers, the no-hardcoded-colors rule) plus the relevant `docs/features/*` doc. (The `/codemux-ui` skill was removed in PR #115; its theming rules now live in the design-system reference.)
-
-## Skills
-
-- `/codemux-features` auto-loads for new ADE feature implementation.
-
-## Codemux Environment
-
-This terminal runs inside Codemux. Check: `test -n "$CODEMUX"`
-
-### Browser
-
-**Never** use `xdg-open` or system browsers. Use:
-- `codemux browser open <url>` — navigate browser pane
-- `codemux browser snapshot --dom` — list interactive elements with selectors
-- `codemux browser click "<selector>"` — click an element
-- `codemux browser fill "<selector>" "<text>"` — type into input
-- `codemux browser screenshot` — capture screenshot
-- `codemux browser viewport <mobile|tablet|desktop|...|WxH|reset>` — resize viewport for responsive testing (CSS media queries fire at the new width); `codemux browser viewport-presets` lists available presets
-
-Always get a snapshot before interacting so you know what elements exist.
-
-### Commands
-
-- `codemux browser --help` — browser control
-- `codemux memory show/set/add` — project memory
-- `codemux index build/search` — code search index
-- `codemux capabilities` — JSON listing of all commands
-- `codemux --help` — discover all subcommands
+- Rebase onto the latest `main` before opening a pull request. Stale branches create unnecessary conflicts.
