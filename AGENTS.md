@@ -15,7 +15,7 @@ Make Codemux performant, reliable, and easy to use. Do not preserve complexity j
 
 ## UI Verification
 
-When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For UI changes, run `npm run dev`, inspect `http://localhost:1420`, and capture visual evidence with `codemux browser screenshot`. The development server uses the Tauri mock; use `npm run tauri:dev` when real IPC is required. Run `codemux browser --help` to discover commands.
+When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For UI changes, run `npm run dev`, inspect `http://localhost:1420`, and capture visual evidence with `codemux browser screenshot`. The development server uses the Tauri mock; use `npm run tauri:dev` when real IPC is required. Stop the development server when finished. Run `codemux browser --help` to discover commands.
 
 ## Process Safety
 
@@ -24,3 +24,6 @@ When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For U
 ## Pull Requests
 
 - Rebase onto the latest `main` before opening a pull request. Stale branches create unnecessary conflicts.
+- Use a concise conventional-commit title in plain language.
+- Body: the problem in a sentence or two, then how you fixed it. End with the model and harness that did the work.
+- UI changes need before/after screenshots in the pull request. Use mock data and exclude sensitive or personal information.
