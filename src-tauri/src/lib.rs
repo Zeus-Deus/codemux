@@ -83,6 +83,9 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+// VS Code Marketplace theme import — search the public gallery and pull the
+// dark colour themes out of a downloaded .vsix.
+pub mod vscode_marketplace;
 // Embedded web remote-access server (default-off HTTP+WebSocket). Lets a
 // browser on another device drive this running instance as a second
 // frontend. See docs/plans/web-remote-access.md.
@@ -2278,6 +2281,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // VS Code Marketplace theme import (Settings → Theme).
+            vscode_marketplace::vscode_marketplace_search,
+            vscode_marketplace::vscode_marketplace_fetch_themes,
         ])
 }
 

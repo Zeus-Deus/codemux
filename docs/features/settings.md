@@ -19,7 +19,7 @@ Settings are organized into two nav groups (`buildNavGroups` in `settings-view.t
 ### Personal Settings
 
 - **Account**: sign-in email, display name, dev mode badge, sign out
-- **Appearance**: theme preset, font family, border radius, **color palette** (cool/warm — a `.theme-warm` root class), **spacing density** (comfortable/compact — the `data-density` root attr), a **Sidebar** subsection — **Show git stats** (`sidebar.show_git_stats`, default on; off hides the ↑ahead and +/− numbers on inbox cards, branch stays) and **Auto-settle idle work** (`sidebar.auto_settle_days`, Off/1/3/7/14 days, default 3; merged/closed-PR cards auto-settle once idle regardless) — and an **Agents** subsection — a single **Match the orb to the activity** toggle (`agents.orb_match_activity`, default on) with a live two-row preview. On, the agent orb's animation follows what the agent is doing (searching / composing / working / solving / connecting / weaving / listening / breathing); off pins every orb in the app to the neutral `working` state. The orb itself is always monochrome and has no color setting. This replaced the **working-indicator glyph picker** (`sidebar.working_indicator`) and **indicator color swatches** (`sidebar.working_indicator_color`), both **deleted outright** — saved values are dropped on read rather than migrated, which is safe because the machine-local settings table is a free-form `Record<string, string>` with no Rust-side schema, so an old row is simply never read and never written back. See `docs/features/sidebar.md` and `docs/features/agent-chat.md` for the surfaces. The old `sidebar.workspace_detail` Clean/Branch/Detailed control and the `sidebar.live_agents` Stay-in-project/Gather-on-top grouping were both removed earlier. A **Scrolling** subsection carries **Smooth scrolling** (`appearance.smooth_scrolling`, default off) — it renders only on the Linux desktop app, where WebKit's animated wheel scrolling makes fast flicks travel *less* than slow ones; the value is machine-local (not synced) and hidden on the web remote client, since it acts on the desktop host's webview.
+- **Appearance**: unchanged except for the theme control. **Picking** a theme is no longer on this page — it lives in the command palette (⌘K → "theme"), where the whole app repaints behind the list as you arrow through it; the swatch grid is replaced by a single row stating the applied theme (its surface + accent as two discs, its name, "Shell, terminal, code and editor. Synced to your account.") with two doors: **Change** reopens the palette on the theme query, **Customize** opens the Theme Studio on the current theme (or starts a new one when a built-in is applied — built-ins are managed and not editable in place). The studio is a **modal over Settings**, not a rail: Settings stays mounted behind it, so Esc returns you to Appearance. Export and delete for a saved custom theme live in its footer. Everything else on the page stayed put: a truthful fixed typography row, live radius readout, resource monitor, **spacing density** (comfortable/compact — the `data-density` root attr), wrap-code-in-chat, the Linux-only smooth-scrolling toggle, and the **Sidebar** and **Agents** subsections. Selected theme and custom themes sync; the old local cool/warm control is retired and an explicit saved warm value migrates once. The same theme drives product chrome, terminal ANSI, file-editor syntax, and chat syntax. See `docs/features/theming.md`.
 - **Interface**: the Agent Chat GUI master toggle (`InterfaceSection`, `interface-section.tsx`). Default **on** — flips `enable_agent_chat` + `enable_lazy_workspace_creation` atomically via the `set_agent_chat_enabled` Tauri command; turning it off returns to the classic terminal-first (CLI) interface. Either flip quits the app (reopen to apply). Existing installs are upgraded to on once by the `agent_chat_promoted` migration in `observability.rs` (marker persisted as a standalone sentinel file so a downgrade → upgrade cycle can't re-run it); an opt-out made after that is respected.
 - **Notifications**: notification sounds (agent completion/attention), desktop notification toggle (D-Bus)
 - **Shortcuts**: keyboard keybind customization with conflict detection, search, and reset to defaults
@@ -45,7 +45,7 @@ Settings are organized into two nav groups (`buildNavGroups` in `settings-view.t
 
 ## Current Constraints
 
-- No import/export of settings
+- There is no whole-settings import/export; application themes have their own import/export flow.
 - Notification sound toggle exists in UI, but actual audio playback is not implemented
 - Custom keybinds stored in `~/.claude/keybindings.json`
 
@@ -54,6 +54,11 @@ Settings are organized into two nav groups (`buildNavGroups` in `settings-view.t
 - `src/components/settings/settings-view.tsx` — main settings panel component
 - `src/components/settings/keybind-editor.tsx` — keyboard shortcuts editor
 - `src/stores/synced-settings-store.ts` — persisted user settings (server-synced)
-- `src/stores/settings-store.ts` — local theme/appearance state
+- `src/components/settings/theme-settings.tsx` — the Appearance theme row
+- `src/components/settings/theme-studio.tsx` — the app-level Generate / Import modal
+- `src/components/settings/theme-swatches.tsx` — shared theme miniature, coins, ANSI dots
+- `src/components/overlays/command-palette.tsx` — the theme picker itself
+- `src/lib/themes.ts` — application-theme engine
+- `src/stores/settings-store.ts` — machine-local appearance state (density, terminal source, scrolling)
 - `src/stores/ui-store.ts` — settings panel open/section state
 - `.codemux/config.json` — workspace-level project config

@@ -17,6 +17,7 @@ import {
   CHAT_MARKDOWN_COMPONENTS,
   ChatCodeRendererProvider,
 } from "./ChatCodeBlock";
+import { ChatMarkdownLink } from "./ChatMarkdownLink";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 import { MarkdownLocalImage } from "./MarkdownLocalImage";
 
@@ -131,6 +132,7 @@ const rehypePlugins = [rehypeRichExternalLinks, rehypeLocalImageLinks];
 // processor cache on the identity of this map.
 const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
+  a: ChatMarkdownLink,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
   [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
 };

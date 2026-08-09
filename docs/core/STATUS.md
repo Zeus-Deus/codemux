@@ -30,6 +30,97 @@ published build:
 
 - **Settings → Usage: live quota is independent from historical cost.** `ProviderRuntimeEvent::PlanUsageUpdated` still carries fresh account-level quota windows and provider plan labels into an in-memory newest-snapshot store. It is never persisted or used to classify historical dollars. Claude/Codex lanes show up to two provider-reported windows when available; a provider with no current reading shows no meter. See `docs/features/usage-dashboard.md`.
 
+- **Application theming is now a first-class system.** Five managed dark
+  themes plus a Theme Studio for contrast-aware two-color generation, Codemux
+  JSON/shadcn/VS Code import, file or paste input, export, preview, and
+  deletion. A complete semantic role + ANSI schema is applied atomically
+  through namespaced root variables; a validated boot shadow runs before
+  CSS/React to prevent a default-theme flash — React re-applies only once both
+  settings stores have loaded, so the placeholder default is never painted or
+  persisted over the shadow. Selected and custom themes sync, an explicit
+  legacy warm preference migrates exactly once (the machine-local key is
+  retired on the first successful write, so picking Graphite afterwards
+  sticks), and one shared syntax store drives xterm, CodeMirror, and Shiki in
+  app or system mode. See `docs/features/theming.md`.
+
+- **The Theme Studio became a modal in Appearance** (Theming design handoff,
+  turn 4). Three things were wrong: the palette action navigated you out of
+  Settings, the studio opened in the right-hand `Sheet` that belongs to agent
+  panes, and a 380px column cannot show a theme — so the form floated in a
+  mostly empty tube. The studio is now a **centered 1000px `Dialog`** with two
+  tabs, **Generate** and **Import**, a 330px control column, and a live
+  preview filling the rest. `SettingsView` mounts its own `CommandPalette` and
+  `openCommandPaletteWith` no longer closes Settings, so Change → palette →
+  "Make a theme…" keeps you on the page and Esc lands back on Appearance.
+  **The studio no longer touches the running app**: the candidate is painted
+  by `ThemePreviewShell` (a miniature app — sidebar, chat, diff card, terminal
+  strip — every color an inline style read off the candidate), so cancelling
+  has nothing to undo and the preview shows surfaces the settings page does
+  not contain. The palette picker still previews against the real app; that is
+  turn 3 and is unchanged. Role editing was demoted from a third tab to an
+  **Edit roles by hand** link — as a peer it made a three-way decision out of a
+  two-way one — and a seedless theme reopens straight into it.
+  **Import gained three named sources** (VS Code / shadcn / a `.codemux-theme`
+  file) and lost its Parse button: `importThemeDetailed` runs on every change
+  and returns the format, the roles the source carried and the roles Codemux
+  solved, so the panel states the first two as a sentence and *lists* the
+  third. Choosing **VS Code** swaps the paste box for a Marketplace search —
+  new Rust module `vscode_marketplace.rs` with `vscode_marketplace_search`
+  (public gallery `extensionquery`, ≤12 hits that ship a `.vsix`) and
+  `vscode_marketplace_fetch_themes` (streams the `.vsix` under a 60 MB
+  ceiling, reads `extension/package.json`, returns the raw JSONC of every
+  **dark** `contributes.themes` entry; zip-slip-guarded, per-member capped,
+  all archive work in `spawn_blocking`; `zip` pinned to 4.x deflate-only so it
+  unifies with the copy `tauri-plugin-updater` already pulls in). Payloads are
+  snake_case, the repo convention for command results.
+  **Two engine fixes the design's own example exposed.** (1) Generated
+  surfaces and text now follow the **background's** hue with chroma bounded by
+  the canvas's own — every surface used to be derived from the *accent's* hue,
+  so a blue-black canvas with a warm accent produced a brown app and the
+  chosen background survived only in the role literally named `background`.
+  (2) The VS Code accent heuristic is reordered with `focusBorder` **last** and
+  a 3:1-against-canvas gate: it is very often a translucent grey (Tokyo
+  Night's is `#545c7e33`), which flattened to a mud accent for a theme
+  everyone recognises as blue. See `docs/features/theming.md` § The studio.
+
+- **The theme picker lives in the command palette** (Theming design handoff,
+  turn 3). ⌘K → "theme" surfaces a
+  **Themes** group between Projects and Commands; **highlighting** a row calls
+  `applyTheme(theme, { persist: false })`, so arrowing repaints the shell, the
+  diff tints, the editor and the terminal ANSI at once and the choice is made
+  by looking at the app rather than at a swatch grid. Enter promotes the
+  preview (boot shadow + synced `appearance.theme`); Esc, a click outside, or
+  arrowing off the group reverts — the unmount cleanup is the single revert
+  path, so no close route can leave a preview stranded. The footer swaps to
+  `↑↓ preview · ⏎ keep it · esc back to <applied>` while a theme is
+  highlighted. Themes are **search-only** (excluded at rest, in `>` command
+  mode and in `/` path mode), and `rankThemeGroup` scores each row against its
+  **label alone**, falling back to the whole set in registry order when the
+  query is one of the group's generic words — folding those keywords into each
+  row's haystack made "theme" match everything with a score that differed only
+  by name length, sorting the list by how short each theme was called. Reading
+  the highlighted row needs cmdk's **controlled** `value`; it only fires
+  `onValueChange` when `value` is supplied. Settings → Appearance lost the
+  **swatch grid** — and only that — for a single theme row (applied theme +
+  **Change**, which hands the palette a seed query via `commandPaletteQuery`
+  and leaves Settings since the palette does not mount inside that
+  full-screen surface, + **Customize**). Every other control on the page
+  stayed exactly where it was: typography, radius, resource monitor, density,
+  wrap-code-in-chat, smooth scrolling, and the Sidebar and Agents
+  subsections. The handoff's 3b mock also relocated typography/sidebar to
+  Interface, scrolling to Terminal, and terminal colors onto Appearance; that
+  part was **deliberately not taken** — the canvas only designed the theming
+  surface, and nothing else was to move yet. The Theme Studio *was* hoisted
+  out of the Appearance page into an **app-level** overlay
+  (`theme-studio.tsx`, driven by `useUIStore.themeStudio`, mounted in
+  `App.tsx`) because its three doors — the palette's two studio rows and
+  Appearance's Customize — live on surfaces that replace each other;
+  custom-theme export and delete moved from the deleted cards into its
+  footer. Colors only: radius, fonts, spacing and the success/info status
+  hues stay fixed. See
+  `docs/features/command-palette.md`, `docs/features/theming.md`,
+  `docs/features/settings.md`.
+
 - **The agent activity indicator is contextual** (PR #260, refined after `v0.18.0`). The configurable working-indicator glyph (braille / ring / blink / sweep / typing) and its six color swatches are **deleted** — `WorkingIndicator`, `AsciiSpinner`, `sidebar.working_indicator`, and `sidebar.working_indicator_color` are all gone. Agent-local working/running indicators render `AgentOrb` (`src/components/ui/agent-orb.tsx`) over the MIT `thinking-orbs` library: the in-flight turn (the Activity block header, with `StreamingMarker` covering the dead time either side), subagent rows, the docked composer strip, and workflow/orchestration run headers. The expanded sidebar workspace card instead uses a static amber `CircleDotDashed`: workspace navigation knows lifecycle but not the thread's current action, and the collapsed rail already uses a static status dot. Orbs remain monochrome — the library inks from `theme="auto"` off the root `dark` class, so no call site passes a color and red stays reserved for state needing a human. Sizes are 20 (inline) and 64 only. A single shared helper, `src/lib/orb-state.ts`, maps the agent's current tool to a state (searching / composing / working / solving / connecting / weaving / listening / breathing, neutral `working` fallback), fed by `src/lib/agent-chat/orb-activity.ts` from tool-call name + input + status the reducer already stamps — no new backend plumbing. Shell tools read their command string, so `git push` reads as connecting and `cargo test` as working. Design rule enforced by tests: **one orb per live thing** — aggregate headers and the composer strip stay neutral, each running row owns its own, and finished rows revert to the flat check. Settings → Appearance → Agents lost both pickers and gained a **Match the orb to the activity** toggle (`agents.orb_match_activity`, default on); off pins every rendered orb to `working`. Migration is a **drop, not a map**: the machine-local settings table is a free-form `Record<string, string>` with no Rust-side schema, so old keys are simply never read and never written back. See `docs/features/agent-chat.md` § "Agent activity orb", `docs/features/sidebar.md`, `docs/features/settings.md`.
 
 - **Subagent work is now one line per uninterrupted stretch** (Canvas-6 Turn 2, superseding the Canvas-3 rail). Canonical per-turn `subagent_run` events are unchanged, but `transcript-slots.ts` presentation-merges adjacent runs across invisible turn-end markers into one `subagent_stretch`; visible prose/tools split it. The transcript spends one labelled 32px row for 1 or 40 agents (`Ran N subagents` · preview/real rollup · `View ›`) and never expands child rows inline. View opens and marks the right-panel **watch surface**, which owns aggregate progress, live activity-matched cards, finished rows, and `Open thread` drill-in. The composer strip now hides while its matching work-log row is visible and returns only as the off-screen tether. Browser-open activity uses the same compact row grammar while the context-row browser indicator remains live. A lone successful `Read`/`Grep`/`Glob` is now silent (bursts still roll into one Activity summary; running/error/approval/image calls remain). Persistence, provider mapping, and drill-in routing remain canonical-run-based; zero-size run-id anchors keep every pre-existing jump/highlight target valid after a merge. See `docs/features/agent-chat.md` § "Subagent view (cross-provider)", § "Composer running strip", and `docs/features/browser.md` § "Background browser in GUI mode".

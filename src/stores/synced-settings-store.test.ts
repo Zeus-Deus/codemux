@@ -56,7 +56,7 @@ describe("synced-settings-store", () => {
   describe("initial state", () => {
     it("starts with default settings", () => {
       const { settings } = useSyncedSettingsStore.getState();
-      expect(settings.appearance.theme).toBe("system");
+      expect(settings.appearance.theme).toBe("default");
       expect(settings.appearance.terminal_font_size).toBe(13);
       expect(settings.terminal.scrollback_limit).toBe(10_000);
       expect(settings.terminal.cursor_style).toBe("bar");
@@ -186,7 +186,7 @@ describe("synced-settings-store", () => {
       useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS });
 
       const state = useSyncedSettingsStore.getState();
-      expect(state.settings.appearance.theme).toBe("system");
+      expect(state.settings.appearance.theme).toBe("default");
       expect(state.settings.appearance.terminal_font_size).toBe(13);
       expect(state.settings.terminal.cursor_style).toBe("bar");
       expect(state.settings.notifications.sound_enabled).toBe(true);

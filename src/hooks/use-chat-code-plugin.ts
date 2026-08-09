@@ -2,10 +2,11 @@ import { useMemo, useSyncExternalStore } from "react";
 import { createCodePlugin, type CodeHighlighterPlugin } from "@streamdown/code";
 
 import { buildChatCodeThemes } from "@/lib/shiki-chat-theme";
-import { getCurrentTheme } from "@/tauri/commands";
-import { onThemeChanged } from "@/tauri/events";
 import type { ThemeColors } from "@/tauri/types";
-import { fallbackTheme } from "./use-theme-colors";
+import {
+  getSyntaxThemeSnapshot,
+  subscribeSyntaxTheme,
+} from "./use-theme-colors";
 
 /**
  * Supplies the Shiki code-highlighting plugin for chat markdown, colored by
@@ -24,49 +25,29 @@ import { fallbackTheme } from "./use-theme-colors";
  * propagating through the markdown tree on every keystroke.)
  */
 
-let currentTheme: ThemeColors = fallbackTheme;
 const subscribers = new Set<() => void>();
-let unlisten: (() => void) | null = null;
-let started = false;
-
-function setTheme(next: ThemeColors) {
-  currentTheme = next;
-  for (const notify of subscribers) notify();
-}
-
-function start() {
-  if (started) return;
-  started = true;
-  // Both are best-effort: outside Tauri (or before the backend is ready) the
-  // fallback palette renders fine, it just isn't the user's terminal theme.
-  getCurrentTheme()
-    .then(setTheme)
-    .catch(() => {});
-  onThemeChanged(setTheme)
-    .then((fn) => {
-      unlisten = fn;
-    })
-    .catch(() => {});
-}
+let unsubscribeSyntax: (() => void) | null = null;
 
 function subscribe(onStoreChange: () => void) {
   subscribers.add(onStoreChange);
-  start();
+  if (!unsubscribeSyntax) {
+    unsubscribeSyntax = subscribeSyntaxTheme(() => {
+      for (const notify of subscribers) notify();
+    });
+  }
   return () => {
     subscribers.delete(onStoreChange);
   };
 }
 
 function getSnapshot(): ThemeColors {
-  return currentTheme;
+  return getSyntaxThemeSnapshot();
 }
 
 /** Test-only: drops the listener and resets the palette to the fallback. */
 export function resetChatCodePluginStore() {
-  unlisten?.();
-  unlisten = null;
-  started = false;
-  currentTheme = fallbackTheme;
+  unsubscribeSyntax?.();
+  unsubscribeSyntax = null;
   cachedPlugin = null;
   subscribers.clear();
 }

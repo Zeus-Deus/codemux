@@ -236,7 +236,7 @@ describe("SettingsPanel", () => {
     // ScrollArea may duplicate nav buttons; click the first match (the actual nav button)
     const appearanceButtons = screen.getAllByRole("button", { name: /Appearance/i });
     fireEvent.click(appearanceButtons[0]);
-    expect(screen.getAllByText("Theme preset").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Typography").length).toBeGreaterThan(0);
 
     const terminalButtons = screen.getAllByRole("button", { name: /Terminal/i });
     fireEvent.click(terminalButtons[0]);
@@ -487,5 +487,29 @@ describe("SettingsPanel — Appearance Agents section", () => {
       "agents.orb_match_activity",
       "false",
     );
+  });
+
+  it("replaces the theme grid with a single row plus its two doors", () => {
+    openAppearance();
+    // Picking happens in the command palette now.
+    expect(screen.getAllByRole("button", { name: /Change/ }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("button", { name: "Customize" }).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Create or import")).toBeNull();
+  });
+
+  it("keeps every control that was on the page before the theme row landed", () => {
+    openAppearance();
+    for (const label of [
+      "Typography",
+      "Border radius",
+      "Resource monitor",
+      "Density",
+      "Wrap code in chat",
+      "Show git stats",
+      "Auto-settle idle work",
+      "Match the orb to the activity",
+    ]) {
+      expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+    }
   });
 });

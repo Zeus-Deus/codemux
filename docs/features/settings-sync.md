@@ -26,7 +26,8 @@ Per-user settings that sync to the server via the auth API. A single `synced-set
 ```
 UserSettings
   appearance
-    theme: string              (default: "system")
+    theme: string              (default: "default"; built-in or custom theme id)
+    custom_themes: unknown[]   (default: []; versioned custom-theme payloads validated by the frontend)
     shell_font: string | null  (default: null)
     terminal_font_size: number (default: 13.0)
   editor
