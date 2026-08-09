@@ -389,6 +389,19 @@ body.pane-resizing iframe {
     user-select: text;
     cursor: auto;
     }
+  /* WebKitGTK paints the structural boxes between separately selectable
+   * transcript messages. When the custom text-node highlight is available,
+   * keep the native range for clipboard and accessibility but let the exact
+   * per-text-node ranges own the visible paint. */
+  .transcript-selection-highlight [data-slot="transcript-list"]::selection,
+  .transcript-selection-highlight [data-slot="transcript-list"] *::selection {
+    background-color: transparent;
+    color: currentColor;
+    }
+  ::highlight(codemux-transcript-selection) {
+    background-color: var(--selection-background);
+    color: var(--selection-foreground);
+    }
   /* Companion cursor for one-off `select-text` opt-ins (the utility itself
    * only sets user-select; without this the body's `cursor: default` would
    * leave selectable text without an I-beam). */

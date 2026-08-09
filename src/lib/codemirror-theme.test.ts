@@ -52,6 +52,22 @@ describe("editor selection contract", () => {
 });
 
 describe("document selection contract", () => {
+  it("replaces WebKit transcript box paint only when the text-range highlight is active", () => {
+    const nativeRule = globalsCss.match(
+      /\.transcript-selection-highlight \[data-slot="transcript-list"\] \*::selection\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    const customRule = globalsCss.match(
+      /::highlight\(codemux-transcript-selection\)\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+
+    expect(nativeRule).toContain("background-color: transparent");
+    expect(nativeRule).toContain("color: currentColor");
+    expect(customRule).toContain(
+      "background-color: var(--selection-background)",
+    );
+    expect(customRule).toContain("color: var(--selection-foreground)");
+  });
+
   it("defines both selection channels at the root so no native fallback leaks in", () => {
     const rule = globalsCss.match(/:root::selection\s*\{([^}]*)\}/)?.[1] ?? "";
     expect(rule).toContain("background-color: var(--selection-background)");
