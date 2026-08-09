@@ -9,8 +9,8 @@ import type {
 
 import { buildTranscriptSlots, reuseTranscriptSlots } from "./transcript-slots";
 
-function userMsg(seq: number, text = "hi"): ChatViewItem {
-  return { kind: "user_message", id: `um-${seq}`, seq, text };
+function userMsg(seq: number, text = "hi", createdAt?: number): ChatViewItem {
+  return { kind: "user_message", id: `um-${seq}`, seq, text, created_at: createdAt };
 }
 
 function assistantMsg(seq: number, text = "ok"): ChatViewItem {
@@ -51,6 +51,23 @@ function tool(seq: number, overrides: Partial<ToolCallItem> = {}): ToolCallItem 
   };
 }
 
+function turnEnd(
+  seq: number,
+  completedAt?: number,
+  status: Extract<ChatViewItem, { kind: "turn_ended" }>["status"] = {
+    kind: "success",
+  },
+): ChatViewItem {
+  return {
+    kind: "turn_ended",
+    id: `te-${seq}`,
+    seq,
+    turn_id: "t1",
+    status,
+    completed_at: completedAt,
+  };
+}
+
 describe("buildTranscriptSlots — activity grouping", () => {
   it("folds a run of ≥2 completed tool calls into one activity slot", () => {
     const slots = buildTranscriptSlots([tool(0), tool(1), tool(2)]);
@@ -69,12 +86,12 @@ describe("buildTranscriptSlots — activity grouping", () => {
     expect(slots).toHaveLength(0);
   });
 
-  it("keeps a lone completed action as its own item slot (below GROUP_MIN)", () => {
+  it("renders a lone completed action as a compact activity row", () => {
     const slots = buildTranscriptSlots([
       tool(0, { tool_name: "Bash", input: { command: "npm test" } }),
     ]);
     expect(slots).toHaveLength(1);
-    expect(slots[0].body.kind).toBe("item");
+    expect(slots[0].body.kind).toBe("activity");
   });
 
   it("folds contiguous reasoning + tool calls into ONE activity block", () => {
@@ -123,9 +140,12 @@ describe("buildTranscriptSlots — activity grouping", () => {
     }
   });
 
-  it("keeps a lone tool as a single card when settled (not streaming)", () => {
+  it("uses the same compact activity treatment for a lone non-streaming tool", () => {
     const slots = buildTranscriptSlots([tool(0, { status: "running" })], false);
-    expect(slots[0].body.kind).toBe("item");
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.working).toBe(false);
+    }
   });
 
   it("marks working only on the tail run of an active turn; earlier runs settle", () => {
@@ -206,6 +226,83 @@ describe("buildTranscriptSlots — non-rendering rows", () => {
     const slots = buildTranscriptSlots([ok, bad]);
     expect(slots).toHaveLength(1);
     expect(slots[0].messageId).toBe("te-bad");
+  });
+});
+
+describe("buildTranscriptSlots — settled turn presentation", () => {
+  const settledTurn = (): ChatViewItem[] => [
+    userMsg(0, "please inspect this", 1_000),
+    assistantMsg(1, "I’ll inspect the renderer."),
+    reasoning(2),
+    tool(3),
+    assistantMsg(4, "The renderer now uses a compact final answer."),
+    turnEnd(5, 14_400),
+  ];
+
+  it("keeps the final answer and replaces completed work with one quiet fold", () => {
+    const slots = buildTranscriptSlots(settledTurn());
+
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "item",
+      "turn_fold",
+      "item",
+    ]);
+    const fold = slots[1].body;
+    expect(fold.kind).toBe("turn_fold");
+    if (fold.kind === "turn_fold") {
+      expect(fold.label).toBe("Worked for 13s");
+      expect(fold.hiddenCount).toBe(3);
+      expect(fold.expanded).toBe(false);
+    }
+    const final = slots[2].body;
+    expect(final.kind).toBe("item");
+    if (final.kind === "item" && final.item.kind === "assistant_message") {
+      expect(final.item.text).toContain("compact final answer");
+    }
+  });
+
+  it("restores the original work chronologically when the fold is expanded", () => {
+    const slots = buildTranscriptSlots(settledTurn(), false, new Set(["t1"]));
+
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "item",
+      "turn_fold",
+      "item",
+      "activity",
+      "item",
+    ]);
+    const expanded = slots[1].body;
+    expect(expanded.kind).toBe("turn_fold");
+    if (expanded.kind === "turn_fold") expect(expanded.expanded).toBe(true);
+  });
+
+  it("leaves pending approvals visible even after a terminal event", () => {
+    const gated = tool(2, {
+      status: "running",
+      approval_request_id: "req-1",
+    });
+    const request: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-1",
+      seq: 3,
+      request_id: "req-1",
+      turn_id: "t1",
+      request_kind: "command",
+      payload: {},
+      tool_use_id: gated.tool_use_id,
+      resolution: { state: "pending" },
+    };
+    const slots = buildTranscriptSlots([
+      userMsg(0),
+      assistantMsg(1, "Working"),
+      gated,
+      request,
+      assistantMsg(4, "Waiting for approval"),
+      turnEnd(5),
+    ]);
+
+    expect(slots.some((slot) => slot.messageId === gated.id)).toBe(true);
+    expect(slots.some((slot) => slot.body.kind === "turn_fold")).toBe(true);
   });
 });
 
@@ -368,7 +465,7 @@ describe("buildTranscriptSlots — turn boundaries", () => {
     expect(slots[0].showAvatar).toBe(false);
   });
 
-  it("shows the avatar once — on the first assistant row of a contiguous run", () => {
+  it("keeps assistant rows on a clean, avatar-free reading rail", () => {
     const slots = buildTranscriptSlots([
       userMsg(0),
       assistantMsg(1),
@@ -377,7 +474,7 @@ describe("buildTranscriptSlots — turn boundaries", () => {
     ]);
     const [u, a1, a2, t3] = slots;
     expect(u.showAvatar).toBe(false);
-    expect(a1.showAvatar).toBe(true);
+    expect(a1.showAvatar).toBe(false);
     expect(a1.turnStart).toBe(true);
     expect(a2.showAvatar).toBe(false);
     expect(a2.turnStart).toBe(false);
@@ -385,14 +482,14 @@ describe("buildTranscriptSlots — turn boundaries", () => {
     expect(t3.scrollAnchor).toBe(false);
   });
 
-  it("starts a fresh assistant turn (new avatar) after a user interjection", () => {
+  it("starts a fresh assistant turn rhythm after a user interjection", () => {
     const slots = buildTranscriptSlots([
       assistantMsg(0),
       userMsg(1),
       assistantMsg(2),
     ]);
-    expect(slots[0].showAvatar).toBe(true);
-    expect(slots[2].showAvatar).toBe(true);
+    expect(slots[0].showAvatar).toBe(false);
+    expect(slots[2].showAvatar).toBe(false);
     expect(slots[2].turnStart).toBe(true);
   });
 });

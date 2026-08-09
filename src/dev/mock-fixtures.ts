@@ -1263,7 +1263,9 @@ export function richChatTurnEnvelopes(
         kind: "assistant_text",
         text:
           "Done — [issue #57298](https://github.com/example/gateway/issues/57298) " +
-          "implemented, the regression test passes, and the " +
+          "implemented in [`gateway/run.py:225`](gateway/run.py:225), with " +
+          "coverage in [`tests/test_traceback.py:88`](tests/test_traceback.py:88). " +
+          "The regression test passes, and the " +
           "[exception-chain notes](https://docs.python.org/3/library/exceptions.html) are ready.\n\n" +
           "[Dashboard screenshot](/tmp/codemux-dashboard-proof.png)",
       },

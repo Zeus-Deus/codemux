@@ -22,13 +22,43 @@ not shipped in a published build. Older per-release implementation notes were mo
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.17.1` (2026-08-07)**, a sidebar-and-settlement release: a fifth `Monitoring` agent status for background watch loops, durable workspace pinning, a run that can no longer stay stuck on "Working", side-branch PR badges, the dimmed Settled shelf, and AppImage child-process environment hygiene. `v0.17.0` (2026-08-05) was the app-chrome and chat-navigation release: the GUI title bar became frameless floating islands, the full-width workspace context bar was deleted, the chat transcript gained an explicit new-turn scroll contract, cross-provider skills became provider-correct, text-selection colors were standardized onto two tokens, and the legacy standalone orchestration runtime was deleted outright. Release notes for `v0.16.0` and earlier live in `docs/archive/release-notes-v0.16.md`, `docs/archive/release-notes-v0.14-v0.15.md`, and `docs/archive/release-notes-v0.6-v0.13.md`.
 
 Unreleased after `v0.17.1` — the current Canvas-6 work, the Settings → Usage
-dashboard, plus five merged PRs (#257–#261), grouped by subsystem below.
+dashboard, plus six merged PRs (#257–#261, #264), grouped by subsystem below.
 Everything in this block is current checkout behavior and has not shipped in a
 published build:
 
 - **Settings → Usage: provider-wide local history for Claude Code, Codex, and OpenCode.** Provider-owned durable history is now the single accounting source regardless of launcher: Claude and Codex JSONL transcripts plus OpenCode's read-only SQLite message history (with legacy JSON fallback). The ledger is a rebuildable materialized cache keyed by provider-native record ids; growing responses upsert instead of freezing partial counts, resumed/forked records deduplicate, and importer v3 clears the legacy runtime/import hybrid so Codemux-launched work cannot double-count. Subagent attribution and the four-way non-overlapping token split remain. The page reports one clearly labelled API/list-price-equivalent estimate—never guessed “billed” or “plan-covered” spend—plus tokens, sessions, model breakdown, confidence, CSV, and an honest this-machine-only source note. Open/manual/30-second refreshes all scan provider history first. See `docs/features/usage-dashboard.md`.
 
 - **Settings → Usage: live quota is independent from historical cost.** `ProviderRuntimeEvent::PlanUsageUpdated` still carries fresh account-level quota windows and provider plan labels into an in-memory newest-snapshot store. It is never persisted or used to classify historical dollars. Claude/Codex lanes show up to two provider-reported windows when available; a provider with no current reading shows no meter. See `docs/features/usage-dashboard.md`.
+
+- **The inbox card's hover chrome became bare glyphs, and a running process now
+  shows on the card** (PR #264, Workspace Chrome design handoff, variant 1b).
+  The active card's bordered Settle / Snooze / Unpin pills are **deleted**.
+  Hover or focus now slides a borderless cluster into the eyebrow's right edge
+  (`row-in`, a 130ms fade + 5px drop in `globals.css`):
+  a bare **Pin** glyph on every card, plus a bare **Snooze** glyph and a
+  **✓ Settle** text button on cards that can settle. Pin is unconditional and
+  toggles `setWorkspacePinned` straight from the card, so pinning — the one
+  action that changes where a card lives — no longer requires the context menu
+  (the menu entries stay). The guardrail is unchanged (`canSettle = !pinned &&
+  !working && !permission`), but the **state readout now keeps its place**
+  whenever Settle/Snooze are withheld, so a working or blocked card shows its
+  status *and* a pin glyph instead of trading one for the other. A pinned,
+  unhovered card carries a small static pin marker beside the repo name, which
+  hides under the pointer so the row never draws two pins. The settled shelf's
+  **Un-settle** lost its pill for the same borderless icon + word.
+  **New:** a 12px pulsing green terminal glyph on the meta line marks a
+  **long-running process** (`Long-running process on :<port>`), wired to the
+  existing `appState.detected_ports` attribution — no new Tauri command, no Rust
+  change. It is subscribed **once** in `sidebar-inbox.tsx` and passed down as a
+  port number, so the ports domain still can't wake the card list (the
+  `detected_ports` case in `sidebar-inbox-delta.test.tsx` passes unchanged).
+  The meta line's trailing indicator column is now sized per list render by
+  `metaClusterWidth(maxProviderMarks, anyRunIndicator)` rather than by a flat
+  `min-w-[15px]`, so the PR chip column stays stable across cards that carry
+  different numbers of indicators. No new color tokens: the design's palette
+  maps onto the existing `--status-*` set (its green is already
+  `--status-open`). See `docs/features/sidebar.md` § "The hover-revealed action
+  cluster", § "Running-process indicator".
 
 - **Application theming is now a first-class system.** Five managed dark
   themes plus a Theme Studio for contrast-aware two-color generation, Codemux

@@ -7,6 +7,7 @@ import {
   lastTurnUnsettled,
   parseReplayPayloads,
   replayPayloads,
+  replayTimed,
 } from "./hydrate";
 import { applyEvent, createEmptyThreadState } from "./reducer";
 import { findSubagentView, runningSubagentEntries } from "./subagents";
@@ -113,6 +114,43 @@ describe("replayPayloads", () => {
       kind: "assistant_message",
       text: "hello back",
       streaming: false,
+    });
+  });
+
+  it("restores durable row timestamps for stable worked-time labels", () => {
+    const state = replayTimed([
+      {
+        event: { type: "user_message", thread_id: "t", text: "time this" },
+        createdAtMs: 1_000,
+      },
+      {
+        event: {
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text: "done" },
+        },
+        createdAtMs: 2_000,
+      },
+      {
+        event: {
+          type: "turn_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          status: { kind: "success" },
+          usage: null,
+        },
+        createdAtMs: 6_500,
+      },
+    ]);
+
+    expect(state.messages[0]).toMatchObject({
+      kind: "user_message",
+      created_at: 1_000,
+    });
+    expect(state.messages[state.messages.length - 1]).toMatchObject({
+      kind: "turn_ended",
+      completed_at: 6_500,
     });
   });
 
@@ -432,14 +470,16 @@ describe("replayPayloads", () => {
       );
     }
     const state = replayPayloads(payloads);
-    // 100 user + 100 assistant = 200 rendered items (turn_completed
-    // success is silent in the reducer).
-    expect(state.messages).toHaveLength(200);
+    // Each turn retains a visually silent completion marker so presentation
+    // can derive stable settled-turn folds without discarding raw history.
+    expect(state.messages).toHaveLength(300);
     for (let i = 0; i < 100; i++) {
-      const userItem = state.messages[i * 2];
-      const asstItem = state.messages[i * 2 + 1];
+      const userItem = state.messages[i * 3];
+      const asstItem = state.messages[i * 3 + 1];
+      const endedItem = state.messages[i * 3 + 2];
       expect(userItem.kind).toBe("user_message");
       expect(asstItem.kind).toBe("assistant_message");
+      expect(endedItem.kind).toBe("turn_ended");
       if (userItem.kind === "user_message") {
         expect(userItem.text).toBe(`u-${i}`);
       }

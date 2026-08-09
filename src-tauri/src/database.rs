@@ -3409,8 +3409,8 @@ impl DatabaseStore {
     ) -> Result<Option<i64>, String> {
         let conn = self.conn.lock().unwrap();
         match conn.execute(
-            "INSERT INTO agent_chat_messages (thread_id, payload)
-             VALUES (?1, ?2)",
+            "INSERT INTO agent_chat_messages (thread_id, payload, created_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%f', 'now'))",
             params![thread_id, payload_json],
         ) {
             Ok(_) => Ok(Some(conn.last_insert_rowid())),
@@ -3446,7 +3446,7 @@ impl DatabaseStore {
     }
 
     /// Cursor read: every message for `thread_id` with `id > after_id`,
-    /// ordered ascending, as `(id, payload)` pairs. `None` means "from
+    /// ordered ascending, as `(id, payload, created_at_ms)` triples. `None` means "from
     /// the beginning" (ids start at 1, so the query uses 0).
     ///
     /// Served entirely by `idx_agent_chat_messages_thread(thread_id, id
@@ -3456,10 +3456,12 @@ impl DatabaseStore {
         &self,
         thread_id: &str,
         after_id: Option<i64>,
-    ) -> Vec<(i64, String)> {
+    ) -> Vec<(i64, String, i64)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, payload FROM agent_chat_messages
+            "SELECT id, payload,
+                    CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER)
+             FROM agent_chat_messages
              WHERE thread_id = ?1 AND id > ?2
              ORDER BY id ASC",
         ) {
@@ -3467,7 +3469,11 @@ impl DatabaseStore {
             Err(_) => return Vec::new(),
         };
         stmt.query_map(params![thread_id, after_id.unwrap_or(0)], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .map(|iter| iter.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
@@ -5596,6 +5602,7 @@ mod tests {
         assert_eq!(all.len(), 5);
         assert_eq!(all[0].0, ids[0]);
         assert_eq!(all[4].1, r#"{"i":4}"#);
+        assert!(all[0].2 > 1_700_000_000_000);
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
 
         // A cursor is exclusive.

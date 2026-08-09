@@ -1579,7 +1579,7 @@ describe("agent-chat reducer — follow-up queueing", () => {
     let state = appendUserMessage(
       createEmptyThreadState(),
       "hello",
-      undefined,
+      () => 1_000,
       "n1",
     );
     state = applyEvent(state, {
@@ -1590,18 +1590,23 @@ describe("agent-chat reducer — follow-up queueing", () => {
       text: "hello",
     });
     const queuedSeq = users(state)[0].seq;
-    state = applyEvent(state, {
-      type: "queued_turn_dispatched",
-      thread_id: "t1",
-      queued_id: "q-1",
-      turn_id: "turn-9",
-      text: "hello",
-    });
+    state = applyEvent(
+      state,
+      {
+        type: "queued_turn_dispatched",
+        thread_id: "t1",
+        queued_id: "q-1",
+        turn_id: "turn-9",
+        text: "hello",
+      },
+      () => 5_000,
+    );
     const list = users(state);
     expect(list).toHaveLength(1);
     expect(list[0].queued).toBeUndefined(); // promoted to normal
     expect(list[0].seq).toBeLessThan(queuedSeq); // re-seq'd out of the queued band
     expect(list[0].text).toBe("hello");
+    expect(list[0].created_at).toBe(5_000); // queue wait is not work time
   });
 
   it("queued_turn_cancelled removes the greyed bubble", () => {

@@ -6,6 +6,7 @@ import {
   Cloud,
   Pin,
   PinOff,
+  Terminal,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
@@ -43,6 +44,47 @@ export interface InboxRepo {
   path: string;
 }
 
+/** Floor for the meta line's trailing cluster: the width of the *widest*
+ *  single indicator (the 15px notification pill, not the 13px provider logo),
+ *  so a card showing nothing there still can't pull its PR chip out past its
+ *  neighbours'. */
+export const META_CLUSTER_MIN_WIDTH = 15;
+
+const PROVIDER_MARK_WIDTH = 13;
+const RUN_INDICATOR_WIDTH = 12;
+/** The cluster's own `gap-2`. */
+const META_CLUSTER_GAP = 8;
+
+/** How much room the trailing indicator cluster should reserve for one list
+ *  render, given the largest number of provider marks any visible card carries
+ *  and whether *any* of them shows the running-process indicator.
+ *
+ *  Reserving per list rather than per card is the whole point: the PR chip is
+ *  right-aligned against this cluster, so a card with one provider mark and a
+ *  card with three would otherwise start their chips at different x positions
+ *  and the column would read as ragged noise down a scrolling list. Reserving
+ *  only what *this* list actually needs — rather than a fixed worst case —
+ *  means a sidebar where nothing is running and everything is single-provider
+ *  doesn't pay a permanent indent for indicators no card shows.
+ *
+ *  Applied as a `min-width`, not a fixed width, because unlike the source
+ *  design this cluster can also carry a remote-host icon and a notification
+ *  pill; those are per-card and rare, so they are allowed to push past the
+ *  reservation rather than force every card to pay for them. */
+export function metaClusterWidth(
+  maxProviderMarks: number,
+  anyRunIndicator: boolean,
+): number {
+  const marks = Math.max(0, maxProviderMarks);
+  const width =
+    marks * PROVIDER_MARK_WIDTH +
+    Math.max(0, marks - 1) * META_CLUSTER_GAP +
+    (anyRunIndicator
+      ? RUN_INDICATOR_WIDTH + (marks > 0 ? META_CLUSTER_GAP : 0)
+      : 0);
+  return Math.max(META_CLUSTER_MIN_WIDTH, width);
+}
+
 interface Props {
   workspace: WorkspaceSnapshot;
   repo: InboxRepo;
@@ -67,6 +109,19 @@ interface Props {
   /** A pinned card stays above every lifecycle tier. */
   pinned?: boolean;
   onUnpin?: (workspaceId: string) => void;
+  /** Pin from the card itself. Pinning used to be a context-menu-only gesture,
+   *  which made the one action that reorders the list the hardest to reach. */
+  onPin?: (workspaceId: string) => void;
+  /** Port of a long-running process detected in this workspace (a dev server,
+   *  a watcher), or null when nothing is listening. Passed down as a plain
+   *  number rather than resolved per card so the whole inbox holds exactly one
+   *  subscription to the ports domain — see `sidebar-inbox.tsx`. */
+  runningPort?: number | null;
+  /** Reserved width (px) for the meta line's trailing indicator cluster,
+   *  computed once per list render from the widest cluster any visible card
+   *  needs. Without it the PR chip starts at a different x on every card and
+   *  the column reads as ragged. */
+  metaClusterMinWidth?: number;
   /** The agent finished here since the user last opened this workspace. */
   unread: boolean;
   /** Recently returned from a snooze. The list order is static, so a woken
@@ -107,6 +162,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   onSnooze,
   pinned = false,
   onUnpin,
+  onPin,
+  runningPort = null,
+  metaClusterMinWidth = META_CLUSTER_MIN_WIDTH,
   unread,
   woke,
   selected,
@@ -253,27 +311,31 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // menu closes and Radix returns focus to the trigger inside the card.
   const actionsPinned = snoozeMenuOpen;
 
-  /** Shared shape for the eyebrow's hover-revealed actions: identical height,
-   *  border, radius and type scale, so Settle and Snooze read as one control
-   *  pair rather than two buttons that happen to sit together. */
-  const eyebrowActionClass = cn(
-    "h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
-    "text-[11px] font-semibold text-muted-foreground transition-colors duration-150",
-    "hover:border-muted-foreground/50 hover:text-foreground",
-    actionsPinned
-      ? "inline-flex"
-      : "hidden group-hover/card:inline-flex group-focus-within/card:inline-flex",
+  /** Shared shape for the eyebrow's hover-revealed actions: borderless,
+   *  transparent, one muted ink that resolves to full foreground on the
+   *  button's own hover. The actions used to be bordered pills, which gave
+   *  three fills and three outlines to a strip that is meant to read as chrome
+   *  until you aim at it — and made a hovered card look busier than a card
+   *  with a live agent. Bare glyphs put the weight back on the card's content;
+   *  Settle keeps its word because it is the one destructive-feeling verb here
+   *  and a check glyph alone doesn't name it. */
+  const eyebrowGlyphClass = cn(
+    "flex shrink-0 items-center border-none bg-transparent p-0",
+    "text-muted-foreground/75 transition-colors duration-150 hover:text-foreground",
   );
 
   const stateCluster = (
     <span
       className={cn(
         "flex shrink-0 items-center gap-1.5 text-[11px]",
-        // The hover/focus swap: state hides, Settle/Snooze show. CSS-only so
-        // no re-render churn on pointer moves. Only hide when an action button
-        // will actually take its place — a guardrailed card keeps its state
-        // visible on hover/focus since there is nothing to swap to.
-        (pinned || canSettle) &&
+        // The hover/focus swap: state hides, Snooze/Settle show. CSS-only so
+        // no re-render churn on pointer moves. The state yields to the *wide*
+        // actions only — a card that can't settle reveals nothing but the Pin
+        // glyph, which is narrow enough to sit beside the readout, so its
+        // state keeps its place. That is the point of the guardrail: a live,
+        // blocked or pinned card must never trade its status for chrome the
+        // user can't use anyway.
+        canSettle &&
           (actionsPinned
             ? "hidden"
             : "group-hover/card:hidden group-focus-within/card:hidden"),
@@ -473,11 +535,21 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 <span className="min-w-0 truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
                   {repo.name}
                 </span>
+                {/* Resting pin marker. It sits beside the repo name rather
+                    than at the row's right edge because that edge belongs to
+                    the state readout, and it hides under the pointer: the
+                    action cluster's own pin glyph occupies the same claim
+                    while revealed, and showing both would read as two pins. */}
                 {pinned && (
                   <Pin
                     role="img"
                     aria-label="Pinned workspace"
-                    className="size-3 shrink-0 text-muted-foreground/65"
+                    className={cn(
+                      "size-[11px] shrink-0 text-muted-foreground/75",
+                      actionsPinned
+                        ? "hidden"
+                        : "group-hover/card:hidden group-focus-within/card:hidden",
+                    )}
                   />
                 )}
                 <span className="flex-1" />
@@ -503,35 +575,45 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     Woke
                   </span>
                 )}
-                {stateCluster}
-                {pinned && (
+                {/* Hover/focus-revealed action cluster. Pin is unconditional —
+                    it is the one action with no guardrail, and burying the
+                    gesture that reorders the list in a context menu made it
+                    the least discoverable thing the card can do. Snooze and
+                    Settle ride the settle guardrail together, so a live or
+                    blocked agent reveals a pin and nothing else. */}
+                <span
+                  className={cn(
+                    "row-in shrink-0 items-center gap-[7px]",
+                    actionsPinned
+                      ? "flex"
+                      : "hidden group-hover/card:flex group-focus-within/card:flex",
+                  )}
+                >
                   <button
                     type="button"
                     onClick={(e) => {
+                      // Every action here stops propagation: these buttons sit
+                      // inside the card's own click target, and without this a
+                      // pin or a snooze would also yank the main pane onto the
+                      // workspace the user was only filing away.
                       e.stopPropagation();
-                      onUnpin?.(workspace.workspace_id);
+                      if (pinned) onUnpin?.(workspace.workspace_id);
+                      else onPin?.(workspace.workspace_id);
                     }}
-                    aria-label={`Unpin "${workspace.title}"`}
-                    className={eyebrowActionClass}
+                    aria-label={
+                      pinned
+                        ? `Unpin "${workspace.title}"`
+                        : `Pin "${workspace.title}" to top`
+                    }
+                    title={pinned ? "Unpin" : "Pin to top"}
+                    className={eyebrowGlyphClass}
                   >
-                    <PinOff className="h-2.5 w-2.5" strokeWidth={2.5} />
-                    Unpin
+                    {pinned ? (
+                      <PinOff className="size-3" strokeWidth={1.5} />
+                    ) : (
+                      <Pin className="size-3" strokeWidth={1.5} />
+                    )}
                   </button>
-                )}
-                {canSettle && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSettle(workspace.workspace_id);
-                    }}
-                    aria-label={`Settle "${workspace.title}"`}
-                    className={eyebrowActionClass}
-                  >
-                    <Check className="h-2.5 w-2.5" strokeWidth={2.5} />
-                    Settle
-                  </button>
-                )}
                 {canSnooze && (
                   <DropdownMenu
                     open={snoozeMenuOpen}
@@ -542,10 +624,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         type="button"
                         onClick={(e) => e.stopPropagation()}
                         aria-label={`Snooze "${workspace.title}"`}
-                        className={eyebrowActionClass}
+                        title="Snooze"
+                        className={eyebrowGlyphClass}
                       >
-                        <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
-                        Snooze
+                        <AlarmClock className="size-3" strokeWidth={1.5} />
                       </button>
                     </DropdownMenuTrigger>
                     {/* Radix portals this into document.body, but React events
@@ -553,8 +635,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         stoppers every preset click and every Enter inside the
                         menu would also hit the card's activate handlers and
                         navigate away while snoozing. The width override undoes
-                        the default "match the trigger", which here is a 60px
-                        button. */}
+                        the default "match the trigger", which here is a bare
+                        12px alarm-clock glyph. */}
                     <DropdownMenuContent
                       align="end"
                       className="w-auto min-w-[132px]"
@@ -581,6 +663,30 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     </DropdownMenuContent>
                   </DropdownMenu>
                 )}
+                  {canSettle && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSettle(workspace.workspace_id);
+                      }}
+                      aria-label={`Settle "${workspace.title}"`}
+                      className={cn(
+                        // Settle keeps its word where Pin and Snooze went bare:
+                        // it is the primary action of the whole inbox and the
+                        // only one whose glyph (a check) reads as a claim about
+                        // the work rather than a verb the user is performing.
+                        "flex shrink-0 items-center gap-1 border-none bg-transparent p-0",
+                        "text-[11px] font-semibold text-muted-foreground",
+                        "transition-colors duration-150 hover:text-foreground",
+                      )}
+                    >
+                      <Check className="size-[11px]" strokeWidth={2.1} />
+                      Settle
+                    </button>
+                  )}
+                </span>
+                {stateCluster}
               </div>
 
               {/* Title line: work title + linked-issue chip */}
@@ -702,13 +808,34 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   </button>
                 )}
                 {/* Trailing indicators keep the far-right column. The reserved
-                    min-width is what stops a card with no provider mark from
+                    min-width is what stops a card with fewer indicators from
                     pulling its PR chip out past its neighbours' — the icon
-                    cluster is the anchor the chip aligns against. It is sized to
-                    the *widest* single indicator (the 15px notification pill, not
-                    the 13px logos) so which indicator a card happens to show
-                    cannot shift the chip either. */}
-                <span className="flex min-w-[15px] shrink-0 items-center justify-end gap-2">
+                    cluster is the anchor the chip aligns against. The parent
+                    sizes it once per list render from the widest cluster any
+                    visible card needs (see `metaClusterWidth`), so the column
+                    is stable across cards without every sidebar paying for
+                    indicators none of its cards show. */}
+                <span
+                  className="flex shrink-0 items-center justify-end gap-2"
+                  style={{ minWidth: `${metaClusterMinWidth}px` }}
+                >
+                  {/* Long-running process. Distinct from the agent-state
+                      readout on the eyebrow: that says whether an *agent* is
+                      doing something, this says a dev server or watcher the
+                      user started is still holding a port — the thing that is
+                      easy to forget about and expensive to leave running. It
+                      pulses because a port is live state, and it takes the
+                      same green as an open PR because both mean "up". */}
+                  {runningPort != null && (
+                    <span
+                      role="img"
+                      aria-label={`Long-running process on :${runningPort}`}
+                      title={`Long-running process on :${runningPort}`}
+                      className="flex shrink-0 animate-pulse items-center text-status-open"
+                    >
+                      <Terminal className="size-3" strokeWidth={1.7} />
+                    </span>
+                  )}
                   {providers.map((p) => (
                     <ProviderLogo
                       key={p}

@@ -172,11 +172,11 @@ function leadingTextLength(text: string): number {
   return firstCodePoint?.length ?? 0;
 }
 
-function faviconNode(host: string): HastNode {
+function faviconNode(host: string, href: string): HastNode {
   return {
     type: "element",
     tagName: CHAT_LINK_FAVICON_TAG,
-    properties: { host },
+    properties: { host, href },
     children: [],
   };
 }
@@ -241,8 +241,8 @@ function attachLeadingFavicon(container: HastNode, favicon: HastNode): boolean {
   return false;
 }
 
-function decorateExternalLink(node: HastNode, host: string) {
-  const favicon = faviconNode(host);
+function decorateExternalLink(node: HastNode, host: string, href: string) {
+  const favicon = faviconNode(host, href);
   if (attachLeadingFavicon(node, favicon)) return;
 
   // No splittable text (an image or inline-code label). Keep the icon glued to
@@ -256,8 +256,17 @@ function decorateExternalLink(node: HastNode, host: string) {
 
 function visit(node: HastNode) {
   if (node.type === "element" && node.tagName === "a") {
-    const host = externalWebLinkHost(node.properties?.href);
-    if (host) decorateExternalLink(node, host);
+    const href = node.properties?.href;
+    const host = externalWebLinkHost(href);
+    if (host) {
+      if (typeof node.properties?.title !== "string") {
+        node.properties = {
+          ...node.properties,
+          title: node.properties?.href,
+        };
+      }
+      decorateExternalLink(node, host, String(href));
+    }
   }
 
   for (const child of node.children ?? []) visit(child);

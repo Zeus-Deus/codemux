@@ -776,6 +776,7 @@ const MOCK_LAZY_TOOL_RESULT_PREVIEW_BYTES = 2 * 1024;
 interface MockMessageRow {
   id: number;
   payload: string;
+  created_at_ms: number;
 }
 
 /** Row id → the UNSHAPED payload, so `agent_chat_get_tool_result` can
@@ -804,10 +805,16 @@ function mockThreadPayloads(threadId: string): string[] {
 function mockThreadRows(threadId: string): MockMessageRow[] {
   const cached = mockThreadRowCache.get(threadId);
   if (cached) return cached;
-  const rows = mockThreadPayloads(threadId).map((payload, index) => {
+  const payloads = mockThreadPayloads(threadId);
+  const firstCreatedAt = Date.now() - payloads.length * 725;
+  const rows = payloads.map((payload, index) => {
     const id = index + 1;
     mockFullPayloadById.set(id, payload);
-    return { id, payload: mockShapePayload(id, payload) };
+    return {
+      id,
+      payload: mockShapePayload(id, payload),
+      created_at_ms: firstCreatedAt + index * 725,
+    };
   });
   mockThreadRowCache.set(threadId, rows);
   return rows;

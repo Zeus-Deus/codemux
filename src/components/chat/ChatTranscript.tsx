@@ -54,6 +54,8 @@ interface Props {
    *  affordance and the GUI-mode background-browser chip lookup
    *  (docs/features/browser.md). */
   workspaceId?: string | null;
+  /** Active worktree root for resolving relative source references. */
+  cwd?: string | null;
 }
 
 /**
@@ -85,6 +87,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   onSendQueuedNow,
   onEnterSubagent,
   workspaceId,
+  cwd,
 }: Props) {
   const showThinking = useMemo(
     () => shouldShowThinkingIndicator(messages, streaming),
@@ -112,6 +115,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         onSendQueuedNow={onSendQueuedNow}
         onEnterSubagent={onEnterSubagent}
         workspaceId={workspaceId}
+        cwd={cwd}
       />
     </div>
   );

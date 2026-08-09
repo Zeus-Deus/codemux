@@ -2,6 +2,9 @@ import { Check, Copy, FileText } from "lucide-react";
 import { useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
+import { MarkdownFileLink } from "./MarkdownFileLink";
+import { useChatFileLinkContext } from "./chat-file-link-context";
 
 /**
  * Diff surface (design D7). Computes a line-level diff from the tool
@@ -22,6 +25,8 @@ export function DiffView({
   newText: string;
   copyText: string;
 }) {
+  const { cwd } = useChatFileLinkContext();
+  const fileMeta = filename ? resolveChatFileLink(filename, cwd) : null;
   const rows = computeLineDiff(oldText, newText);
   const added = rows.filter((r) => r.type === "add").length;
   const removed = rows.filter((r) => r.type === "remove").length;
@@ -32,12 +37,20 @@ export function DiffView({
     <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-[13px] py-[9px]">
         <span className="flex min-w-0 items-center gap-2 font-mono text-[12px] text-muted-foreground">
-          <FileText
-            className="h-3 w-3 shrink-0 text-muted-foreground/70"
-            strokeWidth={1.4}
-            aria-hidden
-          />
-          <span className="truncate">{filename ?? "diff"}</span>
+          {fileMeta ? (
+            <MarkdownFileLink meta={fileMeta} variant="plain">
+              {fileMeta.basename}
+            </MarkdownFileLink>
+          ) : (
+            <>
+              <FileText
+                className="h-3 w-3 shrink-0 text-muted-foreground/70"
+                strokeWidth={1.4}
+                aria-hidden
+              />
+              <span className="truncate">{filename ?? "diff"}</span>
+            </>
+          )}
         </span>
         <span className="flex items-center gap-2.5">
           <span className="font-mono text-[11px]">

@@ -49,12 +49,15 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
   const initTab = useEditorStore((s) => s.initTab);
   const setBaselineContent = useEditorStore((s) => s.setBaselineContent);
   const setDirty = useEditorStore((s) => s.setDirty);
+  const clearReveal = useEditorStore((s) => s.clearReveal);
 
   const filePath = tab?.filePath ?? null;
   const isDirty = tab?.isDirty ?? false;
   const baselineContent = tab?.baselineContent ?? "";
+  const revealRequest = tab?.revealRequest;
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [content, setContent] = useState("");
+  const [loadedFilePath, setLoadedFilePath] = useState<string | null>(null);
 
   const isMd = filePath != null && isMarkdownFile(filePath);
   const isImage = filePath != null && isImageExtension(filePath);
@@ -192,6 +195,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
 
     isLoadingRef.current = true;
     setErrorMsg(null);
+    setLoadedFilePath(null);
 
     // Fire the file read IPC and the language-module dynamic import
     // concurrently. They are independent \u2014 `readFile` does Tauri IPC
@@ -211,6 +215,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
         });
         setBaselineContent(tabId, c);
         setContent(c);
+        setLoadedFilePath(filePath);
       })
       .catch((err) => {
         setErrorMsg(String(err));
@@ -233,6 +238,50 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
       }
     });
   }, [filePath, tabId, setBaselineContent]);
+
+  // Markdown opens rendered, which hides the CodeMirror container. When this
+  // pane owns its mode (no controlled prop) it flips itself to source for a
+  // pending line reveal; the right-panel deck drives its own flag instead, so
+  // its rendered/source toggle keeps matching the pane.
+  useEffect(() => {
+    if (viewModeProp == null && isMd && revealRequest) setViewMode("raw");
+  }, [isMd, revealRequest, viewModeProp]);
+
+  // A source-reference click can target an already-open doc pane. Requests
+  // carry a nonce so clicking the same citation twice still re-centres it,
+  // and each is consumed once applied: `loadedFilePath` flips to the current
+  // file on every mount, and the right panel mounts only the active pane, so
+  // an unconsumed request would replay its cursor/scroll/focus reset on every
+  // tab switch back.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !revealRequest || loadedFilePath !== filePath) return;
+    // A rendered-markdown pane keeps the CodeMirror container hidden, so a
+    // scroll dispatched now would land nowhere. Hold the request instead —
+    // the doc pane flips to raw whenever a line is requested.
+    if (isMd && viewMode !== "raw") return;
+    const lineNumber = Math.min(
+      Math.max(1, revealRequest.line),
+      view.state.doc.lines,
+    );
+    const line = view.state.doc.line(lineNumber);
+    const columnOffset = Math.max(0, (revealRequest.column ?? 1) - 1);
+    const position = Math.min(line.to, line.from + columnOffset);
+    view.dispatch({
+      selection: { anchor: position },
+      effects: EditorView.scrollIntoView(position, { y: "center" }),
+    });
+    view.focus();
+    clearReveal(tabId, revealRequest.nonce);
+  }, [
+    clearReveal,
+    filePath,
+    isMd,
+    loadedFilePath,
+    revealRequest,
+    tabId,
+    viewMode,
+  ]);
 
   // When switching back to raw, sync content from store in case it changed
   useEffect(() => {

@@ -44,11 +44,15 @@ import {
   selectSidebarAutoSettleDays,
 } from "@/stores/settings-store";
 import { formatElapsed } from "@/stores/sidebar-density-store";
-import { getWorkspaceStatus } from "@/lib/pane-status";
+import { getWorkspaceProviders, getWorkspaceStatus } from "@/lib/pane-status";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
-import { SidebarInboxCard, type InboxRepo } from "./sidebar-inbox-card";
+import {
+  SidebarInboxCard,
+  metaClusterWidth,
+  type InboxRepo,
+} from "./sidebar-inbox-card";
 import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
@@ -654,13 +658,19 @@ const SettledRow = memo(function SettledRow({
         }}
         aria-label={`Un-settle "${workspace.title}"`}
         className={cn(
-          "hidden h-[19px] shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-[7px]",
-          "text-[10px] font-semibold text-muted-foreground transition-colors duration-150",
-          "hover:border-muted-foreground/50 hover:text-foreground",
+          // Borderless, matching the cards' action cluster: a settled row is
+          // 30px tall and mostly negative space, and a bordered pill inside it
+          // read as a second object competing with the row rather than as the
+          // row's own affordance. The word stays — this is the one control on
+          // the shelf that changes a lifecycle, and an undo arrow alone is too
+          // close to "go back" to be trusted with it.
+          "hidden shrink-0 items-center gap-1 border-none bg-transparent p-0",
+          "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+          "hover:text-foreground",
           "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
         )}
       >
-        <Undo2 className="h-2.5 w-2.5" />
+        <Undo2 className="size-2.5" strokeWidth={1.7} />
         Un-settle
       </button>
     </div>
@@ -817,6 +827,27 @@ export function SidebarInbox() {
   // Only "has the first snapshot landed" — a boolean, so the guards below stop
   // dragging the whole snapshot into their dependency arrays.
   const appStateLoaded = useAppStore((s) => s.appState !== null);
+  // Long-running processes (dev servers, watchers) the port scan attributed to
+  // a workspace. Subscribed ONCE here and handed to the cards as a plain port
+  // number, deliberately not read per card: a subscription on every row would
+  // wake the whole list on each port scan, and the reduced form below only
+  // changes when a workspace actually gains or loses its first port — so the
+  // cards' memo boundary still bails out on an ordinary scan tick.
+  const detectedPorts = useAppStore((s) => s.appState?.detected_ports);
+  const runningPortByWorkspace = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const p of detectedPorts ?? []) {
+      if (!p.workspace_id) continue;
+      // Lowest port wins when a workspace holds several. Which one is named is
+      // arbitrary, but it must be *stable*, or the indicator's tooltip would
+      // flip between ports as the scanner reorders its results. The full list
+      // lives on the hover card, which is where a user goes to actually read
+      // it.
+      const seen = map.get(p.workspace_id);
+      if (seen === undefined || p.port < seen) map.set(p.workspace_id, p.port);
+    }
+    return map;
+  }, [detectedPorts]);
   const allWorkspaces = useMemo(() => workspaces ?? [], [workspaces]);
   // Pending-aware so the highlight moves in the click's own task, before the
   // backend snapshot lands (docs/plans/gui-responsiveness.md, Phase 1).
@@ -1111,6 +1142,22 @@ export function SidebarInbox() {
     ...wrappingUpTier,
   ];
 
+  // One reservation for the whole render, so every card's PR chip right-aligns
+  // against the same column. Measured off the cards actually on screen rather
+  // than a fixed worst case: a sidebar of single-provider workspaces with
+  // nothing listening shouldn't carry a permanent indent for a run indicator
+  // and two extra logos it never shows. Recomputed per render, but it feeds the
+  // cards as a number, so an unchanged list hands them an unchanged prop and
+  // their memo boundary holds.
+  let maxProviderMarks = 0;
+  let anyRunIndicator = false;
+  for (const ws of orderedActiveCards) {
+    const marks = getWorkspaceProviders(ws.surfaces).length;
+    if (marks > maxProviderMarks) maxProviderMarks = marks;
+    if (runningPortByWorkspace.has(ws.workspace_id)) anyRunIndicator = true;
+  }
+  const metaClusterMinWidth = metaClusterWidth(maxProviderMarks, anyRunIndicator);
+
   // Snoozed rows, soonest wake first — the shelf reads as a queue of returns.
   const snoozedRows = snoozed
     .map((entry) => ({ entry, workspace: workspaceById.get(entry.id) }))
@@ -1266,6 +1313,18 @@ export function SidebarInbox() {
   const handleUnpin = useCallback((workspaceId: string) => {
     void setWorkspacePinned(workspaceId, false).catch((err) => {
       toast.error("Unpin failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }, []);
+
+  /** Pin straight from the card. The gesture already existed in the context
+   *  menu, which is a poor home for it: pinning is the one action that changes
+   *  where a card lives, so a user has to discover it before the list will
+   *  hold still for them. */
+  const handlePin = useCallback((workspaceId: string) => {
+    void setWorkspacePinned(workspaceId, true).catch((err) => {
+      toast.error("Pin failed", {
         description: err instanceof Error ? err.message : String(err),
       });
     });
@@ -1728,6 +1787,9 @@ export function SidebarInbox() {
         onSnooze={handleSnooze}
         pinned={ws.pinned_at != null}
         onUnpin={handleUnpin}
+        onPin={handlePin}
+        runningPort={runningPortByWorkspace.get(id) ?? null}
+        metaClusterMinWidth={metaClusterMinWidth}
         unread={isUnread(ws)}
         woke={wokeIds.has(id)}
         selected={selectedIds.has(id)}

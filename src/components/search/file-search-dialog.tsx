@@ -11,11 +11,9 @@ import { Input } from "@/components/ui/input";
 import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
-import { useEditorStore } from "@/stores/editor-store";
 import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchFileNames } from "@/tauri/commands";
-import { docEditorTabId } from "@/components/layout/right-panel/doc-pane";
-import { docPaneId } from "@/components/layout/right-panel/pane-registry";
+import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import { basename } from "@/lib/path";
 
@@ -85,12 +83,7 @@ export function FileSearchDialog() {
         // the pick becomes a closable doc pane there instead of yanking
         // the user to a main-area editor tab.
         if (useUIStore.getState().fileSearchTarget === "right-panel") {
-          useEditorStore
-            .getState()
-            .initTab(docEditorTabId(ws.workspace_id, fullPath), {
-              filePath: fullPath,
-            });
-          useUIStore.getState().setRightPanelTab(ws.workspace_id, docPaneId(fullPath));
+          openRightPanelDoc(ws.workspace_id, fullPath);
         } else {
           await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
         }

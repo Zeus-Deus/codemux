@@ -68,7 +68,11 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
 });
 
 // Late imports so the mocks above apply.
-import { SidebarInboxCard } from "./sidebar-inbox-card";
+import {
+  SidebarInboxCard,
+  META_CLUSTER_MIN_WIDTH,
+  metaClusterWidth,
+} from "./sidebar-inbox-card";
 import { activateWorkspace } from "@/tauri/commands";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 
@@ -137,6 +141,10 @@ function renderCard(overrides: Partial<CardProps> = {}) {
     "[data-inbox-card]",
   ) as HTMLElement;
   return { ...utils, props, card };
+}
+
+function metaLine(container: HTMLElement) {
+  return container.querySelector("[data-meta-line]") as HTMLElement;
 }
 
 beforeEach(() => {
@@ -230,15 +238,18 @@ describe("SidebarInboxCard — snooze affordance", () => {
   it("keeps the hover cluster pinned open while the snooze menu is open", async () => {
     renderCard();
     const trigger = screen.getByRole("button", { name: 'Snooze "Ship it"' });
+    // The reveal rides the cluster the buttons share, not each button, so the
+    // three actions can never half-appear.
+    const cluster = trigger.parentElement!;
     // At rest the cluster is CSS-hidden and only revealed by hover/focus.
-    expect(trigger.className).toContain("hidden");
+    expect(cluster.className).toContain("hidden");
 
     await userEvent.click(trigger);
 
     // With the menu open the reveal is state-driven, so the pointer leaving
     // the card can no longer collapse the trigger out from under it.
-    expect(trigger.className).not.toContain("hidden");
-    expect(trigger.className).toContain("inline-flex");
+    expect(cluster.className).not.toContain("hidden");
+    expect(cluster.className).toContain("flex");
   });
 
   it("snoozes to the chosen preset's instant without activating the workspace", async () => {
@@ -379,10 +390,6 @@ describe("SidebarInboxCard — working status", () => {
 });
 
 describe("SidebarInboxCard — meta line alignment", () => {
-  function metaLine(container: HTMLElement) {
-    return container.querySelector("[data-meta-line]") as HTMLElement;
-  }
-
   // jsdom does not lay out, so these assert the DOM contract that *produces*
   // the alignment rather than the pixels: the git-local facts flow from the
   // left, a flex spacer absorbs the slack, and everything after it is pinned
@@ -441,19 +448,32 @@ describe("SidebarInboxCard — meta line alignment", () => {
   });
 
   it("reserves the trailing indicator column so a bare card still aligns", () => {
-    // The reserved width is sized to the widest single indicator (the 15px
-    // notification pill), not the 13px provider logo — otherwise which
-    // indicator a card happens to show would shift its PR chip by 2px.
+    // The reservation is a width the parent computes once per list render and
+    // hands to every card, so cards with different indicator counts still
+    // right-align their PR chips against one column. Its floor is the widest
+    // single indicator (the 15px notification pill), not the 13px provider
+    // logo — otherwise which indicator a card happens to show would shift its
+    // PR chip by 2px.
     const { container } = renderCard({
       workspace: makeWorkspace({ pr_number: 1, pr_state: "open" }),
     });
     const children = [...metaLine(container).children];
-    const trailing = children[children.length - 1];
+    const trailing = children[children.length - 1] as HTMLElement;
 
-    expect(trailing.className).toContain("min-w-[15px]");
+    expect(trailing.style.minWidth).toBe(`${META_CLUSTER_MIN_WIDTH}px`);
     expect(trailing.className).toContain("justify-end");
     // Last child, so it — not the PR chip — owns the far-right column.
     expect(trailing.nextElementSibling).toBeNull();
+  });
+
+  it("honours the width the list reserved rather than its own content", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({ pr_number: 1, pr_state: "open" }),
+      metaClusterMinWidth: 46,
+    });
+    const children = [...metaLine(container).children];
+    const trailing = children[children.length - 1] as HTMLElement;
+    expect(trailing.style.minWidth).toBe("46px");
   });
 
   it("still renders the trailing indicators it owns", () => {
@@ -463,6 +483,119 @@ describe("SidebarInboxCard — meta line alignment", () => {
     const children = [...metaLine(container).children];
     const trailing = children[children.length - 1];
     expect(trailing).toHaveTextContent("3");
+  });
+});
+
+describe("SidebarInboxCard — pin affordance", () => {
+  it("offers Pin on every card, guardrail or not", () => {
+    // Pin is the one action with no lifecycle guardrail: it changes where a
+    // card is shown, never whether its agent is interruptible. A working or
+    // blocked card that offered nothing at all would also have no way out of
+    // the context menu, which is where this gesture used to be buried.
+    for (const status of [null, "working", "permission", "review"] as (
+      | ActivePaneStatus
+      | null
+    )[]) {
+      renderCard({ status });
+      expect(
+        screen.getByRole("button", { name: 'Pin "Ship it" to top' }),
+      ).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it("pins without activating the workspace", async () => {
+    const { props } = renderCard({ onPin: vi.fn() });
+    await userEvent.click(
+      screen.getByRole("button", { name: 'Pin "Ship it" to top' }),
+    );
+    expect(props.onPin).toHaveBeenCalledWith("ws-1");
+    expect(activateWorkspace).not.toHaveBeenCalled();
+    expect(props.onSelect).not.toHaveBeenCalled();
+  });
+
+  it("turns into Unpin once the card is pinned", async () => {
+    const { props } = renderCard({ pinned: true, onUnpin: vi.fn() });
+    expect(
+      screen.queryByRole("button", { name: 'Pin "Ship it" to top' }),
+    ).toBeNull();
+    await userEvent.click(
+      screen.getByRole("button", { name: 'Unpin "Ship it"' }),
+    );
+    expect(props.onUnpin).toHaveBeenCalledWith("ws-1");
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("hides the resting pin marker under the pointer", () => {
+    // The revealed cluster carries its own pin glyph, so leaving the marker up
+    // would draw two pins on one row.
+    const { container } = renderCard({ pinned: true });
+    // An SVG node, so `className` is an SVGAnimatedString — read the attribute.
+    const marker = container.querySelector('[aria-label="Pinned workspace"]')!;
+    const classes = marker.getAttribute("class") ?? "";
+    expect(classes).toContain("group-hover/card:hidden");
+    expect(classes).toContain("group-focus-within/card:hidden");
+  });
+
+  it("keeps the state readout in place on a card that cannot settle", () => {
+    // `stateKeepsPlace`: the readout yields only to the wide Snooze/Settle
+    // pair. A guardrailed card reveals nothing but the narrow pin glyph, which
+    // fits beside the readout — so a working agent never trades its status for
+    // chrome the user cannot act on.
+    const { container } = renderCard({ status: "working" });
+    const state = screen.getByText("Working").closest("span")!;
+    expect(state.className).not.toContain("group-hover/card:hidden");
+
+    cleanup();
+    const settleable = renderCard({ status: "review" });
+    const readout = settleable.getByText("Done · review").closest("span")!;
+    expect(readout.className).toContain("group-hover/card:hidden");
+    expect(container).toBeTruthy();
+  });
+});
+
+describe("SidebarInboxCard — running-process indicator", () => {
+  it("names the port it found", () => {
+    renderCard({ runningPort: 5173 });
+    expect(
+      screen.getByRole("img", { name: "Long-running process on :5173" }),
+    ).toBeInTheDocument();
+  });
+
+  it("stays absent when nothing is listening", () => {
+    renderCard();
+    expect(
+      screen.queryByRole("img", { name: /Long-running process/ }),
+    ).toBeNull();
+  });
+
+  it("sits inside the trailing cluster, ahead of the provider marks", () => {
+    const { container } = renderCard({ runningPort: 3000 });
+    const children = [...metaLine(container).children];
+    const trailing = children[children.length - 1];
+    const indicator = screen.getByRole("img", {
+      name: "Long-running process on :3000",
+    });
+    expect(trailing.contains(indicator)).toBe(true);
+    expect(trailing.firstElementChild).toBe(indicator);
+  });
+});
+
+describe("metaClusterWidth", () => {
+  it("never reserves less than the widest single indicator", () => {
+    expect(metaClusterWidth(0, false)).toBe(META_CLUSTER_MIN_WIDTH);
+    expect(metaClusterWidth(1, false)).toBe(META_CLUSTER_MIN_WIDTH);
+  });
+
+  it("grows with the busiest card in the list, not with each card", () => {
+    // 3 marks: 3×13 + 2×8 gaps.
+    expect(metaClusterWidth(3, false)).toBe(55);
+    // …plus the 12px run glyph and one more gap.
+    expect(metaClusterWidth(3, true)).toBe(75);
+  });
+
+  it("charges no gap for a run indicator standing alone", () => {
+    expect(metaClusterWidth(0, true)).toBe(META_CLUSTER_MIN_WIDTH);
   });
 });
 
