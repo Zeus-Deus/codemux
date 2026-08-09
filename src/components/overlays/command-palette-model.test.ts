@@ -4,8 +4,11 @@ import {
   compareWorkspaceOrder,
   groupCountLabel,
   parsePaletteQuery,
+  previewedThemeId,
   rankByQuery,
+  rankThemeGroup,
   resultCountLabel,
+  themeRowValue,
   workspacePathText,
   workspaceRowSubtitle,
   workspaceSearchText,
@@ -202,5 +205,59 @@ describe("labels", () => {
     expect(resultCountLabel(1)).toBe("1 result");
     expect(resultCountLabel(0)).toBe("0 results");
     expect(resultCountLabel(12)).toBe("12 results");
+  });
+});
+
+describe("theme rows", () => {
+  // Registry order: built-ins as declared, then custom.
+  const themes = ["Graphite", "Warm Stone", "Ember", "Abyss", "Iris", "Sonokai"].map(
+    (label) => ({ label }),
+  );
+
+  const match = (needle: string) =>
+    rankThemeGroup(themes, parsePaletteQuery(needle), (t) => t.label).map((t) => t.label);
+
+  it("surfaces the whole set, in registry order, for the word itself", () => {
+    // Regression: scoring every row against a shared `… theme colors palette`
+    // haystack matched them all with a score that differed only by name
+    // length, so "theme" returned the list sorted by how short each theme was
+    // called — Iris first, Warm Stone last.
+    expect(match("theme")).toEqual([
+      "Graphite",
+      "Warm Stone",
+      "Ember",
+      "Abyss",
+      "Iris",
+      "Sonokai",
+    ]);
+  });
+
+  it("answers to the group's other generic words too", () => {
+    expect(match("colors")).toHaveLength(themes.length);
+    expect(match("appearance")).toHaveLength(themes.length);
+    expect(match("palette")).toHaveLength(themes.length);
+  });
+
+  it("narrows to the named theme when the query names one", () => {
+    expect(match("ember")).toEqual(["Ember"]);
+    expect(match("abyss")).toEqual(["Abyss"]);
+  });
+
+  it("shows nothing for a query that is neither a name nor a group word", () => {
+    expect(match("workspace")).toEqual([]);
+    expect(match("")).toEqual([]);
+  });
+
+  it("reads back the theme a selected row should preview", () => {
+    expect(previewedThemeId(themeRowValue("custom-night-signal"))).toBe(
+      "custom-night-signal",
+    );
+  });
+
+  it("previews nothing for any other kind of row", () => {
+    expect(previewedThemeId("ws:abc")).toBeNull();
+    expect(previewedThemeId("cmd:settings")).toBeNull();
+    expect(previewedThemeId("theme-studio:generate")).toBeNull();
+    expect(previewedThemeId("")).toBeNull();
   });
 });

@@ -121,6 +121,15 @@ const detachPtyOutput = vi.fn(async () => {
 });
 
 vi.mock("@/tauri/commands", () => ({
+  getCurrentTheme: vi.fn(async () => ({
+    accent: "#7aa2f7", cursor: "#c0caf5", foreground: "#c0caf5", background: "#1a1b26",
+    selection_foreground: "#c0caf5", selection_background: "#283457",
+    color0: "#15161e", color1: "#f7768e", color2: "#9ece6a", color3: "#e0af68",
+    color4: "#7aa2f7", color5: "#bb9af7", color6: "#7dcfff", color7: "#a9b1d6",
+    color8: "#414868", color9: "#f7768e", color10: "#9ece6a", color11: "#e0af68",
+    color12: "#7aa2f7", color13: "#bb9af7", color14: "#7dcfff", color15: "#c0caf5",
+  })),
+  getShellAppearance: vi.fn(async () => ({ font_family: "monospace" })),
   writeToPty: vi.fn(async () => {}),
   resizePty: vi.fn(async () => {}),
   detachPtyOutput: (...args: unknown[]) => detachPtyOutput(...(args as [])),
@@ -145,7 +154,10 @@ vi.mock("@/tauri/commands", () => ({
   },
 }));
 
-vi.mock("@/tauri/events", () => ({ onTerminalStatus: vi.fn() }));
+vi.mock("@/tauri/events", () => ({
+  onTerminalStatus: vi.fn(),
+  onThemeChanged: vi.fn(async () => () => {}),
+}));
 vi.mock("@/hooks/use-tauri-event", () => ({ useTauriEvent: () => {} }));
 vi.mock("@/hooks/use-scrollback-serializer", () => ({
   registerTerminalForSerialize: () => () => {},

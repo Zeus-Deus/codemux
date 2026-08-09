@@ -28,6 +28,7 @@ import {
   CHAT_MARKDOWN_COMPONENTS,
   ChatCodeRendererProvider,
 } from "./ChatCodeBlock";
+import { ChatMarkdownLink } from "./ChatMarkdownLink";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 import { MarkdownLocalImage } from "./MarkdownLocalImage";
 import { MarkdownFileLink } from "./MarkdownFileLink";
@@ -143,22 +144,21 @@ const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 // are never parsed as links), so the two override sets are disjoint — they just
 // have to travel in one module-level object, because Streamdown keys its
 // processor cache on the identity of this map.
-function FileLinkElement(props: Record<string, unknown>) {
+function FileLinkElement({ sourceHref, ...props }: Record<string, unknown>) {
   const { cwd } = useChatFileLinkContext();
-  const meta = resolveChatFileLink(String(props.sourceHref ?? ""), cwd);
+  const href = String(sourceHref ?? "");
+  const meta = resolveChatFileLink(href, cwd);
   // A common agent pattern is [`path/to/file.ts:42`](path/to/file.ts:42).
   // Streamdown has already rendered that label through our inline-code
   // override by the time the transformed link reaches this component. Keep
   // only its text so the explicit source link owns the single interactive
   // element instead of producing an invalid button-inside-button tree.
   const label = plainText(props.children as ReactNode) || meta?.displayPath;
-  if (!meta) {
-    return (
-      <code data-streamdown="inline-code">
-        {props.children as ReactNode}
-      </code>
-    );
-  }
+  // Nothing to open (no workspace root, or the path escapes it): hand the
+  // anchor back to `ChatMarkdownLink`, which renders every non-web
+  // destination inert while still surfacing it on hover. A chip that cannot
+  // resolve must not look clickable, but the reader still deserves the path.
+  if (!meta) return <ChatMarkdownLink {...props} href={href} />;
   return <MarkdownFileLink meta={meta}>{label}</MarkdownFileLink>;
 }
 
@@ -195,6 +195,7 @@ function plainText(node: ReactNode): string {
 const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
   inlineCode: InlineSourceReference,
+  a: ChatMarkdownLink,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
   [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
   [CHAT_FILE_LINK_TAG]: FileLinkElement,

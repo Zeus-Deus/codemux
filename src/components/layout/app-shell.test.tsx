@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 
 // ── Mutable mock state ──
 let hasWorkspacesFlag = false;
@@ -14,6 +14,20 @@ let showAutomationsFlag = false;
 let showWorkspacesOverviewFlag = false;
 let showNewProjectScreenFlag = false;
 let commandPaletteOpenFlag = false;
+// Appearance state: the machine-local legacy palette key, the synced theme id,
+// and the two writes the shell can make in response to them.
+let localSettings: Record<string, string> = {};
+let syncedThemeId = "default";
+const { applyThemeSpy } = vi.hoisted(() => ({ applyThemeSpy: vi.fn() }));
+const setLocalSetting = vi.fn((key: string, value: string) => {
+  localSettings = { ...localSettings, [key]: value };
+});
+const updateSyncedSetting = vi.fn(
+  async (_section: string, key: string, value: unknown) => {
+    // Mirrors the real store's optimistic local write.
+    if (key === "theme") syncedThemeId = String(value);
+  },
+);
 
 // The real AppShell imports a lot. We mock the heavy children down to
 // sentinel text nodes so we can assert which branch of the shell
@@ -130,40 +144,62 @@ vi.mock("@/stores/settings-store", () => ({
     vi.fn((selector: (s: unknown) => unknown) =>
       selector({
         loaded: settingsLoaded,
-        settings: {},
+        settings: localSettings,
       }),
     ),
-    { getState: () => ({ load: vi.fn() }) },
+    { getState: () => ({ load: vi.fn(), set: setLocalSetting }) },
   ),
   // Appearance selectors read by AppShell to apply palette/density attrs.
   selectPalette: () => "cool",
   selectDensity: () => "comfortable",
 }));
 
+const EMPTY_CUSTOM_THEMES: unknown[] = [];
+
 vi.mock("@/stores/synced-settings-store", () => ({
   useSyncedSettingsStore: vi.fn((selector: (s: unknown) => unknown) =>
-    selector({ isLoading: syncedLoading }),
+    selector({
+      isLoading: syncedLoading,
+      settings: {
+        appearance: { theme: syncedThemeId, custom_themes: EMPTY_CUSTOM_THEMES },
+      },
+      updateSetting: updateSyncedSetting,
+    }),
   ),
+}));
+
+// Only `applyTheme` is stubbed; the shell's theme resolution stays real so the
+// spy sees the theme the user would actually get.
+vi.mock("@/lib/themes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/themes")>()),
+  applyTheme: applyThemeSpy,
 }));
 
 import { AppShell } from "./app-shell";
 
 afterEach(() => cleanup());
 
+function resetMockState() {
+  hasWorkspacesFlag = false;
+  enableLazyFlag = false;
+  activeDraftId = null;
+  appStateReady = true;
+  settingsLoaded = true;
+  syncedLoading = false;
+  showSettingsFlag = false;
+  showAutomationsFlag = false;
+  showWorkspacesOverviewFlag = false;
+  showNewProjectScreenFlag = false;
+  commandPaletteOpenFlag = false;
+  localSettings = {};
+  syncedThemeId = "default";
+  applyThemeSpy.mockClear();
+  setLocalSetting.mockClear();
+  updateSyncedSetting.mockClear();
+}
+
 describe("AppShell rendering gates", () => {
-  beforeEach(() => {
-    hasWorkspacesFlag = false;
-    enableLazyFlag = false;
-    activeDraftId = null;
-    appStateReady = true;
-    settingsLoaded = true;
-    syncedLoading = false;
-    showSettingsFlag = false;
-    showAutomationsFlag = false;
-    showWorkspacesOverviewFlag = false;
-    showNewProjectScreenFlag = false;
-    commandPaletteOpenFlag = false;
-  });
+  beforeEach(resetMockState);
 
   it("renders EmptyState when there are no workspaces and no active draft", () => {
     hasWorkspacesFlag = false;
@@ -220,5 +256,91 @@ describe("AppShell rendering gates", () => {
     const { getByTestId, queryByTestId } = render(<AppShell />);
     expect(getByTestId("settings-view")).toBeInTheDocument();
     expect(queryByTestId("workspaces-overview-view")).toBeNull();
+  });
+});
+
+describe("AppShell theme activation", () => {
+  beforeEach(resetMockState);
+
+  it("does not touch the theme while the stores are still loading", () => {
+    // The inline boot script has already painted the user's theme; the synced
+    // store is still handing out the DEFAULT_SETTINGS placeholder here, so
+    // applying it would repaint to Graphite and persist it over the boot
+    // shadow.
+    syncedLoading = true;
+    render(<AppShell />);
+    expect(applyThemeSpy).not.toHaveBeenCalled();
+
+    cleanup();
+    syncedLoading = false;
+    settingsLoaded = false;
+    render(<AppShell />);
+    expect(applyThemeSpy).not.toHaveBeenCalled();
+  });
+
+  it("applies the synced theme once both stores have loaded", () => {
+    syncedThemeId = "ocean";
+    render(<AppShell />);
+    expect(applyThemeSpy).toHaveBeenCalledTimes(1);
+    expect(applyThemeSpy.mock.calls[0]![0]).toMatchObject({ id: "ocean" });
+    // Persistence is left at its default: this is the real applied theme, so
+    // it is exactly what the next boot should paint.
+    expect(applyThemeSpy.mock.calls[0]![1]).toBeUndefined();
+  });
+
+  it("keeps density on the root even before the theme is applied", () => {
+    syncedLoading = true;
+    render(<AppShell />);
+    expect(document.documentElement.dataset.density).toBe("comfortable");
+  });
+});
+
+describe("AppShell legacy warm-palette migration", () => {
+  beforeEach(resetMockState);
+
+  it("migrates a stored warm palette once and then retires the local key", async () => {
+    localSettings = { "appearance.palette": "warm" };
+    const { rerender } = render(<AppShell />);
+
+    await waitFor(() =>
+      expect(updateSyncedSetting).toHaveBeenCalledWith(
+        "appearance",
+        "theme",
+        "warm",
+      ),
+    );
+    await waitFor(() =>
+      expect(setLocalSetting).toHaveBeenCalledWith("appearance.palette", "cool"),
+    );
+    expect(updateSyncedSetting).toHaveBeenCalledTimes(1);
+
+    // The user now deliberately picks Graphite. With the legacy key retired the
+    // migration must stay quiet — it used to re-fire forever, making Graphite
+    // unselectable on any machine that ever ran the Warm palette.
+    syncedThemeId = "default";
+    applyThemeSpy.mockClear();
+    rerender(<AppShell />);
+    await waitFor(() =>
+      expect(applyThemeSpy.mock.calls[0]?.[0]).toMatchObject({ id: "default" }),
+    );
+    expect(updateSyncedSetting).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not migrate while the stores are still loading", () => {
+    // The placeholder synced id reads as "default" during load; acting on it
+    // would stamp "warm" over whatever theme the account actually holds.
+    localSettings = { "appearance.palette": "warm" };
+    syncedThemeId = "iris";
+    syncedLoading = true;
+    render(<AppShell />);
+    expect(updateSyncedSetting).not.toHaveBeenCalled();
+  });
+
+  it("leaves an explicitly chosen theme alone", () => {
+    localSettings = { "appearance.palette": "warm" };
+    syncedThemeId = "ember";
+    render(<AppShell />);
+    expect(updateSyncedSetting).not.toHaveBeenCalled();
+    expect(applyThemeSpy.mock.calls[0]![0]).toMatchObject({ id: "ember" });
   });
 });

@@ -45,7 +45,10 @@ Even a cheap teardown is still work the incoming pane has to wait behind, so the
   - **Windows**: prefers `pwsh.exe` (PowerShell 7+) when on `PATH`, falls back to `powershell.exe` (Windows PowerShell 5.1, pre-installed on every supported Windows version), then `%COMSPEC%`, then literal `"cmd.exe"`. PowerShell wins because the Windows preset wrappers emit PowerShell `$env:VAR` syntax for context injection — see `agent_context.rs` and `docs/features/presets.md`
 - PTY resize on pane/window resize
 - xterm.js WebGL renderer (GPU glyph rendering) gated by a once-per-session probe: DOM renderer on **software-rendered WebGL** (SwiftShader/llvmpipe-class stacks) and on **Linux WebKitGTK** (masked renderer strings + input-lag history; `localStorage["codemux:terminal-renderer"]` overrides), with the existing fallbacks on GPU context loss or missing WebGL2 support, plus kitty keyboard protocol support
-- terminal theme reads dynamically from CSS variables via MutationObserver
+- terminal theme comes from the shared syntax-theme store. App mode uses the
+  active application's ANSI roles; system mode uses the native terminal
+  palette. Live panes update xterm directly with no CSS MutationObserver or
+  duplicate native listener.
 - session state tracking — `TerminalLifecycleState { Starting, Migrating, Ready, Exited, Failed }` and the persisted `TerminalSessionState { Starting, Ready, Exited, Failed }`
 - environment injection: `CODEMUX`, `CODEMUX_VERSION`, `CODEMUX_WORKSPACE_ID`, `CODEMUX_BROWSER_CMD`, `BROWSER`, `CODEMUX_AGENT_CONTEXT`
   - `strip_renderer_env` removes the three WebKit renderer variables (`WEBKIT_DMABUF_RENDERER_FORCE_SHM`, `WEBKIT_DISABLE_DMABUF_RENDERER`, `WEBKIT_DISABLE_COMPOSITING_MODE`) from every child shell — both spawn paths and the pty daemon — so a GTK/WebKit app launched from a Codemux terminal picks its own renderer instead of inheriting the app's choice. See `docs/features/agent-chat.md` § "Perf on Linux WebKitGTK".
@@ -84,7 +87,8 @@ Note: terminal scrollback is saved and restored across app restarts. See `docs/f
 - `src-tauri/src/pty_daemon/{protocol,client,server}.rs` — `SetFlowPaused` wire request + per-session `flow_paused` flag gating the daemon read loop (with `Attach`/`Close`/max-park fail-safes); invoked by the live `TerminalPane` path for daemon-backed sessions (the in-process path uses `mod.rs`'s own `flow_paused` gate)
 - `src-tauri/src/terminal/mod.rs` — `create_terminal_session`, `write_to_pty`, `resize_pty`, `attach_pty_output` (registered in `lib.rs` as `terminal::*`; `commands/workspace.rs` only reaches PTYs via `write_to_pty_by_session`)
 - `src/components/terminal/terminal-cache.ts` — **DISABLED / not wired** (see file banner): module-level persistent Terminal cache, parking node, attach/detach/dispose API, `pumpWrites` + HIGH/LOW watermark pause/resume. Retained for a possible future flag-gated revival; inert in production. Its watermark constants/approach were reused on the live `TerminalPane`/`terminal-write-pump.ts` path (do NOT resurrect this file — see issue #73 pitfalls).
-- `src/hooks/use-terminal-cache-gc.ts`, `src/hooks/use-terminal-theme-sync.ts` — operate on the disabled cache's empty map; no-ops today
+- `src/hooks/use-terminal-cache-gc.ts`, `src/hooks/use-terminal-theme-sync.ts` — operate on the disabled cache's empty map; the theme hook follows the shared syntax-theme source and remains a no-op until the cache is revived
+- `src/lib/xterm-theme.ts` — maps the shared 16-slot syntax palette into xterm's `ITheme`
 - `src/lib/terminal-cwd.ts` — **the cwd hint formatter**: pure `formatCwdHint(cwd, workspaceRoot, homeDir)` implementing the "quiet at the root, elide the head, contract to `~`" rules; unit-tested in `terminal-cwd.test.ts`
 - `src/stores/terminal-cwd-store.ts` — frontend-only `sessionId -> {cwd, source}` map with the `osc7`-beats-`proc` precedence rule and the OSC 7 payload parser; unit-tested in `terminal-cwd-store.test.ts`
 - `src/hooks/use-terminal-cwd-poll.ts` — single app-level interval (2s) that batches one `terminal_session_cwds` call for the active workspace's non-OSC-7 sessions, pauses while the window is hidden, and prunes entries for closed sessions

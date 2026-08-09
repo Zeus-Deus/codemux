@@ -1,14 +1,16 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import {
   useSettingsStore,
-  selectPalette,
   selectDensity,
 } from "@/stores/settings-store";
-import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import {
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
+import { applyTheme, parseCustomThemes, resolveTheme } from "@/lib/themes";
 import { SidebarProvider, SidebarInset, useSidebar } from "@/components/ui/sidebar";
 import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
 import { AppSidebar } from "./app-sidebar";
@@ -23,6 +25,8 @@ import { NewProjectScreen } from "@/components/overlays/new-project-screen";
 import { FileSearchDialog } from "@/components/search/file-search-dialog";
 import { ContentSearchDialog } from "@/components/search/content-search-dialog";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
+
+const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
 export function AppShell() {
   const isLoading = useAppStore((s) => s.appState === null);
@@ -44,23 +48,66 @@ export function AppShell() {
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
-  // Appearance: palette (Cool/Warm) + density (Comfortable/Compact) are
-  // applied as root attributes so the CSS variable blocks swap app-wide.
-  const palette = useSettingsStore(selectPalette);
+  // Appearance uses the synced theme id and payloads. Density stays local: it
+  // controls layout rhythm rather than the color system.
+  const syncedThemeId = useSyncedSettingsStore((s) => s.settings?.appearance?.theme ?? "default");
+  const customThemePayloads = useSyncedSettingsStore((s) => s.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS);
+  const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
+  const legacyPalette = useSettingsStore((s) => s.settings["appearance.palette"]);
   const density = useSettingsStore(selectDensity);
+  const customThemes = useMemo(
+    () => parseCustomThemes(customThemePayloads),
+    [customThemePayloads],
+  );
+  // Both stores must have answered before the synced theme id means anything:
+  // until then `syncedThemeId` is the DEFAULT_SETTINGS placeholder ("default")
+  // and `legacyPalette` is undefined, so acting on either would be acting on a
+  // value the user never chose.
+  const appearanceReady = settingsLoaded && !syncedLoading;
+  const effectiveThemeId =
+    legacyPalette === "warm" &&
+    (syncedThemeId === "system" || syncedThemeId === "dark" || syncedThemeId === "default")
+      ? "warm"
+      : syncedThemeId;
+  const activeTheme = useMemo(
+    () => resolveTheme(effectiveThemeId, customThemes),
+    [effectiveThemeId, customThemes],
+  );
 
   useEffect(() => {
     useSettingsStore.getState().load();
   }, []);
 
-  useEffect(() => {
+  // The inline boot script already painted the last applied theme, so until the
+  // stores load there is nothing to do: applying here would repaint the shell
+  // to Graphite and — because `applyTheme` persists by default — overwrite the
+  // boot shadow with it, so a crash (or a failed load) during that window would
+  // open the *next* launch on Graphite too. Density is a layout attribute, not
+  // a color, and stays unconditional.
+  useLayoutEffect(() => {
     const root = document.documentElement;
-    // Warm palette is a `.theme-warm` token override on the root; Cool is
-    // the default token map (no class). Density stays a data attribute.
-    root.classList.toggle("theme-warm", palette === "warm");
-    delete root.dataset.pal; // clean up the legacy attribute if present
+    if (appearanceReady) applyTheme(activeTheme);
+    delete root.dataset.pal;
     root.dataset.density = density;
-  }, [palette, density]);
+  }, [activeTheme, density, appearanceReady]);
+
+  // One-time migration from the machine-local Cool/Warm axis to the unified,
+  // synced theme id. Only an explicitly stored legacy value participates, and
+  // only once the real settings are in hand — reading the placeholder id would
+  // stamp "warm" over whatever theme the account actually holds. The local key
+  // is rewritten as soon as the synced write lands, which both retires the
+  // `default → warm` display mapping above and stops the migration from firing
+  // again the next time the user deliberately picks Graphite.
+  useEffect(() => {
+    if (!appearanceReady) return;
+    if (legacyPalette !== "warm") return;
+    if (syncedThemeId !== "system" && syncedThemeId !== "dark" && syncedThemeId !== "default") return;
+    updateSyncedSetting("appearance", "theme", "warm")
+      .then(() => {
+        useSettingsStore.getState().set("appearance.palette", "cool");
+      })
+      .catch(console.error);
+  }, [appearanceReady, legacyPalette, syncedThemeId, updateSyncedSetting]);
 
   useWorktreeIncludeToast();
 

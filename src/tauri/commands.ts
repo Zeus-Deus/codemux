@@ -2551,3 +2551,30 @@ export const webRemotePublishUpdateAvailable = (
  *  applies). Agents survive the restart; the web client reconnects. */
 export const webRemoteRequestUpdate = () =>
   invoke<void>("web_remote_request_update");
+
+// ── VS Code Marketplace theme import ─────────────────────────────────────
+
+/** A Marketplace extension that ships at least one dark colour theme.
+ *  snake_case because that is what the Rust side serializes — the repo's
+ *  convention for frontend-facing command payloads (see `tauri/types.ts`). */
+export interface MarketplaceTheme {
+  extension_id: string;
+  display_name: string;
+  publisher: string;
+  install_count: number;
+  version: string;
+  vsix_url: string;
+}
+
+/** One dark colour theme inside an extension, with its raw JSONC. */
+export interface MarketplaceThemeVariant {
+  label: string;
+  ui_theme: string;
+  content: string;
+}
+
+export const searchMarketplaceThemes = (query: string) =>
+  invoke<MarketplaceTheme[]>("vscode_marketplace_search", { query });
+
+export const fetchMarketplaceThemes = (vsixUrl: string) =>
+  invoke<MarketplaceThemeVariant[]>("vscode_marketplace_fetch_themes", { vsixUrl });

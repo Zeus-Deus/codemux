@@ -1,6 +1,25 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+
+const mocks = vi.hoisted(() => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
+  toastError: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mocks.openUrl(...args),
+}));
+
+vi.mock("@/lib/toast", () => ({
+  toast: { error: (...args: unknown[]) => mocks.toastError(...args) },
+}));
 
 import {
   docEditorTabId,
@@ -17,8 +36,18 @@ beforeEach(() => {
   resetFaviconFailureCache();
   useEditorStore.setState({ tabs: {} });
   useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
+  mocks.openUrl.mockReset().mockResolvedValue(undefined);
+  mocks.toastError.mockReset();
 });
 afterEach(() => cleanup());
+
+/** Middle click. `fireEvent` has no auxClick helper, and it never fires onClick. */
+function middleClick(element: Element): boolean {
+  return fireEvent(
+    element,
+    new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+  );
+}
 
 describe("ChatMarkdown rich external links", () => {
   it("adds the destination favicon to any labelled http(s) link", () => {
@@ -40,6 +69,88 @@ describe("ChatMarkdown rich external links", () => {
       "https://www.google.com/s2/favicons?domain=github.com&sz=32",
     );
     expect(link?.querySelector(".chat-markdown-link-leading")).toHaveTextContent("P");
+  });
+
+  it("confirms external links in a body-level portal before opening the system browser", async () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[OpenAI documentation](https://platform.openai.com/docs)"}
+      </ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link?.tagName).toBe("A");
+    expect(link).toHaveAttribute("href", "https://platform.openai.com/docs");
+    // The confirmed open goes through the Tauri opener, so a browsing context
+    // target would only buy an unconfirmed middle-click navigation.
+    expect(link).not.toHaveAttribute("target");
+
+    fireEvent.click(link as HTMLAnchorElement);
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.parentElement).toBe(document.body);
+    expect(
+      screen.getByText("https://platform.openai.com/docs"),
+    ).toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+
+    await waitFor(() =>
+      expect(mocks.openUrl).toHaveBeenCalledWith(
+        "https://platform.openai.com/docs",
+      ),
+    );
+  });
+
+  it("never navigates an external link itself, not even on middle click", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[Reference](https://example.com/reference)"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    // fireEvent returns false once a handler called preventDefault.
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(middleClick(link as HTMLAnchorElement)).toBe(false);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not open an external link when its confirmation is cancelled", () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[Reference](https://example.com/reference)"}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(
+      container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an opener failure after confirmation", async () => {
+    mocks.openUrl.mockRejectedValueOnce(new Error("opener unavailable"));
+    const { container } = render(
+      <ChatMarkdown>
+        {"[Reference](https://example.com/reference)"}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(
+      container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open link" }));
+
+    await waitFor(() =>
+      expect(mocks.toastError).toHaveBeenCalledWith("Could not open the link", {
+        description: "opener unavailable",
+      }),
+    );
   });
 
   it("keeps a bare URL's protocol with the favicon and leaves local links plain", () => {
@@ -153,6 +264,59 @@ describe("ChatMarkdown rich external links", () => {
   });
 });
 
+describe("ChatMarkdown non-web link destinations", () => {
+  // `ChatMarkdown` supplies its own rehype plugins, which replaces Streamdown's
+  // sanitize/harden chain, so an agent-authored href reaches the anchor exactly
+  // as written. Nothing but a confirmed http(s) URL may ever be navigable.
+  it("renders a script-scheme destination inert", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[click me](javascript:alert(1))"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link).toHaveTextContent("click me");
+    expect(link).not.toHaveAttribute("href");
+    expect(link).toHaveAttribute("data-inert-link");
+    // No href to follow, and the click is swallowed rather than defaulted.
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate the webview for a local path link", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[log](/tmp/build.log)"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link).toHaveTextContent("log");
+    // A live href here would unload the single-page app onto app-origin/tmp/…
+    expect(link).not.toHaveAttribute("href");
+    expect(link).toHaveAttribute("title", "/tmp/build.log");
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+    expect(middleClick(link as HTMLAnchorElement)).toBe(false);
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("leaves mailto, file, and relative destinations without a live href", () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[mail](mailto:hello@codemux.org) [file](file:///etc/hosts) [rel](./notes.md) [anchor](#code-blocks)"}
+      </ChatMarkdown>,
+    );
+
+    const links = container.querySelectorAll('[data-streamdown="link"]');
+    expect(links).toHaveLength(4);
+    for (const link of links) {
+      expect(link).not.toHaveAttribute("href");
+      expect(link).toHaveAttribute("data-inert-link");
+    }
+  });
+});
+
 describe("ChatMarkdown local image links", () => {
   it("upgrades a labelled absolute PNG link to a clickable preview", () => {
     const { container, getByRole } = render(
@@ -185,10 +349,13 @@ describe("ChatMarkdown local image links", () => {
     );
 
     expect(container.querySelector("[data-chat-local-image]")).toBeNull();
-    expect(container.querySelector('[data-streamdown="link"]')).toBeNull();
-    expect(container.querySelector('code[data-streamdown="inline-code"]')).toHaveTextContent(
-      "implementation",
-    );
+    expect(container.querySelector("button")).toBeNull();
+    // Falls back to the inert-link treatment every non-web destination gets:
+    // nothing to click, but the path still shows on hover.
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link).toHaveTextContent("implementation");
+    expect(link).not.toHaveAttribute("href");
+    expect(link).toHaveAttribute("title", "/home/me/src/app.tsx");
   });
 });
 

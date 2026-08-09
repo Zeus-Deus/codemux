@@ -771,7 +771,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   acting inside a thread, while the sidebar is workspace navigation and only
   knows the coarse `pane_statuses` lifecycle. Activity-matched orbs remain
   where the tool is actually visible (the thread and its subagents — see
-  `docs/features/agent-chat.md`). The collapsed rail remains even denser and
+  `docs/features/agent-chat.md`). The `Working` label is followed by a compact,
+  tabular elapsed value (`42s`, `12m`, `1h12m`) derived from the card's
+  client-observed working transition and advanced by the sidebar's shared
+  coarse clock. Only the stable `Working` label is announced as live status;
+  the ticking value is presentation-only so assistive technology is not
+  interrupted on every update. The collapsed rail remains even denser and
   uses its existing amber status dot. The old configurable glyph picker,
   `sidebar.working_indicator` (braille / ring / blink / sweep / typing), and
   `sidebar.working_indicator_color` remain **deleted**, along with

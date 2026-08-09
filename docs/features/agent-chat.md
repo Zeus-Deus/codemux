@@ -156,15 +156,15 @@ two read as one surface.
 
 - **Syntax highlighting** is Streamdown's Shiki `code` plugin
   (`@streamdown/code`), enabled via `plugins={{ code }}`. Token colors come
-  from a theme built out of the **terminal ANSI palette**
+  from a theme built out of the **shared app/system ANSI palette**
   (`src/lib/shiki-chat-theme.ts`), whose scope map mirrors the Lezer tag map
   in `src/lib/codemirror-theme.ts` — so a keyword is the same color in chat,
   the file editor, and the terminal. Keep the two maps in sync.
 - The plugin is supplied by `useChatCodePlugin()`
-  (`src/hooks/use-chat-code-plugin.ts`), a **module-level store** rather than
-  a per-component hook: a transcript mounts one `ChatMarkdown` per assistant
-  message, so a per-hook fetch would fire one `get_current_theme` IPC call and
-  one `theme-changed` listener per message. The plugin instance is memoized on
+  (`src/hooks/use-chat-code-plugin.ts`) from the module-level syntax store in
+  `src/hooks/use-theme-colors.ts`, rather than opening a native listener per
+  message. A transcript mounts one `ChatMarkdown` per assistant message. The
+  plugin instance is memoized on
   palette identity to avoid **render churn** — a fresh plugin identity on every
   streamed keystroke would propagate through the whole markdown tree. It is
   *not* about cache preservation: Shiki's highlighter and token caches live in
@@ -243,11 +243,30 @@ favicon attached to their protocol; labelled links keep it attached to the
 first character, preventing an icon from wrapping onto a line by itself.
 
 `rehypeRichExternalLinks` (`src/lib/agent-chat/rich-links.ts`) decorates the HAST
-children rather than replacing Streamdown's anchor component. This preserves
-Streamdown's safe-link confirmation behavior. `MarkdownLinkFavicon` requests a
-32px image from the same Google favicon service already used for project
-avatars, carries the full destination as its native tooltip, and falls back to
-a token-colored globe.
+children without changing the anchor destination. `ChatMarkdownLink` owns the
+safe-link interaction: an external link remains a real anchor, opens a
+shadcn/Radix confirmation dialog portalled to the document body, then delegates
+the confirmed URL to Tauri's system-browser opener. The body-level portal is a
+hard requirement because LegendList rows use paint/layout containment; a modal
+mounted beside a transcript link is clipped to its virtualized row.
+`MarkdownLinkFavicon` requests a 32px image from the same Google favicon service
+already used for project avatars and falls back to a token-colored globe.
+
+**The webview never performs a link's navigation.** `ChatMarkdown` passes its
+own `rehypePlugins`, and Streamdown treats that as a *replacement* for its
+default `raw`/`sanitize`/`harden` chain — so an href arrives at the anchor
+exactly as the agent wrote it (raw HTML still renders as text, since the `raw`
+plugin is absent too). `ChatMarkdownLink` is therefore the sanitizer: only an
+absolute `http(s)` URL (classified by `externalWebLinkHost`) is given a live
+`href`, and even that one is `preventDefault`ed on both `click` and `auxclick`
+so the *only* route to the destination is the confirmation dialog plus the
+Tauri opener. There is no `target="_blank"` — the confirmed open never uses the
+anchor, and the attribute would only buy an unconfirmed middle-click
+navigation. Every other destination — `javascript:` and other script schemes,
+`file:`, `mailto:`, absolute paths, relative paths, fragments — renders with no
+`href` at all (`data-inert-link`, destination on hover via `title`): following
+one in place would either execute in the app origin with IPC reach or unload
+the single-page app onto an app-origin path.
 
 Three cases render that globe with no network request at all: while the
 message is still streaming (a bare URL is autolinked on every frame, so
@@ -256,9 +275,9 @@ are not publicly resolvable (`localhost`, single-label names, `.local`/
 `.internal`/`.lan`/`.home`/`.corp` suffixes, and private or reserved IP
 literals — those names are never sent to the third-party favicon service), and
 for hosts whose icon recently failed to load (a five-minute TTL, capped cache).
-Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
-unchanged. The dev mock's rich transcript includes both GitHub and docs
-examples for visual verification.
+Fragment, relative, `mailto:`, `javascript:`, and other non-web links get no
+favicon decoration. The dev mock's rich transcript includes both GitHub and
+docs examples for visual verification.
 
 ### Local screenshot links in chat
 
@@ -1662,7 +1681,10 @@ presentation decision and never deletes transcript data.
 and resolvable fenced-code titles in absolute or worktree-relative form,
 including `:line[:column]` and `#L…` locations. `file-links.ts` rejects web
 schemes, version/package lookalikes, traversal outside the active worktree, and
-unsafe/ambiguous values. Without a workspace root the reference remains inert.
+unsafe/ambiguous values. A destination that does not resolve — no workspace
+root, or a path outside it — falls back to `ChatMarkdownLink`, so it gets the
+same inert treatment as any other non-web destination: no live `href`, the
+path on hover, nothing that looks clickable.
 
 Inline code is held to a stricter rule than an href: `resolveChatFileLink`
 takes `allowSpaces: false` for that source, so a span whose path portion

@@ -85,7 +85,7 @@ describe("settings single-store integration", () => {
       useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS });
 
       const s = useSyncedSettingsStore.getState().settings;
-      expect(s.appearance.theme).toBe("system");
+      expect(s.appearance.theme).toBe("default");
       expect(s.appearance.terminal_font_size).toBe(13);
       expect(s.terminal.cursor_style).toBe("bar");
       expect(s.git.default_base_branch).toBe("main");

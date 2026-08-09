@@ -17,12 +17,13 @@ Built from the `Command Palette.dc.html` design handoff.
 
 ## Current Model
 
-Three groups, always in this order, each with a sticky header carrying a match
+Four groups, always in this order, each with a sticky header carrying a match
 count:
 
 1. **Workspaces** — avatar, title, mono sub-label, live status or idle age.
 2. **Projects** — avatar, name, `~`-contracted path, active-workspace count.
-3. **Commands** — glyph, label, resolved keybind hint.
+3. **Themes** — the theme picker (below). Search-only.
+4. **Commands** — glyph, label, resolved keybind hint.
 
 The palette owns its filtering (`shouldFilter={false}` on cmdk) so the rules
 below are the app's, not the library's. All of them live in
@@ -45,6 +46,13 @@ below are the app's, not the library's. All of them live in
   commands (label + hidden `keywords` synonyms).
 - Settled and snoozed workspaces stay indexed — they are live workspace
   records; parking is visual only.
+- **Themes match by name, or by the group's own words.** `rankThemeGroup`
+  scores each row against its label alone; if nothing is named that, the
+  query is tested against `THEME_KEYWORDS` (`theme colors palette
+  appearance`) and the whole set comes back in **registry order**. Folding
+  those keywords into each row's haystack — the obvious first try — made
+  `theme` match every row with a score that differed only by name length, so
+  the list came back sorted by how short each theme was called.
 
 ### Resting order and caps
 
@@ -71,6 +79,41 @@ terminal tab · Close tab · Focus next/previous pane · Open browser · Toggle
 sidebar · Toggle right panel · Toggle preset bar · Keyboard shortcuts ·
 Settings · Regenerate MCP config.
 
+### The theme picker
+
+⌘K → "theme" is where a theme is chosen; Settings ▸ Appearance only states
+which one is on. The group shows the built-ins then any custom themes, each
+row carrying the theme's own surface + accent as two overlapping discs and
+four of its ANSI hues as squares, with `current` on the applied one. Two
+studio rows sit at the foot of the list: **Make a theme from two colors…**
+and **Paste a VS Code or shadcn theme…**, both opening the Theme Studio.
+
+**Highlighting a row previews it.** `applyTheme(theme, { persist: false })`
+writes the same runtime variables the applied theme uses, so arrowing repaints
+the shell, the diff tints, the editor and the terminal ANSI at once — the
+choice is made by looking at the app you were already working in. `persist:
+false` keeps the boot shadow pointing at the real choice, so a crash
+mid-preview reopens on the applied theme.
+
+- **Enter** promotes the preview: persists the boot shadow and writes the
+  synced `appearance.theme` field.
+- **Esc**, a click outside, or any other close reverts. Radix unmounts the
+  palette body on close, so the unmount cleanup is the single revert path.
+- Arrowing *off* the theme list reverts too — the preview follows the
+  highlighted row, not the group.
+- The footer swaps to `↑↓ preview · ⏎ keep it · esc back to <applied>` while a
+  theme is highlighted, because that is the only moment Esc does something
+  other than close.
+
+Themes are **search-only**: at rest the palette answers "where was I?", and
+six colour rows there would both bury that answer and put a live preview one
+arrow key away from someone who only meant to switch workspaces. Command mode
+(`>`) and path mode (`/`) both exclude them.
+
+Reading the highlighted row requires cmdk's **controlled** `value` — it only
+calls `onValueChange` when `value` is supplied. cmdk still drives the
+selection; the palette's state is only where the value is parked.
+
 ### Selection behavior
 
 - **Workspace** — clears the active chat draft, then activates (mirrors the
@@ -78,6 +121,7 @@ Settings · Regenerate MCP config.
 - **Project** — scopes the sidebar inbox filter to that project, then lands on
   its top-ranked workspace. "Go to this project", one keystroke.
 - **Command** — dispatches, then closes.
+- **Theme** — applies + syncs, then closes (see above).
 
 ## What Works Today
 
@@ -93,6 +137,8 @@ Settings · Regenerate MCP config.
 
 ## Current Constraints
 
+- The theme picker has no create/paste flow of its own — both rows hand off to
+  the Theme Studio modal
 - No user-defined custom commands
 - No recently-used / frecency ranking — resting order is status + activity
 - No nested submenus within groups
@@ -101,8 +147,11 @@ Settings · Regenerate MCP config.
 
 ## Important Touch Points
 
-- `src/components/overlays/command-palette.tsx` — palette UI + command catalogue
-- `src/components/overlays/command-palette-model.ts` — pure query/rank/label model
+- `src/components/overlays/command-palette.tsx` — palette UI + command catalogue + theme picker
+- `src/components/overlays/command-palette-model.ts` — pure query/rank/label model, incl. `rankThemeGroup` / `previewedThemeId`
+- `src/lib/themes.ts` — `applyTheme`, the built-in registry, custom-theme parsing
+- `src/components/settings/theme-swatches.tsx` — the row's coins and ANSI dots, shared with Settings
+- `src/stores/ui-store.ts` — `commandPaletteQuery` (the seed query Settings' Change button hands over), `themeStudio`
 - `src/components/overlays/command-palette-model.test.ts` — its unit tests
 - `src/lib/fuzzy.ts` — shared scorer
 - `src/lib/pane-status.ts` — `STATUS_LABEL` / `STATUS_TEXT_CLASS` / `STATUS_DOT_CLASS` / `statusRank`
