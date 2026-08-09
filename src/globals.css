@@ -20,6 +20,12 @@
 
 @custom-variant dark (&:is(.dark *));
 
+@keyframes rename-field-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
 @theme inline {
     /* Headings use the UI sans (DM Sans), NOT mono — per the design
      * system, mono is reserved for code-like metadata only. */

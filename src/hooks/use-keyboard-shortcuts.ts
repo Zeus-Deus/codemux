@@ -93,6 +93,10 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       ui.setOnboardingProjectDir(null);
       return true;
     }
+    if (ui.renameWorkspaceId) {
+      ui.closeRenameWorkspace();
+      return true;
+    }
     if (ui.showSettings) {
       ui.setShowSettings(false);
       return true;
@@ -210,6 +214,11 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   if (actionId === "runDevCommand") {
     runProjectDevCommand(ws.workspace_id).catch(console.error);
+    return true;
+  }
+
+  if (actionId === "renameWorkspace") {
+    ui.requestRenameWorkspace(ws.workspace_id);
     return true;
   }
 

@@ -39,6 +39,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
   { id: "runDevCommand", label: "Run dev command", category: "workspaces", defaultKeys: "Ctrl+Shift+G" },
+  { id: "renameWorkspace", label: "Rename active workspace", category: "workspaces", defaultKeys: "F2" },
   // Jump straight to the Nth visible sidebar-inbox card. Alt (not Ctrl) because
   // Ctrl+1..9 are the terminal tab switches above.
   { id: "workspaceJump1", label: "Jump to workspace 1", category: "workspaces", defaultKeys: "Alt+1" },

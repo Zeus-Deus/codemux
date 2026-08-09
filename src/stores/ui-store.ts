@@ -118,6 +118,10 @@ interface UIStore {
   pendingPresetCreate: boolean;
   showAutomations: boolean;
   showWorkspacesOverview: boolean;
+  /** Workspace targeted by the app-level rename dialog. Transient: menus
+   *  unmount as soon as their item is chosen, so the request lives here and
+   *  the dialog can stay mounted above every workspace surface. */
+  renameWorkspaceId: string | null;
   showFileSearch: boolean;
   showContentSearch: boolean;
   pendingWorkspaces: PendingWorkspace[];
@@ -194,6 +198,8 @@ interface UIStore {
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
   setShowWorkspacesOverview: (show: boolean) => void;
+  requestRenameWorkspace: (workspaceId: string) => void;
+  closeRenameWorkspace: () => void;
   setShowFileSearch: (show: boolean, target?: "editor" | "right-panel") => void;
   setShowContentSearch: (show: boolean) => void;
   addPendingWorkspace: (pw: PendingWorkspace) => void;
@@ -241,6 +247,7 @@ export const useUIStore = create<UIStore>()(
       pendingPresetCreate: false,
       showAutomations: false,
       showWorkspacesOverview: false,
+      renameWorkspaceId: null,
       showFileSearch: false,
       showContentSearch: false,
       pendingWorkspaces: [],
@@ -401,6 +408,9 @@ export const useUIStore = create<UIStore>()(
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
       setShowAutomations: (show) => set({ showAutomations: show }),
       setShowWorkspacesOverview: (show) => set({ showWorkspacesOverview: show }),
+      requestRenameWorkspace: (workspaceId) =>
+        set({ renameWorkspaceId: workspaceId }),
+      closeRenameWorkspace: () => set({ renameWorkspaceId: null }),
       setShowFileSearch: (show, target = "editor") =>
         set({ showFileSearch: show, fileSearchTarget: show ? target : "editor" }),
       setShowContentSearch: (show) => set({ showContentSearch: show }),

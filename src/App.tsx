@@ -27,6 +27,7 @@ import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useProviderCapabilitiesInit } from "@/stores/provider-capabilities-store";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
 import { getHomeDir } from "@/tauri/commands";
+import { RenameWorkspaceDialog } from "@/components/overlays/rename-workspace-dialog";
 
 function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -97,6 +98,7 @@ function App() {
   return (
     <>
       <AppShell />
+      <RenameWorkspaceDialog />
       {/* App-level, not a child of the Appearance page: both of its doors —
           the palette's create/paste rows and Appearance's Customize button —
           live on surfaces that replace each other. */}

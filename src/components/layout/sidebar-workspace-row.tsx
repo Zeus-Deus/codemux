@@ -70,7 +70,6 @@ import {
   checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
-  renameWorkspace,
   unarchiveWorkspace,
   setWorkspaceMuted,
   setWorkspacePinned,
@@ -121,6 +120,7 @@ import { toast } from "@/lib/toast";
 import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
 import { computeSnoozePresets } from "./sidebar-snooze";
+import { useUIStore } from "@/stores/ui-store";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -512,6 +512,9 @@ export function WorkspaceContextMenuItems({
    *  user previously set "Don't ask again for this host". */
   onRequestPushConfirm?: (host: HostView) => void;
 }) {
+  const requestRenameWorkspace = useUIStore(
+    (state) => state.requestRenameWorkspace,
+  );
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   // Const alias so the discriminant narrowing survives into the preset map's
   // callbacks — TypeScript drops narrowing on a (mutable) parameter binding
@@ -631,13 +634,6 @@ export function WorkspaceContextMenuItems({
     }
   };
 
-  const handleRename = () => {
-    const newTitle = window.prompt("Rename workspace", workspace.title);
-    if (newTitle && newTitle !== workspace.title) {
-      renameWorkspace(workspace.workspace_id, newTitle).catch(console.error);
-    }
-  };
-
   const handleCopyBranch = () => {
     if (workspace.git_branch) {
       navigator.clipboard.writeText(workspace.git_branch).catch(console.error);
@@ -747,7 +743,10 @@ export function WorkspaceContextMenuItems({
       <ContextMenuLabel className={cn(MENU_SECTION_LABEL, "mt-1")}>
         Actions
       </ContextMenuLabel>
-      <ContextMenuItem className={MENU_ROW} onClick={handleRename}>
+      <ContextMenuItem
+        className={MENU_ROW}
+        onClick={() => requestRenameWorkspace(workspace.workspace_id)}
+      >
         <Pencil />
         <span className="flex-1">Rename workspace</span>
         <MenuKeycap keys="F2" />
