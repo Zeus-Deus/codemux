@@ -11,10 +11,10 @@
  * Pane state lives in the deck, keyed by pane id, so switching tabs and
  * coming back preserves raw/wrap/tree exactly as you left it.
  */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Search } from "lucide-react";
 
-import { EditorPane } from "@/components/editor/EditorPane";
+import { EditorPane, isMarkdownFile } from "@/components/editor/EditorPane";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import { useEditorStore } from "@/stores/editor-store";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -28,6 +28,7 @@ export function DocPane({
   treeOpen,
   onOpenFile,
   onSearchFiles,
+  onRequestRawView,
   treeRefreshKey,
 }: {
   workspace: WorkspaceSnapshot;
@@ -37,10 +38,14 @@ export function DocPane({
   treeOpen: boolean;
   onOpenFile: (filePath: string) => void;
   onSearchFiles: () => void;
+  /** Asks the deck to show source — a source reference targeting a line in a
+   *  markdown file has nothing to reveal in the rendered view. */
+  onRequestRawView?: () => void;
   treeRefreshKey: number;
 }) {
   const tabId = docEditorTabId(workspace.workspace_id, filePath);
   const storedPath = useEditorStore((s) => s.tabs[tabId]?.filePath ?? null);
+  const revealNonce = useEditorStore((s) => s.tabs[tabId]?.revealRequest?.nonce);
 
   // The deck seeds this when it opens the pane; this is the reload path
   // (persisted pane list restored before the editor store is consulted).
@@ -49,6 +54,19 @@ export function DocPane({
       useEditorStore.getState().initTab(tabId, { filePath });
     }
   }, [tabId, filePath, storedPath]);
+
+  // A citation with a line number has to land in the source view: a markdown
+  // doc opens rendered, where the CodeMirror container is hidden and the
+  // reveal would be invisible. Flip the deck's own raw flag rather than
+  // overriding it locally, so the pane bar's rendered/source toggle keeps
+  // matching what the pane shows. The nonce guard makes this fire once per
+  // request — a remount after the reveal was consumed leaves it alone.
+  const revealedNonceRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (revealNonce == null || revealNonce === revealedNonceRef.current) return;
+    revealedNonceRef.current = revealNonce;
+    if (!raw && isMarkdownFile(filePath)) onRequestRawView?.();
+  }, [filePath, onRequestRawView, raw, revealNonce]);
 
   return (
     <div className="flex h-full min-h-0">

@@ -171,7 +171,10 @@ function InlineSourceReference({
   void _node;
   const { cwd } = useChatFileLinkContext();
   const text = plainText(children);
-  const meta = resolveChatFileLink(text, cwd);
+  // Inline code is prose, not markup: only a whitespace-free token can be a
+  // source reference, so `cat src/foo.ts` stays a code span instead of
+  // becoming a chip that resolves to `<root>/cat src/foo.ts`.
+  const meta = resolveChatFileLink(text, cwd, { allowSpaces: false });
   if (meta) return <MarkdownFileLink meta={meta}>{text}</MarkdownFileLink>;
   return (
     <code {...props} className={className} data-streamdown="inline-code">

@@ -49,6 +49,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
   const initTab = useEditorStore((s) => s.initTab);
   const setBaselineContent = useEditorStore((s) => s.setBaselineContent);
   const setDirty = useEditorStore((s) => s.setDirty);
+  const clearReveal = useEditorStore((s) => s.clearReveal);
 
   const filePath = tab?.filePath ?? null;
   const isDirty = tab?.isDirty ?? false;
@@ -238,11 +239,27 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
     });
   }, [filePath, tabId, setBaselineContent]);
 
+  // Markdown opens rendered, which hides the CodeMirror container. When this
+  // pane owns its mode (no controlled prop) it flips itself to source for a
+  // pending line reveal; the right-panel deck drives its own flag instead, so
+  // its rendered/source toggle keeps matching the pane.
+  useEffect(() => {
+    if (viewModeProp == null && isMd && revealRequest) setViewMode("raw");
+  }, [isMd, revealRequest, viewModeProp]);
+
   // A source-reference click can target an already-open doc pane. Requests
-  // carry a nonce so clicking the same citation twice still re-centres it.
+  // carry a nonce so clicking the same citation twice still re-centres it,
+  // and each is consumed once applied: `loadedFilePath` flips to the current
+  // file on every mount, and the right panel mounts only the active pane, so
+  // an unconsumed request would replay its cursor/scroll/focus reset on every
+  // tab switch back.
   useEffect(() => {
     const view = viewRef.current;
     if (!view || !revealRequest || loadedFilePath !== filePath) return;
+    // A rendered-markdown pane keeps the CodeMirror container hidden, so a
+    // scroll dispatched now would land nowhere. Hold the request instead —
+    // the doc pane flips to raw whenever a line is requested.
+    if (isMd && viewMode !== "raw") return;
     const lineNumber = Math.min(
       Math.max(1, revealRequest.line),
       view.state.doc.lines,
@@ -255,7 +272,16 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
       effects: EditorView.scrollIntoView(position, { y: "center" }),
     });
     view.focus();
-  }, [filePath, loadedFilePath, revealRequest]);
+    clearReveal(tabId, revealRequest.nonce);
+  }, [
+    clearReveal,
+    filePath,
+    isMd,
+    loadedFilePath,
+    revealRequest,
+    tabId,
+    viewMode,
+  ]);
 
   // When switching back to raw, sync content from store in case it changed
   useEffect(() => {

@@ -23,6 +23,7 @@ interface EditorStore {
   setBaselineContent: (tabId: string, content: string) => void;
   setDirty: (tabId: string, dirty: boolean) => void;
   requestReveal: (tabId: string, line: number, column?: number) => void;
+  clearReveal: (tabId: string, nonce: number) => void;
   removeTab: (tabId: string) => void;
 }
 
@@ -91,6 +92,24 @@ export const useEditorStore = create<EditorStore>()(
               },
             },
           };
+        }),
+
+      /**
+       * Consume the request a pane just applied. Without this the request
+       * sticks around and replays on every remount of the pane — the right
+       * panel mounts only the active pane, so every tab switch would reset
+       * the cursor and re-centre the scroll. The nonce is matched so a newer
+       * citation that landed between the reveal and this call survives.
+       */
+      clearReveal: (tabId, nonce) =>
+        set((s) => {
+          const current = s.tabs[tabId];
+          if (!current?.revealRequest || current.revealRequest.nonce !== nonce) {
+            return s;
+          }
+          const { revealRequest: _consumed, ...rest } = current;
+          void _consumed;
+          return { tabs: { ...s.tabs, [tabId]: rest } };
         }),
 
       removeTab: (tabId) =>

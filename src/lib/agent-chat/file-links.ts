@@ -97,9 +97,22 @@ function parseLocation(value: string): {
   return { path, line, column };
 }
 
+export interface ResolveChatFileLinkOptions {
+  /**
+   * Whether the path portion may contain unencoded whitespace. Href sources
+   * keep this on (a legitimate `%20` decodes into a space); inline-code spans
+   * turn it off, because prose like `cargo check --manifest-path
+   * src-tauri/Cargo.toml` or `cat src/foo.ts` ends in a file-like segment
+   * without being a file reference. A plain inline-code token is preferable
+   * to a confident chip that opens the wrong file. Defaults to `true`.
+   */
+  allowSpaces?: boolean;
+}
+
 export function resolveChatFileLink(
   candidate: string,
   cwd?: string | null,
+  options: ResolveChatFileLinkOptions = {},
 ): ChatFileLinkMeta | null {
   if (!cwd || !candidate || candidate.includes("\n") || candidate.includes("\0")) {
     return null;
@@ -116,6 +129,7 @@ export function resolveChatFileLink(
   if (decoded.includes("?") || decoded.includes("`")) return null;
 
   const location = parseLocation(decoded);
+  if (options.allowSpaces === false && /\s/.test(location.path)) return null;
   if (!looksLikeFile(location.path)) return null;
   const root = normalizePath(cwd);
   const resolved = isAbsolute(location.path)

@@ -420,6 +420,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
       })),
     [],
   );
+  const showActiveDocSource = useCallback(() => {
+    if (activePane) patchDocView(activePane, { raw: true });
+  }, [activePane, patchDocView]);
 
   // ── Deck actions ──
   // The file the tree draws as selected. The tree lost its size column and
@@ -822,6 +825,7 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
             treeOpen={docView.tree}
             onOpenFile={openDocPane}
             onSearchFiles={handleOpenFile}
+            onRequestRawView={showActiveDocSource}
             treeRefreshKey={treeRefreshKey}
           />
         ) : activePane === "files" ? (

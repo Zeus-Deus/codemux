@@ -1664,6 +1664,14 @@ including `:line[:column]` and `#L…` locations. `file-links.ts` rejects web
 schemes, version/package lookalikes, traversal outside the active worktree, and
 unsafe/ambiguous values. Without a workspace root the reference remains inert.
 
+Inline code is held to a stricter rule than an href: `resolveChatFileLink`
+takes `allowSpaces: false` for that source, so a span whose path portion
+carries unencoded whitespace never becomes a chip. Agents write commands in
+code spans constantly — `cargo check --manifest-path src-tauri/Cargo.toml`,
+`cat src/foo.ts` — and every one of those ends in a file-like token. A plain
+inline-code token is preferable to a confident chip that opens the wrong file.
+Hrefs keep spaces allowed because a legitimate `%20` decodes into one.
+
 Recognized references render through `MarkdownFileLink` with the existing
 language/file icon and resolved-path tooltip. The same component is used by
 Read/Grep/Edit details and diff headers. Clicking calls the shared
@@ -1671,6 +1679,22 @@ Read/Grep/Edit details and diff headers. Clicking calls the shared
 pane; a transient nonce-bearing editor request then focuses and centers the
 cited CodeMirror line/column. The pane id remains path-only, so repeated clicks
 reuse one syntax-highlighted doc pane while still re-running reveal.
+
+Two rules keep that reveal honest:
+
+- **It is consumed once applied.** `EditorPane` calls `clearReveal(tabId,
+  nonce)` right after dispatching the scroll, and the store only drops a
+  request whose nonce still matches (a citation that landed in between
+  survives). The right panel mounts only the *active* pane, so a doc pane
+  remounts on every tab switch and `loadedFilePath` flips back to the current
+  file each time — an unconsumed request would replay, resetting the cursor,
+  re-centring the scroll you had moved, and stealing focus.
+- **A line always lands in source.** Markdown doc panes open rendered, where
+  the CodeMirror container is hidden, so `DocPane` asks the deck to flip its
+  `raw` flag when a line-bearing request arrives (keeping the pane bar's
+  rendered/source toggle in sync with what the pane shows), and `EditorPane`
+  holds the reveal until raw is actually on. A pane that owns its own view
+  mode flips itself.
 
 `ChatTranscript` is a thin shell that derives `showThinking`, forwards
 the optional `sessionStartedAt` (top session-start divider), and sizes

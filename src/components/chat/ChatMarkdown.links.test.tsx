@@ -251,6 +251,23 @@ describe("ChatMarkdown source references", () => {
     );
   });
 
+  it.each([
+    "cargo check --manifest-path src-tauri/Cargo.toml",
+    "npx vitest run src/components/chat/ChatMarkdown.links.test.tsx",
+    "cat src/foo.ts",
+  ])("leaves the command span `%s` as plain inline code", (command) => {
+    const { container, queryByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {`Run \`${command}\` first.`}
+      </ChatMarkdown>,
+    );
+
+    expect(queryByRole("button")).toBeNull();
+    expect(container.querySelector('code[data-streamdown="inline-code"]')).toHaveTextContent(
+      command,
+    );
+  });
+
   it("makes a resolvable fenced-code title open the same source pane", () => {
     const { getByRole } = render(
       <TooltipProvider>

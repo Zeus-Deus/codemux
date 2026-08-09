@@ -38,4 +38,31 @@ describe("resolveChatFileLink", () => {
   ])("rejects non-worktree target %s", (input) => {
     expect(resolveChatFileLink(input, cwd)).toBeNull();
   });
+
+  describe("allowSpaces: false (inline-code sources)", () => {
+    it.each([
+      "cargo check --manifest-path src-tauri/Cargo.toml",
+      "npx vitest run src/components/chat/ChatMarkdown.links.test.tsx",
+      "cat src/foo.ts",
+      "src/My File.ts",
+      "src/My%20File.ts:11",
+    ])("rejects the command-shaped span %s", (input) => {
+      expect(resolveChatFileLink(input, cwd, { allowSpaces: false })).toBeNull();
+    });
+
+    it("still resolves a bare whitespace-free reference", () => {
+      expect(
+        resolveChatFileLink("src/components/Chat.tsx:42", cwd, {
+          allowSpaces: false,
+        }),
+      ).toMatchObject({ filePath: "/work/codemux/src/components/Chat.tsx", line: 42 });
+    });
+
+    it("keeps percent-encoded spaces resolvable for href sources", () => {
+      expect(resolveChatFileLink("src/My%20File.ts:11", cwd)).toMatchObject({
+        filePath: "/work/codemux/src/My File.ts",
+        line: 11,
+      });
+    });
+  });
 });
