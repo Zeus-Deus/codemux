@@ -149,6 +149,13 @@ iroh = "1"
 # rpassword is the small, widely-used crate for exactly that and pulls in
 # nothing beyond libc / windows-sys, both already in the tree.
 rpassword = "7"
+# ZIP reader for the VS Code Marketplace theme import (`vscode_marketplace.rs`).
+# A `.vsix` is a plain deflate ZIP, so the optional bzip2/lzma/zstd/AES codecs
+# are switched off — `deflate-flate2` reuses the `flate2` crate already in the
+# tree, keeping this a pure-Rust addition with no new C toolchain deps.
+# Pinned to the 4.x line so it unifies with the copy tauri-plugin-updater
+# already pulls in on Windows/macOS instead of adding a second zip build.
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

@@ -182,6 +182,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const settledAt = useSidebarDensityStore(
     (s) => s.settledAt[workspace.workspace_id],
   );
+  const statusMark = useSidebarDensityStore(
+    (s) => s.statusSince[workspace.workspace_id],
+  );
 
   // Radix portals the open Snooze menu out of this card, so once it opens the
   // pointer is no longer over the card and focus no longer sits inside it —
@@ -288,6 +291,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     (workspace.git_additions > 0 || workspace.git_deletions > 0);
   const idleTime =
     settledAt != null ? formatElapsed(now - settledAt) : null;
+  const workingTime =
+    isWorking && statusMark?.status === "working"
+      ? formatElapsed(now - statusMark.at)
+      : null;
 
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -359,9 +366,23 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         <span className="size-1.5 rounded-full bg-status-monitoring" />
       )}
       {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
-      {isWorking
-        ? "Working"
-        : isNeeds
+      {isWorking ? (
+        <>
+          {/* Keep only the stable label in the live region. The elapsed value
+              changes on every coarse clock tick and would otherwise make a
+              screen reader repeatedly announce this card while the user is
+              working elsewhere. */}
+          <span role="status">Working</span>
+          {workingTime && (
+            <span
+              aria-hidden="true"
+              className="font-mono font-medium tabular-nums"
+            >
+              {workingTime}
+            </span>
+          )}
+        </>
+      ) : isNeeds
           ? "Needs you"
           : isMonitoring
             ? "Monitoring"

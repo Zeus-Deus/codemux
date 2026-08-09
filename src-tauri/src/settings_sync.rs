@@ -55,6 +55,10 @@ pub struct BrowserSettings {
 pub struct AppearanceSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Versioned custom theme payloads. The frontend owns the extensible role
+    /// schema; raw JSON keeps settings forward-compatible across clients.
+    #[serde(default)]
+    pub custom_themes: Vec<serde_json::Value>,
     #[serde(default)]
     pub shell_font: Option<String>,
     #[serde(default = "default_font_size")]
@@ -68,6 +72,7 @@ impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            custom_themes: Vec::new(),
             shell_font: None,
             terminal_font_size: default_font_size(),
             show_resource_monitor: true,
@@ -211,7 +216,7 @@ impl Default for SessionRestoreSettings {
 }
 
 fn default_theme() -> String {
-    "system".into()
+    "default".into()
 }
 fn default_font_size() -> f32 {
     13.0
@@ -463,7 +468,7 @@ mod tests {
     #[test]
     fn default_settings_have_expected_values() {
         let s = UserSettings::default();
-        assert_eq!(s.appearance.theme, "system");
+        assert_eq!(s.appearance.theme, "default");
         assert_eq!(s.appearance.terminal_font_size, 13.0);
         assert!(s.appearance.shell_font.is_none());
         assert!(s.editor.default_ide.is_none());
@@ -557,6 +562,7 @@ mod tests {
         let s = UserSettings {
             appearance: AppearanceSettings {
                 theme: "dark".into(),
+                custom_themes: Vec::new(),
                 shell_font: Some("Fira Code".into()),
                 terminal_font_size: 18.5,
                 show_resource_monitor: false,
@@ -751,7 +757,7 @@ mod tests {
 
         // User B signs in — cache should be empty, fallback is defaults
         let user_b_settings = load_cache().unwrap_or_default();
-        assert_eq!(user_b_settings.appearance.theme, "system");
+        assert_eq!(user_b_settings.appearance.theme, "default");
         assert_eq!(user_b_settings.appearance.terminal_font_size, 13.0);
         assert!(user_b_settings.notifications.sound_enabled);
         assert!(!is_dirty());
@@ -874,7 +880,7 @@ mod tests {
 
         // Should not crash — returns server settings as fallback
         let result = sync_settings("test-token").await.unwrap();
-        assert_eq!(result.appearance.theme, "system"); // server defaults returned
+        assert_eq!(result.appearance.theme, "default"); // server defaults returned
 
         // push_settings got a non-success status which returns Err,
         // but the error path in sync_settings catches it and falls through

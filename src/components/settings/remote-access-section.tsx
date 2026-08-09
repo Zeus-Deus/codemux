@@ -372,7 +372,7 @@ function PairingPanel({
                 role="img"
               />
             ) : (
-              <span className="text-[11px] text-neutral-400">No endpoint</span>
+              <span className="text-[11px] text-muted-foreground">No endpoint</span>
             )}
           </div>
         </div>

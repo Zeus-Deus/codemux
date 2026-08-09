@@ -227,14 +227,17 @@ predicate — see `docs/features/gui-chrome.md`) or the equivalent per-workspace
 flag+type check where a specific (possibly non-active) workspace id is
 already in hand:
 
-- **Inline conversation chip** (`src/components/chat/BackgroundBrowserChip.tsx`)
+- **Inline conversation event** (`src/components/chat/BackgroundBrowserChip.tsx`)
   — `MessageList` cross-references `agent_browser_sessions` for the pane's
   workspace (a session that `is_active` and has no `pane_id`) and appends
-  the chip as a derived row after the transcript (not a reducer
-  `ChatViewItem`). Globe icon chip with a blinking amber dot, "Browser
-  opened in background" + `LIVE` badge while active, the current URL
-  (`agent_browser_sessions[].current_url`, already tracked — no new field
-  needed), and a "View" affordance. Click opens the peek overlay.
+  the event as a derived row after the transcript (not a reducer
+  `ChatViewItem`). Canvas-6 Turn 2 uses the same quiet 32px grammar as the
+  subagent work log: globe + "Opened the browser" + current URL +
+  `· navigating` + `View ›`, with no card border or LIVE badge. When it
+  immediately follows a subagent stretch it shares that stretch's tiny
+  `work log` label instead of repeating it. Click opens the peek overlay.
+  This transcript row records *when* the browser opened; the terminal/context
+  indicator below remains the live status surface.
 - **Terminal-header indicator**
   (`src/components/browser/background-browser-indicator.tsx`, mounted by
   `PaneNode.tsx`) — the active terminal shows a compact sky-tinted Browser

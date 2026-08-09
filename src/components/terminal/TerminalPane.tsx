@@ -1,6 +1,5 @@
 import { useEffect, useRef, useCallback, memo } from "react";
 import { Terminal } from "@xterm/xterm";
-import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -49,8 +48,8 @@ import {
   parseOsc7,
 } from "@/stores/terminal-cwd-store";
 import { onTerminalStatus } from "@/tauri/events";
-// TODO: re-enable as "system theme" option in settings
-// import { useThemeColors } from "@/hooks/use-theme-colors";
+import { useSyntaxThemeColors } from "@/hooks/use-theme-colors";
+import { themeColorsToXtermTheme } from "@/lib/xterm-theme";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import type { TerminalStatusPayload } from "@/tauri/types";
 
@@ -61,67 +60,6 @@ interface Props {
   visible: boolean;
   title: string;
 }
-
-// Static ANSI palette — Ember warm-tinted colors
-const ANSI_COLORS = {
-  black: "#151110",
-  red: "#dc6b6b",
-  green: "#7ec699",
-  yellow: "#e5c07b",
-  blue: "#61afef",
-  magenta: "#c678dd",
-  cyan: "#56b6c2",
-  white: "#eae8e6",
-  brightBlack: "#5c5856",
-  brightRed: "#e88888",
-  brightGreen: "#98d1a8",
-  brightYellow: "#ecd08f",
-  brightBlue: "#7ec0f5",
-  brightMagenta: "#d494e6",
-  brightCyan: "#73c7d3",
-  brightWhite: "#ffffff",
-};
-
-function resolveOklch(value: string): string {
-  const el = document.createElement("div");
-  el.style.color = value;
-  document.body.appendChild(el);
-  const rgb = getComputedStyle(el).color;
-  document.body.removeChild(el);
-  return rgb;
-}
-
-function getCSSVar(name: string): string {
-  const raw = getComputedStyle(document.documentElement)
-    .getPropertyValue(name)
-    .trim();
-  if (!raw) return "";
-  return resolveOklch(raw);
-}
-
-function buildThemeFromCSS(): ITheme {
-  return {
-    background: getCSSVar("--background"),
-    foreground: getCSSVar("--foreground"),
-    cursor: getCSSVar("--sidebar-primary"),
-    cursorAccent: getCSSVar("--background"),
-    selectionBackground: getCSSVar("--accent"),
-    selectionForeground: getCSSVar("--accent-foreground"),
-    ...ANSI_COLORS,
-  };
-}
-
-// TODO: re-enable as "system theme" option in settings
-// function buildXtermTheme(t: ThemeColors): ITheme {
-//   return {
-//     background: t.background, foreground: t.foreground, cursor: t.cursor,
-//     selectionBackground: t.selection_background, selectionForeground: t.selection_foreground,
-//     black: t.color0, red: t.color1, green: t.color2, yellow: t.color3,
-//     blue: t.color4, magenta: t.color5, cyan: t.color6, white: t.color7,
-//     brightBlack: t.color8, brightRed: t.color9, brightGreen: t.color10, brightYellow: t.color11,
-//     brightBlue: t.color12, brightMagenta: t.color13, brightCyan: t.color14, brightWhite: t.color15,
-//   };
-// }
 
 // How long the status overlay takes to fade out once the session is alive
 // (state → ready, or first output on a migrating pane). Must match the
@@ -149,8 +87,7 @@ function isAltScreen(t: Terminal): boolean {
 // so the exported pane skips re-render on backend ticks that don't change them.
 // Export-only wrapper: the component body below is unchanged.
 export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
-  // TODO: re-enable as "system theme" option in settings
-  // const { theme, shellAppearance } = useThemeColors();
+  const syntaxTheme = useSyntaxThemeColors();
 
   // Refs for mutable state that persists across renders
   const shellRef = useRef<HTMLDivElement>(null);
@@ -334,7 +271,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Create terminal ──
     const term = new Terminal({
       fontFamily: getTerminalFontFamily(),
-      theme: buildThemeFromCSS(),
+      theme: themeColorsToXtermTheme(syntaxTheme),
       convertEol: false,
       cursorBlink: true,
       cursorWidth: 2,
@@ -1108,33 +1045,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // TODO: re-enable as "system theme" option in settings
-  // useEffect(() => {
-  //   if (termRef.current) {
-  //     termRef.current.options.theme = buildXtermTheme(theme);
-  //   }
-  // }, [theme]);
-  //
-  // useEffect(() => {
-  //   if (termRef.current) {
-  //     termRef.current.options.fontFamily = shellAppearance.font_family || "monospace";
-  //     fitAddonRef.current?.fit();
-  //   }
-  // }, [shellAppearance]);
-
-  // ── Re-read CSS variables when theme class/style changes ──
+  // One palette drives xterm, Shiki, and CodeMirror. App-theme changes and
+  // desktop-theme events both flow through useSyntaxThemeColors.
   useEffect(() => {
-    const observer = new MutationObserver(() => {
-      if (termRef.current) {
-        termRef.current.options.theme = buildThemeFromCSS();
-      }
-    });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class", "style"],
-    });
-    return () => observer.disconnect();
-  }, []);
+    if (termRef.current) termRef.current.options.theme = themeColorsToXtermTheme(syntaxTheme);
+  }, [syntaxTheme]);
 
   // ── Focus management ──
   // Depends on `sessionId` as well as `focused`: when a new tab is created

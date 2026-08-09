@@ -1,8 +1,10 @@
 import type {
   ChatViewItem,
   ReasoningItem,
+  SubagentRunItem,
   ToolCallItem,
 } from "@/lib/agent-chat/types";
+import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
 
@@ -22,7 +24,8 @@ export type ActivityStep = ReasoningItem | ToolCallItem;
 
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
-  | { kind: "activity"; items: ActivityStep[]; working: boolean };
+  | { kind: "activity"; items: ActivityStep[]; working: boolean }
+  | { kind: "subagent_stretch"; runs: SubagentRunItem[] };
 
 export interface TranscriptSlot {
   /** Stable React key + virtual-list navigation id. */
@@ -42,12 +45,28 @@ export interface TranscriptSlot {
 
 /**
  * Minimum steps a SETTLED run needs to roll up into an Activity block. A
- * lone completed tool call (or a lone thought) keeps rendering as its own
- * card so a single action never hides behind a summary header. While the
- * run is the live WORKING tail this drops to 1 — a single running tool
- * should still surface as the "Working" line.
+ * lone completed action (or a lone thought) keeps rendering as its own card
+ * so a single action never hides behind a summary header. Quiet successful
+ * observation calls are the exception below. While the run is the live
+ * WORKING tail this drops to 1 — a single running tool still surfaces as the
+ * "Working" line.
  */
 const GROUP_MIN = 2;
+
+/** Canvas-6 Turn 2: a successful observational call carries no signal on its
+ * own. Bursts still roll up into one Activity line; errors, in-flight calls,
+ * approvals, and image-bearing reads always remain visible. */
+function isQuietObservationalTool(step: ActivityStep): boolean {
+  return (
+    step.kind === "tool_call" &&
+    step.status === "done" &&
+    step.approval_request_id == null &&
+    (step.tool_name === "Read" ||
+      step.tool_name === "Grep" ||
+      step.tool_name === "Glob") &&
+    !hasToolResultImages(step.result_content)
+  );
+}
 
 /**
  * A tool call that folds into an Activity block. Unlike the old
@@ -58,9 +77,9 @@ const GROUP_MIN = 2;
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
- * (`subagent_run` orchestration cards are `kind: "subagent_run"`, not
- * `tool_call`, so they never satisfy this predicate — each renders as its
- * own standalone full-width slot and breaks any surrounding run.)
+ * (`subagent_run` orchestration events are `kind: "subagent_run"`, not
+ * `tool_call`, so they never satisfy this predicate. Contiguous spawn groups
+ * are merged later into one work-log stretch.)
  */
 function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
@@ -104,6 +123,10 @@ export function buildTranscriptSlots(
   // relaxes GROUP_MIN to 1 for a single live step.
   const flush = (isTail: boolean) => {
     if (run.length === 0) return;
+    if (run.length === 1 && isQuietObservationalTool(run[0])) {
+      run = [];
+      return;
+    }
     const working = streaming && isTail;
     const hasTool = run.some((s) => s.kind === "tool_call");
     // A pure-reasoning run never becomes an Activity block: a lone thought
@@ -133,6 +156,19 @@ export function buildTranscriptSlots(
     }
     // A rendered standalone item follows this run → it is not the tail.
     flush(false);
+    if (item.kind === "subagent_run") {
+      // Turn 2: consecutive spawn groups are one transcript event even when
+      // the reducer stores one canonical run per turn. Non-error turn-ended
+      // markers were already dropped above, so they do not split a stretch;
+      // prose, a visible tool/result, or any other rendered row does.
+      const tail = bodies[bodies.length - 1];
+      if (tail?.kind === "subagent_stretch") {
+        tail.runs.push(item);
+      } else {
+        bodies.push({ kind: "subagent_stretch", runs: [item] });
+      }
+      continue;
+    }
     bodies.push({ kind: "item", item });
   }
   flush(true);
@@ -220,6 +256,13 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
     }
     return true;
   }
+  if (a.kind === "subagent_stretch" && b.kind === "subagent_stretch") {
+    if (a.runs.length !== b.runs.length) return false;
+    for (let i = 0; i < a.runs.length; i++) {
+      if (a.runs[i] !== b.runs[i]) return false;
+    }
+    return true;
+  }
   return false;
 }
 
@@ -233,6 +276,12 @@ function slotIdentity(body: SlotBody): {
     // grows and as it transitions working → settled (a streaming token then
     // mutates one memoized row and the scroller pin holds).
     const id = `run:${body.items[0].id}`;
+    return { key: id, messageId: id, scrollAnchor: false };
+  }
+  if (body.kind === "subagent_stretch") {
+    // The first canonical run anchors the visual stretch. Appending another
+    // turn updates this row in place instead of remounting it in LegendList.
+    const id = `subagent-stretch:${body.runs[0].id}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }
   const { item } = body;

@@ -1,10 +1,19 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { getCurrentTheme, getShellAppearance } from "@/tauri/commands";
 import { onThemeChanged } from "@/tauri/events";
 import type { ThemeColors, ShellAppearance } from "@/tauri/types";
-import { useTauriEvent } from "./use-tauri-event";
+import {
+  getActiveTheme,
+  subscribeActiveTheme,
+  themeToSyntaxColors,
+  type ThemeDefinition,
+} from "@/lib/themes";
+import {
+  getTerminalThemeMode,
+  subscribeTerminalThemeMode,
+} from "@/lib/terminal-theme-mode";
 
-const fallbackTheme: ThemeColors = {
+export const fallbackTheme: ThemeColors = {
   accent: "#7aa2f7",
   cursor: "#c0caf5",
   foreground: "#c0caf5",
@@ -29,24 +38,87 @@ const fallbackTheme: ThemeColors = {
   color15: "#c0caf5",
 };
 
-export function useThemeColors() {
-  const [theme, setTheme] = useState<ThemeColors>(fallbackTheme);
-  const [shellAppearance, setShellAppearance] = useState<ShellAppearance>({
-    font_family: "monospace",
-  });
+let systemTheme = fallbackTheme;
+let shellAppearance: ShellAppearance = { font_family: "monospace" };
+let started = false;
+const systemListeners = new Set<() => void>();
+const shellListeners = new Set<() => void>();
 
-  useEffect(() => {
-    getCurrentTheme()
-      .then(setTheme)
-      .catch(() => setTheme(fallbackTheme));
-    getShellAppearance()
-      .then(setShellAppearance)
-      .catch(() => {});
-  }, []);
-
-  useTauriEvent(onThemeChanged, setTheme, []);
-
-  return { theme, shellAppearance };
+function notify(listeners: Set<() => void>) {
+  for (const listener of listeners) listener();
 }
 
-export { fallbackTheme };
+function startSystemThemeStore() {
+  if (started) return;
+  started = true;
+  if (typeof getCurrentTheme === "function") getCurrentTheme().then((theme) => {
+    systemTheme = theme;
+    notify(systemListeners);
+  }).catch(() => {});
+  if (typeof getShellAppearance === "function") getShellAppearance().then((appearance) => {
+    shellAppearance = appearance;
+    notify(shellListeners);
+  }).catch(() => {});
+  if (typeof onThemeChanged === "function") onThemeChanged((theme) => {
+    systemTheme = theme;
+    notify(systemListeners);
+  }).catch(() => {});
+}
+
+export function subscribeSystemTheme(listener: () => void): () => void {
+  systemListeners.add(listener);
+  startSystemThemeStore();
+  return () => systemListeners.delete(listener);
+}
+
+export function getSystemThemeSnapshot(): ThemeColors {
+  return systemTheme;
+}
+
+function subscribeShellAppearance(listener: () => void): () => void {
+  shellListeners.add(listener);
+  startSystemThemeStore();
+  return () => shellListeners.delete(listener);
+}
+
+let cachedActiveTheme: ThemeDefinition | null = null;
+let cachedAppSyntax = fallbackTheme;
+
+function appSyntaxSnapshot(): ThemeColors {
+  const active = getActiveTheme();
+  if (active !== cachedActiveTheme) {
+    cachedActiveTheme = active;
+    cachedAppSyntax = themeToSyntaxColors(active);
+  }
+  return cachedAppSyntax;
+}
+
+export function getSyntaxThemeSnapshot(): ThemeColors {
+  return getTerminalThemeMode() === "system"
+    ? systemTheme
+    : appSyntaxSnapshot();
+}
+
+export function subscribeSyntaxTheme(listener: () => void): () => void {
+  startSystemThemeStore();
+  const offSystem = subscribeSystemTheme(listener);
+  const offActive = subscribeActiveTheme(listener);
+  const offSettings = subscribeTerminalThemeMode(listener);
+  return () => {
+    offSystem();
+    offActive();
+    offSettings();
+  };
+}
+
+export function useThemeColors() {
+  const theme = useSyncExternalStore(subscribeSystemTheme, getSystemThemeSnapshot, getSystemThemeSnapshot);
+  const appearance = useSyncExternalStore(subscribeShellAppearance, () => shellAppearance, () => shellAppearance);
+  return { theme, shellAppearance: appearance };
+}
+
+/** ANSI/syntax palette selected by Settings → Terminal: the active app theme
+ * or the desktop/Omarchy theme. Shared by xterm, Shiki, and CodeMirror. */
+export function useSyntaxThemeColors(): ThemeColors {
+  return useSyncExternalStore(subscribeSyntaxTheme, getSyntaxThemeSnapshot, getSyntaxThemeSnapshot);
+}

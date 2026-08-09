@@ -1,83 +1,22 @@
 /**
- * DISABLED — applies theme to an empty cache. The persistent terminal cache
- * in `terminal-cache.ts` is not wired into the live app (see the banner there),
- * so `applyThemeToAllTerminals` iterates an empty Map and this is a no-op. The
- * live theme source of truth is TerminalPane's own per-mount MutationObserver.
- * Kept wired in App.tsx alongside the cache for a possible future revival.
- *
- * App-level theme MutationObserver for the terminal cache.
- *
- * Theme changes (light/dark, accent updates) are signalled by class/style
- * mutations on document.documentElement. This hook installs ONE observer
- * that walks every cached xterm and updates its theme — including panes
- * that are currently unmounted/parked. Without it, switching theme while
- * a workspace pane is unmounted leaves it stuck on the old palette.
- *
- * The TerminalPane component still has a per-mount observer for the live
- * theme of the visible pane (cheap belt-and-suspenders), but this hook is
- * the source of truth for cached-but-unmounted panes.
+ * The persistent terminal cache is currently disabled, so this applies to an
+ * empty cache. Keeping the subscription wired means a future cache revival
+ * automatically follows the same app/system syntax-theme source as live panes.
  */
 import { useEffect } from "react";
-import type { ITheme } from "@xterm/xterm";
 import { applyThemeToAllTerminals } from "@/components/terminal/terminal-cache";
-
-const ANSI_COLORS = {
-  black: "#151110",
-  red: "#dc6b6b",
-  green: "#7ec699",
-  yellow: "#e5c07b",
-  blue: "#61afef",
-  magenta: "#c678dd",
-  cyan: "#56b6c2",
-  white: "#eae8e6",
-  brightBlack: "#5c5856",
-  brightRed: "#e88888",
-  brightGreen: "#98d1a8",
-  brightYellow: "#ecd08f",
-  brightBlue: "#7ec0f5",
-  brightMagenta: "#d494e6",
-  brightCyan: "#73c7d3",
-  brightWhite: "#ffffff",
-};
-
-function resolveOklch(value: string): string {
-  const el = document.createElement("div");
-  el.style.color = value;
-  document.body.appendChild(el);
-  const rgb = getComputedStyle(el).color;
-  document.body.removeChild(el);
-  return rgb;
-}
-
-function getCSSVar(name: string): string {
-  const raw = getComputedStyle(document.documentElement)
-    .getPropertyValue(name)
-    .trim();
-  if (!raw) return "";
-  return resolveOklch(raw);
-}
-
-function buildThemeFromCSS(): ITheme {
-  return {
-    background: getCSSVar("--background"),
-    foreground: getCSSVar("--foreground"),
-    cursor: getCSSVar("--sidebar-primary"),
-    cursorAccent: getCSSVar("--background"),
-    selectionBackground: getCSSVar("--accent"),
-    selectionForeground: getCSSVar("--accent-foreground"),
-    ...ANSI_COLORS,
-  };
-}
+import {
+  getSyntaxThemeSnapshot,
+  subscribeSyntaxTheme,
+} from "@/hooks/use-theme-colors";
+import { themeColorsToXtermTheme } from "@/lib/xterm-theme";
 
 export function useTerminalThemeSync() {
   useEffect(() => {
-    const observer = new MutationObserver(() => {
-      applyThemeToAllTerminals(buildThemeFromCSS());
-    });
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class", "style"],
-    });
-    return () => observer.disconnect();
+    const apply = () => {
+      applyThemeToAllTerminals(themeColorsToXtermTheme(getSyntaxThemeSnapshot()));
+    };
+    apply();
+    return subscribeSyntaxTheme(apply);
   }, []);
 }
