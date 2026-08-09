@@ -20,8 +20,8 @@ export const ORB_FALLBACK_STATE: OrbState = "working";
 /**
  * The live signal a surface can offer. Every field is optional — a surface
  * that only knows "something is running" passes `{}` and gets the neutral
- * working orb, which is exactly right for the sidebar (see
- * `docs/features/sidebar.md`: `pane_statuses` carries no tool name).
+ * working orb, which is exactly right for the sidebar because
+ * `pane_statuses` carries no tool name.
  */
 export interface OrbActivity {
   /** Name of the tool currently running, if the surface can see one. */

@@ -1123,9 +1123,8 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
 
             // Resolve the CLI session name to use for agent-browser commands.
             let cli_session_name = if !workspace_id.is_empty() {
-                // P2 from docs/plans/browser-stream-fix.md: allocate the
-                // stream port keyed by `cli_session_name` directly, not
-                // by `workspace_id` plus an `ensure_port` alias.
+                // Allocate the stream port keyed by `cli_session_name`
+                // directly, not by `workspace_id` plus an `ensure_port` alias.
                 //
                 // The old flow allocated against `workspace_id`, then
                 // mirrored the port into the manager under
@@ -1141,9 +1140,8 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 // port (the previously-stored value, or
                 // `DEFAULT_STREAM_PORT` for the very first call) so we
                 // know the canonical `cli_session_name`, then allocate
-                // for real and write the actual port back into state so
-                // the frontend's reactive `stream_url` reflects reality
-                // (P6).
+                // for real and write the actual port back into state so the
+                // frontend's reactive `stream_url` reflects reality.
                 let existing_port =
                     state.agent_browser_stream_port_for_workspace(&workspace_id);
                 let placeholder_port = existing_port
@@ -1183,11 +1181,9 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                     crate::state::schedule_emit_app_state(&app);
                 }
 
-                // GUI-mode background browsing (docs/features/browser.md
-                // "Background browser in GUI mode"): when the Agent Chat
-                // GUI beta is on, the
-                // agent's browser session must stay detached — the
-                // frontend renders it as an inline chip + context-bar
+                // In GUI-mode background browsing, when the Agent Chat GUI
+                // beta is on, the agent's browser session must stay detached.
+                // The frontend renders it as an inline chip + context-bar
                 // indicator instead of splitting the chat into a pane.
                 // The flag-off path keeps today's split-pane behavior.
                 let gui_background_mode = observability.agent_chat_enabled();
@@ -1308,8 +1304,7 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             };
 
             // Get the port for this session (already allocated above or in start_stream).
-            // P2 from docs/plans/browser-stream-fix.md removed the
-            // `workspace_id` alias the manager used to register, so
+            // The manager no longer registers a `workspace_id` alias, so
             // `cli_session_name` is the only key the manager knows.
             let vision_port = agent_browser.get_port(&cli_session_name).await
                 .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
@@ -1717,9 +1712,8 @@ fn filter_ports_by_workspace<'a>(
 /// Decide whether `browser_automation` should auto-create (or reconnect) a
 /// split browser pane for the agent's browser session.
 ///
-/// Extracted as a small pure function so the GUI-mode background-browsing
-/// gate (docs/features/browser.md "Background browser in GUI mode") is
-/// unit-testable without standing up `AppStateStore`/`ObservabilityStore`.
+/// Extracted as a small pure function so the GUI-mode background-browsing gate
+/// is unit-testable without standing up `AppStateStore`/`ObservabilityStore`.
 /// `surfaced` and `user_dismissed` mirror the existing pre-GUI-mode
 /// rule; `gui_background_mode` is `true` when the Agent Chat GUI beta is on
 /// for a workspace, in which case the session must stay detached even though

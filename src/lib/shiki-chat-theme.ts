@@ -6,9 +6,9 @@ import type { ThemeColors } from "@/tauri/types";
  * code blocks in chat are colored by the same source as the file editor
  * (`src/lib/codemirror-theme.ts`) and the terminal panes.
  *
- * This is the documented ANSI-palette exception to the no-hardcoded-colors
- * rule (see `docs/reference/DESIGN-SYSTEM.md`): Shiki emits concrete colors
- * into inline `style` attributes, so it needs real values rather than CSS
+ * This is the ANSI-palette exception to the no-hardcoded-colors rule: Shiki
+ * emits concrete colors into inline `style` attributes, so it needs real
+ * values rather than CSS
  * variables. Structural chrome (container, header, borders) stays on design
  * tokens — only the token colors come from `ThemeColors`.
  *

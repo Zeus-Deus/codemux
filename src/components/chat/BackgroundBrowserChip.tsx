@@ -13,8 +13,7 @@ interface Props {
 }
 
 /**
- * Compact conversation-row event for a GUI-mode background browser session
- * (design "Background browser in GUI mode" — see `docs/features/browser.md`).
+ * Compact conversation-row event for a GUI-mode background browser session.
  *
  * Rendered by `MessageList` as a derived row (not a reducer/`ChatViewItem`)
  * appended after the transcript whenever this pane's workspace has a live,

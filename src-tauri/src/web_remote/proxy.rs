@@ -2,9 +2,8 @@
 //!
 //! The embedded browser pane is a screenshot-driven Chromium session served by
 //! a per-workspace `agent-browser` daemon bound to `127.0.0.1:<port>` (ports
-//! 9223–9299; see `docs/features/browser.md` and
-//! `src-tauri/src/agent_browser.rs`). The desktop pane talks to that daemon
-//! directly: a WebSocket for the screencast + input events, and HTTP
+//! 9223–9299; see `src-tauri/src/agent_browser.rs`). The desktop pane talks to
+//! that daemon directly: a WebSocket for the screencast + input events, and HTTP
 //! `/api/status` / `/api/command` for liveness probes and evals
 //! (`src/components/browser/{BrowserPane,stream-protocol}.ts`).
 //!
@@ -19,7 +18,7 @@
 //!
 //! The daemon reads each HTTP request with ONE peek and only sees the first
 //! TCP segment (~1.4 KB); a request that spans segments looks like it has an
-//! empty body (`docs/features/browser.md`). The HTTP forwarder therefore
+//! empty body. The HTTP forwarder therefore
 //! rebuilds a MINIMAL request — request line, `Host`, and (only with a body)
 //! `Content-Type` / `Content-Length`, plus `Connection: close` — and writes it
 //! in a single `write_all`. Every inbound header (cookies, the session bearer,

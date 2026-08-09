@@ -22,8 +22,7 @@
  *     ticket, reopen, re-subscribe. In-flight invokes reject on the drop;
  *     the UI's own `get_app_state`-on-mount + snapshot events self-heal.
  *
- * The protocol contract is defined in `docs/plans/web-remote-access.md`
- * ("WS protocol contract") and MUST match the Rust server exactly.
+ * This protocol contract MUST match the Rust server exactly.
  */
 import { Inflate } from "fflate";
 

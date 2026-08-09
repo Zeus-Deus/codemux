@@ -159,11 +159,10 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
         };
     }
 
-    // Build SpawnConfig. We deliberately don't sanitize the GUI env
-    // (per CLAUDE.md `sanitize_gui_env_*`) because MCP servers are the
-    // user's own installs and they may legitimately need DISPLAY etc.
-    // for headed use cases. If this becomes a problem the registry can
-    // grow a per-server option.
+    // Build SpawnConfig. We deliberately don't sanitize the GUI env because
+    // MCP servers are the user's own installs and may legitimately need
+    // DISPLAY etc. for headed use cases. If this becomes a problem the
+    // registry can grow a per-server option.
     let spawn = SpawnConfig {
         program: PathBuf::from(&config.command),
         args: config.args.clone(),

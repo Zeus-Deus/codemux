@@ -986,8 +986,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Hydrate on (re)mount when the pane attaches to a thread that
   // already has a server-side transcript.
   //
-  // The provider event broadcaster is live-only (bounded channel, no
-  // replay — see docs/features/agent-chat.md). When the user switches
+  // The provider event broadcaster is live-only (bounded channel, no replay).
+  // When the user switches
   // workspaces the entire inactive workspace's pane tree unmounts
   // (workspace-main.tsx returns null for non-active workspaces), so
   // the `useAgentChatEvents` listener detaches and any provider events
@@ -2753,7 +2753,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // whatever the user had typed here. Creating worktrees belongs to
   // surfaces honest about creating a workspace (`DraftChatSurface`, the
   // sidebar worktree flow); switching project/workspace belongs to the
-  // sidebar. See `docs/features/agent-chat.md` § Thread Scope.
+  // sidebar.
 
   // Zone 1 — nothing renders above the composer anymore: scope lives
   // BELOW it (`belowComposerSlot`). `undefined` (no resolvable project

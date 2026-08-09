@@ -33,8 +33,7 @@ import { dockBrowserInRightPanel } from "@/tauri/commands";
 const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 
 /**
- * Floating "peek" overlay for a GUI-mode background browser session
- * (docs/features/browser.md "Background browser in GUI mode"): clicking the
+ * Floating "peek" overlay for a GUI-mode background browser session: clicking the
  * inline chat chip or terminal-header indicator opens this instead of
  * splitting the chat into a pane. Renders the live browser stream as a
  * top-right floating panel absolutely positioned over the chat surface — it

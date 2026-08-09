@@ -7,8 +7,7 @@
 //!
 //! The SSH wiring that writes these to a host and enables them belongs
 //! in `ssh/bootstrap.rs`; it is wired once the account API is deployed
-//! and the host bootstrap can also provision a scheduler token — see
-//! `docs/plans/automations-sync.md` Phase E.
+//! and the host bootstrap can also provision a scheduler token.
 
 /// A systemd **user** service unit for the scheduler.
 ///

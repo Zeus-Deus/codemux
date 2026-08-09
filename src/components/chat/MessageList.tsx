@@ -147,8 +147,7 @@ interface Props {
    *  Two consumers: (a) threaded down to `WorkflowRunCard` so its
    *  "Open panel" affordance can flip the right panel to the
    *  Orchestration tab; (b) the GUI-mode background-browser session
-   *  lookup for the inline chip (docs/features/browser.md "Background
-   *  browser in GUI mode"). Absent → both affordances are inert
+   *  lookup for the inline chip. Absent → both affordances are inert
    *  (legacy / non-workspace-scoped callers keep byte-identical
    *  output) rather than throwing. */
   workspaceId?: string | null;
@@ -189,8 +188,7 @@ export const MessageList = memo(function MessageList({
   workspaceId,
   cwd,
 }: Props) {
-  // GUI-mode background browser session for this pane's workspace (see
-  // docs/features/browser.md "Background browser in GUI mode"). Gated on
+  // GUI-mode background browser session for this pane's workspace. Gated on
   // the same predicate the backend's `browser_automation` handler uses to
   // suppress pane creation: Agent Chat beta on.
   // `workspaceId` is absent for legacy/non-workspace-scoped callers, so
@@ -1272,8 +1270,7 @@ const WS_FADE_STYLE: CSSProperties = {
 
 /** Amber "no activity" notice shown at the tail of a silently-stalled
  *  mid-turn run (issue #154). Advisory only — the run may still be alive
- *  (a long quiet tool call), so the copy hedges. Tokens only, per
- *  docs/reference/DESIGN-SYSTEM.md (no hardcoded colors). */
+ *  (a long quiet tool call), so the copy hedges. Uses design tokens only. */
 function RunStalledNotice({ silentForSecs }: { silentForSecs: number }) {
   const minutes = Math.max(1, Math.floor(silentForSecs / 60));
   return (

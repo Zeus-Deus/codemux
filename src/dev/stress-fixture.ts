@@ -1,6 +1,5 @@
 /**
- * Stress fixtures for the dev mock runtime — Phase 0 of
- * `docs/plans/gui-responsiveness.md`.
+ * Stress fixtures for GUI-responsiveness testing in the dev mock runtime.
  *
  * The default seed is a *design* fixture: 18 hand-curated workspaces chosen to
  * exercise every sidebar and chat state. It is deliberately far below the

@@ -8,7 +8,7 @@
 //! Tauri/UI dependency.
 //!
 //! Design constraints baked in for a future optional cloud relay
-//! (paid tier, not on the v1 roadmap; see docs/plans/mcp-on-remote.md):
+//! (paid tier, not on the v1 roadmap):
 //!
 //! 1. **HTTP transport, not Unix-socket JSON-lines.** A future relay
 //!    can forward HTTP through a WebSocket tunnel without the daemon

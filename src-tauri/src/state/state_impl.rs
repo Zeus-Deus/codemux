@@ -3542,7 +3542,7 @@ impl AppStateStore {
     /// Return the stream port currently recorded for a workspace's agent
     /// browser session, parsed from `stream_url`. Used by `control.rs`
     /// to resolve the canonical `cli_session_name` before allocating a
-    /// new port — see P2 in `docs/plans/browser-stream-fix.md`. Returns
+    /// new port. Returns
     /// `None` when the workspace has no session yet (first call).
     pub fn agent_browser_stream_port_for_workspace(
         &self,
@@ -3561,8 +3561,8 @@ impl AppStateStore {
     }
 
     /// Update the stream port recorded on an agent browser session so
-    /// the frontend's `stream_url` becomes reactive on re-allocation
-    /// (P6 in `docs/plans/browser-stream-fix.md`). Returns Err when no
+    /// the frontend's `stream_url` becomes reactive on re-allocation.
+    /// Returns Err when no
     /// session exists for the workspace yet — callers should
     /// `resolve_agent_browser_session` first if that matters.
     /// Returns whether `stream_url` actually moved — re-allocating the same
@@ -4056,7 +4056,7 @@ impl AppStateStore {
     /// [`Self::clear_transient_pane_status_by_session`]. Only the two callers
     /// whose whole operation is this one clear use it — the rest of the
     /// pane-status writers mutate other domains in the same breath and stay on
-    /// full snapshot emits (see `docs/plans/gui-responsiveness.md`).
+    /// full snapshot emits.
     pub fn clear_transient_pane_status_by_session_delta(
         &self,
         session_id: &str,

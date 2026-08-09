@@ -13,8 +13,7 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
  * rows) whose dense lists should NOT grow to 32px rows. The container surface
  * is unified globally; the row rhythm is opt-in per menu.
  *
- * Every colour here is a design token or a token alpha mix — see
- * `docs/reference/DESIGN-SYSTEM.md`.
+ * Every colour here is a design token or a token alpha mix.
  */
 
 /** One 32px menu row: 8px radius, 9px side padding, 10px gap, 13px label, and

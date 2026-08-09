@@ -573,7 +573,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   const openWorkspace = (workspaceId: string) => {
     close();
-    // The one activation path (`docs/plans/gui-responsiveness.md`, Phase 1):
+    // The one activation path:
     // commits the selection optimistically in this click's own task, clears any
     // active chat draft so a draft surface can't keep holding the view, and
     // traces the switch. Both palette entry points — a workspace row and a

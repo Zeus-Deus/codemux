@@ -38,8 +38,8 @@ export const STATUS_LABEL: Record<ActivePaneStatus, string> = {
   review: "Done · review",
 };
 
-/** Design-token text colour per status (see `docs/reference/DESIGN-SYSTEM.md`
- *  — status tones are identical across every palette variant). */
+/** Design-token text colour per status; status tones are identical across
+ *  every palette variant. */
 export const STATUS_TEXT_CLASS: Record<ActivePaneStatus, string> = {
   working: "text-status-working",
   permission: "text-status-attention",

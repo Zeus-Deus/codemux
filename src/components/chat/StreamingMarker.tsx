@@ -15,8 +15,8 @@ import { formatActivityDuration } from "./activity-steps";
  * component derives the label, the orb's activity, and the turn start.
  *
  * This is the thread's one live orb: it stands for the turn as a whole, so
- * individual tool-call rows above it stay still (see `docs/features/
- * agent-chat.md` — one orb per live thing).
+ * individual tool-call rows above it stay still. There is one orb per live
+ * thing.
  */
 export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
   const label = deriveStreamingLabel(messages);

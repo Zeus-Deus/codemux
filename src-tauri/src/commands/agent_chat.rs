@@ -2373,7 +2373,7 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 /// badge off) leaves the user with a dot they cannot dismiss. The tracker's
 /// stop-blocklist is what keeps that surviving task from re-lighting the badge;
 /// killing it outright needs a provider-side capability that does not exist
-/// yet. See `docs/features/monitoring-status.md` § Stopping.
+/// yet.
 ///
 /// Errors from the interrupt are swallowed for the same reason: the user asked
 /// for the monitoring to stop, and the state clear is the part Codemux can

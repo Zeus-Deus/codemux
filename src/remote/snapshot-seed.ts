@@ -11,8 +11,7 @@
  *
  * The endpoint is deliberately shaped as the first piece of a versioned API
  * for future non-web (native mobile) clients; see the backend module
- * `src-tauri/src/web_remote/snapshot.rs` and
- * `docs/features/web-remote-access.md`.
+ * `src-tauri/src/web_remote/snapshot.rs`.
  *
  * Seeding is a pure optimization: any failure resolves to `null`, and the shim
  * silently falls back to the existing WS `get_app_state` path, which remains

@@ -1639,10 +1639,9 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
     workspace_id: String,
 ) -> Result<(), String> {
     let activate_started = std::time::Instant::now();
-    // Section timings feed the Phase 0 attribution harness
-    // (docs/plans/gui-responsiveness.md): a slow activate must name whether it
-    // was the locked state mutation, the snapshot+serialise, or the SQLite
-    // write, rather than reporting one opaque total.
+    // Section timings feed the attribution harness: a slow activate must name
+    // whether it was the locked state mutation, the snapshot+serialise, or the
+    // SQLite write, rather than reporting one opaque total.
     let mutate_started = std::time::Instant::now();
     let activated = state.activate_workspace(&workspace_id);
     let mutate_ms = mutate_started.elapsed().as_secs_f64() * 1000.0;
@@ -1669,8 +1668,7 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
 /// and never persisting the active workspace, so a cycled-to workspace was
 /// forgotten at restart.
 ///
-/// Returns `(emit_ms, persist_ms)` for the Phase 0 attribution harness
-/// (`docs/plans/gui-responsiveness.md`).
+/// Returns `(emit_ms, persist_ms)` for the activation attribution harness.
 fn run_activation_side_effects<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -2512,8 +2510,8 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
     // editor must inherit the GUI env to render a window. Stripping
     // it here makes the spawn succeed silently with no visible
     // result (Wayland/X11 reject the window because the env was
-    // unset). Same exception class as `hyprctl` / `ydotool` /
-    // `systemctl` / `loginctl` documented in CLAUDE.md.
+    // unset). This is the same exception class as explicitly requested
+    // desktop-control commands such as `hyprctl` and `ydotool`.
     cmd.spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())

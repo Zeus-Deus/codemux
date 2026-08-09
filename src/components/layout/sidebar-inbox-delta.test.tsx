@@ -1,7 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 /**
- * Exit gate for Phase 6 of `docs/plans/gui-responsiveness.md`: a metadata
- * change touches only its domain's subscribers.
+ * A metadata change should touch only its domain's subscribers.
  *
  * Unlike `sidebar-inbox.test.tsx`, this file uses the REAL app store — the
  * whole point is the path from `applyAppStateDelta` through the store's

@@ -2,8 +2,7 @@
 //! and a settings row that afterwards describes what is actually running.
 //!
 //! Companion to `serve_persisted_config.rs` (which covers the
-//! already-configured box). The documented scope resolution
-//! (docs/features/web-remote-access.md § "Headless server mode") is: an
+//! already-configured box). Scope resolution is: an
 //! explicit `--scope` wins; no flag on an already-enabled config keeps its
 //! scope; no flag on first run defaults to `all` — the away-from-home SSH case,
 //! where nothing else would be reachable. This asserts the third branch

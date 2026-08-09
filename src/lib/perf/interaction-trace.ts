@@ -1,5 +1,5 @@
 /**
- * Interaction tracing — Phase 0 of `docs/plans/gui-responsiveness.md`.
+ * Interaction tracing for GUI responsiveness measurements.
  *
  * One trace per user interaction carries an id from the click through every
  * hand-off (IPC, snapshot delivery, Zustand commit, React mount, paint) so a

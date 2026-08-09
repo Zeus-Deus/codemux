@@ -29,7 +29,7 @@
 //!   the server is a stateless model-list cache and an immediate
 //!   kill loses nothing.
 //! * **GUI sanitation**: env is sanitised through
-//!   `sanitize_gui_env_tokio` per CLAUDE.md so an OpenCode binary
+//!   `sanitize_gui_env_tokio` so an OpenCode binary
 //!   that inadvertently launches a GUI helper does not pop windows
 //!   on the host display.
 //!

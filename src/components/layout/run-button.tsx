@@ -19,9 +19,8 @@ interface RunButtonProps {
   workspaceId: string;
   /** Rendering shape. `"legacy"` (default) is the original ghost
    *  [Run/Set Run + badge] button + standalone gear pair — used by the
-   *  legacy (flag-off) PresetBar, which must stay byte-identical per the
-   *  gui-chrome contract (docs/features/gui-chrome.md). `"split"` is the
-   *  GUI-chrome split button: main segment runs (green play glyph), caret
+   *  legacy (flag-off) PresetBar, which must stay byte-identical. `"split"` is
+   *  the GUI-chrome split button: main segment runs (green play glyph), caret
    *  segment configures, no standalone gear. Only the GUI branch of
    *  `title-bar.tsx` passes `"split"`. */
   variant?: "legacy" | "split";

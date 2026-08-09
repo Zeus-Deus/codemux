@@ -8,8 +8,7 @@ export type { SubagentToneClasses };
  * `statusTone` (design tokens: running = status-working/amber,
  * completed = status-open/green, failed = status-attention/red,
  * stopped/pending = muted) so the panel's colors stay identical to the
- * rest of the subagent UI — no hardcoded colors, per
- * docs/reference/DESIGN-SYSTEM.md.
+ * rest of the subagent UI, with no hardcoded colors.
  */
 
 /** Tone for the run-level status pill. `WorkflowRunStatus` is a superset

@@ -1,7 +1,6 @@
 //! End-to-end integration test for `codemux-remote serve` + `codemux-remote mcp`.
 //!
-//! This is the headline-feature test for the headless-daemon work
-//! tracked in `docs/plans/mcp-on-remote.md`. It exercises the full
+//! This is the headline-feature test for the headless daemon. It exercises the full
 //! agent-on-the-remote-controls-Codemux loop, but locally so CI
 //! can run it without SSH:
 //!

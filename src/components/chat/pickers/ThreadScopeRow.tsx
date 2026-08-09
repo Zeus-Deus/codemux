@@ -130,7 +130,6 @@ export interface ThreadScopeRowProps {
  * such freedom — its workspace owns one project root and one checkout,
  * shared by every tab and pane inside it — so `AgentChatPane` renders
  * the read-only Context Row on an empty thread instead of this row.
- * See `docs/features/agent-chat.md` § Thread Scope.
  */
 export function ThreadScopeRow({
   target,

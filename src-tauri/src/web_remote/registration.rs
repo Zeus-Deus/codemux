@@ -4,8 +4,7 @@
 //! the desktop is signed into a Codemux account, the desktop registers itself
 //! with the account device registry so a browser signed into the **same**
 //! account can discover it — and dial it by `node_id` — from any network. This
-//! is the desktop half of the Design 1 Stage B/C control-plane registry
-//! (`docs/plans/web-remote-account-mode.md` §1.2).
+//! is the desktop half of the account-mode control-plane registry.
 //!
 //! ## Contract
 //!

@@ -6,8 +6,8 @@ import type { SettledEntry, SnoozeEntry } from "@/stores/sidebar-inbox-store";
  *
  * The picker lists every project that has a live workspace, which is the
  * same set the sidebar draws from — but the sidebar splits that set into
- * "active" and parked tiers (settled and snoozed — see
- * `docs/features/sidebar.md`), and the picker used to render it as one
+ * "active" and parked tiers (settled and snoozed), and the picker used to
+ * render it as one
  * flat, unsorted, uncapped list. On a machine with a dozen-plus adopted
  * projects that reads as a wall of equals: the project you touched a
  * minute ago sits below one you settled months ago, because the only

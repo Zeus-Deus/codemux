@@ -3,7 +3,7 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 
 /**
- * GUI chrome predicate (see `docs/features/gui-chrome.md`): renders for a
+ * GUI chrome predicate: renders for a
  * real workspace when the Agent Chat Beta is on. A live
  * lazy-creation draft (no workspace yet) resolves `false` here — the
  * draft renders its own GUI-styled titlebar variant instead (see
@@ -13,7 +13,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
  *
  * Extracted from `title-bar.tsx` (the original single call site) so other
  * GUI-mode-only surfaces — the background browser chip and context-bar
- * indicator (`docs/features/browser.md` "Background browser in GUI mode")
+ * indicator
  * — gate on the exact same predicate without re-deriving it.
  */
 export function useGuiChrome(): boolean {

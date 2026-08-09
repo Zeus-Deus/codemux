@@ -9,13 +9,12 @@
 //! ## Security model — full-file read is by design
 //!
 //! This route serves ANY file the desktop user can read. That is intentional:
-//! a paired web session has desktop-level control — it *is* the desktop (see
-//! decision 5 in `docs/plans/web-remote-access.md`). The security boundary is
-//! pairing + revocation + the network layer, not per-path ACLs. The desktop
-//! webview's own `asset:`/`convertFileSrc` protocol reads arbitrary local
-//! files the same way; this is the web-transport equivalent. Access is gated
-//! on an approved, non-revoked session (bearer or HttpOnly cookie) plus a
-//! same-origin check via [`super::server::require_session`]. Directories and
+//! a paired web session has desktop-level control — it *is* the desktop. The
+//! security boundary is pairing + revocation + the network layer, not per-path
+//! ACLs. The desktop webview's own `asset:`/`convertFileSrc` protocol reads
+//! arbitrary local files the same way; this is the web-transport equivalent.
+//! Access is gated on an approved, non-revoked session (bearer or HttpOnly
+//! cookie) plus a same-origin check via [`super::server::require_session`]. Directories and
 //! non-regular files return 404 — the route never produces a directory
 //! listing.
 

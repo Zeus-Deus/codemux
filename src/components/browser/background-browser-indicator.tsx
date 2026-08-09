@@ -6,9 +6,8 @@ import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
 
 /**
- * GUI-mode background browser session lookup for a workspace (see
- * docs/features/browser.md "Background browser in GUI mode") — a
- * detached agent browser session that is live (`is_active`) but has no
+ * GUI-mode background browser session lookup for a workspace: a detached
+ * agent browser session that is live (`is_active`) but has no
  * visible surface of its own.
  *
  * "No surface" is the union of both hosts, mirroring

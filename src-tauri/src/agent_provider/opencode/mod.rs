@@ -38,8 +38,7 @@
 //!   on top of the discovery surface here.
 //! * No upstream-credential UX. OpenCode reads OpenAI / Anthropic /
 //!   Google API keys from `~/.config/opencode/`; Codemux deliberately
-//!   stays out of that. See `docs/plans/step-12-opencode-implementation-plan.md`
-//!   §2.3 for the rationale.
+//!   stays out of that.
 //!
 //! Stage 1 ships nothing user-visible — its job is to extend the schema
 //! seam (`ProviderKind::OpenCode`) and stand up the discovery surface so

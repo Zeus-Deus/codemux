@@ -34,8 +34,7 @@ import {
 /**
  * Context Row status cluster (design: `.design-import/Context Row.dc.html`)
  * — the passive git/PR status from the retired full-width workspace
- * context bar, relocated to sit RIGHT of the composer's scope row (see
- * `docs/features/agent-chat.md` "Context Row"). Renders:
+ * context bar, relocated to sit RIGHT of the composer's scope row. Renders:
  *
  *  - the GUI-mode background-browser indicator (the same sky-tinted
  *    "Browser" pill shown compactly in terminal headers — shared

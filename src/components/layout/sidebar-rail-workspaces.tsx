@@ -137,7 +137,7 @@ export function SidebarRailWorkspaces() {
     [appState?.workspaces],
   );
   // Pending-aware so the highlight moves in the click's own task, before the
-  // backend snapshot lands (docs/plans/gui-responsiveness.md, Phase 1).
+  // backend snapshot lands.
   const activeWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
   const homeDir = useHomeDir();
   const hosts = useHosts();

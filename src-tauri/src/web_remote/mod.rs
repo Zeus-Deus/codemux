@@ -24,8 +24,6 @@
 //! - [`assets`]   — authenticated `/api/assets` file route (`convertFileSrc`).
 //! - [`proxy`]    — auth-gated browser-pane WS + HTTP proxy to loopback daemons.
 //! - [`snapshot`] — authenticated `/api/snapshot` bulk state bootstrap (versioned API).
-//!
-//! See `docs/plans/web-remote-access.md` for the locked protocol contract.
 
 pub mod account;
 pub mod assets;

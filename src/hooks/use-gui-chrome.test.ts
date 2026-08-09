@@ -65,8 +65,8 @@ function setActiveWorkspace(overrides: Partial<WorkspaceSnapshot> = {}) {
   });
 }
 
-// This is the single source of truth for the GUI chrome predicate
-// (docs/features/gui-chrome.md): title-bar.tsx, the background-browser
+// This is the single source of truth for the GUI chrome predicate:
+// title-bar.tsx, the background-browser
 // chip/terminal-header indicator, and the peek overlay all key off it.
 describe("useGuiChrome", () => {
   afterEach(() => {

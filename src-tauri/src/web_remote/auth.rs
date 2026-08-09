@@ -1,6 +1,6 @@
 //! Authentication primitives for the web-remote server.
 //!
-//! The trust model (see `docs/plans/web-remote-access.md`):
+//! The trust model:
 //!
 //! 1. **Pairing token** — 32 random bytes, 10-minute TTL, single use,
 //!    in memory only. Handed to a browser out-of-band (QR / link).

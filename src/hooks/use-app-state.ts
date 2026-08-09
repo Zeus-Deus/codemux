@@ -75,7 +75,7 @@ export function useAppStateInit(skip = false) {
   // serialized the whole snapshot to a multi-KB string on every tick.
   //
   // The two `markOpenInteraction` calls are the delivery/commit boundary of an
-  // in-flight interaction trace (docs/plans/gui-responsiveness.md, Phase 0).
+  // in-flight interaction trace.
   // They are no-ops unless a trace is open, and scoping them to the snapshot's
   // own `active_workspace_id` keeps an unrelated streaming emit from claiming
   // the stamp.
