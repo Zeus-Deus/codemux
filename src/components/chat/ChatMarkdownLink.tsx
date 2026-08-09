@@ -31,48 +31,77 @@ type ChatMarkdownLinkProps = ComponentProps<"a"> & {
  * virtualized row and can leave only its dimming backdrop visible. The shared
  * AlertDialog primitive portals to document.body and therefore stays in the
  * viewport stacking context.
+ *
+ * The webview never performs a link's navigation itself. Chat markdown is
+ * agent-relayed text, and `ChatMarkdown` passes its own `rehypePlugins`, which
+ * REPLACES Streamdown's sanitize/harden chain — so an href reaches this
+ * component exactly as written. Only an absolute `http(s)` URL is treated as a
+ * destination, and only through the confirmation dialog plus Tauri's system
+ * browser opener. Every other href (script schemes, `file:`, `mailto:`,
+ * absolute paths, relative paths, fragments) renders without a live `href`:
+ * following one in place would either execute in the app origin with IPC reach
+ * or unload the single-page app.
  */
 export function ChatMarkdownLink({
   children,
   className,
   href,
   node: _node,
+  onAuxClick,
   onClick,
+  rel,
+  target: _target,
+  title,
   ...props
 }: ChatMarkdownLinkProps) {
   const [confirmationOpen, setConfirmationOpen] = useState(false);
-  const external = externalWebLinkHost(href) !== null;
   const incomplete = href === INCOMPLETE_LINK;
+  const externalHref =
+    !incomplete && typeof href === "string" && externalWebLinkHost(href) !== null
+      ? href
+      : null;
+  // A destination we refuse to navigate to, but still worth surfacing on hover
+  // so the label is not the only clue about where the agent pointed.
+  const inertHref = !incomplete && !externalHref ? href : undefined;
 
   const link = (
     <a
       {...props}
-      href={incomplete ? undefined : href}
-      rel={external ? "noopener noreferrer" : props.rel}
-      target={external ? "_blank" : props.target}
+      href={externalHref ?? undefined}
+      rel={externalHref ? "noopener noreferrer" : rel}
+      title={title ?? inertHref}
       data-incomplete={incomplete || undefined}
+      data-inert-link={inertHref ? "" : undefined}
       data-streamdown="link"
       aria-disabled={incomplete || undefined}
       className={cn(
-        "wrap-anywhere cursor-pointer font-medium text-primary underline",
+        "wrap-anywhere font-medium text-primary underline",
+        externalHref ? "cursor-pointer" : "cursor-default",
         incomplete && "pointer-events-none opacity-50",
         className,
       )}
       onClick={(event) => {
         onClick?.(event);
-        if (event.defaultPrevented || !external) return;
+        const handledByCaller = event.defaultPrevented;
         event.preventDefault();
+        if (handledByCaller || !externalHref) return;
         setConfirmationOpen(true);
+      }}
+      onAuxClick={(event) => {
+        onAuxClick?.(event);
+        // Middle click never fires `onClick`, so a live href would request a
+        // background navigation that skipped the confirmation entirely.
+        event.preventDefault();
       }}
     >
       {children}
     </a>
   );
 
-  if (!external || !href) return link;
+  if (!externalHref) return link;
 
   const openConfirmedLink = () => {
-    void openUrl(href).catch((error) => {
+    void openUrl(externalHref).catch((error) => {
       toast.error("Could not open the link", {
         description: error instanceof Error ? error.message : String(error),
       });
@@ -93,7 +122,7 @@ export function ChatMarkdownLink({
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-xs text-muted-foreground">
-          {href}
+          {externalHref}
         </div>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>

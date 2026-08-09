@@ -31,6 +31,14 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
+/** Middle click. `fireEvent` has no auxClick helper, and it never fires onClick. */
+function middleClick(element: Element): boolean {
+  return fireEvent(
+    element,
+    new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+  );
+}
+
 describe("ChatMarkdown rich external links", () => {
   it("adds the destination favicon to any labelled http(s) link", () => {
     const { container } = render(
@@ -59,6 +67,9 @@ describe("ChatMarkdown rich external links", () => {
     const link = container.querySelector('[data-streamdown="link"]');
     expect(link?.tagName).toBe("A");
     expect(link).toHaveAttribute("href", "https://platform.openai.com/docs");
+    // The confirmed open goes through the Tauri opener, so a browsing context
+    // target would only buy an unconfirmed middle-click navigation.
+    expect(link).not.toHaveAttribute("target");
 
     fireEvent.click(link as HTMLAnchorElement);
 
@@ -76,6 +87,20 @@ describe("ChatMarkdown rich external links", () => {
         "https://platform.openai.com/docs",
       ),
     );
+  });
+
+  it("never navigates an external link itself, not even on middle click", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[Reference](https://example.com/reference)"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    // fireEvent returns false once a handler called preventDefault.
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(middleClick(link as HTMLAnchorElement)).toBe(false);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
   });
 
   it("does not open an external link when its confirmation is cancelled", () => {
@@ -222,6 +247,59 @@ describe("ChatMarkdown rich external links", () => {
       "src",
       "https://www.google.com/s2/favicons?domain=docs.codemux.org&sz=32",
     );
+  });
+});
+
+describe("ChatMarkdown non-web link destinations", () => {
+  // `ChatMarkdown` supplies its own rehype plugins, which replaces Streamdown's
+  // sanitize/harden chain, so an agent-authored href reaches the anchor exactly
+  // as written. Nothing but a confirmed http(s) URL may ever be navigable.
+  it("renders a script-scheme destination inert", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[click me](javascript:alert(1))"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link).toHaveTextContent("click me");
+    expect(link).not.toHaveAttribute("href");
+    expect(link).toHaveAttribute("data-inert-link");
+    // No href to follow, and the click is swallowed rather than defaulted.
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate the webview for a local path link", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[log](/tmp/build.log)"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    expect(link).toHaveTextContent("log");
+    // A live href here would unload the single-page app onto app-origin/tmp/…
+    expect(link).not.toHaveAttribute("href");
+    expect(link).toHaveAttribute("title", "/tmp/build.log");
+    expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
+    expect(middleClick(link as HTMLAnchorElement)).toBe(false);
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  it("leaves mailto, file, and relative destinations without a live href", () => {
+    const { container } = render(
+      <ChatMarkdown>
+        {"[mail](mailto:hello@codemux.org) [file](file:///etc/hosts) [rel](./notes.md) [anchor](#code-blocks)"}
+      </ChatMarkdown>,
+    );
+
+    const links = container.querySelectorAll('[data-streamdown="link"]');
+    expect(links).toHaveLength(4);
+    for (const link of links) {
+      expect(link).not.toHaveAttribute("href");
+      expect(link).toHaveAttribute("data-inert-link");
+    }
   });
 });
 

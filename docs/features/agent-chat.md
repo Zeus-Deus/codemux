@@ -253,6 +253,22 @@ mounted beside a transcript link is clipped to its virtualized row.
 `MarkdownLinkFavicon` requests a 32px image from the same Google favicon service
 already used for project avatars and falls back to a token-colored globe.
 
+**The webview never performs a link's navigation.** `ChatMarkdown` passes its
+own `rehypePlugins`, and Streamdown treats that as a *replacement* for its
+default `raw`/`sanitize`/`harden` chain — so an href arrives at the anchor
+exactly as the agent wrote it (raw HTML still renders as text, since the `raw`
+plugin is absent too). `ChatMarkdownLink` is therefore the sanitizer: only an
+absolute `http(s)` URL (classified by `externalWebLinkHost`) is given a live
+`href`, and even that one is `preventDefault`ed on both `click` and `auxclick`
+so the *only* route to the destination is the confirmation dialog plus the
+Tauri opener. There is no `target="_blank"` — the confirmed open never uses the
+anchor, and the attribute would only buy an unconfirmed middle-click
+navigation. Every other destination — `javascript:` and other script schemes,
+`file:`, `mailto:`, absolute paths, relative paths, fragments — renders with no
+`href` at all (`data-inert-link`, destination on hover via `title`): following
+one in place would either execute in the app origin with IPC reach or unload
+the single-page app onto an app-origin path.
+
 Three cases render that globe with no network request at all: while the
 message is still streaming (a bare URL is autolinked on every frame, so
 in-flight prefixes like `docs.p` would each fire a lookup), for hostnames that
@@ -260,9 +276,9 @@ are not publicly resolvable (`localhost`, single-label names, `.local`/
 `.internal`/`.lan`/`.home`/`.corp` suffixes, and private or reserved IP
 literals — those names are never sent to the third-party favicon service), and
 for hosts whose icon recently failed to load (a five-minute TTL, capped cache).
-Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
-unchanged. The dev mock's rich transcript includes both GitHub and docs
-examples for visual verification.
+Fragment, relative, `mailto:`, `javascript:`, and other non-web links get no
+favicon decoration. The dev mock's rich transcript includes both GitHub and
+docs examples for visual verification.
 
 ### Local screenshot links in chat
 
