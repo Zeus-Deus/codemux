@@ -516,8 +516,7 @@ pub async fn hosts_reinstall_remote<R: tauri::Runtime>(
 /// Running PTY sessions are NOT migrated across the network — they
 /// terminate cleanly, the user reopens panes on the remote, and
 /// adapter-aware agents (Claude Code, Codex) auto-resume via the
-/// existing scrollback adapter mechanism. This is documented in
-/// `docs/features/remote-hosts.md`.
+/// existing scrollback adapter mechanism.
 #[tauri::command]
 pub async fn workspace_push_to_host<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,

@@ -36,8 +36,7 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/stores/app-store")>();
   const state = () => ({
     appState: appStateHolder.current,
-    // Optimistic selection: the activation helper writes these before the
-    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    // Optimistic selection: the activation helper writes these before invoke.
     pendingActiveWorkspaceId: null,
     pendingActivationAt: null,
     beginPendingActivation: vi.fn(),

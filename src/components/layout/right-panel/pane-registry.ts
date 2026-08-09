@@ -18,7 +18,7 @@
  * `rightPanelDismissedPanes`).
  *
  * `browser` is a real deck pane, not a jump-out: it hosts the workspace's
- * one agent browser session (see `docs/features/browser.md`), the same
+ * one agent browser session, the same
  * Chromium the `codemux browser` CLI and MCP tools drive. Opening it docks
  * that session here rather than spawning a second browser.
  */

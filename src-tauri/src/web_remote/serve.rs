@@ -132,8 +132,7 @@ pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
 
 /// Which bind scope a `codemux serve` startup should request, given the
 /// `--scope` flag and whether remote access was already persisted-enabled.
-/// `None` means "leave the persisted scope alone". Pure so the documented
-/// precedence (docs/features/web-remote-access.md § "Headless server mode") is
+/// `None` means "leave the persisted scope alone". Kept pure so precedence is
 /// unit-testable:
 ///
 /// - an explicit `--scope` always wins;

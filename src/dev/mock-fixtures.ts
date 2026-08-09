@@ -382,9 +382,8 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
   };
 })();
 
-/** Detached (pane-less) agent browser session for `wsCodemuxChat` —
- *  drives the "Background browser in GUI mode" chrome (issue: browser
- *  chip + terminal-header indicator + peek overlay, `docs/features/browser.md`):
+/** Detached (pane-less) agent browser session for `wsCodemuxChat` — drives the
+ *  background-browser chip, terminal-header indicator, and peek overlay:
  *  the agent opened a browser mid-chat but it stayed off to the side
  *  instead of splitting the chat into a pane. `pane_id: null` + `is_active:
  *  true` is exactly the predicate `MessageList`, the terminal-header
@@ -532,7 +531,7 @@ export const MOCK_MONITORING_THREAD_ID = "thread-mock-monitoring";
  *  `MonitoringBar` title and proves the reason plumbing end to end. */
 export const MOCK_MONITORING_REASON = "CI checks on PR #482";
 
-/** Monitoring demo (`docs/features/monitoring-status.md`): a chat agent that
+/** Monitoring demo: a chat agent that
  *  finished its deliverable and is now babysitting a CI run. Seeds the calm
  *  cyan sidebar badge + the docked "Monitoring in the background" bar with a
  *  working Stop button, so both are screenshot-reachable under `npm run dev`
@@ -1256,7 +1255,7 @@ export function richChatTurnEnvelopes(
         text: "Here's the dashboard before the fix — captured for the PR description:",
       },
     }),
-    ...readScreenshot(3, "docs/plans/assets/dashboard-before.png"),
+    ...readScreenshot(3, "/tmp/codemux-dashboard-before.png"),
     evt({
       type: "item_completed",
       item: {
@@ -1274,8 +1273,7 @@ export function richChatTurnEnvelopes(
 }
 
 /**
- * Runtime-event envelopes for a seeded subagents turn, mirroring the
- * design fixture (`docs/plans/assets/Subagents.dc.html`): the orchestrator
+ * Runtime-event envelopes for a seeded subagents turn: the orchestrator
  * delegates to two subagents — "Implement" (completed) and "Verify" (still
  * running). Replayed through the real reducer by `mockChatTranscript`, so
  * the orchestration card, the running pill, and the drill-in all render

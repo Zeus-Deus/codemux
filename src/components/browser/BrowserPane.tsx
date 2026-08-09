@@ -39,8 +39,7 @@ interface Props {
   focused: boolean;
   visible: boolean;
   /** When set, resolves the agent browser session by workspace instead of
-   *  strictly by `browser_id`. A detached/background agent session
-   *  (GUI-mode background browsing, docs/features/browser.md) has no
+   *  strictly by `browser_id`. A detached/background agent session has no
    *  `browser_id` until it's promoted to a pane, so the peek overlay
    *  passes the session's own `cli_session_name` as `browserId` (so the
    *  stream daemon starts against the right session) plus `workspaceId`
@@ -229,7 +228,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     setSelectedElement(null);
   }, []);
 
-  // P6 from docs/plans/browser-stream-fix.md — reactive stream URL.
+  // Keep the stream URL reactive.
   //
   // The agent browser session in app state owns the canonical
   // `stream_url`. When the Rust manager re-allocates a port (after a
@@ -495,8 +494,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
     };
     // `reactiveStreamUrl` is included so a port re-allocation in the
     // backend (after a teardown/respawn cycle) tears down this WS and
-    // reconnects against the fresh URL — the bug the old deps array
-    // missed (P6 in docs/plans/browser-stream-fix.md).
+    // reconnects against the fresh URL — the bug the old deps array missed.
   }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl]);
 
   // ── Pointer input ──────────────────────────────────────────────────

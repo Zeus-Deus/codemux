@@ -1,8 +1,7 @@
 import { create } from "zustand";
 
 /**
- * Peek-overlay open state for the GUI-mode background browser (see
- * `docs/features/browser.md` "Background browser in GUI mode").
+ * Peek-overlay open state for the GUI-mode background browser.
  *
  * A single `openWorkspaceId` (not a per-workspace map): the peek is a
  * transient "look at this now" affordance, so at most one can be open and

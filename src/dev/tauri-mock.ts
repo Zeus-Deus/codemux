@@ -1935,7 +1935,7 @@ const handlers: Record<string, Handler> = {
   agent_browser_run: () => null,
 
   // The right-panel deck's browser pane hosts the workspace's ONE agent
-  // browser session (`docs/features/browser.md`). The mock mirrors the real
+  // browser session. The mock mirrors the real
   // command's contract — flip `right_panel_docked`, hand the session back so
   // the pane knows which `cli_session_name` to stream — but there is no
   // pane tree to adopt from here, so the adopt branch has nothing to do.
@@ -2046,8 +2046,7 @@ const handlers: Record<string, Handler> = {
       "README.md",
       "CLAUDE.md",
       "package.json",
-      "docs/INDEX.md",
-      "docs/core/STATUS.md",
+      "CONTRIBUTING.md",
       "src/components/layout/right-panel.tsx",
       "src/stores/ui-store.ts",
       "src-tauri/Cargo.toml",

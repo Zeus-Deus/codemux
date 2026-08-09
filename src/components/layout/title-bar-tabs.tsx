@@ -288,8 +288,7 @@ function useTabReorder(workspace: WorkspaceSnapshot) {
  * compact pill; the active chat tab grows a chevron that opens the shared
  * session-history dropdown. Live subagent status no longer rides an
  * inline pill here — it lives in the docked `SubagentActivityBar` above
- * the composer (see `docs/features/agent-chat.md` "Docked live activity
- * bar"). Tabs stay backend-owned — activation/close/reorder go through
+ * the composer. Tabs stay backend-owned — activation/close/reorder go through
  * the existing commands. Reorder is a pointer-driven drag (see
  * `useTabReorder` below) rather than the legacy TabBar's HTML5 DnD.
  */

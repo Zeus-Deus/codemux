@@ -5,7 +5,7 @@
 //! on-disk `dist/` in dev) and exposes the `/api/*` control surface plus
 //! the `/ws` transport the browser shim drives.
 //!
-//! HTTP surface (see `docs/plans/web-remote-access.md`):
+//! HTTP surface:
 //!
 //! - `GET  /*`             — static bundle (public; all state is behind auth).
 //! - `GET  /api/health`    — public version probe.

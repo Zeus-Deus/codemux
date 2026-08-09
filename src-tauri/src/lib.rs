@@ -87,8 +87,7 @@ pub mod webview_tuning;
 // dark colour themes out of a downloaded .vsix.
 pub mod vscode_marketplace;
 // Embedded web remote-access server (default-off HTTP+WebSocket). Lets a
-// browser on another device drive this running instance as a second
-// frontend. See docs/plans/web-remote-access.md.
+// browser on another device drive this running instance as a second frontend.
 pub mod web_remote;
 
 /// Which surface the app is booting. The GUI desktop build runs
@@ -876,10 +875,9 @@ fn build_core_app<R: tauri::Runtime>(
             // visible to the user's account. Without it, a workspace
             // an agent creates on a host (via the MCP `workspace_create`
             // tool) never appears in any dev device's overview because
-            // no laptop ever pushed it. See `docs/features/workspaces-sync.md`
-            // for the "asymmetric publish" model: codemux-remote hosts
-            // auto-publish, codemux-app dev devices keep their existing
-            // explicit push/pull.
+            // no laptop ever pushed it. In the asymmetric publish model,
+            // codemux-remote hosts auto-publish, while codemux-app dev devices
+            // keep their existing explicit push/pull.
             #[cfg(unix)]
             crate::hosts_inventory::spawn(app.handle().clone());
 
@@ -2261,7 +2259,7 @@ fn build_core_app<R: tauri::Runtime>(
             session_adapters::validate_resume,
             session_adapters::get_adapter_info,
             session_adapters::get_scanner_captures,
-            // Web remote access (docs/plans/web-remote-access.md).
+            // Web remote access.
             web_remote::web_remote_status,
             web_remote::web_remote_enable,
             web_remote::web_remote_disable,

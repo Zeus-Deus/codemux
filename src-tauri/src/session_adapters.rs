@@ -225,8 +225,7 @@ fn write_config(config: &AdaptersFile) -> Result<(), String> {
         toml::to_string_pretty(config).map_err(|e| format!("TOML serialize: {e}"))?;
 
     let header = "# Codemux Session Adapters\n\
-                  # Define how CLI tools can be detected and resumed after app restart.\n\
-                  # See: docs/features/session-persistence.md\n\n";
+                  # Define how CLI tools can be detected and resumed after app restart.\n\n";
 
     fs::write(&path, format!("{header}{toml_str}"))
         .map_err(|e| format!("write: {e}"))?;

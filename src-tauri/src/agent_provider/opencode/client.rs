@@ -2,9 +2,8 @@
 //!
 //! Stage 1 lands the request shape and a single `ping()` round-trip.
 //! Stage 2 will replace the placeholder model harvest with the real
-//! `provider.list` + `app.agents` calls (see
-//! `docs/plans/step-12-opencode-implementation-plan.md` §2.1) and
-//! introduce streaming subscriptions on top.
+//! `provider.list` + `app.agents` calls and introduce streaming subscriptions
+//! on top.
 //!
 //! The shape is deliberately Rust-direct-HTTP rather than a Bun /
 //! Node sidecar — option (a) from the plan, locked because porting

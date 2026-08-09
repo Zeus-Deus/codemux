@@ -19,8 +19,7 @@
 //!   5. `/api/assets`: already-compressed media streams untouched with its
 //!      `Content-Length`, while a compressible text asset is gzipped.
 //!
-//! The wire contract under test is documented in
-//! `docs/features/web-remote-access.md` § "WS protocol contract".
+//! The test covers the web-remote wire contract.
 //!
 //! CRITICAL ISOLATION (identical to `serve_web_remote_roundtrip.rs`): a real
 //! Codemux instance may be running on this machine, so `isolate_env` repoints

@@ -3,8 +3,6 @@
 //! This module is the seam between the chat runtime and any concrete agent
 //! integration (Claude Code, Codex, …). It is currently scaffolding — no
 //! user-visible behaviour is wired to it yet.
-//!
-//! See `docs/features/agent-chat.md` for the bigger picture.
 
 pub mod claude;
 pub mod codex;

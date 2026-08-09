@@ -1,5 +1,5 @@
 //! Activation side effects are the same for every surface that switches
-//! workspaces (`docs/plans/gui-responsiveness.md`, Phase 1).
+//! workspaces.
 //!
 //! `cycle_workspace` (Ctrl+Tab) used to diverge from `activate_workspace`: it
 //! spawned PTYs synchronously on the IPC thread, skipped the git refresh, and

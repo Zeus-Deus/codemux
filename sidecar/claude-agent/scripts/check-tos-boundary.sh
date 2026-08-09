@@ -101,9 +101,9 @@ check_env_peeks
 
 if [ $FAIL -ne 0 ]; then
   echo ""
-  echo "ToS boundary check FAILED. See docs/features/agent-chat.md for the rules."
-  echo "Forbidden patterns must not appear in the sidecar except inside the"
-  echo "explicit auth-probe allowlist in this script."
+  echo "ToS boundary check FAILED. Provider SDK imports, credential reads,"
+  echo "API URLs, and Claude process launches must not appear in the sidecar"
+  echo "except inside the explicit auth-probe allowlist in this script."
   exit 1
 fi
 

@@ -10,8 +10,7 @@
 //! so a browser can dial it by its stable [`iroh::EndpointId`] (the device's
 //! `node_id`) over an E2E-encrypted QUIC stream — hole-punched directly when
 //! possible, or forwarded as *ciphertext* through a relay of last resort (the
-//! relay operator never sees plaintext). See
-//! `docs/plans/web-remote-account-mode.md` (Design 1 §1.2, Stage C).
+//! relay operator never sees plaintext).
 //!
 //! It is strictly **additive and default-off**: nothing here runs unless the
 //! new `web_remote.config.relay_mode_enabled` flag is on. The axum `/ws`
@@ -330,8 +329,7 @@ fn reject_frame_bytes(reject: &HandshakeReject) -> Vec<u8> {
 // after verifying it owns this account and this device. The grant IS the
 // credential; the desktop verifies it out-of-band and, on success, mints a fresh
 // `web_remote_sessions` row so everything downstream (`/ws` frames, revocation)
-// is identical to a paired session. See
-// `docs/plans/web-remote-account-mode.md` (Design 1 Stage C).
+// is identical to a paired session.
 //
 //   C→S  kind 0  {"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>"}
 //   S→C  kind 0  {"t":"welcome","session_id":"<id>"}         (on accept)

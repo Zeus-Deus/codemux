@@ -783,7 +783,6 @@ describe("MessageList workflow_run dispatch", () => {
 });
 
 // ── GUI-mode background browser chip ──
-// (docs/features/browser.md "Background browser in GUI mode")
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {

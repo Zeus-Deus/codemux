@@ -97,7 +97,6 @@ rrule = "0.14"
 # a manifest file. The transport choice (HTTP+bearer over loopback,
 # tunnelled via SSH when remote) is the v1 design constraint that lets
 # us drop in an optional cloud relay later without changing the daemon.
-# See docs/plans/mcp-on-remote.md.
 #
 # The `ws` feature is required by the embedded web-remote-access server
 # (`src/web_remote/`), which upgrades `/ws` connections to drive the same
@@ -140,8 +139,7 @@ qrcode = { version = "0.14", default-features = false }
 # forwards ciphertext only — the operator never sees plaintext). The existing
 # `/ws` frame contract rides *inside* an iroh bi-stream unchanged; iroh only
 # swaps the transport. Shares the app's tokio runtime — no second runtime is
-# spawned. See `src/web_remote/iroh.rs` and
-# `docs/plans/web-remote-account-mode.md` (Design 1 §1.2, Stage C).
+# spawned. See `src/web_remote/iroh.rs`.
 iroh = "1"
 # No-echo password prompt for `codemux login`. The CLI has to read a
 # password from a bare SSH session with no GUI, so it needs to flip the

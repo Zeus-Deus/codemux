@@ -94,8 +94,8 @@ export interface LaunchModel {
 /**
  * Maintained model list for Gemini — the one family with no chat
  * capability harvest. Small and hand-updated; Gemini ships a handful of
- * models that change rarely. Tracked as the Gemini arm of the launch
- * model picker (see `docs/plans/model-selection-before-launch.md`).
+ * models that change rarely. This is the Gemini arm of the launch model
+ * picker.
  */
 export const GEMINI_MODELS: LaunchModel[] = [
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },

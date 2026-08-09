@@ -494,9 +494,8 @@ body.pane-resizing iframe {
  * stable across Streamdown releases.
  *
  * Only structure/chrome is styled here, all from design tokens. Syntax token
- * colors are inlined by Shiki from the terminal ANSI palette — see
- * `src/lib/shiki-chat-theme.ts` and the ANSI exception in
- * `docs/reference/DESIGN-SYSTEM.md`.
+ * colors are inlined by Shiki from the terminal ANSI palette; see
+ * `src/lib/shiki-chat-theme.ts`.
  *
  * Syntax token colors are still supplied by the shared Streamdown Shiki
  * plugin. The custom card changes the shell, not the highlighting pipeline.

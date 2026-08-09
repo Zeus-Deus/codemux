@@ -13,8 +13,7 @@
 //!   5. `GET  /ws?ticket=…`   → upgrade, send an invoke frame, and assert the
 //!      id-matched `{"t":"ok","id":1,…}` response arrives.
 //!
-//! This is the WS protocol contract in docs/features/web-remote-access.md
-//! § "WS protocol contract".
+//! This exercises the web-remote WebSocket protocol contract end to end.
 //!
 //! CRITICAL ISOLATION (identical to `serve_headless_dispatch.rs`): a real
 //! Codemux instance may be running on this machine, so `isolate_env` repoints

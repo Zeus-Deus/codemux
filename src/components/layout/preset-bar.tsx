@@ -210,9 +210,8 @@ function PresetBarImpl({
   // so they show up immediately without waiting for the next render.
   // Step 13 — drop chat_agent presets when the master Beta toggle is
   // off so a user who never opted in never sees the affordance. The
-  // preset still exists in the store; we just hide it at the UI layer
-  // (data preservation, see docs/plans/step-13-beta-toggle-research.md
-  // §5).
+  // preset still exists in the store; we just hide it at the UI layer to
+  // preserve its data.
   const allPresets = enableAgentChat
     ? presetStore.presets
     : presetStore.presets.filter((p) => p.kind !== "chat_agent");

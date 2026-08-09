@@ -66,7 +66,7 @@
 //! the same `host_server_id`, `project_remote`, and `git_branch`.
 //! Single-device users (the common case) never hit this.
 //!
-//! Tracked as a known limitation in `docs/features/workspaces-sync.md`.
+//! This is a known limitation.
 
 #![cfg(unix)]
 

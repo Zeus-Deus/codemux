@@ -35,7 +35,7 @@ function disarmPendingTimeout(): void {
  * workspace routes through here, so selection is optimistic, traced and
  * draft-clearing everywhere instead of only on the sidebar.
  *
- * Order matters (`docs/plans/gui-responsiveness.md`, Phase 1): the pending id
+ * Order matters: the pending id
  * is written synchronously, in the click's own task, before the IPC is fired.
  * That single store write is what paints — the sidebar highlight flips and
  * `WorkspaceMain`/`PaneContainer` mount the target pane from workspace data

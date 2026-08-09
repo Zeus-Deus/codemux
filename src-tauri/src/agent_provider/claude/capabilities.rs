@@ -1188,8 +1188,7 @@ fn merge_sdk_with_maintained(
         // serves `usage.speed: "standard"` while the UI claims Fast — a
         // pill that overpromises. Re-enabling requires closing that loop
         // first (pick-time `accountInfo` entitlement gate + post-turn
-        // `usage.speed` heal) — see
-        // docs/research/opus-5-agent-chat-support.md.
+        // `usage.speed` heal).
         supports_fast_mode: false,
         supports_images: true,
         sub_provider: None,

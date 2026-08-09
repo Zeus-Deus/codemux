@@ -126,7 +126,7 @@ pub fn prepare_worktree(
 // An automation run needs the project repo *on the machine the run
 // executes on*. On the desktop / "This machine" that is `project_path`.
 // On a separate host that path does not exist, so the host clones the
-// project's git remote — see `docs/plans/automations-sync.md` Phase F.
+// project's git remote.
 
 /// A project repository resolved to a usable path on this machine, plus
 /// the ref a new worktree should branch off.

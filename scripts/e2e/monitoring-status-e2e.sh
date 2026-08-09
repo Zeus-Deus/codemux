@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end harness for the provider-agnostic "Monitoring" agent status
-# (docs/features/monitoring-status.md).
+# End-to-end harness for the provider-agnostic "Monitoring" agent status.
 #
 # Drives the real control surface — no display, no GUI, no provider. Boots the
 # debug `codemux` binary in headless `serve` mode against a throwaway

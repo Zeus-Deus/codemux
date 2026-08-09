@@ -12,8 +12,8 @@ bash scripts/check-deps.sh
 # Install npm dependencies (also patches agent-browser via postinstall)
 npm install
 
-# Run the full verification suite
-npm run verify
+# Run frontend type checks
+npm run check
 
 # Launch the desktop app in dev mode
 npm run tauri:dev
@@ -82,10 +82,14 @@ Starts only the Vite dev server on `localhost:1420`. Useful for iterating on Rea
 ### Verification
 
 ```bash
-npm run verify
+npm run check
+CARGO_BUILD_JOBS=2 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-Runs the full suite: `cargo check` + `cargo test` + `tsc --noEmit` + `vitest`. Run this before submitting changes.
+Use the smallest relevant check while iterating. Run affected frontend tests with
+`npm run test -- <test-file>` and affected Rust tests with
+`cargo test -j 2 --manifest-path src-tauri/Cargo.toml <filter> -- --test-threads=2`.
+CI owns the full repository-wide suite.
 
 ### CLI
 
@@ -126,7 +130,6 @@ These are not required to build or run Codemux but enable additional features. A
 src/            React + Tailwind v4 + shadcn frontend
 src-tauri/      Rust backend — Tauri 2, CLI, PTY, browser, agent providers
 scripts/        Build and patch helper scripts
-docs/           Canonical project documentation
 ```
 
 ### Frontend Conventions
@@ -141,22 +144,15 @@ docs/           Canonical project documentation
 - Tauri commands split by domain in `src-tauri/src/commands/`
 - App state in `src-tauri/src/state/`
 - Browser runtimes: `src-tauri/src/agent_browser.rs` (primary), `src-tauri/src/browser.rs` (legacy CDP)
-- Workflow orchestration: `src/components/workflow/` and `docs/features/workflow-orchestration.md`
+- Workflow orchestration: `src/components/workflow/`
 
 ## Documentation
 
-Start each session by reading:
-
-1. `WORKFLOW.md` — session bootstrap and doc ownership
-2. `docs/INDEX.md` — canonical docs hub with read order
-3. `AGENTS.md` — agent operating rules (browser automation, Codemux-specific behavior)
-
-Key docs:
-
-- `docs/core/PROJECT.md` — product direction and architecture
-- `docs/core/STATUS.md` — current implementation reality
-- `docs/core/PLAN.md` — roadmap and build order
-- `docs/reference/ARCHITECTURE.md` — repo structure and layer boundaries
+- `README.md` covers the product and installation.
+- This file covers contributor setup and repository conventions.
+- `AGENTS.md` contains concise defaults for coding agents.
+- User-facing product documentation is maintained in the separate Codemux website repository.
+- Current code and tests are authoritative for implementation behavior.
 
 ## Commit Conventions
 
@@ -173,5 +169,5 @@ Use conventional commit prefixes based on the type of change:
 
 1. Fork the repository and create a feature branch
 2. Make your changes
-3. Run `npm run verify` — all checks must pass
+3. Run the relevant focused checks; the full suite runs in CI
 4. Submit a pull request with a clear description of the change

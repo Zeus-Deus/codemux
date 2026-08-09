@@ -106,8 +106,7 @@ function appStoreState() {
     workspacePushPullInFlight: null,
     workspacePushPullStartedAt: null,
     setWorkspacePushPullInFlight: vi.fn(),
-    // Optimistic selection: the activation helper writes these before the
-    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    // Optimistic selection: the activation helper writes these before invoke.
     pendingActiveWorkspaceId: null,
     pendingActivationAt: null,
     beginPendingActivation: vi.fn(),

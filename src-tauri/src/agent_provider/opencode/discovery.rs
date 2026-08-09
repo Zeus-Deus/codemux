@@ -21,10 +21,7 @@ use tokio::process::Command;
 
 use crate::execution::sanitize_gui_env_tokio;
 
-/// Minimum OpenCode CLI version Codemux requires. Mirrors the
-/// reference pin captured in
-/// `docs/plans/step-12-opencode-research.md` §3 and verified against
-/// `/tmp/<reference>/apps/server/src/provider/Layers/OpenCodeProvider.ts:31`.
+/// Minimum OpenCode CLI version Codemux requires.
 /// Versions below this are reported as `installed: true` with the
 /// detected version still attached so the eventual UI can surface a
 /// "please upgrade" hint instead of a hard error.
@@ -104,10 +101,9 @@ impl OpenCodeAvailability {
 /// settings-panel UI needs to render a "url X is/isn't reachable" hint
 /// even when the local binary is absent.
 ///
-/// Spawns are routed through [`sanitize_gui_env_tokio`] (per
-/// `CLAUDE.md` Spawning Child Processes) so an OpenCode binary that
-/// inadvertently launches a GUI helper does not pop windows on the
-/// host display.
+/// Spawns are routed through [`sanitize_gui_env_tokio`] so an OpenCode binary
+/// that inadvertently launches a GUI helper does not pop windows on the host
+/// display.
 pub async fn check_opencode_availability(server_url: Option<String>) -> OpenCodeAvailability {
     let (server_running, server_url) = match server_url {
         Some(url) => {
@@ -261,8 +257,7 @@ mod tests {
     #[test]
     fn minimum_version_constant_matches_reference_pin() {
         // Pinned: changing this value silently changes which OpenCode
-        // versions Codemux warns about. Keep in sync with
-        // `docs/plans/step-12-opencode-research.md` §3.
+        // versions Codemux warns about.
         assert_eq!(MINIMUM_OPENCODE_VERSION, "1.14.19");
     }
 

@@ -592,8 +592,8 @@ enum ReconcileOutcome {
     /// cleanup must NOT run after this — it would kill daemons that
     /// belong to another codemux instance.
     ReconciledFromPidFiles,
-    /// No PID files at all. Either a fresh install or the first launch
-    /// after upgrading past P7. Run the legacy cleanup once so any
+    /// No PID files at all. Either a fresh install or the first launch after
+    /// the PID-file migration. Run the legacy cleanup once so any
     /// orphaned daemons from before the migration get reaped.
     NoStateFound,
 }
@@ -732,10 +732,8 @@ fn resolve_binary() -> String {
     // different extension-handling semantics — on `windows-latest` CI it
     // was returning paths without the `.exe` suffix that looked valid but
     // pointed at non-existent files, breaking downstream callers. The
-    // Windows story for `agent-browser` discovery is tracked under the
-    // "Agent Integration" blocker in docs/plans/windows-support.md — for
-    // now, Windows falls through to the Tauri sidecar lookup and then
-    // the `npx agent-browser` fallback.
+    // Windows discovery is not native yet; for now, Windows falls through to
+    // the Tauri sidecar lookup and then the `npx agent-browser` fallback.
     #[cfg(unix)]
     {
         let mut which_cmd = std::process::Command::new("which");
@@ -1508,8 +1506,7 @@ impl AgentBrowserManager {
     /// Create a new manager and reconcile any agent-browser daemons left
     /// over from a previous app run. The old `new_with_cleanup` did a
     /// blanket `pkill -f agent-browser` plus a 9223–9233 port sweep, which
-    /// is the exact behavior P8 in `docs/plans/browser-stream-fix.md` was
-    /// written to remove: it also nuked daemons started by other codemux
+    /// also nuked daemons started by other codemux
     /// sessions (e.g. the user has two app windows open) and any unrelated
     /// process that happened to bind one of those ports.
     ///
@@ -1523,9 +1520,9 @@ impl AgentBrowserManager {
     ///      Anything else (dead PID, alive PID with a dead port) is
     ///      cleaned up: kill the PID if alive, delete the stale PID file.
     ///   3. The legacy blanket cleanup is *kept as a fallback only* when
-    ///      `~/.codemux/run/` is empty (first run after upgrade), so
-    ///      installations that pre-date P7 still get their orphans reaped
-    ///      once before the new path takes over on the next launch.
+    ///      `~/.codemux/run/` is empty (first run after upgrade), so older
+    ///      installations still get their orphans reaped once before the new
+    ///      path takes over on the next launch.
     pub fn new_with_cleanup() -> Self {
         Self::new_with_adoption()
     }
@@ -1650,7 +1647,7 @@ impl AgentBrowserManager {
                 continue;
             }
 
-            // Symmetric bind-test (P4 from docs/plans/browser-stream-fix.md).
+            // Symmetric bind test.
             // We bind `127.0.0.1:<port>` and immediately drop the listener;
             // if the bind fails some other process (often a dead-PID leak
             // from a previous codemux run, or a separate codemux instance,
@@ -1687,7 +1684,7 @@ impl AgentBrowserManager {
     /// The previous design registered the same port under multiple keys
     /// (workspace_id and cli_session_name) so different code paths could
     /// look up the session by whichever id they had. That dual-keying was
-    /// the root cause of the leaked-alias bug fixed in P2: `close()` only
+    /// the root cause of the leaked-alias bug: `close()` only
     /// cleaned the key it was passed, leaving the alias entry pinning the
     /// port forever.
     ///
@@ -1916,8 +1913,7 @@ impl AgentBrowserManager {
         .map_err(|e| format!("agent-browser screenshot task failed: {e}"))?
     }
 
-    /// Atomic teardown for a session (P3 from
-    /// `docs/plans/browser-stream-fix.md`). Ordered so each step's failure
+    /// Atomic teardown for a session. Ordered so each step's failure
     /// leaves the system in a recoverable state:
     ///
     ///   1. Pop the session from the map under the lock — no other caller
@@ -2028,15 +2024,15 @@ impl AgentBrowserManager {
     ///   2. Set `AGENT_BROWSER_STREAM_PORT` so the daemon binds to our port.
     ///   3. Run `agent-browser open` to trigger daemon + browser launch,
     ///      with stderr redirected to `~/.codemux/run/agent-browser-{name}.log`
-    ///      so the next investigation has a paper trail (P7).
+    ///      so the next investigation has a paper trail.
     ///   4. Probe the port with `probe_stream_port()` — only mark
     ///      `running = true` when we've actually seen a live socket. The
     ///      old "sleep(1s) and trust" approach lied to the frontend when
     ///      the daemon crashed mid-startup, leaving the BrowserPane to
-    ///      retry-loop a dead URL forever (P5).
+    ///      retry-loop a dead URL forever.
     ///   5. Capture the daemon PID from `~/.agent-browser/{name}.pid` and
-    ///      mirror it into our own `~/.codemux/run/{name}.pid` so the
-    ///      next process-tree teardown can target it directly (P1, P7).
+    ///      mirror it into our own `~/.codemux/run/{name}.pid` so the next
+    ///      process-tree teardown can target it directly.
     ///   6. Return the WebSocket URL.
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
@@ -2132,7 +2128,7 @@ impl AgentBrowserManager {
                 session, port
             );
 
-            // P7: stderr to a per-session log file under ~/.codemux/run/.
+            // Send stderr to a per-session log file under ~/.codemux/run/.
             // Best-effort — if we can't open the log file we fall back to the
             // inherited stderr so behavior matches the pre-fix baseline.
             let log_path = session_log_path(&session);
@@ -2203,11 +2199,11 @@ impl AgentBrowserManager {
                 let _ = launch_status_with_timeout(cmd, OPEN_TIMEOUT);
             }
 
-            // P5: real health check. Probe the port up to ~5s; only mark
+            // Probe the port up to ~5s; only mark
             // running when we have actual evidence the daemon is alive.
             let port_alive = probe_stream_port(port, 25, Duration::from_millis(200));
 
-            // P1: capture the daemon's PID. agent-browser writes its PID file
+            // Capture the daemon's PID. agent-browser writes its PID file
             // synchronously while initialising, so by the time the probe
             // succeeds the file should exist. We try once before and once
             // after to handle either ordering.
@@ -2460,8 +2456,7 @@ mod tests {
     // Structurally Linux/macOS only: the assertion hardcodes
     // `agent-browser-linux-x64` / `agent-browser-darwin` binary names.
     // Windows needs its own version once `resolve_binary()` grows a
-    // Windows target-triple branch — tracked under the "Agent
-    // Integration" blocker in docs/plans/windows-support.md.
+    // Windows target-triple branch.
     #[cfg(unix)]
     #[test]
     fn resolve_binary_finds_native_binary_from_project_root() {
@@ -2914,7 +2909,7 @@ Active Connections
         );
     }
 
-    // ── New tests for docs/plans/browser-stream-fix.md (P1–P8) ──
+    // ── Browser stream lifecycle regression tests ──
     //
     // These tests target only behavior that lives entirely in this
     // module: pure helpers and the manager's public surface. The
@@ -2975,16 +2970,15 @@ Active Connections
         assert!(!probe_stream_port(1, 2, Duration::from_millis(10)));
     }
 
-    /// `allocate_port` must reject a port that something else is
-    /// already binding (P4: symmetric bind-test). We bind 9223
+    /// `allocate_port` must reject a port that something else is already
+    /// binding. We bind 9223
     /// ourselves before the manager wakes up and assert the manager
     /// hands out 9224+ instead.
     #[tokio::test]
     async fn allocate_port_skips_bound_ports() {
         // Bind the lowest port in the manager's range so the manager
         // is forced to skip past it. If the bind-test regresses to
-        // Windows-only, this test fails on Linux/macOS — which is
-        // exactly the regression P4 is guarding against.
+        // Windows-only, this test fails on Linux/macOS.
         let blocker = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_STREAM_PORT));
         // If 9223 happens to be unavailable on the test host (another
         // codemux instance running), skip the assertion rather than
