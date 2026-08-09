@@ -41,7 +41,7 @@ import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
-import { SubagentsCard } from "./SubagentsCard";
+import { SubagentWorkLogRow } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserInputAnswer } from "./UserInputAnswer";
@@ -179,7 +179,6 @@ export const MessageList = memo(function MessageList({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
-  onEnterSubagent,
   workspaceId,
 }: Props) {
   // GUI-mode background browser session for this pane's workspace (see
@@ -264,6 +263,7 @@ export const MessageList = memo(function MessageList({
   const tailBody = slots.length > 0 ? slots[slots.length - 1].body : null;
   const tailIsWorkingActivity =
     tailBody?.kind === "activity" && tailBody.working;
+  const tailIsSubagentStretch = tailBody?.kind === "subagent_stretch";
 
   const listRef = useRef<LegendListRef | null>(null);
   const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
@@ -916,9 +916,8 @@ export const MessageList = memo(function MessageList({
     if (!cardId) return -1;
     return slots.findIndex(
       (slot) =>
-        slot.body.kind === "item" &&
-        slot.body.item.kind === "subagent_run" &&
-        slot.body.item.id === cardId,
+        slot.body.kind === "subagent_stretch" &&
+        slot.body.runs.some((run) => run.id === cardId),
     );
   }, [slots, subagentJumpRequest?.cardId]);
 
@@ -997,14 +996,12 @@ export const MessageList = memo(function MessageList({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
-          onEnterSubagent={onEnterSubagent}
         />
       </div>
     ),
     [
       onAcceptPlan,
       onCancelQueued,
-      onEnterSubagent,
       onRejectPlan,
       onRespondToRequest,
       onSendQueuedNow,
@@ -1042,6 +1039,7 @@ export const MessageList = memo(function MessageList({
             <BackgroundBrowserChip
               session={backgroundBrowserSession}
               workspaceId={workspaceId}
+              showLabel={!tailIsSubagentStretch}
             />
           </div>
         )}
@@ -1071,6 +1069,7 @@ export const MessageList = memo(function MessageList({
       stalled,
       streaming,
       tailIsWorkingActivity,
+      tailIsSubagentStretch,
       workspaceId,
     ],
   );
@@ -1326,6 +1325,7 @@ function transcriptSlotsAreEqual(
 /** Stable row type lets LegendList keep separate measured-size averages. */
 function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
+  if (slot.body.kind === "subagent_stretch") return "subagent_stretch";
   return slot.body.item.kind;
 }
 
@@ -1365,7 +1365,6 @@ function ItemRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
-  onEnterSubagent,
   workspaceId,
 }: {
   item: ChatViewItem;
@@ -1378,7 +1377,6 @@ function ItemRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
-  onEnterSubagent?: (subagentId: string) => void;
   workspaceId?: string | null;
 }) {
   const requestId =
@@ -1394,10 +1392,6 @@ function ItemRow({
       if (requestId) onRespondToRequest(requestId, decision);
     },
     [requestId, onRespondToRequest],
-  );
-  const handleEnterSubagent = useCallback(
-    (subagentId: string) => onEnterSubagent?.(subagentId),
-    [onEnterSubagent],
   );
   const handleAcceptPlan = useCallback(() => {
     if (item.kind === "permission_request") return onAcceptPlan(item.request_id);
@@ -1416,10 +1410,11 @@ function ItemRow({
     );
   }
 
-  // The orchestration card is a full-width standalone surface (no avatar
-  // gutter), matching the design.
+  // Canonical subagent runs are merged into `subagent_stretch` slots before
+  // this leaf. Keep the exhaustive fallback inert in case a hand-built slot
+  // reaches this layer.
   if (item.kind === "subagent_run") {
-    return <SubagentsCard item={item} onEnter={handleEnterSubagent} />;
+    return null;
   }
 
   // Same full-width, no-gutter treatment for a Workflow tool run.
@@ -1581,6 +1576,7 @@ function ActivityRow({
 // stable slot key keeps the scroller row from remounting.)
 const ItemRowMemo = memo(ItemRow);
 const ActivityRowMemo = memo(ActivityRow);
+const SubagentWorkLogRowMemo = memo(SubagentWorkLogRow);
 
 /**
  * Whole-row wrapper (level-1 memo — see the comment above the leaf memos). It
@@ -1599,7 +1595,6 @@ function SlotRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
-  onEnterSubagent,
 }: {
   slot: TranscriptSlot;
   provider?: AgentChatProviderKind | null;
@@ -1611,7 +1606,6 @@ function SlotRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
-  onEnterSubagent?: (subagentId: string) => void;
 }) {
   return (
     <div
@@ -1625,6 +1619,11 @@ function SlotRow({
           showAvatar={slot.showAvatar}
           provider={provider}
         />
+      ) : slot.body.kind === "subagent_stretch" ? (
+        <SubagentWorkLogRowMemo
+          runs={slot.body.runs}
+          workspaceId={workspaceId}
+        />
       ) : (
         <ItemRowMemo
           item={slot.body.item}
@@ -1637,7 +1636,6 @@ function SlotRow({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
-          onEnterSubagent={onEnterSubagent}
           workspaceId={workspaceId}
         />
       )}

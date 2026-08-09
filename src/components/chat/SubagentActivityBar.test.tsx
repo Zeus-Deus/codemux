@@ -1,6 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 
 import type { ChatViewItem, SubagentRunItem, SubagentView } from "@/lib/agent-chat/types";
 
@@ -9,6 +16,7 @@ import { SubagentActivityBar } from "./SubagentActivityBar";
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 function subagent(overrides: Partial<SubagentView>): SubagentView {
@@ -68,6 +76,48 @@ describe("SubagentActivityBar", () => {
       <SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />,
     );
     expect(container.firstChild).toBeNull();
+  });
+
+  it("stays hidden while the matching transcript work-log row is visible", async () => {
+    class VisibleIntersectionObserver {
+      constructor(
+        private readonly callback: IntersectionObserverCallback,
+      ) {}
+      observe(target: Element) {
+        this.callback(
+          [{ isIntersecting: true, target } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver,
+        );
+      }
+      disconnect() {}
+      unobserve() {}
+      takeRecords() {
+        return [];
+      }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    const messages: ChatViewItem[] = [
+      card("run-1", [subagent({ id: "a", status: "running" })]),
+    ];
+    render(
+      <>
+        <div data-subagent-card="run-1">
+          <span data-subagent-run-id="run-1" />
+        </div>
+        <SubagentActivityBar
+          messages={messages}
+          threadId="t1"
+          streaming
+          onJump={() => {}}
+        />
+      </>,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId("subagent-activity-bar")).toBeNull();
+    });
   });
 
   it("single running: shows the count + View, and clicking the bar jumps to its card", () => {

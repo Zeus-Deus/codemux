@@ -7,10 +7,13 @@ import type { AgentBrowserSession } from "@/tauri/types";
 interface Props {
   session: AgentBrowserSession;
   workspaceId: string;
+  /** Omit when an immediately preceding subagent row already introduced the
+   *  shared work-log stretch. */
+  showLabel?: boolean;
 }
 
 /**
- * Inline conversation-row chip for a GUI-mode background browser session
+ * Compact conversation-row event for a GUI-mode background browser session
  * (design "Background browser in GUI mode" — see `docs/features/browser.md`).
  *
  * Rendered by `MessageList` as a derived row (not a reducer/`ChatViewItem`)
@@ -19,54 +22,53 @@ interface Props {
  * full width instead of splitting into a pane. Clicking opens the peek
  * overlay (`BrowserPeekOverlay`); it never splits the chat on its own.
  *
- * Indented past the assistant avatar gutter (`w-[29px]` spacer) so it
- * aligns with the rest of the transcript's assistant-side rows.
+ * It deliberately uses the same 32px grammar as subagent work: the thread
+ * records *when* the browser opened, while the context-row indicator remains
+ * the live browser surface.
  */
 export const BackgroundBrowserChip = memo(function BackgroundBrowserChip({
   session,
   workspaceId,
+  showLabel = true,
 }: Props) {
   const open = useBrowserPeekStore((s) => s.open);
   const live = session.is_active;
 
   return (
-    <div className="flex gap-[13px]">
-      <div className="w-[29px] shrink-0" aria-hidden />
+    <div className="min-w-0">
+      {showLabel && (
+        <div className="mb-0.5 pl-0.5 font-mono text-[9px] leading-none lowercase tracking-[0.08em] text-muted-foreground/55">
+          work log
+        </div>
+      )}
       <button
         type="button"
         onClick={() => open(workspaceId)}
-        className="flex min-w-0 flex-1 items-center gap-2.5 rounded-[11px] border border-border bg-status-remote/5 px-3 py-2.5 text-left transition-colors hover:border-status-remote/45"
+        className="group/browser -mx-2 flex h-8 w-[calc(100%+1rem)] min-w-0 items-center gap-2 rounded-md px-2 text-left transition-colors hover:bg-foreground/[0.05]"
       >
-        <span className="relative flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg bg-status-remote/15 text-status-remote">
-          <Globe className="h-4 w-4" aria-hidden />
+        <span className="relative flex size-5 shrink-0 items-center justify-center text-status-remote">
+          <Globe className="size-3.5" strokeWidth={1.7} aria-hidden />
           {live && (
             <span
-              className="cm-blink absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-status-working ring-2 ring-card"
+              className="cm-blink absolute right-0 top-0 size-1.5 rounded-full bg-status-working ring-1 ring-background"
               aria-hidden
             />
           )}
         </span>
-
-        <span className="min-w-0 flex-1">
-          <span className="flex items-center gap-1.5">
-            <span className="text-xs font-semibold text-foreground">
-              Browser opened in background
-            </span>
-            {live && (
-              <span className="rounded bg-status-working/15 px-1.5 text-[9px] font-bold uppercase tracking-wide text-status-working">
-                Live
-              </span>
-            )}
-          </span>
-          <span className="block truncate font-mono text-[11px] text-muted-foreground">
-            {session.current_url ?? "about:blank"}
-            {live ? " · agent is navigating…" : ""}
-          </span>
+        <span className="shrink-0 text-[12px] font-semibold text-foreground/85">
+          Opened the browser
         </span>
-
-        <span className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-[11px] font-medium text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">
+          {session.current_url ?? "about:blank"}
+          {live ? " · navigating" : ""}
+        </span>
+        <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-medium text-foreground/70">
           View
-          <ChevronRight className="h-3 w-3" aria-hidden />
+          <ChevronRight
+            className="size-3 transition-transform group-hover/browser:translate-x-0.5"
+            strokeWidth={1.7}
+            aria-hidden
+          />
         </span>
       </button>
     </div>
