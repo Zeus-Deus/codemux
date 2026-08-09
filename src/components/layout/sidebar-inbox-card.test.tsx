@@ -368,6 +368,20 @@ describe("SidebarInboxCard — background recede", () => {
   });
 });
 
+describe("SidebarInboxCard — working status", () => {
+  it("uses a static workspace mark instead of the thread activity orb", () => {
+    const { container } = renderCard({ status: "working" });
+
+    expect(
+      container.querySelector("[data-workspace-working-icon]"),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector("[data-orb-state]"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Working")).toBeInTheDocument();
+  });
+});
+
 describe("SidebarInboxCard — meta line alignment", () => {
   // jsdom does not lay out, so these assert the DOM contract that *produces*
   // the alignment rather than the pixels: the git-local facts flow from the

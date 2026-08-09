@@ -2853,6 +2853,64 @@ describe("SidebarInbox — unread + woke markers", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("restores Done · review when a completed workspace is marked unread", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Completed result",
+        surfaces: surfaceWithPane("p1"),
+      }),
+      makeWorkspace({ title: "Current work" }),
+    ];
+    activeWorkspaceId = "ws-2";
+    paneStatuses = { p1: "review" };
+    const { container, rerender } = await flushRender();
+
+    const completedCard = () =>
+      container.querySelector('[data-inbox-card="ws-1"]') as HTMLElement;
+    expect(
+      within(completedCard()).getByText("Done · review"),
+    ).toBeInTheDocument();
+
+    // Visiting the result acknowledges it, so the backend drops `review`.
+    activeWorkspaceId = "ws-1";
+    paneStatuses = {};
+    await rerenderInbox(rerender);
+    expect(
+      within(completedCard()).queryByText("Done · review"),
+    ).not.toBeInTheDocument();
+
+    // Once we move away, the explicit inverse gesture restores both claims:
+    // the orange unread dot and the green review-ready state.
+    activeWorkspaceId = "ws-2";
+    await rerenderInbox(rerender);
+    fireEvent.contextMenu(completedCard());
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Mark unread" }),
+    );
+
+    expect(
+      within(completedCard()).getByLabelText('Unread — "Completed result"'),
+    ).toBeInTheDocument();
+    expect(
+      within(completedCard()).getByText("Done · review"),
+    ).toBeInTheDocument();
+
+    // Genuine new work supersedes the restored completion, and once that
+    // work clears the stale review must not return.
+    paneStatuses = { p1: "working" };
+    await rerenderInbox(rerender);
+    expect(within(completedCard()).getByText("Working")).toBeInTheDocument();
+    expect(
+      within(completedCard()).queryByText("Done · review"),
+    ).not.toBeInTheDocument();
+
+    paneStatuses = {};
+    await rerenderInbox(rerender);
+    expect(
+      within(completedCard()).queryByText("Done · review"),
+    ).not.toBeInTheDocument();
+  });
+
   it("badges a card that woke from its snooze and clears it on visit", async () => {
     const base = Date.now();
     persistInbox({ snoozed: [{ id: "ws-1", at: base - 1000, until: base - 1 }] });

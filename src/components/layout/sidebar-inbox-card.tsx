@@ -1,5 +1,13 @@
 import { memo, useEffect, useState } from "react";
-import { AlarmClock, Check, Cloud, Pin, PinOff, Terminal } from "lucide-react";
+import {
+  AlarmClock,
+  Check,
+  CircleDotDashed,
+  Cloud,
+  Pin,
+  PinOff,
+  Terminal,
+} from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
@@ -10,7 +18,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProviderLogo } from "@/components/chat/provider-logo";
-import { AgentOrb } from "@/components/ui/agent-orb";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
   PrStatusIcon,
@@ -332,12 +339,17 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         !status && "font-medium text-muted-foreground/70",
       )}
     >
-      {/* The sidebar sees `pane_statuses`, a five-value enum with no tool
-          name in it, so this orb stays on the neutral working state — it
-          is the "something is alive here" mark, not a readout. The
-          activity-matched states live where the tool is actually visible
-          (the thread and its subagents). */}
-      {isWorking && <AgentOrb size={20} aria-label="Agent working" />}
+      {/* Workspace navigation reports lifecycle, not the agent's current
+          action. Keep its working mark static; the animated activity orb
+          belongs inside the thread where that activity has context. */}
+      {isWorking && (
+        <CircleDotDashed
+          data-workspace-working-icon
+          aria-hidden
+          className="size-3.5"
+          strokeWidth={2}
+        />
+      )}
       {isNeeds && (
         <span className="size-1.5 animate-pulse rounded-full bg-status-attention" />
       )}

@@ -909,6 +909,31 @@ export function SidebarInbox() {
   // `last_visited_at`) is what clears it, so the override can never outlive
   // the truth it is overriding.
   const [manualUnread, setManualUnread] = useState<ReadonlySet<string>>(new Set());
+  // Opening a finished workspace clears its backend `review` status because
+  // the result has been seen. Keep just enough session-local history to make
+  // the inverse gesture honest: if the user later chooses "Mark unread", the
+  // green Done · review claim returns with the unread dot. Any new live status
+  // retires that history, so an old completion can never mask fresh work.
+  const restorableReviewIdsRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (!paneStatuses) return;
+    const presentIds = new Set<string>();
+    for (const ws of allWorkspaces) {
+      const id = ws.workspace_id;
+      presentIds.add(id);
+      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
+      if (status === "review") {
+        restorableReviewIdsRef.current.add(id);
+      } else if (status !== null) {
+        restorableReviewIdsRef.current.delete(id);
+      }
+      // A null status deliberately retains the last review: that is the
+      // transition produced by reading a completed workspace.
+    }
+    for (const id of restorableReviewIdsRef.current) {
+      if (!presentIds.has(id)) restorableReviewIdsRef.current.delete(id);
+    }
+  }, [allWorkspaces, paneStatuses]);
   // Last status observed by the activity effect. A keep-active pin is cleared
   // only by a NEW non-idle status edge, matching the server-side
   // "real activity clears the override" lifecycle. Re-reading an existing
@@ -1036,8 +1061,20 @@ export function SidebarInbox() {
   const matchesFilter = (ws: WorkspaceSnapshot) =>
     !filter || repoByWorkspace.get(ws.workspace_id)?.path === filter;
 
-  const statusOf = (ws: WorkspaceSnapshot) =>
-    paneStatuses ? getWorkspaceStatus(ws.surfaces, paneStatuses) : null;
+  /** Status presented by inbox surfaces. Backend state always wins; the only
+   *  synthetic state is the review the user explicitly restores by marking a
+   *  previously completed workspace unread. Lifecycle effects below continue
+   *  to read the backend status directly. */
+  const statusOf = (ws: WorkspaceSnapshot): ActivePaneStatus | null => {
+    const status = paneStatuses
+      ? getWorkspaceStatus(ws.surfaces, paneStatuses)
+      : null;
+    if (status !== null) return status;
+    return manualUnread.has(ws.workspace_id) &&
+      restorableReviewIdsRef.current.has(ws.workspace_id)
+      ? "review"
+      : null;
+  };
 
   // A pin overrides both parking lifecycles without erasing either persisted
   // shelf entry. Unpinning therefore returns the workspace to the exact shelf
@@ -1966,11 +2003,7 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
-                  status={
-                    paneStatuses
-                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
-                      : null
-                  }
+                  status={statusOf(workspace)}
                   timeUntil={formatTimeUntil(entry.until - now)}
                   onWake={handleWake}
                   onSelect={handleSelect}
@@ -2000,11 +2033,7 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
-                  status={
-                    paneStatuses
-                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
-                      : null
-                  }
+                  status={statusOf(workspace)}
                   time={formatElapsed(now - resolveSettledTimestamp(entry))}
                   unread={isUnread(workspace)}
                   justSettled={justSettledId === workspace.workspace_id}
