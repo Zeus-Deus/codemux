@@ -7,6 +7,7 @@ import type {
   UserMessageItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
 
@@ -25,6 +26,7 @@ export interface TurnFoldBody {
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
   | { kind: "activity"; items: ActivityStep[]; working: boolean }
+  | { kind: "subagent_stretch"; runs: SubagentRunItem[] }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -42,7 +44,10 @@ export interface TranscriptSlot {
 }
 
 type PresentationEntry =
-  | { kind: "item"; item: ChatViewItem }
+  /** `revealed` marks an item the user pulled back out of an expanded turn
+   *  fold — it was explicitly asked for, so the quiet-observation filter
+   *  below leaves it alone. */
+  | { kind: "item"; item: ChatViewItem; revealed?: boolean }
   | { kind: "turn_fold"; body: TurnFoldBody };
 
 interface TurnSegment {
@@ -50,6 +55,31 @@ interface TurnSegment {
   items: ChatViewItem[];
 }
 
+/** A successful observational call carries no signal on its own. Bursts still
+ * roll up into one work-log line; errors, in-flight calls, approvals, and
+ * image-bearing reads always remain visible. */
+function isQuietObservationalTool(step: ActivityStep): boolean {
+  return (
+    step.kind === "tool_call" &&
+    step.status === "done" &&
+    step.approval_request_id == null &&
+    (step.tool_name === "Read" ||
+      step.tool_name === "Grep" ||
+      step.tool_name === "Glob") &&
+    !hasToolResultImages(step.result_content)
+  );
+}
+
+/**
+ * A tool call that folds into the work log. It excludes:
+ *  - approval-gated calls (`approval_request_id` set) — the inline
+ *    approval footer must render on a standalone `ToolCallCard`.
+ *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
+ *    checklist.
+ * (`subagent_run` orchestration events are `kind: "subagent_run"`, not
+ * `tool_call`, so they never satisfy this predicate. Contiguous spawn groups
+ * are merged later into one work-log stretch.)
+ */
 function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&
@@ -259,7 +289,7 @@ function buildPresentationEntries(
         foldInserted = true;
       }
       if (hiddenIds.has(item.id) && !expanded) continue;
-      entries.push({ kind: "item", item });
+      entries.push({ kind: "item", item, revealed: hiddenIds.has(item.id) });
     }
   }
 
@@ -289,19 +319,32 @@ export function buildTranscriptSlots(
   );
   const bodies: SlotBody[] = [];
   let run: ActivityStep[] = [];
+  let runRevealed = false;
   const flush = () => {
     if (run.length === 0) return;
+    const working =
+      workingStepId != null && run.some((step) => step.id === workingStepId);
+    // A lone settled Read/Grep/Glob carries no signal — drop it rather than
+    // leave a one-line work-log row behind. An in-flight one still surfaces,
+    // and so does one the user pulled out of an expanded turn fold.
+    if (
+      !working &&
+      !runRevealed &&
+      run.length === 1 &&
+      isQuietObservationalTool(run[0])
+    ) {
+      run = [];
+      runRevealed = false;
+      return;
+    }
     const hasTool = run.some((step) => step.kind === "tool_call");
     if (hasTool) {
-      bodies.push({
-        kind: "activity",
-        items: run,
-        working: workingStepId != null && run.some((step) => step.id === workingStepId),
-      });
+      bodies.push({ kind: "activity", items: run, working });
     } else {
       for (const step of run) bodies.push({ kind: "item", item: step });
     }
     run = [];
+    runRevealed = false;
   };
 
   for (const entry of entries) {
@@ -319,9 +362,23 @@ export function buildTranscriptSlots(
     }
     if (isActivityStep(item)) {
       run.push(item);
+      if (entry.revealed) runRevealed = true;
       continue;
     }
     flush();
+    if (item.kind === "subagent_run") {
+      // Consecutive spawn groups are one transcript event even when the
+      // reducer stores one canonical run per turn. Non-error turn-ended
+      // markers were already dropped above, so they do not split a stretch;
+      // prose, a visible tool/result, or any other rendered row does.
+      const tail = bodies[bodies.length - 1];
+      if (tail?.kind === "subagent_stretch") {
+        tail.runs.push(item);
+      } else {
+        bodies.push({ kind: "subagent_stretch", runs: [item] });
+      }
+      continue;
+    }
     bodies.push({ kind: "item", item });
   }
   flush();
@@ -395,6 +452,13 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.items.every((item, index) => item === b.items[index])
     );
   }
+  if (a.kind === "subagent_stretch" && b.kind === "subagent_stretch") {
+    if (a.runs.length !== b.runs.length) return false;
+    for (let i = 0; i < a.runs.length; i++) {
+      if (a.runs[i] !== b.runs[i]) return false;
+    }
+    return true;
+  }
   return false;
 }
 
@@ -409,6 +473,12 @@ function slotIdentity(body: SlotBody): {
   }
   if (body.kind === "turn_fold") {
     const id = `turn-fold:${body.turnId}`;
+    return { key: id, messageId: id, scrollAnchor: false };
+  }
+  if (body.kind === "subagent_stretch") {
+    // The first canonical run anchors the visual stretch. Appending another
+    // turn updates this row in place instead of remounting it in LegendList.
+    const id = `subagent-stretch:${body.runs[0].id}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }
   return {

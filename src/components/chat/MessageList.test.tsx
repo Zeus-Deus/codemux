@@ -568,11 +568,12 @@ describe("MessageList activity blocks", () => {
     expect(screen.getByText("Show fewer work entries")).toBeInTheDocument();
   });
 
-  it("renders a lone completed tool call as one compact row", () => {
+  it("keeps a lone successful observational call silent", () => {
     renderList([readCall(0, "/only")]);
     expect(screen.queryByText(/previous tool call/)).toBeNull();
-    expect(screen.getByText("read")).toBeInTheDocument();
-    expect(screen.getByText("/only")).toBeInTheDocument();
+    expect(screen.queryByText("Details")).toBeNull();
+    expect(screen.queryByText("read")).toBeNull();
+    expect(screen.queryByText("/only")).toBeNull();
   });
 
   it("shows one live orb beside the newest streaming action", () => {
@@ -863,7 +864,7 @@ describe("MessageList background browser chip", () => {
     useFeatureFlags.setState({ enableAgentChat: false });
   });
 
-  it("renders the inline chip with the LIVE badge and current URL when the workspace has a live background session (GUI mode on)", () => {
+  it("renders the compact work-log browser event and current URL when the workspace has a live background session (GUI mode on)", () => {
     useFeatureFlags.setState({ enableAgentChat: true });
     setAppStateForBrowserChip({}, [makeBackgroundSession()]);
     render(
@@ -873,8 +874,8 @@ describe("MessageList background browser chip", () => {
         {...noopHandlers}
       />,
     );
-    expect(screen.getByText("Browser opened in background")).toBeInTheDocument();
-    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByText("Opened the browser")).toBeInTheDocument();
+    expect(screen.getByText("work log")).toBeInTheDocument();
     expect(
       screen.getByText(/https:\/\/example\.com\/dashboard/),
     ).toBeInTheDocument();

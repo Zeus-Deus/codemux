@@ -81,8 +81,15 @@ describe("buildTranscriptSlots — activity grouping", () => {
     expect(slots[0].messageId).toBe("run:tc-0");
   });
 
-  it("renders a lone completed tool call as a compact activity row", () => {
+  it("drops a lone successful observational tool call", () => {
     const slots = buildTranscriptSlots([tool(0)]);
+    expect(slots).toHaveLength(0);
+  });
+
+  it("renders a lone completed action as a compact activity row", () => {
+    const slots = buildTranscriptSlots([
+      tool(0, { tool_name: "Bash", input: { command: "npm test" } }),
+    ]);
     expect(slots).toHaveLength(1);
     expect(slots[0].body.kind).toBe("activity");
   });
@@ -299,7 +306,7 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
   });
 });
 
-describe("buildTranscriptSlots — subagent card", () => {
+describe("buildTranscriptSlots — subagent work-log stretches", () => {
   function subagentRun(seq: number): ChatViewItem {
     return {
       kind: "subagent_run",
@@ -317,17 +324,20 @@ describe("buildTranscriptSlots — subagent card", () => {
     };
   }
 
-  it("renders a subagent_run as its own standalone item slot", () => {
+  it("renders a subagent_run as a one-run stretch", () => {
     const slots = buildTranscriptSlots([subagentRun(0)]);
     expect(slots).toHaveLength(1);
-    expect(slots[0].body.kind).toBe("item");
-    expect(slots[0].messageId).toBe("run-0");
+    expect(slots[0].body.kind).toBe("subagent_stretch");
+    expect(slots[0].messageId).toBe("subagent-stretch:run-0");
+    if (slots[0].body.kind === "subagent_stretch") {
+      expect(slots[0].body.runs).toHaveLength(1);
+    }
     // Assistant-side, but never a scroll anchor (not a user turn).
     expect(slots[0].side).toBe("assistant");
     expect(slots[0].scrollAnchor).toBe(false);
   });
 
-  it("breaks a run — the card never folds into an activity block", () => {
+  it("breaks activity — the work-log row never folds into an activity block", () => {
     const slots = buildTranscriptSlots([
       tool(0),
       tool(1),
@@ -335,13 +345,44 @@ describe("buildTranscriptSlots — subagent card", () => {
       tool(3),
       tool(4),
     ]);
-    // The subagent_run is a standalone `item` slot that splits the two
+    // The subagent stretch is a standalone slot that splits the two
     // contiguous tool runs into separate Activity blocks (#124 renamed the
     // folded slot kind `toolGroup` → `activity`).
     expect(slots.map((s) => s.body.kind)).toEqual([
       "activity",
-      "item",
+      "subagent_stretch",
       "activity",
+    ]);
+  });
+
+  it("merges runs across invisible turn-ended markers", () => {
+    const ended: ChatViewItem = {
+      kind: "turn_ended",
+      id: "ended",
+      seq: 1,
+      turn_id: "t1",
+      status: { kind: "success" },
+    };
+    const first = subagentRun(0);
+    const second = subagentRun(2);
+    const slots = buildTranscriptSlots([first, ended, second]);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("subagent_stretch");
+    if (slots[0].body.kind === "subagent_stretch") {
+      expect(slots[0].body.runs).toEqual([first, second]);
+    }
+  });
+
+  it("splits stretches when visible prose lands between runs", () => {
+    const slots = buildTranscriptSlots([
+      subagentRun(0),
+      assistantMsg(1, "First pass is in."),
+      subagentRun(2),
+    ]);
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "subagent_stretch",
+      "item",
+      "subagent_stretch",
     ]);
   });
 });
@@ -429,7 +470,7 @@ describe("buildTranscriptSlots — turn boundaries", () => {
       userMsg(0),
       assistantMsg(1),
       assistantMsg(2),
-      tool(3),
+      tool(3, { tool_name: "Bash", input: { command: "npm test" } }),
     ]);
     const [u, a1, a2, t3] = slots;
     expect(u.showAvatar).toBe(false);

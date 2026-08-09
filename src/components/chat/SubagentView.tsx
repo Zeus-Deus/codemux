@@ -95,6 +95,14 @@ export function SubagentView({
               <div className="border-b border-border/60 pb-2 text-xs text-muted-foreground">
                 {slot.body.label}
               </div>
+            ) : slot.body.kind === "subagent_stretch" ? (
+              <div className="h-8 text-[11px] text-muted-foreground">
+                Ran {slot.body.runs.reduce(
+                  (count, run) => count + run.subagents.length,
+                  0,
+                )}{" "}
+                nested subagents
+              </div>
             ) : (
               <SubItem item={slot.body.item} workspaceId={workspaceId} cwd={cwd} />
             )}

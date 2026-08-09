@@ -30,31 +30,41 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("BackgroundBrowserChip", () => {
-  it("shows the title, LIVE badge, URL, and navigating suffix while live", () => {
+  it("shows a compact work-log event with the URL and navigating suffix", () => {
     render(<BackgroundBrowserChip session={makeSession()} workspaceId="ws-1" />);
-    expect(screen.getByText("Browser opened in background")).toBeInTheDocument();
-    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByText("work log")).toBeInTheDocument();
+    expect(screen.getByText("Opened the browser")).toBeInTheDocument();
     expect(
-      screen.getByText(/https:\/\/example\.com\/dashboard.*agent is navigating…/),
+      screen.getByText(/https:\/\/example\.com\/dashboard.*navigating/),
     ).toBeInTheDocument();
     expect(screen.getByText("View")).toBeInTheDocument();
   });
 
-  it("drops the LIVE badge and navigating suffix once the session is no longer active", () => {
+  it("drops the navigating suffix once the session is no longer active", () => {
     render(
       <BackgroundBrowserChip
         session={makeSession({ is_active: false })}
         workspaceId="ws-1"
       />,
     );
-    expect(screen.queryByText("Live")).not.toBeInTheDocument();
     expect(screen.getByText("https://example.com/dashboard")).toBeInTheDocument();
+  });
+
+  it("can join an existing work-log stretch without repeating the label", () => {
+    render(
+      <BackgroundBrowserChip
+        session={makeSession()}
+        workspaceId="ws-1"
+        showLabel={false}
+      />,
+    );
+    expect(screen.queryByText("work log")).not.toBeInTheDocument();
   });
 
   it("opens the peek overlay for this workspace on click", async () => {
     render(<BackgroundBrowserChip session={makeSession()} workspaceId="ws-1" />);
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
-    await userEvent.click(screen.getByText("Browser opened in background"));
+    await userEvent.click(screen.getByText("Opened the browser"));
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
   });
 });
