@@ -247,7 +247,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
         inTitlebar
           ? // Clear the fixed panel cluster and, on desktop, the native
             // window buttons sitting above this row's right end.
-            { paddingRight: `${topRightReserve(remoteClient)}px` }
+            { paddingRight: `${topRightReserve(remoteClient, true)}px` }
           : undefined
       }
     >

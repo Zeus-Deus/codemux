@@ -26,7 +26,7 @@
  * It used to be 240, back when the panel's tab row had the panel's full
  * width to itself. That row is now the window's titlebar band, so its right
  * end is spoken for by the fixed panel cluster and the native window buttons
- * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 166px on
+ * drawn above it — `topRightReserve()` in `@/lib/titlebar-geometry`, 174px on
  * desktop. At 240 that left about 60px for the tabs *and* the active pane's
  * actions, i.e. no visible tab at all. 360 leaves roughly one full tab plus
  * stubs beside a pane's controls, which is the least this row can do and

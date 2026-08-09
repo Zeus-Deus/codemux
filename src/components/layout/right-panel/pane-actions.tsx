@@ -27,6 +27,7 @@ export function PaneActionButton({
   active = false,
   disabled = false,
   testId,
+  size = "pane",
 }: {
   label: string;
   icon: LucideIcon;
@@ -34,6 +35,8 @@ export function PaneActionButton({
   active?: boolean;
   disabled?: boolean;
   testId?: string;
+  /** Titlebar controls match its 28px sidebar toggle; pane chrome stays dense. */
+  size?: "pane" | "titlebar";
 }) {
   return (
     <Tooltip>
@@ -46,15 +49,23 @@ export function PaneActionButton({
           data-testid={testId}
           onClick={onClick}
           className={cn(
-            "flex size-6 shrink-0 items-center justify-center rounded-md",
+            "flex shrink-0 items-center justify-center",
+            size === "titlebar"
+              ? "size-7 rounded-[min(var(--radius-md),12px)]"
+              : "size-6 rounded-md",
             "transition-colors duration-[120ms]",
             "disabled:pointer-events-none disabled:opacity-40",
             active
               ? "bg-foreground/10 text-foreground"
-              : "text-foreground/42 hover:bg-foreground/8 hover:text-foreground/80",
+              : size === "titlebar"
+                ? "text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
+                : "text-foreground/42 hover:bg-foreground/8 hover:text-foreground/80",
           )}
         >
-          <Icon className="size-[13px]" strokeWidth={1.6} />
+          <Icon
+            className={size === "titlebar" ? "size-3.5" : "size-[13px]"}
+            strokeWidth={size === "titlebar" ? 2 : 1.6}
+          />
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>

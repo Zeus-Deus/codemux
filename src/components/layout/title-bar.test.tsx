@@ -347,16 +347,20 @@ describe("TitleBar chrome gating", () => {
     state.enableAgentChat = true;
     const { getByRole } = renderBar();
 
-    expect(
-      getByRole("button", { name: "Toggle sidebar" }).querySelector(
-        ".lucide-panel-left",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      getByRole("button", { name: "Open panel" }).querySelector(
-        ".lucide-panel-right",
-      ),
-    ).toBeInTheDocument();
+    const sidebarToggle = getByRole("button", { name: "Toggle sidebar" });
+    const panelToggle = getByRole("button", { name: "Open panel" });
+    const sidebarIcon = sidebarToggle.querySelector(".lucide-panel-left");
+    const panelIcon = panelToggle.querySelector(".lucide-panel-right");
+    expect(sidebarIcon).toBeInTheDocument();
+    expect(panelIcon).toBeInTheDocument();
+    expect(sidebarToggle).toHaveClass("size-7");
+    expect(panelToggle).toHaveClass("size-7");
+    expect(sidebarToggle).toHaveClass("text-muted-foreground");
+    expect(panelToggle).toHaveClass("text-muted-foreground");
+    expect(sidebarIcon).toHaveClass("h-3.5", "w-3.5");
+    expect(panelIcon).toHaveClass("size-3.5");
+    expect(sidebarIcon).toHaveAttribute("stroke-width", "2");
+    expect(panelIcon).toHaveAttribute("stroke-width", "2");
   });
 
   it("keeps the open right-panel toggle frameless", () => {
@@ -534,9 +538,11 @@ describe("TitleBar GUI chrome — floating placement", () => {
     // `useSidebarGapWidth` stays on its fallback — which matches
     // `SidebarProvider`'s own default width (256px). The floating band
     // begins six pixels beyond that edge and stops before the fixed panel
-    // cluster (56 + 6) plus the window controls (104).
+    // cluster (one 28px button + 6px) plus the window controls (104). The
+    // hidden expand control must not leave an empty slot while the panel is
+    // closed.
     expect(band.style.left).toBe("262px");
-    expect(band.style.right).toBe("166px");
+    expect(band.style.right).toBe("138px");
   });
 
   it("moves the workspace actions left of an open right panel", () => {
