@@ -99,29 +99,50 @@ impl Default for PortStore {
     }
 }
 
+/// What [`PortStore::load`] does with a file it cannot parse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnCorruption {
+    /// Move the unreadable file aside and carry on with an empty store.
+    ///
+    /// Only correct while holding the store lock. Unlocked, the rename can
+    /// destroy good data: a concurrent writer may already have recovered from
+    /// the same corruption and written a valid store, and renaming *that*
+    /// aside would discard every live reservation.
+    MoveAside,
+    /// Report the corruption and carry on with an empty store, leaving the
+    /// file untouched for whoever holds the lock to deal with.
+    Report,
+}
+
 impl PortStore {
     /// Read the store, falling back to an empty one when the file is missing
     /// or unreadable.
     ///
     /// A corrupt file is recovered from rather than fatal: the store is a
     /// cache of reservations, and refusing to allocate because a half-written
-    /// JSON file exists would leave an agent with no way forward. The old
-    /// contents are moved aside so the damage is inspectable instead of
-    /// silently overwritten.
-    fn load(path: &Path) -> Self {
+    /// JSON file exists would leave an agent with no way forward.
+    fn load(path: &Path, on_corruption: OnCorruption) -> Self {
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
         match serde_json::from_str(&raw) {
             Ok(store) => store,
             Err(error) => {
-                let backup = path.with_extension("json.corrupt");
-                let _ = fs::rename(path, &backup);
-                eprintln!(
-                    "[codemux::ports] {} is not valid JSON ({error}); starting a fresh store, previous contents kept at {}",
-                    path.display(),
-                    backup.display()
-                );
+                match on_corruption {
+                    OnCorruption::MoveAside => {
+                        let backup = path.with_extension("json.corrupt");
+                        let _ = fs::rename(path, &backup);
+                        eprintln!(
+                            "[codemux::ports] {} is not valid JSON ({error}); starting a fresh store, previous contents kept at {}",
+                            path.display(),
+                            backup.display()
+                        );
+                    }
+                    OnCorruption::Report => eprintln!(
+                        "[codemux::ports] {} is not valid JSON ({error}); reporting an empty store",
+                        path.display()
+                    ),
+                }
                 Self::default()
             }
         }
@@ -222,11 +243,13 @@ impl PortStore {
 /// An advisory lock held for the length of a load → mutate → save cycle.
 ///
 /// `create_new` is atomic on every platform we ship, which is enough for a
-/// mutual exclusion primitive without pulling in a locking crate. The lock is
-/// released on drop, and a lock left behind by a killed process is reclaimed
-/// once it goes stale.
+/// mutual exclusion primitive without pulling in a locking crate. Each holder
+/// writes a token that is unique to the acquisition, so a lock file can always
+/// be traced back to the process that created it — that identity is what makes
+/// releasing and reclaiming safe rather than "whatever is at this path".
 struct StoreLock {
     path: PathBuf,
+    token: String,
 }
 
 impl StoreLock {
@@ -243,6 +266,10 @@ impl StoreLock {
             fs::create_dir_all(dir)
                 .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         }
+        // The pid makes a wedged holder identifiable by hand; the uuid makes
+        // the token unique even against a recycled pid or a second attempt
+        // from this same process.
+        let token = format!("{}\n{}", std::process::id(), uuid::Uuid::new_v4());
         let deadline = Instant::now() + timeout;
         loop {
             match fs::OpenOptions::new()
@@ -251,14 +278,19 @@ impl StoreLock {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    // The pid is diagnostic only — it makes a wedged holder
-                    // identifiable without changing how the lock behaves.
-                    let _ = write!(file, "{}", std::process::id());
-                    return Ok(Self { path });
+                    file.write_all(token.as_bytes())
+                        .and_then(|()| file.sync_all())
+                        .map_err(|error| {
+                            format!("cannot write the lock at {}: {error}", path.display())
+                        })?;
+                    return Ok(Self { path, token });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path, stale_after) {
-                        let _ = fs::remove_file(&path);
+                    // Read the holder before judging staleness so the reclaim
+                    // can prove it is moving *this* file and not a fresh lock
+                    // that replaced it in the meantime.
+                    let holder = fs::read_to_string(&path).unwrap_or_default();
+                    if lock_is_stale(&path, stale_after) && reclaim_stale_lock(&path, &holder) {
                         continue;
                     }
                     if Instant::now() >= deadline {
@@ -279,8 +311,65 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Remove the file only while it still carries our token. Deleting by
+        // path alone is what turns one reclaim race into a cascade: a process
+        // whose lock was reclaimed would drop the *next* holder's lock on its
+        // way out, and so on.
+        if fs::read_to_string(&self.path).unwrap_or_default() == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Move a stale lock out of the way so acquisition can retry. Returns whether
+/// the caller should retry immediately.
+///
+/// The move is a `rename` to a name only this call knows. Renaming is atomic,
+/// so of several processes that judged the same lock stale exactly one can win
+/// it; the losers see their rename fail and go back to waiting. Removing the
+/// path directly instead — the obvious version — lets every one of them
+/// "succeed", and a loser's delete then lands on the *fresh* lock the winner
+/// has already created, putting two processes inside the critical section at
+/// once.
+///
+/// Winning the rename is still not proof that the file moved is the stale one:
+/// an earlier winner may have reclaimed and replaced it between the staleness
+/// check and the rename. The moved file is therefore matched against the
+/// holder token observed as stale, and put back untouched when it turns out to
+/// belong to somebody alive.
+fn reclaim_stale_lock(path: &Path, observed_holder: &str) -> bool {
+    let mut reclaimed = path.as_os_str().to_owned();
+    reclaimed.push(format!(".reclaim.{}", uuid::Uuid::new_v4()));
+    let reclaimed = PathBuf::from(reclaimed);
+
+    if fs::rename(path, &reclaimed).is_err() {
+        // Someone else reclaimed it first (or it was released normally).
+        return false;
+    }
+    if fs::read_to_string(&reclaimed).unwrap_or_default() == observed_holder {
+        let _ = fs::remove_file(&reclaimed);
+        return true;
+    }
+
+    // A live lock, created after the observation. Put it back with
+    // `hard_link`, which fails if the path exists rather than overwriting the
+    // way a second `rename` would.
+    match fs::hard_link(&reclaimed, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&reclaimed);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A lock reappeared while ours was moved aside; that one is live
+            // and the copy in hand is redundant.
+            let _ = fs::remove_file(&reclaimed);
+        }
+        Err(_) => {
+            // A filesystem without hard links. Fall back to renaming it back,
+            // which restores the same bytes minus the exclusivity guarantee.
+            let _ = fs::rename(&reclaimed, path);
+        }
+    }
+    false
 }
 
 fn lock_is_stale(path: &Path, stale_after: Duration) -> bool {
@@ -366,7 +455,7 @@ pub fn run(command: PortsCommand) -> Result<(), String> {
         PortsCommand::Allocate { name } => {
             let name = normalize_name(&name)?;
             let _lock = StoreLock::acquire(lock_path(&path))?;
-            let mut store = PortStore::load(&path);
+            let mut store = PortStore::load(&path, OnCorruption::MoveAside);
             let (port, changed) =
                 store.allocate(&worktree, &name, BASE_PORT, MAX_PORT, &port_is_free)?;
             if changed {
@@ -378,8 +467,10 @@ pub fn run(command: PortsCommand) -> Result<(), String> {
         }
         PortsCommand::List => {
             // Read-only, so no lock is needed: the atomic rename in `save`
-            // means a reader sees either the old file or the new one.
-            let store = PortStore::load(&path);
+            // means a reader sees either the old file or the new one. Without
+            // the lock it must not move a corrupt file aside either — see
+            // `OnCorruption::MoveAside`.
+            let store = PortStore::load(&path, OnCorruption::Report);
             eprintln!("worktree: {worktree}");
             match store.ports_for(&worktree) {
                 Some(names) if !names.is_empty() => {
@@ -393,7 +484,7 @@ pub fn run(command: PortsCommand) -> Result<(), String> {
         PortsCommand::Release { name } => {
             let name = normalize_name(&name)?;
             let _lock = StoreLock::acquire(lock_path(&path))?;
-            let mut store = PortStore::load(&path);
+            let mut store = PortStore::load(&path, OnCorruption::MoveAside);
             // Releasing something that isn't allocated is a success, not an
             // error: cleanup usually runs from a trap or a teardown step that
             // can't know whether the allocation happened.
@@ -443,7 +534,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("port_allocations.json");
         store.save(&path).expect("store saves");
-        let mut reloaded = PortStore::load(&path);
+        let mut reloaded = PortStore::load(&path, OnCorruption::MoveAside);
         assert_eq!(allocate(&mut reloaded, WORKTREE_A, "web"), first);
     }
 
@@ -543,15 +634,15 @@ mod tests {
         assert!(err.contains("no free port"), "unexpected message: {err}");
     }
 
-    /// A truncated or hand-mangled store must not wedge allocation. The bad
-    /// file is moved aside so it is still inspectable.
+    /// A truncated or hand-mangled store must not wedge allocation. Under the
+    /// lock the bad file is moved aside so it is still inspectable.
     #[test]
     fn a_corrupt_store_recovers_instead_of_failing() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("port_allocations.json");
         fs::write(&path, "{ \"worktrees\": { truncated").expect("write junk");
 
-        let mut store = PortStore::load(&path);
+        let mut store = PortStore::load(&path, OnCorruption::MoveAside);
         assert!(store.worktrees.is_empty());
         assert!(
             path.with_extension("json.corrupt").exists(),
@@ -562,8 +653,30 @@ mod tests {
         allocate(&mut store, WORKTREE_A, "web");
         store.save(&path).expect("store saves");
         assert_eq!(
-            PortStore::load(&path).ports_for(WORKTREE_A).unwrap().len(),
+            PortStore::load(&path, OnCorruption::MoveAside)
+                .ports_for(WORKTREE_A)
+                .unwrap()
+                .len(),
             1
+        );
+    }
+
+    /// The unlocked reader (`ports list`) must never move a file aside. It can
+    /// only be looking at bytes it read without the lock, so the file it would
+    /// rename may already have been replaced by a valid store that a locked
+    /// writer recovered — renaming that away would drop every reservation.
+    #[test]
+    fn a_corrupt_store_is_left_in_place_without_the_lock() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("port_allocations.json");
+        fs::write(&path, "{ \"worktrees\": { truncated").expect("write junk");
+
+        let store = PortStore::load(&path, OnCorruption::Report);
+        assert!(store.worktrees.is_empty(), "reports an empty store");
+        assert!(path.exists(), "the store file is left alone");
+        assert!(
+            !path.with_extension("json.corrupt").exists(),
+            "an unlocked reader must not move the store aside"
         );
     }
 
@@ -571,7 +684,7 @@ mod tests {
     #[test]
     fn a_missing_store_loads_as_empty() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = PortStore::load(&dir.path().join("nope.json"));
+        let store = PortStore::load(&dir.path().join("nope.json"), OnCorruption::MoveAside);
         assert!(store.worktrees.is_empty());
         assert_eq!(store.schema_version, SCHEMA_VERSION);
     }
@@ -631,6 +744,108 @@ mod tests {
         // ago" without having to fake the file's mtime.
         StoreLock::acquire_with(path, Duration::from_millis(50), Duration::ZERO)
             .expect("a stale lock is reclaimed");
+    }
+
+    /// Only one of several processes that judge the same lock stale may
+    /// reclaim it. The second attempt replays what a loser does: it still
+    /// carries the holder token it observed, and finds the file already gone.
+    #[test]
+    fn only_one_reclaim_of_a_stale_lock_can_win() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("port_allocations.json.lock");
+        fs::write(&path, "stale-holder").expect("plant an orphaned lock");
+
+        assert!(
+            reclaim_stale_lock(&path, "stale-holder"),
+            "the first reclaimer wins the rename"
+        );
+        assert!(!path.exists(), "the winner clears the stale lock");
+        assert!(
+            !reclaim_stale_lock(&path, "stale-holder"),
+            "a loser whose rename finds nothing must not claim a reclaim"
+        );
+    }
+
+    /// The race the token check exists for: a loser gets as far as the rename,
+    /// but by then the winner has already reclaimed and taken a *fresh* lock.
+    /// Deleting by path would drop that live holder out of its critical
+    /// section, so the reclaim must recognise the mismatch and put it back.
+    #[test]
+    fn a_reclaim_that_grabs_a_live_lock_restores_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("port_allocations.json.lock");
+
+        // The winner's fresh lock, sitting where the stale one used to be.
+        let live =
+            StoreLock::acquire_with(path.clone(), Duration::from_millis(50), STALE_LOCK_AFTER)
+                .expect("the winner holds a fresh lock");
+
+        // The loser is still working from the token it observed as stale.
+        assert!(
+            !reclaim_stale_lock(&path, "stale-holder"),
+            "grabbing a live lock is not a successful reclaim"
+        );
+        assert!(path.exists(), "the live lock is put back");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the lock"),
+            live.token,
+            "the restored lock still belongs to its original holder"
+        );
+
+        // And the holder can still release its own lock normally.
+        drop(live);
+        assert!(!path.exists(), "the original holder still owns the release");
+
+        // No reclaim scratch files are left lying around.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".reclaim."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "reclaim files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Releasing must be by identity, not by path. A holder whose lock was
+    /// reclaimed out from under it must not delete whatever now sits there —
+    /// that is what turns a single race into a cascade of stolen locks.
+    #[test]
+    fn dropping_a_lock_never_removes_someone_elses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("port_allocations.json.lock");
+
+        let stolen =
+            StoreLock::acquire_with(path.clone(), Duration::from_millis(50), STALE_LOCK_AFTER)
+                .expect("acquire");
+        // Stand in for "someone reclaimed this lock and took it themselves".
+        fs::write(&path, "a-different-holder").expect("overwrite the lock");
+
+        drop(stolen);
+        assert!(path.exists(), "the other holder's lock survives our drop");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the lock"),
+            "a-different-holder"
+        );
+    }
+
+    /// Every acquisition gets its own token, so two locks are never
+    /// mistaken for each other.
+    #[test]
+    fn each_lock_acquisition_has_a_distinct_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("port_allocations.json.lock");
+
+        let first =
+            StoreLock::acquire_with(path.clone(), Duration::from_millis(50), STALE_LOCK_AFTER)
+                .expect("acquire");
+        let first_token = first.token.clone();
+        drop(first);
+        let second = StoreLock::acquire_with(path, Duration::from_millis(50), STALE_LOCK_AFTER)
+            .expect("re-acquire");
+        assert_ne!(first_token, second.token);
     }
 
     #[test]
