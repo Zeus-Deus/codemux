@@ -110,10 +110,10 @@ interface KeycapProps {
   actionId?: string;
   /**
    * A literal combo for a row whose gesture is handled locally rather than
-   * through the registry (row-scoped keys like F2). Only use it for a combo
-   * nothing else claims — a display-only keycap that duplicates a registry
-   * binding for a different action promises a gesture that does something
-   * else entirely.
+   * through the registry. Only use it for a combo nothing else claims — a
+   * display-only keycap that duplicates a registry binding for a different
+   * action promises a gesture that does something else entirely, and it can't
+   * follow a rebind the way `actionId` does.
    */
   keys?: string;
   className?: string;

@@ -38,6 +38,7 @@ beforeEach(() => {
     showContentSearch: false,
     showCommandPalette: false,
     showNewWorkspaceDialog: false,
+    renameWorkspaceId: null,
   });
   // Restore the store's boot state (GUI on) so a case that opts out
   // doesn't leak into the next one.
@@ -114,6 +115,19 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
   });
 
   describe("other overlays — ordering preserved", () => {
+    it("closes the rename dialog before settings", () => {
+      // The rename dialog opts out of Radix's own Escape dismissal so this
+      // ladder is the single closer: one press must take exactly one layer.
+      useUIStore.setState({ renameWorkspaceId: "ws-1", showSettings: true });
+
+      const handled = dispatch("closeOverlay", FAKE_EVENT);
+
+      expect(handled).toBe(true);
+      const s = useUIStore.getState();
+      expect(s.renameWorkspaceId).toBeNull();
+      expect(s.showSettings).toBe(true);
+    });
+
     it("closes settings when onboarding is not active", () => {
       useUIStore.setState({ showSettings: true });
       const handled = dispatch("closeOverlay", FAKE_EVENT);
@@ -180,6 +194,25 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       useAppStore.setState({ appState: null });
       const handled = dispatch("newAgent", FAKE_EVENT);
       expect(handled).toBe(true);
+    });
+
+    it("renameWorkspace targets the active workspace", () => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "ws-2",
+          workspaces: [
+            { workspace_id: "ws-1", surfaces: [] },
+            { workspace_id: "ws-2", surfaces: [] },
+          ],
+        } as unknown as NonNullable<
+          ReturnType<typeof useAppStore.getState>["appState"]
+        >,
+      });
+
+      const handled = dispatch("renameWorkspace", FAKE_EVENT);
+
+      expect(handled).toBe(true);
+      expect(useUIStore.getState().renameWorkspaceId).toBe("ws-2");
     });
 
     it("showShortcuts opens settings", () => {

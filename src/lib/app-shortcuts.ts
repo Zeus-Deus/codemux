@@ -29,9 +29,11 @@ export function updateAppShortcuts(overrides: Record<string, string>) {
   const shortcuts: AppShortcut[] = [];
 
   for (const [id, entry] of resolved.keybindMap) {
-    // Terminal-level shortcuts are handled inside xterm, not intercepted
+    // `terminal` shortcuts are handled inside xterm, and `non-terminal` ones
+    // deliberately yield to a focused pty — neither belongs in the list of
+    // combos the terminal has to give up.
     const reg = KEYBIND_REGISTRY.find((e) => e.id === id);
-    if (reg?.when === "terminal") continue;
+    if (reg?.when === "terminal" || reg?.when === "non-terminal") continue;
     if (!entry.activeKeys) continue;
 
     const parsed = parseKeyCombo(entry.activeKeys);

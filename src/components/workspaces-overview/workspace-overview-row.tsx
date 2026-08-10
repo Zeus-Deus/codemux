@@ -38,7 +38,6 @@ import {
   closeWorkspace,
   closeWorkspaceWithWorktree,
   workspacesReconcileCopy,
-  renameWorkspace,
   workspaceOpenOnHost,
   workspacePullBack,
   workspacePushToHost,
@@ -156,6 +155,9 @@ function LocalRow({
   const hostsLoaded = useHostsStore((s) => s.loaded);
   const setShowWorkspacesOverview = useUIStore(
     (s) => s.setShowWorkspacesOverview,
+  );
+  const requestRenameWorkspace = useUIStore(
+    (s) => s.requestRenameWorkspace,
   );
   const setPushPullInFlight = useAppStore(
     (s) => s.setWorkspacePushPullInFlight,
@@ -287,17 +289,6 @@ function LocalRow({
       setBusy(false);
     }
   }, [workspace.workspace_id, setPushPullInFlight]);
-
-  const handleRename = useCallback(() => {
-    const next = window.prompt("Rename workspace", workspace.title);
-    if (next && next !== workspace.title) {
-      renameWorkspace(workspace.workspace_id, next).catch((err) =>
-        toast.error("Rename failed", {
-          description: err instanceof Error ? err.message : String(err),
-        }),
-      );
-    }
-  }, [workspace.workspace_id, workspace.title]);
 
   const handleDelete = useCallback(() => {
     const confirmed = window.confirm(
@@ -564,7 +555,11 @@ function LocalRow({
                   <GitBranch className="mr-2 size-3.5" />
                   Copy branch name
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={handleRename}>
+                <DropdownMenuItem
+                  onClick={() =>
+                    requestRenameWorkspace(workspace.workspace_id)
+                  }
+                >
                   <Pencil className="mr-2 size-3.5" />
                   Rename…
                 </DropdownMenuItem>
