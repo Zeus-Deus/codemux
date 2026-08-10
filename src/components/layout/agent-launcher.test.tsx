@@ -155,6 +155,7 @@ beforeEach(() => {
   mocks.createTab.mockClear();
   mocks.createBrowserPane.mockClear();
   mocks.launchDraftWithPreset.mockClear();
+  mocks.setShowSettings.mockClear();
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -179,6 +180,66 @@ describe("AgentLauncher", () => {
     expect(screen.getByText("Terminal")).toBeInTheDocument();
     expect(screen.getByText("Browser")).toBeInTheDocument();
     expect(screen.getByText("Manage presets…")).toBeInTheDocument();
+  });
+
+  it("uses the 1a trailing slot, scrollbar, fades, and fixed footer", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+
+    const cliItem = screen.getByTestId("launcher-cli-builtin-claude");
+    const destination = screen.getByTestId(
+      "launcher-destination-builtin-claude",
+    );
+    const pin = screen.getByTestId("launcher-pin-toggle-builtin-claude");
+    expect(destination).toHaveTextContent("terminal");
+    expect(destination).toHaveClass("group-hover/command-item:hidden");
+    expect(pin).toHaveClass(
+      "hidden",
+      "group-hover/command-item:flex",
+      "group-data-selected/command-item:flex",
+    );
+    expect(
+      cliItem.querySelector('[data-slot="command-item-check"]'),
+    ).toBeNull();
+
+    const list = screen.getByTestId("agent-launcher-list");
+    expect(list).toHaveClass("thin-scrollbar");
+    expect(list).not.toHaveClass("no-scrollbar");
+    expect(list).not.toContainElement(screen.getByText("Manage presets…"));
+
+    Object.defineProperties(list, {
+      clientHeight: { configurable: true, value: 320 },
+      scrollHeight: { configurable: true, value: 640 },
+    });
+    fireEvent.scroll(list);
+    expect(screen.getByTestId("agent-launcher-top-fade")).toHaveAttribute(
+      "data-visible",
+      "false",
+    );
+    expect(screen.getByTestId("agent-launcher-bottom-fade")).toHaveAttribute(
+      "data-visible",
+      "true",
+    );
+
+    list.scrollTop = 320;
+    fireEvent.scroll(list);
+    expect(screen.getByTestId("agent-launcher-top-fade")).toHaveAttribute(
+      "data-visible",
+      "true",
+    );
+    expect(screen.getByTestId("agent-launcher-bottom-fade")).toHaveAttribute(
+      "data-visible",
+      "false",
+    );
+  });
+
+  it("opens the fixed Manage presets footer", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    act(() => {
+      fireEvent.click(screen.getByText("Manage presets…"));
+    });
+    expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
   });
 
   it("launches a chat pane when a GUI preset is chosen", () => {
@@ -268,6 +329,15 @@ describe("DraftAgentLauncher", () => {
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Browser")).toBeNull();
     expect(screen.getByText("Manage presets…")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-chat-agent"),
+    ).toHaveTextContent("in app");
+    expect(
+      screen.getByTestId("launcher-destination-draft-builtin-claude"),
+    ).toHaveTextContent("terminal");
+    expect(screen.getByTestId("draft-agent-launcher-list")).not.toContainElement(
+      screen.getByText("Manage presets…"),
+    );
   });
 
   it("materialises the draft with the chosen CLI preset", () => {
@@ -354,6 +424,10 @@ describe("AgentLauncher — titlebar pin toggle", () => {
     openLauncher();
     const toggle = screen.getByTestId("launcher-pin-toggle-builtin-claude");
     expect(toggle).toHaveAttribute("aria-label", "Unpin from title bar");
+    expect(toggle).toHaveClass("flex", "text-accent-ember");
+    expect(
+      screen.queryByTestId("launcher-destination-builtin-claude"),
+    ).toBeNull();
     const unpinned = screen.getByTestId("launcher-pin-toggle-builtin-codex");
     expect(unpinned).toHaveAttribute("aria-label", "Pin to title bar");
   });
