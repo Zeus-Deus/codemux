@@ -179,10 +179,26 @@ export function WorkspaceHoverCardBody({
       ),
     [detectedPorts, workspace.workspace_id],
   );
-  const runningProcessCount = useMemo(
-    () => new Set(ports.map((port) => port.pid)).size,
-    [ports],
-  );
+  // `pid: 0` is a sentinel, not a process id. The backend stamps it on
+  // Docker-published container ports (one row per published host port) and on
+  // static `.codemux/ports.json` entries, so counting raw pids collapsed a
+  // whole compose stack into "1 running" and claimed a live process for a
+  // workspace that had only *declared* its ports in config.
+  //
+  // Count evidence instead of rows: one per distinct real pid, plus one per
+  // distinct Docker-published port — each of those is a container the daemon
+  // reports as up. Static entries count for nothing; they say the workspace
+  // uses a port, not that anything is listening on it, and the Ports row above
+  // already lists them either way.
+  const runningProcessCount = useMemo(() => {
+    const pids = new Set<number>();
+    const dockerPorts = new Set<number>();
+    for (const p of ports) {
+      if (p.pid !== 0) pids.add(p.pid);
+      else if (p.source === "docker") dockerPorts.add(p.port);
+    }
+    return pids.size + dockerPorts.size;
+  }, [ports]);
   const statusSince = useSidebarDensityStore(
     (s) => s.statusSince[workspace.workspace_id],
   );
@@ -382,9 +398,13 @@ export function WorkspaceHoverCardBody({
           <DetailRow
             label={runningProcessCount === 1 ? "Process" : "Processes"}
             value={
+              // `role="img"` collapses the glyph and its count into one
+              // labelled node, the same way the sidebar indicator does — an
+              // `aria-label` on a bare span is ignored by screen readers.
               <span
+                role="img"
                 aria-label={`${runningProcessCount} running ${runningProcessCount === 1 ? "process" : "processes"}`}
-                className="inline-flex items-center justify-end gap-1.5 text-status-open"
+                className="inline-flex items-center gap-1.5 text-status-open"
               >
                 <Terminal
                   aria-hidden="true"

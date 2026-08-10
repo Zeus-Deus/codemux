@@ -338,6 +338,40 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
     );
   });
 
+  it("uses the singular label for a lone process", () => {
+    detectedPorts = [makePort({ port: 3000, pid: 10 })];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Process")).toBe("1 running");
+    expect(screen.getByLabelText("1 running process")).toBeInTheDocument();
+    expect(screen.queryByText("Processes")).not.toBeInTheDocument();
+  });
+
+  it("counts each Docker-published port, which all share the pid-0 sentinel", () => {
+    detectedPorts = [
+      makePort({ port: 3000, pid: 0, source: "docker", label: "app-web-1" }),
+      makePort({ port: 5432, pid: 0, source: "docker", label: "app-db-1" }),
+      makePort({ port: 6379, pid: 0, source: "docker", label: "app-cache-1" }),
+    ];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Processes")).toBe("3 running");
+  });
+
+  it("makes no running claim for statically configured ports", () => {
+    // `.codemux/ports.json` entries also arrive with pid 0, but they only
+    // declare which ports the workspace uses — nothing proves one is live.
+    detectedPorts = [
+      makePort({ port: 3000, pid: 0, source: null, process_name: "" }),
+      makePort({ port: 8080, pid: 0, source: null, process_name: "" }),
+    ];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Ports")).toBe(":3000 :8080");
+    expect(screen.queryByText("Process")).not.toBeInTheDocument();
+    expect(screen.queryByText("Processes")).not.toBeInTheDocument();
+  });
+
   it("omits the ports row when none are detected", () => {
     renderBody(makeWorkspace());
     expect(screen.queryByText("Port")).not.toBeInTheDocument();
