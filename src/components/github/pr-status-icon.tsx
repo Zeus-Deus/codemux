@@ -61,10 +61,33 @@ const STATE_TO_SETTLED_HOVER: Record<PrStatusState, string> = {
     "group-hover/settled:text-muted-foreground group-focus-within/settled:text-muted-foreground",
 };
 
+/** Deferred PR color for a full-size inbox card that is background work.
+ *  These variants mirror the settled-row map above, but name the card's own
+ *  group. Keeping the maps explicit lets Tailwind discover every variant and
+ *  lets a receded working / monitoring / wrapping-up card stay neutral until
+ *  the user points at it or moves keyboard focus inside it. */
+const STATE_TO_RECEDED_CARD_HOVER: Record<PrStatusState, string> = {
+  merged:
+    "group-hover/card:text-accent-violet group-focus-within/card:text-accent-violet",
+  open: "group-hover/card:text-status-open group-focus-within/card:text-status-open",
+  closed:
+    "group-hover/card:text-destructive group-focus-within/card:text-destructive",
+  draft:
+    "group-hover/card:text-muted-foreground group-focus-within/card:text-muted-foreground",
+};
+
 export function prStatusSettledHoverClass(state: string | null | undefined): string | null {
   const normalized = normalizePrState(state);
   if (!normalized) return null;
   return STATE_TO_SETTLED_HOVER[normalized];
+}
+
+export function prStatusRecededCardHoverClass(
+  state: string | null | undefined,
+): string | null {
+  const normalized = normalizePrState(state);
+  if (!normalized) return null;
+  return STATE_TO_RECEDED_CARD_HOVER[normalized];
 }
 
 export function prStatusToneClass(state: string | null | undefined): string | null {
