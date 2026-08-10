@@ -300,6 +300,7 @@ function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
           icon={maximized ? Minimize2 : Maximize2}
           active={maximized}
           testId="right-panel-maximize"
+          size="titlebar"
           onClick={() => toggleMaximized(workspaceId)}
         />
       )}
@@ -308,6 +309,7 @@ function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
         icon={PanelRight}
         active={open}
         testId="right-panel-toggle"
+        size="titlebar"
         onClick={togglePanel}
       />
     </div>
@@ -729,7 +731,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
             ? `${panelBandWidth + 8}px`
             : // The workspace branch stops before the fixed panel cluster;
               // a draft has no panel cluster to clear, only window buttons.
-              `${guiChrome ? topRightReserve(remoteClient) : remoteClient ? 6 : 104}px`,
+              `${guiChrome ? topRightReserve(remoteClient, false) : remoteClient ? 6 : 104}px`,
         }}
       >
         <div
