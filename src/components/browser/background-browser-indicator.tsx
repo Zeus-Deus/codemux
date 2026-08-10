@@ -1,6 +1,5 @@
 import { Globe } from "lucide-react";
 import { useGuiChrome } from "@/hooks/use-gui-chrome";
-import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import type { AgentBrowserSession, AppStateSnapshot } from "@/tauri/types";
@@ -57,29 +56,32 @@ export function BackgroundBrowserIndicator({
   variant?: "chip" | "pane-header";
 }) {
   const openPeek = useBrowserPeekStore((s) => s.open);
+
+  if (variant === "pane-header") {
+    return (
+      <button
+        type="button"
+        onClick={() => openPeek(workspaceId)}
+        aria-label="Browser running in background — view"
+        title="View background browser"
+        className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-status-remote transition-colors hover:bg-status-remote/15 hover:text-status-remote focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-remote/50"
+      >
+        <Globe className="size-3.5" aria-hidden />
+      </button>
+    );
+  }
+
   return (
     <button
       type="button"
       onClick={() => openPeek(workspaceId)}
       aria-label="Browser running in background — view"
-      title={variant === "pane-header" ? "View background browser" : undefined}
-      className={cn(
-        "inline-flex shrink-0 items-center rounded-md border border-status-remote/30 bg-status-remote/10 font-semibold text-status-remote transition-colors hover:bg-status-remote/16 hover:text-foreground",
-        variant === "pane-header"
-          ? "h-5 gap-1 px-1.5 text-[10px]"
-          : "h-[26px] gap-1.5 px-2.5 text-[11px]",
-      )}
+      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-status-remote/30 bg-status-remote/10 px-2.5 text-[11px] font-semibold text-status-remote transition-colors hover:bg-status-remote/16 hover:text-foreground"
     >
-      <Globe
-        className={variant === "pane-header" ? "size-2.5" : "size-3"}
-        aria-hidden
-      />
+      <Globe className="size-3" aria-hidden />
       Browser
       <span
-        className={cn(
-          "cm-blink rounded-full bg-status-working",
-          variant === "pane-header" ? "size-1" : "size-1.5",
-        )}
+        className="cm-blink size-1.5 rounded-full bg-status-working"
         aria-hidden
       />
     </button>

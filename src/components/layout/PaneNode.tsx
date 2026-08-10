@@ -342,6 +342,7 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
             )}
             data-terminal-pane-actions
           >
+            <TerminalBackgroundBrowserIndicator active={isActive} />
             <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
               <SplitSquareHorizontal />
             </Button>
@@ -352,7 +353,6 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
               <X />
             </Button>
           </div>
-          <TerminalBackgroundBrowserIndicator active={isActive} />
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
           <TerminalPane
