@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
@@ -235,7 +235,7 @@ describe("SidebarInboxCard — snooze affordance", () => {
   });
 
   it("keeps the hover cluster pinned open while the snooze menu is open", async () => {
-    renderCard();
+    const { card } = renderCard();
     const trigger = screen.getByRole("button", { name: 'Snooze "Ship it"' });
     // The reveal rides the cluster the buttons share, not each button, so the
     // three actions can never half-appear.
@@ -249,6 +249,10 @@ describe("SidebarInboxCard — snooze affordance", () => {
     // the card can no longer collapse the trigger out from under it.
     expect(cluster.className).not.toContain("hidden");
     expect(cluster.className).toContain("flex");
+    // The menu portal owns pointer/focus now, but the card must stay visually
+    // restored for the duration of that interaction.
+    expect(card.className).not.toContain("opacity-70");
+    expect(within(card).getByText("M").className).not.toContain("grayscale");
   });
 
   it("snoozes to the chosen preset's instant without activating the workspace", async () => {
@@ -341,6 +345,47 @@ describe("SidebarInboxCard — background recede", () => {
     expect(card.className).toContain("focus-within:opacity-100");
   });
 
+  it("neutralizes a background card's colors until hover or focus", () => {
+    const { card } = renderCard({
+      status: "working",
+      workspace: makeWorkspace({
+        git_additions: 38,
+        git_deletions: 12,
+        pr_number: 87,
+        pr_state: "open",
+        pr_url: "https://example.test/pr/87",
+      }),
+    });
+
+    const avatar = screen.getByText("M");
+    expect(avatar.className).toContain("grayscale");
+    expect(avatar.className).toContain("group-hover/card:grayscale-0");
+
+    const title = screen.getByText("Ship it");
+    expect(title.className).toContain("text-muted-foreground/80");
+    expect(title.className).toContain("group-hover/card:text-foreground");
+
+    const workingState = screen.getByText("Working").parentElement;
+    expect(workingState?.className).toContain("text-muted-foreground/70");
+    expect(workingState?.className).toContain("group-hover/card:text-status-working");
+
+    const additions = screen.getByText("+38");
+    const deletions = screen.getByText("−12");
+    expect(additions.className).toContain("text-muted-foreground/70");
+    expect(additions.className).toContain("group-hover/card:text-status-open/80");
+    expect(deletions.className).toContain("text-muted-foreground/70");
+    expect(deletions.className).toContain(
+      "group-focus-within/card:text-status-attention/80",
+    );
+
+    const pr = screen.getByRole("button", { name: "Pull request #87 — open" });
+    expect(pr.className).toContain("text-muted-foreground/65");
+    expect(pr.className).toContain("group-hover/card:text-status-open");
+    expect(pr.className).not.toMatch(/(^|\s)text-status-open\b/);
+    expect(pr.querySelector("svg")?.getAttribute("class")).toContain("text-current");
+    expect(card.className).toContain("opacity-70");
+  });
+
   it("dims an idle background card the same way", () => {
     const { card } = renderCard({ status: null });
     expect(card.className).toContain("opacity-70");
@@ -371,6 +416,28 @@ describe("SidebarInboxCard — background recede", () => {
       expect(card.className, label).not.toContain("opacity-70");
       cleanup();
     }
+  });
+
+  it("keeps semantic colors on the workspace currently being viewed", () => {
+    renderCard({
+      isActive: true,
+      status: "working",
+      workspace: makeWorkspace({
+        git_additions: 8,
+        git_deletions: 3,
+        pr_number: 12,
+        pr_state: "open",
+        pr_url: "https://example.test/pr/12",
+      }),
+    });
+
+    expect(screen.getByText("M").className).not.toContain("grayscale");
+    expect(screen.getByText("Ship it").className).toContain("text-foreground");
+    expect(screen.getByText("+8").className).toContain("text-status-open/80");
+    expect(screen.getByText("−3").className).toContain("text-status-attention/80");
+    expect(
+      screen.getByRole("button", { name: "Pull request #12 — open" }).className,
+    ).toContain("text-status-open");
   });
 });
 
@@ -637,20 +704,26 @@ describe("SidebarInboxCard — working duration", () => {
 });
 
 describe("SidebarInboxCard — monitoring status", () => {
-  it("labels the eyebrow Monitoring in the dedicated tone", () => {
+  it("defers the Monitoring tone until the background card is engaged", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
-    expect(screen.getByText("Monitoring")).toBeInTheDocument();
-    expect(card.innerHTML).toContain("text-status-monitoring");
-    expect(card.innerHTML).toContain("bg-status-monitoring");
+    const label = screen.getByText("Monitoring");
+    expect(label.className).toContain("text-muted-foreground/70");
+    expect(label.className).toContain("group-hover/card:text-status-monitoring");
+    const dot = [...card.querySelectorAll("span")].find((element) =>
+      element.className.includes("group-hover/card:bg-status-monitoring"),
+    );
+    expect(dot?.className).toContain("bg-muted-foreground/60");
   });
 
   // The whole point of a separate status: monitoring is calm. A pulsing dot
   // is this app's "look at me" vocabulary and belongs to `permission` alone.
   it("renders a steady dot with no pulse", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
-    const dot = card.querySelector(".bg-status-monitoring") as HTMLElement;
-    expect(dot).not.toBeNull();
-    expect(dot.className).not.toContain("animate");
+    const dot = [...card.querySelectorAll("span")].find((element) =>
+      element.className.includes("group-hover/card:bg-status-monitoring"),
+    );
+    expect(dot).toBeDefined();
+    expect(dot?.className).not.toContain("animate");
   });
 
   // Settle/Snooze are guarded only against live and blocked agents. A

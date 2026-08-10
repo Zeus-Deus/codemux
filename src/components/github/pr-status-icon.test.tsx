@@ -1,7 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, afterEach } from "vitest";
 import { render, cleanup } from "@testing-library/react";
-import { PrStatusIcon, prStatusSettledHoverClass } from "./pr-status-icon";
+import {
+  PrStatusIcon,
+  prStatusRecededCardHoverClass,
+  prStatusSettledHoverClass,
+} from "./pr-status-icon";
 
 afterEach(cleanup);
 
@@ -44,5 +48,22 @@ describe("PrStatusIcon", () => {
     );
     expect(prStatusSettledHoverClass("weird")).toBeNull();
     expect(prStatusSettledHoverClass(null)).toBeNull();
+  });
+
+  it("defers each state's color to a receded card's hover/focus variants", () => {
+    expect(prStatusRecededCardHoverClass("MERGED")).toContain(
+      "group-hover/card:text-accent-violet",
+    );
+    expect(prStatusRecededCardHoverClass("open")).toContain(
+      "group-focus-within/card:text-status-open",
+    );
+    expect(prStatusRecededCardHoverClass("closed")).toContain(
+      "group-hover/card:text-destructive",
+    );
+    expect(prStatusRecededCardHoverClass("draft")).toContain(
+      "group-hover/card:text-muted-foreground",
+    );
+    expect(prStatusRecededCardHoverClass("weird")).toBeNull();
+    expect(prStatusRecededCardHoverClass(null)).toBeNull();
   });
 });

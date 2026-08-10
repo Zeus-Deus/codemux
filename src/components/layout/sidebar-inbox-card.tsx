@@ -22,6 +22,7 @@ import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
   PrStatusIcon,
   normalizePrState,
+  prStatusRecededCardHoverClass,
   prStatusTextClass,
 } from "@/components/github/pr-status-icon";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
@@ -310,6 +311,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // instead — the actions stay up and the state cluster stays down until the
   // menu closes and Radix returns focus to the trigger inside the card.
   const actionsPinned = snoozeMenuOpen;
+  // The open menu is an active interaction even though its portal has taken
+  // both pointer and focus away from the card. Treat it like hover/focus for
+  // the whole visual contract, not just the root opacity, so descendants do
+  // not fall back to grayscale while the user is operating the card.
+  const visuallyReceded = receded && !actionsPinned;
 
   /** Shared shape for the eyebrow's hover-revealed actions: borderless,
    *  transparent, one muted ink that resolves to full foreground on the
@@ -339,9 +345,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           (actionsPinned
             ? "hidden"
             : "group-hover/card:hidden group-focus-within/card:hidden"),
-        isWorking && "font-semibold text-status-working",
+        isWorking &&
+          (visuallyReceded
+            ? "font-medium text-muted-foreground/70 group-hover/card:text-status-working group-focus-within/card:text-status-working"
+            : "font-semibold text-status-working"),
         isNeeds && "font-semibold text-status-attention",
-        isMonitoring && "font-semibold text-status-monitoring",
+        isMonitoring &&
+          (visuallyReceded
+            ? "font-medium text-muted-foreground/70 group-hover/card:text-status-monitoring group-focus-within/card:text-status-monitoring"
+            : "font-semibold text-status-monitoring"),
         isDone && "font-semibold text-status-open",
         !status && "font-medium text-muted-foreground/70",
       )}
@@ -363,7 +375,14 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       {/* Steady dot, deliberately not the configurable WorkingIndicator and
           deliberately not animated: monitoring is calm background presence. */}
       {isMonitoring && (
-        <span className="size-1.5 rounded-full bg-status-monitoring" />
+        <span
+          className={cn(
+            "size-1.5 rounded-full transition-colors",
+            visuallyReceded
+              ? "bg-muted-foreground/60 group-hover/card:bg-status-monitoring group-focus-within/card:bg-status-monitoring"
+              : "bg-status-monitoring",
+          )}
+        />
       )}
       {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
       {isWorking ? (
@@ -498,8 +517,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // open menu out of this card, so the pointer has left and
                 // focus sits outside — neither restore would hold, and the
                 // card the user is actively operating on would dim mid-menu.
-                receded &&
-                  !actionsPinned &&
+                visuallyReceded &&
                   "opacity-70 hover:opacity-100 focus-within:opacity-100",
               )}
             >
@@ -530,7 +548,11 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   cacheBust={appearance.imageVersion}
                   size="sm"
                   shape="square"
-                  className="shrink-0 font-bold"
+                  className={cn(
+                    "shrink-0 font-bold transition-[opacity,filter] duration-150",
+                    visuallyReceded &&
+                      "opacity-55 grayscale group-hover/card:opacity-100 group-hover/card:grayscale-0 group-focus-within/card:opacity-100 group-focus-within/card:grayscale-0",
+                  )}
                 />
                 <span className="min-w-0 truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
                   {repo.name}
@@ -707,7 +729,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 )}
                 <span
                   className={cn(
-                    "truncate text-[13px] leading-[1.35] text-foreground",
+                    "truncate text-[13px] leading-[1.35] transition-colors duration-150",
+                    visuallyReceded
+                      ? "text-muted-foreground/80 group-hover/card:text-foreground group-focus-within/card:text-foreground"
+                      : "text-foreground",
                     // The extra weight is what makes an unread card readable
                     // as unread at a glance down a scrolling list, where a
                     // 6px dot alone is easy to sweep past.
@@ -764,12 +789,24 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 {hasStats && (
                   <span className="shrink-0 tabular-nums">
                     {workspace.git_additions > 0 && (
-                      <span className="text-status-open/80">
+                      <span
+                        className={cn(
+                          visuallyReceded
+                            ? "text-muted-foreground/70 transition-colors group-hover/card:text-status-open/80 group-focus-within/card:text-status-open/80"
+                            : "text-status-open/80",
+                        )}
+                      >
                         +{workspace.git_additions}
                       </span>
                     )}{" "}
                     {workspace.git_deletions > 0 && (
-                      <span className="text-status-attention/80">
+                      <span
+                        className={cn(
+                          visuallyReceded
+                            ? "text-muted-foreground/70 transition-colors group-hover/card:text-status-attention/80 group-focus-within/card:text-status-attention/80"
+                            : "text-status-attention/80",
+                        )}
+                      >
                         −{workspace.git_deletions}
                       </span>
                     )}
@@ -789,7 +826,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={cn(
                       "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-[10px] font-medium",
                       "transition-colors duration-150",
-                      prStatusTextClass(prState),
+                      visuallyReceded
+                        ? cn(
+                            "text-muted-foreground/65",
+                            prStatusRecededCardHoverClass(prState),
+                          )
+                        : prStatusTextClass(prState),
                       workspace.pr_url
                         ? "hover:bg-foreground/[0.055]"
                         : // `cursor-default`, not `pointer-events-none`: the
@@ -801,7 +843,14 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           "cursor-default opacity-65",
                     )}
                   >
-                    <PrStatusIcon state={prState} size={3} className="shrink-0" />
+                    <PrStatusIcon
+                      state={prState}
+                      size={3}
+                      className={cn(
+                        "shrink-0",
+                        visuallyReceded && "text-current",
+                      )}
+                    />
                     {workspace.pr_number != null && (
                       <span>{providerRef(scProvider, workspace.pr_number)}</span>
                     )}
@@ -831,7 +880,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       role="img"
                       aria-label={`Long-running process on :${runningPort}`}
                       title={`Long-running process on :${runningPort}`}
-                      className="flex shrink-0 animate-pulse items-center text-status-open"
+                      className={cn(
+                        "flex shrink-0 animate-pulse items-center transition-colors",
+                        visuallyReceded
+                          ? "text-muted-foreground/60 group-hover/card:text-status-open group-focus-within/card:text-status-open"
+                          : "text-status-open",
+                      )}
                     >
                       <Terminal className="size-3" strokeWidth={1.7} />
                     </span>
@@ -840,13 +894,23 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     <ProviderLogo
                       key={p}
                       provider={p}
-                      className="h-[13px] w-[13px] opacity-80"
+                      className={cn(
+                        "h-[13px] w-[13px] transition-[opacity,filter]",
+                        visuallyReceded
+                          ? "opacity-50 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
+                          : "opacity-80",
+                      )}
                     />
                   ))}
                   {isRemote && (
                     <Cloud
                       aria-label="Runs on a remote host"
-                      className="h-[13px] w-[13px] shrink-0 text-status-remote"
+                      className={cn(
+                        "h-[13px] w-[13px] shrink-0 transition-colors",
+                        visuallyReceded
+                          ? "text-muted-foreground/60 group-hover/card:text-status-remote group-focus-within/card:text-status-remote"
+                          : "text-status-remote",
+                      )}
                     />
                   )}
                   {workspace.notification_count > 0 && (
