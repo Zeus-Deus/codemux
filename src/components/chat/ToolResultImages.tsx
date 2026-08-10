@@ -1,7 +1,11 @@
 import { useState } from "react";
 import { ImageOff } from "lucide-react";
 
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import {
+  ImageLightbox,
+  IMAGE_LIGHTBOX_FALLBACK_CLASS,
+  IMAGE_LIGHTBOX_MEDIA_CLASS,
+} from "@/components/chat/ImageLightbox";
 import type { ToolResultImage } from "@/lib/agent-chat/tool-result-images";
 
 /**
@@ -30,19 +34,15 @@ export function ToolResultImages({ images }: { images: ToolResultImage[] }) {
         />
       ))}
 
-      <Dialog
+      <ImageLightbox
         open={lightboxImage !== undefined}
         onOpenChange={(open) => {
           if (!open) setLightboxIndex(null);
         }}
+        title="Tool result image"
       >
-        <DialogContent className="max-w-[92vw] border-none bg-transparent p-0 shadow-none sm:max-w-[92vw]">
-          <DialogTitle className="sr-only">Tool result image</DialogTitle>
-          {lightboxImage ? (
-            <LightboxImage image={lightboxImage} />
-          ) : null}
-        </DialogContent>
-      </Dialog>
+        {lightboxImage ? <LightboxImage image={lightboxImage} /> : null}
+      </ImageLightbox>
     </div>
   );
 }
@@ -94,7 +94,7 @@ function LightboxImage({ image }: { image: ToolResultImage }) {
 
   if (failed) {
     return (
-      <div className="flex h-[60vh] w-full flex-col items-center justify-center gap-2 rounded-lg bg-muted/40 text-muted-foreground">
+      <div className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
         <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
         <span className="text-xs">Failed to load image</span>
       </div>
@@ -105,7 +105,7 @@ function LightboxImage({ image }: { image: ToolResultImage }) {
     <img
       src={image.src}
       alt={image.mediaType ?? "tool result image"}
-      className="mx-auto max-h-[88vh] w-auto max-w-full rounded-lg object-contain"
+      className={IMAGE_LIGHTBOX_MEDIA_CLASS}
       onError={() => setFailed(true)}
     />
   );

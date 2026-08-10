@@ -2,10 +2,10 @@ import { memo, useCallback, useState } from "react";
 import { CornerDownLeft, ImageOff, X } from "lucide-react";
 
 import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  ImageLightbox,
+  IMAGE_LIGHTBOX_FALLBACK_CLASS,
+  IMAGE_LIGHTBOX_MEDIA_CLASS,
+} from "@/components/chat/ImageLightbox";
 import { isAbsoluteFsPath, resolveAssetSrc } from "@/lib/asset-url";
 import { readChatImage } from "@/tauri/commands";
 import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
@@ -169,22 +169,15 @@ export const UserMessage = memo(function UserMessage({
         ) : null}
       </div>
 
-      {/* Lightbox — reuses the shared Dialog so Esc / click-outside close
-          for free (matches project-image-dialog). Near-fullscreen,
-          object-contain so no image is cropped. */}
-      <Dialog
+      <ImageLightbox
         open={lightboxImage !== undefined}
         onOpenChange={(open) => {
           if (!open) setLightboxIndex(null);
         }}
+        title="Attached image"
       >
-        <DialogContent className="max-w-[92vw] border-none bg-transparent p-0 shadow-none sm:max-w-[92vw]">
-          <DialogTitle className="sr-only">Attached image</DialogTitle>
-          {lightboxImage ? (
-            <LightboxImage image={lightboxImage} />
-          ) : null}
-        </DialogContent>
-      </Dialog>
+        {lightboxImage ? <LightboxImage image={lightboxImage} /> : null}
+      </ImageLightbox>
     </div>
   );
 });
@@ -237,7 +230,7 @@ function LightboxImage({ image }: { image: UserMessageImage }) {
 
   if (failed || !src) {
     return (
-      <div className="flex h-[60vh] w-full flex-col items-center justify-center gap-2 rounded-lg bg-muted/40 text-muted-foreground">
+      <div className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
         <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
         <span className="text-xs">Failed to load image</span>
       </div>
@@ -248,7 +241,7 @@ function LightboxImage({ image }: { image: UserMessageImage }) {
     <img
       src={src}
       alt={image.mediaType ?? "attached image"}
-      className="mx-auto max-h-[88vh] w-auto max-w-full rounded-lg object-contain"
+      className={IMAGE_LIGHTBOX_MEDIA_CLASS}
       onError={onError}
     />
   );

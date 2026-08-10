@@ -2,11 +2,10 @@ import { useCallback, useRef, useState, type ReactNode } from "react";
 import { ImageIcon, ImageOff, Maximize2 } from "lucide-react";
 
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogTitle,
-} from "@/components/ui/dialog";
+  ImageLightbox,
+  IMAGE_LIGHTBOX_FALLBACK_CLASS,
+  IMAGE_LIGHTBOX_MEDIA_CLASS,
+} from "@/components/chat/ImageLightbox";
 import { resolveAssetSrc } from "@/lib/asset-url";
 import { readLocalChatImage } from "@/tauri/commands";
 
@@ -166,15 +165,14 @@ export function MarkdownLocalImage({
         </span>
       </button>
 
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="w-fit max-w-[94vw] border-none bg-transparent p-0 shadow-none sm:max-w-[94vw]">
-          <DialogTitle className="sr-only">{caption}</DialogTitle>
-          <DialogDescription className="sr-only">
-            Full-size preview of {caption}
-          </DialogDescription>
-          <ExpandedImage path={path} caption={caption} />
-        </DialogContent>
-      </Dialog>
+      <ImageLightbox
+        open={open}
+        onOpenChange={setOpen}
+        title={caption}
+        description={`Full-size preview of ${caption}`}
+      >
+        <ExpandedImage path={path} caption={caption} />
+      </ImageLightbox>
     </span>
   );
 }
@@ -184,7 +182,7 @@ function ExpandedImage({ path, caption }: { path: string; caption: string }) {
 
   if (image.failed || !image.src) {
     return (
-      <span className="flex h-[60vh] w-full flex-col items-center justify-center gap-2 rounded-xl bg-muted text-muted-foreground">
+      <span className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
         <ImageOff className="size-8 opacity-50" aria-hidden />
         <span className="text-sm">Failed to load {caption}</span>
       </span>
@@ -195,7 +193,7 @@ function ExpandedImage({ path, caption }: { path: string; caption: string }) {
     <img
       src={image.src}
       alt={caption}
-      className="mx-auto max-h-[90vh] w-auto max-w-full rounded-lg object-contain shadow-2xl"
+      className={IMAGE_LIGHTBOX_MEDIA_CLASS}
       onError={image.onError}
     />
   );
