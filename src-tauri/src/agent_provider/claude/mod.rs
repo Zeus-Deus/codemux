@@ -264,14 +264,14 @@ impl AgentProvider for ClaudeAgentProvider {
         &self,
         thread_id: ThreadId,
         queued_id: String,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<bool, ProviderError> {
         let session = {
             let sessions = self.sessions.read().await;
             sessions.get(&thread_id).cloned()
         };
         // A missing session means nothing is queued — treat as a no-op.
         let Some(session) = session else {
-            return Ok(());
+            return Ok(false);
         };
         session.cancel_queued(&queued_id).await
     }

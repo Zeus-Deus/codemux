@@ -266,13 +266,13 @@ impl AgentProvider for CodexAgentProvider {
         &self,
         thread_id: ThreadId,
         queued_id: String,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<bool, ProviderError> {
         let session = {
             let sessions = self.sessions.read().await;
             sessions.get(&thread_id).cloned()
         };
         let Some(session) = session else {
-            return Ok(());
+            return Ok(false);
         };
         session.cancel_queued(&queued_id).await
     }

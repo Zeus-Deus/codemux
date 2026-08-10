@@ -2274,10 +2274,12 @@ const handlers: Record<string, Handler> = {
       queuedId: string;
     };
     const q = chatQueues.get(threadId);
+    let removed = false;
     if (q) {
       const idx = q.findIndex((e) => e.queuedId === queuedId);
       if (idx >= 0) {
         q.splice(idx, 1);
+        removed = true;
         emitChatEvent(threadId, {
           type: "queued_turn_cancelled",
           thread_id: threadId,
@@ -2285,7 +2287,7 @@ const handlers: Record<string, Handler> = {
         });
       }
     }
-    return undefined;
+    return removed;
   },
   agent_chat_send_queued_turn_now: (a) => {
     const { threadId, queuedId } = a as {

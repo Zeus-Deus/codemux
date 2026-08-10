@@ -1081,6 +1081,37 @@ function findQueuedUserMessage(
   );
 }
 
+/** Promote a queued bubble into the normal transcript at dispatch time.
+ *
+ * The live `queued_turn_dispatched` event is not durable, but the
+ * `user_message` envelope written at the same boundary is. Both paths use
+ * this helper so a pane that missed the live event can still reconcile its
+ * warm queued bubble when it replays the persisted envelope. */
+function promoteQueuedUserMessage(
+  state: ChatThreadState,
+  index: number,
+  now: Clock,
+): ChatThreadState {
+  const existing = state.messages[index];
+  if (existing?.kind !== "user_message" || !existing.queued) return state;
+  const { seq, next } = takeSeq(state);
+  const { queued: _dropped, ...rest } = existing;
+  const promoted: UserMessageItem = {
+    ...rest,
+    seq,
+    // Queue wait is not agent work. Start the visible duration at the
+    // moment the follow-up actually becomes the active provider turn.
+    created_at: now(),
+  };
+  return {
+    ...next,
+    // A dispatched follow-up means a live turn is starting — clear any
+    // interrupted flag so the Continue chip / divider drop.
+    interrupted: false,
+    messages: replaceItem(next.messages, index, promoted),
+  };
+}
+
 /**
  * Local-only action: mark a permission request as "responding" so the
  * UI can render a pending state while the Tauri invoke is in flight.
@@ -1187,8 +1218,19 @@ function applyEventInner(
       // sender appended, on the greyed bubble `turn_queued` reconstructs,
       // and on this envelope — so whoever already has the turn on screen
       // skips it, and whoever does not inserts it in row order.
-      if (event.client_nonce && hasUserMessageNonce(state, event.client_nonce)) {
-        return state;
+      if (event.client_nonce) {
+        const existingIdx = state.messages.findIndex(
+          (m) =>
+            m.kind === "user_message" &&
+            m.clientNonce === event.client_nonce,
+        );
+        if (existingIdx >= 0) {
+          // A queued turn's user-message envelope is only persisted when
+          // that turn dispatches. Therefore a matching durable row is also
+          // an authoritative dispatch signal when the pane missed the
+          // live-only `queued_turn_dispatched` event while detached.
+          return promoteQueuedUserMessage(state, existingIdx, now);
+        }
       }
       // Persisted `images` carry absolute paths; the bubble's display
       // shape wants them under `src`, which `resolveAssetSrc` routes
@@ -1676,23 +1718,7 @@ function applyEventInner(
       // produced), not where it was typed.
       const idx = findQueuedUserMessage(state.messages, event.queued_id);
       if (idx < 0) return state;
-      const existing = state.messages[idx] as UserMessageItem;
-      const { seq, next } = takeSeq(state);
-      const { queued: _dropped, ...rest } = existing;
-      const promoted: UserMessageItem = {
-        ...rest,
-        seq,
-        // Queue wait is not agent work. Start the visible duration at the
-        // moment the follow-up actually becomes the active provider turn.
-        created_at: now(),
-      };
-      // A dispatched follow-up means a live turn is starting — clear any
-      // interrupted flag so the Continue chip / divider drop.
-      return {
-        ...next,
-        interrupted: false,
-        messages: replaceItem(next.messages, idx, promoted),
-      };
+      return promoteQueuedUserMessage(state, idx, now);
     }
 
     case "queued_turn_cancelled": {

@@ -1609,6 +1609,42 @@ describe("agent-chat reducer — follow-up queueing", () => {
     expect(list[0].created_at).toBe(5_000); // queue wait is not work time
   });
 
+  it("a persisted user row promotes a matching queued bubble after a missed dispatch event", () => {
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "follow up",
+      () => 1_000,
+      "nonce-dispatched",
+    );
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-missed",
+      client_nonce: "nonce-dispatched",
+      text: "follow up",
+    });
+    const queuedSeq = users(state)[0].seq;
+
+    // `user_message` is durable at dispatch time. A remount can replay it
+    // without ever receiving the live-only `queued_turn_dispatched` event.
+    state = applyEvent(
+      state,
+      {
+        type: "user_message",
+        thread_id: "t1",
+        text: "follow up",
+        client_nonce: "nonce-dispatched",
+      },
+      () => 6_000,
+    );
+
+    const list = users(state);
+    expect(list).toHaveLength(1);
+    expect(list[0].queued).toBeUndefined();
+    expect(list[0].seq).toBeLessThan(queuedSeq);
+    expect(list[0].created_at).toBe(6_000);
+  });
+
   it("queued_turn_cancelled removes the greyed bubble", () => {
     let state = applyEvent(createEmptyThreadState(), {
       type: "turn_queued",

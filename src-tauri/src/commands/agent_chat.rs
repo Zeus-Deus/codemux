@@ -1538,17 +1538,17 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     Ok(result)
 }
 
-/// Cancel a queued (not-yet-dispatched) follow-up turn. Idempotent — an
-/// unknown or already-dispatched id is a silent success. On success the
-/// provider emits a `QueuedTurnCancelled` event so the UI removes the
-/// greyed bubble.
+/// Cancel a queued (not-yet-dispatched) follow-up turn. Returns whether the
+/// provider actually removed an item. An unknown or already-dispatched id
+/// returns `false`; a real cancellation also emits `QueuedTurnCancelled` so
+/// the UI removes the greyed bubble.
 #[tauri::command]
 pub async fn agent_chat_cancel_queued_turn<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     queued_id: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();

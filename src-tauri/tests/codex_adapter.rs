@@ -1067,10 +1067,11 @@ async fn cancel_queued_turn_removes_it_codex() {
         .queued_id
         .expect("second send queued");
 
-    provider
+    let removed = provider
         .cancel_queued_turn(ThreadId("t-cq".into()), queued.clone())
         .await
         .unwrap();
+    assert!(removed, "the queued turn should be reported as removed");
 
     let cancelled = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
@@ -1084,6 +1085,11 @@ async fn cancel_queued_turn_removes_it_codex() {
     .ok()
     .flatten();
     assert_eq!(cancelled.as_deref(), Some(queued.as_str()));
+    let removed_again = provider
+        .cancel_queued_turn(ThreadId("t-cq".into()), queued)
+        .await
+        .unwrap();
+    assert!(!removed_again, "an already-cancelled id should report false");
     provider.stop_session(ThreadId("t-cq".into())).await.ok();
 }
 

@@ -1508,15 +1508,16 @@ export const agentChatTurnActive = (
     threadId,
   });
 
-/** Cancel a queued (not-yet-dispatched) follow-up turn. On success the
- *  provider emits a `queued_turn_cancelled` event so the UI removes the
- *  greyed bubble. */
+/** Cancel a queued (not-yet-dispatched) follow-up turn. Returns whether the
+ *  provider actually removed it; a `false` result means it already
+ *  dispatched or otherwise no longer exists. A real cancellation emits a
+ *  `queued_turn_cancelled` event so the UI removes the greyed bubble. */
 export const agentChatCancelQueuedTurn = (
   provider: AgentChatProviderKind,
   threadId: string,
   queuedId: string,
 ) =>
-  invoke<void>("agent_chat_cancel_queued_turn", {
+  invoke<boolean>("agent_chat_cancel_queued_turn", {
     provider,
     threadId,
     queuedId,
