@@ -52,6 +52,34 @@ describe("editor selection contract", () => {
 });
 
 describe("document selection contract", () => {
+  it("replaces WebKit transcript box paint only when the text-range highlight is active", () => {
+    const nativeRule = globalsCss.match(
+      /\.transcript-selection-highlight \[data-slot="transcript-list"\] \*::selection\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    const customRule = globalsCss.match(
+      /::highlight\(codemux-transcript-selection\)\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+
+    expect(nativeRule).toContain("background-color: transparent");
+    expect(nativeRule).toContain("color: currentColor");
+    expect(customRule).toContain(
+      "background-color: var(--selection-background)",
+    );
+    expect(customRule).toContain("color: var(--selection-foreground)");
+  });
+
+  it("leaves text controls in the transcript with a visible native selection", () => {
+    // A textarea's editable text has no light-DOM text nodes, so the custom
+    // highlight can never paint it. Without this rule the suppression above
+    // inherits in and selecting a typed deny reason shows nothing at all.
+    const textareaRule = globalsCss.match(
+      /\.transcript-selection-highlight\s+\[data-slot="transcript-list"\]\s+textarea::selection[^{]*\{([^}]*)\}/,
+    )?.[1] ?? "";
+
+    expect(textareaRule).toContain("background-color: var(--selection-background)");
+    expect(textareaRule).toContain("color: var(--selection-foreground)");
+  });
+
   it("defines both selection channels at the root so no native fallback leaks in", () => {
     const rule = globalsCss.match(/:root::selection\s*\{([^}]*)\}/)?.[1] ?? "";
     expect(rule).toContain("background-color: var(--selection-background)");

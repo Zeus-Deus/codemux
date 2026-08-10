@@ -26,6 +26,7 @@ import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useProviderCapabilitiesInit } from "@/stores/provider-capabilities-store";
 import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
+import { useTranscriptSelectionHighlight } from "@/hooks/use-transcript-selection-highlight";
 import { getHomeDir } from "@/tauri/commands";
 
 function App() {
@@ -86,6 +87,9 @@ function App() {
   // effects (the transcript edge-fade) switch themselves off when the webview
   // is running CPU-rendered.
   useRendererModeInit();
+  // WebKitGTK otherwise paints the virtualized boxes between selected chat
+  // messages. Keep native selection semantics and paint exact text ranges.
+  useTranscriptSelectionHighlight();
   // Web remote client only: bridge backend `notification` events into the
   // browser (Web Notifications API with a toast fallback). No-op on desktop.
   useWebNotifications();

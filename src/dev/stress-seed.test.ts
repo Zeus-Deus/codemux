@@ -28,7 +28,7 @@ describe("dev mock seed — stress fixture scaling", () => {
   it("leaves the curated seed untouched when no fixture is selected", async () => {
     const seed = await loadSeed(null);
     expect(seed.workspaces).toHaveLength(19);
-    expect(seed.active_workspace_id).toBe("ws-codemux-mock");
+    expect(seed.active_workspace_id).toBe("ws-codemux-chat");
   });
 
   it("grows the seed to the requested workspace count", async () => {
