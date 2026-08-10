@@ -2,6 +2,8 @@ use crate::control::{send_control_request, ControlRequest};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+pub mod ports;
+
 #[derive(Parser)]
 #[command(name = "codemux", about = "Codemux desktop and control CLI")]
 pub struct Cli {
@@ -55,6 +57,20 @@ pub enum CommandSet {
     Monitor {
         #[command(subcommand)]
         command: MonitorCommand,
+    },
+    /// Reserve host ports that no other worktree will be handed, so several
+    /// worktrees of one project can each bring up their own stack instead of
+    /// fighting over 4200/8000/5432.
+    ///
+    /// `codemux ports allocate <name>` prints a free port and remembers it:
+    /// the same worktree asking for the same name always gets the same
+    /// number, so an ephemeral compose file written against it keeps working
+    /// across restarts. Works with no project setup and changes nothing in
+    /// the repository — reach for it instead of asking to stop someone
+    /// else's stack.
+    Ports {
+        #[command(subcommand)]
+        command: ports::PortsCommand,
     },
     /// Run Codemux headless as a web-remote server — no desktop GUI. Boots the
     /// full backend, binds the web-remote server, and prints a scannable
@@ -834,6 +850,12 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
             Ok(true)
         }
+        // Purely local: the allocation table is a file on disk, so this works
+        // from a bare shell with no Codemux instance running.
+        Some(CommandSet::Ports { command }) => {
+            ports::run(command)?;
+            Ok(true)
+        }
         Some(CommandSet::Remote { command }) => {
             match command {
                 RemoteCommand::Pair { name } => {
@@ -1051,6 +1073,14 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                             "start": { "args": "[--reason <text>] [--pane-id <id>]", "description": "Mark this pane as monitoring in the background" },
                             "stop": { "args": "[--pane-id <id>]", "description": "Clear this pane's monitoring status" },
                             "status": { "args": "[--pane-id <id>]", "description": "Report whether this pane currently reads as monitoring" }
+                        }
+                    },
+                    "ports": {
+                        "description": "Reserve host ports no other worktree will be handed, so parallel worktrees of one project can each run their own stack",
+                        "subcommands": {
+                            "allocate": { "args": "<name>", "description": "Print a free port reserved for this worktree under <name>; the same name always returns the same port" },
+                            "list": { "description": "List the ports this worktree owns" },
+                            "release": { "args": "<name>", "description": "Give a previously allocated port back" }
                         }
                     },
                     "serve": {
@@ -1290,6 +1320,45 @@ mod tests {
         // that otherwise only surface when a user runs the command.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// The `ports` module is only reachable if it is registered on
+    /// `CommandSet`. Parsing the real argv guards the failure mode where the
+    /// implementation exists but `codemux ports` is an unrecognized command.
+    #[test]
+    fn ports_subcommands_parse() {
+        match Cli::try_parse_from(["codemux", "ports", "allocate", "web"])
+            .expect("`codemux ports allocate web` is a known command")
+            .command
+        {
+            Some(CommandSet::Ports {
+                command: ports::PortsCommand::Allocate { name },
+            }) => assert_eq!(name, "web"),
+            _ => panic!("expected ports allocate"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "ports", "list"])
+                .expect("`codemux ports list` is a known command")
+                .command,
+            Some(CommandSet::Ports {
+                command: ports::PortsCommand::List
+            })
+        ));
+
+        match Cli::try_parse_from(["codemux", "ports", "release", "api"])
+            .expect("`codemux ports release api` is a known command")
+            .command
+        {
+            Some(CommandSet::Ports {
+                command: ports::PortsCommand::Release { name },
+            }) => assert_eq!(name, "api"),
+            _ => panic!("expected ports release"),
+        }
+
+        // A name is required — a bare `allocate` must not silently allocate
+        // something under an empty label.
+        assert!(Cli::try_parse_from(["codemux", "ports", "allocate"]).is_err());
     }
 
     #[test]

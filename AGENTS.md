@@ -17,6 +17,10 @@ Make Codemux performant, reliable, and easy to use. Do not preserve complexity j
 
 When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For UI changes, run `npm run dev`, inspect `http://localhost:1420`, and capture visual evidence with `codemux browser screenshot`. The development server uses the Tauri mock; use `npm run tauri:dev` when real IPC is required. Stop the development server when finished. Run `codemux browser --help` to discover commands.
 
+## Ports
+
+Several worktrees of one project share the host network, so bringing up a stack on its default ports collides with whatever another worktree is already running. When you hit that, reach for `codemux ports allocate <name>` — it prints a free port reserved for this worktree, and the same name always returns the same port, so an ephemeral compose file or `.env` you write against it keeps working across restarts. No other worktree is ever handed that port. Use `codemux ports list` to see what this worktree owns and `codemux ports release <name>` when you are done with it. Reach for this instead of asking to stop another worktree's stack, and only put allocated ports in ephemeral files you created yourself — never rewrite the project's own compose or config files.
+
 ## Process Safety
 
 - Never kill processes by name or pattern; stop only processes you started.
@@ -27,13 +31,3 @@ When `$CODEMUX` is set, use `codemux browser` instead of a system browser. For U
 - Use a concise conventional-commit title in plain language.
 - Body: the problem in a sentence or two, then how you fixed it. End with the model and harness that did the work.
 - UI changes need before/after screenshots in the pull request. Use mock data and exclude sensitive or personal information.
-
-## Port Allocation
-
-When working on a project with multiple concurrent worktrees (agents), each agent must use the Codemux port allocator to avoid conflicts on shared host ports (e.g., 4200, 8000, 5432).
-
-- Run `codemux ports allocate <name>` to get a deterministic, globally-aware free port.
-- Reuse the same `<name>` across runs to get the same port.
-- If done, run `codemux ports release <name>` to free it.
-- Run `codemux ports list` to see current allocations for this worktree.
-- Never ask the user to stop another agent's stack; use `codemux ports allocate` instead.
