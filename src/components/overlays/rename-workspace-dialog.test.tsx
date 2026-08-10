@@ -1,7 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Profiler } from "react";
 
 import type { AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
@@ -32,13 +33,14 @@ function makeWorkspace(
   workspaceId: string,
   title: string,
   branch: string | null = "master",
+  projectRoot = "/home/test/world-bench",
 ): WorkspaceSnapshot {
   return {
     workspace_id: workspaceId,
     title,
     workspace_type: "standard",
-    cwd: "/home/test/world-bench",
-    project_root: "/home/test/world-bench",
+    cwd: projectRoot,
+    project_root: projectRoot,
     git_branch: branch,
     git_ahead: 0,
     git_behind: 0,
@@ -60,17 +62,22 @@ function makeWorkspace(
   } as WorkspaceSnapshot;
 }
 
-function openDialog() {
-  const workspaces = [
-    makeWorkspace("ws-1", "add-gpt5-benchmark-runs"),
-    makeWorkspace("ws-2", "review-open-prs", "main"),
-  ];
+function setWorkspaces(workspaces: WorkspaceSnapshot[]) {
   useAppStore.setState({
     appState: {
       workspaces,
       active_workspace_id: "ws-1",
     } as unknown as AppStateSnapshot,
   });
+}
+
+function openDialog(
+  workspaces: WorkspaceSnapshot[] = [
+    makeWorkspace("ws-1", "add-gpt5-benchmark-runs"),
+    makeWorkspace("ws-2", "review-open-prs", "main"),
+  ],
+) {
+  setWorkspaces(workspaces);
   useUIStore.setState({ renameWorkspaceId: "ws-1" });
   render(<RenameWorkspaceDialog />);
 }
@@ -106,6 +113,26 @@ describe("getWorkspaceRenameStatus", () => {
       "idle",
     );
     expect(getWorkspaceRenameStatus({ ...base, name: "new-name" }).kind).toBe(
+      "ready",
+    );
+  });
+
+  it("treats a taken name as taken regardless of case or padding", () => {
+    const base = {
+      originalName: "original",
+      branch: null,
+      takenNames: [" Already-Used "],
+    } as const;
+
+    expect(
+      getWorkspaceRenameStatus({ ...base, name: "already-used" }).kind,
+    ).toBe("taken");
+    expect(
+      getWorkspaceRenameStatus({ ...base, name: "  ALREADY-USED  " }).kind,
+    ).toBe("taken");
+    // Re-casing the workspace's own name is a real rename, not a collision —
+    // the caller leaves the renamed workspace out of `takenNames`.
+    expect(getWorkspaceRenameStatus({ ...base, name: "Original" }).kind).toBe(
       "ready",
     );
   });
@@ -174,5 +201,88 @@ describe("RenameWorkspaceDialog", () => {
 
     expect(useUIStore.getState().renameWorkspaceId).toBeNull();
     expect(mocks.renameWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("flags a duplicate only within the same project, ignoring case", async () => {
+    const user = userEvent.setup();
+    openDialog([
+      makeWorkspace("ws-1", "add-gpt5-benchmark-runs"),
+      makeWorkspace("ws-2", "Review-Open-PRs", "main"),
+      makeWorkspace("ws-3", "shared-name", "main", "/home/test/other-project"),
+    ]);
+    const input = screen.getByRole("textbox", { name: "Workspace name" });
+
+    // Same project, different casing — still the same label.
+    await user.clear(input);
+    await user.type(input, "review-open-prs");
+    expect(
+      screen.getByText("Another workspace already uses this name"),
+    ).toBeInTheDocument();
+
+    // Same name under a different project is fine.
+    await user.clear(input);
+    await user.type(input, "shared-name");
+    expect(
+      screen.queryByText("Another workspace already uses this name"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rename" })).toHaveAttribute(
+      "aria-disabled",
+      "false",
+    );
+  });
+
+  it("leaves Escape to the app-level close ladder", async () => {
+    const user = userEvent.setup();
+    openDialog();
+
+    await user.keyboard("{Escape}");
+
+    // Radix must not dismiss on its own: the ladder in use-keyboard-shortcuts
+    // owns the ordering, and two closers racing would take Settings down with
+    // this dialog on a single press.
+    expect(useUIStore.getState().renameWorkspaceId).toBe("ws-1");
+    expect(
+      screen.getByRole("textbox", { name: "Workspace name" }),
+    ).toBeInTheDocument();
+  });
+
+  it("clears the pending rename when the workspace disappears", async () => {
+    openDialog();
+    expect(useUIStore.getState().renameWorkspaceId).toBe("ws-1");
+
+    await act(async () => {
+      setWorkspaces([makeWorkspace("ws-2", "review-open-prs", "main")]);
+    });
+
+    expect(useUIStore.getState().renameWorkspaceId).toBeNull();
+    expect(
+      screen.queryByRole("textbox", { name: "Workspace name" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("ignores app-state emits while closed", () => {
+    setWorkspaces([makeWorkspace("ws-1", "add-gpt5-benchmark-runs")]);
+    useUIStore.setState({ renameWorkspaceId: null });
+
+    const onRender = vi.fn();
+    const { container } = render(
+      <Profiler id="rename-workspace-dialog" onRender={onRender}>
+        <RenameWorkspaceDialog />
+      </Profiler>,
+    );
+    expect(container).toBeEmptyDOMElement();
+
+    // This dialog is mounted at the app root, so a closed one must cost
+    // nothing on the app-state firehose.
+    onRender.mockClear();
+    act(() => setWorkspaces([makeWorkspace("ws-1", "add-gpt5-benchmark-runs")]));
+    expect(onRender).not.toHaveBeenCalled();
+
+    // Control: the same emit does reach the open dialog, so the assertion
+    // above is measuring a real subscription rather than a dead Profiler.
+    act(() => useUIStore.setState({ renameWorkspaceId: "ws-1" }));
+    onRender.mockClear();
+    act(() => setWorkspaces([makeWorkspace("ws-1", "add-gpt5-benchmark-runs")]));
+    expect(onRender).toHaveBeenCalled();
   });
 });

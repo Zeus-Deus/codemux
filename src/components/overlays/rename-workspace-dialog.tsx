@@ -40,7 +40,11 @@ export function getWorkspaceRenameStatus({
       message: `Keep it under ${WORKSPACE_NAME_MAX_LENGTH} characters`,
     };
   }
-  if (takenNames.includes(value)) {
+  // Case-insensitive: two sibling rows called "Docs" and "docs" are the same
+  // label to anyone scanning the sidebar. Normalization lives here so callers
+  // can hand over raw titles.
+  const folded = value.toLowerCase();
+  if (takenNames.some((taken) => taken.trim().toLowerCase() === folded)) {
     return {
       kind: "taken",
       message: "Another workspace already uses this name",
@@ -59,32 +63,50 @@ export function getWorkspaceRenameStatus({
   };
 }
 
+/**
+ * Mounted at the app root, so it must cost nothing while closed: the outer
+ * component watches one id and never touches `appState` until a rename is
+ * actually requested. The `key` also guarantees the body starts from scratch
+ * for each target instead of carrying the previous name over.
+ */
 export function RenameWorkspaceDialog() {
   const workspaceId = useUIStore((s) => s.renameWorkspaceId);
+  if (!workspaceId) return null;
+  return <RenameWorkspaceDialogBody key={workspaceId} workspaceId={workspaceId} />;
+}
+
+function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
   const closeRenameWorkspace = useUIStore((s) => s.closeRenameWorkspace);
-  const appState = useAppStore((s) => s.appState);
-  const workspace = appState?.workspaces.find(
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const workspace = workspaces?.find(
     (candidate) => candidate.workspace_id === workspaceId,
   );
-  const [name, setName] = useState("");
+  const [name, setName] = useState(() => workspace?.title ?? "");
   const [touched, setTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const fieldRef = useRef<HTMLDivElement>(null);
 
+  // The workspace can be archived or closed from another surface while the
+  // dialog is up. Drop the request too, or the id lingers as a phantom rung on
+  // the Escape ladder that swallows a press and shows nothing.
   useEffect(() => {
-    if (!workspaceId || !workspace) return;
-    setName(workspace.title);
-    setTouched(false);
-    setSubmitting(false);
-  }, [workspaceId, workspace?.workspace_id]);
+    if (!workspace) closeRenameWorkspace();
+  }, [workspace, closeRenameWorkspace]);
 
+  // Only siblings in the same project can collide: identical names across two
+  // unrelated projects read fine, each under its own project header.
+  const projectKey = workspace ? (workspace.project_root ?? workspace.cwd) : null;
   const takenNames = useMemo(
     () =>
-      appState?.workspaces
-        .filter((candidate) => candidate.workspace_id !== workspaceId)
-        .map((candidate) => candidate.title.trim()) ?? [],
-    [appState?.workspaces, workspaceId],
+      workspaces
+        ?.filter(
+          (candidate) =>
+            candidate.workspace_id !== workspaceId &&
+            (candidate.project_root ?? candidate.cwd) === projectKey,
+        )
+        .map((candidate) => candidate.title) ?? [],
+    [workspaces, workspaceId, projectKey],
   );
 
   if (!workspace) return null;
@@ -140,7 +162,7 @@ export function RenameWorkspaceDialog() {
 
   return (
     <Dialog
-      open={workspaceId !== null}
+      open
       onOpenChange={(open) => {
         if (!open) closeRenameWorkspace();
       }}
@@ -148,6 +170,11 @@ export function RenameWorkspaceDialog() {
       <DialogContent
         showCloseButton={false}
         overlayClassName="!bg-black/60 supports-backdrop-filter:backdrop-blur-[3px]"
+        // Escape belongs to the app's close ladder, which knows this dialog
+        // sits above Settings and closes exactly one layer per press. Letting
+        // the dialog dismiss itself too would close both at once, since the
+        // ladder runs after and finds the rung already gone.
+        onEscapeKeyDown={(event) => event.preventDefault()}
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           inputRef.current?.focus();

@@ -515,6 +515,9 @@ export function WorkspaceContextMenuItems({
   const requestRenameWorkspace = useUIStore(
     (state) => state.requestRenameWorkspace,
   );
+  const isActiveWorkspace = useAppStore(
+    (s) => s.appState?.active_workspace_id === workspace.workspace_id,
+  );
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   // Const alias so the discriminant narrowing survives into the preset map's
   // callbacks — TypeScript drops narrowing on a (mutable) parameter binding
@@ -749,7 +752,10 @@ export function WorkspaceContextMenuItems({
       >
         <Pencil />
         <span className="flex-1">Rename workspace</span>
-        <MenuKeycap keys="F2" />
+        {/* The shortcut renames whatever workspace is active, so only that
+         *  row may advertise it — on any other row the keycap would promise a
+         *  key that renames something else. */}
+        {isActiveWorkspace && <MenuKeycap actionId="renameWorkspace" />}
       </ContextMenuItem>
       {editors.length === 1 ? (
         <ContextMenuItem

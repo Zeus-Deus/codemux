@@ -12,8 +12,17 @@ export interface KeybindEntry {
   category: KeybindCategory;
   defaultKeys: string;
   description?: string;
-  /** "terminal" means handled inside xterm, not at the window level */
-  when?: "always" | "terminal";
+  /**
+   * Where the binding is handled.
+   * - `"always"` (the default): window-level, and intercepted before a focused
+   *   terminal can see it.
+   * - `"terminal"`: handled inside xterm; the window handler never dispatches it.
+   * - `"non-terminal"`: window-level, but a focused terminal wins. The combo is
+   *   kept out of the intercept list so the pty still receives the key (F2 in
+   *   htop, mc or nano), and xterm stops the event before it reaches the window
+   *   handler. Anywhere else — sidebar, chat, overview — the action fires.
+   */
+  when?: "always" | "terminal" | "non-terminal";
 }
 
 export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
@@ -39,7 +48,9 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
   { id: "runDevCommand", label: "Run dev command", category: "workspaces", defaultKeys: "Ctrl+Shift+G" },
-  { id: "renameWorkspace", label: "Rename active workspace", category: "workspaces", defaultKeys: "F2" },
+  // `non-terminal`: F2 is a live key inside curses apps (htop, mc, nano), so a
+  // focused pty keeps it and only the rest of the app renames on F2.
+  { id: "renameWorkspace", label: "Rename active workspace", category: "workspaces", defaultKeys: "F2", when: "non-terminal" },
   // Jump straight to the Nth visible sidebar-inbox card. Alt (not Ctrl) because
   // Ctrl+1..9 are the terminal tab switches above.
   { id: "workspaceJump1", label: "Jump to workspace 1", category: "workspaces", defaultKeys: "Alt+1" },

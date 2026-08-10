@@ -57,6 +57,16 @@ describe("keybind-registry", () => {
     }
   });
 
+  it("keeps F2 out of the terminal's way", () => {
+    const entry = getRegistryEntry("renameWorkspace");
+    expect(entry).toBeDefined();
+    expect(entry!.defaultKeys).toBe("F2");
+    // F2 is a live key in curses apps, so a focused pty must keep it. Anything
+    // other than "non-terminal" either steals it from the shell ("always") or
+    // stops the window handler from renaming at all ("terminal").
+    expect(entry!.when).toBe("non-terminal");
+  });
+
   it("registers reload-blocking shortcuts", () => {
     const blockReload = getRegistryEntry("blockReload");
     expect(blockReload).toBeDefined();

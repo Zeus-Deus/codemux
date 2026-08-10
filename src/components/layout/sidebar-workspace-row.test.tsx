@@ -164,6 +164,7 @@ import {
 } from "./sidebar-workspace-row";
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
+import { useUIStore } from "@/stores/ui-store";
 
 /** Build a single-terminal-pane surface carrying a known pane id. */
 function surfaceWithPane(paneId: string): SurfaceSnapshot {
@@ -253,6 +254,7 @@ beforeEach(() => {
   mockToast.success.mockReset();
   mockToast.error.mockReset();
   mockToast.undoable.mockReset();
+  useUIStore.setState({ renameWorkspaceId: null });
   __resetDefaultBranchCacheForTests();
 });
 
@@ -1503,5 +1505,48 @@ describe("Workspace pin and lifecycle context-menu block", () => {
     await flushDefaultBranchFetch();
 
     expect(screen.queryByText("Snooze until…")).not.toBeInTheDocument();
+  });
+});
+
+// The rename shortcut always targets the *active* workspace, so its keycap is
+// only truthful on the active row — and it has to come from the registry so a
+// rebind moves the label with it.
+describe("Rename workspace context-menu item", () => {
+  function renderRenameRow(workspaceId: string, activeWorkspaceId: string) {
+    appStateHolder.current = {
+      active_workspace_id: activeWorkspaceId,
+      pane_statuses: {},
+    };
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ workspace_id: workspaceId })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    return screen.getByRole("menuitem", { name: /Rename workspace/ });
+  }
+
+  it("shows the registry keycap on the active row", async () => {
+    const item = renderRenameRow("ws-1", "ws-1");
+    await flushDefaultBranchFetch();
+
+    expect(item.textContent).toContain("F2");
+  });
+
+  it("omits the keycap on a row that F2 would not rename", async () => {
+    const item = renderRenameRow("ws-1", "ws-other");
+    await flushDefaultBranchFetch();
+
+    expect(item.textContent).not.toContain("F2");
+  });
+
+  it("routes the click to the app-level rename dialog", async () => {
+    const item = renderRenameRow("ws-rename", "ws-rename");
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(item);
+
+    expect(useUIStore.getState().renameWorkspaceId).toBe("ws-rename");
   });
 });
