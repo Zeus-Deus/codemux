@@ -320,10 +320,64 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
     expect(valueFor("Ports")).toBe(":3000 :3001 :3002 +2");
   });
 
+  it("shows the matching running-process indicator as the final detail row", () => {
+    detectedPorts = [
+      makePort({ port: 3000, pid: 10 }),
+      makePort({ port: 3001, pid: 10 }),
+      makePort({ port: 5173, pid: 20 }),
+    ];
+    const { container } = renderBody(makeWorkspace());
+
+    expect(valueFor("Processes")).toBe("2 running");
+    expect(screen.getByLabelText("2 running processes")).toBeInTheDocument();
+    expect(container.querySelector(".lucide-terminal")).toBeInTheDocument();
+
+    const detailRows = container.querySelectorAll(".flex.flex-col > div");
+    expect(detailRows.item(detailRows.length - 1)).toHaveTextContent(
+      "Processes2 running",
+    );
+  });
+
+  it("uses the singular label for a lone process", () => {
+    detectedPorts = [makePort({ port: 3000, pid: 10 })];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Process")).toBe("1 running");
+    expect(screen.getByLabelText("1 running process")).toBeInTheDocument();
+    expect(screen.queryByText("Processes")).not.toBeInTheDocument();
+  });
+
+  it("counts each Docker-published port, which all share the pid-0 sentinel", () => {
+    detectedPorts = [
+      makePort({ port: 3000, pid: 0, source: "docker", label: "app-web-1" }),
+      makePort({ port: 5432, pid: 0, source: "docker", label: "app-db-1" }),
+      makePort({ port: 6379, pid: 0, source: "docker", label: "app-cache-1" }),
+    ];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Processes")).toBe("3 running");
+  });
+
+  it("makes no running claim for statically configured ports", () => {
+    // `.codemux/ports.json` entries also arrive with pid 0, but they only
+    // declare which ports the workspace uses — nothing proves one is live.
+    detectedPorts = [
+      makePort({ port: 3000, pid: 0, source: null, process_name: "" }),
+      makePort({ port: 8080, pid: 0, source: null, process_name: "" }),
+    ];
+    renderBody(makeWorkspace());
+
+    expect(valueFor("Ports")).toBe(":3000 :8080");
+    expect(screen.queryByText("Process")).not.toBeInTheDocument();
+    expect(screen.queryByText("Processes")).not.toBeInTheDocument();
+  });
+
   it("omits the ports row when none are detected", () => {
     renderBody(makeWorkspace());
     expect(screen.queryByText("Port")).not.toBeInTheDocument();
     expect(screen.queryByText("Ports")).not.toBeInTheDocument();
+    expect(screen.queryByText("Process")).not.toBeInTheDocument();
+    expect(screen.queryByText("Processes")).not.toBeInTheDocument();
   });
 });
 
