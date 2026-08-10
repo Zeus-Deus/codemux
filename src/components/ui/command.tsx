@@ -95,8 +95,10 @@ function CommandList({
   return (
     <CommandPrimitive.List
       data-slot="command-list"
+      // The scrollbar is left to the browser default; callers that want a
+      // visible one pass `thin-scrollbar` (globals.css) via className.
       className={cn(
-        "no-scrollbar max-h-72 scroll-py-1 overflow-x-hidden overflow-y-auto outline-none",
+        "max-h-72 scroll-py-1 overflow-x-hidden overflow-y-auto outline-none",
         className
       )}
       {...props}
@@ -149,8 +151,11 @@ function CommandSeparator({
 function CommandItem({
   className,
   children,
+  showCheckmark = true,
   ...props
-}: React.ComponentProps<typeof CommandPrimitive.Item>) {
+}: React.ComponentProps<typeof CommandPrimitive.Item> & {
+  showCheckmark?: boolean
+}) {
   return (
     <CommandPrimitive.Item
       data-slot="command-item"
@@ -161,7 +166,12 @@ function CommandItem({
       {...props}
     >
       {children}
-      <CheckIcon className="ml-auto opacity-0 group-has-data-[slot=command-shortcut]/command-item:hidden group-data-[checked=true]/command-item:opacity-100" />
+      {showCheckmark && (
+        <CheckIcon
+          data-slot="command-item-check"
+          className="ml-auto opacity-0 group-has-data-[slot=command-shortcut]/command-item:hidden group-data-[checked=true]/command-item:opacity-100"
+        />
+      )}
     </CommandPrimitive.Item>
   )
 }
