@@ -273,9 +273,15 @@ describe("terminal pane header background browser", () => {
     const button = screen.getByRole("button", {
       name: /Browser running in background/,
     });
+    const actions = document.querySelector("[data-terminal-pane-actions]");
     const closePane = screen.getByRole("button", { name: "Close pane" });
     expect(button).toBeInTheDocument();
-    expect(button.previousElementSibling).toContainElement(closePane);
+    expect(button).not.toHaveTextContent("Browser");
+    expect(actions).toContainElement(button);
+    expect(actions?.lastElementChild).toBe(closePane);
+    expect(button.nextElementSibling).toBe(
+      screen.getByRole("button", { name: "Split right" }),
+    );
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
 
     await userEvent.click(button);
