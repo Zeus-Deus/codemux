@@ -41,12 +41,14 @@ export function useBackgroundBrowserSession(
 }
 
 /**
- * The background-browser indicator pill — a sky-tinted "Browser" chip
- * with a blinking working dot; click opens the floating peek overlay
- * (`BrowserPeekOverlay`) for the workspace. Shared by the Agent Chat
- * Context Row and the compact terminal-header control. Render it only
- * when `useBackgroundBrowserSession` resolves a session; the chip itself
- * is presentation + click only.
+ * The background-browser indicator — a "Browser" control whose presence
+ * already communicates that the session is live, so it needs no tint,
+ * border or blinking dot. Click opens the floating peek overlay
+ * (`BrowserPeekOverlay`) for the workspace. The Agent Chat Context Row
+ * gets the labelled chip; the terminal pane header gets a bare globe
+ * button sized to sit beside the other pane actions. Render it only
+ * when `useBackgroundBrowserSession` resolves a session; the control
+ * itself is presentation + click only.
  */
 export function BackgroundBrowserIndicator({
   workspaceId,
@@ -64,9 +66,9 @@ export function BackgroundBrowserIndicator({
         onClick={() => openPeek(workspaceId)}
         aria-label="Browser running in background — view"
         title="View background browser"
-        className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-status-remote transition-colors hover:bg-status-remote/15 hover:text-status-remote focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-remote/50"
+        className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-status-remote transition-colors hover:bg-status-remote/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-remote/50"
       >
-        <Globe className="size-3.5" aria-hidden />
+        <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
       </button>
     );
   }
@@ -76,14 +78,10 @@ export function BackgroundBrowserIndicator({
       type="button"
       onClick={() => openPeek(workspaceId)}
       aria-label="Browser running in background — view"
-      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-status-remote/30 bg-status-remote/10 px-2.5 text-[11px] font-semibold text-status-remote transition-colors hover:bg-status-remote/16 hover:text-foreground"
+      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 px-1.5 text-[11px] font-semibold text-status-remote transition-opacity hover:opacity-80"
     >
-      <Globe className="size-3" aria-hidden />
+      <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
       Browser
-      <span
-        className="cm-blink size-1.5 rounded-full bg-status-working"
-        aria-hidden
-      />
     </button>
   );
 }

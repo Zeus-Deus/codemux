@@ -12,7 +12,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import {
-  PR_CHIP_TONE,
+  PrStatusIcon,
   humanizePrState,
   normalizePrState,
   prStatusTextClass,
@@ -217,11 +217,12 @@ export function WorkspaceStatusCluster() {
                   : undefined
               }
               className={cn(
-                "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors",
-                PR_CHIP_TONE[prState],
+                "inline-flex h-[26px] shrink-0 items-center gap-1 px-1.5 font-mono text-[11px] font-semibold transition-opacity hover:enabled:opacity-80",
+                prStatusTextClass(prState),
                 !workspace.pr_url && "cursor-not-allowed opacity-60",
               )}
             >
+              <PrStatusIcon state={prState} size={3.5} />
               {workspace.pr_number
                 ? providerRef(provider, workspace.pr_number)
                 : provider.shortNoun}

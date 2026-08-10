@@ -26,21 +26,6 @@ const STATE_TO_TONE: Record<PrStatusState, string> = {
   draft: "text-muted-foreground bg-muted-foreground/15",
 };
 
-/** Tinted border/fill/text per PR state for the Context Row's bordered
- *  PR chip button. Same tone family as `STATE_TO_TONE` above, but with the
- *  border + hover treatment a clickable chip needs so the PR reads as a
- *  labeled action rather than a bare icon. Single home for both
- *  consumers — do not duplicate this map. */
-export const PR_CHIP_TONE: Record<PrStatusState, string> = {
-  open: "text-status-open border-status-open/40 bg-status-open/10 hover:bg-status-open/20",
-  merged:
-    "text-accent-violet border-accent-violet/40 bg-accent-violet/10 hover:bg-accent-violet/20",
-  closed:
-    "text-destructive border-destructive/40 bg-destructive/10 hover:bg-destructive/20",
-  draft:
-    "text-muted-foreground border-muted-foreground/40 bg-muted-foreground/10 hover:bg-muted-foreground/20",
-};
-
 /** Deferred-color variant of `STATE_TO_ICON` for the sidebar's parked rows.
  *  A settled row is history: it rests grayed out and only lights up under the
  *  pointer (or keyboard focus), so its PR badge starts neutral and picks the
@@ -48,8 +33,8 @@ export const PR_CHIP_TONE: Record<PrStatusState, string> = {
  *  differs. The variants name the settled row's own group (`group/settled` in
  *  `sidebar-inbox.tsx`) and are written out in full because Tailwind only
  *  sees class names that appear literally in the source. Keep the hues in
- *  lockstep with `STATE_TO_ICON` / `STATE_TO_TONE` / `PR_CHIP_TONE` above —
- *  they are one palette wearing four sets of chrome, and a state that drifts
+ *  lockstep with `STATE_TO_ICON` / `STATE_TO_TONE` above —
+ *  they are one palette wearing three sets of chrome, and a state that drifts
  *  here shows up as a PR that changes color when you point at it. */
 const STATE_TO_SETTLED_HOVER: Record<PrStatusState, string> = {
   merged:
@@ -98,7 +83,7 @@ export function prStatusToneClass(state: string | null | undefined): string | nu
 
 /** Text-only color for a PR state — no background/border, for a value
  *  rendered inline in a detail row (the Context Row popover's "Pull
- *  request" row). Same color-per-state as `STATE_TO_ICON`/`PR_CHIP_TONE`
+ *  request" row). Same color-per-state as `STATE_TO_ICON`
  *  above, just without their chip chrome. */
 export function prStatusTextClass(state: string | null | undefined): string | null {
   const normalized = normalizePrState(state);
