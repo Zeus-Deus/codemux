@@ -1,5 +1,13 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
-import { Pin, Plus, Terminal, Globe, Settings, ExternalLink } from "lucide-react";
+import {
+  Pin,
+  PinOff,
+  Plus,
+  Terminal,
+  Globe,
+  Settings,
+  ExternalLink,
+} from "lucide-react";
 
 import {
   Command,
@@ -53,11 +61,16 @@ function TitlebarPinToggle({
   };
 
   return (
-    <div className="ml-auto flex shrink-0 items-center">
+    // The trailing slot is `relative` so an unpinned toggle can sit on top of
+    // the destination label instead of next to it: the design swaps the two on
+    // hover, but the toggle must keep its box (hiding it with `display: none`
+    // drops it out of the tab order and the accessibility tree), so it fades
+    // in over the label rather than pushing it around.
+    <div className="relative ml-auto flex shrink-0 items-center">
       {!pinned && (
         <span
           data-testid={`launcher-destination-${presetId}`}
-          className="font-mono text-[10px] tracking-[0.02em] text-muted-foreground/70 group-hover/command-item:hidden group-data-selected/command-item:hidden"
+          className="font-mono text-[10px] tracking-[0.02em] text-muted-foreground/70 transition-opacity group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
         >
           {destination}
         </span>
@@ -75,15 +88,45 @@ function TitlebarPinToggle({
           useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
         }}
         className={cn(
-          "h-5 w-5 shrink-0 items-center justify-center rounded transition-colors",
+          "flex h-5 w-5 shrink-0 items-center justify-center rounded transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
           pinned
-            ? "flex text-accent-ember hover:text-accent-ember/80"
-            : "hidden text-muted-foreground group-hover/command-item:flex group-data-selected/command-item:flex hover:text-foreground",
+            ? "text-accent-ember hover:text-accent-ember/80"
+            : "absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 group-hover/command-item:opacity-100 group-data-selected/command-item:opacity-100 hover:text-foreground",
         )}
       >
-        <Pin className="size-3" />
+        {pinned ? (
+          <>
+            {/* Hovering a pinned row swaps in `PinOff` so the click target
+                reads as "unpin", matching the aria-label/title. */}
+            <Pin
+              data-testid={`launcher-pin-icon-${presetId}`}
+              className="size-3 group-hover/command-item:hidden group-data-selected/command-item:hidden"
+            />
+            <PinOff
+              data-testid={`launcher-unpin-icon-${presetId}`}
+              className="hidden size-3 group-hover/command-item:block group-data-selected/command-item:block"
+            />
+          </>
+        ) : (
+          <Pin
+            data-testid={`launcher-pin-icon-${presetId}`}
+            className="size-3"
+          />
+        )}
       </button>
     </div>
+  );
+}
+
+/** Legacy `preset.pinned` marker (the PresetBar flag, not the title-bar pins). */
+function PresetPinnedBadge({ presetId }: { presetId: string }) {
+  return (
+    <span
+      data-testid={`launcher-preset-pinned-${presetId}`}
+      className="shrink-0 font-mono text-[9px] font-semibold tracking-[0.09em] text-muted-foreground/70"
+    >
+      PINNED
+    </span>
   );
 }
 
@@ -112,14 +155,17 @@ function LauncherDestination({
 
 /**
  * Scroll shell from design 1a. Unlike the shared CommandList default, the
- * launcher advertises overflow with a thin draggable scrollbar and edge fades.
+ * launcher advertises overflow with a thin draggable scrollbar and edge fades,
+ * and keeps the "Manage presets…" row parked on the bottom edge.
  */
 function LauncherCommandList({
   children,
   testId,
+  onManagePresets,
 }: {
   children: React.ReactNode;
   testId: string;
+  onManagePresets: () => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [overflow, setOverflow] = useState({ top: false, bottom: false });
@@ -169,12 +215,31 @@ function LauncherCommandList({
     <div className="relative min-h-0">
       <CommandList
         ref={listRef}
-        showScrollbar
         data-testid={`${testId}-list`}
-        className="thin-scrollbar max-h-80"
+        // `scroll-pb` keeps the keyboard-selected row clear of the footer that
+        // is parked over the bottom of the scrollport.
+        className="thin-scrollbar max-h-80 scroll-pb-11"
         onScroll={(event) => syncOverflow(event.currentTarget)}
       >
         {children}
+        {/* The footer stays INSIDE the list: cmdk only treats items inside
+            the list sizer as navigable, and only they can be referenced by
+            the listbox's aria-activedescendant. `sticky` gives it the fixed
+            look without moving it out of the list. When cmdk filters the
+            footer away this wrapper collapses to zero height, which drops
+            the bottom fade back onto the list's own bottom edge. */}
+        <div className="sticky bottom-0 z-20">
+          <div
+            aria-hidden="true"
+            data-testid={`${testId}-bottom-fade`}
+            data-visible={overflow.bottom}
+            className={cn(
+              "pointer-events-none absolute inset-x-0 bottom-full h-[26px] bg-gradient-to-t from-popover to-transparent transition-opacity duration-150",
+              overflow.bottom ? "opacity-100" : "opacity-0",
+            )}
+          />
+          <LauncherFooter onSelect={onManagePresets} />
+        </div>
       </CommandList>
       <div
         aria-hidden="true"
@@ -185,22 +250,13 @@ function LauncherCommandList({
           overflow.top ? "opacity-100" : "opacity-0",
         )}
       />
-      <div
-        aria-hidden="true"
-        data-testid={`${testId}-bottom-fade`}
-        data-visible={overflow.bottom}
-        className={cn(
-          "pointer-events-none absolute inset-x-0 bottom-0 z-10 h-[26px] bg-gradient-to-t from-popover to-transparent transition-opacity duration-150",
-          overflow.bottom ? "opacity-100" : "opacity-0",
-        )}
-      />
     </div>
   );
 }
 
 function LauncherFooter({ onSelect }: { onSelect: () => void }) {
   return (
-    <CommandGroup className="border-t border-border p-1">
+    <CommandGroup className="border-t border-border bg-popover p-1">
       <CommandItem
         value="manage presets"
         onSelect={onSelect}
@@ -339,7 +395,10 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
               shiftHeld.current = e.shiftKey;
             }}
           />
-          <LauncherCommandList testId="agent-launcher">
+          <LauncherCommandList
+            testId="agent-launcher"
+            onManagePresets={managePresets}
+          >
             <CommandEmpty>No matches.</CommandEmpty>
             {chatPresets.length > 0 && (
               <CommandGroup heading="GUI" className={LAUNCHER_GROUP_CLASS}>
@@ -354,6 +413,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                   >
                     <PresetIcon icon={preset.icon} className="h-4 w-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
+                    {preset.pinned && <PresetPinnedBadge presetId={preset.id} />}
                     <TitlebarPinToggle
                       presetId={preset.id}
                       destination="in app"
@@ -410,7 +470,6 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
               </CommandItem>
             </CommandGroup>
           </LauncherCommandList>
-          <LauncherFooter onSelect={managePresets} />
         </Command>
       </PopoverContent>
     </Popover>
@@ -490,7 +549,10 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
       >
         <Command>
           <CommandInput placeholder="Start with an agent…" />
-          <LauncherCommandList testId="draft-agent-launcher">
+          <LauncherCommandList
+            testId="draft-agent-launcher"
+            onManagePresets={managePresets}
+          >
             <CommandEmpty>No matches.</CommandEmpty>
             {chatPresets.length > 0 && (
               <CommandGroup heading="GUI" className={LAUNCHER_GROUP_CLASS}>
@@ -536,7 +598,6 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
               </CommandGroup>
             )}
           </LauncherCommandList>
-          <LauncherFooter onSelect={managePresets} />
         </Command>
       </PopoverContent>
     </Popover>

@@ -90,17 +90,15 @@ function CommandInput({
 
 function CommandList({
   className,
-  showScrollbar = false,
   ...props
-}: React.ComponentProps<typeof CommandPrimitive.List> & {
-  showScrollbar?: boolean
-}) {
+}: React.ComponentProps<typeof CommandPrimitive.List>) {
   return (
     <CommandPrimitive.List
       data-slot="command-list"
+      // The scrollbar is left to the browser default; callers that want a
+      // visible one pass `thin-scrollbar` (globals.css) via className.
       className={cn(
         "max-h-72 scroll-py-1 overflow-x-hidden overflow-y-auto outline-none",
-        !showScrollbar && "no-scrollbar",
         className
       )}
       {...props}

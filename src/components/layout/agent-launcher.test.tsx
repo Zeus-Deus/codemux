@@ -134,6 +134,19 @@ function openLauncher() {
   });
 }
 
+/** Text of the row cmdk currently has selected (its keyboard cursor). */
+function selectedItemText(): string | null {
+  const selected = document.querySelector('[cmdk-item][aria-selected="true"]');
+  return selected?.textContent ?? null;
+}
+
+/** `data-value` of every row cmdk left mounted after filtering. */
+function visibleItemValues(): string[] {
+  return Array.from(document.querySelectorAll("[cmdk-item]")).map(
+    (el) => el.getAttribute("data-value") ?? "",
+  );
+}
+
 beforeEach(() => {
   mocks.presetStore = {
     bar_visible: true,
@@ -182,7 +195,7 @@ describe("AgentLauncher", () => {
     expect(screen.getByText("Manage presets…")).toBeInTheDocument();
   });
 
-  it("uses the 1a trailing slot, scrollbar, fades, and fixed footer", () => {
+  it("uses the 1a trailing slot, scrollbar, fades, and sticky footer", () => {
     render(<AgentLauncher workspace={makeWorkspace()} />);
     openLauncher();
 
@@ -192,12 +205,17 @@ describe("AgentLauncher", () => {
     );
     const pin = screen.getByTestId("launcher-pin-toggle-builtin-claude");
     expect(destination).toHaveTextContent("terminal");
-    expect(destination).toHaveClass("group-hover/command-item:hidden");
+    expect(destination).toHaveClass("group-hover/command-item:opacity-0");
+    // Hidden with opacity, never `display: none` — the toggle has to stay in
+    // the tab order and the accessibility tree.
     expect(pin).toHaveClass(
-      "hidden",
-      "group-hover/command-item:flex",
-      "group-data-selected/command-item:flex",
+      "flex",
+      "opacity-0",
+      "group-hover/command-item:opacity-100",
+      "group-data-selected/command-item:opacity-100",
+      "focus-visible:opacity-100",
     );
+    expect(pin).not.toHaveClass("hidden");
     expect(
       cliItem.querySelector('[data-slot="command-item-check"]'),
     ).toBeNull();
@@ -205,7 +223,16 @@ describe("AgentLauncher", () => {
     const list = screen.getByTestId("agent-launcher-list");
     expect(list).toHaveClass("thin-scrollbar");
     expect(list).not.toHaveClass("no-scrollbar");
-    expect(list).not.toContainElement(screen.getByText("Manage presets…"));
+    // The footer lives inside the list (cmdk only navigates items inside the
+    // list sizer) and is parked on the bottom edge with `sticky`.
+    const footerItem = screen
+      .getByText("Manage presets…")
+      .closest("[cmdk-item]") as HTMLElement;
+    expect(list).toContainElement(footerItem);
+    expect(list.querySelector("[cmdk-list-sizer]")).toContainElement(
+      footerItem,
+    );
+    expect(footerItem.closest(".sticky")).not.toBeNull();
 
     Object.defineProperties(list, {
       clientHeight: { configurable: true, value: 320 },
@@ -233,11 +260,48 @@ describe("AgentLauncher", () => {
     );
   });
 
-  it("opens the fixed Manage presets footer", () => {
+  it("opens the sticky Manage presets footer", () => {
     render(<AgentLauncher workspace={makeWorkspace()} />);
     openLauncher();
     act(() => {
       fireEvent.click(screen.getByText("Manage presets…"));
+    });
+    expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
+  });
+
+  it("reaches the Manage presets footer with ArrowDown and runs it on Enter", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    const input = screen.getByPlaceholderText("Launch an agent…");
+    // More presses than there are rows: cmdk does not loop, so this lands on
+    // the last navigable item — which must be the footer. One `act` per press,
+    // since cmdk reads the selected row back off the DOM between presses.
+    for (let i = 0; i < 10; i++) {
+      act(() => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    expect(selectedItemText()).toBe("Manage presets…");
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+    expect(mocks.createTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps the footer selectable when the query filters every other row", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    const input = screen.getByPlaceholderText("Launch an agent…");
+    act(() => {
+      fireEvent.change(input, { target: { value: "manage" } });
+    });
+    expect(visibleItemValues()).toEqual(["manage presets"]);
+    expect(screen.queryByText("No matches.")).toBeNull();
+    expect(selectedItemText()).toBe("Manage presets…");
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
     });
     expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
   });
@@ -335,9 +399,42 @@ describe("DraftAgentLauncher", () => {
     expect(
       screen.getByTestId("launcher-destination-draft-builtin-claude"),
     ).toHaveTextContent("terminal");
-    expect(screen.getByTestId("draft-agent-launcher-list")).not.toContainElement(
+    expect(screen.getByTestId("draft-agent-launcher-list")).toContainElement(
       screen.getByText("Manage presets…"),
     );
+  });
+
+  it("reaches the Manage presets footer with ArrowDown and runs it on Enter", () => {
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    openDraftLauncher();
+    const input = screen.getByPlaceholderText("Start with an agent…");
+    // One `act` per press: cmdk reads the selected row back off the DOM, so
+    // the selection has to flush between presses.
+    for (let i = 0; i < 10; i++) {
+      act(() => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    expect(selectedItemText()).toBe("Manage presets…");
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
+    expect(mocks.launchDraftWithPreset).not.toHaveBeenCalled();
+  });
+
+  it("keeps the footer selectable when the query filters every other row", () => {
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    openDraftLauncher();
+    const input = screen.getByPlaceholderText("Start with an agent…");
+    act(() => {
+      fireEvent.change(input, { target: { value: "manage" } });
+    });
+    expect(visibleItemValues()).toEqual(["manage presets"]);
+    act(() => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(mocks.setShowSettings).toHaveBeenCalledWith(true, "presets");
   });
 
   it("materialises the draft with the chosen CLI preset", () => {
@@ -430,6 +527,35 @@ describe("AgentLauncher — titlebar pin toggle", () => {
     ).toBeNull();
     const unpinned = screen.getByTestId("launcher-pin-toggle-builtin-codex");
     expect(unpinned).toHaveAttribute("aria-label", "Pin to title bar");
+  });
+
+  it("swaps in a PinOff icon on hover so a pinned row reads as 'click to unpin'", () => {
+    useTitlebarPinsStore.setState({ pinnedIds: ["builtin-claude"] });
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    const pinIcon = screen.getByTestId("launcher-pin-icon-builtin-claude");
+    const unpinIcon = screen.getByTestId("launcher-unpin-icon-builtin-claude");
+    expect(pinIcon).toHaveClass(
+      "group-hover/command-item:hidden",
+      "group-data-selected/command-item:hidden",
+    );
+    expect(unpinIcon).toHaveClass(
+      "hidden",
+      "group-hover/command-item:block",
+      "group-data-selected/command-item:block",
+    );
+    // An unpinned row keeps the plain Pin icon in both states.
+    expect(
+      screen.queryByTestId("launcher-unpin-icon-builtin-codex"),
+    ).toBeNull();
+  });
+
+  it("marks GUI rows that carry the legacy preset.pinned flag", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    expect(
+      screen.getByTestId("launcher-preset-pinned-builtin-chat-agent"),
+    ).toHaveTextContent("PINNED");
   });
 
   it("does not select the row when Shift-clicking the pin toggle on a CLI row", () => {
