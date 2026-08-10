@@ -59,15 +59,15 @@ pub trait AgentProvider: Send + Sync {
     ) -> Result<(), ProviderError>;
 
     /// Cancel a queued (not-yet-dispatched) follow-up turn by its queued
-    /// id. Idempotent — cancelling an unknown or already-dispatched id is
-    /// a silent success. The default implementation is a no-op for
-    /// providers without a follow-up queue (e.g. OpenCode).
+    /// id. Returns whether an item was actually removed. An unknown or
+    /// already-dispatched id returns `false`; the default implementation is
+    /// a no-op for providers without a follow-up queue (e.g. OpenCode).
     async fn cancel_queued_turn(
         &self,
         _thread_id: ThreadId,
         _queued_id: String,
-    ) -> Result<(), ProviderError> {
-        Ok(())
+    ) -> Result<bool, ProviderError> {
+        Ok(false)
     }
 
     /// **Send now (steer):** promote a queued follow-up to the front of

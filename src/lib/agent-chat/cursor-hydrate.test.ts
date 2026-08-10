@@ -317,6 +317,46 @@ describe("cursor hydrate — path selection", () => {
     expect(transcript()).toEqual(["seed", "do the thing", "on it"]);
   });
 
+  it("promotes a queued bubble when hydrate replays its dispatched user row", async () => {
+    seedWarmSlice(10, "seed");
+    useAgentChatStore
+      .getState()
+      .appendUserMessage(THREAD, "queued follow-up", "nonce-queued");
+    useAgentChatStore.getState().applyEvent(THREAD, {
+      type: "turn_queued",
+      thread_id: THREAD,
+      queued_id: "q-1",
+      client_nonce: "nonce-queued",
+      text: "queued follow-up",
+    });
+    const before = useAgentChatStore.getState().threads[THREAD].messages.find(
+      (m) => m.kind === "user_message" && m.clientNonce === "nonce-queued",
+    );
+    expect(before?.kind === "user_message" ? before.queued : undefined).toEqual({
+      queuedId: "q-1",
+    });
+
+    // The pane was detached for dispatch, so only the durable user row and
+    // later assistant result are available; the dispatch event was lost.
+    const deps = deferredDeps(
+      [
+        userRow(11, "queued follow-up", "nonce-queued"),
+        row(12, assistantEvent("handled it", "turn-2")),
+      ],
+      12,
+    );
+    deps.release();
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps.deps);
+
+    expect(transcript()).toEqual(["seed", "queued follow-up", "handled it"]);
+    const after = useAgentChatStore.getState().threads[THREAD].messages.find(
+      (m) => m.kind === "user_message" && m.clientNonce === "nonce-queued",
+    );
+    expect(
+      after?.kind === "user_message" ? after.queued : undefined,
+    ).toBeUndefined();
+  });
+
   it("applies a tail user_message that has no local bubble", async () => {
     // Same row, no optimistic bubble (another window sent it, or this
     // pane never saw the send) — it must render.

@@ -87,11 +87,12 @@ function useImageWithFallback(rawSrc: string): {
  * to know which form it got.
  *
  * Follow-up queueing: while `item.queued` is set the bubble renders
- * greyed-out (reduced opacity + muted foreground) with a small "Queued"
- * pill and, on hover, two actions — "Send now" (steer: soft-interrupt the
- * active turn and dispatch this message immediately, keeping all progress)
- * and an X to cancel (restores the text into the composer). Both are
- * handled by the parent. All colors are theme tokens.
+ * visually muted with a quiet "Queued" footer anchored to the bubble's
+ * right edge. On hover or keyboard focus, two compact actions appear to the
+ * footer's left without moving the status: "Send now" soft-interrupts the
+ * active turn and dispatches this message immediately (keeping all progress),
+ * while X cancels and restores the text into the composer. Both are handled
+ * by the parent. All colors are theme tokens.
  */
 export const UserMessage = memo(function UserMessage({
   item,
@@ -118,7 +119,7 @@ export const UserMessage = memo(function UserMessage({
           className={cn(
             "flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] text-sm leading-relaxed",
             queued
-              ? "border-dashed border-border/50 bg-muted/40 text-muted-foreground opacity-70"
+              ? "border-border/35 bg-muted/30 text-muted-foreground/75"
               : "border-border/60 bg-card text-foreground",
           )}
         >
@@ -138,33 +139,35 @@ export const UserMessage = memo(function UserMessage({
           ) : null}
         </div>
         {queued ? (
-          <div className="flex items-center gap-1.5 pr-0.5">
-            <span className="rounded-full bg-muted px-2 py-[1px] text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          <div className="relative flex h-4 items-center justify-end pr-0.5">
+            <div className="pointer-events-none absolute right-full mr-1 flex h-4 translate-x-0.5 items-center gap-px opacity-0 transition-[opacity,transform] duration-100 group-focus-within:pointer-events-auto group-focus-within:translate-x-0 group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:translate-x-0 group-hover:opacity-100">
+              {onSendQueuedNow ? (
+                <button
+                  type="button"
+                  aria-label="Send now"
+                  title="Interrupt current work and send this message now — progress so far is kept"
+                  onClick={() => onSendQueuedNow(queued.queuedId)}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-[4px] text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  <CornerDownLeft className="h-2.5 w-2.5" aria-hidden />
+                </button>
+              ) : null}
+              {onCancelQueued ? (
+                <button
+                  type="button"
+                  aria-label="Cancel queued message"
+                  title="Remove from queue and return to the composer"
+                  onClick={() => onCancelQueued(queued.queuedId, item.text)}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-[4px] text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  <X className="h-2.5 w-2.5" aria-hidden />
+                </button>
+              ) : null}
+            </div>
+            <span className="inline-flex h-4 items-center gap-1 text-[10px] font-medium text-muted-foreground/55">
+              <span className="h-1 w-1 rounded-full bg-muted-foreground/45" aria-hidden />
               Queued
             </span>
-            {onSendQueuedNow ? (
-              <button
-                type="button"
-                aria-label="Send now"
-                title="Interrupt current work and send this message now — progress so far is kept"
-                onClick={() => onSendQueuedNow(queued.queuedId)}
-                className="flex items-center gap-0.5 rounded text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-              >
-                <CornerDownLeft className="h-3 w-3" aria-hidden />
-                Send now
-              </button>
-            ) : null}
-            {onCancelQueued ? (
-              <button
-                type="button"
-                aria-label="Cancel queued message"
-                onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                className="flex items-center gap-0.5 rounded text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-              >
-                <X className="h-3 w-3" aria-hidden />
-                Cancel
-              </button>
-            ) : null}
           </div>
         ) : null}
       </div>

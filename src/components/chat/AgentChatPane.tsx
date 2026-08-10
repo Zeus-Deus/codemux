@@ -1989,18 +1989,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Follow-up queueing: cancel a queued (not-yet-dispatched) turn. The
   // backend emits `queued_turn_cancelled`, which the reducer uses to
   // remove the greyed bubble — so we don't optimistically remove here.
-  // On success we restore the cancelled text into the composer draft so
-  // the user can edit and resend (prepended if the composer already has
-  // content, to avoid clobbering an in-progress draft).
+  // When the provider confirms it actually removed an item, restore the
+  // cancelled text into the composer draft so the user can edit and resend
+  // (prepended if the composer already has content, to avoid clobbering an
+  // in-progress draft).
   const handleCancelQueued = useCallback(
     (queuedId: string, text: string) => {
       if (!threadId) return;
       const tid = threadId;
       void (async () => {
         try {
-          await agentChatCancelQueuedTurn(provider, tid, queuedId);
-          const current = useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
-          setInputDraft(tid, current.trim().length > 0 ? `${text}\n${current}` : text);
+          const cancelled = await agentChatCancelQueuedTurn(
+            provider,
+            tid,
+            queuedId,
+          );
+          // The provider returns false when this id already dispatched.
+          // Do not resurrect an already-sent prompt in the composer just
+          // because the UI briefly held a stale queue marker.
+          if (!cancelled) return;
+          const current =
+            useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
+          setInputDraft(
+            tid,
+            current.trim().length > 0 ? `${text}\n${current}` : text,
+          );
         } catch (err) {
           toast.error(`Failed to cancel queued message: ${err}`);
         }

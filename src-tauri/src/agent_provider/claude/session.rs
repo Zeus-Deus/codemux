@@ -518,9 +518,9 @@ impl ClaudeSession {
 
     /// Cancel a single queued turn by id (user pressed X). Emits
     /// [`ProviderRuntimeEvent::QueuedTurnCancelled`] when the item was
-    /// found. Idempotent — cancelling an unknown / already-dispatched id
-    /// is a silent no-op.
-    pub async fn cancel_queued(&self, queued_id: &str) -> Result<(), ProviderError> {
+    /// found. Returns whether the queued item was actually removed; an
+    /// unknown / already-dispatched id returns `false`.
+    pub async fn cancel_queued(&self, queued_id: &str) -> Result<bool, ProviderError> {
         let removed = {
             let mut state = self.state.lock().await;
             if let Some(pos) = state
@@ -540,7 +540,7 @@ impl ClaudeSession {
                 queued_id: queued_id.to_string(),
             });
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// **Send now (steer):** promote a queued follow-up to the front of

@@ -53,6 +53,7 @@ const setModelMock = vi.fn();
 const setModeMock = vi.fn();
 const setModePriorMock = vi.fn();
 const setPermissionModeMock = vi.fn();
+const setInputDraftMock = vi.fn();
 const markRequestResolvedMock = vi.fn();
 const setHasDebugActivityMock = vi.fn();
 const setDebugActivityResolvedMock = vi.fn();
@@ -93,6 +94,7 @@ vi.mock("./ChatTranscript", () => ({
     threadKey,
     onAcceptPlan,
     onEnterSubagent,
+    onCancelQueued,
     onSendQueuedNow,
   }: {
     messages: unknown[];
@@ -101,6 +103,7 @@ vi.mock("./ChatTranscript", () => ({
     threadKey?: string | null;
     onAcceptPlan: (requestId: string) => void;
     onEnterSubagent?: (subagentId: string) => void;
+    onCancelQueued?: (queuedId: string, text: string) => void;
     onSendQueuedNow?: (queuedId: string) => void;
   }) => (
     <div
@@ -130,6 +133,10 @@ vi.mock("./ChatTranscript", () => ({
       />
       {/* Dispatching a queued turn is a send, so it takes the same
           new-turn scroll contract as a composer submission. */}
+      <button
+        data-testid="cancel-queued"
+        onClick={() => onCancelQueued?.("q-1", "queued follow-up")}
+      />
       <button
         data-testid="send-queued-now"
         onClick={() => onSendQueuedNow?.("q-1")}
@@ -367,6 +374,7 @@ vi.mock("@/tauri/commands", () => ({
   // divider unless a test seeds a record.
   agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
+  agentChatCancelQueuedTurn: vi.fn().mockResolvedValue(true),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSendQueuedTurnNow: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
@@ -533,7 +541,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       const state = {
         threads: buildThreads(),
         ensureThread: vi.fn(),
-        setInputDraft: vi.fn(),
+        setInputDraft: setInputDraftMock,
         setModel: setModelMock,
         setPermissionMode: setPermissionModeMock,
         setSessionLaunchMode: vi.fn(),
@@ -761,7 +769,11 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     currentSliceOverrides = { "thread-x": { inputDraft: "hello there" } };
     workspaceIdForPaneOverride = "ws-home";
     appendUserMessageMock.mockClear();
-    const { agentChatSendTurn } = await import("@/tauri/commands");
+    setInputDraftMock.mockClear();
+    const { agentChatCancelQueuedTurn, agentChatSendTurn } = await import(
+      "@/tauri/commands"
+    );
+    vi.mocked(agentChatCancelQueuedTurn).mockClear().mockResolvedValue(true);
     vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
       turn_id: "turn-1",
       queued_id: null,
@@ -875,6 +887,43 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       container.querySelector('[data-testid="send-queued-now"]')!,
     );
     await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
+  });
+
+  it("restores a queued message only when the backend actually cancels it", async () => {
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "draft already in progress" },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="cancel-queued"]')!);
+
+    const { agentChatCancelQueuedTurn } = await import("@/tauri/commands");
+    await waitFor(() => {
+      expect(vi.mocked(agentChatCancelQueuedTurn)).toHaveBeenCalledWith(
+        expect.anything(),
+        "thread-x",
+        "q-1",
+      );
+    });
+    expect(setInputDraftMock).toHaveBeenCalledWith(
+      "thread-x",
+      "queued follow-up\ndraft already in progress",
+    );
+  });
+
+  it("does not resurrect an already-dispatched queued message in the composer", async () => {
+    const { agentChatCancelQueuedTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatCancelQueuedTurn).mockResolvedValueOnce(false);
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="cancel-queued"]')!);
+
+    await waitFor(() => {
+      expect(vi.mocked(agentChatCancelQueuedTurn)).toHaveBeenCalledWith(
+        expect.anything(),
+        "thread-x",
+        "q-1",
+      );
+    });
+    expect(setInputDraftMock).not.toHaveBeenCalled();
   });
 
   it("keeps the anchor when the turn settles", async () => {

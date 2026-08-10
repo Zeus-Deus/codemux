@@ -604,8 +604,9 @@ impl CodexSession {
     }
 
     /// Cancel a single queued turn by id (user pressed X). Emits
-    /// [`ProviderRuntimeEvent::QueuedTurnCancelled`] when found; idempotent.
-    pub async fn cancel_queued(&self, queued_id: &str) -> Result<(), ProviderError> {
+    /// [`ProviderRuntimeEvent::QueuedTurnCancelled`] when found. Returns
+    /// whether the queued item was actually removed.
+    pub async fn cancel_queued(&self, queued_id: &str) -> Result<bool, ProviderError> {
         let removed = {
             let mut state = self.state.lock().await;
             if let Some(pos) = state
@@ -625,7 +626,7 @@ impl CodexSession {
                 queued_id: queued_id.to_string(),
             });
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// **Send now (steer):** promote a queued follow-up to the front of
