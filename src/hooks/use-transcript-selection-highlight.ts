@@ -32,11 +32,41 @@ function isSelectableText(node: Text, transcript: Element): boolean {
   return false;
 }
 
+const INLINE_DISPLAY = /^(inline|ruby)/;
+
+/** Does this sibling share an inline formatting context with the whitespace
+ *  next to it? Text always does; elements only when they lay out inline. */
+function rendersInline(node: ChildNode | null): boolean {
+  if (!node) return false;
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node as Text).data.trim().length > 0;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  const display = getComputedStyle(node as Element).display;
+  // A tree with no default style sheet reports no display at all. Treat that
+  // as inline so prose spacing still paints instead of silently dropping out.
+  return display === "" || INLINE_DISPLAY.test(display);
+}
+
+/**
+ * Whitespace-only text nodes are two different things wearing one face. The
+ * newline between two block rows of rendered markup is scaffolding — painting
+ * it is what makes WebKitGTK blow the highlight up to the whole virtualized
+ * row box. The space between two inline elements (`<em>a</em> <em>b</em>`) is
+ * real prose, and dropping it punches a hole in the middle of a selection.
+ * Inline neighbours on both sides separate the two cases without needing to
+ * know anything about the surrounding row scaffolding.
+ */
+function isPaintableWhitespace(text: Text): boolean {
+  return rendersInline(text.previousSibling) && rendersInline(text.nextSibling);
+}
+
 /**
  * Split the browser's native selection into text-only ranges inside Agent
  * Chat transcripts. Structural whitespace nodes are deliberately omitted:
  * WebKitGTK expands those nodes to their virtualized row boxes when painting
- * one range across multiple messages.
+ * one range across multiple messages. Whitespace that is part of a line of
+ * prose still counts as text — see `isPaintableWhitespace`.
  */
 export function collectTranscriptSelectionRanges(
   selection: Selection,
@@ -61,7 +91,7 @@ export function collectTranscriptSelectionRanges(
       while (current) {
         const text = current as Text;
         if (
-          text.data.trim().length > 0 &&
+          (text.data.trim().length > 0 || isPaintableWhitespace(text)) &&
           rangeIntersectsNode(selectionRange, text) &&
           isSelectableText(text, transcript)
         ) {
@@ -108,12 +138,33 @@ export function useTranscriptSelectionHighlight(): void {
     const root = document.documentElement;
     let frame = 0;
 
+    // Native paint is suppressed while a selection lives, so rows the
+    // virtualizer remounts mid-selection arrive with text nodes no range
+    // covers and read as unselected until the user moves the caret. Rows come
+    // and go through the DOM, so watching for that is enough — the highlight
+    // ranges themselves are live and follow scrolling on their own. The
+    // observer only runs while something is actually selected.
+    const observer = new MutationObserver(() => schedulePaint());
+
+    const watchTranscripts = () => {
+      observer.disconnect();
+      for (const transcript of document.querySelectorAll(TRANSCRIPT_SELECTOR)) {
+        observer.observe(transcript, { childList: true, subtree: true });
+      }
+    };
+
     const paint = () => {
       frame = 0;
       const selection = document.getSelection();
       const ranges = selection
         ? collectTranscriptSelectionRanges(selection)
         : [];
+
+      if (selection && !selection.isCollapsed && selection.rangeCount > 0) {
+        watchTranscripts();
+      } else {
+        observer.disconnect();
+      }
 
       if (ranges.length === 0) {
         CSS.highlights.delete(TRANSCRIPT_SELECTION_HIGHLIGHT);
@@ -136,6 +187,7 @@ export function useTranscriptSelectionHighlight(): void {
 
     return () => {
       document.removeEventListener("selectionchange", schedulePaint);
+      observer.disconnect();
       if (frame) cancelAnimationFrame(frame);
       CSS.highlights.delete(TRANSCRIPT_SELECTION_HIGHLIGHT);
       root.classList.remove(TRANSCRIPT_SELECTION_CLASS);

@@ -68,6 +68,18 @@ describe("document selection contract", () => {
     expect(customRule).toContain("color: var(--selection-foreground)");
   });
 
+  it("leaves text controls in the transcript with a visible native selection", () => {
+    // A textarea's editable text has no light-DOM text nodes, so the custom
+    // highlight can never paint it. Without this rule the suppression above
+    // inherits in and selecting a typed deny reason shows nothing at all.
+    const textareaRule = globalsCss.match(
+      /\.transcript-selection-highlight\s+\[data-slot="transcript-list"\]\s+textarea::selection[^{]*\{([^}]*)\}/,
+    )?.[1] ?? "";
+
+    expect(textareaRule).toContain("background-color: var(--selection-background)");
+    expect(textareaRule).toContain("color: var(--selection-foreground)");
+  });
+
   it("defines both selection channels at the root so no native fallback leaks in", () => {
     const rule = globalsCss.match(/:root::selection\s*\{([^}]*)\}/)?.[1] ?? "";
     expect(rule).toContain("background-color: var(--selection-background)");
