@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  chatDraftHasUserContent,
+  partializeChatDraftStoreState,
   selectActiveDraft,
   selectDraftForWorkspace,
   useChatDraftStore,
   type ChatDraft,
   type DraftId,
 } from "./chat-draft-store";
+import { useAgentChatStore } from "./agent-chat-store";
 
 function resetStore() {
   useChatDraftStore.setState({
@@ -15,6 +18,7 @@ function resetStore() {
     projectDraftIdByPath: {},
     activeDraftId: null,
   });
+  useAgentChatStore.setState({ threads: {} });
 }
 
 describe("chat-draft-store", () => {
@@ -107,6 +111,27 @@ describe("chat-draft-store", () => {
         .getOrCreateHomeDraft({ lockedToHome: true });
       expect(second.draftId).toBe(first.draftId);
     });
+
+    it("preserves an invested home draft and mints a fresh one", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(first.draftId, "unfinished investigation");
+
+      const second = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      const state = useChatDraftStore.getState();
+
+      expect(second.draftId).not.toBe(first.draftId);
+      expect(state.activeHomeDraftId).toBe(second.draftId);
+      expect(state.draftsById[first.draftId]?.inputDraft).toBe(
+        "unfinished investigation",
+      );
+      expect(state.draftsById[second.draftId]).toBeDefined();
+    });
   });
 
   describe("getOrCreateProjectDraft", () => {
@@ -127,6 +152,55 @@ describe("chat-draft-store", () => {
       const project = useChatDraftStore.getState().getOrCreateProjectDraft("/x");
       expect(home.draftId).not.toBe(project.draftId);
       expect(project.target).toEqual({ kind: "project", projectPath: "/x" });
+    });
+
+    it("preserves an invested project draft and remaps the project slot", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/repo");
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(first.draftId, "first idea");
+
+      const second = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/repo");
+      const state = useChatDraftStore.getState();
+
+      expect(second.draftId).not.toBe(first.draftId);
+      expect(state.projectDraftIdByPath["/repo"]).toBe(second.draftId);
+      expect(state.draftsById[first.draftId]?.inputDraft).toBe("first idea");
+    });
+
+    it("treats staged attachments as invested content", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/repo");
+      const chat = useAgentChatStore.getState();
+      chat.ensureThread(first.threadId);
+      chat.addStagedAttachment(first.threadId, {
+        id: "attachment-1",
+        kind: "file",
+        ref: "/repo/README.md",
+        metadata: { label: "README.md" },
+      });
+
+      const second = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/repo");
+
+      expect(second.draftId).not.toBe(first.draftId);
+      expect(useChatDraftStore.getState().draftsById[first.draftId]).toBeDefined();
+    });
+  });
+
+  describe("content detection", () => {
+    it("counts text or attachments but not ambient configuration", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(chatDraftHasUserContent(draft)).toBe(false);
+      expect(chatDraftHasUserContent({ ...draft, inputDraft: "  hello  " })).toBe(true);
+      expect(chatDraftHasUserContent(draft, 1)).toBe(true);
+      expect(chatDraftHasUserContent({ ...draft, effort: "high" })).toBe(false);
     });
   });
 
@@ -225,6 +299,27 @@ describe("chat-draft-store", () => {
       expect(state.draftsById[draft.draftId]).toBeUndefined();
       expect(state.projectDraftIdByPath["/p"]).toBeUndefined();
       expect(state.activeDraftId).toBeNull();
+    });
+
+    it("discardDraft also releases the pre-minted thread slice", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/p");
+      const chat = useAgentChatStore.getState();
+      chat.ensureThread(draft.threadId);
+      chat.addStagedAttachment(draft.threadId, {
+        id: "attachment-1",
+        kind: "file",
+        ref: "/p/README.md",
+        metadata: { label: "README.md" },
+      });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+      useChatDraftStore.getState().discardDraft(draft.draftId);
+
+      expect(useChatDraftStore.getState().draftsById[draft.draftId]).toBeUndefined();
+      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+      expect(useAgentChatStore.getState().threads[draft.threadId]).toBeUndefined();
     });
   });
 
@@ -325,6 +420,37 @@ describe("chat-draft-store", () => {
   });
 
   describe("persistence", () => {
+    it("keeps invested unmapped drafts and drops empty unmapped sessions", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/persist");
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(first.draftId, "keep me");
+      const mapped = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/persist");
+      const emptyId = "empty-unmapped" as DraftId;
+      useChatDraftStore.setState((state) => ({
+        draftsById: {
+          ...state.draftsById,
+          [emptyId]: {
+            ...mapped,
+            draftId: emptyId,
+            threadId: "thread-empty-unmapped",
+          },
+        },
+      }));
+
+      const persisted = partializeChatDraftStoreState(
+        useChatDraftStore.getState(),
+      );
+
+      expect(persisted.draftsById[first.draftId]).toBeDefined();
+      expect(persisted.draftsById[mapped.draftId]).toBeDefined();
+      expect(persisted.draftsById[emptyId]).toBeUndefined();
+    });
+
     it("persists state to localStorage and hydrates a second store with the same payload", async () => {
       const draft = useChatDraftStore.getState().getOrCreateProjectDraft("/persist");
       useChatDraftStore.getState().updateDraftInput(draft.draftId, "remembered");

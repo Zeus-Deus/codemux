@@ -4,7 +4,11 @@ import {
   capabilityDefaults,
   defaultModelId,
 } from "@/lib/agent-chat/capability-defaults";
-import type { ChatMode } from "@/stores/agent-chat-store";
+import { discardStagedImage } from "@/lib/agent-chat/image-staging";
+import {
+  useAgentChatStore,
+  type ChatMode,
+} from "@/stores/agent-chat-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 /** Branded draft identifier. Assigned via `crypto.randomUUID()`. */
@@ -166,6 +170,11 @@ export interface ChatDraftStore {
   clearSendError: (draftId: DraftId) => void;
 
   // Removal
+  /** Permanently discard an unsent draft and its in-memory attachment
+   *  slice. Unlike `clearDraft` (the post-promotion metadata cleanup),
+   *  this also releases staged image files because no real thread will
+   *  inherit them. */
+  discardDraft: (draftId: DraftId) => void;
   clearDraft: (draftId: DraftId) => void;
   /** When `projectPath === homeDir`, also sweeps home-target
    *  drafts so closing the sidebar's Home group clears the draft
@@ -214,6 +223,42 @@ function isReusableDraft(draft: ChatDraft | undefined): draft is ChatDraft {
     draft.materializedTo === null &&
     !draft.promoting
   );
+}
+
+/** Whether the user has put meaningful work into a draft. Provider/model,
+ *  permission and checkout choices are ambient defaults and deliberately do
+ *  not count; text and attachments are the things a user expects to find
+ *  again after leaving the composer. */
+export function chatDraftHasUserContent(
+  draft: ChatDraft | null | undefined,
+  attachmentCount = 0,
+): boolean {
+  return !!draft && (draft.inputDraft.trim().length > 0 || attachmentCount > 0);
+}
+
+function liveDraftAttachmentCount(draft: ChatDraft): number {
+  return (
+    useAgentChatStore.getState().threads[draft.threadId]?.stagedAttachments
+      .length ?? 0
+  );
+}
+
+function draftHasLiveUserContent(draft: ChatDraft | undefined): boolean {
+  return !!draft && chatDraftHasUserContent(draft, liveDraftAttachmentCount(draft));
+}
+
+/** Release runtime-only state owned by an unsent draft. This must never run
+ *  for the delayed post-promotion cleanup: the real thread deliberately
+ *  inherits the same pre-minted thread id and slice. */
+function discardDraftRuntime(draft: ChatDraft): void {
+  const chat = useAgentChatStore.getState();
+  const attachments = chat.threads[draft.threadId]?.stagedAttachments ?? [];
+  for (const attachment of attachments) {
+    if (attachment.stagedImage) {
+      discardStagedImage(attachment.stagedImage.path);
+    }
+  }
+  chat.resetThread(draft.threadId);
 }
 
 function makeDraft(
@@ -341,27 +386,39 @@ export const useChatDraftStore = create<ChatDraftStore>()(
       getOrCreateHomeDraft: (opts = {}) => {
         const state = get();
         const existingId = state.activeHomeDraftId;
+        let discardedEmptyDraft: ChatDraft | null = null;
         if (existingId) {
           const existing = state.draftsById[existingId];
-          // Reuse only when the draft is still pristine AND the
-          // requested `lockedToHome` flag matches the existing draft's
-          // flag. Mismatch → fall through to a fresh draft. This is
-          // why explicit "New agent" clicks always land on a clean
-          // home composer: the existing implicit home draft (if any)
-          // may have already been auto-seeded to an existing
-          // workspace by `DraftChatSurface`'s mount effect, and
-          // returning it would defeat the point of the explicit click.
+          // Reuse only an EMPTY draft whose home-lock semantics still
+          // match. Invested drafts stay alive in draftsById so their sidebar
+          // row can reopen them; the home slot moves to a fresh session.
           if (
             isReusableDraft(existing) &&
+            !draftHasLiveUserContent(existing) &&
             !!existing.lockedToHome === !!opts.lockedToHome
           ) {
             return existing;
           }
+          // A lock mismatch can leave behind a pristine implicit home draft.
+          // It has no user work to preserve and would never earn a sidebar
+          // row, so remove it immediately instead of waiting for persistence
+          // compaction.
+          if (isReusableDraft(existing) && !draftHasLiveUserContent(existing)) {
+            discardedEmptyDraft = existing;
+          }
         }
         const draft = makeDraft({ kind: "home" }, opts);
+        const nextDraftsById = { ...state.draftsById };
+        if (discardedEmptyDraft) {
+          delete nextDraftsById[discardedEmptyDraft.draftId];
+          discardDraftRuntime(discardedEmptyDraft);
+        }
         set({
-          draftsById: { ...state.draftsById, [draft.draftId]: draft },
+          draftsById: { ...nextDraftsById, [draft.draftId]: draft },
           activeHomeDraftId: draft.draftId,
+          ...(discardedEmptyDraft && state.activeDraftId === discardedEmptyDraft.draftId
+            ? { activeDraftId: draft.draftId }
+            : {}),
         });
         return draft;
       },
@@ -371,7 +428,12 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         const existingId = state.projectDraftIdByPath[projectPath];
         if (existingId) {
           const existing = state.draftsById[existingId];
-          if (isReusableDraft(existing)) return existing;
+          // A project slot is only reusable while it is empty. Once the user
+          // types or attaches context, "new agent" means a genuinely new
+          // draft; the invested session remains reachable from the sidebar.
+          if (isReusableDraft(existing) && !draftHasLiveUserContent(existing)) {
+            return existing;
+          }
         }
         const draft = makeDraft({ kind: "project", projectPath });
         set({
@@ -529,6 +591,30 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           };
         }),
 
+      discardDraft: (draftId) => {
+        const existing = get().draftsById[draftId];
+        if (!existing) return;
+        discardDraftRuntime(existing);
+        set((s) => {
+          const current = s.draftsById[draftId];
+          if (!current) return s;
+          const nextDrafts = { ...s.draftsById };
+          delete nextDrafts[draftId];
+          const patch: Partial<ChatDraftStore> = { draftsById: nextDrafts };
+          if (s.activeHomeDraftId === draftId) patch.activeHomeDraftId = null;
+          if (s.activeDraftId === draftId) patch.activeDraftId = null;
+          if (current.target.kind === "project") {
+            const path = current.target.projectPath;
+            if (s.projectDraftIdByPath[path] === draftId) {
+              const nextMap = { ...s.projectDraftIdByPath };
+              delete nextMap[path];
+              patch.projectDraftIdByPath = nextMap;
+            }
+          }
+          return patch as ChatDraftStore;
+        });
+      },
+
       clearDraft: (draftId) =>
         set((s) => {
           const existing = s.draftsById[draftId];
@@ -550,17 +636,18 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           return patch as ChatDraftStore;
         }),
 
-      clearDraftsForProject: (projectPath, homeDir) =>
+      clearDraftsForProject: (projectPath, homeDir) => {
+        const state = get();
+        const sweepHomeDrafts = homeDir !== null && projectPath === homeDir;
+        const matching = Object.values(state.draftsById).filter(
+          (d) =>
+            (d.target.kind === "project" &&
+              d.target.projectPath === projectPath) ||
+            (sweepHomeDrafts && d.target.kind === "home"),
+        );
+        if (matching.length === 0) return;
+        for (const draft of matching) discardDraftRuntime(draft);
         set((s) => {
-          const sweepHomeDrafts =
-            homeDir !== null && projectPath === homeDir;
-          const matching = Object.values(s.draftsById).filter(
-            (d) =>
-              (d.target.kind === "project" &&
-                d.target.projectPath === projectPath) ||
-              (sweepHomeDrafts && d.target.kind === "home"),
-          );
-          if (matching.length === 0) return s;
           const nextDrafts = { ...s.draftsById };
           for (const d of matching) delete nextDrafts[d.draftId];
           const nextProjectMap = { ...s.projectDraftIdByPath };
@@ -579,11 +666,15 @@ export const useChatDraftStore = create<ChatDraftStore>()(
               patch.activeHomeDraftId = null;
             }
           }
-          if (s.activeDraftId && matching.some((d) => d.draftId === s.activeDraftId)) {
+          if (
+            s.activeDraftId &&
+            matching.some((d) => d.draftId === s.activeDraftId)
+          ) {
             patch.activeDraftId = null;
           }
           return patch as ChatDraftStore;
-        }),
+        });
+      },
     }),
     {
       name: STORAGE_KEY,
@@ -606,15 +697,61 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         }
         return persistedState as ChatDraftStore;
       },
-      partialize: (state) => ({
-        draftsById: state.draftsById,
-        activeHomeDraftId: state.activeHomeDraftId,
-        projectDraftIdByPath: state.projectDraftIdByPath,
-        activeDraftId: state.activeDraftId,
-      }),
+      partialize: partializeChatDraftStoreState,
     },
   ),
 );
+
+export type PersistedChatDraftStoreState = Pick<
+  ChatDraftStore,
+  | "draftsById"
+  | "activeHomeDraftId"
+  | "projectDraftIdByPath"
+  | "activeDraftId"
+>;
+
+/** Persist only sessions that still have a way back: the currently active or
+ *  mapped empty draft, an invested draft, or an interrupted promotion that
+ *  must remain recoverable. Empty unmapped sessions are implementation
+ *  leftovers and otherwise accumulate forever. */
+export function partializeChatDraftStoreState(
+  state: ChatDraftStore,
+): PersistedChatDraftStoreState {
+  const mappedDraftIds = new Set<DraftId>([
+    ...(state.activeHomeDraftId ? [state.activeHomeDraftId] : []),
+    ...Object.values(state.projectDraftIdByPath),
+  ]);
+  const draftsById = Object.fromEntries(
+    Object.entries(state.draftsById).filter(([draftId, draft]) => {
+      const id = draftId as DraftId;
+      return (
+        id === state.activeDraftId ||
+        mappedDraftIds.has(id) ||
+        draft.promoting ||
+        draft.materializedTo !== null ||
+        draft.lastSendError !== null ||
+        draftHasLiveUserContent(draft)
+      );
+    }),
+  ) as Record<DraftId, ChatDraft>;
+
+  return {
+    draftsById,
+    activeHomeDraftId:
+      state.activeHomeDraftId && draftsById[state.activeHomeDraftId]
+        ? state.activeHomeDraftId
+        : null,
+    projectDraftIdByPath: Object.fromEntries(
+      Object.entries(state.projectDraftIdByPath).filter(
+        ([, draftId]) => draftsById[draftId] !== undefined,
+      ),
+    ),
+    activeDraftId:
+      state.activeDraftId && draftsById[state.activeDraftId]
+        ? state.activeDraftId
+        : null,
+  };
+}
 
 /** Selector helpers — colocated so call sites do not reinvent them. */
 
