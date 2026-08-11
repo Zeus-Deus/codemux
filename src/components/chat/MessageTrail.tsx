@@ -15,9 +15,8 @@ import { normalizeWheelDelta } from "@/lib/wheel";
 
 import {
   buildTrailEntries,
-  deriveActiveTrailIndex,
+  findTrailEntryAtOffset,
   sampleTrailIndices,
-  withActiveIndex,
   type TrailEntry,
 } from "./message-trail";
 import type { TranscriptSlot } from "./transcript-slots";
@@ -26,7 +25,7 @@ import type { TranscriptSlot } from "./transcript-slots";
  *  (short threads scroll fine on their own). */
 const TRAIL_MIN_TURNS = 3;
 /** Hard ceiling on rendered ticks; a very long thread downsamples to this
- *  (see `sampleTrailIndices`). The active turn is always re-injected. */
+ *  (see `sampleTrailIndices`). */
 const TRAIL_MAX_TICKS = 60;
 /** Approx vertical space one tick (bar + hit-area padding + gap) occupies;
  *  the effective tick cap is derived from the measured rail height so the
@@ -34,9 +33,6 @@ const TRAIL_MAX_TICKS = 60;
 const TICK_SLOT_PX = 10;
 /** Top/bottom breathing room reserved inside the rail. */
 const RAIL_PAD_PX = 12;
-/** Small delay before a hover preview shows, so scrubbing the rail doesn't
- *  flicker a card at every tick. */
-const SHOW_DELAY_MS = 120;
 /** Desired viewport-relative offset of a jumped-to turn's top. */
 const SCROLL_MARGIN_PX = 10;
 /** Estimated preview-card height, used only to clamp it within the rail. */
@@ -46,11 +42,11 @@ const CARD_EST_H = 96;
  * Message **navigation trail** for the Agent Chat transcript: a slim gutter
  * of tick marks in the transcript's left margin, one per user turn. Hover a
  * tick to preview the turn (prompt + reply start); click to jump to it. The
- * tick for the turn currently in view is highlighted.
+ * ticks for turns currently in view are highlighted.
  *
- * Rendered as a sibling of LegendList. Active-row tracking and jumps go
- * through the list's index API, so the rail does not assume its target is
- * currently mounted.
+ * Rendered as a sibling of LegendList. Visibility tracking reads the list's
+ * position model and updates tick attributes directly on animation frames;
+ * scrolling therefore never schedules a React render of the transcript.
  *
  * Memoized: it re-derives its entries from every slot, so it must not be
  * dragged through a render triggered by something it does not consume.
@@ -58,45 +54,32 @@ const CARD_EST_H = 96;
 export const MessageTrail = memo(function MessageTrail({
   slots,
   listRef,
-  firstVisibleSlotIndex,
 }: {
   slots: TranscriptSlot[];
   listRef: React.RefObject<LegendListRef | null>;
-  firstVisibleSlotIndex: number;
 }) {
   const entries = useMemo(() => buildTrailEntries(slots), [slots]);
 
   if (entries.length < TRAIL_MIN_TURNS) return null;
   return (
-    <TrailRail
-      entries={entries}
-      listRef={listRef}
-      firstVisibleSlotIndex={firstVisibleSlotIndex}
-    />
+    <TrailRail entries={entries} listRef={listRef} />
   );
 });
 
 const TrailRail = memo(function TrailRail({
   entries,
   listRef,
-  firstVisibleSlotIndex,
 }: {
   entries: TrailEntry[];
   listRef: React.RefObject<LegendListRef | null>;
-  firstVisibleSlotIndex: number;
 }) {
   const railRef = useRef<HTMLElement | null>(null);
+  const tickRefs = useRef(new Map<number, HTMLSpanElement>());
   const [railHeight, setRailHeight] = useState(0);
   const [hovered, setHovered] = useState<{
     entryIndex: number;
     centerY: number;
   } | null>(null);
-  const showTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const activeIndex = useMemo(
-    () => deriveActiveTrailIndex(entries, firstVisibleSlotIndex),
-    [entries, firstVisibleSlotIndex],
-  );
 
   // Effective tick cap fits the measured rail so the gutter never overflows.
   const maxTicks = useMemo(() => {
@@ -108,13 +91,9 @@ const TrailRail = memo(function TrailRail({
     );
   }, [railHeight]);
 
-  const baseSample = useMemo(
+  const ticks = useMemo(
     () => sampleTrailIndices(entries.length, maxTicks),
     [entries.length, maxTicks],
-  );
-  const ticks = useMemo(
-    () => withActiveIndex(baseSample, activeIndex),
-    [baseSample, activeIndex],
   );
 
   // Measure the rail (pre-paint) and track resizes so `maxTicks` stays right.
@@ -129,34 +108,92 @@ const TrailRail = memo(function TrailRail({
     return () => ro.disconnect();
   }, []);
 
-  useEffect(
-    () => () => {
-      if (showTimerRef.current) clearTimeout(showTimerRef.current);
-    },
-    [],
-  );
+  // LegendList already owns the hot scroll path. Reading its position model
+  // once per animation frame and mutating these tiny presentation attributes
+  // avoids the previous onFirstVisibleItemChanged -> setState -> React commit
+  // cycle for every visible-row transition. This is the same strategy used by
+  // T3 Code's minimap and works even when target rows are virtualized away.
+  useEffect(() => {
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+
+    let frame = 0;
+    const sync = () => {
+      frame = 0;
+      const state = listRef.current?.getState();
+      if (!state) return;
+
+      const scrollTop = viewport.scrollTop;
+      const scrollBottom = scrollTop + viewport.clientHeight;
+      const activeEntryIndex = findTrailEntryAtOffset(
+        entries,
+        scrollTop + 1,
+        state.positionAtIndex,
+      );
+
+      let currentTick = -1;
+      let nearestDistance = Infinity;
+      for (const entryIndex of ticks) {
+        const distance = Math.abs(entryIndex - activeEntryIndex);
+        if (activeEntryIndex >= 0 && distance < nearestDistance) {
+          nearestDistance = distance;
+          currentTick = entryIndex;
+        }
+      }
+
+      for (const entryIndex of ticks) {
+        const strip = tickRefs.current.get(entryIndex);
+        if (!strip) continue;
+        const entry = entries[entryIndex];
+        const rowTop = state.positionAtIndex(entry.slotIndex);
+        const rowHeight = state.sizeAtIndex(entry.slotIndex);
+        const inView =
+          Number.isFinite(rowTop) &&
+          rowTop < scrollBottom &&
+          rowTop + Math.max(1, Number.isFinite(rowHeight) ? rowHeight : 1) >
+            scrollTop;
+        const current = entryIndex === currentTick;
+        const nextInView = String(inView);
+        const nextCurrent = String(current);
+        if (strip.dataset.inView !== nextInView) {
+          strip.dataset.inView = nextInView;
+        }
+        if (strip.dataset.current !== nextCurrent) {
+          strip.dataset.current = nextCurrent;
+        }
+        const button = strip.parentElement;
+        if (current && button?.getAttribute("aria-current") !== "true") {
+          button?.setAttribute("aria-current", "true");
+        } else if (!current && button?.hasAttribute("aria-current")) {
+          button.removeAttribute("aria-current");
+        }
+      }
+    };
+    const scheduleSync = () => {
+      if (frame === 0) frame = requestAnimationFrame(sync);
+    };
+
+    scheduleSync();
+    viewport.addEventListener("scroll", scheduleSync, { passive: true });
+    return () => {
+      viewport.removeEventListener("scroll", scheduleSync);
+      if (frame !== 0) cancelAnimationFrame(frame);
+    };
+  }, [entries, listRef, ticks]);
 
   const showPreview = useCallback(
-    (entryIndex: number, target: HTMLElement, immediate: boolean) => {
+    (entryIndex: number, target: HTMLElement) => {
       const rail = railRef.current;
       if (!rail) return;
       const railRect = rail.getBoundingClientRect();
       const r = target.getBoundingClientRect();
       const centerY = r.top - railRect.top + r.height / 2;
-      if (showTimerRef.current) clearTimeout(showTimerRef.current);
-      if (immediate) {
-        setHovered({ entryIndex, centerY });
-        return;
-      }
-      showTimerRef.current = setTimeout(() => {
-        setHovered({ entryIndex, centerY });
-      }, SHOW_DELAY_MS);
+      setHovered({ entryIndex, centerY });
     },
     [],
   );
 
   const hidePreview = useCallback(() => {
-    if (showTimerRef.current) clearTimeout(showTimerRef.current);
     setHovered(null);
   }, []);
 
@@ -192,6 +229,9 @@ const TrailRail = memo(function TrailRail({
   );
 
   const hoveredEntry = hovered ? entries[hovered.entryIndex] : null;
+  const hoveredTickPosition = hovered
+    ? ticks.indexOf(hovered.entryIndex)
+    : -1;
 
   return (
     <nav
@@ -200,28 +240,40 @@ const TrailRail = memo(function TrailRail({
       onWheel={forwardWheel}
       onMouseLeave={hidePreview}
       onBlur={hidePreview}
-      className="group/trail absolute inset-y-0 left-0 z-20 flex w-7 flex-col items-center justify-center gap-[1.5px] opacity-55 transition-opacity duration-300 group-hover/transcript-list:opacity-100"
+      className="absolute inset-y-0 left-0 z-20 flex w-7 flex-col items-center justify-center gap-[1.5px] opacity-55 transition-opacity duration-150 group-hover/transcript-list:opacity-100"
     >
-      {ticks.map((entryIndex) => {
+      {ticks.map((entryIndex, tickPosition) => {
         const entry = entries[entryIndex];
-        const isActive = entryIndex === activeIndex;
+        const hoverDistance =
+          hoveredTickPosition < 0
+            ? null
+            : Math.abs(tickPosition - hoveredTickPosition);
         return (
           <button
             key={entry.messageId}
             type="button"
             aria-label={`Jump to turn ${entry.turnIndex + 1}: ${firstWords(entry.userText)}`}
-            aria-current={isActive ? "true" : undefined}
             onClick={() => jumpTo(entry.slotIndex)}
-            onMouseEnter={(e) => showPreview(entryIndex, e.currentTarget, false)}
-            onFocus={(e) => showPreview(entryIndex, e.currentTarget, true)}
+            onMouseEnter={(e) => showPreview(entryIndex, e.currentTarget)}
+            onFocus={(e) => showPreview(entryIndex, e.currentTarget)}
             className="group/tick flex w-full items-center justify-center py-[3px] outline-none"
           >
             <span
+              ref={(node) => {
+                if (node) tickRefs.current.set(entryIndex, node);
+                else tickRefs.current.delete(entryIndex);
+              }}
+              data-current="false"
+              data-in-view="false"
               className={cn(
-                "rounded-full transition-all duration-200",
-                isActive
-                  ? "h-[3px] w-4 bg-foreground/70"
-                  : "h-[2px] w-2.5 bg-muted-foreground/30 group-hover/trail:w-3 group-hover/trail:bg-muted-foreground/55 group-focus-visible/tick:h-[3px] group-focus-visible/tick:w-4 group-focus-visible/tick:bg-foreground/60",
+                "h-0.5 rounded-full bg-muted-foreground/30 transition-[width,background-color] duration-150 data-[current=true]:bg-foreground/70 data-[in-view=true]:bg-foreground/90",
+                hoverDistance === 0
+                  ? "w-6 bg-muted-foreground/75"
+                  : hoverDistance === 1
+                    ? "w-4"
+                    : hoverDistance === 2
+                      ? "w-2.5"
+                      : "w-2",
               )}
             />
           </button>

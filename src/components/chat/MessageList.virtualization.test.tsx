@@ -137,7 +137,7 @@ describe("MessageList virtualization & memoization", () => {
     expect(screen.getByText("message body 999")).toBeInTheDocument();
     expect(screen.queryByText("message body 0")).not.toBeInTheDocument();
     expect(lastListProps.current).toMatchObject({
-      drawDistance: 800,
+      drawDistance: 250,
       estimatedItemSize: 112,
       initialScrollAtEnd: true,
       recycleItems: false,
@@ -289,7 +289,7 @@ describe("MessageList anchored new-turn contract (windowed list)", () => {
       document.querySelectorAll("[data-am-row]").length,
     ).toBeLessThanOrEqual(12);
     expect(lastListProps.current).toMatchObject({
-      drawDistance: 800,
+      drawDistance: 250,
       recycleItems: false,
     });
     expect(lastListProps.current?.anchoredEndSpace).toMatchObject({

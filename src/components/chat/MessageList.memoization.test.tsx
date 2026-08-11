@@ -77,9 +77,6 @@ describe("MessageList prop stability", () => {
       expect(props.keyExtractor).toBe(first.keyExtractor);
       expect(props.itemsAreEqual).toBe(first.itemsAreEqual);
       expect(props.getItemType).toBe(first.getItemType);
-      expect(props.onFirstVisibleItemChanged).toBe(
-        first.onFirstVisibleItemChanged,
-      );
     }
   });
 

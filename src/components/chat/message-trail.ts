@@ -4,20 +4,14 @@ import type { TranscriptSlot } from "./transcript-slots";
  * Pure helpers for the transcript **navigation trail** (a.k.a. turn rail /
  * jump menu): a slim gutter of tick marks, one per user turn, that previews
  * a turn on hover and jumps to it on click. Kept side-effect-free and
- * exported so the turn extraction + active-turn derivation can be
- * unit-tested directly (jsdom can't exercise real scrolling / an
- * IntersectionObserver).
- *
- * The trail derives its active turn from LegendList's first-visible-item
- * callback. That signal comes from the virtualizer's range model, so it also
- * works when most transcript rows are deliberately not mounted.
+ * exported so turn extraction and downsampling can be unit-tested directly.
+ * Runtime visibility is read from LegendList's position model by the rail.
  */
 
 export interface TrailEntry {
   /** Stable id of the user-turn row — used by labels and previews. */
   messageId: string;
-  /** Index of this turn's slot in the full `slots` array. Active-turn
-   *  tracking compares this against the first visible row's slot index. */
+  /** Index of this turn's slot in the full `slots` array. */
   slotIndex: number;
   /** 0-based ordinal of this user turn (drives labels / aria). */
   turnIndex: number;
@@ -65,42 +59,12 @@ export function buildTrailEntries(slots: TranscriptSlot[]): TrailEntry[] {
 }
 
 /**
- * Index (into `entries`) of the turn currently "in view": the last entry
- * whose slot begins at or above the FIRST visible row (document order).
- *
- * - `-1` when nothing is visible yet, or the viewport sits above the first
- *   user turn (e.g. only the session-start marker / a leading assistant row
- *   is on screen).
- * - Clamps to the last entry once the viewport scrolls past the final turn
- *   (the last entry's slot index stays `<=` any later row's index).
- *
- * `firstVisibleSlotIndex` may identify any row (assistant prose, a folded
- * activity group, etc.); the active turn is therefore the most recent user
- * turn at or before that position.
- */
-export function deriveActiveTrailIndex(
-  entries: TrailEntry[],
-  firstVisibleSlotIndex: number,
-): number {
-  if (entries.length === 0 || firstVisibleSlotIndex < 0) return -1;
-
-  let active = -1;
-  for (let i = 0; i < entries.length; i++) {
-    if (entries[i].slotIndex <= firstVisibleSlotIndex) active = i;
-    else break;
-  }
-  return active;
-}
-
-/**
  * Evenly-spaced sample of `[0, count)` bounded to `maxTicks` marks.
  *
  * A very long thread would otherwise render (and try to lay out) hundreds
  * of ticks in a fixed-height gutter — overflowing or shrinking them to
  * invisibility. Downsampling keeps the rail readable at a bounded height;
- * the tradeoff is that not every turn gets its own tick past the cap, so
- * the caller re-injects the ACTIVE turn's index (see `withActiveIndex`) to
- * guarantee the in-view turn is always represented.
+ * the tradeoff is that not every turn gets its own tick past the cap.
  *
  * Endpoints are always included (first + last turn), and rounding
  * collisions are de-duplicated so no two ticks map to the same turn.
@@ -119,26 +83,31 @@ export function sampleTrailIndices(count: number, maxTicks: number): number[] {
 }
 
 /**
- * Ensure `active` appears in a sampled index list without growing it: if
- * the active turn was dropped by downsampling, swap the nearest sampled
- * index for it, then re-sort. Keeps the tick count bounded while the
- * in-view turn always has a visible (and highlightable) tick.
+ * Last trail entry whose virtual row begins at or above `offset`.
+ *
+ * LegendList positions are monotonic, so binary search keeps scroll work
+ * logarithmic even for transcripts with thousands of turns. Returns `-1`
+ * while the viewport is above the first user turn.
  */
-export function withActiveIndex(sample: number[], active: number): number[] {
-  if (active < 0 || sample.length === 0 || sample.includes(active)) {
-    return sample;
-  }
-  let nearest = 0;
-  let best = Infinity;
-  for (let i = 0; i < sample.length; i++) {
-    const d = Math.abs(sample[i] - active);
-    if (d < best) {
-      best = d;
-      nearest = i;
+export function findTrailEntryAtOffset(
+  entries: TrailEntry[],
+  offset: number,
+  positionAtIndex: (slotIndex: number) => number,
+): number {
+  let low = 0;
+  let high = entries.length - 1;
+  let active = -1;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const rowTop = positionAtIndex(entries[middle].slotIndex);
+    if (Number.isFinite(rowTop) && rowTop <= offset) {
+      active = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
     }
   }
-  const copy = sample.slice();
-  copy[nearest] = active;
-  copy.sort((a, b) => a - b);
-  return copy;
+
+  return active;
 }
