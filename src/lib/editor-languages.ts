@@ -43,12 +43,17 @@ const IMAGE_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "avif", "svg",
 ]);
 
+const VIDEO_EXTENSIONS = new Set([
+  "mp4", "m4v", "webm", "mov", "ogv", "mkv", "avi",
+]);
+
 const BINARY_EXTENSIONS = new Set([
   ...IMAGE_EXTENSIONS,
+  ...VIDEO_EXTENSIONS,
   "woff", "woff2", "ttf", "eot", "otf",
   "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
   "exe", "dll", "so", "dylib", "o", "a",
-  "wasm", "pdf", "mp3", "mp4", "wav", "ogg", "webm",
+  "wasm", "pdf", "mp3", "wav", "ogg",
 ]);
 
 export function isBinaryExtension(filename: string): boolean {
@@ -59,4 +64,9 @@ export function isBinaryExtension(filename: string): boolean {
 export function isImageExtension(filename: string): boolean {
   const ext = filename.split(".").pop()?.toLowerCase();
   return ext != null && IMAGE_EXTENSIONS.has(ext);
+}
+
+export function isVideoExtension(filename: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  return ext != null && VIDEO_EXTENSIONS.has(ext);
 }

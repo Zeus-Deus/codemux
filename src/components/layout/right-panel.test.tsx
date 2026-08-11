@@ -88,6 +88,7 @@ vi.mock("@/tauri/commands", async (importOriginal) => ({
 }));
 
 import { RightPanel } from "./right-panel";
+import { docPaneId } from "./right-panel/pane-registry";
 
 function chatPane(threadId: string | null): PaneNodeSnapshot {
   return {
@@ -389,6 +390,23 @@ describe("RightPanel deck", () => {
     expect(screen.getByTestId("right-panel-pane-actions")).toHaveTextContent(
       "−12",
     );
+  });
+
+  it("keeps video previews free of text-editor actions", () => {
+    const videoPane = docPaneId("/p/artifacts/scroll-performance-after.mp4");
+    useUIStore.setState({
+      rightPanelPanes: {
+        "ws-1": [...DEFAULT_RIGHT_PANEL_PANES, videoPane],
+      },
+      rightPanelTabs: { "ws-1": videoPane },
+    });
+
+    renderDeck({ activeTab: videoPane });
+
+    expect(screen.getByTestId("video-viewer")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "File explorer" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Disable soft wrap" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy file" })).toBeNull();
   });
 
   // Tabs carry their state as a fill, not a box. A border on the active tab
