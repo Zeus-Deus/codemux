@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Brain, Check, ChevronDown } from "lucide-react";
+import { Brain, Check, ChevronDown, Zap } from "lucide-react";
 
 import {
   Command,
@@ -193,16 +193,25 @@ export function ReasoningPicker({
             title={triggerAriaLabel}
             className={FOOTER_TRIGGER}
           >
-            {reasoningLabel ? <Brain className="h-4 w-4" /> : null}
+            {fastMode ? (
+              <Zap
+                aria-hidden
+                data-testid="fast-mode-indicator"
+                className="h-3.5 w-3.5 fill-current text-foreground/80"
+                strokeWidth={1.5}
+              />
+            ) : reasoningLabel ? (
+              <Brain className="h-4 w-4" />
+            ) : null}
             <span className="max-w-[200px] truncate">{triggerLabel}</span>
             <ChevronDown className="h-3 w-3 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[340px] p-0"
-        align="start"
-        onOpenAutoFocus={focusCmdkOnOpen}
-      >
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          className="w-[340px] p-0"
+          align="start"
+          onOpenAutoFocus={focusCmdkOnOpen}
+        >
         <Command>
           {hasEffortSection && ultrathinkInBodyText ? (
             <div className="px-3 pt-2 pb-1 text-[11px] text-muted-foreground/80">

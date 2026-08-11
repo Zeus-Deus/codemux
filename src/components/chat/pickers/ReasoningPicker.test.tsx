@@ -137,7 +137,7 @@ describe("ReasoningPicker — render", () => {
     expect(trigger).toHaveTextContent("Standard");
   });
 
-  it("keeps service tier visually quiet in the closed trigger", () => {
+  it("shows a compact bolt in the closed trigger when fast mode is enabled", () => {
     const { trigger } = renderPicker({
       model: FAST_CAPABLE,
       effortValue: "high",
@@ -145,10 +145,20 @@ describe("ReasoningPicker — render", () => {
     });
     expect(trigger).toHaveTextContent("High");
     expect(trigger).not.toHaveTextContent("Fast");
+    expect(screen.getByTestId("fast-mode-indicator")).toBeInTheDocument();
     expect(trigger).toHaveAttribute(
       "aria-label",
       "Reasoning: High; service tier: Fast",
     );
+  });
+
+  it("hides the fast indicator while the standard tier is selected", () => {
+    renderPicker({
+      model: FAST_CAPABLE,
+      effortValue: "high",
+      fastMode: false,
+    });
+    expect(screen.queryByTestId("fast-mode-indicator")).not.toBeInTheDocument();
   });
 
   it("renders pill with 'Effort · Context' format when both axes populated", () => {
