@@ -1,6 +1,12 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
+import {
+  render,
+  screen,
+  cleanup,
+  fireEvent,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
@@ -257,7 +263,9 @@ describe("SidebarInboxCard — snooze affordance", () => {
 
   it("snoozes to the chosen preset's instant without activating the workspace", async () => {
     const { props } = renderCard();
-    await userEvent.click(screen.getByRole("button", { name: 'Snooze "Ship it"' }));
+    await userEvent.click(
+      screen.getByRole("button", { name: 'Snooze "Ship it"' }),
+    );
     await userEvent.click(await screen.findByText("Tomorrow"));
 
     const [id, until] = vi.mocked(props.onSnooze).mock.calls[0];
@@ -278,7 +286,9 @@ describe("SidebarInboxCard — unread / woke", () => {
 
   it("shows the woke pill alongside an unread dot", () => {
     renderCard({ unread: true, woke: true });
-    expect(screen.getByLabelText('"Ship it" woke from snooze')).toBeInTheDocument();
+    expect(
+      screen.getByLabelText('"Ship it" woke from snooze'),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText('Unread — "Ship it"')).toBeInTheDocument();
   });
 
@@ -367,12 +377,16 @@ describe("SidebarInboxCard — background recede", () => {
 
     const workingState = screen.getByText("Working").parentElement;
     expect(workingState?.className).toContain("text-muted-foreground/70");
-    expect(workingState?.className).toContain("group-hover/card:text-status-working");
+    expect(workingState?.className).toContain(
+      "group-hover/card:text-status-working",
+    );
 
     const additions = screen.getByText("+38");
     const deletions = screen.getByText("−12");
     expect(additions.className).toContain("text-muted-foreground/70");
-    expect(additions.className).toContain("group-hover/card:text-status-open/80");
+    expect(additions.className).toContain(
+      "group-hover/card:text-status-open/80",
+    );
     expect(deletions.className).toContain("text-muted-foreground/70");
     expect(deletions.className).toContain(
       "group-focus-within/card:text-status-attention/80",
@@ -382,7 +396,9 @@ describe("SidebarInboxCard — background recede", () => {
     expect(pr.className).toContain("text-muted-foreground/65");
     expect(pr.className).toContain("group-hover/card:text-status-open");
     expect(pr.className).not.toMatch(/(^|\s)text-status-open\b/);
-    expect(pr.querySelector("svg")?.getAttribute("class")).toContain("text-current");
+    expect(pr.querySelector("svg")?.getAttribute("class")).toContain(
+      "text-current",
+    );
     expect(card.className).toContain("opacity-70");
   });
 
@@ -404,11 +420,17 @@ describe("SidebarInboxCard — background recede", () => {
   it("keeps every card that wants a human at full brightness", () => {
     const cases: Array<[string, Partial<CardProps>]> = [
       ["the workspace you are in", { isActive: true, status: "working" }],
-      ["a card ticked for a bulk action", { selected: true, status: "working" }],
+      [
+        "a card ticked for a bulk action",
+        { selected: true, status: "working" },
+      ],
       ["unread agent output", { unread: true, status: "working" }],
       ["a card just back from a snooze", { woke: true, status: null }],
       ["an agent blocked on you", { status: "permission" as ActivePaneStatus }],
-      ["work finished and waiting on a review", { status: "review" as ActivePaneStatus }],
+      [
+        "work finished and waiting on a review",
+        { status: "review" as ActivePaneStatus },
+      ],
     ];
 
     for (const [label, overrides] of cases) {
@@ -434,7 +456,9 @@ describe("SidebarInboxCard — background recede", () => {
     expect(screen.getByText("M").className).not.toContain("grayscale");
     expect(screen.getByText("Ship it").className).toContain("text-foreground");
     expect(screen.getByText("+8").className).toContain("text-status-open/80");
-    expect(screen.getByText("−3").className).toContain("text-status-attention/80");
+    expect(screen.getByText("−3").className).toContain(
+      "text-status-attention/80",
+    );
     expect(
       screen.getByRole("button", { name: "Pull request #12 — open" }).className,
     ).toContain("text-status-open");
@@ -448,9 +472,7 @@ describe("SidebarInboxCard — working status", () => {
     expect(
       container.querySelector("[data-workspace-working-icon]"),
     ).toBeInTheDocument();
-    expect(
-      container.querySelector("[data-orb-state]"),
-    ).not.toBeInTheDocument();
+    expect(container.querySelector("[data-orb-state]")).not.toBeInTheDocument();
     expect(screen.getByText("Working")).toBeInTheDocument();
   });
 });
@@ -506,8 +528,18 @@ describe("SidebarInboxCard — meta line alignment", () => {
 
       // ahead + diff stats are git-local facts: they belong with the branch on
       // the left, so growing them shifts nothing in the right-hand column.
-      expect(children.slice(0, spacer).map((c) => c.textContent).join(" ")).toContain("↑2");
-      expect(children.slice(0, spacer).map((c) => c.textContent).join(" ")).toContain("+484");
+      expect(
+        children
+          .slice(0, spacer)
+          .map((c) => c.textContent)
+          .join(" "),
+      ).toContain("↑2");
+      expect(
+        children
+          .slice(0, spacer)
+          .map((c) => c.textContent)
+          .join(" "),
+      ).toContain("+484");
       expect(chip).toBeGreaterThan(spacer);
       cleanup();
     }
@@ -558,10 +590,12 @@ describe("SidebarInboxCard — pin affordance", () => {
     // card is shown, never whether its agent is interruptible. A working or
     // blocked card that offered nothing at all would also have no way out of
     // the context menu, which is where this gesture used to be buried.
-    for (const status of [null, "working", "permission", "review"] as (
-      | ActivePaneStatus
-      | null
-    )[]) {
+    for (const status of [
+      null,
+      "working",
+      "permission",
+      "review",
+    ] as (ActivePaneStatus | null)[]) {
       renderCard({ status });
       expect(
         screen.getByRole("button", { name: 'Pin "Ship it" to top' }),
@@ -654,10 +688,10 @@ describe("metaClusterWidth", () => {
   });
 
   it("grows with the busiest card in the list, not with each card", () => {
-    // 3 marks: 3×13 + 2×8 gaps.
-    expect(metaClusterWidth(3, false)).toBe(55);
+    // 3 marks: 3×14 + 2×8 gaps.
+    expect(metaClusterWidth(3, false)).toBe(58);
     // …plus the 12px run glyph and one more gap.
-    expect(metaClusterWidth(3, true)).toBe(75);
+    expect(metaClusterWidth(3, true)).toBe(78);
   });
 
   it("charges no gap for a run indicator standing alone", () => {
@@ -708,7 +742,9 @@ describe("SidebarInboxCard — monitoring status", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
     const label = screen.getByText("Monitoring");
     expect(label.className).toContain("text-muted-foreground/70");
-    expect(label.className).toContain("group-hover/card:text-status-monitoring");
+    expect(label.className).toContain(
+      "group-hover/card:text-status-monitoring",
+    );
     const dot = [...card.querySelectorAll("span")].find((element) =>
       element.className.includes("group-hover/card:bg-status-monitoring"),
     );

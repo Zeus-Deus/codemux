@@ -1,4 +1,11 @@
-import { ArrowUp, Check, ListTodo, LoaderCircle, Plus, Square } from "lucide-react";
+import {
+  ArrowUp,
+  Check,
+  ListTodo,
+  LoaderCircle,
+  Plus,
+  Square,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -14,7 +21,6 @@ import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
-import { SpeedPicker } from "./pickers/SpeedPicker";
 
 interface Props {
   provider: AgentChatProviderKind;
@@ -178,15 +184,10 @@ export function ComposerFooter({
           contextWindowValue={contextWindow}
           labelMap={effortLabelMap}
           ultrathinkInBodyText={ultrathinkInBodyText}
+          fastMode={fastMode}
           onEffortChange={onEffortChange}
           onContextWindowChange={onContextWindowChange}
-          disabled={controlsDisabled}
-          withSeparator
-        />
-        <SpeedPicker
-          model={activeModel}
-          value={fastMode}
-          onChange={onFastModeChange}
+          onFastModeChange={onFastModeChange}
           disabled={controlsDisabled}
           withSeparator
         />

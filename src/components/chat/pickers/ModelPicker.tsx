@@ -99,13 +99,16 @@ export function ModelPicker({
         <button
           type="button"
           disabled={disabled}
-          className={FOOTER_TRIGGER}
+          className={cn(FOOTER_TRIGGER, "gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-3 w-3" />
+          <ProviderLogo provider={provider} className="h-4 w-4" />
           <span className="max-w-[140px] truncate">
             {modelLabel(provider, current)}
           </span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown
+            className="-mx-0.5 h-3.5 w-3.5 opacity-70"
+            strokeWidth={2.25}
+          />
         </button>
       </PopoverTrigger>
       <PopoverContent

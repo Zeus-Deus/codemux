@@ -55,6 +55,19 @@ const OPUS_4_5: ChatModelInfo = {
   context_window_options: [],
 };
 
+const FAST_CAPABLE: ChatModelInfo = {
+  ...OPUS_4_5,
+  id: "gpt-5.6-codex",
+  label: "GPT-5.6 Codex",
+  supports_fast_mode: true,
+};
+
+const SERVICE_TIER_ONLY: ChatModelInfo = {
+  ...HAIKU,
+  id: "service-tier-only",
+  supports_fast_mode: true,
+};
+
 // Context-only edge case: a hypothetical future model that offers
 // context-window choice without effort. No current Claude model looks
 // like this, but the picker's branches support it — test it.
@@ -80,6 +93,7 @@ type Props = Parameters<typeof ReasoningPicker>[0];
 function renderPicker(overrides: Partial<Props> = {}) {
   const onEffortChange = vi.fn();
   const onContextWindowChange = vi.fn();
+  const onFastModeChange = vi.fn();
   const utils = render(
     <TooltipProvider>
       <ReasoningPicker
@@ -88,14 +102,22 @@ function renderPicker(overrides: Partial<Props> = {}) {
         contextWindowValue={null}
         labelMap={LABEL_MAP}
         ultrathinkInBodyText={false}
+        fastMode={false}
         onEffortChange={onEffortChange}
         onContextWindowChange={onContextWindowChange}
+        onFastModeChange={onFastModeChange}
         {...overrides}
       />
     </TooltipProvider>,
   );
   const trigger = utils.container.querySelector("button") as HTMLElement | null;
-  return { ...utils, onEffortChange, onContextWindowChange, trigger };
+  return {
+    ...utils,
+    onEffortChange,
+    onContextWindowChange,
+    onFastModeChange,
+    trigger,
+  };
 }
 
 describe("ReasoningPicker — render", () => {
@@ -104,9 +126,29 @@ describe("ReasoningPicker — render", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  it("hides when the model has no effort AND ≤1 context options (Haiku)", () => {
+  it("hides when the model has no configurable runtime options (Haiku)", () => {
     const { container } = renderPicker({ model: HAIKU });
     expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("renders for a service-tier-only model", () => {
+    const { trigger } = renderPicker({ model: SERVICE_TIER_ONLY });
+    expect(trigger).not.toBeNull();
+    expect(trigger).toHaveTextContent("Standard");
+  });
+
+  it("keeps service tier visually quiet in the closed trigger", () => {
+    const { trigger } = renderPicker({
+      model: FAST_CAPABLE,
+      effortValue: "high",
+      fastMode: true,
+    });
+    expect(trigger).toHaveTextContent("High");
+    expect(trigger).not.toHaveTextContent("Fast");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "Reasoning: High; service tier: Fast",
+    );
   });
 
   it("renders pill with 'Effort · Context' format when both axes populated", () => {
@@ -213,6 +255,15 @@ describe("ReasoningPicker — dropdown structure", () => {
     await user.click(trigger!);
     expect(await screen.findByText("Context Window")).toBeInTheDocument();
     expect(screen.queryByText("Effort")).toBeNull();
+  });
+
+  it("adds Service tier only for fast-capable models", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ model: FAST_CAPABLE });
+    await user.click(trigger!);
+    expect(await screen.findByText("Service tier")).toBeInTheDocument();
+    expect(screen.getByText("Standard")).toBeInTheDocument();
+    expect(screen.getByText("Fast")).toBeInTheDocument();
   });
 
   it("lists every native + prompt-injected effort level", async () => {
@@ -334,6 +385,38 @@ describe("ReasoningPicker — interaction", () => {
     await user.click(target!);
     expect(onContextWindowChange).toHaveBeenCalledWith("200k");
   });
+
+  it("selecting Fast fires the existing fast-mode callback", async () => {
+    const user = userEvent.setup();
+    const { trigger, onFastModeChange } = renderPicker({
+      model: FAST_CAPABLE,
+      fastMode: false,
+    });
+    await user.click(trigger!);
+    const options = await screen.findAllByRole("option");
+    const fast = options.find((option) =>
+      (option.textContent ?? "").startsWith("Fast"),
+    );
+    expect(fast).toBeDefined();
+    await user.click(fast!);
+    expect(onFastModeChange).toHaveBeenCalledWith(true);
+  });
+
+  it("selecting Standard fires the existing fast-mode callback", async () => {
+    const user = userEvent.setup();
+    const { trigger, onFastModeChange } = renderPicker({
+      model: FAST_CAPABLE,
+      fastMode: true,
+    });
+    await user.click(trigger!);
+    const options = await screen.findAllByRole("option");
+    const standard = options.find((option) =>
+      (option.textContent ?? "").startsWith("Standard"),
+    );
+    expect(standard).toBeDefined();
+    await user.click(standard!);
+    expect(onFastModeChange).toHaveBeenCalledWith(false);
+  });
 });
 
 describe("ReasoningPicker — effort descriptions", () => {
@@ -370,7 +453,9 @@ describe("ReasoningPicker — effort descriptions", () => {
     // `ultra` has no provider blurb in this payload, so the picker's
     // own fallback line has to fill the row's second line.
     expect(
-      await screen.findByText("Deepest reasoning with automatic task delegation"),
+      await screen.findByText(
+        "Deepest reasoning with automatic task delegation",
+      ),
     ).toBeInTheDocument();
   });
 

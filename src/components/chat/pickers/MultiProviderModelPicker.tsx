@@ -102,10 +102,7 @@ function filterProviders(
  *  without re-querying the backend. Anything we can't classify lands
  *  in `unknown` and falls through to the generic "Unavailable" copy. */
 type ProviderErrorKind =
-  | "not_installed"
-  | "not_authenticated"
-  | "harvest_failed"
-  | "unknown";
+  "not_installed" | "not_authenticated" | "harvest_failed" | "unknown";
 
 interface ParsedProviderError {
   kind: ProviderErrorKind;
@@ -245,10 +242,7 @@ export function MultiProviderModelPicker({
   // the whole array (rather than calling `isFavorite` lazily) is
   // what tells zustand to re-render this component on every toggle.
   const favoritesArray = usePickerFavorites((s) => s.favorites);
-  const favoritesSet = useMemo(
-    () => new Set(favoritesArray),
-    [favoritesArray],
-  );
+  const favoritesSet = useMemo(() => new Set(favoritesArray), [favoritesArray]);
 
   // The favorites pseudo-tab in the rail must be gated on favorites
   // FOR THE CURRENTLY VISIBLE PROVIDERS, not on the unfiltered total.
@@ -304,7 +298,7 @@ export function MultiProviderModelPicker({
           allRows.filter((row) =>
             favoritesSet.has(pickerFavoriteKey(row.provider, row.model.id)),
           )
-        : rowsByProvider[railKey] ?? [];
+        : (rowsByProvider[railKey] ?? []);
 
     // Two-level sort:
     //   1. Favorites bubble to the very top of every list (rail-only,
@@ -415,9 +409,9 @@ export function MultiProviderModelPicker({
           // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
           // in for a tinted dot. Hairline pipes between footer
           // controls — not per-pill borders — carry the separation.
-          className={FOOTER_TRIGGER}
+          className={cn(FOOTER_TRIGGER, "gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-3 w-3" />
+          <ProviderLogo provider={provider} className="h-4 w-4" />
           <span className="max-w-[180px] truncate">
             {triggerSubtitle ? (
               <>
@@ -431,7 +425,10 @@ export function MultiProviderModelPicker({
               triggerLabel
             )}
           </span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown
+            className="-mx-0.5 h-3.5 w-3.5 opacity-70"
+            strokeWidth={2.25}
+          />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -759,10 +756,7 @@ function ModelRow({
           <span className="truncate">{model.label}</span>
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground/70">
-          <ProviderLogo
-            provider={provider}
-            className="h-2.5 w-2.5 shrink-0"
-          />
+          <ProviderLogo provider={provider} className="h-2.5 w-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
           </span>
@@ -807,9 +801,7 @@ function ModelRow({
         data-slot="command-shortcut"
         data-favorite={isFavorite || undefined}
         aria-pressed={isFavorite}
-        aria-label={
-          isFavorite ? "Remove from favorites" : "Add to favorites"
-        }
+        aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
         className={cn(
           // Always visible (not hover-revealed): a dim outline star on
           // every row keeps the favoriting affordance discoverable and
@@ -856,9 +848,7 @@ function ModelListEmptyState({
     return (
       <div className="px-4 py-6 text-center text-xs text-muted-foreground">
         <p className="font-medium text-foreground">No favorites yet</p>
-        <p className="mt-1">
-          Click the star on any model row to favorite it.
-        </p>
+        <p className="mt-1">Click the star on any model row to favorite it.</p>
       </div>
     );
   }
@@ -917,8 +907,8 @@ function ModelListEmptyState({
             Codex not detected on your system
           </p>
           <p className="mt-1">
-            Install the <code className="rounded bg-muted px-1">codex</code>{" "}
-            CLI and ensure it is on your PATH.
+            Install the <code className="rounded bg-muted px-1">codex</code> CLI
+            and ensure it is on your PATH.
           </p>
           <p className="mt-2">
             <a
@@ -936,13 +926,10 @@ function ModelListEmptyState({
     if (parsed?.kind === "not_authenticated") {
       return (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-          <p className="font-medium text-foreground">
-            Codex is not signed in
-          </p>
+          <p className="font-medium text-foreground">Codex is not signed in</p>
           <p className="mt-1">
-            Run{" "}
-            <code className="rounded bg-muted px-1">codex login</code>{" "}
-            in a terminal and try again.
+            Run <code className="rounded bg-muted px-1">codex login</code> in a
+            terminal and try again.
           </p>
         </div>
       );

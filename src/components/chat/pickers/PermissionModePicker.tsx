@@ -67,14 +67,17 @@ export function PermissionModePicker({
   return (
     <>
       {withSeparator && (
-        <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 self-center bg-border" />
+        <span
+          aria-hidden
+          className="mx-0.5 h-4 w-px shrink-0 self-center bg-border"
+        />
       )}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
-          <Lock className="h-3 w-3" />
+            <Lock className="h-4 w-4" />
           <span className="max-w-[140px] truncate">{label}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+            <ChevronDown className="h-3 w-3 opacity-50" />
         </button>
       </PopoverTrigger>
       <PopoverContent
