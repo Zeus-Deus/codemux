@@ -3,12 +3,15 @@ import { Command as CommandPrimitive } from "cmdk";
 import {
   ArrowLeft,
   ArrowRight,
+  Bot,
   ClipboardPaste,
   Columns2,
   FolderOpen,
   Globe,
   Keyboard,
   LayoutGrid,
+  LoaderCircle,
+  MessageSquareText,
   PanelLeft,
   Play,
   Plus,
@@ -18,6 +21,7 @@ import {
   SplitSquareHorizontal,
   SplitSquareVertical,
   Terminal,
+  UserRound,
   X,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
@@ -50,8 +54,10 @@ import {
   createBrowserPane,
   cyclePane,
   getPresets,
+  agentChatSearch,
   regenerateMcpConfig,
   setPresetBarVisible,
+  type AgentChatSearchResult,
 } from "@/tauri/commands";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
@@ -64,6 +70,7 @@ import {
   type ThemeDefinition,
 } from "@/lib/themes";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { openConversationSearchResult } from "@/lib/agent-chat/conversation-search";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   COMMAND_MODE_PREFIX,
@@ -265,7 +272,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
       open={open}
       onOpenChange={onOpenChange}
       title="Command palette"
-      description="Search workspaces, projects, and commands."
+      description="Search workspaces, conversations, projects, and commands."
       className="top-24 w-full gap-0 border border-border p-0 sm:max-w-[640px]"
     >
       {/* Radix unmounts dialog content while closed, so the body's stores,
@@ -284,6 +291,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
   const listRef = useRef<HTMLDivElement>(null);
+  const searchRequestRef = useRef(0);
+  const [conversationRows, setConversationRows] = useState<AgentChatSearchResult[]>([]);
+  const [conversationSearching, setConversationSearching] = useState(false);
 
   // Every keystroke re-ranks the list and cmdk re-selects the top row, but it
   // only scrolls on arrow navigation — so without this the user can be left
@@ -495,6 +505,41 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
 
   const searching = query.needle !== "";
+  const conversationsEligible = searching && !commandsOnly && !query.pathMode;
+
+  // Conversation text lives in SQLite FTS5, so unlike the in-memory groups
+  // it resolves asynchronously. A short debounce keeps fast palette typing
+  // from queuing stale DB reads; the generation guard makes the latest query
+  // authoritative even if an older invoke returns last.
+  useEffect(() => {
+    const request = ++searchRequestRef.current;
+    if (!conversationsEligible || workspaces.length === 0) {
+      setConversationRows([]);
+      setConversationSearching(false);
+      return;
+    }
+    setConversationRows([]);
+    setConversationSearching(true);
+    const timer = window.setTimeout(() => {
+      void agentChatSearch(
+        query.needle,
+        workspaces.map((workspace) => workspace.workspace_id),
+        12,
+      )
+        .then((rows) => {
+          if (searchRequestRef.current === request) setConversationRows(rows);
+        })
+        .catch((error) => {
+          if (searchRequestRef.current !== request) return;
+          console.warn("[command-palette] conversation search failed", error);
+          setConversationRows([]);
+        })
+        .finally(() => {
+          if (searchRequestRef.current === request) setConversationSearching(false);
+        });
+    }, 140);
+    return () => window.clearTimeout(timer);
+  }, [conversationsEligible, query.needle, workspaces]);
 
   // Themes are search-only. The resting palette answers "where was I?", and
   // six colour rows there would both bury that answer and put a live preview
@@ -522,6 +567,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const totalShown =
     shownWorkspaces.length +
     shownProjects.length +
+    conversationRows.length +
     matchedThemes.length +
     matchedThemeStudio.length +
     matchedCommands.length;
@@ -593,6 +639,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     if (target) openWorkspace(target.workspace.workspace_id);
   };
 
+  const openConversation = (row: AgentChatSearchResult) => {
+    close();
+    void openConversationSearchResult(row).catch(() => {
+      // The navigation helper already surfaces a user-facing toast.
+    });
+  };
+
   const runCommand = (command: PaletteCommand) => {
     close();
     if (command.run) {
@@ -647,7 +700,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           autoFocus
           value={rawQuery}
           onValueChange={setRawQuery}
-          placeholder={`Search workspaces, projects, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
+          placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
         />
         <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/70">
@@ -664,7 +717,12 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           {totalShown === 0 && (
             <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
               <span className="text-[13px] text-muted-foreground">
-                {query.needle === "" ? (
+                {conversationSearching ? (
+                  <span className="inline-flex items-center gap-2">
+                    <LoaderCircle className="size-3.5 animate-spin" />
+                    Searching conversations…
+                  </span>
+                ) : query.needle === "" ? (
                   "Nothing to show yet"
                 ) : (
                   <>
@@ -707,11 +765,32 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <ProjectItem key={row.key} row={row} homeDir={homeDir} onSelect={() => openProject(row)} />
           ))}
 
+          {conversationRows.length > 0 && (
+            <GroupHeader
+              label="Conversations"
+              count={`${conversationRows.length}`}
+              first={shownWorkspaces.length === 0 && shownProjects.length === 0}
+            />
+          )}
+          {conversationRows.map((row) => (
+            <ConversationItem
+              key={`conversation:${row.thread_id}:${row.message_id ?? "title"}`}
+              row={row}
+              query={query.needle}
+              workspace={workspaces.find((workspace) => workspace.workspace_id === row.workspace_id)}
+              onSelect={() => openConversation(row)}
+            />
+          ))}
+
           {matchedThemes.length + matchedThemeStudio.length > 0 && (
             <GroupHeader
               label="Themes"
               count={`${matchedThemes.length}`}
-              first={shownWorkspaces.length === 0 && shownProjects.length === 0}
+              first={
+                shownWorkspaces.length === 0 &&
+                shownProjects.length === 0 &&
+                conversationRows.length === 0
+              }
             />
           )}
           {matchedThemes.map((row) => (
@@ -733,6 +812,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
               first={
                 shownWorkspaces.length === 0 &&
                 shownProjects.length === 0 &&
+                conversationRows.length === 0 &&
                 matchedThemes.length + matchedThemeStudio.length === 0
               }
             />
@@ -805,17 +885,22 @@ function GroupHeader({
 function PaletteItem({
   value,
   onSelect,
+  className,
   children,
 }: {
   value: string;
   onSelect: () => void;
+  className?: string;
   children: React.ReactNode;
 }) {
   return (
     <CommandPrimitive.Item
       value={value}
       onSelect={onSelect}
-      className="group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 outline-none select-none data-selected:bg-accent"
+      className={cn(
+        "group/pal-row flex h-10 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 outline-none select-none data-selected:bg-accent",
+        className,
+      )}
     >
       {children}
     </CommandPrimitive.Item>
@@ -926,6 +1011,77 @@ function ProjectItem({
       </span>
       <EnterBadge />
     </PaletteItem>
+  );
+}
+
+function ConversationItem({
+  row,
+  query,
+  workspace,
+  onSelect,
+}: {
+  row: AgentChatSearchResult;
+  query: string;
+  workspace: WorkspaceSnapshot | undefined;
+  onSelect: () => void;
+}) {
+  const Icon =
+    row.role === "user" ? UserRound : row.role === "assistant" ? Bot : MessageSquareText;
+  const roleLabel = row.role === "user" ? "You" : row.role === "assistant" ? "Agent" : "Title";
+  const location = [workspace?.title, workspace?.git_branch]
+    .filter((part): part is string => !!part)
+    .join(" · ");
+  return (
+    <PaletteItem
+      value={`conversation:${row.thread_id}:${row.message_id ?? "title"}`}
+      onSelect={onSelect}
+      className="h-[58px] py-1.5"
+    >
+      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-foreground/[0.025] text-muted-foreground/80">
+        <Icon className="size-3" />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex min-w-0 items-baseline gap-2">
+          <span className="truncate text-[12px] font-medium text-foreground/90">
+            {row.session_title || "Untitled chat"}
+          </span>
+          {location && (
+            <span className="truncate font-mono text-[10px] text-muted-foreground/60">
+              {location}
+            </span>
+          )}
+        </span>
+        <span className="flex min-w-0 items-baseline gap-1.5 text-[11px] text-muted-foreground">
+          <span className="flex-none font-medium text-muted-foreground/75">{roleLabel}</span>
+          <span className="truncate">
+            <HighlightedSearchText text={row.snippet} query={query} />
+          </span>
+        </span>
+      </span>
+      <EnterBadge />
+    </PaletteItem>
+  );
+}
+
+function HighlightedSearchText({ text, query }: { text: string; query: string }) {
+  const terms = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
+  if (terms.length === 0) return text;
+  const escaped = [...new Set(terms.map((term) => term.toLocaleLowerCase()))]
+    .sort((a, b) => b.length - a.length)
+    .map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (escaped.length === 0) return text;
+  const matcher = new RegExp(`(${escaped.join("|")})`, "giu");
+  return text.split(matcher).map((part, index) =>
+    escaped.some((term) => part.toLocaleLowerCase().startsWith(term.replace(/\\/g, ""))) ? (
+      <mark
+        key={`${index}:${part}`}
+        className="rounded-sm bg-accent-ember/15 px-0.5 text-foreground"
+      >
+        {part}
+      </mark>
+    ) : (
+      part
+    ),
   );
 }
 

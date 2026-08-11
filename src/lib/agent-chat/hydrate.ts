@@ -34,6 +34,7 @@ export type ReplayPayload = ProviderRuntimeEvent;
 export interface TimedReplayPayload {
   event: ReplayPayload;
   createdAtMs?: number;
+  persistedId?: number;
 }
 
 const STALE_REQUEST_MESSAGE =
@@ -191,13 +192,72 @@ function foldReplayPayloads(
 ): ChatThreadState {
   let state = base;
   for (const row of timed) {
+    const previous = state;
     state = applyEvent(
       state,
       row.event,
       row.createdAtMs == null ? undefined : () => row.createdAtMs!,
     );
+    if (row.persistedId != null) {
+      state = stampSearchSourceId(previous, state, row.event, row.persistedId);
+    }
   }
   return state;
+}
+
+/** Attach a durable search-row id to the visible prose item produced by one
+ * persisted event. The live path uses this too: a user bubble may already
+ * exist optimistically, so matching by nonce/text is as important as finding
+ * a newly-appended item. */
+export function stampSearchSourceId<T extends ChatThreadState>(
+  previous: ChatThreadState,
+  next: T,
+  event: ReplayPayload,
+  persistedId: number,
+): T {
+  let targetIndex = -1;
+  if (event.type === "user_message") {
+    for (let i = next.messages.length - 1; i >= 0; i--) {
+      const item = next.messages[i];
+      if (
+        item.kind === "user_message" &&
+        (event.client_nonce
+          ? item.clientNonce === event.client_nonce
+          : item.text === event.text &&
+            (i >= previous.messages.length || previous.messages[i] !== item))
+      ) {
+        targetIndex = i;
+        break;
+      }
+    }
+  } else if (
+    event.type === "item_completed" &&
+    !event.subagent_id &&
+    event.item.kind === "assistant_text"
+  ) {
+    for (let i = next.messages.length - 1; i >= 0; i--) {
+      const item = next.messages[i];
+      if (
+        item.kind === "assistant_message" &&
+        item.turn_id === event.turn_id &&
+        item.text === event.item.text
+      ) {
+        targetIndex = i;
+        break;
+      }
+    }
+  }
+  if (targetIndex < 0) return next;
+  const target = next.messages[targetIndex];
+  if (
+    (target.kind !== "user_message" && target.kind !== "assistant_message") ||
+    target.source_event_id === persistedId
+  ) {
+    return next;
+  }
+  const messages = next.messages.slice();
+  messages[targetIndex] = { ...target, source_event_id: persistedId };
+  return { ...next, messages };
 }
 
 /**
@@ -363,7 +423,7 @@ export function parseReplayPayloads(payloads: string[]): ReplayPayload[] {
 
 /** Parse cursor/history rows while preserving their durable timestamps. */
 export function parseTimedReplayPayloads(
-  rows: ReadonlyArray<{ payload: string; created_at_ms?: number }>,
+  rows: ReadonlyArray<{ id?: number; payload: string; created_at_ms?: number }>,
 ): TimedReplayPayload[] {
   const parsed: TimedReplayPayload[] = [];
   for (const source of rows) {
@@ -372,6 +432,9 @@ export function parseTimedReplayPayloads(
     const createdAtMs = source.created_at_ms;
     parsed.push({
       event,
+      ...(typeof source.id === "number" && Number.isFinite(source.id)
+        ? { persistedId: source.id }
+        : {}),
       ...(typeof createdAtMs === "number" && Number.isFinite(createdAtMs)
         ? { createdAtMs }
         : {}),

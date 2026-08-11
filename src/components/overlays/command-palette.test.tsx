@@ -16,6 +16,13 @@ const mocks = vi.hoisted(() => ({
     },
     updateSetting: vi.fn().mockResolvedValue(undefined),
   },
+  app: {
+    appState: null as unknown,
+  },
+  backend: {
+    agentChatSearch: vi.fn(),
+    openConversationSearchResult: vi.fn(),
+  },
 }));
 
 vi.mock("@/stores/ui-store", () => {
@@ -35,7 +42,7 @@ vi.mock("@/stores/synced-settings-store", () => {
 });
 
 vi.mock("@/stores/app-store", () => ({
-  useAppStore: (selector: (state: unknown) => unknown) => selector({ appState: null }),
+  useAppStore: (selector: (state: unknown) => unknown) => selector(mocks.app),
   useHomeDir: () => "/home/z",
   useProjectGroupedWorkspaces: () => [],
 }));
@@ -66,11 +73,16 @@ vi.mock("@/lib/perf/instrumented-activate", () => ({
   activateWorkspaceInteraction: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/tauri/commands", () => ({
+  agentChatSearch: mocks.backend.agentChatSearch,
   createBrowserPane: vi.fn(),
   cyclePane: vi.fn(),
   getPresets: vi.fn().mockResolvedValue({ bar_visible: false }),
   regenerateMcpConfig: vi.fn(),
   setPresetBarVisible: vi.fn(),
+}));
+
+vi.mock("@/lib/agent-chat/conversation-search", () => ({
+  openConversationSearchResult: mocks.backend.openConversationSearchResult,
 }));
 
 import { CommandPalette } from "./command-palette";
@@ -98,6 +110,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.synced.settings.appearance.theme = "default";
   mocks.synced.settings.appearance.custom_themes = [];
+  mocks.app.appState = null;
+  mocks.backend.agentChatSearch.mockResolvedValue([]);
+  mocks.backend.openConversationSearchResult.mockResolvedValue(undefined);
   mocks.ui.takeCommandPaletteQuery.mockReturnValue(null);
   applyTheme(GRAPHITE, { animate: false, persist: false });
 });
@@ -216,5 +231,56 @@ describe("command palette — theme picker", () => {
 
     expect(screen.getByRole("combobox")).toHaveValue("theme");
     await waitFor(() => expect(screen.getByText("Ember")).toBeInTheDocument());
+  });
+});
+
+describe("command palette — conversation search", () => {
+  it("searches open workspaces and opens a durable transcript hit", async () => {
+    const hit = {
+      message_id: 42,
+      thread_id: "thread-42",
+      workspace_id: "ws-1",
+      cwd: "/repo",
+      provider: "claude",
+      session_title: "Virtualized transcript fix",
+      role: "assistant",
+      turn_id: "turn-7",
+      snippet: "The virtualized transcript now preserves its anchor.",
+      created_at: "2026-08-10 10:00:00",
+    } as const;
+    mocks.app.appState = {
+      active_workspace_id: "ws-1",
+      pane_statuses: {},
+      workspaces: [
+        {
+          workspace_id: "ws-1",
+          title: "Search branch",
+          cwd: "/repo",
+          git_branch: "feature/search",
+          project_root: "/repo",
+          surfaces: [],
+          active_surface_id: "",
+        },
+      ],
+    };
+    mocks.backend.agentChatSearch.mockResolvedValue([hit]);
+    const user = userEvent.setup();
+
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "virtualized");
+
+    await waitFor(() =>
+      expect(mocks.backend.agentChatSearch).toHaveBeenCalledWith(
+        "virtualized",
+        ["ws-1"],
+        12,
+      ),
+    );
+    expect(await screen.findByText("Conversations")).toBeInTheDocument();
+    expect(screen.getByText("Virtualized transcript fix")).toBeInTheDocument();
+    expect(screen.getByText("Agent")).toBeInTheDocument();
+
+    await user.click(screen.getByText("Virtualized transcript fix"));
+    expect(mocks.backend.openConversationSearchResult).toHaveBeenCalledWith(hit);
   });
 });

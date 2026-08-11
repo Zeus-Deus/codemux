@@ -117,6 +117,38 @@ describe("replayPayloads", () => {
     });
   });
 
+  it("stamps searchable prose with its durable persisted event id", () => {
+    const state = replayTimed([
+      {
+        event: {
+          type: "user_message",
+          thread_id: "t",
+          text: "find this prompt",
+        },
+        persistedId: 17,
+      },
+      {
+        event: {
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-search",
+          item: { kind: "assistant_text", text: "find this answer" },
+        },
+        persistedId: 18,
+      },
+    ]);
+
+    expect(state.messages[0]).toMatchObject({
+      kind: "user_message",
+      source_event_id: 17,
+    });
+    expect(state.messages[1]).toMatchObject({
+      kind: "assistant_message",
+      turn_id: "turn-search",
+      source_event_id: 18,
+    });
+  });
+
   it("restores durable row timestamps for stable worked-time labels", () => {
     const state = replayTimed([
       {

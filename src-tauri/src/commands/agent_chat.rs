@@ -30,11 +30,12 @@ use crate::agent_provider::{
     UserMessageImage,
 };
 use crate::database::{
-    AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
+    AgentChatCheckpointRecord, AgentChatSearchResult, AgentChatSessionConfig,
+    AgentChatSessionRecord, DatabaseStore,
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::observability::ObservabilityStore;
-use crate::state::{AppStateStore, PaneStatus};
+use crate::state::{AppStateStore, PaneNodeSnapshot, PaneStatus};
 
 /// Event name used for the few provider events that are NOT scoped to
 /// a single thread (global `RuntimeWarning`s with no `thread_id`).
@@ -2813,6 +2814,107 @@ pub async fn agent_chat_list_sessions(
 ) -> Result<Vec<AgentChatSessionRecord>, String> {
     let limit = limit.unwrap_or(50);
     Ok(db.list_agent_chat_sessions(&workspace_id, cwd.as_deref(), limit))
+}
+
+/// Search durable chat titles plus user/assistant prose in the open workspace
+/// scope supplied by the frontend command palette.
+#[tauri::command]
+pub async fn agent_chat_search(
+    db: State<'_, DatabaseStore>,
+    query: String,
+    workspace_ids: Vec<String>,
+    limit: Option<u32>,
+) -> Result<Vec<AgentChatSearchResult>, String> {
+    db.search_agent_chat(&query, &workspace_ids, limit.unwrap_or(12))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAgentChatSearchResult {
+    pub pane_id: String,
+    pub workspace_id: String,
+}
+
+fn pane_tree_contains_id(root: &PaneNodeSnapshot, target: &str) -> bool {
+    match root {
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => pane_id.0 == target,
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .any(|child| pane_tree_contains_id(child, target)),
+    }
+}
+
+/// Focus the pane already bound to a search hit's thread, or create a new tab
+/// bound to that exact persisted thread. No provider process starts here:
+/// mounting the pane hydrates SQLite history and the normal send path resumes
+/// the provider lazily if the user continues the conversation.
+#[tauri::command]
+pub async fn agent_chat_open_search_result<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    observability: State<'_, ObservabilityStore>,
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<OpenAgentChatSearchResult, String> {
+    feature_flag_on(&observability)?;
+    let record = db
+        .get_agent_chat_session(&thread_id)
+        .ok_or_else(|| format!("conversation_not_found: {thread_id}"))?;
+    let provider = match record.provider.to_ascii_lowercase().as_str() {
+        "claude" => ProviderKind::Claude,
+        "codex" => ProviderKind::Codex,
+        "opencode" => ProviderKind::OpenCode,
+        other => return Err(format!("unsupported_provider: {other}")),
+    };
+
+    let pane_id = if let Some(existing) = state.agent_chat_pane_id_for_thread(&thread_id) {
+        existing
+    } else {
+        let pane_id = state.create_agent_chat_pane(
+            &record.workspace_id,
+            Some(provider),
+            record.cwd.clone(),
+            Some(crate::presets::LaunchMode::NewTab),
+        )?;
+        if !state.set_agent_chat_binding(&pane_id.0, provider, thread_id.clone()) {
+            return Err("failed_to_bind_conversation_pane".to_string());
+        }
+        pane_id.0
+    };
+
+    // Pane activation selects the workspace/surface, while tab activation is
+    // a separate state field. Resolve both from one immutable snapshot and
+    // then update them before emitting the final state once.
+    let snapshot = state.snapshot();
+    let location = snapshot.workspaces.iter().find_map(|workspace| {
+        workspace.surfaces.iter().find_map(|surface| {
+            if !pane_tree_contains_id(&surface.root, &pane_id) {
+                return None;
+            }
+            let tab_id = workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.surface_id.as_ref() == Some(&surface.surface_id))
+                .map(|tab| tab.tab_id.clone());
+            Some((workspace.workspace_id.0.clone(), tab_id))
+        })
+    });
+    let Some((workspace_id, tab_id)) = location else {
+        return Err(format!("conversation_pane_not_found: {pane_id}"));
+    };
+    if let Some(tab_id) = tab_id {
+        state.activate_tab(&workspace_id, &tab_id)?;
+    }
+    if !state.activate_pane(&pane_id) {
+        return Err(format!("conversation_pane_not_found: {pane_id}"));
+    }
+    crate::state::emit_app_state(&app);
+
+    Ok(OpenAgentChatSearchResult {
+        pane_id,
+        workspace_id,
+    })
 }
 
 /// Fetch a single persisted chat session row by `thread_id`, including

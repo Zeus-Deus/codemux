@@ -4,6 +4,7 @@ import {
   applyTimedReplayTail,
   parseTimedReplayPayloads,
   replayTimed,
+  stampSearchSourceId,
 } from "@/lib/agent-chat/hydrate";
 import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
@@ -561,7 +562,11 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
           if (persistedId != null && cursor != null && persistedId <= cursor) {
             continue;
           }
+          const before = next;
           next = reduceThreadEvent(next, event);
+          if (persistedId != null) {
+            next = stampSearchSourceId(before, next, event, persistedId);
+          }
           // Only a synced slice may advance: from `null` we have no idea
           // which rows below this id we are missing.
           if (persistedId != null && cursor != null && persistedId > cursor) {
