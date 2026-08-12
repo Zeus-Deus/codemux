@@ -283,4 +283,63 @@ describe("command palette — conversation search", () => {
     await user.click(screen.getByText("Virtualized transcript fix"));
     expect(mocks.backend.openConversationSearchResult).toHaveBeenCalledWith(hit);
   });
+
+  it("survives app-state emits that only change workspace identities", async () => {
+    const hit = {
+      message_id: 7,
+      thread_id: "thread-7",
+      workspace_id: "ws-1",
+      cwd: "/repo",
+      provider: "claude",
+      session_title: "Anchor preserved",
+      role: "assistant",
+      turn_id: "turn-1",
+      snippet: "The anchor is preserved.",
+      created_at: "2026-08-10 10:00:00",
+    } as const;
+    // A fresh state object with fresh workspace objects — what every pane
+    // status or streaming emit produces, even when nothing relevant moved.
+    const stateWith = (ids: string[]) => ({
+      active_workspace_id: ids[0] ?? "",
+      pane_statuses: {},
+      workspaces: ids.map((id) => ({
+        workspace_id: id,
+        title: `Workspace ${id}`,
+        cwd: "/repo",
+        git_branch: "feature/search",
+        project_root: "/repo",
+        surfaces: [],
+        active_surface_id: "",
+      })),
+    });
+    mocks.app.appState = stateWith(["ws-1"]);
+    mocks.backend.agentChatSearch.mockResolvedValue([hit]);
+    const user = userEvent.setup();
+
+    const { rerender } = renderPalette();
+    await user.type(screen.getByRole("combobox"), "anchor");
+    expect(await screen.findByText("Anchor preserved")).toBeInTheDocument();
+    expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(1);
+
+    mocks.app.appState = stateWith(["ws-1"]);
+    rerender(<CommandPalette open onOpenChange={vi.fn()} />);
+
+    // Rows stay put, and nothing re-queries once the debounce window passes.
+    expect(screen.getByText("Anchor preserved")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Anchor preserved")).toBeInTheDocument();
+
+    // A real change to the open set is still worth a fresh query.
+    mocks.app.appState = stateWith(["ws-1", "ws-2"]);
+    rerender(<CommandPalette open onOpenChange={vi.fn()} />);
+    await waitFor(() =>
+      expect(mocks.backend.agentChatSearch).toHaveBeenLastCalledWith(
+        "anchor",
+        ["ws-1", "ws-2"],
+        12,
+      ),
+    );
+    expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(2);
+  });
 });

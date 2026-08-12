@@ -507,13 +507,23 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const searching = query.needle !== "";
   const conversationsEligible = searching && !commandsOnly && !query.pathMode;
 
+  // The search only cares about *which* workspaces are open, but `workspaces`
+  // gets a fresh identity on every app-state emit (pane status, streaming, …).
+  // Depending on this key instead keeps background churn from clearing the
+  // results and restarting the debounce under the user's cursor.
+  const workspaceIdsKey = useMemo(
+    () => workspaces.map((workspace) => workspace.workspace_id).join("\n"),
+    [workspaces],
+  );
+
   // Conversation text lives in SQLite FTS5, so unlike the in-memory groups
   // it resolves asynchronously. A short debounce keeps fast palette typing
   // from queuing stale DB reads; the generation guard makes the latest query
   // authoritative even if an older invoke returns last.
   useEffect(() => {
     const request = ++searchRequestRef.current;
-    if (!conversationsEligible || workspaces.length === 0) {
+    const workspaceIds = workspaceIdsKey === "" ? [] : workspaceIdsKey.split("\n");
+    if (!conversationsEligible || workspaceIds.length === 0) {
       setConversationRows([]);
       setConversationSearching(false);
       return;
@@ -521,11 +531,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     setConversationRows([]);
     setConversationSearching(true);
     const timer = window.setTimeout(() => {
-      void agentChatSearch(
-        query.needle,
-        workspaces.map((workspace) => workspace.workspace_id),
-        12,
-      )
+      void agentChatSearch(query.needle, workspaceIds, 12)
         .then((rows) => {
           if (searchRequestRef.current === request) setConversationRows(rows);
         })
@@ -539,7 +545,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         });
     }, 140);
     return () => window.clearTimeout(timer);
-  }, [conversationsEligible, query.needle, workspaces]);
+  }, [conversationsEligible, query.needle, workspaceIdsKey]);
 
   // Themes are search-only. The resting palette answers "where was I?", and
   // six colour rows there would both bury that answer and put a live preview
