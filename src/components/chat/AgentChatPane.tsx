@@ -345,6 +345,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     );
     return match?.threadId ?? null;
   });
+  // Promotion metadata intentionally survives for a short cleanup window,
+  // but focus handoff is a one-shot concern. Consume the signal after the
+  // replacement Composer has had its mount effect; otherwise an unrelated
+  // remount during that grace period could steal focus later.
+  const promotionFocusConsumedRef = useRef(false);
+  const focusComposerAfterPromotion =
+    promotedDraftThreadId !== null &&
+    threadId === promotedDraftThreadId &&
+    !promotionFocusConsumedRef.current;
+  useEffect(() => {
+    if (focusComposerAfterPromotion) {
+      promotionFocusConsumedRef.current = true;
+    }
+  }, [focusComposerAfterPromotion]);
   // Recovery fallback: if materialize made it past pane-creation but
   // failed during start_session / send_turn, the draft has
   // `materializedTo` set and `promotedTo` still null. The existing
@@ -2924,6 +2938,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // An empty pane reads as a new chat: "Describe what you want the
       // agent to do…" until the first turn lands (design D10 copy).
       isDraft={messages.length === 0}
+      // A local first send replaces ChatHomeLanding with the transcript;
+      // a promoted lazy draft replaces DraftChatSurface with this pane.
+      // Both swaps create a new textarea, so explicitly carry keyboard
+      // focus across them. Existing-thread mounts have neither signal and
+      // therefore do not steal focus.
+      focusOnMount={isSending || focusComposerAfterPromotion}
       // In a subagent drill-in the composer stays parent-bound; only the
       // placeholder changes to make that explicit (design copy).
       placeholderOverride={

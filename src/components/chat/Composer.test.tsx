@@ -76,6 +76,24 @@ function renderComposer(props: Partial<ComposerProps> = {}) {
 }
 
 describe("Composer", () => {
+  describe("focus handoff", () => {
+    it("focuses the textarea when a layout transition requests it", () => {
+      const { container } = renderComposer({ focusOnMount: true });
+      expect(document.activeElement).toBe(container.querySelector("textarea"));
+    });
+
+    it("does not steal focus on a normal mount", () => {
+      const outside = document.createElement("button");
+      document.body.appendChild(outside);
+      outside.focus();
+
+      renderComposer();
+
+      expect(document.activeElement).toBe(outside);
+      outside.remove();
+    });
+  });
+
   describe("error banner (§8)", () => {
     it("renders the banner when errorMessage is set", () => {
       const { getByRole } = renderComposer({

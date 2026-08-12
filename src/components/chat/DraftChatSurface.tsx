@@ -277,6 +277,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // multi-second workspace/session bring-up. Cleared on failure (restore
   // composer); on success the surface unmounts as the live pane flips in.
   const [pending, setPending] = useState<DraftPendingState | null>(null);
+  // Once this surface has accepted a first send, every composer replacement
+  // in the handoff (centered -> docked, or docked -> retry after failure)
+  // should reclaim the caret. This state dies with the draft surface, so it
+  // cannot make an unrelated chat steal focus later.
+  const [focusComposerAfterSubmit, setFocusComposerAfterSubmit] =
+    useState(false);
 
   // Warm the MCP servers as soon as the draft mounts so the up-front
   // prime cost overlaps the user composing, instead of blocking the
@@ -350,6 +356,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     }
 
     sendInFlightRef.current = true;
+    setFocusComposerAfterSubmit(true);
     const chat = useAgentChatStore.getState();
     // Resolve any `/skill-name` tokens in the draft text against the
     // skills registry. Same parser the live pane uses; bodies are
@@ -992,6 +999,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       sessionReady={true}
       // No live session yet — drives the draft-variant placeholder copy.
       isDraft={true}
+      focusOnMount={focusComposerAfterSubmit}
       placeholderOverride={placeholderOverride}
       showProviderPicker={true}
       showStopButton={false}

@@ -149,6 +149,10 @@ interface Props {
    *  steer the agent…" (design D10). Mode-specific placeholders
    *  (plan/ask/debug) are unaffected. Defaults to false. */
   isDraft?: boolean;
+  /** Reclaim keyboard focus when this composer is mounted as part of a
+   *  first-send layout transition. Opt-in so opening an existing pane does
+   *  not steal focus from another control. */
+  focusOnMount?: boolean;
   /** When set, overrides the computed textarea placeholder entirely.
    *  Used by the subagent drill-in to swap in "Steering goes to the
    *  orchestrator…" while the composer stays parent-bound. */
@@ -311,6 +315,7 @@ export function Composer({
   sessionReady,
   showProviderPicker,
   isDraft = false,
+  focusOnMount = false,
   placeholderOverride,
   mode,
   errorMessage = null,
@@ -366,6 +371,16 @@ export function Composer({
   // input's onChange forwards each picked File to onAttachImage.
   // Kept hidden so the visible affordance stays the popup row.
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+
+  // The first send moves the composer between distinct layout branches
+  // (empty-state -> transcript, and draft -> live pane), which replaces the
+  // textarea DOM node. Restore the caret on the replacement without allowing
+  // the browser to scroll the newly bottom-docked composer out of position.
+  // This is deliberately opt-in: a normal pane mount must not steal focus.
+  useEffect(() => {
+    if (!focusOnMount) return;
+    textareaRef.current?.focus({ preventScroll: true });
+  }, [focusOnMount]);
 
   // Auto-grow textarea from the resting min up to ~10 rows.
   useEffect(() => {

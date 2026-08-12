@@ -209,6 +209,7 @@ vi.mock("./Composer", () => ({
     provider,
     providerCliInstalled,
     providerAuthenticated,
+    focusOnMount,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -223,12 +224,14 @@ vi.mock("./Composer", () => ({
     provider: "claude" | "codex" | "opencode";
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
+    focusOnMount?: boolean;
   }) => (
     <div
       data-testid="composer"
       data-provider={provider}
       data-provider-cli-installed={String(providerCliInstalled)}
       data-provider-authenticated={String(providerAuthenticated)}
+      data-focus-on-mount={focusOnMount ? "true" : "false"}
     >
       {/* The running-subagents strip is welded inside the real composer's
           top edge, so the mock has to render the slot for the pane's
@@ -662,6 +665,34 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+
+  it("requests composer focus when a local first send swaps in the transcript", async () => {
+    currentMessages = [];
+    currentSliceOverrides = { "thread-x": { inputDraft: "hello" } };
+    const view = render(<AgentChatPane pane={pane} />);
+
+    fireEvent.click(
+      view.container.querySelector('[data-testid="composer-submit"]')!,
+    );
+    await waitFor(() => {
+      expect(
+        view.container.querySelector('[data-testid="composer"]'),
+      ).toHaveAttribute(
+        "data-focus-on-mount",
+        "true",
+      );
+    });
+
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    view.rerender(<AgentChatPane pane={pane} />);
+
+    expect(
+      view.container.querySelector('[data-testid="composer"]'),
+    ).toHaveAttribute(
+      "data-focus-on-mount",
+      "true",
+    );
   });
 });
 
@@ -1379,6 +1410,26 @@ describe("AgentChatPane Stage C race fix", () => {
     expect(transcript!.getAttribute("data-message-count")).toBe("1");
     // Critical: no duplicate session started.
     expect(agentChatStartSession).not.toHaveBeenCalled();
+  });
+
+  it("requests focus for the composer mounted from a promoted draft", () => {
+    currentDraftsById = {
+      "draft-1": {
+        draftId: "draft-1",
+        threadId: "draft-thread-42",
+        promotedTo: { workspaceId: "ws-home", paneId: "pane-new" },
+      },
+    };
+    currentThreadsMap = {
+      "draft-thread-42": [{ kind: "user_message", id: "m1", text: "hello" }],
+    };
+
+    const { container } = render(<AgentChatPane pane={paneNoThread} />);
+
+    expect(container.querySelector('[data-testid="composer"]')).toHaveAttribute(
+      "data-focus-on-mount",
+      "true",
+    );
   });
 
   it("starts a fresh session when pane.thread_id is null AND no promoted draft claims this workspace", () => {

@@ -742,6 +742,29 @@ describe("DraftChatSurface", () => {
         ).toEqual([]);
       }
     });
+
+    it("keeps the textarea focused when the first send docks the composer", async () => {
+      vi.mocked(materializeAndSend).mockImplementation(
+        () => new Promise(() => {}),
+      );
+      seedProjectDraft();
+      const { container, getByRole } = renderSurface();
+      const centeredTextarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+      centeredTextarea.focus();
+
+      fireEvent.keyDown(centeredTextarea, { key: "Enter" });
+
+      await vi.waitFor(() => {
+        expect(getByRole("status", { name: "Starting the agent" })).toBeTruthy();
+      });
+      const dockedTextarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+      expect(dockedTextarea).not.toBe(centeredTextarea);
+      expect(document.activeElement).toBe(dockedTextarea);
+    });
   });
 
   describe("config handlers", () => {
