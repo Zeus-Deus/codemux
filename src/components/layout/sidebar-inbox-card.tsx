@@ -46,12 +46,12 @@ export interface InboxRepo {
 }
 
 /** Floor for the meta line's trailing cluster: the width of the *widest*
- *  single indicator (the 15px notification pill, not the 13px provider logo),
+ *  single indicator (the 15px notification pill),
  *  so a card showing nothing there still can't pull its PR chip out past its
  *  neighbours'. */
 export const META_CLUSTER_MIN_WIDTH = 15;
 
-const PROVIDER_MARK_WIDTH = 13;
+const PROVIDER_MARK_WIDTH = 14;
 const RUN_INDICATOR_WIDTH = 12;
 /** The cluster's own `gap-2`. */
 const META_CLUSTER_GAP = 8;
@@ -218,7 +218,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   };
 
   const handleClick = (e: React.MouseEvent) => {
-    const mode = e.metaKey || e.ctrlKey ? "toggle" : e.shiftKey ? "range" : null;
+    const mode =
+      e.metaKey || e.ctrlKey ? "toggle" : e.shiftKey ? "range" : null;
     if (mode) {
       // A modified click is a selection gesture, not navigation: activating
       // here would yank the user into a workspace they were only ticking off
@@ -232,7 +233,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     selectAndActivate();
   };
 
-  const isRemote = workspace.host_id !== null && workspace.host_id !== undefined;
+  const isRemote =
+    workspace.host_id !== null && workspace.host_id !== undefined;
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
@@ -262,8 +264,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // workspace left babysitting CI is exactly the kind of thing a user parks.
   // Pinned cards are exempt: the pin is a visibility override that parking
   // would silently defeat.
-  const canSettle =
-    !pinned && status !== "working" && status !== "permission";
+  const canSettle = !pinned && status !== "working" && status !== "permission";
 
   // Snooze hides the card just as thoroughly as Settle does, so it rides the
   // same guardrail rather than restating it — a second copy of the condition
@@ -290,8 +291,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const hasStats =
     showGitStats &&
     (workspace.git_additions > 0 || workspace.git_deletions > 0);
-  const idleTime =
-    settledAt != null ? formatElapsed(now - settledAt) : null;
+  const idleTime = settledAt != null ? formatElapsed(now - settledAt) : null;
   const workingTime =
     isWorking && statusMark?.status === "working"
       ? formatElapsed(now - statusMark.at)
@@ -401,13 +401,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
             </span>
           )}
         </>
-      ) : isNeeds
-          ? "Needs you"
-          : isMonitoring
-            ? "Monitoring"
-            : isDone
-              ? "Done · review"
-              : idleTime}
+      ) : isNeeds ? (
+        "Needs you"
+      ) : isMonitoring ? (
+        "Monitoring"
+      ) : isDone ? (
+        "Done · review"
+      ) : (
+        idleTime
+      )}
     </span>
   );
 
@@ -895,7 +897,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       key={p}
                       provider={p}
                       className={cn(
-                        "h-[13px] w-[13px] transition-[opacity,filter]",
+                        "h-3.5 w-3.5 transition-[opacity,filter]",
                         visuallyReceded
                           ? "opacity-50 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
                           : "opacity-80",

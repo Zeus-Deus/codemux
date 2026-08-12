@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Brain, Check, ChevronDown } from "lucide-react";
+import { Brain, Check, ChevronDown, Zap } from "lucide-react";
 
 import {
   Command,
@@ -48,11 +48,15 @@ interface Props {
   /** True when the composer's draft text contains "ultrathink" outside
    *  the canonical prefix — disables the effort section. */
   ultrathinkInBodyText: boolean;
+  /** Premium service tier for models that advertise fast-mode support. */
+  fastMode: boolean;
   /** Fires when the user picks an effort row. `"ultrathink"` carries
    *  the special meaning of "prepend to the prompt"; caller handles that. */
   onEffortChange: (nextValue: string) => void;
   /** Fires when the user picks a context-window row. */
   onContextWindowChange: (nextValue: string) => void;
+  /** Fires when the user picks Standard or Fast service tier. */
+  onFastModeChange: (fastMode: boolean) => void;
   disabled?: boolean;
   /** Render a leading hairline pipe. Lives inside the picker (not the
    *  footer) so the pipe disappears together with the control when the
@@ -69,15 +73,18 @@ function effortLabel(labelMap: Record<string, string>, id: string): string {
 // reads correctly without a frontend bump. The built-in map covers
 // providers that report nothing.
 function effortDescription(model: ChatModelInfo, id: string): string {
-  return model.effort_descriptions?.[id] ?? DEFAULT_EFFORT_DESCRIPTIONS[id] ?? "";
+  return (
+    model.effort_descriptions?.[id] ?? DEFAULT_EFFORT_DESCRIPTIONS[id] ?? ""
+  );
 }
 
 /**
- * Combined Effort + Context Window picker.
+ * Combined Reasoning + Context Window + Service Tier picker.
  *
  * Replaces the separate `EffortPicker` and `ContextWindowPicker` that
  * used to render as two adjacent pills. Merged surface: one pill
- * shows "Effort · Context", one dropdown has both sections.
+ * shows "Effort · Context", one dropdown carries every model-level runtime
+ * choice. Service tier lives here instead of taking a permanent footer slot.
  *
  * Null-slice fallback (Option C of the Stage C follow-up): when the
  * slice's effort or contextWindow is null, the picker resolves to the
@@ -88,11 +95,12 @@ function effortDescription(model: ChatModelInfo, id: string): string {
  *
  * Render rules:
  *  - Hidden when `model` is null (capabilities unavailable).
- *  - Hidden when the model has no effort levels AND ≤1 context-window
- *    options (e.g. Haiku 4.5 — nothing to pick).
+ *  - Hidden when the model has no effort levels, ≤1 context-window options,
+ *    AND no service-tier choice (e.g. Haiku 4.5 — nothing to pick).
  *  - The effort section only appears when the model has effort levels.
  *  - The context-window section only appears when the model has >1
  *    options.
+ *  - The service-tier section only appears when the model supports fast mode.
  */
 export function ReasoningPicker({
   model,
@@ -100,8 +108,10 @@ export function ReasoningPicker({
   contextWindowValue,
   labelMap,
   ultrathinkInBodyText,
+  fastMode,
   onEffortChange,
   onContextWindowChange,
+  onFastModeChange,
   disabled,
   withSeparator,
 }: Props) {
@@ -116,9 +126,12 @@ export function ReasoningPicker({
   const contextOptions = model.context_window_options;
   const hasEffortSection = effortLevels.length > 0;
   const hasContextSection = contextOptions.length > 1;
+  const hasServiceTierSection = model.supports_fast_mode;
 
-  // Haiku and other models without either choice: hide entirely.
-  if (!hasEffortSection && !hasContextSection) return null;
+  // Haiku and other models without any configurable runtime choice: hide.
+  if (!hasEffortSection && !hasContextSection && !hasServiceTierSection) {
+    return null;
+  }
 
   // Option C fallback — null slice values resolve to the model's
   // default. These are the values the pill reflects and the checkmarks
@@ -126,7 +139,7 @@ export function ReasoningPicker({
   const currentEffort =
     effortValue && effortLevels.includes(effortValue)
       ? effortValue
-      : model.default_effort ?? effortLevels[0] ?? null;
+      : (model.default_effort ?? effortLevels[0] ?? null);
 
   const defaultContextWindow =
     contextOptions.find((o) => o.is_default)?.value ??
@@ -142,8 +155,8 @@ export function ReasoningPicker({
     ? effortLabel(labelMap, currentEffort)
     : null;
   const contextLabelText = currentContextWindow
-    ? contextOptions.find((o) => o.value === currentContextWindow)?.label ??
-      currentContextWindow
+    ? (contextOptions.find((o) => o.value === currentContextWindow)?.label ??
+      currentContextWindow)
     : null;
 
   // Pill-label composition:
@@ -152,31 +165,53 @@ export function ReasoningPicker({
   //  - Only context: just the context label (edge case; no Claude
   //    model has this shape today but the branch keeps the picker
   //    future-proof).
-  const pillLabel = (() => {
+  const reasoningLabel = (() => {
     if (effortLabelText && contextLabelText) {
       return `${effortLabelText} · ${contextLabelText}`;
     }
-    return effortLabelText ?? contextLabelText ?? "";
+    return effortLabelText ?? contextLabelText ?? null;
   })();
+  const triggerLabel = reasoningLabel ?? (fastMode ? "Fast" : "Standard");
+  const triggerAriaLabel = reasoningLabel
+    ? `Reasoning: ${reasoningLabel}; service tier: ${fastMode ? "Fast" : "Standard"}`
+    : `Service tier: ${fastMode ? "Fast" : "Standard"}`;
 
   return (
     <>
       {withSeparator && (
-        <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 self-center bg-border" />
+        <span
+          aria-hidden
+          className="mx-0.5 h-4 w-px shrink-0 self-center bg-border"
+        />
       )}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
-          <Brain className="h-3 w-3" />
-          <span className="max-w-[200px] truncate">{pillLabel}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[340px] p-0"
-        align="start"
-        onOpenAutoFocus={focusCmdkOnOpen}
-      >
+          <button
+            type="button"
+            disabled={disabled}
+            aria-label={triggerAriaLabel}
+            title={triggerAriaLabel}
+            className={FOOTER_TRIGGER}
+          >
+            {fastMode ? (
+              <Zap
+                aria-hidden
+                data-testid="fast-mode-indicator"
+                className="h-3.5 w-3.5 fill-current text-foreground/80"
+                strokeWidth={1.5}
+              />
+            ) : reasoningLabel ? (
+              <Brain className="h-4 w-4" />
+            ) : null}
+            <span className="max-w-[200px] truncate">{triggerLabel}</span>
+            <ChevronDown className="h-3 w-3 opacity-50" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          className="w-[340px] p-0"
+          align="start"
+          onOpenAutoFocus={focusCmdkOnOpen}
+        >
         <Command>
           {hasEffortSection && ultrathinkInBodyText ? (
             <div className="px-3 pt-2 pb-1 text-[11px] text-muted-foreground/80">
@@ -222,7 +257,9 @@ export function ReasoningPicker({
                       <Check
                         className={cn(
                           "h-3.5 w-3.5 text-muted-foreground",
-                          currentEffort === level ? "opacity-100" : "opacity-0",
+                          currentEffort === level
+                            ? "opacity-100"
+                            : "opacity-0",
                         )}
                       />
                     </CommandItem>
@@ -231,7 +268,10 @@ export function ReasoningPicker({
               </CommandGroup>
             )}
 
-            {hasEffortSection && hasContextSection && <CommandSeparator />}
+            {hasEffortSection &&
+              (hasContextSection || hasServiceTierSection) && (
+                <CommandSeparator />
+              )}
 
             {hasContextSection && (
               <CommandGroup heading="Context Window">
@@ -263,6 +303,56 @@ export function ReasoningPicker({
                     </CommandItem>
                   );
                 })}
+              </CommandGroup>
+            )}
+
+            {hasContextSection && hasServiceTierSection && (
+              <CommandSeparator />
+            )}
+
+            {hasServiceTierSection && (
+              <CommandGroup heading="Service tier">
+                <CommandItem
+                  value="service-tier:standard"
+                  onSelect={() => onFastModeChange(false)}
+                  className="h-auto gap-2 py-2"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="text-xs text-foreground">
+                      Standard
+                      <span className="ml-1.5 text-muted-foreground/60">
+                        (default)
+                      </span>
+                    </span>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Normal speed and usage rate
+                    </span>
+                  </div>
+                  <Check
+                    className={cn(
+                      "h-3.5 w-3.5 text-muted-foreground",
+                      fastMode ? "opacity-0" : "opacity-100",
+                    )}
+                  />
+                </CommandItem>
+                <CommandItem
+                  value="service-tier:fast"
+                  onSelect={() => onFastModeChange(true)}
+                  className="h-auto gap-2 py-2"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="text-xs text-foreground">Fast</span>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Faster output at a premium usage rate
+                    </span>
+                  </div>
+                  <Check
+                    className={cn(
+                      "h-3.5 w-3.5 text-muted-foreground",
+                      fastMode ? "opacity-100" : "opacity-0",
+                    )}
+                  />
+                </CommandItem>
               </CommandGroup>
             )}
           </CommandList>
