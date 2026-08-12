@@ -14,6 +14,8 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   SidebarDraftBlock,
   SidebarRailDrafts,
+  useFrozenActiveDraftRow,
+  useVisibleSidebarDraftCount,
   type SidebarDraftCatalog,
 } from "./sidebar-draft-block";
 
@@ -25,6 +27,36 @@ const catalog: SidebarDraftCatalog = {
   ]),
   projectByWorkspaceId: new Map(),
 };
+
+/** Mirrors how the sidebar inbox wires the block: one frozen snapshot feeds
+ *  both the rendered rows and the count behind the "Nothing active"
+ *  placeholder, so every test also asserts they cannot disagree. */
+function DraftBlockHarness(props: { filterPath: string | null }) {
+  const frozenActive = useFrozenActiveDraftRow(catalog, props.filterPath);
+  const visibleCount = useVisibleSidebarDraftCount(
+    catalog,
+    props.filterPath,
+    frozenActive,
+  );
+  return (
+    <>
+      <div data-testid="visible-draft-count">{visibleCount}</div>
+      <SidebarDraftBlock
+        catalog={catalog}
+        filterPath={props.filterPath}
+        frozenActive={frozenActive}
+      />
+    </>
+  );
+}
+
+function expectCountMatchesRows() {
+  const rows = screen.queryAllByTestId("sidebar-draft-row").length;
+  expect(screen.getByTestId("visible-draft-count").textContent).toBe(
+    String(rows),
+  );
+  return rows;
+}
 
 function resetStores() {
   useChatDraftStore.setState({
@@ -47,7 +79,7 @@ describe("SidebarDraftBlock", () => {
       .getState()
       .getOrCreateProjectDraft("/repo");
     useChatDraftStore.getState().setActiveDraft(draft.draftId);
-    render(<SidebarDraftBlock catalog={catalog} filterPath={null} />);
+    render(<DraftBlockHarness filterPath={null} />);
 
     act(() => {
       useChatDraftStore
@@ -55,11 +87,14 @@ describe("SidebarDraftBlock", () => {
         .updateDraftInput(draft.draftId, "Investigate the flaky build");
     });
     expect(screen.queryByTestId("sidebar-draft-row")).not.toBeInTheDocument();
+    // The placeholder count must agree: no row means nothing to count.
+    expect(expectCountMatchesRows()).toBe(0);
 
     act(() => {
       useChatDraftStore.getState().setActiveDraft(null);
     });
     const row = screen.getByTestId("sidebar-draft-row");
+    expectCountMatchesRows();
     expect(row).toHaveTextContent("codemux");
     expect(row).toHaveTextContent("Investigate the flaky build");
 
@@ -75,7 +110,7 @@ describe("SidebarDraftBlock", () => {
     useChatDraftStore
       .getState()
       .updateDraftInput(draft.draftId, "Original preview");
-    render(<SidebarDraftBlock catalog={catalog} filterPath={null} />);
+    render(<DraftBlockHarness filterPath={null} />);
 
     const row = screen.getByTestId("sidebar-draft-row");
     await userEvent.click(row);
@@ -107,9 +142,10 @@ describe("SidebarDraftBlock", () => {
     useChatDraftStore
       .getState()
       .updateDraftInput(second.draftId, "Second unfinished task");
-    render(<SidebarDraftBlock catalog={catalog} filterPath={null} />);
+    render(<DraftBlockHarness filterPath={null} />);
 
     expect(screen.getAllByTestId("sidebar-draft-row")).toHaveLength(2);
+    expectCountMatchesRows();
     const secondRow = screen
       .getAllByTestId("sidebar-draft-row")
       .find((row) => row.textContent?.includes("Second unfinished task"));
@@ -141,15 +177,66 @@ describe("SidebarDraftBlock", () => {
       metadata: { label: "README.md" },
     });
 
-    const { rerender } = render(
-      <SidebarDraftBlock catalog={catalog} filterPath="/repo" />,
-    );
+    const { rerender } = render(<DraftBlockHarness filterPath="/repo" />);
     expect(screen.getByTestId("sidebar-draft-row")).toHaveTextContent(
       "1 attachment",
     );
+    expectCountMatchesRows();
 
-    rerender(<SidebarDraftBlock catalog={catalog} filterPath="/other" />);
+    rerender(<DraftBlockHarness filterPath="/other" />);
     expect(screen.queryByTestId("sidebar-draft-row")).not.toBeInTheDocument();
+    expect(expectCountMatchesRows()).toBe(0);
+  });
+
+  it("keeps the count silent for a draft activated while empty", () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/repo");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+    render(<DraftBlockHarness filterPath={null} />);
+
+    act(() => {
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(draft.draftId, "Typing into a fresh draft");
+    });
+
+    // Frozen-null: the block deliberately renders nothing, so the count must
+    // stay 0 or the inbox hides its "Nothing active" placeholder for a row
+    // that does not exist.
+    expect(screen.queryByTestId("sidebar-draft-block")).not.toBeInTheDocument();
+    expect(expectCountMatchesRows()).toBe(0);
+  });
+
+  it("recaptures the active row when the project filter stops hiding it", () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/repo");
+    useChatDraftStore
+      .getState()
+      .updateDraftInput(draft.draftId, "Invested before activation");
+    const { rerender } = render(<DraftBlockHarness filterPath="/other" />);
+
+    act(() => {
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+    });
+    expect(expectCountMatchesRows()).toBe(0);
+
+    rerender(<DraftBlockHarness filterPath={null} />);
+    expect(screen.getByTestId("sidebar-draft-row")).toHaveTextContent(
+      "Invested before activation",
+    );
+    expect(expectCountMatchesRows()).toBe(1);
+
+    // Still frozen: edits after the recapture do not repaint the preview.
+    act(() => {
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(draft.draftId, "Edited after recapture");
+    });
+    expect(screen.getByTestId("sidebar-draft-row")).toHaveTextContent(
+      "Invested before activation",
+    );
   });
 
   it("keeps invested drafts one click away in the collapsed rail", async () => {

@@ -383,6 +383,26 @@ describe("chat-draft-store", () => {
       expect(state.draftsById[projectDraft.draftId]).toBeDefined();
     });
 
+    it("keeps a promoted draft's live thread when its project is cleared", () => {
+      const draft = useChatDraftStore.getState().getOrCreateProjectDraft("/p");
+      const chat = useAgentChatStore.getState();
+      chat.ensureThread(draft.threadId);
+      useChatDraftStore.getState().markPromoted(draft.draftId, {
+        workspaceId: "ws-1",
+        paneId: "pane-1",
+        threadId: draft.threadId,
+      });
+
+      // Archiving the project group inside the post-send grace window must not
+      // reset the real pane, which inherited the pre-minted thread id.
+      useChatDraftStore.getState().clearDraftsForProject("/p", null);
+
+      expect(useAgentChatStore.getState().threads[draft.threadId]).toBeDefined();
+      expect(
+        useChatDraftStore.getState().draftsById[draft.draftId],
+      ).toBeUndefined();
+    });
+
     it("does NOT sweep home-target drafts when homeDir is null (fall-back safety)", () => {
       const store = useChatDraftStore.getState();
       const homeDraft = store.getOrCreateHomeDraft();

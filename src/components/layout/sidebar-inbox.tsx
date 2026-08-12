@@ -86,6 +86,7 @@ import {
 import {
   buildSidebarDraftCatalog,
   SidebarDraftBlock,
+  useFrozenActiveDraftRow,
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
 
@@ -883,9 +884,14 @@ export function SidebarInbox() {
   const filter = useSidebarInboxStore((s) => s.filter);
   const setFilter = useSidebarInboxStore((s) => s.setFilter);
   const prune = useSidebarInboxStore((s) => s.prune);
+  const frozenActiveDraftRow = useFrozenActiveDraftRow(
+    sidebarDraftCatalog,
+    filter,
+  );
   const visibleDraftCount = useVisibleSidebarDraftCount(
     sidebarDraftCatalog,
     filter,
+    frozenActiveDraftRow,
   );
 
   // One coarse (~30s) clock for every elapsed label in the list, and the tick
@@ -1942,6 +1948,7 @@ export function SidebarInbox() {
         <SidebarDraftBlock
           catalog={sidebarDraftCatalog}
           filterPath={filter}
+          frozenActive={frozenActiveDraftRow}
         />
 
         {visibleDraftCount === 0 &&

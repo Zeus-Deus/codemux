@@ -646,7 +646,14 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             (sweepHomeDrafts && d.target.kind === "home"),
         );
         if (matching.length === 0) return;
-        for (const draft of matching) discardDraftRuntime(draft);
+        // A promoted draft is only a metadata leftover awaiting the delayed
+        // post-send cleanup — its pre-minted thread id and slice now belong to
+        // the real pane, so releasing that runtime state would wipe a live
+        // conversation. Drop the entry, keep the thread.
+        for (const draft of matching) {
+          if (draft.promotedTo !== null) continue;
+          discardDraftRuntime(draft);
+        }
         set((s) => {
           const nextDrafts = { ...s.draftsById };
           for (const d of matching) delete nextDrafts[d.draftId];

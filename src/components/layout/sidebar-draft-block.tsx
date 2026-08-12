@@ -110,14 +110,21 @@ function draftMatchesFilter(
 /** Primitive count subscriptions keep the enormous SidebarInbox from
  *  repainting on every composer keystroke. The count changes only on the
  *  empty↔invested boundary, draft lifecycle transitions, attachment changes,
- *  or project-filter changes. */
+ *  or project-filter changes.
+ *
+ *  The active draft is counted through `frozenActive`, the same snapshot the
+ *  block renders from, so the count can never disagree with what is on screen
+ *  (a draft that was empty at activation renders no row and must not count). */
 export function useVisibleSidebarDraftCount(
   catalog: SidebarDraftCatalog,
   filterPath: string | null,
+  frozenActive: FrozenActiveDraftRow,
 ): number {
+  const activeDraftId = frozenActive.draftId;
   const textDraftCount = useChatDraftStore((state) => {
     let count = 0;
     for (const draft of Object.values(state.draftsById)) {
+      if (draft.draftId === activeDraftId) continue;
       if (!isDraftLifecycleVisible(draft)) continue;
       if (!draftMatchesFilter(draft, catalog, filterPath)) continue;
       if (draft.inputDraft.trim().length > 0) count += 1;
@@ -128,6 +135,7 @@ export function useVisibleSidebarDraftCount(
     Object.values(state.draftsById)
       .filter(
         (draft) =>
+          draft.draftId !== activeDraftId &&
           isDraftLifecycleVisible(draft) &&
           draftMatchesFilter(draft, catalog, filterPath) &&
           draft.inputDraft.trim().length === 0,
@@ -152,7 +160,7 @@ export function useVisibleSidebarDraftCount(
     }
     return count;
   });
-  return textDraftCount + attachmentOnlyDraftCount;
+  return textDraftCount + attachmentOnlyDraftCount + (frozenActive.row ? 1 : 0);
 }
 
 interface SidebarDraftRowData {
@@ -179,6 +187,60 @@ function toDraftRowData(
         : `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`,
     attachmentCount,
   };
+}
+
+/** The active draft's row, captured once and then held still. `row === null`
+ *  means the active draft renders no row at all — it was empty when activated,
+ *  or the project filter excludes it. */
+export interface FrozenActiveDraftRow {
+  draftId: DraftId | null;
+  filterPath: string | null;
+  row: SidebarDraftRowData | null;
+}
+
+function captureActiveDraftRow(
+  activeDraftId: DraftId | null,
+  catalog: SidebarDraftCatalog,
+  filterPath: string | null,
+): FrozenActiveDraftRow {
+  const frozen: FrozenActiveDraftRow = {
+    draftId: activeDraftId,
+    filterPath,
+    row: null,
+  };
+  const draft = activeDraftId
+    ? useChatDraftStore.getState().draftsById[activeDraftId]
+    : undefined;
+  if (!draft) return frozen;
+  if (!isDraftLifecycleVisible(draft)) return frozen;
+  if (!draftMatchesFilter(draft, catalog, filterPath)) return frozen;
+  const attachmentCount =
+    useAgentChatStore.getState().threads[draft.threadId]?.stagedAttachments
+      .length ?? 0;
+  if (!chatDraftHasUserContent(draft, attachmentCount)) return frozen;
+  return { ...frozen, row: toDraftRowData(draft, attachmentCount, catalog) };
+}
+
+/** Capture the active row exactly when it becomes active. A fresh empty draft
+ *  captures null and therefore does not sprout a row while the user types.
+ *  Reopening an existing row captures its current preview and freezes it until
+ *  the user leaves again, preventing sidebar repaint churn per keystroke.
+ *
+ *  Recaptured on project-filter changes too: a draft activated while the filter
+ *  hid it captures null, and would otherwise stay invisible after the filter
+ *  clears. Typing still never recaptures, so the preview stays frozen. */
+export function useFrozenActiveDraftRow(
+  catalog: SidebarDraftCatalog,
+  filterPath: string | null,
+): FrozenActiveDraftRow {
+  const activeDraftId = useChatDraftStore((state) => state.activeDraftId);
+  const [frozen, setFrozen] = useState<FrozenActiveDraftRow>(() =>
+    captureActiveDraftRow(activeDraftId, catalog, filterPath),
+  );
+  if (frozen.draftId !== activeDraftId || frozen.filterPath !== filterPath) {
+    setFrozen(captureActiveDraftRow(activeDraftId, catalog, filterPath));
+  }
+  return frozen;
 }
 
 const SidebarDraftRow = memo(function SidebarDraftRow(props: {
@@ -285,6 +347,9 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
 export const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   catalog: SidebarDraftCatalog;
   filterPath: string | null;
+  /** Owned by the inbox (`useFrozenActiveDraftRow`) so the rows below and the
+   *  "Nothing active" placeholder agree on whether the active draft shows. */
+  frozenActive: FrozenActiveDraftRow;
 }) {
   const draftsById = useChatDraftStore((state) => state.draftsById);
   const activeDraftId = useChatDraftStore((state) => state.activeDraftId);
@@ -337,28 +402,7 @@ export const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
     [props.catalog],
   );
 
-  // Capture the active row exactly when it becomes active. A fresh empty draft
-  // captures null and therefore does not sprout a row while the user types.
-  // Reopening an existing row captures its current preview and freezes it until
-  // the user leaves again, preventing sidebar repaint churn per keystroke.
-  const [frozenActive, setFrozenActive] = useState<{
-    draftId: DraftId | null;
-    row: SidebarDraftRowData | null;
-  }>({ draftId: null, row: null });
-  if (frozenActive.draftId !== activeDraftId) {
-    const activeDraft = activeDraftId ? draftsById[activeDraftId] : undefined;
-    const activeAttachments = activeDraft
-      ? attachmentsByThreadId[activeDraft.threadId] ?? EMPTY_ATTACHMENTS
-      : EMPTY_ATTACHMENTS;
-    const row =
-      activeDraft &&
-      isDraftLifecycleVisible(activeDraft) &&
-      draftMatchesFilter(activeDraft, props.catalog, props.filterPath) &&
-      chatDraftHasUserContent(activeDraft, activeAttachments.length)
-        ? rowForDraft(activeDraft, activeAttachments.length)
-        : null;
-    setFrozenActive({ draftId: activeDraftId, row });
-  }
+  const frozenActive = props.frozenActive;
 
   const rows = useMemo(() => {
     const result: SidebarDraftRowData[] = [];
