@@ -9,6 +9,7 @@ import {
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
@@ -16,6 +17,10 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 import { Pin } from "lucide-react";
+import {
+  buildSidebarDraftCatalog,
+  SidebarRailDrafts,
+} from "./sidebar-draft-block";
 
 interface RailItemRepo {
   name: string;
@@ -138,13 +143,19 @@ export function SidebarRailWorkspaces() {
   );
   // Pending-aware so the highlight moves in the click's own task, before the
   // backend snapshot lands.
-  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
+  const selectedWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
+  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
+  const activeWorkspaceId = activeDraftId ? "" : selectedWorkspaceId;
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const projectGroups = useProjectGroupedWorkspaces(
     allWorkspaces,
     homeDir,
     hosts,
+  );
+  const sidebarDraftCatalog = useMemo(
+    () => buildSidebarDraftCatalog(projectGroups, homeDir),
+    [projectGroups, homeDir],
   );
 
   const load = useSidebarInboxStore((s) => s.load);
@@ -218,6 +229,7 @@ export function SidebarRailWorkspaces() {
 
   return (
     <div className="flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <SidebarRailDrafts catalog={sidebarDraftCatalog} />
       {railWorkspaces.map((ws) => {
         const repo = repoByWorkspace.get(ws.workspace_id);
         if (!repo) return null;

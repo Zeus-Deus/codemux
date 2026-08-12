@@ -72,6 +72,7 @@ import {
 } from "@/components/github/pr-status-icon";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { parseKeyCombo } from "@/lib/keybind-utils";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   setJumpTargets,
   DEFAULT_JUMP_MODIFIER,
@@ -82,6 +83,12 @@ import {
   providerRef,
   providerRefLabel,
 } from "@/lib/source-control";
+import {
+  buildSidebarDraftCatalog,
+  SidebarDraftBlock,
+  useFrozenActiveDraftRow,
+  useVisibleSidebarDraftCount,
+} from "./sidebar-draft-block";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -851,10 +858,16 @@ export function SidebarInbox() {
   const allWorkspaces = useMemo(() => workspaces ?? [], [workspaces]);
   // Pending-aware so the highlight moves in the click's own task, before the
   // backend snapshot lands.
-  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
+  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
+  const selectedWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
+  const activeWorkspaceId = activeDraftId ? "" : selectedWorkspaceId;
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir, hosts);
+  const sidebarDraftCatalog = useMemo(
+    () => buildSidebarDraftCatalog(projectGroups, homeDir),
+    [projectGroups, homeDir],
+  );
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
   const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
   const { openProject } = useProjectActions();
@@ -871,6 +884,15 @@ export function SidebarInbox() {
   const filter = useSidebarInboxStore((s) => s.filter);
   const setFilter = useSidebarInboxStore((s) => s.setFilter);
   const prune = useSidebarInboxStore((s) => s.prune);
+  const frozenActiveDraftRow = useFrozenActiveDraftRow(
+    sidebarDraftCatalog,
+    filter,
+  );
+  const visibleDraftCount = useVisibleSidebarDraftCount(
+    sidebarDraftCatalog,
+    filter,
+    frozenActiveDraftRow,
+  );
 
   // One coarse (~30s) clock for every elapsed label in the list, and the tick
   // the activity + auto-settle + wake effects re-run on.
@@ -1923,7 +1945,15 @@ export function SidebarInbox() {
       </div>
 
       <div className="px-2.5 pb-2.5" onContextMenuCapture={handleListContextMenuCapture}>
-        {orderedActiveCards.length === 0 && filteredPending.length === 0 && (
+        <SidebarDraftBlock
+          catalog={sidebarDraftCatalog}
+          filterPath={filter}
+          frozenActive={frozenActiveDraftRow}
+        />
+
+        {visibleDraftCount === 0 &&
+          orderedActiveCards.length === 0 &&
+          filteredPending.length === 0 && (
           <div className="px-2 py-6 text-center text-xs text-muted-foreground">
             Nothing active
             {filterName && (
@@ -1933,7 +1963,7 @@ export function SidebarInbox() {
               </>
             )}
           </div>
-        )}
+          )}
 
         {pinnedCards.map((ws, index) => renderCard(ws, index))}
 
