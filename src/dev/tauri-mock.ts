@@ -2815,7 +2815,7 @@ const handlers: Record<string, Handler> = {
       { name: "feature/40-dev-mock-tauri-runtime", last_commit_unix: now - 8 * DAY, is_local: true, is_remote: true },
       { name: "chore/port-detection", last_commit_unix: now - 12 * DAY, is_local: true, is_remote: false },
       { name: "feature/75-chat-channel", last_commit_unix: now - 15 * DAY, is_local: true, is_remote: true },
-      { name: "t3code/094b1560", last_commit_unix: now - 21 * DAY, is_local: true, is_remote: false },
+      { name: "agent/094b1560", last_commit_unix: now - 21 * DAY, is_local: true, is_remote: false },
       { name: "feature-208-address-and-sector-support", last_commit_unix: now - 35 * DAY, is_local: false, is_remote: true },
       { name: "feature-189-search-history-delete", last_commit_unix: now - 38 * DAY, is_local: false, is_remote: true },
       { name: "fix-prod-dockerfile", last_commit_unix: now - 44 * DAY, is_local: false, is_remote: true },

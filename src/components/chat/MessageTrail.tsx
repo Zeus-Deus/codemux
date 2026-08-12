@@ -111,8 +111,9 @@ const TrailRail = memo(function TrailRail({
   // LegendList already owns the hot scroll path. Reading its position model
   // once per animation frame and mutating these tiny presentation attributes
   // avoids the previous onFirstVisibleItemChanged -> setState -> React commit
-  // cycle for every visible-row transition. This is the same strategy used by
-  // T3 Code's minimap and works even when target rows are virtualized away.
+  // cycle for every visible-row transition. This is the standard
+  // editor-minimap strategy and works even when target rows are virtualized
+  // away.
   useEffect(() => {
     const viewport = listRef.current?.getScrollableNode();
     if (!viewport) return;
