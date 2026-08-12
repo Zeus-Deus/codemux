@@ -20,13 +20,16 @@ export function VideoViewer({ filePath }: Props) {
 
   if (state === "error") {
     return (
-      <div className="flex flex-1 items-center justify-center bg-[#050505] px-6 text-center text-zinc-400">
+      <div className="flex flex-1 items-center justify-center bg-[#050505] px-6 text-center text-muted-foreground">
         <div className="flex max-w-[280px] flex-col items-center">
           <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-white/10 bg-white/[0.04]">
-            <VideoOff className="size-[18px] text-zinc-500" strokeWidth={1.5} />
+            <VideoOff
+              className="size-[18px] text-muted-foreground/60"
+              strokeWidth={1.5}
+            />
           </div>
-          <p className="text-xs font-medium text-zinc-200">Can’t play this video</p>
-          <p className="mt-1.5 text-[11px] leading-[1.55] text-zinc-500">
+          <p className="text-xs font-medium text-foreground">Can’t play this video</p>
+          <p className="mt-1.5 text-[11px] leading-[1.55] text-muted-foreground">
             The file may use a codec that isn’t available in the system webview.
           </p>
         </div>
@@ -45,7 +48,7 @@ export function VideoViewer({ filePath }: Props) {
           className="pointer-events-none absolute inset-0 flex items-center justify-center"
         >
           <LoaderCircle
-            className="size-[18px] animate-spin text-zinc-600"
+            className="size-[18px] animate-spin text-muted-foreground/60"
             strokeWidth={1.5}
             aria-label="Loading video"
           />
