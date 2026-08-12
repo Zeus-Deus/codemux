@@ -133,6 +133,30 @@ function findChatPaneIdForThread(threadId: string): string | null {
   return null;
 }
 
+function findChatPaneLocation(threadId: string): {
+  workspace: WorkspaceSnapshot;
+  surface: SurfaceSnapshot;
+  paneId: string;
+} | null {
+  const walk = (node: PaneNodeSnapshot): string | null => {
+    if (node.kind === "agent_chat" && node.thread_id === threadId) return node.pane_id;
+    if (node.kind === "split") {
+      for (const child of node.children) {
+        const found = walk(child);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  for (const workspace of appState.workspaces) {
+    for (const surface of workspace.surfaces) {
+      const paneId = walk(surface.root);
+      if (paneId) return { workspace, surface, paneId };
+    }
+  }
+  return null;
+}
+
 function emitAppState(): void {
   emitEvent("app-state-changed", appState);
 }
@@ -2173,6 +2197,118 @@ const handlers: Record<string, Handler> = {
         permission_mode: "bypassPermissions",
       },
     ];
+  },
+  agent_chat_search: (a) => {
+    const query = String(a.query ?? "").trim().toLocaleLowerCase();
+    const workspaceIds = new Set((a.workspaceIds as string[] | undefined) ?? []);
+    const limit = Math.max(1, Math.min(50, Number(a.limit ?? 12)));
+    if (!query || workspaceIds.size === 0) return [];
+    const mainRecord = {
+      thread_id: MOCK_CHAT_THREAD_ID,
+      workspace_id: "ws-codemux-chat",
+      cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+      provider: "claude",
+      title: "agent-chat-demo",
+    };
+    const records = [
+      mainRecord,
+      ...Object.keys(WORKFLOW_THREAD_WORKSPACE)
+        .map((threadId) => mockWorkflowSessionRecord(threadId))
+        .filter((record): record is Record<string, unknown> => !!record)
+        .map((record) => ({
+          thread_id: String(record.thread_id),
+          workspace_id: String(record.workspace_id),
+          cwd: String(record.cwd),
+          provider: String(record.provider),
+          title: String(record.title),
+        })),
+    ];
+    const results: Array<Record<string, unknown>> = [];
+    for (const record of records) {
+      if (!workspaceIds.has(record.workspace_id)) continue;
+      const titleMatches = record.title.toLocaleLowerCase().includes(query);
+      if (titleMatches) {
+        results.push({
+          message_id: null,
+          thread_id: record.thread_id,
+          workspace_id: record.workspace_id,
+          cwd: record.cwd,
+          provider: record.provider,
+          session_title: record.title,
+          role: "title",
+          turn_id: null,
+          snippet: record.title,
+          created_at: new Date().toISOString(),
+        });
+      }
+      // Production prefers one title row over repeating content hits from
+      // that same conversation in the limited palette group.
+      if (titleMatches) continue;
+      // Search raw persisted payloads and stop as soon as the palette cap is
+      // satisfied. Going through `mockThreadRows` would eagerly shape every
+      // row in the 520-turn virtualization fixture (including every tool
+      // result) just to find the first few prose hits, freezing the dev UI on
+      // its first search even though the real SQLite FTS lookup is bounded.
+      const payloads = mockThreadPayloads(record.thread_id);
+      const firstCreatedAt = Date.now() - payloads.length * 725;
+      for (let sourceIndex = 0; sourceIndex < payloads.length; sourceIndex++) {
+        const payload = payloads[sourceIndex];
+        let envelope: Record<string, unknown>;
+        try {
+          envelope = JSON.parse(payload) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        let role: "user" | "assistant" | null = null;
+        let text = "";
+        if (envelope.type === "user_message") {
+          role = "user";
+          text = String(envelope.text ?? "");
+        } else if (envelope.type === "item_completed" && !envelope.subagent_id) {
+          const item = envelope.item as Record<string, unknown> | undefined;
+          if (item?.kind === "assistant_text") {
+            role = "assistant";
+            text = String(item.text ?? "");
+          }
+        }
+        const matchAt = text.toLocaleLowerCase().indexOf(query);
+        if (!role || matchAt < 0) continue;
+        const from = Math.max(0, matchAt - 48);
+        const to = Math.min(text.length, matchAt + query.length + 90);
+        results.push({
+          message_id: sourceIndex + 1,
+          thread_id: record.thread_id,
+          workspace_id: record.workspace_id,
+          cwd: record.cwd,
+          provider: record.provider,
+          session_title: record.title,
+          role,
+          turn_id: role === "assistant" ? String(envelope.turn_id ?? "") || null : null,
+          snippet: `${from > 0 ? "… " : ""}${text.slice(from, to)}${to < text.length ? " …" : ""}`,
+          created_at: new Date(firstCreatedAt + sourceIndex * 725).toISOString(),
+        });
+        if (results.length >= limit) return results.slice(0, limit);
+      }
+      if (results.length >= limit) break;
+    }
+    return results.slice(0, limit);
+  },
+  agent_chat_open_search_result: (a) => {
+    const threadId = String(a.threadId ?? "");
+    const location = findChatPaneLocation(threadId);
+    if (!location) throw new Error(`not_found: mock chat session ${threadId}`);
+    location.workspace.active_surface_id = location.surface.surface_id;
+    location.surface.active_pane_id = location.paneId;
+    const tab = location.workspace.tabs.find(
+      (candidate) => candidate.surface_id === location.surface.surface_id,
+    );
+    if (tab) location.workspace.active_tab_id = tab.tab_id;
+    appState = { ...appState, active_workspace_id: location.workspace.workspace_id };
+    emitAppState();
+    return {
+      pane_id: location.paneId,
+      workspace_id: location.workspace.workspace_id,
+    };
   },
   // Restart-resume seed (design F): the pane's mount-seed effect fetches
   // this to restore picker config + resume cursor. Return a plausible

@@ -33,6 +33,13 @@ interface Props {
   threadKey?: string | null;
   /** Virtual-list jump request from the docked subagent activity bar. */
   subagentJumpRequest?: { cardId: string; nonce: number } | null;
+  /** One-shot deep link from global conversation search. */
+  conversationSearchJumpRequest?: {
+    messageId: number | null;
+    turnId: string | null;
+    nonce: number;
+  } | null;
+  onConversationSearchJumpHandled?: (nonce: number) => void;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -77,6 +84,8 @@ export const ChatTranscript = memo(function ChatTranscript({
   positionedNonceRef,
   threadKey,
   subagentJumpRequest,
+  conversationSearchJumpRequest,
+  onConversationSearchJumpHandled,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -105,6 +114,8 @@ export const ChatTranscript = memo(function ChatTranscript({
         positionedNonceRef={positionedNonceRef}
         threadKey={threadKey}
         subagentJumpRequest={subagentJumpRequest}
+        conversationSearchJumpRequest={conversationSearchJumpRequest}
+        onConversationSearchJumpHandled={onConversationSearchJumpHandled}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}

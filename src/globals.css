@@ -892,6 +892,18 @@ body.pane-resizing iframe {
   transition: box-shadow 0.3s ease;
 }
 
+/* Conversation-search navigation lands on one virtualized transcript row.
+ * The quiet ember wash makes the destination legible without changing its
+ * layout or fighting the row's own card/bubble chrome. */
+.conversation-search-highlight {
+  border-radius: 12px;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-ember) 72%, transparent),
+    0 0 24px color-mix(in srgb, var(--accent-ember) 18%, transparent);
+  background: color-mix(in srgb, var(--accent-ember) 7%, transparent);
+  transition: box-shadow 0.35s ease, background-color 0.35s ease;
+}
+
 /* ── Popup-menu surface ────────────────────────────────────────────────
  * Every dropdown/context menu sits on the same surface language as the
  * command palette: one radius, one hairline border, one elevation. The

@@ -52,6 +52,7 @@ import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ChatFileLinkContext } from "./chat-file-link-context";
+import { resolveConversationSearchTargetIndex } from "./conversation-search-target";
 import {
   deriveAlwaysRenderKeys,
   lookupApproval,
@@ -122,6 +123,14 @@ interface Props {
   threadKey?: string | null;
   /** Index-capable request from the docked subagent activity bar. */
   subagentJumpRequest?: { cardId: string; nonce: number } | null;
+  /** Global conversation-search deep link. `turnId` is the fallback when a
+   * settled turn folded the exact assistant block out of the presentation. */
+  conversationSearchJumpRequest?: {
+    messageId: number | null;
+    turnId: string | null;
+    nonce: number;
+  } | null;
+  onConversationSearchJumpHandled?: (nonce: number) => void;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
@@ -178,6 +187,8 @@ export const MessageList = memo(function MessageList({
   positionedNonceRef,
   threadKey,
   subagentJumpRequest,
+  conversationSearchJumpRequest,
+  onConversationSearchJumpHandled,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -945,6 +956,14 @@ export const MessageList = memo(function MessageList({
     );
   }, [slots, subagentJumpRequest?.cardId]);
 
+  const conversationSearchTargetIndex = useMemo(() => {
+    if (!conversationSearchJumpRequest) return -1;
+    return resolveConversationSearchTargetIndex(
+      slots,
+      conversationSearchJumpRequest,
+    );
+  }, [conversationSearchJumpRequest, slots]);
+
   // Rows with live controls must not unmount while the reader scrolls away:
   // queued-turn cancel/send-now actions and pending approval forms can carry
   // transient local input. Derivation lives in `always-render-keys.ts` so the
@@ -997,6 +1016,51 @@ export const MessageList = memo(function MessageList({
       highlightedCard?.classList.remove("subagent-card-highlight");
     };
   }, [cancelFollowForUserNavigation, subagentJumpRequest, subagentTargetIndex]);
+
+  useEffect(() => {
+    if (!conversationSearchJumpRequest || conversationSearchTargetIndex < 0) return;
+    cancelFollowForUserNavigation();
+    let cancelled = false;
+    let frame: number | undefined;
+    let timer: number | undefined;
+    let highlightedRow: HTMLElement | null = null;
+    const nonce = conversationSearchJumpRequest.nonce;
+    void listRef.current
+      ?.scrollToIndex({
+        index: conversationSearchTargetIndex,
+        animated: !prefersReducedMotion(),
+        viewOffset: 28,
+      })
+      .then(() => {
+        if (cancelled) return;
+        frame = requestAnimationFrame(() => {
+          if (cancelled) return;
+          const row = listRef.current
+            ?.getState()
+            .elementAtIndex(conversationSearchTargetIndex);
+          if (row instanceof HTMLElement) {
+            row.classList.add("conversation-search-highlight");
+            highlightedRow = row;
+          }
+          timer = window.setTimeout(() => {
+            highlightedRow?.classList.remove("conversation-search-highlight");
+            highlightedRow = null;
+            onConversationSearchJumpHandled?.(nonce);
+          }, 1200);
+        });
+      });
+    return () => {
+      cancelled = true;
+      if (frame != null) cancelAnimationFrame(frame);
+      if (timer != null) window.clearTimeout(timer);
+      highlightedRow?.classList.remove("conversation-search-highlight");
+    };
+  }, [
+    cancelFollowForUserNavigation,
+    conversationSearchJumpRequest,
+    conversationSearchTargetIndex,
+    onConversationSearchJumpHandled,
+  ]);
 
   const renderItem = useCallback(
     ({ item: slot }: { item: TranscriptSlot }) => (

@@ -1,10 +1,10 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -54,6 +54,24 @@ pub struct AgentChatSessionRecord {
     /// `false` for rows created before this column existed.
     #[serde(default)]
     pub fast_mode: bool,
+}
+
+/// One hit in the durable conversation index. `message_id` points back to
+/// the persisted event so the frontend can reopen the thread and jump to the
+/// matching turn; title-only hits intentionally leave it empty.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatSearchResult {
+    pub message_id: Option<i64>,
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub cwd: Option<String>,
+    pub provider: String,
+    pub session_title: Option<String>,
+    /// `user`, `assistant`, or `title`.
+    pub role: String,
+    pub turn_id: Option<String>,
+    pub snippet: String,
+    pub created_at: String,
 }
 
 /// Per-thread chat configuration written alongside an
@@ -277,6 +295,103 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Full-text conversation index (schema v14). Its rowid is the
+        -- durable source message id. Keep only human-visible conversation
+        -- prose: user messages and top-level assistant text. Tool payloads,
+        -- reasoning, workflow state, and subagent internals stay out.
+        CREATE VIRTUAL TABLE IF NOT EXISTS agent_chat_search USING fts5(
+            content,
+            thread_id UNINDEXED,
+            role UNINDEXED,
+            turn_id UNINDEXED,
+            tokenize = 'unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS agent_chat_search_after_insert
+        AFTER INSERT ON agent_chat_messages
+        BEGIN
+            INSERT INTO agent_chat_search(rowid, content, thread_id, role, turn_id)
+            SELECT
+                NEW.id,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                        THEN json_extract(NEW.payload, '$.text')
+                    ELSE json_extract(NEW.payload, '$.item.text')
+                END,
+                NEW.thread_id,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                        THEN 'user'
+                    ELSE 'assistant'
+                END,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'item_completed'
+                        THEN json_extract(NEW.payload, '$.turn_id')
+                    ELSE NULL
+                END
+            WHERE json_valid(NEW.payload)
+              AND (
+                    (
+                        json_extract(NEW.payload, '$.type') = 'user_message'
+                        AND length(trim(COALESCE(json_extract(NEW.payload, '$.text'), ''))) > 0
+                    )
+                    OR
+                    (
+                        json_extract(NEW.payload, '$.type') = 'item_completed'
+                        AND json_extract(NEW.payload, '$.item.kind') = 'assistant_text'
+                        AND json_extract(NEW.payload, '$.subagent_id') IS NULL
+                        AND length(trim(COALESCE(json_extract(NEW.payload, '$.item.text'), ''))) > 0
+                    )
+              );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS agent_chat_search_after_delete
+        AFTER DELETE ON agent_chat_messages
+        BEGIN
+            DELETE FROM agent_chat_search WHERE rowid = OLD.id;
+        END;
+
+        -- Thread ids change when a provider promotes or de-duplicates a
+        -- persisted session, so updates have to move their FTS rows too.
+        CREATE TRIGGER IF NOT EXISTS agent_chat_search_after_update
+        AFTER UPDATE OF thread_id, payload ON agent_chat_messages
+        BEGIN
+            DELETE FROM agent_chat_search WHERE rowid = OLD.id;
+            INSERT INTO agent_chat_search(rowid, content, thread_id, role, turn_id)
+            SELECT
+                NEW.id,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                        THEN json_extract(NEW.payload, '$.text')
+                    ELSE json_extract(NEW.payload, '$.item.text')
+                END,
+                NEW.thread_id,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                        THEN 'user'
+                    ELSE 'assistant'
+                END,
+                CASE
+                    WHEN json_extract(NEW.payload, '$.type') = 'item_completed'
+                        THEN json_extract(NEW.payload, '$.turn_id')
+                    ELSE NULL
+                END
+            WHERE json_valid(NEW.payload)
+              AND (
+                    (
+                        json_extract(NEW.payload, '$.type') = 'user_message'
+                        AND length(trim(COALESCE(json_extract(NEW.payload, '$.text'), ''))) > 0
+                    )
+                    OR
+                    (
+                        json_extract(NEW.payload, '$.type') = 'item_completed'
+                        AND json_extract(NEW.payload, '$.item.kind') = 'assistant_text'
+                        AND json_extract(NEW.payload, '$.subagent_id') IS NULL
+                        AND length(trim(COALESCE(json_extract(NEW.payload, '$.item.text'), ''))) > 0
+                    )
+              );
+        END;
 
         -- Usage ledger behind Settings → Usage. This is a materialized
         -- local cache of provider-owned history (Claude/Codex transcripts
@@ -671,6 +786,60 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    let installed_schema_version = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get::<_, Option<u32>>(0)
+        })
+        .map_err(|e| format!("Failed to read installed schema version: {e}"))?
+        .unwrap_or(0);
+
+    // Upgrading users already have transcript rows when the v14 table first
+    // appears. Backfill once during that migration; triggers maintain every
+    // later insert/update/delete without a full transcript scan at startup.
+    if installed_schema_version < 14 {
+        conn.execute(
+            "INSERT INTO agent_chat_search(rowid, content, thread_id, role, turn_id)
+         SELECT
+             m.id,
+             CASE
+                 WHEN json_extract(m.payload, '$.type') = 'user_message'
+                     THEN json_extract(m.payload, '$.text')
+                 ELSE json_extract(m.payload, '$.item.text')
+             END,
+             m.thread_id,
+             CASE
+                 WHEN json_extract(m.payload, '$.type') = 'user_message'
+                     THEN 'user'
+                 ELSE 'assistant'
+             END,
+             CASE
+                 WHEN json_extract(m.payload, '$.type') = 'item_completed'
+                     THEN json_extract(m.payload, '$.turn_id')
+                 ELSE NULL
+             END
+         FROM agent_chat_messages m
+         WHERE NOT EXISTS (
+                   SELECT 1 FROM agent_chat_search f WHERE f.rowid = m.id
+               )
+           AND json_valid(m.payload)
+           AND (
+                 (
+                     json_extract(m.payload, '$.type') = 'user_message'
+                     AND length(trim(COALESCE(json_extract(m.payload, '$.text'), ''))) > 0
+                 )
+                 OR
+                 (
+                     json_extract(m.payload, '$.type') = 'item_completed'
+                     AND json_extract(m.payload, '$.item.kind') = 'assistant_text'
+                     AND json_extract(m.payload, '$.subagent_id') IS NULL
+                     AND length(trim(COALESCE(json_extract(m.payload, '$.item.text'), ''))) > 0
+                 )
+           )",
+            [],
+        )
+        .map_err(|e| format!("Failed to backfill agent chat search index: {e}"))?;
+    }
+
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
     // table/indexes, so we just need to bump the stored version.
@@ -723,6 +892,36 @@ pub fn init_database() -> Result<DatabaseStore, String> {
     Ok(DatabaseStore {
         conn: Mutex::new(conn),
     })
+}
+
+/// Convert arbitrary palette input into a safe FTS5 prefix query. Punctuation
+/// becomes a separator and repeated terms are removed, so quotes/operators in
+/// user input can never change the MATCH expression's grammar.
+fn conversation_fts_query(query: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut seen = HashSet::new();
+
+    let mut finish_term = |current: &mut String| {
+        if current.is_empty() {
+            return;
+        }
+        let term = std::mem::take(current);
+        if seen.insert(term.to_lowercase()) {
+            terms.push(format!("\"{term}\"*"));
+        }
+    };
+
+    for character in query.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            current.push(character);
+        } else {
+            finish_term(&mut current);
+        }
+    }
+    finish_term(&mut current);
+
+    (!terms.is_empty()).then(|| terms.join(" AND "))
 }
 
 impl DatabaseStore {
@@ -3219,6 +3418,136 @@ impl DatabaseStore {
         }
     }
 
+    /// Search persisted conversation titles and human-visible transcript
+    /// prose inside the supplied workspace scope. FTS prefix matching keeps
+    /// partial words useful while the command palette is still being typed.
+    pub fn search_agent_chat(
+        &self,
+        query: &str,
+        workspace_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<AgentChatSearchResult>, String> {
+        let query = query.trim();
+        if query.is_empty() || workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let limit = limit.clamp(1, 50);
+        let placeholders = std::iter::repeat("?")
+            .take(workspace_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.conn.lock().unwrap();
+        let mut results = Vec::new();
+
+        // Titles are few and short, so a case-insensitive substring scan is
+        // more natural than token-prefix FTS and gives one row per session.
+        let title_sql = format!(
+            "SELECT thread_id, workspace_id, cwd, provider, title, last_active_at
+             FROM agent_chat_sessions
+             WHERE workspace_id IN ({placeholders})
+               AND instr(lower(COALESCE(title, '')), lower(?)) > 0
+             ORDER BY last_active_at DESC
+             LIMIT {limit}"
+        );
+        let mut title_params: Vec<Value> = workspace_ids
+            .iter()
+            .cloned()
+            .map(Value::Text)
+            .collect();
+        title_params.push(Value::Text(query.to_string()));
+        let mut title_stmt = conn
+            .prepare(&title_sql)
+            .map_err(|e| format!("Failed to prepare agent chat title search: {e}"))?;
+        let title_rows = title_stmt
+            .query_map(params_from_iter(title_params), |row| {
+                let title: Option<String> = row.get(4)?;
+                Ok(AgentChatSearchResult {
+                    message_id: None,
+                    thread_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    cwd: row.get(2)?,
+                    provider: row.get(3)?,
+                    session_title: title.clone(),
+                    role: "title".to_string(),
+                    turn_id: None,
+                    snippet: title.unwrap_or_default(),
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("Failed to search agent chat titles: {e}"))?;
+        for row in title_rows {
+            results.push(row.map_err(|e| format!("Failed to read agent chat title hit: {e}"))?);
+        }
+
+        if results.len() >= limit as usize {
+            results.truncate(limit as usize);
+            return Ok(results);
+        }
+
+        let Some(fts_query) = conversation_fts_query(query) else {
+            return Ok(results);
+        };
+        let title_threads: HashSet<String> =
+            results.iter().map(|result| result.thread_id.clone()).collect();
+        let content_fetch_limit = limit.saturating_mul(2);
+        let content_sql = format!(
+            "SELECT
+                 m.id,
+                 s.thread_id,
+                 s.workspace_id,
+                 s.cwd,
+                 s.provider,
+                 s.title,
+                 agent_chat_search.role,
+                 agent_chat_search.turn_id,
+                 snippet(agent_chat_search, 0, '', '', ' … ', 18),
+                 m.created_at
+             FROM agent_chat_search
+             JOIN agent_chat_messages m ON m.id = agent_chat_search.rowid
+             JOIN agent_chat_sessions s ON s.thread_id = m.thread_id
+             WHERE agent_chat_search MATCH ?
+               AND s.workspace_id IN ({placeholders})
+             ORDER BY bm25(agent_chat_search), m.id DESC
+             LIMIT {content_fetch_limit}"
+        );
+        let mut content_params = vec![Value::Text(fts_query)];
+        content_params.extend(workspace_ids.iter().cloned().map(Value::Text));
+        let mut content_stmt = conn
+            .prepare(&content_sql)
+            .map_err(|e| format!("Failed to prepare agent chat content search: {e}"))?;
+        let content_rows = content_stmt
+            .query_map(params_from_iter(content_params), |row| {
+                Ok(AgentChatSearchResult {
+                    message_id: Some(row.get(0)?),
+                    thread_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    cwd: row.get(3)?,
+                    provider: row.get(4)?,
+                    session_title: row.get(5)?,
+                    role: row.get(6)?,
+                    turn_id: row.get(7)?,
+                    snippet: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("Failed to search agent chat content: {e}"))?;
+        for row in content_rows {
+            let row = row.map_err(|e| format!("Failed to read agent chat content hit: {e}"))?;
+            // A title match is already a better representation of the same
+            // thread, so do not spend a result slot repeating it.
+            if title_threads.contains(&row.thread_id) {
+                continue;
+            }
+            results.push(row);
+            if results.len() == limit as usize {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
     /// De-duplicate sessions that share an `sdk_session_id`. When the
     /// user resumes a past chat we start a NEW provider session with
     /// a new `thread_id`, but its SDK session id matches an existing
@@ -5552,6 +5881,132 @@ mod tests {
     fn seed_session(db: &DatabaseStore, thread_id: &str) {
         db.upsert_agent_chat_session(thread_id, "ws", Some("/p"), "claude")
             .unwrap();
+    }
+
+    #[test]
+    fn agent_chat_search_indexes_only_visible_conversation_prose() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        db.set_agent_chat_title("t", "Release investigation").unwrap();
+
+        let user_id = db
+            .append_agent_chat_message(
+                "t",
+                r#"{"type":"user_message","text":"Investigate deployment latency"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let assistant_id = db
+            .append_agent_chat_message(
+                "t",
+                r#"{"type":"item_completed","thread_id":"t","turn_id":"turn-7","item":{"kind":"assistant_text","text":"The deployment bottleneck is the cache warmup."}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        db.append_agent_chat_message(
+            "t",
+            r#"{"type":"item_completed","thread_id":"t","turn_id":"turn-7","item":{"kind":"tool_result","content":"toolbodysecret deployment"}}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            "t",
+            r#"{"type":"item_completed","thread_id":"t","turn_id":"turn-7","subagent_id":"sub-1","item":{"kind":"assistant_text","text":"subagentsecret deployment"}}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            "t",
+            r#"{"type":"item_completed","thread_id":"t","turn_id":"turn-7","item":{"kind":"assistant_thinking","text":"thinkingsecret deployment"}}"#,
+        )
+        .unwrap();
+
+        let hits = db
+            .search_agent_chat("deploy", &["ws".to_string()], 20)
+            .unwrap();
+        assert_eq!(hits.len(), 2, "user and top-level assistant text only");
+        assert!(hits.iter().any(|hit| {
+            hit.role == "user" && hit.message_id == Some(user_id) && hit.turn_id.is_none()
+        }));
+        assert!(hits.iter().any(|hit| {
+            hit.role == "assistant"
+                && hit.message_id == Some(assistant_id)
+                && hit.turn_id.as_deref() == Some("turn-7")
+        }));
+        for excluded in ["toolbodysecret", "subagentsecret", "thinkingsecret"] {
+            assert!(db
+                .search_agent_chat(excluded, &["ws".to_string()], 20)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn agent_chat_search_includes_titles_and_respects_workspace_scope() {
+        let db = init_test_database();
+        seed_session(&db, "inside");
+        db.set_agent_chat_title("inside", "Virtualized transcript fix")
+            .unwrap();
+        db.upsert_agent_chat_session("outside", "other-ws", None, "codex")
+            .unwrap();
+        db.set_agent_chat_title("outside", "Virtualized transcript elsewhere")
+            .unwrap();
+
+        let hits = db
+            .search_agent_chat("transcript", &["ws".to_string()], 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thread_id, "inside");
+        assert_eq!(hits[0].role, "title");
+        assert_eq!(hits[0].message_id, None);
+        assert_eq!(hits[0].workspace_id, "ws");
+        assert!(db.search_agent_chat("transcript", &[], 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_chat_search_index_tracks_migration_deletion_and_backfill() {
+        let db = init_test_database();
+        seed_session(&db, "old");
+        let message_id = db
+            .append_agent_chat_message(
+                "old",
+                r#"{"type":"user_message","text":"durable migration marker"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        db.upsert_agent_chat_session("new", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+
+        let migrated = db
+            .search_agent_chat("migration", &["ws".to_string()], 10)
+            .unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].thread_id, "new");
+        assert_eq!(migrated[0].message_id, Some(message_id));
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM agent_chat_search WHERE rowid = ?1",
+                params![message_id],
+            )
+            .unwrap();
+            conn.execute("UPDATE schema_version SET version = 13", [])
+                .unwrap();
+            create_schema(&conn).unwrap();
+        }
+        assert_eq!(
+            db.search_agent_chat("migration", &["ws".to_string()], 10)
+                .unwrap()
+                .len(),
+            1,
+            "schema startup backfills a missing index row"
+        );
+
+        db.delete_agent_chat_session("new").unwrap();
+        assert!(db
+            .search_agent_chat("migration", &["ws".to_string()], 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

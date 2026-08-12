@@ -1597,6 +1597,27 @@ export interface AgentChatSessionRecord {
   fast_mode?: boolean;
 }
 
+/** One SQLite FTS5 hit in the persisted conversation store. A content hit
+ * carries the durable message row id used for transcript deep-linking; a
+ * title-only hit carries `null` and opens at the start of the thread. */
+export interface AgentChatSearchResult {
+  message_id: number | null;
+  thread_id: string;
+  workspace_id: string;
+  cwd: string | null;
+  provider: AgentChatProviderKind;
+  session_title: string | null;
+  role: "user" | "assistant" | "title";
+  turn_id: string | null;
+  snippet: string;
+  created_at: string;
+}
+
+export interface OpenAgentChatSearchResult {
+  pane_id: string;
+  workspace_id: string;
+}
+
 /** Partial per-thread config patch for
  *  `agent_chat_update_session_config`. Only the fields present are
  *  overwritten in the DB row (snake_case to match the Rust struct /
@@ -1618,6 +1639,22 @@ export const agentChatListSessions = (
     workspaceId,
     cwd,
     limit,
+  });
+
+export const agentChatSearch = (
+  query: string,
+  workspaceIds: string[],
+  limit = 12,
+) =>
+  invoke<AgentChatSearchResult[]>("agent_chat_search", {
+    query,
+    workspaceIds,
+    limit,
+  });
+
+export const agentChatOpenSearchResult = (threadId: string) =>
+  invoke<OpenAgentChatSearchResult>("agent_chat_open_search_result", {
+    threadId,
   });
 
 export const agentChatRenameSession = (threadId: string, title: string) =>

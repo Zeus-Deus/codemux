@@ -83,6 +83,11 @@ export interface UserMessageItem {
    *  the persisted envelope's `images[].path`. Absent for text-only
    *  turns and for messages persisted before this field existed. */
   images?: UserMessageImage[];
+  /** Durable `agent_chat_messages.id` when this item came from (or was
+   * reconciled with) a persisted row. Used only for conversation-search
+   * deep links; absent on optimistic bubbles until the backend fans the row
+   * back with its id. */
+  source_event_id?: number;
 }
 
 export interface AssistantMessageItem {
@@ -94,6 +99,8 @@ export interface AssistantMessageItem {
   streaming: boolean;
   /** First-observed wall-clock time for this assistant block. */
   created_at?: number;
+  /** Durable source row for conversation-search deep links. */
+  source_event_id?: number;
 }
 
 /**

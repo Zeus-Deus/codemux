@@ -67,6 +67,7 @@ import {
   type ChatMode,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useConversationSearchStore } from "@/stores/conversation-search-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
@@ -201,6 +202,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
   const [provider, setProvider] = useState<AgentChatProviderKind>(initialProvider);
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  const conversationSearchJumpRequest = useConversationSearchStore((state) =>
+    state.target?.threadId === threadId ? state.target : null,
+  );
+  const clearConversationSearchJump = useConversationSearchStore(
+    (state) => state.clearHandled,
+  );
   // Session-created timestamp for the transcript's top-of-thread marker
   // (design D2). Resolved from the persisted sessions list, keyed by the
   // active thread id; `undefined` until it resolves (or when no record
@@ -3047,6 +3054,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               positionedNonceRef={sendAnchorPositionedNonceRef}
               threadKey={threadId}
               subagentJumpRequest={subagentJumpRequest}
+              conversationSearchJumpRequest={conversationSearchJumpRequest}
+              onConversationSearchJumpHandled={clearConversationSearchJump}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}
