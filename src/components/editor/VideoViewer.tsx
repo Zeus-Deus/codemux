@@ -18,11 +18,17 @@ export function VideoViewer({ filePath }: Props) {
   const [state, setState] = useState<VideoState>("loading");
   const src = convertFileSrc(filePath);
 
+  // `canplay` is not guaranteed with preload="metadata" — a webview may settle
+  // at HAVE_METADATA and never buffer further while autoplay is policy-blocked.
+  // Metadata is enough to reveal the element and its controls. `error` stays
+  // terminal so a late readiness event can never resurrect a broken player.
+  const markReady = () => setState((prev) => (prev === "error" ? prev : "ready"));
+
   if (state === "error") {
     return (
-      <div className="flex flex-1 items-center justify-center bg-[#050505] px-6 text-center text-muted-foreground">
+      <div className="flex flex-1 items-center justify-center bg-[var(--background)] px-6 text-center text-muted-foreground">
         <div className="flex max-w-[280px] flex-col items-center">
-          <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-white/10 bg-white/[0.04]">
+          <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
             <VideoOff
               className="size-[18px] text-muted-foreground/60"
               strokeWidth={1.5}
@@ -48,7 +54,7 @@ export function VideoViewer({ filePath }: Props) {
           className="pointer-events-none absolute inset-0 flex items-center justify-center"
         >
           <LoaderCircle
-            className="size-[18px] animate-spin text-muted-foreground/60"
+            className="size-[18px] animate-spin text-white/60"
             strokeWidth={1.5}
             aria-label="Loading video"
           />
@@ -61,7 +67,9 @@ export function VideoViewer({ filePath }: Props) {
         controls
         playsInline
         preload="metadata"
-        onCanPlay={() => setState("ready")}
+        onLoadedMetadata={markReady}
+        onLoadedData={markReady}
+        onCanPlay={markReady}
         onError={() => setState("error")}
         className={`max-h-full max-w-full rounded-md bg-black shadow-[0_16px_48px_rgba(0,0,0,0.45)] ring-1 ring-white/10 transition-opacity duration-200 ${
           state === "ready" ? "opacity-100" : "opacity-0"
