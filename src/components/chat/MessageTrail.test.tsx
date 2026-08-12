@@ -14,9 +14,29 @@ let viewport: HTMLDivElement;
 let listRef: React.RefObject<LegendListRef | null>;
 let scrollTop = 0;
 
+// The global jsdom ResizeObserver stub is a no-op; swap in one that records
+// its observed targets so a resize can be driven from a test.
+const resizeObservers: { target: Element; fire: () => void }[] = [];
+globalThis.ResizeObserver = class {
+  constructor(private readonly callback: () => void) {}
+  observe(target: Element) {
+    resizeObservers.push({ target, fire: () => this.callback() });
+  }
+  unobserve() {}
+  disconnect() {}
+} as unknown as typeof ResizeObserver;
+
+/** Fire the ResizeObserver that observes `target`, if one is attached. */
+function resize(target: Element) {
+  for (const entry of resizeObservers) {
+    if (entry.target === target) entry.fire();
+  }
+}
+
 afterEach(() => {
   cleanup();
   scrollToIndex.mockClear();
+  resizeObservers.length = 0;
 });
 
 function userMsg(seq: number, text: string): ChatViewItem {
@@ -164,6 +184,31 @@ describe("MessageTrail", () => {
     expect(buttons[0]).not.toHaveAttribute("aria-current");
     expect(buttons[2]).toHaveAttribute("aria-current", "true");
     expect(buttons[2].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "true",
+    );
+  });
+
+  it("resyncs tick visibility when the viewport resizes without scrolling", async () => {
+    renderTrail(turns(4));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const buttons = screen.getAllByRole("button");
+    expect(buttons[1].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "false",
+    );
+
+    // A taller viewport brings the second turn into view; `scrollTop` never
+    // changes, so no `scroll` event fires.
+    Object.defineProperty(viewport, "clientHeight", {
+      configurable: true,
+      value: 500,
+    });
+    resize(viewport);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    expect(buttons[1].querySelector("span")).toHaveAttribute(
       "data-in-view",
       "true",
     );

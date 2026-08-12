@@ -176,8 +176,18 @@ const TrailRail = memo(function TrailRail({
 
     scheduleSync();
     viewport.addEventListener("scroll", scheduleSync, { passive: true });
+    // A viewport resize (window resize, or a LegendList re-measurement that
+    // shifts rows without moving `scrollTop`) changes what is visible without
+    // firing `scroll`, which would otherwise leave the ticks stale until the
+    // next scroll. Route it through the same rAF-coalesced sync.
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(scheduleSync);
+    resizeObserver?.observe(viewport);
     return () => {
       viewport.removeEventListener("scroll", scheduleSync);
+      resizeObserver?.disconnect();
       if (frame !== 0) cancelAnimationFrame(frame);
     };
   }, [entries, listRef, ticks]);
