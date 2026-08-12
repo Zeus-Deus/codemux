@@ -226,15 +226,15 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
           "transition-[background-color,box-shadow] duration-150",
           "focus-visible:ring-2 focus-visible:ring-ring/50",
           props.active
-            ? "bg-amber-500/[0.09]"
-            : "bg-transparent hover:bg-amber-500/[0.055]",
+            ? "bg-accent-ember/[0.09]"
+            : "bg-transparent hover:bg-accent-ember/[0.055]",
         )}
       >
         <div className="px-2 py-2">
           <div className="flex h-4 min-w-0 items-center gap-1.5">
             <SquarePen
               aria-hidden="true"
-              className="size-3 shrink-0 text-amber-600 dark:text-amber-300/80"
+              className="size-3 shrink-0 text-accent-ember"
             />
             <ProjectAvatar
               name={row.project.name}
@@ -481,8 +481,8 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                 className={cn(
                   "relative flex size-7 items-center justify-center rounded-lg transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
                   row.draftId === activeDraftId
-                    ? "bg-amber-500/[0.10]"
-                    : "bg-transparent hover:bg-amber-500/[0.07]",
+                    ? "bg-accent-ember/[0.10]"
+                    : "bg-transparent hover:bg-accent-ember/[0.07]",
                 )}
               >
                 <ProjectAvatar
@@ -490,7 +490,7 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                   size="md"
                   shape="square"
                 />
-                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded bg-sidebar text-amber-500">
+                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded bg-sidebar text-accent-ember">
                   <SquarePen className="size-2.5" />
                 </span>
               </button>
