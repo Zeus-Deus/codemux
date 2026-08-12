@@ -1552,8 +1552,16 @@ describe("SidebarInbox — settle / un-settle", () => {
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
+    expect(row.className).toContain(
+      "grid-cols-[auto_minmax(0,1fr)_52px_48px]",
+    );
+    expect(row.querySelector("[data-settled-pr-slot]")).toHaveClass(
+      "w-[52px]",
+    );
+    expect(row.querySelector("[data-settled-meta-slot]")).toHaveClass("w-12");
     // In a slim settled-history row, the PR remains visible and directly
-    // reachable instead of degrading to an unlabeled merge glyph.
+    // reachable instead of degrading to an unlabeled merge glyph. Its fixed
+    // slot makes the PR and age columns line up across the whole shelf.
     const pr = within(row).getByRole("button", {
       name: "Open PR #203 on GitHub — merged",
     });

@@ -572,7 +572,7 @@ const SettledRow = memo(function SettledRow({
         activateFromSidebar(workspace.workspace_id);
       }}
       className={cn(
-        "group/settled flex h-[30px] cursor-pointer items-center gap-2 rounded-lg px-2",
+        "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_52px_48px] items-center gap-2 rounded-lg px-2",
         // Same off-screen containment as the cards (see `SidebarInboxCard`):
         // the Settled shelf is the list that actually grows without bound, and
         // paging only limits what is *rendered*, not what the forced-visible
@@ -609,77 +609,100 @@ const SettledRow = memo(function SettledRow({
       >
         {workspace.title}
       </span>
-      {prState && (
+      {/* Every settled row reserves the same PR column, including rows without
+          one. Together with the fixed age/action column below, this keeps the
+          historical shelf on one quiet vertical rhythm instead of letting
+          variable title, PR-number and elapsed-label widths nudge each other. */}
+      <div
+        data-settled-pr-slot
+        className="flex h-5 w-[52px] min-w-0 items-center"
+      >
+        {prState && (
+          <button
+            type="button"
+            onClick={handlePrClick}
+            disabled={!workspace.pr_url}
+            aria-label={
+              workspace.pr_number
+                ? workspace.pr_url
+                  ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prState}`
+                  : `${providerRefLabel(provider, workspace.pr_number)} — ${prState}`
+                : `${provider.nounTitle} — ${prState}`
+            }
+            className={cn(
+              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 font-mono text-[10px] font-medium",
+              "transition-colors duration-150",
+              // Held one step brighter than the avatar's /40: `#87` is this
+              // control's only label, so the badge has to stay legible at rest
+              // even though it has given its state color up. The row still
+              // reads as one grey block — the difference is a shade, not a
+              // second focal point.
+              dimmed
+                ? cn(
+                    "text-muted-foreground/55",
+                    prStatusSettledHoverClass(prState),
+                  )
+                : prStatusTextClass(prState),
+              workspace.pr_url
+                ? "hover:bg-foreground/[0.055]"
+                : "cursor-default opacity-65",
+            )}
+          >
+            {/* `text-current` hands the icon's color to the button above, so
+                the badge's icon and number light up together on hover instead
+                of the icon staying colored while the number is grey. It works
+                because `PrStatusIcon` runs its own `STATE_TO_ICON` color through
+                `cn()` *before* this className: tailwind-merge is caller-wins
+                within a conflicting group, so the later `text-current` drops the
+                built-in `text-status-open`/etc. Swap that argument order inside
+                the icon and this badge silently goes back to a colored glyph on
+                a grey number — there is a test pinning it. */}
+            <PrStatusIcon
+              state={prState}
+              size={3}
+              className="shrink-0 text-current"
+            />
+            {workspace.pr_number != null && (
+              <span className="truncate">
+                {providerRef(provider, workspace.pr_number)}
+              </span>
+            )}
+          </button>
+        )}
+      </div>
+      <div
+        data-settled-meta-slot
+        className="relative h-5 w-12 justify-self-end whitespace-nowrap"
+      >
+        {time && (
+          <span className="absolute inset-y-0 right-0 flex items-center font-mono text-[11px] tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
+            {time}
+          </span>
+        )}
         <button
           type="button"
-          onClick={handlePrClick}
-          disabled={!workspace.pr_url}
-          aria-label={
-            workspace.pr_number
-              ? workspace.pr_url
-                ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prState}`
-                : `${providerRefLabel(provider, workspace.pr_number)} — ${prState}`
-              : `${provider.nounTitle} — ${prState}`
-          }
+          onClick={(e) => {
+            e.stopPropagation();
+            onUnsettle(workspace.workspace_id);
+          }}
+          aria-label={`Un-settle "${workspace.title}"`}
           className={cn(
-            "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
-            "transition-colors duration-150",
-            // Held one step brighter than the avatar's /40: `#87` is this
-            // control's only label, so the badge has to stay legible at rest
-            // even though it has given its state color up. The row still
-            // reads as one grey block — the difference is a shade, not a
-            // second focal point.
-            dimmed
-              ? cn("text-muted-foreground/55", prStatusSettledHoverClass(prState))
-              : prStatusTextClass(prState),
-            workspace.pr_url
-              ? "hover:bg-foreground/[0.055]"
-              : "cursor-default opacity-65",
+            // Borderless, matching the cards' action cluster: a settled row is
+            // 30px tall and mostly negative space, and a bordered pill inside it
+            // read as a second object competing with the row rather than as the
+            // row's own affordance. The word stays — this is the one control on
+            // the shelf that changes a lifecycle, and an undo arrow alone is too
+            // close to "go back" to be trusted with it.
+            "absolute inset-y-0 right-0 hidden items-center gap-1 border-none bg-transparent p-0",
+            "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+            "hover:text-foreground",
+            "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
           )}
         >
-          {/* `text-current` hands the icon's color to the button above, so
-              the badge's icon and number light up together on hover instead
-              of the icon staying colored while the number is grey. It works
-              because `PrStatusIcon` runs its own `STATE_TO_ICON` color through
-              `cn()` *before* this className: tailwind-merge is caller-wins
-              within a conflicting group, so the later `text-current` drops the
-              built-in `text-status-open`/etc. Swap that argument order inside
-              the icon and this badge silently goes back to a colored glyph on
-              a grey number — there is a test pinning it. */}
-          <PrStatusIcon state={prState} size={3} className="shrink-0 text-current" />
-          {workspace.pr_number != null && (
-            <span>{providerRef(provider, workspace.pr_number)}</span>
-          )}
+          <Undo2 className="size-2.5" strokeWidth={1.7} />
+          Un-settle
         </button>
-      )}
-      {time && (
-        <span className="shrink-0 text-[11px] text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
-          {time}
-        </span>
-      )}
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onUnsettle(workspace.workspace_id);
-        }}
-        aria-label={`Un-settle "${workspace.title}"`}
-        className={cn(
-          // Borderless, matching the cards' action cluster: a settled row is
-          // 30px tall and mostly negative space, and a bordered pill inside it
-          // read as a second object competing with the row rather than as the
-          // row's own affordance. The word stays — this is the one control on
-          // the shelf that changes a lifecycle, and an undo arrow alone is too
-          // close to "go back" to be trusted with it.
-          "hidden shrink-0 items-center gap-1 border-none bg-transparent p-0",
-          "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
-          "hover:text-foreground",
-          "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
-        )}
-      >
-        <Undo2 className="size-2.5" strokeWidth={1.7} />
-        Un-settle
-      </button>
+      </div>
     </div>
     </WorkspaceHoverCard>
     </div>
