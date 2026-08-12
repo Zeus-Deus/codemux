@@ -76,48 +76,48 @@ export function PermissionModePicker({
         <PopoverTrigger asChild>
           <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
             <Lock className="h-4 w-4" />
-          <span className="max-w-[140px] truncate">{label}</span>
+            <span className="max-w-[140px] truncate">{label}</span>
             <ChevronDown className="h-3 w-3 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        className="w-[340px] p-0"
-        align="start"
-        onOpenAutoFocus={focusCmdkOnOpen}
-      >
-        <Command>
-          <CommandList className="max-h-[300px]">
-            <CommandEmpty>No permission modes</CommandEmpty>
-            <CommandGroup>
-              {modes.map((mode) => (
-                <CommandItem
-                  key={mode.value}
-                  value={mode.value}
-                  onSelect={() => {
-                    onChange(mode.value);
-                    setOpen(false);
-                  }}
-                  className="h-auto gap-2 py-2"
-                >
-                  <div className="flex flex-1 flex-col min-w-0">
-                    <span className="text-xs text-foreground truncate">
-                      {mode.label}
-                    </span>
-                    <span className="text-[11px] text-muted-foreground/80 truncate">
-                      {mode.description}
-                    </span>
-                  </div>
-                  <Check
-                    className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
-                      current === mode.value ? "opacity-100" : "opacity-0",
-                    )}
-                  />
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          className="w-[340px] p-0"
+          align="start"
+          onOpenAutoFocus={focusCmdkOnOpen}
+        >
+          <Command>
+            <CommandList className="max-h-[300px]">
+              <CommandEmpty>No permission modes</CommandEmpty>
+              <CommandGroup>
+                {modes.map((mode) => (
+                  <CommandItem
+                    key={mode.value}
+                    value={mode.value}
+                    onSelect={() => {
+                      onChange(mode.value);
+                      setOpen(false);
+                    }}
+                    className="h-auto gap-2 py-2"
+                  >
+                    <div className="flex flex-1 flex-col min-w-0">
+                      <span className="text-xs text-foreground truncate">
+                        {mode.label}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground/80 truncate">
+                        {mode.description}
+                      </span>
+                    </div>
+                    <Check
+                      className={cn(
+                        "h-3.5 w-3.5 text-muted-foreground",
+                        current === mode.value ? "opacity-100" : "opacity-0",
+                      )}
+                    />
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            </CommandList>
+          </Command>
         </PopoverContent>
       </Popover>
     </>

@@ -218,7 +218,7 @@ export function ComposerFooter({
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               className={cn(
-                "inline-flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-sm font-medium leading-none transition-colors",
                 tasks.running
                   ? "border-status-working/25 bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -230,14 +230,14 @@ export function ComposerFooter({
               title={`${tasks.completed} of ${tasks.total} tasks complete`}
             >
               {tasks.running ? (
-                <LoaderCircle className="size-3 animate-spin" aria-hidden />
+                <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
               ) : tasks.completed === tasks.total ? (
-                <Check className="size-3" aria-hidden />
+                <Check className="size-3.5" aria-hidden />
               ) : (
                 <ListTodo className="size-3.5" aria-hidden />
               )}
               <span>Tasks</span>
-              <span className="text-[10px] tabular-nums opacity-70">
+              <span className="text-[11px] tabular-nums opacity-70">
                 {tasks.completed}/{tasks.total}
               </span>
             </button>

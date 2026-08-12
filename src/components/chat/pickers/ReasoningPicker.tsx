@@ -257,9 +257,9 @@ export function ReasoningPicker({
                       <Check
                         className={cn(
                           "h-3.5 w-3.5 text-muted-foreground",
-                            currentEffort === level
-                              ? "opacity-100"
-                              : "opacity-0",
+                          currentEffort === level
+                            ? "opacity-100"
+                            : "opacity-0",
                         )}
                       />
                     </CommandItem>
@@ -268,10 +268,10 @@ export function ReasoningPicker({
               </CommandGroup>
             )}
 
-              {hasEffortSection &&
-                (hasContextSection || hasServiceTierSection) && (
-                  <CommandSeparator />
-                )}
+            {hasEffortSection &&
+              (hasContextSection || hasServiceTierSection) && (
+                <CommandSeparator />
+              )}
 
             {hasContextSection && (
               <CommandGroup heading="Context Window">
@@ -306,55 +306,55 @@ export function ReasoningPicker({
               </CommandGroup>
             )}
 
-              {hasContextSection && hasServiceTierSection && (
-                <CommandSeparator />
-              )}
+            {hasContextSection && hasServiceTierSection && (
+              <CommandSeparator />
+            )}
 
-              {hasServiceTierSection && (
-                <CommandGroup heading="Service tier">
-                  <CommandItem
-                    value="service-tier:standard"
-                    onSelect={() => onFastModeChange(false)}
-                    className="h-auto gap-2 py-2"
-                  >
-                    <div className="flex min-w-0 flex-1 flex-col">
-                      <span className="text-xs text-foreground">
-                        Standard
-                        <span className="ml-1.5 text-muted-foreground/60">
-                          (default)
-                        </span>
+            {hasServiceTierSection && (
+              <CommandGroup heading="Service tier">
+                <CommandItem
+                  value="service-tier:standard"
+                  onSelect={() => onFastModeChange(false)}
+                  className="h-auto gap-2 py-2"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="text-xs text-foreground">
+                      Standard
+                      <span className="ml-1.5 text-muted-foreground/60">
+                        (default)
                       </span>
-                      <span className="text-[11px] text-muted-foreground/80">
-                        Normal speed and usage rate
-                      </span>
-                    </div>
-                    <Check
-                      className={cn(
-                        "h-3.5 w-3.5 text-muted-foreground",
-                        fastMode ? "opacity-0" : "opacity-100",
-                      )}
-                    />
-                  </CommandItem>
-                  <CommandItem
-                    value="service-tier:fast"
-                    onSelect={() => onFastModeChange(true)}
-                    className="h-auto gap-2 py-2"
-                  >
-                    <div className="flex min-w-0 flex-1 flex-col">
-                      <span className="text-xs text-foreground">Fast</span>
-                      <span className="text-[11px] text-muted-foreground/80">
-                        Faster output at a premium usage rate
-                      </span>
-                    </div>
-                    <Check
-                      className={cn(
-                        "h-3.5 w-3.5 text-muted-foreground",
-                        fastMode ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                  </CommandItem>
-                </CommandGroup>
-              )}
+                    </span>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Normal speed and usage rate
+                    </span>
+                  </div>
+                  <Check
+                    className={cn(
+                      "h-3.5 w-3.5 text-muted-foreground",
+                      fastMode ? "opacity-0" : "opacity-100",
+                    )}
+                  />
+                </CommandItem>
+                <CommandItem
+                  value="service-tier:fast"
+                  onSelect={() => onFastModeChange(true)}
+                  className="h-auto gap-2 py-2"
+                >
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="text-xs text-foreground">Fast</span>
+                    <span className="text-[11px] text-muted-foreground/80">
+                      Faster output at a premium usage rate
+                    </span>
+                  </div>
+                  <Check
+                    className={cn(
+                      "h-3.5 w-3.5 text-muted-foreground",
+                      fastMode ? "opacity-100" : "opacity-0",
+                    )}
+                  />
+                </CommandItem>
+              </CommandGroup>
+            )}
           </CommandList>
         </Command>
         </PopoverContent>

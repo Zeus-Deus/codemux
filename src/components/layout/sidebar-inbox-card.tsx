@@ -897,7 +897,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       key={p}
                       provider={p}
                       className={cn(
-                      "h-3.5 w-3.5 transition-[opacity,filter]",
+                        "h-3.5 w-3.5 transition-[opacity,filter]",
                         visuallyReceded
                           ? "opacity-50 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
                           : "opacity-80",
