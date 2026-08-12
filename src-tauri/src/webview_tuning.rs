@@ -1,15 +1,19 @@
 //! WebKitGTK renderer + scrolling tuning (Linux).
 //!
-//! Two independent knobs live here, both no-ops on non-Linux targets:
+//! Three independent knobs live here, all no-ops on non-Linux targets:
 //!
-//! 1. **Renderer transport** — [`configure_renderer_env`] picks the buffer
+//! 1. **Display backend** — [`configure_gdk_backend_env`] prefers native
+//!    Wayland when it is available, including undoing the AppImage GTK
+//!    plugin's generated `GDK_BACKEND=x11` launcher default.
+//!
+//! 2. **Renderer transport** — [`configure_renderer_env`] picks the buffer
 //!    path WebKitGTK uses to hand composited frames to the UI process. The
 //!    choice has to be made through env vars *before* GTK/Tauri initialise,
 //!    so it runs at the very top of `run()` and resolves its own paths with
 //!    `dirs` (same logic as every other piece of local state) rather than
 //!    through an `AppHandle`, which does not exist yet.
 //!
-//! 2. **Smooth scrolling** — WebKitGTK's `enable-smooth-scrolling` setting,
+//! 3. **Smooth scrolling** — WebKitGTK's `enable-smooth-scrolling` setting,
 //!    applied per webview via `with_webview`. Each `WebviewWindow` owns its
 //!    own `WebKitSettings` object, so this is applied to every window, not
 //!    just `main`.
@@ -38,6 +42,18 @@ pub const DISABLE_COMPOSITING_ENV: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
 /// is never scrubbed and always wins.
 pub const COMPAT_MODE_ENV: &str = "CODEMUX_WEBKIT_COMPAT";
 
+/// Explicit display-backend override. This exists because linuxdeploy's GTK
+/// AppImage hook writes `GDK_BACKEND=x11` inside its generated launcher,
+/// masking a value inherited by the outer process. Most users should leave
+/// this unset and let [`configure_gdk_backend_env`] prefer native Wayland.
+pub const GDK_BACKEND_OVERRIDE_ENV: &str = "CODEMUX_GDK_BACKEND";
+
+#[cfg(target_os = "linux")]
+const GDK_BACKEND_ENV: &str = "GDK_BACKEND";
+
+#[cfg(target_os = "linux")]
+const APPDIR_ENV: &str = "APPDIR";
+
 /// Env vars the user may set themselves to take full manual control. Any of
 /// them being present makes [`configure_renderer_env`] hands-off.
 ///
@@ -65,6 +81,12 @@ const STAMPED_VALUE: &str = "1";
 #[cfg(target_os = "linux")]
 const MAX_CONSECUTIVE_FAILURES: u32 = 2;
 
+/// Increment whenever a startup-path change makes an old compatibility
+/// fallback worth retrying. Without this, a machine pinned by crashes in an
+/// older release remains on the CPU renderer forever after upgrading.
+#[cfg(target_os = "linux")]
+const RENDERER_POLICY_REVISION: u32 = 2;
+
 /// Minimum WebKitGTK version whose renderer understands
 /// [`FORCE_SHM_ENV`]. The DMA-BUF backing store — and with it the
 /// shared-memory transport this module's accelerated default relies on —
@@ -85,10 +107,22 @@ const SENTINEL_FILE: &str = "webview-renderer.sentinel";
 /// exit ([`mark_clean_exit`]) — so only a startup that dies hard inside
 /// WebKit's renderer init leaves the increment behind.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RendererSentinel {
     #[serde(default)]
     pub consecutive_failures: u32,
+    #[serde(default)]
+    pub policy_revision: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for RendererSentinel {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            policy_revision: RENDERER_POLICY_REVISION,
+        }
+    }
 }
 
 /// Parse sentinel JSON, treating anything unreadable as "no failures". A
@@ -96,6 +130,66 @@ pub struct RendererSentinel {
 #[cfg(target_os = "linux")]
 pub fn parse_sentinel(raw: &str) -> RendererSentinel {
     serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Migrate sentinel state from an older renderer policy. A policy change is
+/// a one-time retry opportunity, not permission to ignore repeated crashes:
+/// once written at the current revision, the normal sticky fallback applies.
+#[cfg(target_os = "linux")]
+pub fn normalize_sentinel(state: RendererSentinel) -> RendererSentinel {
+    if state.policy_revision == RENDERER_POLICY_REVISION {
+        state
+    } else {
+        RendererSentinel::default()
+    }
+}
+
+/// Decide whether Codemux should replace `GDK_BACKEND` before GTK starts.
+///
+/// The generated AppImage launcher sets the literal `x11` even in a Wayland
+/// session. That is packaging policy rather than user intent, so it is safe
+/// to correct only when `APPDIR` proves this is an AppImage. Other explicit
+/// values remain untouched.
+#[cfg(target_os = "linux")]
+pub fn preferred_gdk_backend(
+    appimage: bool,
+    wayland_available: bool,
+    current: Option<&str>,
+) -> Option<&'static str> {
+    if !wayland_available {
+        return None;
+    }
+    match current {
+        None => Some("wayland,x11"),
+        Some("x11") if appimage => Some("wayland,x11"),
+        _ => None,
+    }
+}
+
+/// Select a native display backend before any GTK/Tauri initialization.
+/// `wayland,x11` tries native Wayland first and retains X11 as a portable
+/// fallback. `CODEMUX_GDK_BACKEND` is the explicit escape hatch and always
+/// wins, including inside an AppImage.
+#[cfg(target_os = "linux")]
+pub fn configure_gdk_backend_env() {
+    if let Some(value) = std::env::var_os(GDK_BACKEND_OVERRIDE_ENV) {
+        unsafe { std::env::set_var(GDK_BACKEND_ENV, &value) };
+        return;
+    }
+
+    let appimage = std::env::var_os(APPDIR_ENV).is_some();
+    let wayland_available = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let current = std::env::var(GDK_BACKEND_ENV).ok();
+    if let Some(preferred) = preferred_gdk_backend(appimage, wayland_available, current.as_deref())
+    {
+        if current.as_deref() == Some("x11") {
+            crate::diagnostics::stderr_line(
+                "[codemux::webview] replacing the AppImage launcher fallback GDK_BACKEND=x11 \
+                 with wayland,x11; set CODEMUX_GDK_BACKEND=x11 to force XWayland.",
+            );
+        }
+        unsafe { std::env::set_var(GDK_BACKEND_ENV, preferred) };
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -340,7 +434,7 @@ pub fn configure_renderer_env() {
         return;
     }
 
-    let sentinel = read_sentinel();
+    let sentinel = normalize_sentinel(read_sentinel());
     if sentinel.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
         crate::diagnostics::stderr_line(&format!(
             "[codemux::webview] {} consecutive failed startups on the accelerated renderer — \
@@ -359,6 +453,7 @@ pub fn configure_renderer_env() {
 
     write_sentinel(RendererSentinel {
         consecutive_failures: sentinel.consecutive_failures + 1,
+        policy_revision: RENDERER_POLICY_REVISION,
     });
     SENTINEL_OWNED.store(true, Ordering::Release);
     unsafe { std::env::set_var(FORCE_SHM_ENV, "1") };
@@ -502,6 +597,7 @@ mod tests {
     fn parses_a_written_sentinel_round_trip() {
         let state = RendererSentinel {
             consecutive_failures: 2,
+            policy_revision: RENDERER_POLICY_REVISION,
         };
         let raw = serde_json::to_string(&state).unwrap();
         assert_eq!(parse_sentinel(&raw), state);
@@ -509,7 +605,13 @@ mod tests {
 
     #[test]
     fn treats_corrupt_or_empty_sentinel_as_no_failures() {
-        for raw in ["", "not json", "{", "[]", "{\"consecutive_failures\":\"x\"}"] {
+        for raw in [
+            "",
+            "not json",
+            "{",
+            "[]",
+            "{\"consecutive_failures\":\"x\"}",
+        ] {
             assert_eq!(parse_sentinel(raw).consecutive_failures, 0, "raw = {raw:?}");
         }
     }
@@ -517,6 +619,39 @@ mod tests {
     #[test]
     fn tolerates_a_sentinel_missing_the_counter_field() {
         assert_eq!(parse_sentinel("{}").consecutive_failures, 0);
+    }
+
+    #[test]
+    fn old_renderer_policy_gets_one_fresh_accelerated_attempt() {
+        let old = parse_sentinel(r#"{"consecutive_failures":2}"#);
+        assert_eq!(old.policy_revision, 0);
+        assert_eq!(normalize_sentinel(old), RendererSentinel::default());
+    }
+
+    #[test]
+    fn current_renderer_policy_keeps_its_failure_counter() {
+        let current = RendererSentinel {
+            consecutive_failures: 2,
+            policy_revision: RENDERER_POLICY_REVISION,
+        };
+        assert_eq!(normalize_sentinel(current), current);
+    }
+
+    #[test]
+    fn appimage_replaces_its_generated_x11_default_on_wayland() {
+        assert_eq!(
+            preferred_gdk_backend(true, true, Some("x11")),
+            Some("wayland,x11")
+        );
+        assert_eq!(preferred_gdk_backend(true, true, None), Some("wayland,x11"));
+    }
+
+    #[test]
+    fn backend_selection_preserves_real_user_and_x11_sessions() {
+        assert_eq!(preferred_gdk_backend(false, true, Some("x11")), None);
+        assert_eq!(preferred_gdk_backend(true, true, Some("wayland")), None);
+        assert_eq!(preferred_gdk_backend(true, false, Some("x11")), None);
+        assert_eq!(preferred_gdk_backend(false, false, None), None);
     }
 
     #[test]

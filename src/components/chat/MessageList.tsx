@@ -294,9 +294,6 @@ export const MessageList = memo(function MessageList({
 
   const listRef = useRef<LegendListRef | null>(null);
   const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
-  const [firstVisibleSlotIndex, setFirstVisibleSlotIndex] = useState(() =>
-    Math.max(0, slots.length - 1),
-  );
 
   // -------------------------------------------------------------------------
   // New-turn scroll contract (see send-scroll-state.ts for the state model)
@@ -1052,14 +1049,6 @@ export const MessageList = memo(function MessageList({
     [sessionStartedAt],
   );
 
-  const handleFirstVisibleItemChanged = useCallback(
-    ({ index }: { index: number }) =>
-      setFirstVisibleSlotIndex((current) =>
-        current === index ? current : index,
-      ),
-    [],
-  );
-
   const listFooter = useMemo(
     () => (
       <div className={cn(CHAT_COLUMN, "pb-[30px]")}>
@@ -1109,11 +1098,7 @@ export const MessageList = memo(function MessageList({
         className="group/transcript-list relative size-full min-h-0 overflow-hidden"
         data-provider={provider ?? undefined}
       >
-      <MessageTrail
-        slots={slots}
-        listRef={listRef}
-        firstVisibleSlotIndex={firstVisibleSlotIndex}
-      />
+      <MessageTrail slots={slots} listRef={listRef} />
       <LegendList<TranscriptSlot>
         ref={listRef}
         data={slots}
@@ -1123,7 +1108,7 @@ export const MessageList = memo(function MessageList({
         renderItem={renderItem}
         estimatedItemSize={112}
         estimatedHeaderSize={48}
-        drawDistance={800}
+        drawDistance={250}
         recycleItems={false}
         alwaysRender={
           alwaysRenderKeys.length > 0 ? { keys: alwaysRenderKeys } : undefined
@@ -1145,7 +1130,6 @@ export const MessageList = memo(function MessageList({
         }
         maintainScrollAtEndThreshold={0.03}
         maintainVisibleContentPosition={{ data: true, size: false }}
-        onFirstVisibleItemChanged={handleFirstVisibleItemChanged}
         aria-busy={showThinking || undefined}
         data-slot="transcript-list"
         // `scrollbar-gutter: stable both-edges` (not plain `stable`):

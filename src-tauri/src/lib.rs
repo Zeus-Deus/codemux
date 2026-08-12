@@ -188,10 +188,8 @@ pub fn run() {
     // (which triggers unintended Hyprland window rules on AppImage builds).
     #[cfg(target_os = "linux")]
     {
+        webview_tuning::configure_gdk_backend_env();
         webview_tuning::configure_renderer_env();
-        if std::env::var("GDK_BACKEND").is_err() {
-            unsafe { std::env::set_var("GDK_BACKEND", "wayland,x11") };
-        }
     }
 
     #[cfg(debug_assertions)]

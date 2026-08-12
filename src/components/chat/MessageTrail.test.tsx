@@ -12,10 +12,31 @@ import { buildTranscriptSlots } from "./transcript-slots";
 const scrollToIndex = vi.fn(() => Promise.resolve());
 let viewport: HTMLDivElement;
 let listRef: React.RefObject<LegendListRef | null>;
+let scrollTop = 0;
+
+// The global jsdom ResizeObserver stub is a no-op; swap in one that records
+// its observed targets so a resize can be driven from a test.
+const resizeObservers: { target: Element; fire: () => void }[] = [];
+globalThis.ResizeObserver = class {
+  constructor(private readonly callback: () => void) {}
+  observe(target: Element) {
+    resizeObservers.push({ target, fire: () => this.callback() });
+  }
+  unobserve() {}
+  disconnect() {}
+} as unknown as typeof ResizeObserver;
+
+/** Fire the ResizeObserver that observes `target`, if one is attached. */
+function resize(target: Element) {
+  for (const entry of resizeObservers) {
+    if (entry.target === target) entry.fire();
+  }
+}
 
 afterEach(() => {
   cleanup();
   scrollToIndex.mockClear();
+  resizeObservers.length = 0;
 });
 
 function userMsg(seq: number, text: string): ChatViewItem {
@@ -46,19 +67,28 @@ function turns(n: number): ChatViewItem[] {
 function renderTrail(messages: ChatViewItem[]) {
   const slots = buildTranscriptSlots(messages);
   viewport = document.createElement("div");
+  Object.defineProperties(viewport, {
+    clientHeight: { configurable: true, value: 120 },
+    scrollTop: {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+      },
+    },
+  });
+  scrollTop = 0;
   listRef = {
     current: {
       getScrollableNode: () => viewport,
+      getState: () => ({
+        positionAtIndex: (index: number) => index * 100,
+        sizeAtIndex: () => 80,
+      }),
       scrollToIndex,
     } as unknown as LegendListRef,
   };
-  return render(
-    <MessageTrail
-      slots={slots}
-      listRef={listRef}
-      firstVisibleSlotIndex={0}
-    />,
-  );
+  return render(<MessageTrail slots={slots} listRef={listRef} />);
 }
 
 describe("MessageTrail", () => {
@@ -97,9 +127,22 @@ describe("MessageTrail", () => {
   it("shows a hover preview card with the prompt and reply snippet", () => {
     renderTrail(turns(3));
     const button = screen.getByRole("button", { name: /Jump to turn 2:/ });
-    fireEvent.focus(button); // focus shows the preview immediately (no delay)
+    fireEvent.mouseEnter(button);
     expect(screen.getByText("Question number 2 about the transcript")).toBeInTheDocument();
     expect(screen.getByText("Reply to question 2")).toBeInTheDocument();
+  });
+
+  it("immediately expands the hovered tick and its nearest neighbors", () => {
+    renderTrail(turns(5));
+    const buttons = screen.getAllByRole("button");
+
+    fireEvent.mouseEnter(buttons[2]);
+
+    expect(buttons[2].querySelector("span")).toHaveClass("w-6");
+    expect(buttons[1].querySelector("span")).toHaveClass("w-4");
+    expect(buttons[3].querySelector("span")).toHaveClass("w-4");
+    expect(buttons[0].querySelector("span")).toHaveClass("w-2.5");
+    expect(buttons[4].querySelector("span")).toHaveClass("w-2.5");
   });
 
   it("forwards rail wheel as a native wheel event on the viewport plus a scrollTop write", () => {
@@ -121,5 +164,53 @@ describe("MessageTrail", () => {
     const forwarded = wheelSpy.mock.calls[0][0] as WheelEvent;
     expect(forwarded.deltaY).toBe(120);
     expect(viewport.scrollTop).toBe(before + 120);
+  });
+
+  it("updates tick visibility from the virtualizer without a React render", async () => {
+    renderTrail(turns(4));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const buttons = screen.getAllByRole("button");
+    expect(buttons[0]).toHaveAttribute("aria-current", "true");
+    expect(buttons[0].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "true",
+    );
+
+    scrollTop = 405;
+    fireEvent.scroll(viewport);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    expect(buttons[0]).not.toHaveAttribute("aria-current");
+    expect(buttons[2]).toHaveAttribute("aria-current", "true");
+    expect(buttons[2].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "true",
+    );
+  });
+
+  it("resyncs tick visibility when the viewport resizes without scrolling", async () => {
+    renderTrail(turns(4));
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const buttons = screen.getAllByRole("button");
+    expect(buttons[1].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "false",
+    );
+
+    // A taller viewport brings the second turn into view; `scrollTop` never
+    // changes, so no `scroll` event fires.
+    Object.defineProperty(viewport, "clientHeight", {
+      configurable: true,
+      value: 500,
+    });
+    resize(viewport);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    expect(buttons[1].querySelector("span")).toHaveAttribute(
+      "data-in-view",
+      "true",
+    );
   });
 });

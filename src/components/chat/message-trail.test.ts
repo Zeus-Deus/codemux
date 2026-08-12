@@ -4,9 +4,8 @@ import type { ChatViewItem, ToolCallItem } from "@/lib/agent-chat/types";
 
 import {
   buildTrailEntries,
-  deriveActiveTrailIndex,
+  findTrailEntryAtOffset,
   sampleTrailIndices,
-  withActiveIndex,
 } from "./message-trail";
 import { buildTranscriptSlots } from "./transcript-slots";
 
@@ -100,69 +99,6 @@ describe("buildTrailEntries", () => {
   });
 });
 
-describe("deriveActiveTrailIndex", () => {
-  // user(0) am(1) user(2) group(3,4) am(5) user(6)
-  const slots = buildTranscriptSlots([
-    userMsg(0),
-    assistantMsg(1),
-    userMsg(2),
-    tool(3),
-    tool(4),
-    assistantMsg(5),
-    userMsg(6),
-  ]);
-  const entries = buildTrailEntries(slots); // slotIndex 0, 2, 5
-  it("returns -1 with no entries", () => {
-    expect(deriveActiveTrailIndex([], 0)).toBe(-1);
-  });
-
-  it("returns -1 before the list reports a visible row", () => {
-    expect(deriveActiveTrailIndex(entries, -1)).toBe(-1);
-  });
-
-  it("maps the first visible user row to its own turn", () => {
-    expect(deriveActiveTrailIndex(entries, 0)).toBe(0);
-    expect(deriveActiveTrailIndex(entries, 5)).toBe(2);
-  });
-
-  it("maps a visible assistant row to the enclosing turn", () => {
-    // am-1 (slot 1) is still turn 0; am-5 (slot 4) is turn 1.
-    expect(deriveActiveTrailIndex(entries, 1)).toBe(0);
-    expect(deriveActiveTrailIndex(entries, 4)).toBe(1);
-  });
-
-  it("maps a visible folded tool-group id to the enclosing turn", () => {
-    // run:tc-3 is slot 3, inside turn 1 (user at slot 2).
-    expect(deriveActiveTrailIndex(entries, 3)).toBe(1);
-  });
-
-  it("stays -1 while the viewport sits above the first user turn", () => {
-    const lead = buildTranscriptSlots([
-      assistantMsg(0),
-      userMsg(1),
-      assistantMsg(2),
-      userMsg(3),
-    ]);
-    const leadEntries = buildTrailEntries(lead); // slotIndex 1, 3
-    // am-0 is slot 0, before the first turn's slot 1.
-    expect(deriveActiveTrailIndex(leadEntries, 0)).toBe(-1);
-  });
-
-  it("clamps to the last turn once scrolled past it", () => {
-    const past = buildTranscriptSlots([
-      userMsg(0),
-      assistantMsg(1),
-      userMsg(2),
-      assistantMsg(3),
-      // trailing assistant continuation well past the last user turn
-      assistantMsg(4),
-    ]);
-    const pastEntries = buildTrailEntries(past); // slotIndex 0, 2
-    // am-4 (slot 4) is beyond the last user turn (slot 2) → clamp to index 1.
-    expect(deriveActiveTrailIndex(pastEntries, 4)).toBe(1);
-  });
-});
-
 describe("sampleTrailIndices", () => {
   it("returns every index when under the cap", () => {
     expect(sampleTrailIndices(5, 60)).toEqual([0, 1, 2, 3, 4]);
@@ -181,19 +117,41 @@ describe("sampleTrailIndices", () => {
   });
 });
 
-describe("withActiveIndex", () => {
-  it("returns the sample unchanged when active is already present or unset", () => {
-    const sample = [0, 3, 6, 9];
-    expect(withActiveIndex(sample, 6)).toBe(sample);
-    expect(withActiveIndex(sample, -1)).toBe(sample);
+describe("findTrailEntryAtOffset", () => {
+  const entries = buildTrailEntries(
+    buildTranscriptSlots([
+      assistantMsg(0),
+      userMsg(1),
+      assistantMsg(2),
+      userMsg(3),
+      assistantMsg(4),
+      userMsg(5),
+    ]),
+  );
+  const positions = [0, 100, 200, 300, 400, 500];
+  const positionAtIndex = (slotIndex: number) => positions[slotIndex];
+
+  it("finds the latest user turn above the viewport offset", () => {
+    expect(findTrailEntryAtOffset(entries, 99, positionAtIndex)).toBe(-1);
+    expect(findTrailEntryAtOffset(entries, 100, positionAtIndex)).toBe(0);
+    expect(findTrailEntryAtOffset(entries, 299, positionAtIndex)).toBe(0);
+    expect(findTrailEntryAtOffset(entries, 300, positionAtIndex)).toBe(1);
+    expect(findTrailEntryAtOffset(entries, 999, positionAtIndex)).toBe(2);
   });
 
-  it("injects a dropped active index without growing the list", () => {
-    const sample = [0, 3, 6, 9];
-    const out = withActiveIndex(sample, 4);
-    expect(out).toHaveLength(sample.length);
-    expect(out).toContain(4);
-    // stays sorted
-    for (let i = 1; i < out.length; i++) expect(out[i]).toBeGreaterThan(out[i - 1]);
+  it("does logarithmic position lookups for a long trail", () => {
+    const longEntries = Array.from({ length: 1024 }, (_, i) => ({
+      ...entries[0],
+      messageId: `turn-${i}`,
+      slotIndex: i * 2,
+      turnIndex: i,
+    }));
+    let lookups = 0;
+    const found = findTrailEntryAtOffset(longEntries, 1701, (slotIndex) => {
+      lookups += 1;
+      return slotIndex;
+    });
+    expect(found).toBe(850);
+    expect(lookups).toBeLessThanOrEqual(11);
   });
 });
