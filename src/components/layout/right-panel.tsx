@@ -38,7 +38,9 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileImage,
   FileText,
+  FileVideo,
   ListFilter,
   Loader2,
   PanelRight as PanelRightIcon,
@@ -68,6 +70,10 @@ import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
+import {
+  isImageExtension,
+  isVideoExtension,
+} from "@/lib/editor-languages";
 import { maxRightPanelWidth } from "@/lib/right-panel-width";
 import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -409,6 +415,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   );
 
   const activeDocPath = activePane ? docPanePath(activePane) : null;
+  const activeDocIsMedia =
+    activeDocPath != null &&
+    (isImageExtension(activeDocPath) || isVideoExtension(activeDocPath));
   const docView = activeDocPath
     ? (docViews[activePane as string] ?? DEFAULT_DOC_VIEW)
     : DEFAULT_DOC_VIEW;
@@ -552,7 +561,12 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   const tabs: DeckTab[] = visiblePanes.map((id) => {
     const path = docPanePath(id);
     if (path) {
-      return { id, label: baseName(path), icon: FileText, testId: "doc-tab" };
+      const icon = isVideoExtension(path)
+        ? FileVideo
+        : isImageExtension(path)
+          ? FileImage
+          : FileText;
+      return { id, label: baseName(path), icon, testId: "doc-tab" };
     }
     const meta = paneMeta(id as RightPanelCorePane)!;
     const tab: DeckTab = { id, label: meta.label, icon: meta.icon };
@@ -639,17 +653,21 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
             onClick={() => patchDocView(paneKey, { raw: !docView.raw })}
           />
         )}
-        <PaneActionButton
-          label={docView.wrap ? "Disable soft wrap" : "Soft wrap"}
-          icon={WrapText}
-          active={docView.wrap}
-          onClick={() => patchDocView(paneKey, { wrap: !docView.wrap })}
-        />
-        <PaneActionButton
-          label={copiedDoc ? "Copied" : "Copy file"}
-          icon={copiedDoc ? Check : Copy}
-          onClick={handleCopyDoc}
-        />
+        {!activeDocIsMedia && (
+          <>
+            <PaneActionButton
+              label={docView.wrap ? "Disable soft wrap" : "Soft wrap"}
+              icon={WrapText}
+              active={docView.wrap}
+              onClick={() => patchDocView(paneKey, { wrap: !docView.wrap })}
+            />
+            <PaneActionButton
+              label={copiedDoc ? "Copied" : "Copy file"}
+              icon={copiedDoc ? Check : Copy}
+              onClick={handleCopyDoc}
+            />
+          </>
+        )}
         <PaneActionButton
           label="File explorer"
           icon={PanelRightIcon}

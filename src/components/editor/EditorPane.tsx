@@ -8,10 +8,16 @@ import { FileCode } from "lucide-react";
 import { useEditorStore } from "@/stores/editor-store";
 import { readFile, writeFile } from "@/tauri/commands";
 import { buildEditorTheme } from "@/lib/codemirror-theme";
-import { loadLanguage, isBinaryExtension, isImageExtension } from "@/lib/editor-languages";
+import {
+  loadLanguage,
+  isBinaryExtension,
+  isImageExtension,
+  isVideoExtension,
+} from "@/lib/editor-languages";
 import { useSyntaxThemeColors } from "@/hooks/use-theme-colors";
 import { MarkdownRendered } from "./MarkdownRendered";
 import { ImageViewer } from "./ImageViewer";
+import { VideoViewer } from "./VideoViewer";
 
 interface Props {
   tabId: string;
@@ -61,6 +67,7 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
 
   const isMd = filePath != null && isMarkdownFile(filePath);
   const isImage = filePath != null && isImageExtension(filePath);
+  const isVideo = filePath != null && isVideoExtension(filePath);
   const [localViewMode, setViewMode] = useState<ViewMode>("raw");
   const viewMode = viewModeProp ?? localViewMode;
 
@@ -181,9 +188,9 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
     const view = viewRef.current;
     if (!view || !filePath) return;
 
-    // Images render in a dedicated viewer below \u2014 no need to read
+    // Previewable media renders in a dedicated viewer below \u2014 no need to read
     // bytes into the text editor or show a "binary" error.
-    if (isImageExtension(filePath)) {
+    if (isImageExtension(filePath) || isVideoExtension(filePath)) {
       setErrorMsg(null);
       return;
     }
@@ -368,20 +375,25 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
       </div>
 
       {/* Image viewer — shown instead of the text editor for image files */}
-      {isImage && <ImageViewer filePath={filePath} />}
+      {isImage && <ImageViewer key={filePath} filePath={filePath} />}
+
+      {/* Video viewer — stream local recordings through Tauri's asset URL. */}
+      {isVideo && <VideoViewer key={filePath} filePath={filePath} />}
 
       {/* Rendered markdown view */}
       {isMd && viewMode === "rendered" && (
         <MarkdownRendered content={renderedContent} filePath={filePath} />
       )}
 
-      {/* CodeMirror container — hidden when showing rendered view or image */}
+      {/* CodeMirror container — hidden for rendered or media previews */}
       <div
         ref={containerRef}
         className="flex-1 min-h-0 overflow-hidden [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto"
         style={{
           display:
-            isImage || (isMd && viewMode === "rendered") ? "none" : undefined,
+            isImage || isVideo || (isMd && viewMode === "rendered")
+              ? "none"
+              : undefined,
         }}
       />
     </div>

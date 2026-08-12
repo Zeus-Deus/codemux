@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { isBinaryExtension, isImageExtension } from "./editor-languages";
+import {
+  isBinaryExtension,
+  isImageExtension,
+  isVideoExtension,
+} from "./editor-languages";
 
 describe("isImageExtension", () => {
   it("returns true for common raster image extensions", () => {
@@ -70,5 +74,27 @@ describe("isBinaryExtension", () => {
     expect(isBinaryExtension("README.md")).toBe(false);
     expect(isBinaryExtension("main.rs")).toBe(false);
     expect(isBinaryExtension("Cargo.toml")).toBe(false);
+  });
+});
+
+describe("isVideoExtension", () => {
+  it("recognises common video containers case-insensitively", () => {
+    for (const f of [
+      "demo.mp4",
+      "demo.m4v",
+      "demo.webm",
+      "demo.mov",
+      "demo.ogv",
+      "demo.mkv",
+      "demo.AVI",
+    ]) {
+      expect(isVideoExtension(f)).toBe(true);
+    }
+  });
+
+  it("does not classify audio, image, or text files as video", () => {
+    for (const f of ["song.mp3", "sound.ogg", "photo.png", "README.md"]) {
+      expect(isVideoExtension(f)).toBe(false);
+    }
   });
 });
