@@ -25,9 +25,39 @@ export class IrohWasmUnavailableError extends Error {
   }
 }
 
-/** Served paths of the built artifact (from `public/iroh-wasm/`). */
-const ARTIFACT_JS = "/iroh-wasm/iroh_wasm.js";
-const ARTIFACT_WASM = "/iroh-wasm/iroh_wasm_bg.wasm";
+export interface IrohWasmArtifactPaths {
+  readonly js: string;
+  readonly wasm: string;
+}
+
+/** Resolve the served artifact paths. Hosted release builds use a versioned
+ *  directory so a tab running an older frontend can never fetch a newer,
+ *  incompatible wasm-bindgen pair through the stable filenames. Local and
+ *  embedded builds retain the unversioned development path. */
+export function resolveIrohWasmArtifactPaths(
+  releaseTag?: string,
+): IrohWasmArtifactPaths {
+  const normalizedTag = releaseTag?.trim();
+  if (
+    normalizedTag &&
+    !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
+      normalizedTag,
+    )
+  ) {
+    throw new Error(`invalid Codemux release tag: ${normalizedTag}`);
+  }
+  const versionPath = normalizedTag
+    ? `/${encodeURIComponent(normalizedTag)}`
+    : "";
+  return {
+    js: `/iroh-wasm${versionPath}/iroh_wasm.js`,
+    wasm: `/iroh-wasm${versionPath}/iroh_wasm_bg.wasm`,
+  };
+}
+
+const ARTIFACT_PATHS = resolveIrohWasmArtifactPaths(
+  import.meta.env.VITE_CODEMUX_RELEASE_TAG,
+);
 
 /** One open stream as exposed by the wasm-bindgen glue. `read` resolves to the
  *  next chunk, or `null`/`undefined` at EOF. */
@@ -85,7 +115,7 @@ export function __resetIrohDialer(): void {
 async function buildDialer(importer: WasmImporter): Promise<IrohDialer> {
   let mod: WasmModule;
   try {
-    mod = (await importer(ARTIFACT_JS)) as WasmModule;
+    mod = (await importer(ARTIFACT_PATHS.js)) as WasmModule;
   } catch (err) {
     throw new IrohWasmUnavailableError(err);
   }
@@ -94,7 +124,7 @@ async function buildDialer(importer: WasmImporter): Promise<IrohDialer> {
       new Error("iroh wasm module missing expected exports"),
     );
   }
-  await mod.default({ module_or_path: ARTIFACT_WASM });
+  await mod.default({ module_or_path: ARTIFACT_PATHS.wasm });
   return {
     async dial(target): Promise<IrohByteStream> {
       const handle = await mod.connect(

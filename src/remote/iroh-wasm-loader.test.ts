@@ -3,10 +3,33 @@ import {
   loadIrohDialer,
   IrohWasmUnavailableError,
   __resetIrohDialer,
+  resolveIrohWasmArtifactPaths,
   type WasmImporter,
 } from "./iroh-wasm-loader";
 
 beforeEach(() => __resetIrohDialer());
+
+describe("resolveIrohWasmArtifactPaths", () => {
+  it("keeps the unversioned path for local builds", () => {
+    expect(resolveIrohWasmArtifactPaths()).toEqual({
+      js: "/iroh-wasm/iroh_wasm.js",
+      wasm: "/iroh-wasm/iroh_wasm_bg.wasm",
+    });
+  });
+
+  it("isolates hosted artifacts by release tag", () => {
+    expect(resolveIrohWasmArtifactPaths("v0.20.0")).toEqual({
+      js: "/iroh-wasm/v0.20.0/iroh_wasm.js",
+      wasm: "/iroh-wasm/v0.20.0/iroh_wasm_bg.wasm",
+    });
+  });
+
+  it("rejects an unsafe release path", () => {
+    expect(() => resolveIrohWasmArtifactPaths("../latest")).toThrow(
+      "invalid Codemux release tag",
+    );
+  });
+});
 
 describe("loadIrohDialer graceful missing-wasm", () => {
   it("throws IrohWasmUnavailableError when the artifact import rejects", async () => {
