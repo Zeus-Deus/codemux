@@ -61,6 +61,25 @@ pub struct AppearanceSettings {
     pub custom_themes: Vec<serde_json::Value>,
     #[serde(default)]
     pub shell_font: Option<String>,
+    #[serde(default = "default_typography_mode")]
+    pub typography_mode: String,
+    #[serde(default)]
+    pub interface_font_family: Option<String>,
+    #[serde(default = "default_interface_font_size")]
+    pub interface_font_size: f32,
+    #[serde(default)]
+    pub conversation_font_family: Option<String>,
+    #[serde(default = "default_conversation_font_size")]
+    pub conversation_font_size: f32,
+    #[serde(default)]
+    pub code_font_family: Option<String>,
+    /// `None` is the migration marker for settings written before code and
+    /// terminal typography were separated. The frontend resolves it from the
+    /// existing terminal size, preserving large-text accessibility choices.
+    #[serde(default)]
+    pub code_font_size: Option<f32>,
+    #[serde(default)]
+    pub terminal_font_family: Option<String>,
     #[serde(default = "default_font_size")]
     pub terminal_font_size: f32,
     /// Show the resource monitor (CPU/memory) icon in the title bar.
@@ -74,6 +93,14 @@ impl Default for AppearanceSettings {
             theme: default_theme(),
             custom_themes: Vec::new(),
             shell_font: None,
+            typography_mode: default_typography_mode(),
+            interface_font_family: None,
+            interface_font_size: default_interface_font_size(),
+            conversation_font_family: None,
+            conversation_font_size: default_conversation_font_size(),
+            code_font_family: None,
+            code_font_size: Some(default_font_size()),
+            terminal_font_family: None,
             terminal_font_size: default_font_size(),
             show_resource_monitor: true,
         }
@@ -217,6 +244,15 @@ impl Default for SessionRestoreSettings {
 
 fn default_theme() -> String {
     "default".into()
+}
+fn default_typography_mode() -> String {
+    "simple".into()
+}
+fn default_interface_font_size() -> f32 {
+    16.0
+}
+fn default_conversation_font_size() -> f32 {
+    14.0
 }
 fn default_font_size() -> f32 {
     13.0
@@ -469,8 +505,16 @@ mod tests {
     fn default_settings_have_expected_values() {
         let s = UserSettings::default();
         assert_eq!(s.appearance.theme, "default");
+        assert_eq!(s.appearance.typography_mode, "simple");
+        assert_eq!(s.appearance.interface_font_size, 16.0);
+        assert_eq!(s.appearance.conversation_font_size, 14.0);
+        assert_eq!(s.appearance.code_font_size, Some(13.0));
         assert_eq!(s.appearance.terminal_font_size, 13.0);
         assert!(s.appearance.shell_font.is_none());
+        assert!(s.appearance.interface_font_family.is_none());
+        assert!(s.appearance.conversation_font_family.is_none());
+        assert!(s.appearance.code_font_family.is_none());
+        assert!(s.appearance.terminal_font_family.is_none());
         assert!(s.editor.default_ide.is_none());
         assert_eq!(s.terminal.scrollback_limit, 10_000);
         assert_eq!(s.terminal.cursor_style, "bar");
@@ -498,6 +542,10 @@ mod tests {
         let json = r#"{"appearance": {"theme": "dark"}}"#;
         let s: UserSettings = serde_json::from_str(json).unwrap();
         assert_eq!(s.appearance.theme, "dark");
+        assert_eq!(s.appearance.typography_mode, "simple");
+        assert_eq!(s.appearance.interface_font_size, 16.0);
+        assert_eq!(s.appearance.conversation_font_size, 14.0);
+        assert!(s.appearance.code_font_size.is_none());
         assert_eq!(s.appearance.terminal_font_size, 13.0);
         assert_eq!(s.terminal.scrollback_limit, 10_000);
         assert_eq!(s.git.default_base_branch, "main");
@@ -564,6 +612,14 @@ mod tests {
                 theme: "dark".into(),
                 custom_themes: Vec::new(),
                 shell_font: Some("Fira Code".into()),
+                typography_mode: "advanced".into(),
+                interface_font_family: Some("Atkinson Hyperlegible".into()),
+                interface_font_size: 17.0,
+                conversation_font_family: Some("Source Sans 3".into()),
+                conversation_font_size: 15.0,
+                code_font_family: Some("Iosevka".into()),
+                code_font_size: Some(14.0),
+                terminal_font_family: Some("Berkeley Mono".into()),
                 terminal_font_size: 18.5,
                 show_resource_monitor: false,
             },
@@ -617,6 +673,23 @@ mod tests {
 
         assert_eq!(back.appearance.theme, "dark");
         assert_eq!(back.appearance.shell_font.as_deref(), Some("Fira Code"));
+        assert_eq!(back.appearance.typography_mode, "advanced");
+        assert_eq!(
+            back.appearance.interface_font_family.as_deref(),
+            Some("Atkinson Hyperlegible")
+        );
+        assert_eq!(back.appearance.interface_font_size, 17.0);
+        assert_eq!(
+            back.appearance.conversation_font_family.as_deref(),
+            Some("Source Sans 3")
+        );
+        assert_eq!(back.appearance.conversation_font_size, 15.0);
+        assert_eq!(back.appearance.code_font_family.as_deref(), Some("Iosevka"));
+        assert_eq!(back.appearance.code_font_size, Some(14.0));
+        assert_eq!(
+            back.appearance.terminal_font_family.as_deref(),
+            Some("Berkeley Mono")
+        );
         assert_eq!(back.appearance.terminal_font_size, 18.5);
         assert_eq!(back.editor.default_ide.as_deref(), Some("cursor"));
         assert_eq!(back.terminal.scrollback_limit, 2000);

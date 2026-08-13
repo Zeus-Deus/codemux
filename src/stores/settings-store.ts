@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { dbGetAllSettings, dbSetSetting } from "@/tauri/commands";
 import { useSyncedSettingsStore } from "./synced-settings-store";
 import { setTerminalThemeMode } from "@/lib/terminal-theme-mode";
+import { resolveTypographySettings } from "@/lib/typography";
 
 /** Machine-local settings only. Per-user settings live in synced-settings-store. */
 export const SETTINGS_DEFAULTS: Record<string, string> = {
@@ -112,13 +113,25 @@ export function getTerminalColorTheme(): string {
 }
 
 export function getTerminalFontFamily(): string {
-  return raw("terminal.font_family");
+  const appearance = useSyncedSettingsStore.getState().settings.appearance;
+  const hasSyncedPreference = Boolean(
+    appearance.terminal_font_family ||
+      appearance.code_font_family ||
+      appearance.shell_font,
+  );
+  // Honor the dormant machine-local override from older development builds
+  // until the user makes a choice in the new synced typography UI.
+  const legacyLocal = useSettingsStore.getState().settings["terminal.font_family"];
+  if (!hasSyncedPreference && legacyLocal) return legacyLocal;
+  return resolveTypographySettings(appearance).terminalFamily;
 }
 
 // ── Per-user imperative getters (redirect to synced store for backward compat) ──
 
 export function getTerminalFontSize(): number {
-  return useSyncedSettingsStore.getState().settings.appearance.terminal_font_size;
+  return resolveTypographySettings(
+    useSyncedSettingsStore.getState().settings.appearance,
+  ).terminalSize;
 }
 
 export function getTerminalCursorStyle(): string {

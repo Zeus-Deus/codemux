@@ -14,7 +14,18 @@ export interface AppearanceSettings {
   /** Versioned Codemux theme files. The frontend validates their extensible
    * role schema so older clients can retain roles added by newer clients. */
   custom_themes?: unknown[];
+  /** Legacy terminal-family preference retained for old synced blobs. New
+   * clients write `terminal_font_family`; resolution still honors this when
+   * that field is absent. */
   shell_font: string | null;
+  typography_mode?: "simple" | "advanced";
+  interface_font_family?: string | null;
+  interface_font_size?: number;
+  conversation_font_family?: string | null;
+  conversation_font_size?: number;
+  code_font_family?: string | null;
+  code_font_size?: number | null;
+  terminal_font_family?: string | null;
   terminal_font_size: number;
   show_resource_monitor: boolean;
 }

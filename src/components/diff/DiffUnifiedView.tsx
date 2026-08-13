@@ -12,37 +12,22 @@ export interface DiffViewHandle {
 export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
   function DiffUnifiedView({ lines }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
-    const hunkIndices = lines.reduce<number[]>((acc, line, i) => {
-      if (line.type === "hunk-header") acc.push(i);
-      return acc;
-    }, []);
-
     const scrollToHunk = useCallback(
       (direction: 1 | -1) => {
         const container = containerRef.current;
-        if (!container || hunkIndices.length === 0) return;
-
-        const scrollTop = container.scrollTop;
-        const lineHeight = 18;
-        const currentLine = Math.floor(scrollTop / lineHeight);
-
-        let targetIdx: number | undefined;
-        if (direction === 1) {
-          targetIdx = hunkIndices.find((i) => i > currentLine + 1);
-        } else {
-          for (let j = hunkIndices.length - 1; j >= 0; j--) {
-            if (hunkIndices[j] < currentLine) {
-              targetIdx = hunkIndices[j];
-              break;
-            }
-          }
-        }
-
-        if (targetIdx !== undefined) {
-          container.scrollTo({ top: targetIdx * lineHeight, behavior: "smooth" });
-        }
+        if (!container) return;
+        const hunks = Array.from(
+          container.querySelectorAll<HTMLElement>("[data-diff-hunk]"),
+        );
+        const target =
+          direction === 1
+            ? hunks.find((hunk) => hunk.offsetTop > container.scrollTop + 1)
+            : [...hunks]
+                .reverse()
+                .find((hunk) => hunk.offsetTop < container.scrollTop - 1);
+        if (target) container.scrollTo({ top: target.offsetTop, behavior: "smooth" });
       },
-      [hunkIndices],
+      [],
     );
 
     useImperativeHandle(ref, () => ({ scrollToHunk }), [scrollToHunk]);
@@ -50,7 +35,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
     return (
       <div
         ref={containerRef}
-        className="select-text flex-1 overflow-auto bg-card font-mono text-xs leading-[18px]"
+        className="code-surface select-text flex-1 overflow-auto bg-card"
       >
         <div className="py-0.5">
           {lines.map((line, i) => {
@@ -58,6 +43,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
               return (
                 <div
                   key={i}
+                  data-diff-hunk
                   className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0"
                 >
                   <span className="w-[72px] shrink-0" />

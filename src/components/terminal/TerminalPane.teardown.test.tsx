@@ -171,16 +171,36 @@ vi.mock("@/hooks/use-resolved-keybinds", () => ({
 }));
 
 let restoreEnabled = true;
-vi.mock("@/stores/synced-settings-store", () => ({
-  useSyncedSettingsStore: {
-    getState: () => ({
-      settings: {
-        session_restore: { enabled: restoreEnabled, scrollback_lines: 1000 },
-        keyboard: { shortcuts: {} },
+vi.mock("@/stores/synced-settings-store", () => {
+  const state = () => ({
+    settings: {
+      appearance: {
+        theme: "default",
+        shell_font: null,
+        typography_mode: "simple",
+        interface_font_family: null,
+        interface_font_size: 16,
+        conversation_font_family: null,
+        conversation_font_size: 14,
+        code_font_family: null,
+        code_font_size: 13,
+        terminal_font_family: null,
+        terminal_font_size: 13,
       },
-    }),
-  },
-}));
+      session_restore: { enabled: restoreEnabled, scrollback_lines: 1000 },
+      keyboard: { shortcuts: {} },
+    },
+  });
+  const useSyncedSettingsStore = Object.assign(
+    (selector: (value: ReturnType<typeof state>) => unknown) => selector(state()),
+    {
+      getState: () => ({
+        ...state(),
+      }),
+    },
+  );
+  return { useSyncedSettingsStore };
+});
 
 vi.mock("@/stores/settings-store", () => ({
   getTerminalFontSize: () => 13,

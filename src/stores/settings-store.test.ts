@@ -68,7 +68,7 @@ describe("settings-store", () => {
 
     it("terminalFontFamily defaults to JetBrains Mono", () => {
       expect(getTerminalFontFamily()).toBe(
-        "'JetBrains Mono Variable', monospace",
+        "'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
       );
     });
 

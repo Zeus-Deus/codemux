@@ -57,7 +57,6 @@ import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   useSyncedSettingsStore,
-  selectTerminalFontSize,
   selectTerminalCursorStyle,
   selectDefaultEditor,
   selectDefaultBaseBranch,
@@ -257,6 +256,7 @@ import { PermissionsSection } from "./permissions-section";
 import { UsageSection } from "./usage-section";
 import { SkillsSection } from "./skills-section";
 import { SmoothScrollingSection } from "./smooth-scrolling-section";
+import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 
@@ -1259,7 +1259,6 @@ export function SettingsView() {
   const storeGet = useSettingsStore((s) => s.get);
   const defaultEditor = useSyncedSettingsStore(selectDefaultEditor);
   const cursorStyle = useSyncedSettingsStore(selectTerminalCursorStyle);
-  const fontSize = useSyncedSettingsStore(selectTerminalFontSize);
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const density = useSettingsStore(selectDensity);
@@ -1371,9 +1370,6 @@ export function SettingsView() {
   };
   const setCursorStyle = (v: string) => {
     updateSyncedSetting("terminal", "cursor_style", v).catch(console.error);
-  };
-  const setFontSize = (v: number) => {
-    updateSyncedSetting("appearance", "terminal_font_size", v).catch(console.error);
   };
   const setBaseBranch = (v: string) => {
     updateSyncedSetting("git", "default_base_branch", v).catch(console.error);
@@ -1572,13 +1568,8 @@ export function SettingsView() {
               title="Appearance"
               description="Customize how Codemux looks. Theme changes apply immediately."
             />
-            <div className="space-y-1">
-              <SettingRow label="Typography" description="Fixed across themes so every palette keeps Codemux's visual rhythm.">
-                <span className="text-right text-[12px] text-muted-foreground">
-                  DM Sans <span className="px-1 text-border">·</span> JetBrains Mono
-                </span>
-              </SettingRow>
-              <Separator />
+            <TypographySettings />
+            <div className="mt-10 space-y-1">
               <SettingRow label="Border radius" description="Fixed across themes so a palette can't change the geometry.">
                 <span className="font-mono text-[12px] text-muted-foreground">{liveRadius}</span>
               </SettingRow>
@@ -1790,6 +1781,20 @@ export function SettingsView() {
               description="Configure the terminal emulator behavior and appearance."
             />
             <div className="space-y-1">
+              <SettingRow
+                label="Font"
+                description="Family, size, and live terminal preview live with the rest of Codemux typography."
+              >
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-[12px] text-muted-foreground"
+                  onClick={() => setActiveSection("appearance")}
+                >
+                  Open Appearance
+                </Button>
+              </SettingRow>
+              <Separator />
               <SettingRow label="Cursor style" description="The shape of the cursor in terminal panes.">
                 <Select value={cursorStyle} onValueChange={setCursorStyle}>
                   <SelectTrigger className="w-36 h-9">
@@ -1801,17 +1806,6 @@ export function SettingsView() {
                     <SelectItem value="underline">Underline</SelectItem>
                   </SelectContent>
                 </Select>
-              </SettingRow>
-              <Separator />
-              <SettingRow label="Font size" description={`${fontSize}px — adjust the terminal text size.`}>
-                <Slider
-                  value={[fontSize]}
-                  onValueChange={([v]) => setFontSize(v)}
-                  min={10}
-                  max={22}
-                  step={1}
-                  className="w-36"
-                />
               </SettingRow>
               <Separator />
               <SettingRow label="Color theme" description="How the terminal gets its colors.">

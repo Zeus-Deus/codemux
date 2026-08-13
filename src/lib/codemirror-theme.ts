@@ -23,8 +23,8 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
     },
     ".cm-content": {
       caretColor: "var(--sidebar-primary)",
-      fontFamily: "'JetBrains Mono Variable', monospace",
-      fontSize: "13px",
+      fontFamily: "var(--font-mono)",
+      fontSize: "var(--font-size-code, 13px)",
       lineHeight: "1.6",
     },
     ".cm-cursor, .cm-dropCursor": {

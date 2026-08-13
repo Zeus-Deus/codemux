@@ -11,6 +11,7 @@ import {
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
 import { applyTheme, parseCustomThemes, resolveTheme } from "@/lib/themes";
+import { applyTypography, resolveTypographySettings } from "@/lib/typography";
 import { SidebarProvider, SidebarInset, useSidebar } from "@/components/ui/sidebar";
 import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
 import { AppSidebar } from "./app-sidebar";
@@ -52,6 +53,7 @@ export function AppShell() {
   // controls layout rhythm rather than the color system.
   const syncedThemeId = useSyncedSettingsStore((s) => s.settings?.appearance?.theme ?? "default");
   const customThemePayloads = useSyncedSettingsStore((s) => s.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS);
+  const typographyAppearance = useSyncedSettingsStore((s) => s.settings?.appearance);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
   const legacyPalette = useSettingsStore((s) => s.settings["appearance.palette"]);
   const density = useSettingsStore(selectDensity);
@@ -73,6 +75,10 @@ export function AppShell() {
     () => resolveTheme(effectiveThemeId, customThemes),
     [effectiveThemeId, customThemes],
   );
+  const typography = useMemo(
+    () => resolveTypographySettings(typographyAppearance),
+    [typographyAppearance],
+  );
 
   useEffect(() => {
     useSettingsStore.getState().load();
@@ -86,10 +92,13 @@ export function AppShell() {
   // a color, and stays unconditional.
   useLayoutEffect(() => {
     const root = document.documentElement;
-    if (appearanceReady) applyTheme(activeTheme);
+    if (appearanceReady) {
+      applyTheme(activeTheme);
+      applyTypography(root, typography);
+    }
     delete root.dataset.pal;
     root.dataset.density = density;
-  }, [activeTheme, density, appearanceReady]);
+  }, [activeTheme, density, appearanceReady, typography]);
 
   // One-time migration from the machine-local Cool/Warm axis to the unified,
   // synced theme id. Only an explicitly stored legacy value participates, and

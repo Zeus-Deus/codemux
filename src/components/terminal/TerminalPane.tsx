@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, memo } from "react";
+import { useEffect, useRef, useCallback, useMemo, memo } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -19,10 +19,10 @@ import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
 import { endSubMeasure, startSubMeasure } from "@/lib/perf/interaction-trace";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
-  getTerminalFontSize,
   getTerminalCursorStyle,
-  getTerminalFontFamily,
 } from "@/stores/settings-store";
+import { resolveTypographySettings } from "@/lib/typography";
+import { applyTerminalTypography } from "@/lib/terminal-typography";
 import {
   writeToPty,
   resizePty,
@@ -88,6 +88,11 @@ function isAltScreen(t: Terminal): boolean {
 // Export-only wrapper: the component body below is unchanged.
 export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const syntaxTheme = useSyntaxThemeColors();
+  const typographyAppearance = useSyncedSettingsStore((s) => s.settings.appearance);
+  const typography = useMemo(
+    () => resolveTypographySettings(typographyAppearance),
+    [typographyAppearance],
+  );
 
   // Refs for mutable state that persists across renders
   const shellRef = useRef<HTMLDivElement>(null);
@@ -270,14 +275,14 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
     // ── Create terminal ──
     const term = new Terminal({
-      fontFamily: getTerminalFontFamily(),
+      fontFamily: typography.terminalFamily,
       theme: themeColorsToXtermTheme(syntaxTheme),
       convertEol: false,
       cursorBlink: true,
       cursorWidth: 2,
       lineHeight: 1.15,
       letterSpacing: 0,
-      fontSize: getTerminalFontSize(),
+      fontSize: typography.terminalSize,
       cursorStyle: getTerminalCursorStyle() as "bar" | "block" | "underline",
       altClickMovesCursor: true,
     });
@@ -1050,6 +1055,20 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = themeColorsToXtermTheme(syntaxTheme);
   }, [syntaxTheme]);
+
+  // Font changes are truly live: update the existing xterm instance, clear
+  // its renderer atlas, refit the cell grid, and tell the PTY its new rows /
+  // columns. Recreating the terminal here would lose modes, selection, and
+  // scroll position—the exact state users are inspecting while tuning type.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    if (!applyTerminalTypography(term, typography.terminalFamily, typography.terminalSize)) return;
+    const frame = requestAnimationFrame(() => {
+      void syncTerminalSize();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [syncTerminalSize, typography.terminalFamily, typography.terminalSize]);
 
   // ── Focus management ──
   // Depends on `sessionId` as well as `focused`: when a new tab is created

@@ -22,7 +22,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   cwd?: string | null;
 }) {
   return (
-    <div className="text-sm leading-relaxed text-foreground break-words">
+    <div className="conversation-text leading-relaxed text-foreground break-words">
       <ChatMarkdown
         streaming={item.streaming}
         workspaceId={workspaceId}

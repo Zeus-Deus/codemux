@@ -2312,7 +2312,7 @@ export function Composer({
               className={cn(
                 "pointer-events-none absolute inset-0 px-3 py-2.5",
                 "whitespace-pre-wrap break-words",
-                "text-sm leading-relaxed text-foreground",
+                "conversation-text leading-relaxed text-foreground",
                 // `overflow-y-auto` (rather than `overflow-hidden`) is
                 // required so we can imperatively assign `scrollTop` —
                 // setting `scrollTop` on a clipped element is a no-op in
@@ -2477,7 +2477,7 @@ export function Composer({
                 "relative block w-full resize-none bg-transparent px-3 py-2.5",
                 // Transparent text — the colored mirror behind shows
                 // through. Caret stays visible via `caret-foreground`.
-                "text-sm leading-relaxed text-transparent caret-foreground",
+                "conversation-text leading-relaxed text-transparent caret-foreground",
                 "placeholder:text-muted-foreground/60",
                 "outline-none",
               )}
