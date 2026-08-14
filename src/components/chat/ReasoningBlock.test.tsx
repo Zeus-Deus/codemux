@@ -49,6 +49,14 @@ describe("ReasoningBlock", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps the settled glyph while streaming when another surface owns the orb", () => {
+    const { container } = render(
+      <ReasoningBlock item={reasoning({ streaming: true })} live={false} />,
+    );
+    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    expect(container.querySelector("[data-orb-state]")).toBeNull();
+  });
+
   it("falls back to 'Thought' when no duration was captured", () => {
     render(<ReasoningBlock item={reasoning({ duration_ms: undefined })} />);
     expect(screen.getByText("Thought")).toBeInTheDocument();

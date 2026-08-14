@@ -149,7 +149,9 @@ function SubItem({
     case "assistant_message":
       return <AssistantMessage item={item} workspaceId={workspaceId} cwd={cwd} />;
     case "reasoning":
-      return <ReasoningBlock item={item} />;
+      // The live tail below owns the run's orb, so a still-streaming thought
+      // keeps its settled glyph here instead of animating a second one.
+      return <ReasoningBlock item={item} live={false} />;
     case "tool_call":
       return isTaskSummaryTool(item as ToolCallItem) ? (
         <TaskSummaryCard item={item as ToolCallItem} />

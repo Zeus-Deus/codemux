@@ -19,11 +19,18 @@ import type { ReasoningItem } from "@/lib/agent-chat/types";
  * The body remains plain italic prose (thinking traces are not trusted
  * markdown and we don't want a shiki/markdown pass on a hot streaming row);
  * inline `code`-fenced spans are left verbatim.
+ *
+ * `live` decides whether this row owns the animated orb. It defaults to the
+ * item's own `streaming` flag, which is right in the main transcript; the
+ * subagent drill-in passes `false` because its live tail already animates the
+ * run's single orb (one-orb doctrine — see `lib/agent-chat/orb-activity.ts`).
  */
 export const ReasoningBlock = memo(function ReasoningBlock({
   item,
+  live = item.streaming,
 }: {
   item: ReasoningItem;
+  live?: boolean;
 }) {
   // Auto-open while streaming; auto-collapse once (when streaming ends)
   // unless the reader has taken manual control.
@@ -52,7 +59,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
       >
         <span className="flex size-5 shrink-0 items-center justify-center">
-          {item.streaming ? (
+          {live ? (
             <AgentOrb size={20} aria-hidden />
           ) : (
             <Lightbulb
