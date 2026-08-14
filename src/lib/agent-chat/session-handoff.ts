@@ -24,6 +24,11 @@ export function metadataFromSessionContext(
     fullHistoryAvailable: context.full_history_available,
     fetchedAt: Date.now(),
     isLoading: false,
+    // A successful read supersedes any earlier failure. Without this the
+    // `...previous` spread would keep a stale `error` on a chip that has since
+    // resolved, so the chip would render the failure indicator for content
+    // that is about to be sent.
+    error: undefined,
   };
 }
 

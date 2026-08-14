@@ -1356,14 +1356,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? undefined
           : useAgentChatStore.getState().threads[threadId];
         const staleList = (preStale?.stagedAttachments ?? []).filter((a) => {
-            // A source conversation may still be active in another tab, so
-            // always rematerialise its handoff immediately before send. This
-            // also closes the pick-then-immediate-Enter race: the submit waits
-            // for its own authoritative read instead of silently omitting a
-            // chip whose attach-time read is still in flight.
-            if (a.kind === "session") return true;
+          // A source conversation may still be active in another tab, so
+          // always rematerialise its handoff immediately before send. This
+          // also closes the pick-then-immediate-Enter race: the submit waits
+          // for its own authoritative read instead of silently omitting a
+          // chip whose attach-time read is still in flight.
+          if (a.kind === "session") return true;
           if (a.metadata.isLoading) return false;
-            if (a.kind !== "issue" && a.kind !== "pr") return false;
+          if (a.kind !== "issue" && a.kind !== "pr") return false;
           const fetchedAt = a.metadata.fetchedAt ?? 0;
           return Date.now() - fetchedAt > STALE_ATTACHMENT_THRESHOLD_MS;
         });
@@ -1372,21 +1372,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           await Promise.all(
             staleList.map(async (att) => {
               try {
-                  if (att.kind === "session") {
-                    if (!paneWorkspaceId) return;
-                    const context = await agentChatGetSessionContext(
-                      paneWorkspaceId,
-                      att.ref,
-                      utilitySelectionFromStores(),
-                    );
-                    updateStagedAttachment(threadId, att.id, {
-                      resolvedContent: context.content,
-                      metadata: metadataFromSessionContext(
-                        context,
-                        att.metadata,
-                      ),
-                    });
-                  } else if (att.kind === "issue") {
+                if (att.kind === "session") {
+                  if (!paneWorkspaceId) return;
+                  const context = await agentChatGetSessionContext(
+                    paneWorkspaceId,
+                    att.ref,
+                    utilitySelectionFromStores(),
+                  );
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: context.content,
+                    metadata: metadataFromSessionContext(context, att.metadata),
+                  });
+                } else if (att.kind === "issue") {
                   const num = Number.parseInt(att.ref.replace(/^#/, ""), 10);
                   if (!Number.isFinite(num)) return;
                   const detail = await getGithubIssueByPath(repoPath, num);
@@ -1410,8 +1407,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                     getGithubPrDiffByPath(repoPath, num, fullDiff),
                   ]);
                   const detailUpper = detail.state.toUpperCase();
-                    const resolvedState:
-                      "open" | "closed" | "merged" | "draft" =
+                  const resolvedState: "open" | "closed" | "merged" | "draft" =
                     detailUpper === "MERGED"
                       ? "merged"
                       : detailUpper === "CLOSED"
@@ -1436,6 +1432,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                   `[agent-chat] stale re-fetch failed for ${att.ref}`,
                   err,
                 );
+                // GitHub chips fail open (see above), but a conversation
+                // handoff fails closed exactly like the draft surface: the
+                // read only fails when the source conversation is gone or out
+                // of this workspace's scope, so shipping the previously
+                // resolved transcript would hand the agent a stale — possibly
+                // cross-workspace — history. Clearing the content trips the
+                // unresolved-handoff guard below with an actionable toast.
+                if (att.kind === "session") {
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: "",
+                    metadata: {
+                      ...att.metadata,
+                      isLoading: false,
+                      error: String(err),
+                    },
+                  });
+                }
               }
             }),
           );
@@ -1464,27 +1477,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // A Continue send never carries attachments or images: it leaves the
       // user's staged chips intact for their real next message and sends plain
       // "Continue". An empty list makes every downstream builder a no-op.
-        const liveAttachments = isContinue
-          ? []
-          : (liveSlice?.stagedAttachments ?? []);
-        const activeLiveAttachments = activeAttachments(
-          rawText,
-          liveAttachments,
-        );
-        const unavailableSession = activeLiveAttachments.find(
-          (attachment) =>
-            attachment.kind === "session" &&
-            !attachment.resolvedContent?.trim(),
+      const liveAttachments = isContinue
+        ? []
+        : (liveSlice?.stagedAttachments ?? []);
+      const activeLiveAttachments = activeAttachments(rawText, liveAttachments);
+      const unavailableSession = activeLiveAttachments.find(
+        (attachment) =>
+          attachment.kind === "session" && !attachment.resolvedContent?.trim(),
       );
-        if (unavailableSession) {
-          toast.error("Conversation handoff could not be loaded", {
-            description: `Remove ${unavailableSession.metadata.label} or try again.`,
-          });
-          sendInFlightRef.current = false;
-          setIsSending(false);
-          return;
-        }
-        const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
+      if (unavailableSession) {
+        toast.error("Conversation handoff could not be loaded", {
+          description: `Remove ${unavailableSession.metadata.label} or try again.`,
+        });
+        sendInFlightRef.current = false;
+        setIsSending(false);
+        return;
+      }
+      const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
       // Images travel as native multimodal content blocks at the SDK
       // layer, NOT inside the text body. They were staged to disk at
       // attach time (`agent_chat_stage_image`), so the turn carries only
@@ -1617,8 +1626,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     updateStagedAttachment,
     requestSendAnchor,
     clearSendAnchor,
-      paneWorkspaceId,
-    ],
+    paneWorkspaceId,
+  ],
   );
 
   /** One-click "Continue run" (issue #154): resume an interrupted run by
