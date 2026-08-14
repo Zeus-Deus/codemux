@@ -13,6 +13,7 @@ LATEST_RELEASE_URL="${CODEMUX_DEPLOY_LATEST_URL:-https://github.com/Zeus-Deus/co
 DOWNLOAD_BASE_URL="${CODEMUX_DEPLOY_DOWNLOAD_BASE_URL:-https://github.com/Zeus-Deus/codemux/releases/download}"
 PUBLIC_URL="${CODEMUX_DEPLOY_PUBLIC_URL:-https://app.codemux.org}"
 API_HEALTH_URL="${CODEMUX_DEPLOY_API_HEALTH_URL:-https://api.codemux.org/health}"
+BACKUP_KEEP="${CODEMUX_DEPLOY_BACKUP_KEEP:-5}"
 DRY_RUN=false
 REQUESTED_TAG="${CODEMUX_DEPLOY_RELEASE_TAG:-}"
 
@@ -44,6 +45,8 @@ case "$APP_DIR" in
 esac
 [ "$APP_DIR" != "/" ] || { echo "ERROR: refusing to use / as the app directory" >&2; exit 1; }
 [ -d "$HTML_DIR" ] || { echo "ERROR: hosted client directory not found: $HTML_DIR" >&2; exit 1; }
+[[ "$BACKUP_KEEP" =~ ^[1-9][0-9]*$ ]] ||
+  { echo "ERROR: backup retention must be a positive integer: $BACKUP_KEEP" >&2; exit 1; }
 
 log() {
   local line
@@ -92,9 +95,7 @@ trap cleanup EXIT
 
 if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
   "$release_url/$archive" -o "$work_dir/$archive" 2>/dev/null; then
-  if $DRY_RUN; then
-    log "hosted client asset is not available for $tag yet"
-  fi
+  log "hosted client asset is not available for $tag yet"
   exit 0
 fi
 if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 \
@@ -178,6 +179,14 @@ backup="$BACKUP_DIR/html-before-${tag}-${timestamp}.tar.gz"
 backup_tmp="$backup.tmp"
 tar -C "$APP_DIR" -czf "$backup_tmp" html
 mv -f "$backup_tmp" "$backup"
+
+# Keep only the most recent backups; a repeatedly failing deploy would
+# otherwise write a full copy of the tree on every poll.
+while IFS= read -r stale_backup; do
+  case "$stale_backup" in
+    "$BACKUP_DIR"/html-before-*.tar.gz) rm -f -- "$stale_backup" ;;
+  esac
+done < <(ls -1t "$BACKUP_DIR"/html-before-*.tar.gz 2>/dev/null | tail -n "+$((BACKUP_KEEP + 1))")
 
 # Copy immutable/versioned files first and retain previous generations. The
 # entry point is promoted last with a same-filesystem rename, so a page load

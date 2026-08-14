@@ -32,6 +32,7 @@ run_deploy() {
   CODEMUX_DEPLOY_APP_DIR="$APP_DIR" \
   CODEMUX_DEPLOY_DOWNLOAD_BASE_URL="file://$RELEASES_DIR" \
   CODEMUX_DEPLOY_SKIP_LIVE_CHECKS=1 \
+  CODEMUX_DEPLOY_BACKUP_KEEP="${DEPLOY_BACKUP_KEEP:-5}" \
     "$DEPLOY_SCRIPT" --tag "$1"
 }
 
@@ -58,5 +59,19 @@ if run_deploy v1.2.4; then
 fi
 test "$(sed -n '1p' "$APP_DIR/deployed-release")" = "v1.2.3"
 grep -q 'assets/app.js' "$APP_DIR/html/index.html"
+
+# A release without a hosted client asset must say so instead of exiting quietly.
+mkdir -p "$RELEASES_DIR/v1.2.5"
+run_deploy v1.2.5
+grep -q 'hosted client asset is not available for v1.2.5' "$APP_DIR/deploy.log"
+test "$(sed -n '1p' "$APP_DIR/deployed-release")" = "v1.2.3"
+
+# Backups are pruned to the retention limit.
+make_release v1.2.6
+make_release v1.2.7
+DEPLOY_BACKUP_KEEP=2 run_deploy v1.2.6
+DEPLOY_BACKUP_KEEP=2 run_deploy v1.2.7
+test "$(find "$APP_DIR/backups" -type f -name 'html-before-*.tar.gz' | wc -l)" -eq 2
+test "$(find "$APP_DIR/backups" -type f -name 'html-before-v1.2.3-*.tar.gz' | wc -l)" -eq 0
 
 echo "deploy-app-codemux tests passed"
