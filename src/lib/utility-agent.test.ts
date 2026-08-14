@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   resolveAutoUtilitySelection,
+  utilityEffortFor,
   utilitySelectionFromStores,
 } from "./utility-agent";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
@@ -141,5 +142,26 @@ describe("Utility agent selection", () => {
       },
     });
     expect(utilitySelectionFromStores()).toBeNull();
+  });
+
+  it("pins Codex Luna to low effort and leaves other models on their default", () => {
+    const luna = model("gpt-5.6-luna", {
+      effort_levels: ["low", "medium"],
+      default_effort: "medium",
+    });
+    expect(utilityEffortFor("codex", luna.id, luna)).toBe("low");
+    const sol = model("gpt-5.6-sol", {
+      effort_levels: ["medium", "high"],
+      default_effort: "medium",
+    });
+    expect(utilityEffortFor("codex", sol.id, sol)).toBe("medium");
+    // A Luna variant without a low tier keeps whatever the provider defaults
+    // to rather than sending an effort the CLI would reject.
+    const lunaNoLow = model("gpt-5.6-luna-x", {
+      effort_levels: ["medium"],
+      default_effort: "medium",
+    });
+    expect(utilityEffortFor("codex", lunaNoLow.id, lunaNoLow)).toBe("medium");
+    expect(utilityEffortFor("claude", "claude-haiku-4-5", null)).toBeNull();
   });
 });

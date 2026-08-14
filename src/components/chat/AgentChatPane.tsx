@@ -3,6 +3,7 @@ import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
+import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import {
   planCapabilityCompatReset,
@@ -49,10 +50,7 @@ import { findSubagentView, subagentOrdinal } from "@/lib/agent-chat/subagents";
 import { taskChipSummary } from "@/lib/agent-chat/task-summary";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
-import {
-  sessionMentionTitle,
-  sessionMentionToken,
-} from "@/lib/agent-chat/session-mentions";
+import { ATTACHMENT_HARD_LIMIT } from "@/lib/agent-chat/attachment-limits";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
@@ -102,7 +100,6 @@ import {
   readFileForAttachment,
   readFolderForAttachment,
   type AgentChatSessionConfigUpdate,
-  type AgentChatSessionMention,
   type AgentChatSessionRecord,
   type AgentChatTurnCheckpointRecord,
 } from "@/tauri/commands";
@@ -167,13 +164,6 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   opencode: "OpenCode",
 };
 
-/** Step 8 Stage 7 — hard cap on staged attachments. Above this we
- *  toast and reject the next attach so prompts can't silently grow
- *  into a token-budget cliff. The matching soft-warning copy lives
- *  in Composer.tsx (rendering concern); this constant gates the
- *  attach handlers. */
-const ATTACHMENT_HARD_LIMIT = 20;
-const SESSION_ATTACHMENT_LIMIT = 3;
 /** Step 8 Stage 7 — issue/PR fetches go stale at this age. On send,
  *  we re-fetch any GitHub-kind attachment whose `fetchedAt` is older
  *  so the agent always sees fresh detail (state flips, new comments)
@@ -1897,102 +1887,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, cwd, addStagedAttachment, updateStagedAttachment],
   );
 
-  /** Attach a persisted GUI conversation as a provider-neutral handoff. The
-   *  source thread id is the durable reference; its title is presentation
-   *  only, so renaming a chat cannot break an already-staged mention. */
-  const handleAttachSession = useCallback(
-    (session: AgentChatSessionMention) => {
-      if (!threadId || !paneWorkspaceId) return;
-      const liveAttachments =
-        useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? [];
-      if (
-        liveAttachments.some(
-          (attachment) =>
-            attachment.kind === "session" &&
-            attachment.ref === session.thread_id,
-        )
-      ) {
-        return;
-      }
-      if (
-        liveAttachments.filter((attachment) => attachment.kind === "session")
-          .length >= SESSION_ATTACHMENT_LIMIT
-      ) {
-        toast.error("Conversation handoff limit reached", {
-          description: `Attach up to ${SESSION_ATTACHMENT_LIMIT} conversations per message.`,
-        });
-        return;
-      }
-      if (liveAttachments.length >= ATTACHMENT_HARD_LIMIT) {
-        toast.error("Attachment limit reached", {
-          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
-        });
-        return;
-      }
-
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const label = sessionMentionTitle(session);
-      addStagedAttachment(threadId, {
-        id,
-        kind: "session",
-        ref: session.thread_id,
-        metadata: {
-          label,
-          mentionToken: sessionMentionToken(session),
-          sourceProvider: session.provider,
-          sourceCwd: session.cwd,
-          sourceUpdatedAt: session.last_active_at,
-          messageCount: session.message_count,
-          isLoading: true,
-        },
-      });
-      void agentChatGetSessionContext(
-        paneWorkspaceId,
-        session.thread_id,
-        utilitySelectionFromStores(),
-      )
-        .then((context) => {
-          updateStagedAttachment(threadId, id, {
-            resolvedContent: context.content,
-            metadata: metadataFromSessionContext(context, {
-              label,
-              mentionToken: sessionMentionToken(session),
-            }),
-          });
-          if (
-            context.summary_error === "utility_model_required" ||
-            context.summary_error === "utility_agent_unavailable"
-          ) {
-            toast.warning("Direct transcript attached", {
-              description:
-                "Choose or change the Utility agent to generate clean handoff summaries.",
-              action: {
-                label: "Choose agent",
-                onClick: () =>
-                  useUIStore.getState().setShowSettings(true, "agent"),
-              },
-            });
-          }
-        })
-        .catch((error) => {
-          updateStagedAttachment(threadId, id, {
-            metadata: {
-              label,
-              mentionToken: sessionMentionToken(session),
-              sourceProvider: session.provider,
-              sourceCwd: session.cwd,
-              sourceUpdatedAt: session.last_active_at,
-              messageCount: session.message_count,
-              isLoading: false,
-              error: String(error),
-            },
-          });
-        });
-    },
-    [threadId, paneWorkspaceId, addStagedAttachment, updateStagedAttachment],
+  const handleAttachSession = useAttachSessionHandoff(
+    threadId,
+    paneWorkspaceId,
   );
 
   /** Step 8 Stage 7 — flip the `expandFullDiff` flag on a staged PR

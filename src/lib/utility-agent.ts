@@ -4,7 +4,7 @@ import {
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type { AgentChatProviderKind, ChatModelInfo } from "@/tauri/types";
 import type { UtilityModelSelection } from "@/tauri/commands";
 
 export const UTILITY_SETTING_KEYS = {
@@ -15,6 +15,21 @@ export const UTILITY_SETTING_KEYS = {
 } as const;
 
 export type UtilityAgentMode = "auto" | "custom";
+
+/** Effort a utility pass should run at. Codex's Luna tier defaults to a
+ *  reasoning level that costs more than the summarisation is worth, so the
+ *  utility path pins it to `low` wherever that is offered; every other model
+ *  keeps the provider's own default. */
+export function utilityEffortFor(
+  provider: AgentChatProviderKind,
+  modelId: string,
+  model: ChatModelInfo | null | undefined,
+): string | null {
+  if (provider === "codex" && /luna/i.test(modelId)) {
+    if (!model || model.effort_levels.includes("low")) return "low";
+  }
+  return model?.default_effort ?? null;
+}
 
 function preferredModel(
   provider: AgentChatProviderKind,
@@ -31,9 +46,7 @@ function preferredModel(
       ? {
           provider,
           model: model.id,
-          effort: model.effort_levels.includes("low")
-            ? "low"
-            : model.default_effort,
+          effort: utilityEffortFor(provider, model.id, model),
         }
       : null;
   }

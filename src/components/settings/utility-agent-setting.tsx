@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/select";
 import {
   resolveAutoUtilitySelection,
+  utilityEffortFor,
   UTILITY_SETTING_KEYS,
   type UtilityAgentMode,
 } from "@/lib/utility-agent";
@@ -50,11 +51,10 @@ export function UtilityAgentSetting() {
     if (next === "custom" && customModel) {
       setSetting(UTILITY_SETTING_KEYS.provider, customProvider);
       setSetting(UTILITY_SETTING_KEYS.model, customModel);
-      const defaultEffort =
-        customProvider === "codex" && /luna/i.test(customModel)
-          ? "low"
-          : selectedModel?.default_effort;
-      setSetting(UTILITY_SETTING_KEYS.effort, defaultEffort ?? "");
+      setSetting(
+        UTILITY_SETTING_KEYS.effort,
+        utilityEffortFor(customProvider, customModel, selectedModel) ?? "",
+      );
     }
   };
 
@@ -114,9 +114,7 @@ export function UtilityAgentSetting() {
               setSetting(UTILITY_SETTING_KEYS.model, model);
               setSetting(
                 UTILITY_SETTING_KEYS.effort,
-                provider === "codex" && /luna/i.test(model)
-                  ? "low"
-                  : (picked?.default_effort ?? ""),
+                utilityEffortFor(provider, model, picked) ?? "",
               );
             }}
           />
