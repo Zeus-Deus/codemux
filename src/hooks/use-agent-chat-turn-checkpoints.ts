@@ -64,7 +64,12 @@ export function useAgentChatTurnCheckpoints(
   );
 
   useEffect(() => {
-    setCheckpoints([]);
+    // Reset only when there is something to clear. A fresh `[]` literal is a
+    // new reference, so an unconditional write would force an extra render of
+    // the whole pane on every mount — wasted work, and enough to clobber
+    // one-shot render-time signals the pane consumes in its own mount effects
+    // (e.g. the promoted-draft composer focus handoff).
+    setCheckpoints((current) => (current.length === 0 ? current : []));
     sawLiveUpdate.current = false;
     if (threadId == null) return;
     let cancelled = false;
