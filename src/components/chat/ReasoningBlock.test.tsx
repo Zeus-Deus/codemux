@@ -22,8 +22,11 @@ function reasoning(overrides: Partial<ReasoningItem> = {}): ReasoningItem {
 
 describe("ReasoningBlock", () => {
   it("shows a shimmering 'Thinking…' header and streams the body while streaming", () => {
-    render(<ReasoningBlock item={reasoning({ streaming: true })} />);
+    const { container } = render(
+      <ReasoningBlock item={reasoning({ streaming: true })} />,
+    );
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    expect(container.querySelector("[data-orb-state]")).toBeInTheDocument();
     // Auto-open while streaming → the body text is visible.
     expect(
       screen.getByText(/Line numbers rarely survive/),
@@ -31,8 +34,12 @@ describe("ReasoningBlock", () => {
   });
 
   it("shows 'Thought for Ns' once sealed and collapses the body by default", () => {
-    render(<ReasoningBlock item={reasoning({ duration_ms: 6000 })} />);
+    const { container } = render(
+      <ReasoningBlock item={reasoning({ duration_ms: 6000 })} />,
+    );
     expect(screen.getByText("Thought for 6s")).toBeInTheDocument();
+    // Settled thoughts keep their recognizable lightbulb, not a live orb.
+    expect(container.querySelector("[data-orb-state]")).toBeNull();
     // Collapsed by default once sealed.
     expect(screen.queryByText(/Line numbers rarely survive/)).toBeNull();
     // Toggling reveals the body.
