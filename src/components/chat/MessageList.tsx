@@ -36,6 +36,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
@@ -148,6 +149,9 @@ interface Props {
   /** Follow-up queueing: send a queued user turn now (steer) —
    *  soft-interrupts the active turn and dispatches it immediately. */
   onSendQueuedNow?: (queuedId: string) => void;
+  turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
+  onRevertTurn?: (turnIndex: number) => void;
+  revertingTurnIndex?: number | null;
   /** Enter a subagent's read-only drill-in (design "Enter subagent").
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
@@ -196,6 +200,9 @@ export const MessageList = memo(function MessageList({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  turnCheckpointByNonce,
+  onRevertTurn,
+  revertingTurnIndex,
   workspaceId,
   cwd,
 }: Props) {
@@ -1084,6 +1091,9 @@ export const MessageList = memo(function MessageList({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
+          turnCheckpointByNonce={turnCheckpointByNonce}
+          onRevertTurn={onRevertTurn}
+          revertingTurnIndex={revertingTurnIndex}
           onToggleTurnFold={toggleTurnFold}
         />
       </div>
@@ -1094,9 +1104,12 @@ export const MessageList = memo(function MessageList({
       onRejectPlan,
       onRespondToRequest,
       onSendQueuedNow,
+      onRevertTurn,
       requestsById,
+      revertingTurnIndex,
       subagentNames,
       toggleTurnFold,
+      turnCheckpointByNonce,
       workspaceId,
       cwd,
     ],
@@ -1424,6 +1437,9 @@ function ItemRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  turnCheckpointByNonce,
+  onRevertTurn,
+  revertingTurnIndex,
   workspaceId,
   cwd,
 }: {
@@ -1435,6 +1451,9 @@ function ItemRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
+  onRevertTurn?: (turnIndex: number) => void;
+  revertingTurnIndex?: number | null;
   workspaceId?: string | null;
   cwd?: string | null;
 }) {
@@ -1460,11 +1479,20 @@ function ItemRow({
   }, [item, onRejectPlan]);
 
   if (item.kind === "user_message") {
+    const checkpoint = item.clientNonce
+      ? turnCheckpointByNonce?.get(item.clientNonce)
+      : undefined;
     return (
       <UserMessage
         item={item}
         onCancelQueued={onCancelQueued}
         onSendQueuedNow={onSendQueuedNow}
+        onRevert={
+          checkpoint && onRevertTurn
+            ? () => onRevertTurn(checkpoint.turn_index)
+            : undefined
+        }
+        reverting={checkpoint?.turn_index === revertingTurnIndex}
       />
     );
   }
@@ -1684,6 +1712,9 @@ function SlotRow({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  turnCheckpointByNonce,
+  onRevertTurn,
+  revertingTurnIndex,
   onToggleTurnFold,
 }: {
   slot: TranscriptSlot;
@@ -1696,6 +1727,9 @@ function SlotRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
+  onRevertTurn?: (turnIndex: number) => void;
+  revertingTurnIndex?: number | null;
   onToggleTurnFold: (turnId: string) => void;
 }) {
   const marginClass =
@@ -1743,6 +1777,9 @@ function SlotRow({
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
           onSendQueuedNow={onSendQueuedNow}
+          turnCheckpointByNonce={turnCheckpointByNonce}
+          onRevertTurn={onRevertTurn}
+          revertingTurnIndex={revertingTurnIndex}
           workspaceId={workspaceId}
           cwd={cwd}
         />

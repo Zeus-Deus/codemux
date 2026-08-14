@@ -164,6 +164,8 @@ impl AgentProvider for ClaudeAgentProvider {
             supports_synchronous_tool_approval: true,
             supports_interrupt: true,
             supports_session_resume: true,
+            // Truncating the adapter's local cursor is not an upstream rewind.
+            supports_conversation_rollback: false,
         }
     }
 

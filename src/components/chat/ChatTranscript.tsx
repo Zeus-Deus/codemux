@@ -4,6 +4,7 @@ import { shouldShowThinkingIndicator } from "@/lib/agent-chat/thinking";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { MessageList } from "./MessageList";
 import type { SendAnchorRequest } from "./send-scroll-state";
@@ -55,6 +56,10 @@ interface Props {
   /** Follow-up queueing: send a queued turn now (steer) — soft-interrupts
    *  the active turn and dispatches this message immediately. */
   onSendQueuedNow?: (queuedId: string) => void;
+  /** Committed checkpoint keyed by the user bubble's client nonce. */
+  turnCheckpointByNonce?: ReadonlyMap<string, AgentChatTurnCheckpointRecord>;
+  onRevertTurn?: (turnIndex: number) => void;
+  revertingTurnIndex?: number | null;
   /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
   onEnterSubagent?: (subagentId: string) => void;
   /** Forwarded to MessageList for the WorkflowRunCard "Open panel"
@@ -93,6 +98,9 @@ export const ChatTranscript = memo(function ChatTranscript({
   onRejectPlan,
   onCancelQueued,
   onSendQueuedNow,
+  turnCheckpointByNonce,
+  onRevertTurn,
+  revertingTurnIndex,
   onEnterSubagent,
   workspaceId,
   cwd,
@@ -123,6 +131,9 @@ export const ChatTranscript = memo(function ChatTranscript({
         onRejectPlan={onRejectPlan}
         onCancelQueued={onCancelQueued}
         onSendQueuedNow={onSendQueuedNow}
+        turnCheckpointByNonce={turnCheckpointByNonce}
+        onRevertTurn={onRevertTurn}
+        revertingTurnIndex={revertingTurnIndex}
         onEnterSubagent={onEnterSubagent}
         workspaceId={workspaceId}
         cwd={cwd}

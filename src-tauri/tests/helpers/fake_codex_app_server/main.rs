@@ -36,6 +36,8 @@
 //!   while reporting that the active provider requires OpenAI auth.
 //! * `FAKE_CODEX_CAPTURE_TURN` — write the latest `turn/start` params JSON
 //!   to this path so adapter tests can assert the exact wire contract.
+//! * `FAKE_CODEX_CAPTURE_ROLLBACK` — write the latest `thread/rollback`
+//!   params JSON to this path.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -161,6 +163,7 @@ fn main() {
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
     let unauthenticated = env_truthy("FAKE_CODEX_UNAUTHENTICATED");
     let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
+    let capture_rollback = std::env::var("FAKE_CODEX_CAPTURE_ROLLBACK").ok();
 
     let pending_server_requests: Arc<Mutex<HashMap<String, Value>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -318,6 +321,13 @@ fn main() {
                 }
             }
             "thread/rollback" => {
+                if let Some(path) = capture_rollback.as_deref() {
+                    std::fs::write(
+                        path,
+                        serde_json::to_vec(&msg.params).expect("capture rollback params"),
+                    )
+                    .expect("write captured thread/rollback params");
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc":"2.0",

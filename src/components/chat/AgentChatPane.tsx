@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
+import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
+import { useTauriEvent } from "@/hooks/use-tauri-event";
 import {
   planCapabilityCompatReset,
   planEffortChange,
@@ -80,7 +82,9 @@ import {
   agentChatSendQueuedTurnNow,
   agentChatGetSession,
   agentChatInterruptTurn,
+  agentChatListMessagesAfter,
   agentChatListSessions,
+  agentChatRevertTurnCheckpoint,
   agentChatRespondToRequest,
   agentChatSendTurn,
   agentChatSetModel,
@@ -98,11 +102,17 @@ import {
   readFolderForAttachment,
   type AgentChatSessionConfigUpdate,
   type AgentChatSessionRecord,
+  type AgentChatTurnCheckpointRecord,
 } from "@/tauri/commands";
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
-import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
+import {
+  onAgentChatTurnCheckpointReverted,
+  type AgentChatEventPayload,
+  type AgentChatTurnCheckpointRevertedPayload,
+  type ApprovalDecision,
+} from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   FileMatch,
@@ -130,6 +140,7 @@ import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { RevertTurnDialog } from "./revert-turn-dialog";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
 // passes the pane snapshot verbatim; nothing else imports this type.
@@ -207,6 +218,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const clearConversationSearchJump = useConversationSearchStore(
     (state) => state.clearHandled,
+  );
+  const turnCheckpoints = useAgentChatTurnCheckpoints(threadId);
+  const turnCheckpointByNonce = useMemo(() => {
+    const byNonce = new Map<string, AgentChatTurnCheckpointRecord>();
+    for (const checkpoint of turnCheckpoints) {
+      if (checkpoint.client_nonce) {
+        byNonce.set(checkpoint.client_nonce, checkpoint);
+      }
+    }
+    return byNonce;
+  }, [turnCheckpoints]);
+  const [revertTarget, setRevertTarget] =
+    useState<AgentChatTurnCheckpointRecord | null>(null);
+  const [revertingTurnIndex, setRevertingTurnIndex] = useState<number | null>(
+    null,
   );
   // Session-created timestamp for the transcript's top-of-thread marker
   // (design D2). Resolved from the persisted sessions list, keyed by the
@@ -685,6 +711,83 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Combined live signal, so the optimistic window between Enter and the
   // backend's first `Running` reads as streaming in the transcript.
   const transcriptStreaming = streaming || isSending;
+  const lastRevertRefreshRef = useRef<{
+    key: string;
+    promise: Promise<void>;
+  } | null>(null);
+  const refreshAfterTurnRevert = useCallback(
+    (payload: AgentChatTurnCheckpointRevertedPayload): Promise<void> => {
+      const key = `${payload.thread_id}:${payload.turn_index}:${payload.transcript_cutoff_id}`;
+      if (lastRevertRefreshRef.current?.key === key) {
+        return lastRevertRefreshRef.current.promise;
+      }
+      const promise = (async () => {
+        flushAgentChatEvents(payload.thread_id);
+        const rows = await agentChatListMessagesAfter(payload.thread_id, null);
+        useAgentChatStore.getState().hydrateThread(payload.thread_id, rows, {
+          runLive: false,
+          provider,
+        });
+        setSendAnchor(null);
+        sendAnchorPositionedNonceRef.current = null;
+      })();
+      lastRevertRefreshRef.current = { key, promise };
+      return promise;
+    },
+    [provider],
+  );
+  useTauriEvent<AgentChatTurnCheckpointRevertedPayload>(
+    onAgentChatTurnCheckpointReverted,
+    (payload) => {
+      if (payload.thread_id !== threadId) return;
+      void refreshAfterTurnRevert(payload).catch((error) => {
+        console.warn("[agent-chat] failed to refresh reverted transcript:", error);
+      });
+    },
+    [threadId, refreshAfterTurnRevert],
+  );
+  const handleRequestTurnRevert = useCallback(
+    (turnIndex: number) => {
+      if (transcriptStreaming) {
+        toast.warning("Finish or interrupt the active turn before reverting.");
+        return;
+      }
+      const checkpoint = turnCheckpoints.find(
+        (record) => record.turn_index === turnIndex,
+      );
+      if (checkpoint) setRevertTarget(checkpoint);
+    },
+    [transcriptStreaming, turnCheckpoints],
+  );
+  const handleConfirmTurnRevert = useCallback(async () => {
+    if (!threadId || !revertTarget || revertingTurnIndex !== null) return;
+    setRevertingTurnIndex(revertTarget.turn_index);
+    try {
+      await agentChatRevertTurnCheckpoint(threadId, revertTarget.turn_index);
+      await refreshAfterTurnRevert({
+        thread_id: threadId,
+        turn_index: revertTarget.turn_index,
+        transcript_cutoff_id: revertTarget.transcript_cutoff_id,
+        remaining_checkpoints: turnCheckpoints.filter(
+          (checkpoint) => checkpoint.turn_index < revertTarget.turn_index,
+        ),
+      });
+      setRevertTarget(null);
+      toast.success("Turn reverted", {
+        description: "Workspace and Codex conversation restored.",
+      });
+    } catch (error) {
+      toast.error("Could not revert turn", { description: String(error) });
+    } finally {
+      setRevertingTurnIndex(null);
+    }
+  }, [
+    refreshAfterTurnRevert,
+    revertTarget,
+    revertingTurnIndex,
+    threadId,
+    turnCheckpoints,
+  ]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -3083,6 +3186,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onRejectPlan={handleRejectPlan}
               onCancelQueued={handleCancelQueued}
               onSendQueuedNow={handleSendQueuedNow}
+              turnCheckpointByNonce={turnCheckpointByNonce}
+              onRevertTurn={handleRequestTurnRevert}
+              revertingTurnIndex={revertingTurnIndex}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
               cwd={cwd}
@@ -3118,6 +3224,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       <DebugExitDialog
         open={debugExitDialog !== null}
         onChoose={(choice) => debugExitDialog?.resolve(choice)}
+      />
+      <RevertTurnDialog
+        checkpoint={revertTarget}
+        reverting={revertingTurnIndex !== null}
+        onOpenChange={(open) => {
+          if (!open) setRevertTarget(null);
+        }}
+        onConfirm={() => void handleConfirmTurnRevert()}
       />
     </div>
   );

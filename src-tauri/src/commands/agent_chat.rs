@@ -27,11 +27,11 @@ use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
     ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
     SerializableProviderError, StartSessionInput, SubagentTaskKind, ThreadId, TurnId,
-    UserMessageImage,
+    TurnDispatchCheckpoint, UserMessageImage,
 };
 use crate::database::{
     AgentChatCheckpointRecord, AgentChatSearchResult, AgentChatSessionConfig,
-    AgentChatSessionRecord, DatabaseStore,
+    AgentChatSessionRecord, AgentChatTurnCheckpointRecord, DatabaseStore,
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::observability::ObservabilityStore;
@@ -718,14 +718,9 @@ pub async fn agent_chat_start_session<R: Runtime>(
         {
             eprintln!("[codemux::agent_chat] failed to persist session config: {error}");
         }
-        // Issue #80 — optional rollback checkpoint. Spawned AFTER the
-        // provider session is up and the session row is persisted, so
-        // not a single git operation (or even the settings-cache read)
-        // sits on the latency-to-first-token path. The opt-in gate is
-        // evaluated inside the task.
-        if let Some(cwd) = cwd_for_persist.clone() {
-            spawn_run_checkpoint(&app, session.thread_id.0.clone(), workspace_id.clone(), cwd);
-        }
+        // Checkpoints are captured at each provider's real dispatch boundary,
+        // not at session start. That keeps queued prompts aligned with both
+        // the workspace and the provider's accepted-turn history.
     }
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
@@ -750,13 +745,11 @@ pub struct AgentChatCheckpointEventPayload {
     pub checkpoint: AgentChatCheckpointRecord,
 }
 
-/// Whether the user opted into run-start checkpoints. Reads the synced
-/// settings cache (same pattern as session-restore in
+/// Whether the user opted into per-turn true-revert checkpoints. Reads the
+/// synced settings cache (same pattern as session-restore in
 /// `terminal/mod.rs`); default is OFF.
 pub fn run_checkpoints_enabled() -> bool {
-    crate::settings_sync::load_cache()
-        .map(|s| s.agent_chat.checkpoints_enabled)
-        .unwrap_or(false)
+    crate::settings_sync::agent_chat_checkpoints_enabled()
 }
 
 /// Synchronous core of the background checkpoint: snapshot the repo at
@@ -793,6 +786,7 @@ pub fn create_run_checkpoint_blocking(
     for namespace in [
         crate::git::CHECKPOINT_REF_PREFIX,
         crate::git::PRE_RESTORE_REF_PREFIX,
+        crate::git::PRE_RESTORE_FAILED_REF_PREFIX,
     ] {
         match crate::git::git_checkpoint_prune(
             repo_path,
@@ -831,27 +825,9 @@ pub fn restore_run_checkpoint_blocking(db: &DatabaseStore, thread_id: &str) -> R
     )
 }
 
-/// Fire-and-forget background checkpoint for a freshly started run.
-///
-/// The whole body — including the settings-cache read that decides
-/// whether the feature is even on — runs off the command path:
-/// `tauri::async_runtime::spawn` returns immediately and the git work
-/// happens on the blocking pool. Failures are logged, never surfaced:
-/// a checkpoint must not break (or slow) the chat it protects.
-fn spawn_run_checkpoint<R: Runtime>(
-    app: &AppHandle<R>,
-    thread_id: String,
-    workspace_id: String,
-    cwd: String,
-) {
-    spawn_run_checkpoint_with_gate(app, thread_id, workspace_id, cwd, run_checkpoints_enabled);
-}
-
-/// [`spawn_run_checkpoint`] with the opt-in gate injected. Public (and
-/// generic over the runtime) so integration tests can drive the REAL
-/// background path — spawn, blocking pool, DB write through managed
-/// state, event emission — on a `tauri::test::mock_app` without
-/// touching the user's settings cache.
+/// Legacy run-start checkpoint helper with the opt-in gate injected. Kept
+/// public for migration/backward-compatibility tests; new sessions use the
+/// per-turn dispatch checkpoints below.
 pub fn spawn_run_checkpoint_with_gate<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: String,
@@ -933,6 +909,560 @@ pub async fn agent_chat_restore_checkpoint<R: Runtime>(
     })
     .await
     .map_err(|e| format!("agent_chat_restore_checkpoint task join failed: {e}"))?
+}
+
+// ── Per-turn checkpoints with provider conversation rollback ────────
+
+pub const AGENT_CHAT_TURN_CHECKPOINT_EVENT: &str = "agent_chat_turn_checkpoint";
+pub const AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT: &str =
+    "agent_chat_turn_checkpoint_reverted";
+pub const AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT: &str =
+    "agent_chat_turn_checkpoints_invalidated";
+const TURN_CHECKPOINT_KEEP_PER_THREAD: usize = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatTurnCheckpointEventPayload {
+    pub thread_id: ThreadId,
+    pub checkpoint: AgentChatTurnCheckpointRecord,
+    pub oldest_turn_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatTurnCheckpointRevertedEventPayload {
+    pub thread_id: ThreadId,
+    pub turn_index: i64,
+    pub transcript_cutoff_id: i64,
+    pub remaining_checkpoints: Vec<AgentChatTurnCheckpointRecord>,
+}
+
+fn turn_checkpoint_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn turn_checkpoint_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = turn_checkpoint_locks().lock().unwrap();
+    locks
+        .entry(thread_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Drop a deleted thread's dispatch lock so the map cannot grow without
+/// bound over a long-lived process. Only the map's std mutex is taken —
+/// never the async lock itself — so this can run from any cleanup path.
+/// A holder that is still mid-dispatch keeps its `Arc` alive and finishes
+/// normally; the thread's rows are already gone, so nothing can contend
+/// for a freshly-minted replacement.
+fn forget_turn_checkpoint_lock(thread_id: &str) {
+    turn_checkpoint_locks().lock().unwrap().remove(thread_id);
+}
+
+fn prepare_turn_checkpoint_blocking(
+    db: &DatabaseStore,
+    repo_path: &std::path::Path,
+    thread_id: &str,
+    workspace_id: &str,
+    client_nonce: Option<String>,
+) -> Result<Option<AgentChatTurnCheckpointRecord>, String> {
+    let turn_index = db.next_agent_chat_turn_checkpoint_index(thread_id)?;
+    let transcript_cutoff_id = db.agent_chat_transcript_cutoff(thread_id)?;
+    let ref_name = crate::git::turn_checkpoint_ref_name(thread_id, turn_index);
+    let message = format!("codemux checkpoint: before turn {turn_index} in {thread_id}");
+    let Some(snapshot) = crate::git::git_checkpoint_create(repo_path, &ref_name, &message)? else {
+        return Ok(None);
+    };
+    Ok(Some(AgentChatTurnCheckpointRecord {
+        thread_id: thread_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        repo_path: repo_path.to_string_lossy().to_string(),
+        turn_index,
+        client_nonce,
+        transcript_cutoff_id,
+        ref_name: snapshot.ref_name,
+        snapshot_commit: snapshot.snapshot_commit,
+        head_commit: snapshot.head_commit,
+        branch: snapshot.branch,
+        created_at: String::new(),
+    }))
+}
+
+struct PreparedTurnCheckpoint {
+    record: Option<AgentChatTurnCheckpointRecord>,
+    _timeline_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct GitTurnDispatchCheckpoint<R: Runtime> {
+    app: AppHandle<R>,
+    thread_id: String,
+    workspace_id: String,
+    repo_path: String,
+    client_nonce: Option<String>,
+    prepared: tokio::sync::Mutex<Option<PreparedTurnCheckpoint>>,
+}
+
+impl<R: Runtime> std::fmt::Debug for GitTurnDispatchCheckpoint<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitTurnDispatchCheckpoint")
+            .field("thread_id", &self.thread_id)
+            .field("repo_path", &self.repo_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
+    fn new(
+        app: AppHandle<R>,
+        thread_id: String,
+        workspace_id: String,
+        repo_path: String,
+        client_nonce: Option<String>,
+    ) -> Self {
+        Self {
+            app,
+            thread_id,
+            workspace_id,
+            repo_path,
+            client_nonce,
+            prepared: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn invalidate_timeline(&self) {
+        let app = self.app.clone();
+        let thread_id = self.thread_id.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            let db: State<'_, DatabaseStore> = app.state();
+            let refs = db.clear_agent_chat_turn_checkpoints(&thread_id)?;
+            for (repo_path, ref_name) in refs {
+                if let Err(error) = crate::git::git_checkpoint_delete_ref(
+                    std::path::Path::new(&repo_path),
+                    &ref_name,
+                ) {
+                    eprintln!("[codemux::agent_chat] failed to delete invalidated ref: {error}");
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        match cleanup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("[codemux::agent_chat] checkpoint invalidation failed: {error}");
+            }
+            Err(error) => {
+                eprintln!("[codemux::agent_chat] checkpoint invalidation task failed: {error}");
+            }
+        }
+        if let Err(error) = self.app.emit(
+            AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
+            ThreadId(self.thread_id.clone()),
+        ) {
+            eprintln!("[codemux::agent_chat] failed to emit checkpoint invalidation: {error}");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
+    async fn prepare(&self) {
+        let guard = turn_checkpoint_lock_for(&self.thread_id)
+            .lock_owned()
+            .await;
+        let app = self.app.clone();
+        let thread_id = self.thread_id.clone();
+        let workspace_id = self.workspace_id.clone();
+        let repo_path = self.repo_path.clone();
+        let client_nonce = self.client_nonce.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let db: State<'_, DatabaseStore> = app.state();
+            prepare_turn_checkpoint_blocking(
+                &db,
+                std::path::Path::new(&repo_path),
+                &thread_id,
+                &workspace_id,
+                client_nonce,
+            )
+        })
+        .await;
+        let record = match result {
+            Ok(Ok(record)) => record,
+            Ok(Err(error)) => {
+                eprintln!("[codemux::agent_chat] turn checkpoint capture failed: {error}");
+                None
+            }
+            Err(error) => {
+                eprintln!("[codemux::agent_chat] turn checkpoint task failed: {error}");
+                None
+            }
+        };
+        *self.prepared.lock().await = Some(PreparedTurnCheckpoint {
+            record,
+            _timeline_guard: guard,
+        });
+    }
+
+    async fn commit(&self) {
+        let prepared = self.prepared.lock().await.take();
+        let Some(prepared) = prepared else {
+            self.invalidate_timeline().await;
+            return;
+        };
+        let Some(record) = prepared.record else {
+            self.invalidate_timeline().await;
+            return;
+        };
+        let db: State<'_, DatabaseStore> = self.app.state();
+        match db.upsert_agent_chat_turn_checkpoint(&record) {
+            Ok(checkpoint) => {
+                match db.prune_agent_chat_turn_checkpoints(
+                    &self.thread_id,
+                    TURN_CHECKPOINT_KEEP_PER_THREAD,
+                ) {
+                    Ok(stale_refs) => {
+                        for (repo_path, ref_name) in stale_refs {
+                            let _ = crate::git::git_checkpoint_delete_ref(
+                                std::path::Path::new(&repo_path),
+                                &ref_name,
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "[codemux::agent_chat] failed to prune turn checkpoints: {error}"
+                    ),
+                }
+                let payload = AgentChatTurnCheckpointEventPayload {
+                    thread_id: ThreadId(self.thread_id.clone()),
+                    checkpoint,
+                    oldest_turn_index: db
+                        .list_agent_chat_turn_checkpoints(&self.thread_id)
+                        .first()
+                        .map(|record| record.turn_index)
+                        .unwrap_or(record.turn_index),
+                };
+                if let Err(error) = self.app.emit(AGENT_CHAT_TURN_CHECKPOINT_EVENT, &payload) {
+                    eprintln!("[codemux::agent_chat] failed to emit turn checkpoint: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("[codemux::agent_chat] turn checkpoint persist failed: {error}");
+                let _ = crate::git::git_checkpoint_delete_ref(
+                    std::path::Path::new(&record.repo_path),
+                    &record.ref_name,
+                );
+                self.invalidate_timeline().await;
+            }
+        }
+    }
+
+    async fn abort(&self) {
+        // Keep `prepared` (and with it the timeline guard) alive across the
+        // invalidation: releasing it first would let the next send commit a
+        // checkpoint that this late invalidation then wipes, silently losing
+        // the Revert affordance. `invalidate_timeline` only touches the DB
+        // and the event bus, never this lock, so holding it cannot deadlock.
+        let prepared = self.prepared.lock().await.take();
+        if let Some(record) = prepared.as_ref().and_then(|p| p.record.as_ref()) {
+            let _ = crate::git::git_checkpoint_delete_ref(
+                std::path::Path::new(&record.repo_path),
+                &record.ref_name,
+            );
+        }
+        // A transport/RPC failure can be ambiguous about whether the provider
+        // accepted the turn. Conservatively discard the older timeline.
+        self.invalidate_timeline().await;
+        drop(prepared);
+    }
+}
+
+#[tauri::command]
+pub async fn agent_chat_list_turn_checkpoints(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Vec<AgentChatTurnCheckpointRecord>, String> {
+    if !run_checkpoints_enabled() {
+        return Ok(Vec::new());
+    }
+    if db
+        .get_agent_chat_session(&thread_id)
+        .is_none_or(|session| session.provider != "codex")
+    {
+        return Ok(Vec::new());
+    }
+    Ok(db.list_agent_chat_turn_checkpoints(&thread_id))
+}
+
+/// Finish the transcript half of a committed dispatch checkpoint once the
+/// accepted user turn has its durable row. If that association cannot be
+/// made, discard the whole timeline: keeping older buttons would under-count
+/// provider turns and violate true-revert semantics.
+fn bind_turn_checkpoint_transcript<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &DatabaseStore,
+    thread_id: &str,
+    client_nonce: Option<&str>,
+    user_message_id: Option<i64>,
+) {
+    if db.list_agent_chat_turn_checkpoints(thread_id).is_empty() {
+        return;
+    }
+    let bound = match (client_nonce, user_message_id) {
+        (Some(nonce), Some(row_id)) if !nonce.is_empty() => db
+            .bind_agent_chat_turn_checkpoint_transcript(thread_id, nonce, row_id)
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    if let Some(checkpoint) = bound {
+        let payload = AgentChatTurnCheckpointEventPayload {
+            thread_id: ThreadId(thread_id.to_string()),
+            oldest_turn_index: db
+                .list_agent_chat_turn_checkpoints(thread_id)
+                .first()
+                .map(|record| record.turn_index)
+                .unwrap_or(checkpoint.turn_index),
+            checkpoint,
+        };
+        let _ = app.emit(AGENT_CHAT_TURN_CHECKPOINT_EVENT, &payload);
+        return;
+    }
+    match db.clear_agent_chat_turn_checkpoints(thread_id) {
+        Ok(refs) => {
+            for (repo_path, ref_name) in refs {
+                let _ = crate::git::git_checkpoint_delete_ref(
+                    std::path::Path::new(&repo_path),
+                    &ref_name,
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("[codemux::agent_chat] failed to invalidate unbound timeline: {error}");
+        }
+    }
+    let _ = app.emit(
+        AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
+        ThreadId(thread_id.to_string()),
+    );
+}
+
+fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
+    match provider {
+        "claude" => Ok(ProviderKind::Claude),
+        "codex" => Ok(ProviderKind::Codex),
+        "opencode" => Ok(ProviderKind::OpenCode),
+        other => Err(format!("unsupported provider stored for chat: {other}")),
+    }
+}
+
+fn restore_turn_checkpoint_workspace_blocking(
+    target: &AgentChatTurnCheckpointRecord,
+) -> Result<crate::git::GitCheckpoint, String> {
+    let repo_path = std::path::Path::new(&target.repo_path);
+    let safety_ref = crate::git::pre_restore_ref_name(&target.thread_id);
+    let safety = crate::git::git_checkpoint_create(
+        repo_path,
+        &safety_ref,
+        "codemux safety snapshot before turn revert",
+    )?
+    .ok_or_else(|| "Cannot create a safety snapshot for this workspace.".to_string())?;
+    crate::git::git_checkpoint_restore_with_existing_safety(
+        repo_path,
+        &target.snapshot_commit,
+        &target.head_commit,
+        target.branch.as_deref(),
+    )?;
+    Ok(safety)
+}
+
+fn compensate_failed_provider_rollback(
+    target: &AgentChatTurnCheckpointRecord,
+    safety: &crate::git::GitCheckpoint,
+) -> Result<(), String> {
+    crate::git::git_checkpoint_restore(
+        std::path::Path::new(&target.repo_path),
+        &safety.snapshot_commit,
+        &safety.head_commit,
+        safety.branch.as_deref(),
+        &crate::git::pre_restore_failed_ref_name(&target.thread_id),
+    )
+}
+
+/// Attachment paths stamped on a `{"type":"user_message"}` transcript
+/// envelope (see [`persist_user_message`]). Any other row shape yields
+/// nothing.
+fn chat_image_paths_in_payload(payload: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("user_message") {
+        return Vec::new();
+    }
+    value
+        .get("images")
+        .and_then(|images| images.as_array())
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|image| Some(image.get("path")?.as_str()?.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reclaim the image files that only the reverted rows referenced.
+///
+/// The transcript rows cascade away inside the revert transaction, but their
+/// attachments live on disk and would otherwise survive until the session is
+/// deleted. A file a retained row still references (the same finalized path
+/// can be re-sent on a later turn) is kept. Best-effort throughout: the
+/// revert already committed, so a rejected path or a failed unlink is only
+/// logged — session deletion still removes the whole thread dir later.
+fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &[String]) {
+    let removed = removed_payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    if removed.is_empty() {
+        return;
+    }
+    let retained = retained_payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    let Some(root) = chat_images_root() else {
+        return;
+    };
+    for path in removed.difference(&retained) {
+        // Containment check first: a transcript row is data, and only paths
+        // inside the chat-image root may ever be unlinked.
+        match resolve_within(&root, path) {
+            Ok(resolved) => {
+                if let Err(error) = std::fs::remove_file(&resolved) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "[codemux::agent_chat] failed to delete reverted image {}: {error}",
+                            resolved.display()
+                        );
+                    }
+                }
+            }
+            Err(error) => eprintln!(
+                "[codemux::agent_chat] skipped reverted image {path}: {error}"
+            ),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
+    app: AppHandle<R>,
+    thread_id: String,
+    turn_index: i64,
+) -> Result<Vec<AgentChatTurnCheckpointRecord>, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    if turn_index < 1 {
+        return Err("turn_index must be positive".to_string());
+    }
+    let session = {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.get_agent_chat_session(&thread_id)
+            .ok_or_else(|| "Chat session not found.".to_string())?
+    };
+    let provider_kind = stored_provider_kind(&session.provider)?;
+    ensure_live_session(&app, provider_kind, &ThreadId(thread_id.clone())).await?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let provider = lookup_provider(&registry, provider_kind).await?;
+    if !provider.capabilities().supports_conversation_rollback {
+        return Err("This provider cannot revert its durable conversation history.".to_string());
+    }
+
+    let _timeline_guard = turn_checkpoint_lock_for(&thread_id).lock_owned().await;
+    if provider.turn_active(&ThreadId(thread_id.clone())).await {
+        return Err("Wait for the active turn to finish before reverting.".to_string());
+    }
+    let checkpoints = {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.list_agent_chat_turn_checkpoints(&thread_id)
+    };
+    let target_position = checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.turn_index == turn_index)
+        .ok_or_else(|| "That turn no longer has a valid checkpoint.".to_string())?;
+    let target = checkpoints[target_position].clone();
+    let rollback_count = u32::try_from(checkpoints.len() - target_position)
+        .map_err(|_| "Too many turns to revert safely.".to_string())?;
+
+    let restore_target = target.clone();
+    let safety = tokio::task::spawn_blocking(move || {
+        restore_turn_checkpoint_workspace_blocking(&restore_target)
+    })
+    .await
+    .map_err(|error| format!("workspace revert task failed: {error}"))??;
+
+    if let Err(error) = provider
+        .rollback_conversation(ThreadId(thread_id.clone()), rollback_count)
+        .await
+    {
+        let compensation_target = target.clone();
+        let compensation_safety = safety.clone();
+        let compensation = tokio::task::spawn_blocking(move || {
+            compensate_failed_provider_rollback(&compensation_target, &compensation_safety)
+        })
+        .await;
+        let compensation_detail = match compensation {
+            Ok(Ok(())) => " The workspace was restored to its pre-revert state.".to_string(),
+            Ok(Err(compensation_error)) => format!(
+                " Workspace compensation also failed: {compensation_error}. The safety ref is {}.",
+                safety.ref_name
+            ),
+            Err(join_error) => format!(
+                " Workspace compensation task failed: {join_error}. The safety ref is {}.",
+                safety.ref_name
+            ),
+        };
+        return Err(format!(
+            "Provider conversation rollback failed: {}{}",
+            provider_err(error),
+            compensation_detail
+        ));
+    }
+
+    let outcome = {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.finalize_agent_chat_turn_revert(
+            &thread_id,
+            target.turn_index,
+            target.transcript_cutoff_id,
+        )?
+    };
+    for (repo_path, ref_name) in outcome.removed_refs {
+        if let Err(error) = crate::git::git_checkpoint_delete_ref(
+            std::path::Path::new(&repo_path),
+            &ref_name,
+        ) {
+            eprintln!("[codemux::agent_chat] failed to delete reverted ref: {error}");
+        }
+    }
+    delete_orphaned_chat_images(
+        &outcome.removed_image_payloads,
+        &outcome.retained_image_payloads,
+    );
+    let remaining_checkpoints = {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.list_agent_chat_turn_checkpoints(&thread_id)
+    };
+    let payload = AgentChatTurnCheckpointRevertedEventPayload {
+        thread_id: ThreadId(thread_id),
+        turn_index,
+        transcript_cutoff_id: target.transcript_cutoff_id,
+        remaining_checkpoints: remaining_checkpoints.clone(),
+    };
+    if let Err(error) = app.emit(AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT, &payload) {
+        eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
+    }
+    Ok(remaining_checkpoints)
 }
 
 // ── Backend auto-resume ──────────────────────────────────────────────
@@ -1410,6 +1940,24 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
     let db: State<'_, DatabaseStore> = app.state();
+    let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled()
+        && impl_.capabilities().supports_conversation_rollback
+    {
+        db.get_agent_chat_session(&thread_id_for_persist)
+            .and_then(|session| {
+                session.cwd.map(|repo_path| {
+                    Arc::new(GitTurnDispatchCheckpoint::new(
+                        app.clone(),
+                        thread_id_for_persist.clone(),
+                        session.workspace_id,
+                        repo_path,
+                        input.client_nonce.clone(),
+                    )) as Arc<dyn TurnDispatchCheckpoint>
+                })
+            })
+    } else {
+        None
+    };
     let skill_invocations = if input.skill_ids.is_empty() {
         Vec::new()
     } else {
@@ -1440,6 +1988,35 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         provider,
         &skill_invocations,
     )?;
+    // A non-checkpointed turn makes every older provider-relative target
+    // unsafe. Serialize that invalidation with checkpoint commit/revert so a
+    // settings or provider switch cannot race a turn currently being
+    // accepted and leave a stale Revert button behind.
+    let invalidation_guard = if turn_checkpoint.is_none() {
+        Some(
+            turn_checkpoint_lock_for(&thread_id_for_persist)
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
+    if turn_checkpoint.is_none() && db.has_agent_chat_turn_checkpoints(&thread_id_for_persist) {
+        let stale_refs = db.clear_agent_chat_turn_checkpoints(&thread_id_for_persist)?;
+        for (repo_path, ref_name) in stale_refs {
+            if let Err(error) = crate::git::git_checkpoint_delete_ref(
+                std::path::Path::new(&repo_path),
+                &ref_name,
+            ) {
+                eprintln!("[codemux::agent_chat] failed to delete stale turn ref: {error}");
+            }
+        }
+        let _ = app.emit(
+            AGENT_CHAT_TURN_CHECKPOINTS_INVALIDATED_EVENT,
+            ThreadId(thread_id_for_persist.clone()),
+        );
+    }
+    drop(invalidation_guard);
     // Build the provider's byte-carrying input from the command DTO.
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
@@ -1451,6 +2028,7 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         effort_override: input.effort_override.clone(),
         permission_mode_override: input.permission_mode_override.clone(),
         client_nonce: input.client_nonce.clone(),
+        turn_checkpoint,
     };
     // A genuine new user turn is the authoritative, provider-agnostic
     // anchor for resetting turn-scoped subagent tracking. Start a new
@@ -1503,6 +2081,13 @@ pub async fn agent_chat_send_turn<R: Runtime>(
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
+            );
+            bind_turn_checkpoint_transcript(
+                &app,
+                &db,
+                &thread_id_for_persist,
+                input.client_nonce.as_deref(),
+                row_id,
             );
             // Then fan the row out to everyone watching this thread. The
             // sender already painted this bubble and drops the copy on its
@@ -2992,7 +3577,80 @@ pub async fn agent_chat_delete_session(
     if let Some(dir) = chat_images_dir(&thread_id) {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    db.delete_agent_chat_session(&thread_id)
+    // SQLite cascades remove checkpoint bookkeeping, but Git refs live
+    // outside the database and would otherwise retain snapshot objects
+    // forever. Gather their locations before deleting the parent row, then
+    // clean them best-effort after the DB deletion succeeds.
+    let turn_checkpoints = db.list_agent_chat_turn_checkpoints(&thread_id);
+    let mut safety_repos = turn_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.repo_path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut checkpoint_refs = turn_checkpoints
+        .into_iter()
+        .map(|checkpoint| (checkpoint.repo_path, checkpoint.ref_name))
+        .collect::<Vec<_>>();
+    if let Some(checkpoint) = db.get_agent_chat_checkpoint(&thread_id) {
+        safety_repos.insert(checkpoint.repo_path.clone());
+        checkpoint_refs.push((checkpoint.repo_path.clone(), checkpoint.ref_name));
+    }
+    if let Some(session) = db.get_agent_chat_session(&thread_id) {
+        if let Some(repo_path) = session.cwd {
+            safety_repos.insert(repo_path);
+        }
+    }
+    checkpoint_refs.extend(safety_repos.into_iter().flat_map(|repo_path| {
+        [
+            (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
+            (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+        ]
+    }));
+    db.delete_agent_chat_session(&thread_id)?;
+    // The thread is gone; its dispatch lock can never be contended again.
+    forget_turn_checkpoint_lock(&thread_id);
+    for (repo_path, ref_name) in checkpoint_refs {
+        if let Err(error) = crate::git::git_checkpoint_delete_ref(
+            std::path::Path::new(&repo_path),
+            &ref_name,
+        ) {
+            eprintln!("[codemux::agent_chat] failed to delete session checkpoint ref: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessionCleanup) {
+    for thread_id in &cleanup.thread_ids {
+        if let Some(dir) = chat_images_dir(thread_id) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        forget_turn_checkpoint_lock(thread_id);
+    }
+    let mut refs = cleanup
+        .checkpoint_refs
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    refs.extend(
+        cleanup
+            .repo_paths
+            .into_iter()
+            .flat_map(|(thread_id, repo_path)| {
+                [
+                    (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
+                    (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+                ]
+            }),
+    );
+    for (repo_path, ref_name) in refs {
+        if let Err(error) = crate::git::git_checkpoint_delete_ref(
+            std::path::Path::new(&repo_path),
+            &ref_name,
+        ) {
+            eprintln!(
+                "[codemux::agent_chat] failed to delete merged-session checkpoint ref: {error}"
+            );
+        }
+    }
 }
 
 /// Return the persisted transcript for a thread.
@@ -3370,8 +4028,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             // Resume creates a fresh DB row (new thread_id) carrying the
             // same sdk_session_id as the original. Collapse the
             // duplicates so the dropdown doesn't grow unboundedly.
-            if let Err(error) = db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
-                eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
+            match db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
+                Ok(cleanup) => cleanup_collapsed_session_resources(cleanup),
+                Err(error) => {
+                    eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
+                }
             }
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
@@ -3421,6 +4082,13 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
+            );
+            bind_turn_checkpoint_transcript(
+                app,
+                &db,
+                &thread_id.0,
+                pending.client_nonce.as_deref(),
+                row_id,
             );
             // Fan the row out under its own id, so every attached client's
             // cursor moves over it instead of over it. Gated on a nonce
@@ -4997,6 +5665,74 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn collapsed_session_cleanup_deletes_checkpoint_and_safety_refs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("code.txt"), "base").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+
+        let thread_id = "collapsed-thread";
+        let checkpoint_ref = crate::git::turn_checkpoint_ref_name(thread_id, 1);
+        let safety_ref = crate::git::pre_restore_ref_name(thread_id);
+        let failed_safety_ref = crate::git::pre_restore_failed_ref_name(thread_id);
+        crate::git::git_checkpoint_create(repo, &checkpoint_ref, "checkpoint")
+            .unwrap()
+            .unwrap();
+        crate::git::git_checkpoint_create(repo, &safety_ref, "safety")
+            .unwrap()
+            .unwrap();
+        crate::git::git_checkpoint_create(repo, &failed_safety_ref, "failed safety")
+            .unwrap()
+            .unwrap();
+
+        cleanup_collapsed_session_resources(crate::database::AgentChatSessionCleanup {
+            thread_ids: vec![thread_id.to_string()],
+            repo_paths: vec![(thread_id.to_string(), repo.to_string_lossy().to_string())],
+            checkpoint_refs: vec![(repo.to_string_lossy().to_string(), checkpoint_ref.clone())],
+        });
+
+        for ref_name in [checkpoint_ref, safety_ref, failed_safety_ref] {
+            let status = std::process::Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", &ref_name])
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{ref_name} should be deleted");
+        }
+    }
+
+    #[test]
+    fn chat_image_paths_read_only_user_message_attachments() {
+        let user = r#"{"type":"user_message","text":"hi","images":[
+            {"path":"/img/a.png","media_type":"image/png"},
+            {"path":"/img/b.png","media_type":"image/png"}]}"#;
+        assert_eq!(
+            chat_image_paths_in_payload(user),
+            vec!["/img/a.png".to_string(), "/img/b.png".to_string()]
+        );
+        // Image-less turns, provider rows and unparsable payloads contribute
+        // nothing to the revert cleanup set.
+        assert!(chat_image_paths_in_payload(r#"{"type":"user_message","text":"hi"}"#).is_empty());
+        assert!(chat_image_paths_in_payload(
+            r#"{"type":"item_completed","images":[{"path":"/img/c.png"}]}"#
+        )
+        .is_empty());
+        assert!(chat_image_paths_in_payload("not json").is_empty());
+    }
 
     // ── lazy tool-result shaping (read path) ──
 

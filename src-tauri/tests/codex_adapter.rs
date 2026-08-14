@@ -17,7 +17,7 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -34,7 +34,7 @@ use codemux_lib::agent_provider::codex::{CodexAgentProvider, CodexProviderConfig
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ContentDelta, ProviderError,
     ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
-    SubagentStatus, ThreadId, TurnId, TurnStatus,
+    SubagentStatus, ThreadId, TurnDispatchCheckpoint, TurnId, TurnStatus,
 };
 use codemux_lib::skills::{
     ResolvedSkillInvocation, SkillInvocationKind, SkillProvider, SkillScope,
@@ -79,6 +79,30 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         recorded_usage_baseline: None,
         env: None,
         extra: serde_json::Value::Null,
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingTurnCheckpoint(Mutex<Vec<&'static str>>);
+
+impl RecordingTurnCheckpoint {
+    fn snapshot(&self) -> Vec<&'static str> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnDispatchCheckpoint for RecordingTurnCheckpoint {
+    async fn prepare(&self) {
+        self.0.lock().unwrap().push("prepare");
+    }
+
+    async fn commit(&self) {
+        self.0.lock().unwrap().push("commit");
+    }
+
+    async fn abort(&self) {
+        self.0.lock().unwrap().push("abort");
     }
 }
 
@@ -267,6 +291,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -338,6 +363,7 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
                 body: Some("Review carefully.".into()),
                 invocation: SkillInvocationKind::CodexSkillItem,
             }],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -352,6 +378,91 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
         })
     }));
     provider.stop_session(ThreadId("t-skill".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_conversation_uses_codex_thread_rollback_contract() {
+    let capture_dir = tempfile::tempdir().unwrap();
+    let capture_path = capture_dir.path().join("rollback.json");
+    let capture_path_string = capture_path.to_string_lossy().to_string();
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CODEX_CAPTURE_ROLLBACK",
+        &capture_path_string,
+    )]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-rollback"))
+        .await
+        .unwrap();
+
+    provider
+        .rollback_conversation(ThreadId("t-rollback".into()), 2)
+        .await
+        .unwrap();
+
+    let captured: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    assert_eq!(
+        captured,
+        json!({
+            "threadId": "c-1",
+            "numTurns": 2
+        })
+    );
+    provider
+        .stop_session(ThreadId("t-rollback".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_conversation_refuses_an_active_turn_without_calling_codex() {
+    let capture_dir = tempfile::tempdir().unwrap();
+    let capture_path = capture_dir.path().join("rollback.json");
+    let capture_path_string = capture_path.to_string_lossy().to_string();
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"t-active"}},
+        {"after":"turn/start","delay_ms":500,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"t-active","status":"succeeded"}}
+    ]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
+        ("FAKE_CODEX_CAPTURE_ROLLBACK", &capture_path_string),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-active-rollback"))
+        .await
+        .unwrap();
+
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-active-rollback".into()),
+            text: "still running".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
+            turn_checkpoint: None,
+        })
+        .await
+        .unwrap();
+
+    let error = provider
+        .rollback_conversation(ThreadId("t-active-rollback".into()), 1)
+        .await
+        .expect_err("an active turn must make rollback fail closed");
+    assert!(matches!(error, ProviderError::ValidationError { .. }));
+    assert!(
+        !capture_path.exists(),
+        "Codex must not receive thread/rollback while a turn is active"
+    );
+    provider
+        .stop_session(ThreadId("t-active-rollback".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -445,6 +556,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -494,6 +606,7 @@ async fn command_approval_request_roundtrip() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -553,6 +666,7 @@ async fn command_approval_deny_roundtrip() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -606,6 +720,7 @@ async fn interrupt_turn_sends_turn_interrupt() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -643,6 +758,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -697,6 +813,7 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -765,6 +882,7 @@ async fn set_model_updates_session_state() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -816,6 +934,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap_err();
@@ -862,6 +981,7 @@ async fn child_process_crash_emits_error_state() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -931,6 +1051,7 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -954,11 +1075,13 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_send_turn_queues_instead_of_erroring() {
     // Follow-up queueing: a second send while the first turn is active is
-    // now QUEUED (not rejected). The fixture emits only turn/started, so
-    // the first turn stays active and the second parks in the queue.
+    // now QUEUED (not rejected). Its checkpoint must wait for actual
+    // dispatch, rather than capturing while the first turn is still active.
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
-         "params":{"threadId":"c-1","turnId":"t-busy"}}
+         "params":{"threadId":"c-1","turnId":"t-busy"}},
+        {"after":"turn/start","delay_ms":250,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"t-busy","status":"succeeded"}}
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
@@ -977,11 +1100,13 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
     assert!(first.queued_id.is_none(), "first send starts immediately");
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued_checkpoint = Arc::new(RecordingTurnCheckpoint::default());
     let second = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
@@ -993,12 +1118,17 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             client_nonce: Some("nonce-2".into()),
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: Some(queued_checkpoint.clone()),
         })
         .await
         .unwrap();
     let queued_id = second
         .queued_id
         .expect("second send should be queued behind the active turn");
+    assert!(
+        queued_checkpoint.snapshot().is_empty(),
+        "enqueue must not capture a dispatch checkpoint"
+    );
 
     let saw = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
@@ -1020,6 +1150,16 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
     .await
     .unwrap_or(false);
     assert!(saw, "expected a TurnQueued event");
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if queued_checkpoint.snapshot() == ["prepare", "commit"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued checkpoint should run at dispatch");
     provider.stop_session(ThreadId("t-busy".into())).await.ok();
 }
 
@@ -1046,6 +1186,7 @@ async fn cancel_queued_turn_removes_it_codex() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1061,6 +1202,7 @@ async fn cancel_queued_turn_removes_it_codex() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap()
@@ -1174,6 +1316,7 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1236,6 +1379,7 @@ async fn thread_token_usage_reaches_the_event_stream_end_to_end() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1387,6 +1531,7 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1500,6 +1645,7 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1653,6 +1799,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();

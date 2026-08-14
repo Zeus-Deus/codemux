@@ -30,5 +30,5 @@ pub use types::{
     ApprovalDecision, ChatModelInfo, ContextWindowOption, EffortGranularity, ImageInput,
     PermissionModeOption, ProviderCapabilities, ProviderChatCapabilities, ProviderKind,
     ProviderSession, ProviderSessionId, RequestId, SendOutcome, SendTurnInput, SessionStatus,
-    StartSessionInput, ThreadId, TurnId, TurnStartResult, UsageBaseline,
+    StartSessionInput, ThreadId, TurnDispatchCheckpoint, TurnId, TurnStartResult, UsageBaseline,
 };

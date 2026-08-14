@@ -160,6 +160,9 @@ impl AgentProvider for OpenCodeAgentProvider {
             // resumed session keeps its conversation context, falling back to a
             // fresh session when the id is stale/unknown. Best-effort but wired.
             supports_session_resume: true,
+            // The adapter does not retain the native message ids required by
+            // OpenCode's revert API yet.
+            supports_conversation_rollback: false,
         }
     }
 
@@ -255,14 +258,32 @@ impl AgentProvider for OpenCodeAgentProvider {
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
         let session = self.lookup(&input.thread_id).await?;
-        let turn_id = session
+        let checkpoint = input.turn_checkpoint.clone();
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint.prepare().await;
+        }
+        let sent = session
             .send_turn(
                 input.text,
                 input.images,
                 input.model_override,
                 input.effort_override,
             )
-            .await?;
+            .await;
+        let turn_id = match sent {
+            Ok(turn_id) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.commit().await;
+                }
+                turn_id
+            }
+            Err(error) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.abort().await;
+                }
+                return Err(error);
+            }
+        };
         // OpenCode has no busy guard and no follow-up queue yet — every
         // send starts immediately, so `queued_id` is always `None`.
         Ok(TurnStartResult {

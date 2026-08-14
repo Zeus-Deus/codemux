@@ -448,6 +448,15 @@ pub fn git_stash_pop(repo_path: &Path) -> Result<(), String> {
 pub const CHECKPOINT_REF_PREFIX: &str = "refs/codemux/checkpoints";
 /// Ref namespace for the safety snapshots taken right before a restore.
 pub const PRE_RESTORE_REF_PREFIX: &str = "refs/codemux/pre-restore";
+/// Ref namespace for the safety snapshots taken before compensating a
+/// revert whose provider rollback failed. A SIBLING of
+/// [`PRE_RESTORE_REF_PREFIX`] rather than a child of the per-thread ref:
+/// `refs/codemux/pre-restore/<thread>` is a loose ref (a file), so any
+/// `refs/codemux/pre-restore/<thread>/…` name is a directory/file conflict
+/// git refuses to create.
+pub const PRE_RESTORE_FAILED_REF_PREFIX: &str = "refs/codemux/pre-restore-failed";
+/// Namespace for exact pre-dispatch checkpoints, one ref per accepted turn.
+pub const TURN_CHECKPOINT_REF_PREFIX: &str = "refs/codemux/turn-checkpoints";
 /// How many refs to keep per namespace when pruning.
 pub const CHECKPOINT_KEEP_PER_NAMESPACE: usize = 20;
 
@@ -495,9 +504,32 @@ pub fn checkpoint_ref_name(thread_id: &str) -> String {
     format!("{CHECKPOINT_REF_PREFIX}/{}", sanitize_ref_component(thread_id))
 }
 
+/// Full checkpoint ref for a particular accepted turn.
+pub fn turn_checkpoint_ref_name(thread_id: &str, turn_index: i64) -> String {
+    format!(
+        "{TURN_CHECKPOINT_REF_PREFIX}/{}/{turn_index}",
+        sanitize_ref_component(thread_id)
+    )
+}
+
 /// Full pre-restore safety ref for a thread id.
 pub fn pre_restore_ref_name(thread_id: &str) -> String {
     format!("{PRE_RESTORE_REF_PREFIX}/{}", sanitize_ref_component(thread_id))
+}
+
+/// Full safety ref for the compensating restore after a failed provider
+/// rollback.
+pub fn pre_restore_failed_ref_name(thread_id: &str) -> String {
+    format!(
+        "{PRE_RESTORE_FAILED_REF_PREFIX}/{}",
+        sanitize_ref_component(thread_id)
+    )
+}
+
+/// Drop one fully-qualified checkpoint ref. Deleting a missing ref is a
+/// successful no-op in git, which makes cleanup naturally idempotent.
+pub fn git_checkpoint_delete_ref(repo_path: &Path, ref_name: &str) -> Result<(), String> {
+    run_git(repo_path, &["update-ref", "-d", ref_name]).map(|_| ())
 }
 
 /// Run git with a private index file so staging operations never touch
@@ -648,6 +680,34 @@ pub fn git_checkpoint_restore(
     branch: Option<&str>,
     safety_ref: &str,
 ) -> Result<(), String> {
+    git_checkpoint_restore_inner(
+        repo_path,
+        snapshot_commit,
+        head_commit,
+        branch,
+        Some(safety_ref),
+    )
+}
+
+/// Restore when the caller has already created and verified its safety
+/// snapshot. Keeping this separate prevents the per-turn revert path from
+/// scanning and snapshotting a large worktree twice before provider rollback.
+pub(crate) fn git_checkpoint_restore_with_existing_safety(
+    repo_path: &Path,
+    snapshot_commit: &str,
+    head_commit: &str,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    git_checkpoint_restore_inner(repo_path, snapshot_commit, head_commit, branch, None)
+}
+
+fn git_checkpoint_restore_inner(
+    repo_path: &Path,
+    snapshot_commit: &str,
+    head_commit: &str,
+    branch: Option<&str>,
+    safety_ref: Option<&str>,
+) -> Result<(), String> {
     let toplevel = run_git(repo_path, &["rev-parse", "--show-toplevel"])
         .map_err(|_| "Cannot restore: not a git repository".to_string())?;
     let repo = Path::new(&toplevel);
@@ -677,9 +737,12 @@ pub fn git_checkpoint_restore(
     // Safety net: snapshot the CURRENT state (including any commits the
     // run made — they stay reachable through this ref's parent chain)
     // before we start rewriting the worktree. Best-effort.
-    if let Err(error) = git_checkpoint_create(repo, safety_ref, "codemux pre-restore safety snapshot")
-    {
-        eprintln!("[codemux::git] pre-restore safety snapshot failed: {error}");
+    if let Some(safety_ref) = safety_ref {
+        if let Err(error) =
+            git_checkpoint_create(repo, safety_ref, "codemux pre-restore safety snapshot")
+        {
+            eprintln!("[codemux::git] pre-restore safety snapshot failed: {error}");
+        }
     }
 
     // 1. Worktree + index → snapshot tree. `read-tree --reset -u` is
@@ -6059,6 +6122,50 @@ C  source.txt -> copy.txt";
         let safety = run_git(&repo, &["rev-parse", "refs/codemux/pre-restore/run-1"]).unwrap();
         let safety_parent = run_git(&repo, &["rev-parse", &format!("{safety}^")]).unwrap();
         assert_eq!(safety_parent, agent_head, "safety snapshot parents the run's last commit");
+    }
+
+    #[test]
+    fn checkpoint_restore_with_existing_safety_does_not_resnapshot() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        run_git(&repo, &["checkout", "-B", "main"]).unwrap();
+        std::fs::write(repo.join("code.txt"), "base").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+
+        std::fs::write(repo.join("code.txt"), "checkpoint").unwrap();
+        let checkpoint = git_checkpoint_create(
+            &repo,
+            "refs/codemux/turn-checkpoints/t/1",
+            "turn checkpoint",
+        )
+        .unwrap()
+        .unwrap();
+
+        std::fs::write(repo.join("code.txt"), "safety").unwrap();
+        let safety_ref = "refs/codemux/pre-restore/t";
+        let safety = git_checkpoint_create(&repo, safety_ref, "safety")
+            .unwrap()
+            .unwrap();
+        std::fs::write(repo.join("code.txt"), "changed after safety").unwrap();
+
+        git_checkpoint_restore_with_existing_safety(
+            &repo,
+            &checkpoint.snapshot_commit,
+            &checkpoint.head_commit,
+            checkpoint.branch.as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_git(&repo, &["rev-parse", safety_ref]).unwrap(),
+            safety.snapshot_commit,
+            "the caller's verified safety ref must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+            "checkpoint"
+        );
     }
 
     #[test]

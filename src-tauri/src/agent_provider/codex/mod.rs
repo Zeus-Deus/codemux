@@ -164,6 +164,7 @@ impl AgentProvider for CodexAgentProvider {
             supports_synchronous_tool_approval: true,
             supports_interrupt: true,
             supports_session_resume: true,
+            supports_conversation_rollback: true,
         }
     }
 
@@ -260,6 +261,19 @@ impl AgentProvider for CodexAgentProvider {
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
         session.interrupt_turn(turn_id).await
+    }
+
+    async fn rollback_conversation(
+        &self,
+        thread_id: ThreadId,
+        num_turns: u32,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
+        session.rollback_conversation(num_turns).await
     }
 
     async fn cancel_queued_turn(

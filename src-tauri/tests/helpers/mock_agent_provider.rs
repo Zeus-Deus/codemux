@@ -29,6 +29,7 @@ pub enum MockCall {
     RespondToRequest(ThreadId, RequestId),
     SetModel(ThreadId, String),
     SetPermissionMode(ThreadId, String),
+    RollbackConversation(ThreadId, u32),
     StopSession(ThreadId),
     ListSessions,
 }
@@ -64,6 +65,7 @@ pub struct MockAgentProvider {
     /// Live-session registry so `has_session` mirrors a real adapter:
     /// `start_session` inserts, `stop_session` removes.
     live: Arc<Mutex<HashSet<ThreadId>>>,
+    rollback_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MockAgentProvider {
@@ -74,7 +76,12 @@ impl MockAgentProvider {
             calls: MockAgentCalls::new(),
             event_tx,
             live: Arc::new(Mutex::new(HashSet::new())),
+            rollback_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn fail_next_rollback(&self, message: impl Into<String>) {
+        *self.rollback_error.lock().unwrap() = Some(message.into());
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -98,6 +105,7 @@ impl AgentProvider for MockAgentProvider {
             supports_synchronous_tool_approval: true,
             supports_interrupt: true,
             supports_session_resume: true,
+            supports_conversation_rollback: true,
         }
     }
 
@@ -117,8 +125,15 @@ impl AgentProvider for MockAgentProvider {
     }
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        let checkpoint = input.turn_checkpoint.clone();
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint.prepare().await;
+        }
         self.calls
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint.commit().await;
+        }
         Ok(TurnStartResult {
             turn_id: TurnId("mock-turn".into()),
             queued_id: None,
@@ -166,6 +181,19 @@ impl AgentProvider for MockAgentProvider {
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
         self.live.lock().unwrap().contains(thread_id)
+    }
+
+    async fn rollback_conversation(
+        &self,
+        thread_id: ThreadId,
+        num_turns: u32,
+    ) -> Result<(), ProviderError> {
+        self.calls
+            .push(MockCall::RollbackConversation(thread_id, num_turns));
+        if let Some(message) = self.rollback_error.lock().unwrap().take() {
+            return Err(ProviderError::RpcError { message });
+        }
+        Ok(())
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

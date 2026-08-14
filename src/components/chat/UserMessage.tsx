@@ -1,5 +1,5 @@
 import { memo, useCallback, useState } from "react";
-import { CornerDownLeft, ImageOff, X } from "lucide-react";
+import { CornerDownLeft, ImageOff, Undo2, X } from "lucide-react";
 
 import {
   ImageLightbox,
@@ -98,10 +98,14 @@ export const UserMessage = memo(function UserMessage({
   item,
   onCancelQueued,
   onSendQueuedNow,
+  onRevert,
+  reverting = false,
 }: {
   item: UserMessageItem;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  onRevert?: () => void;
+  reverting?: boolean;
 }) {
   const queued = item.queued;
   const images = item.images ?? [];
@@ -169,6 +173,19 @@ export const UserMessage = memo(function UserMessage({
               Queued
             </span>
           </div>
+        ) : onRevert ? (
+          <button
+            type="button"
+            aria-label="Revert to before this turn"
+            title="Revert this turn and everything after it"
+            disabled={reverting}
+            onClick={onRevert}
+            className="flex items-center gap-0.5 rounded text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 disabled:cursor-wait disabled:opacity-60 group-hover:opacity-100"
+            data-testid="revert-turn-button"
+          >
+            <Undo2 className="h-3 w-3" aria-hidden />
+            {reverting ? "Reverting…" : "Revert"}
+          </button>
         ) : null}
       </div>
 

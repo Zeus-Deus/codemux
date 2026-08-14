@@ -939,6 +939,7 @@ function mockChatTranscript(): string[] {
     push({
       type: "user_message",
       thread_id: T,
+      client_nonce: `seed-nonce-${i + 1}`,
       text: isLast
         ? "Implement the fix for #57298."
         : `Turn ${i + 1}: how does the virtualized transcript hold up at scale?`,
@@ -1028,6 +1029,7 @@ function mockChatTranscript(): string[] {
   push({
     type: "user_message",
     thread_id: T,
+    client_nonce: "seed-nonce-subagents",
     text: "Implement clipboard-paste fallback",
     // Seed an attached image on this tail turn so the
     // thumbnail + lightbox render the moment the default seeded thread
@@ -1086,6 +1088,35 @@ function mockChatTranscript(): string[] {
 
   mockChatTranscriptCache = out;
   return out;
+}
+
+let mockChatRevertCutoff: number | null = null;
+
+function mockTailTurnCheckpoint() {
+  const clientNonce = "seed-nonce-subagents";
+  const userIndex = mockChatTranscript().findIndex((payload) => {
+    const parsed = JSON.parse(payload) as {
+      type?: string;
+      client_nonce?: string;
+    };
+    return parsed.type === "user_message" && parsed.client_nonce === clientNonce;
+  });
+  if (userIndex < 0 || mockChatRevertCutoff !== null) return null;
+  return {
+    thread_id: MOCK_CHAT_THREAD_ID,
+    workspace_id: "ws-codemux-chat",
+    repo_path: `${MOCK_HOME_DIR}/projects/codemux`,
+    turn_index: MOCK_CHAT_TURNS + 1,
+    client_nonce: clientNonce,
+    // Rows are one-based, while userIndex is zero-based: the previous row's
+    // id is therefore exactly userIndex.
+    transcript_cutoff_id: userIndex,
+    ref_name: `refs/codemux/checkpoints/${MOCK_CHAT_THREAD_ID}/turn/${MOCK_CHAT_TURNS + 1}`,
+    snapshot_commit: "b1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    head_commit: "1234567890abcdef1234567890abcdef12345678",
+    branch: "main",
+    created_at: "2026-08-10 10:00:00",
+  };
 }
 
 // ── /workflow orchestration demo threads ────────────────────────────
@@ -2173,10 +2204,22 @@ const handlers: Record<string, Handler> = {
   agent_chat_list_messages_after: (a) => {
     const threadId = a.threadId as string;
     const afterId = (a.afterId as number | null | undefined) ?? 0;
-    return mockThreadRows(threadId).filter((row) => row.id > afterId);
+    return mockThreadRows(threadId).filter(
+      (row) =>
+        row.id > afterId &&
+        (threadId !== MOCK_CHAT_THREAD_ID ||
+          mockChatRevertCutoff === null ||
+          row.id <= mockChatRevertCutoff),
+    );
   },
   agent_chat_thread_head_id: (a) => {
-    const rows = mockThreadRows(a.threadId as string);
+    const threadId = a.threadId as string;
+    const rows = mockThreadRows(threadId).filter(
+      (row) =>
+        threadId !== MOCK_CHAT_THREAD_ID ||
+        mockChatRevertCutoff === null ||
+        row.id <= mockChatRevertCutoff,
+    );
     return rows.length > 0 ? rows[rows.length - 1].id : null;
   },
   agent_chat_get_tool_result: (a) => {
@@ -2204,14 +2247,14 @@ const handlers: Record<string, Handler> = {
         sdk_session_id: "sdk-mock-chat",
         workspace_id: "ws-codemux-chat",
         cwd: `${MOCK_HOME_DIR}/projects/codemux`,
-        provider: "claude",
+        provider: "codex",
         title: "agent-chat-demo",
         created_at: new Date().toISOString(),
         last_active_at: new Date().toISOString(),
-        model: "claude-opus-4-8",
+        model: "gpt-5.4",
         effort: null,
         context_window: null,
-        permission_mode: "bypassPermissions",
+        permission_mode: "danger-full-access",
       },
     ];
   },
@@ -2339,14 +2382,14 @@ const handlers: Record<string, Handler> = {
         sdk_session_id: "sdk-mock-chat",
         workspace_id: "ws-codemux-chat",
         cwd: `${MOCK_HOME_DIR}/projects/codemux`,
-        provider: "claude",
+        provider: "codex",
         title: "agent-chat-demo",
         created_at: new Date().toISOString(),
         last_active_at: new Date().toISOString(),
-        model: "claude-opus-4-8",
+        model: "gpt-5.4",
         effort: null,
         context_window: null,
-        permission_mode: "bypassPermissions",
+        permission_mode: "danger-full-access",
       };
     }
     return mockWorkflowSessionRecord(threadId);
@@ -2523,25 +2566,28 @@ const handlers: Record<string, Handler> = {
   agent_chat_stop_session: () => undefined,
   agent_chat_rename_session: () => undefined,
   agent_chat_delete_session: () => undefined,
-  // Run-start rollback checkpoint (issue #80). The seeded thread has a
-  // checkpoint so the pane header shows the restore affordance;
-  // restore just logs (the mock has no real working tree to rewrite).
-  agent_chat_get_checkpoint: (a) =>
-    a.threadId === MOCK_CHAT_THREAD_ID
-      ? {
-          thread_id: MOCK_CHAT_THREAD_ID,
-          workspace_id: "ws-codemux-chat",
-          repo_path: `${MOCK_HOME_DIR}/projects/codemux`,
-          ref_name: `refs/codemux/checkpoints/${MOCK_CHAT_THREAD_ID}`,
-          snapshot_commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
-          head_commit: "1234567890abcdef1234567890abcdef12345678",
-          branch: "main",
-          created_at: "2026-06-09 10:00:00",
-        }
-      : null,
-  agent_chat_restore_checkpoint: (a) => {
-    console.info("[tauri-mock] agent_chat_restore_checkpoint", a.threadId);
-    return undefined;
+  agent_chat_list_turn_checkpoints: (a) => {
+    if (a.threadId !== MOCK_CHAT_THREAD_ID) return [];
+    const checkpoint = mockTailTurnCheckpoint();
+    return checkpoint ? [checkpoint] : [];
+  },
+  agent_chat_revert_turn_checkpoint: (a) => {
+    const checkpoint = mockTailTurnCheckpoint();
+    if (
+      a.threadId !== MOCK_CHAT_THREAD_ID ||
+      checkpoint === null ||
+      a.turnIndex !== checkpoint.turn_index
+    ) {
+      throw new Error("This turn checkpoint no longer exists.");
+    }
+    mockChatRevertCutoff = checkpoint.transcript_cutoff_id;
+    emitEvent("agent_chat_turn_checkpoint_reverted", {
+      thread_id: MOCK_CHAT_THREAD_ID,
+      turn_index: checkpoint.turn_index,
+      transcript_cutoff_id: checkpoint.transcript_cutoff_id,
+      remaining_checkpoints: [],
+    });
+    return [];
   },
   grep_count_pattern: () => 0,
 

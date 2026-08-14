@@ -25,9 +25,9 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 use super::protocol::{
     AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo,
     GetAccountRateLimitsResponse, InitializeParams,
-    NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadStartParams,
-    ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
-    RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
+    NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadRollbackParams,
+    ThreadStartParams, ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams,
+    TurnStartResponse, RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
 use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
@@ -530,7 +530,11 @@ impl CodexSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
         }
-        let turn_id = self
+        let checkpoint = input.turn_checkpoint.clone();
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint.prepare().await;
+        }
+        let sent = self
             .do_send(
                 input.text,
                 input.images,
@@ -538,8 +542,21 @@ impl CodexSession {
                 input.model_override,
                 input.effort_override,
             )
-            .await?;
-        Ok(SendOutcome::Started(turn_id))
+            .await;
+        match sent {
+            Ok(turn_id) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.commit().await;
+                }
+                Ok(SendOutcome::Started(turn_id))
+            }
+            Err(error) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.abort().await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Pop the next queued turn (if idle) and dispatch it. No-op when the
@@ -565,6 +582,10 @@ impl CodexSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| queued.input.text.clone());
+            let checkpoint = queued.input.turn_checkpoint.clone();
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                checkpoint.prepare().await;
+            }
             match self
                 .do_send(
                     queued.input.text,
@@ -576,6 +597,9 @@ impl CodexSession {
                 .await
             {
                 Ok(turn_id) => {
+                    if let Some(checkpoint) = checkpoint.as_ref() {
+                        checkpoint.commit().await;
+                    }
                     let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnDispatched {
                         thread_id: self.thread_id.clone(),
                         queued_id: queued.queued_id,
@@ -585,6 +609,9 @@ impl CodexSession {
                     return;
                 }
                 Err(err) => {
+                    if let Some(checkpoint) = checkpoint.as_ref() {
+                        checkpoint.abort().await;
+                    }
                     let _ = self.event_tx().send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(self.thread_id.clone()),
                         message: format!(
@@ -845,6 +872,43 @@ impl CodexSession {
             .await
             .map_err(|e| ProviderError::RpcError {
                 message: format!("turn/interrupt failed: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Remove completed tail turns from Codex's own durable thread.
+    pub async fn rollback_conversation(&self, num_turns: u32) -> Result<(), ProviderError> {
+        if num_turns == 0 {
+            return Err(ProviderError::ValidationError {
+                message: "rollback requires at least one turn".into(),
+            });
+        }
+        let codex_thread_id = {
+            let state = self.state.lock().await;
+            if state.active_turn.is_some()
+                || !state.pending_approvals.is_empty()
+                || !state.queued_turns.is_empty()
+            {
+                return Err(ProviderError::ValidationError {
+                    message: "cannot roll back while a turn, approval, or queued prompt is active"
+                        .into(),
+                });
+            }
+            state.codex_thread_id.clone()
+        };
+        let params = serde_json::to_value(ThreadRollbackParams {
+            thread_id: codex_thread_id,
+            num_turns,
+        })
+        .map_err(|error| ProviderError::ProcessError {
+            message: format!("failed to serialize thread/rollback: {error}"),
+            source: None,
+        })?;
+        self.child
+            .request("thread/rollback", params)
+            .await
+            .map_err(|error| ProviderError::RpcError {
+                message: format!("thread/rollback failed: {error}"),
             })?;
         Ok(())
     }
@@ -1327,6 +1391,7 @@ mod tests {
                 effort_override: None,
                 permission_mode_override: None,
                 client_nonce: None,
+                turn_checkpoint: None,
             },
         }
     }

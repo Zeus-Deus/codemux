@@ -2052,16 +2052,13 @@ export function SettingsView() {
                   }}
                 />
               </SettingRow>
-              {/* Run-start rollback checkpoint (issue #80). Only shown
-                  when the Agent Chat GUI is on — the snapshot fires on
-                  chat-session start, so with the GUI off the toggle
-                  would do nothing. */}
+              {/* True turn checkpoints are an Agent Chat affordance. */}
               {enableAgentChat && (
                 <>
                   <Separator />
                   <SettingRow
-                    label="Checkpoint before agent runs"
-                    description="When an agent chat session starts, snapshot the working tree in the background so you can roll back everything the run changed. Never delays the agent's response."
+                    label="Per-turn revert checkpoints"
+                    description="Before each supported agent turn, snapshot the workspace so Revert can rewind files, the provider conversation, and the transcript together. Currently available for Codex."
                   >
                     <Switch
                       checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
