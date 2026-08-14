@@ -134,10 +134,12 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
 
     return (
       <div className="code-surface select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden">
-        {/* Left — deletions / old */}
+        {/* Left — deletions / old. `relative` is load-bearing: it makes this
+            the offsetParent, so each hunk's offsetTop is a scroll position
+            rather than a page coordinate measured from the app shell. */}
         <div
           ref={leftRef}
-          className="overflow-auto bg-card"
+          className="relative overflow-auto bg-card"
           onScroll={handleScroll("left")}
         >
           <div className="py-0.5">
@@ -153,7 +155,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         {/* Right — additions / new */}
         <div
           ref={rightRef}
-          className="overflow-auto bg-card"
+          className="relative overflow-auto bg-card"
           onScroll={handleScroll("right")}
         >
           <div className="py-0.5">

@@ -35,7 +35,10 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
     return (
       <div
         ref={containerRef}
-        className="code-surface select-text flex-1 overflow-auto bg-card"
+        // `relative` is load-bearing: it makes this the offsetParent, so each
+        // hunk's offsetTop is a scroll position rather than a page coordinate
+        // measured from the app shell above the toolbar.
+        className="code-surface select-text relative flex-1 overflow-auto bg-card"
       >
         <div className="py-0.5">
           {lines.map((line, i) => {
