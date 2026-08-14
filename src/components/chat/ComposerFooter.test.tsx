@@ -204,6 +204,23 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
       "true",
     );
   });
+
+  it.each([
+    ["waiting", { completed: 0, total: 3, running: false }],
+    ["running", { completed: 1, total: 3, running: true }],
+    ["complete", { completed: 3, total: 3, running: false }],
+  ])("keeps the %s Tasks treatment borderless", (_state, tasks) => {
+    renderFooter({ tasks, onTasksClick: vi.fn() });
+
+    const classes = screen
+      .getByTestId("composer-tasks-toggle")
+      .className.split(/\s+/);
+    expect(
+      classes.some((className) =>
+        className === "border" || className.startsWith("border-"),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("ComposerFooter — context-window meter", () => {

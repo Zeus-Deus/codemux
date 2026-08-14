@@ -207,25 +207,25 @@ export function ComposerFooter({
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             <span className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
-            {/* Same slot, but the chip reports run state instead of
+            {/* Same slot, but the control reports run state instead of
                 reading as a setting: amber + spinner while a step is in
                 flight, green + check when the plan is complete, muted
-                checklist glyph before the run starts. Right of the
-                hairline so it scans as status, not another picker. */}
+                checklist glyph before the run starts. Keep its state
+                treatment borderless like the other footer controls. */}
             <button
               type="button"
               onClick={onTasksClick}
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-sm font-medium leading-none transition-colors",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium leading-none transition-colors",
                 tasks.running
-                  ? "border-status-working/25 bg-status-working/8 text-status-working hover:bg-status-working/15"
+                  ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
-                    ? "border-status-open/25 bg-status-open/8 text-status-open hover:bg-status-open/15"
+                    ? "bg-status-open/8 text-status-open hover:bg-status-open/15"
                     : tasksOpen
-                      ? "border-transparent bg-accent-ember/15 text-accent-ember"
-                      : "border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                      ? "bg-accent-ember/15 text-accent-ember"
+                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
               )}
               title={`${tasks.completed} of ${tasks.total} tasks complete`}
             >
