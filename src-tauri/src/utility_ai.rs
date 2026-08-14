@@ -25,13 +25,13 @@ struct UtilityInvocation {
     args: Vec<String>,
     env: Vec<(String, String)>,
     output_file: Option<PathBuf>,
-    prompt_via_stdin: bool,
 }
 
+/// Every provider receives the prompt on stdin, so the argv stays small
+/// enough for Windows' ~32k command-line limit regardless of transcript size.
 fn build_invocation(
     selection: &UtilityModelSelection,
     temp_dir: &Path,
-    prompt: &str,
 ) -> Result<UtilityInvocation, String> {
     if selection.model.trim().is_empty() {
         return Err("utility_model_required".into());
@@ -68,7 +68,6 @@ fn build_invocation(
                 args,
                 env: Vec::new(),
                 output_file: Some(output_file),
-                prompt_via_stdin: true,
             })
         }
         "claude" => {
@@ -91,7 +90,6 @@ fn build_invocation(
                 args,
                 env: Vec::new(),
                 output_file: None,
-                prompt_via_stdin: true,
             })
         }
         "opencode" => {
@@ -108,7 +106,11 @@ fn build_invocation(
             if let Some(effort) = selection.effort.as_deref().filter(|v| !v.is_empty()) {
                 args.extend(["--variant".into(), effort.into()]);
             }
-            args.push(prompt.into());
+            // `opencode run` reads a piped stdin as the message when no
+            // positional message is given. Passing the transcript on argv
+            // instead would blow past Windows' ~32k CreateProcess limit for
+            // any conversation worth summarising.
+            //
             // `--pure` removes plugins. The ephemeral config also denies
             // every tool/permission so a transcript cannot ask OpenCode to
             // inspect or mutate the machine while it is being summarized.
@@ -120,7 +122,6 @@ fn build_invocation(
                     r#"{"permission":{"*":"deny"},"tools":{"*":false},"mcp":{}}"#.into(),
                 )],
                 output_file: None,
-                prompt_via_stdin: false,
             })
         }
         _ => Err(format!(
@@ -153,16 +154,12 @@ pub async fn generate_utility_text(
     prompt: &str,
 ) -> Result<String, String> {
     let temp = tempfile::tempdir().map_err(|e| format!("utility_temp_dir_failed: {e}"))?;
-    let invocation = build_invocation(selection, temp.path(), prompt)?;
+    let invocation = build_invocation(selection, temp.path())?;
     let mut command = crate::execution::host_command_tokio(&invocation.program);
     command
         .args(&invocation.args)
         .current_dir(temp.path())
-        .stdin(if invocation.prompt_via_stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -172,17 +169,15 @@ pub async fn generate_utility_text(
     let mut child = command
         .spawn()
         .map_err(|e| format!("utility_spawn_failed: {}: {e}", selection.provider))?;
-    if invocation.prompt_via_stdin {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "utility_stdin_unavailable".to_string())?;
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .map_err(|e| format!("utility_prompt_write_failed: {e}"))?;
-        drop(stdin);
-    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "utility_stdin_unavailable".to_string())?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|e| format!("utility_prompt_write_failed: {e}"))?;
+    drop(stdin);
     let output = tokio::time::timeout(UTILITY_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| "utility_generation_timeout".to_string())?
@@ -232,13 +227,11 @@ mod tests {
         let inv = build_invocation(
             &selection("codex", "gpt-5.6-luna", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
-            "prompt",
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--ephemeral"));
         assert!(inv.args.windows(2).any(|a| a == ["--sandbox", "read-only"]));
         assert!(!inv.args.iter().any(|a| a.contains("dangerously")));
-        assert!(inv.prompt_via_stdin);
     }
 
     #[test]
@@ -246,7 +239,6 @@ mod tests {
         let inv = build_invocation(
             &selection("claude", "claude-haiku-4-5", None),
             Path::new("/tmp/codemux-utility-test"),
-            "prompt",
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--no-session-persistence"));
@@ -259,11 +251,13 @@ mod tests {
         let inv = build_invocation(
             &selection("opencode", "openai/gpt-5", Some("low")),
             Path::new("/tmp/codemux-utility-test"),
-            "prompt",
         )
         .unwrap();
         assert!(inv.args.iter().any(|a| a == "--pure"));
         assert!(inv.env.iter().any(|(_, value)| value.contains("deny")));
         assert!(!inv.args.iter().any(|a| a == "--auto"));
+        // No positional message: `opencode run` takes it from stdin instead.
+        // On argv a summary chunk would blow past Windows' ~32k limit.
+        assert_eq!(inv.args.last().map(String::as_str), Some("low"));
     }
 }

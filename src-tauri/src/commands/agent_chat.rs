@@ -3438,11 +3438,20 @@ const SESSION_SUMMARY_PROMPT_VERSION: u32 = 1;
 static HANDOFF_SUMMARY_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
+/// Serialises concurrent summary requests for one (thread, revision, model)
+/// so a pick immediately followed by Enter runs the utility model once.
+///
+/// The map only needs the locks someone is currently holding: an entry whose
+/// only remaining reference is the map itself can be recreated for free next
+/// time. Dropping those on insert keeps the map from accumulating one entry
+/// per revision of every conversation for the life of the process.
 fn handoff_summary_lock(key: String) -> Arc<tokio::sync::Mutex<()>> {
-    HANDOFF_SUMMARY_LOCKS
+    let mut locks = HANDOFF_SUMMARY_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap();
+    locks.retain(|existing, lock| *existing == key || Arc::strong_count(lock) > 1);
+    locks
         .entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -3774,9 +3783,14 @@ pub async fn agent_chat_get_session_context(
     if record.workspace_id != workspace_id {
         return Err("conversation_outside_workspace".to_string());
     }
+    // Read the revision BEFORE the messages. A message appended between the
+    // two reads then leaves the summary keyed to the older revision, which is
+    // a harmless cache miss on the next attach; reading it after would stamp
+    // a summary that omits that message under the newer revision and serve it
+    // as current.
+    let revision_message_id = db.agent_chat_visible_revision(&thread_id)?;
     let messages = db.list_agent_chat_visible_messages(&thread_id)?;
     let message_count = messages.len() as u32;
-    let revision_message_id = db.agent_chat_visible_revision(&thread_id)?;
     let (direct_content, direct_included_count, direct_truncated) =
         build_session_handoff(&messages, SESSION_HANDOFF_CHAR_BUDGET);
     if direct_content.is_empty() {
@@ -6328,6 +6342,21 @@ mod tests {
             clean_summary_output(&oversized).chars().count(),
             SESSION_SUMMARY_OUTPUT_BUDGET
         );
+    }
+
+    #[test]
+    fn handoff_summary_locks_drop_unheld_entries() {
+        // Two concurrent requests for the same revision must share one lock…
+        let first = handoff_summary_lock("thread-a:1:codex:luna:low:1".into());
+        let same = handoff_summary_lock("thread-a:1:codex:luna:low:1".into());
+        assert!(Arc::ptr_eq(&first, &same));
+        // …while a new revision retires the previous entry once nothing holds
+        // it, so the map cannot grow for the life of the process.
+        drop(first);
+        drop(same);
+        let _next = handoff_summary_lock("thread-a:2:codex:luna:low:1".into());
+        let locks = HANDOFF_SUMMARY_LOCKS.get().unwrap().lock().unwrap();
+        assert!(!locks.contains_key("thread-a:1:codex:luna:low:1"));
     }
 
     // ── lazy tool-result shaping (read path) ──
