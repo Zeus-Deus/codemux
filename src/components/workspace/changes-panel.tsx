@@ -71,6 +71,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -434,10 +435,14 @@ export function ChangesPanel({
         return;
       }
     }
-    const canUseAi = aiEnabled && claudeReady !== false;
+    const utility = utilitySelectionFromStores();
+    const configuredCli =
+      config?.ai_commit_message_cli ?? utility?.provider ?? null;
+    const canUseAi =
+      aiEnabled && (configuredCli !== null || claudeReady !== false);
     if (canUseAi) {
-      const cli = config?.ai_commit_message_cli ?? "claude";
-      const model = config?.ai_commit_message_model ?? null;
+      const cli = configuredCli ?? "claude";
+      const model = config?.ai_commit_message_model ?? utility?.model ?? null;
       requestGeneration(workspace.workspace_id, cwd, cli, model);
     } else {
       setEditedMsg("");

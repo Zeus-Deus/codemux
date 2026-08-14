@@ -7,6 +7,8 @@ import {
   GitPullRequest,
   Image as ImageIcon,
   Loader2,
+  MessagesSquare,
+  Sparkles,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -18,6 +20,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
+import { utilitySummaryFallbackLabel } from "@/lib/agent-chat/session-handoff";
 import type { Attachment, AttachmentKind } from "@/stores/agent-chat-store";
 
 interface KindConfig {
@@ -53,6 +57,10 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
     icon: ImageIcon,
     className: "bg-accent/15 text-accent-foreground border-accent/30",
   },
+  session: {
+    icon: MessagesSquare,
+    className: "bg-primary/10 text-primary border-primary/20",
+  },
 };
 
 /** State-aware tint resolution. Open issues + open non-draft PRs use
@@ -63,6 +71,14 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
  *  the picker's GitMerge tint. */
 function classNameForAttachment(attachment: Attachment): string {
   const state = attachment.metadata.state;
+  if (
+    attachment.kind === "session" &&
+    attachment.metadata.handoffKind === "direct"
+  ) {
+    return attachment.metadata.summaryError === "utility_model_required"
+      ? "bg-warning/10 text-warning border-warning/25"
+      : "bg-muted/70 text-muted-foreground border-border/70";
+  }
   if (attachment.kind === "issue" && state === "closed") {
     return "bg-foreground/10 text-muted-foreground border-border/60";
   }
@@ -93,9 +109,19 @@ function estimateTokens(att: Attachment): number {
     const label = att.metadata.label ?? "";
     const isCode =
       att.kind === "file" &&
-      ["ts", "tsx", "rs", "py", "go", "js", "jsx", "java", "c", "cpp", "h"].some(
-        (ext) => label.toLowerCase().endsWith(`.${ext}`),
-      );
+      [
+        "ts",
+        "tsx",
+        "rs",
+        "py",
+        "go",
+        "js",
+        "jsx",
+        "java",
+        "c",
+        "cpp",
+        "h",
+      ].some((ext) => label.toLowerCase().endsWith(`.${ext}`));
     return Math.round(bytes / (isCode ? 4 : 5));
   }
   return 0;
@@ -161,7 +187,11 @@ export function AttachmentChip({
   onRemove,
   onToggleExpand,
 }: AttachmentChipProps) {
-  const Icon = KIND_CONFIG[attachment.kind].icon;
+  const Icon =
+    attachment.kind === "session" &&
+    attachment.metadata.handoffKind === "summary"
+      ? Sparkles
+      : KIND_CONFIG[attachment.kind].icon;
   const { metadata } = attachment;
   const isTruncatedFile =
     attachment.kind === "file" &&
@@ -180,9 +210,7 @@ export function AttachmentChip({
     typeof onToggleExpand === "function" &&
     !metadata.isLoading;
   const expandActive = metadata.expandFullDiff === true;
-  const expandTooltip = expandActive
-    ? "Show filenames only"
-    : "Show full diff";
+  const expandTooltip = expandActive ? "Show filenames only" : "Show full diff";
 
   // Image chips lead with a live thumbnail of the pasted/picked image.
   // `previewFailed` covers a decode error on an otherwise-valid blob so a
@@ -235,6 +263,16 @@ export function AttachmentChip({
         <Icon className="h-3 w-3" aria-hidden />
       )}
       <span className="truncate max-w-[200px]">{metadata.label}</span>
+      {attachment.kind === "session" &&
+        !metadata.isLoading &&
+        metadata.handoffKind && (
+          <span
+            className="border-l border-current/15 pl-1.5 text-[9px] font-medium uppercase tracking-[0.08em] opacity-70"
+            data-testid="session-handoff-kind"
+          >
+            {metadata.handoffKind === "summary" ? "Summary" : "Direct"}
+          </span>
+        )}
       {lineCountLabel && (
         <span className="text-[10px] opacity-70" aria-hidden>
           {lineCountLabel}
@@ -321,7 +359,8 @@ export function AttachmentChip({
                 ? `~${tokenEstimate.toLocaleString()} tokens`
                 : "—"}
           </div>
-          {attachment.kind === "file" && typeof metadata.lineCount === "number" && (
+          {attachment.kind === "file" &&
+            typeof metadata.lineCount === "number" && (
             <div className="text-[10px] opacity-70">
               {metadata.lineCount.toLocaleString()} lines
               {typeof metadata.bytes === "number"
@@ -329,13 +368,46 @@ export function AttachmentChip({
                 : ""}
             </div>
           )}
-          {attachment.kind === "image" && typeof metadata.bytes === "number" && (
+          {attachment.kind === "image" &&
+            typeof metadata.bytes === "number" && (
             <div className="text-[10px] opacity-70">
               {(metadata.bytes / 1024).toLocaleString(undefined, {
                 maximumFractionDigits: 1,
               })}{" "}
               KB
             </div>
+          )}
+          {attachment.kind === "session" && (
+            <>
+              <div className="text-[10px] opacity-80">
+                {metadata.sourceProvider
+                  ? sessionProviderLabel(metadata.sourceProvider)
+                  : "Agent chat"}
+                {typeof metadata.includedMessageCount === "number" &&
+                typeof metadata.messageCount === "number"
+                  ? ` · ${metadata.includedMessageCount}/${metadata.messageCount} messages`
+                  : ""}
+              </div>
+              <div className="text-[10px] opacity-70">
+                {metadata.handoffKind === "summary"
+                  ? `Utility summary${metadata.summaryCached ? " · cached" : ""}`
+                  : utilitySummaryFallbackLabel(metadata.summaryError)}
+              </div>
+              {metadata.handoffKind === "summary" &&
+                metadata.summarizerModel && (
+                  <div className="max-w-[280px] truncate font-mono text-[9px] opacity-60">
+                    {metadata.summarizerModel}
+                    {metadata.summarizerEffort
+                      ? ` · ${metadata.summarizerEffort}`
+                      : ""}
+                  </div>
+                )}
+              {metadata.fullHistoryAvailable && (
+                <div className="text-[10px] opacity-70">
+                  Full visible history available on demand
+                </div>
+              )}
+            </>
           )}
         </TooltipContent>
       </Tooltip>

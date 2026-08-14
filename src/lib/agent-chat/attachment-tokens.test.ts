@@ -5,6 +5,7 @@ import {
   parseFileTokens,
   parseIssueTokens,
   parsePrTokens,
+  parseSessionTokens,
   segmentDraftHighlight,
 } from "./attachment-tokens";
 import type { Attachment } from "@/stores/agent-chat-store";
@@ -37,6 +38,23 @@ function makeSkill(name: string): Skill {
     compatibilitySignals: [],
     symlinked: false,
     pluginSlug: null,
+  };
+}
+
+function makeSessionAttachment(
+  overrides: Partial<Attachment> = {},
+): Attachment {
+  return {
+    id: "att-session",
+    kind: "session",
+    ref: "thread-123456",
+    metadata: {
+      label: "Harden authentication",
+      mentionToken: "harden-auth-123456",
+      sourceProvider: "codex",
+    },
+    resolvedContent: "User:\nFix auth\n\nAssistant:\nDone",
+    ...overrides,
   };
 }
 
@@ -122,6 +140,48 @@ describe("parseFileTokens", () => {
     const a = parseFileTokens(text, [att]);
     const b = parseFileTokens(text, [att]);
     expect(a).toEqual(b);
+  });
+});
+
+describe("session attachment tokens", () => {
+  it("matches the compact token while retaining the full source thread ref", () => {
+    const attachment = makeSessionAttachment();
+    const matches = parseSessionTokens(
+      "continue @session:harden-auth-123456 here",
+      [attachment],
+    );
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({
+      basename: "harden-auth-123456",
+      attachment,
+    });
+    expect(matches[0]?.attachment.ref).toBe("thread-123456");
+  });
+
+  it("participates in send-time activation and mirror highlighting", () => {
+    const attachment = makeSessionAttachment();
+    const text = "Use @session:harden-auth-123456 then verify";
+    expect(activeAttachments(text, [attachment])).toEqual([attachment]);
+    expect(activeAttachments("token deleted", [attachment])).toEqual([]);
+    const segments = segmentDraftHighlight(text, [], [attachment]);
+    expect(segments.map((segment) => segment.text).join("")).toBe(text);
+    expect(segments).toContainEqual({
+      kind: "session-attachment",
+      text: "@session:harden-auth-123456",
+      ref: "harden-auth-123456",
+      provider: "codex",
+      isLoading: false,
+      hasError: false,
+    });
+  });
+
+  it("does not let the file parser consume the @session prefix", () => {
+    const fileNamedSession = makeFileAttachment({
+      metadata: { label: "session" },
+    });
+    expect(
+      parseFileTokens("@session:harden-auth-123456", [fileNamedSession]),
+    ).toEqual([]);
   });
 });
 

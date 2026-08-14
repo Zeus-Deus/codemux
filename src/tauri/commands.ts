@@ -77,8 +77,7 @@ export const listProjectFiles = (
   cwd: string,
   query: string | null,
   limit: number,
-) =>
-  invoke<FileMatch[]>("list_project_files", { cwd, query, limit });
+) => invoke<FileMatch[]>("list_project_files", { cwd, query, limit });
 
 /** Read a file for attachment — full content for small files, first
  *  50 lines + outline for large ones. Used when the user picks a file
@@ -100,8 +99,7 @@ export const listProjectFolders = (
   cwd: string,
   query: string | null,
   limit: number,
-) =>
-  invoke<FolderMatch[]>("list_project_folders", { cwd, query, limit });
+) => invoke<FolderMatch[]>("list_project_folders", { cwd, query, limit });
 
 /** Read a folder for attachment — depth-bounded walk that produces a
  *  pre-rendered unicode tree. The agent uses the path to explore via
@@ -119,8 +117,7 @@ export const readFolderForAttachment = (
 
 // ── Auth ──
 
-export const startOauthFlow = () =>
-  invoke<void>("start_oauth_flow");
+export const startOauthFlow = () => invoke<void>("start_oauth_flow");
 
 export const signinEmail = (email: string, password: string) =>
   invoke<AuthResponse>("signin_email", { email, password });
@@ -131,14 +128,11 @@ export const signupEmail = (email: string, password: string, name: string) =>
 export const forgotPassword = (email: string) =>
   invoke<void>("forgot_password", { email });
 
-export const checkAuth = () =>
-  invoke<AuthUser | null>("check_auth");
+export const checkAuth = () => invoke<AuthUser | null>("check_auth");
 
-export const signOut = () =>
-  invoke<void>("sign_out");
+export const signOut = () => invoke<void>("sign_out");
 
-export const getAuthToken = () =>
-  invoke<string | null>("get_auth_token");
+export const getAuthToken = () => invoke<string | null>("get_auth_token");
 
 // ── Skills Sync (Step 10) ──
 //
@@ -183,8 +177,7 @@ export type SkillsSyncStateSnapshot =
   | { state: "syncing"; startedAtMillis: number }
   | { state: "error"; lastError: string; atMillis: number };
 
-export const skillsSyncNow = () =>
-  invoke<SkillsSyncResult>("skills_sync_now");
+export const skillsSyncNow = () => invoke<SkillsSyncResult>("skills_sync_now");
 
 export const skillsSyncStatus = () =>
   invoke<SkillsSyncStateSnapshot>("skills_sync_status");
@@ -246,8 +239,7 @@ export const getResourceMetrics = (detail = true) =>
 
 // ── Core ──
 
-export const getAppState = () =>
-  invoke<AppStateSnapshot>("get_app_state");
+export const getAppState = () => invoke<AppStateSnapshot>("get_app_state");
 
 // ── Workspace ──
 
@@ -290,7 +282,8 @@ export interface WorkspaceCreateResult {
  *  shape so the frontend never breaks on the sibling backend's rollout
  *  order. */
 function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
-  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false };
+  if (typeof raw === "string")
+    return { workspaceId: raw, cwd: null, adopted: false };
   const obj = (raw ?? {}) as {
     workspace_id?: string;
     workspaceId?: string;
@@ -324,9 +317,7 @@ export const createEmptyWorkspace = (
 export const getOrCreateHomeWorkspace = () =>
   invoke<string>("get_or_create_home_workspace");
 
-export const listChatProviderCapabilities = (
-  provider: AgentChatProviderKind,
-) =>
+export const listChatProviderCapabilities = (provider: AgentChatProviderKind) =>
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
   });
@@ -365,8 +356,10 @@ export const closeWorkspace = (workspaceId: string, forceDelete: boolean) =>
 export const cycleWorkspace = (step: number) =>
   invoke<string>("cycle_workspace", { step });
 
-export const splitPane = (paneId: string, direction: "horizontal" | "vertical") =>
-  invoke<string>("split_pane", { paneId, direction });
+export const splitPane = (
+  paneId: string,
+  direction: "horizontal" | "vertical",
+) => invoke<string>("split_pane", { paneId, direction });
 
 export const activatePane = (paneId: string) =>
   invoke("activate_pane", { paneId });
@@ -386,8 +379,11 @@ export const resizeSplit = (paneId: string, childSizes: number[]) =>
 export const resizeActivePane = (delta: number) =>
   invoke("resize_active_pane", { delta });
 
-export const notifyAttention = (message: string, sessionId: string, paneId: string) =>
-  invoke<string>("notify_attention", { message, sessionId, paneId });
+export const notifyAttention = (
+  message: string,
+  sessionId: string,
+  paneId: string,
+) => invoke<string>("notify_attention", { message, sessionId, paneId });
 
 export const setNotificationSoundEnabled = (enabled: boolean) =>
   invoke("set_notification_sound_enabled", { enabled });
@@ -426,11 +422,9 @@ export const renameTab = (workspaceId: string, tabId: string, title: string) =>
 export const reorderTabs = (workspaceId: string, tabIds: string[]) =>
   invoke("reorder_tabs", { workspaceId, tabIds });
 
-export const killPort = (port: number) =>
-  invoke("kill_port", { port });
+export const killPort = (port: number) => invoke("kill_port", { port });
 
-export const detectEditors = () =>
-  invoke<EditorInfo[]>("detect_editors");
+export const detectEditors = () => invoke<EditorInfo[]>("detect_editors");
 
 export const openInEditor = (editorId: string, path: string) =>
   invoke<void>("open_in_editor", { editorId, path });
@@ -503,7 +497,12 @@ export const closeWorkspaceWithWorktree = (
   deleteBranch: boolean,
   forceDelete: boolean,
 ) =>
-  invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
+  invoke<void>("close_workspace_with_worktree", {
+    workspaceId,
+    removeWorktree,
+    deleteBranch,
+    forceDelete,
+  });
 
 // ── Workspace archive ──
 //
@@ -556,7 +555,10 @@ export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
   invoke<void>("set_project_scripts", { path, scripts });
 
 export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
-  invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });
+  invoke<void>("run_project_dev_command", {
+    workspaceId,
+    forceNew: forceNew ?? false,
+  });
 
 export const detectPackageManager = (projectPath: string) =>
   invoke<DetectedSetup[]>("detect_package_manager", { projectPath });
@@ -575,11 +577,9 @@ export const checkoutDefaultBranchInWorkspace = (workspaceId: string) =>
 
 // ── GitHub ──
 
-export const checkGhStatus = () =>
-  invoke<GhStatus>("check_gh_status");
+export const checkGhStatus = () => invoke<GhStatus>("check_gh_status");
 
-export const checkGhAvailable = () =>
-  invoke<boolean>("check_gh_available");
+export const checkGhAvailable = () => invoke<boolean>("check_gh_available");
 
 export const checkGithubRepo = (path: string) =>
   invoke<boolean>("check_github_repo", { path });
@@ -608,7 +608,13 @@ export const createPullRequest = (
   base: string,
   draft: boolean,
 ) =>
-  invoke<PullRequestInfo>("create_pull_request", { path, title, body, base, draft });
+  invoke<PullRequestInfo>("create_pull_request", {
+    path,
+    title,
+    body,
+    base,
+    draft,
+  });
 
 export const listPullRequests = (path: string, state: string) =>
   invoke<PullRequestInfo[]>("list_pull_requests", { path, state });
@@ -626,14 +632,16 @@ export const getGithubPrDiffByPath = (
   path: string,
   prNumber: number,
   full: boolean,
-) =>
-  invoke<string>("get_github_pr_diff_by_path", { path, prNumber, full });
+) => invoke<string>("get_github_pr_diff_by_path", { path, prNumber, full });
 
 export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
-export const mergePullRequest = (path: string, prNumber: number, method: string) =>
-  invoke("merge_pull_request", { path, prNumber, method });
+export const mergePullRequest = (
+  path: string,
+  prNumber: number,
+  method: string,
+) => invoke("merge_pull_request", { path, prNumber, method });
 
 export const getPullRequestChecks = (path: string) =>
   invoke<CheckInfo[]>("get_pull_request_checks", { path });
@@ -644,8 +652,12 @@ export const getPrReviewComments = (path: string) =>
 export const getPrInlineComments = (path: string, prNumber: number) =>
   invoke<InlineReviewComment[]>("get_pr_inline_comments", { path, prNumber });
 
-export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
-  invoke("submit_pr_review", { path, prNumber, event, body });
+export const submitPrReview = (
+  path: string,
+  prNumber: number,
+  event: string,
+  body: string,
+) => invoke("submit_pr_review", { path, prNumber, event, body });
 
 // ── GitHub Issues ──
 
@@ -673,8 +685,10 @@ export const refreshWorkspaceIssue = (workspaceId: string) =>
 export const refreshWorkspacePr = (workspaceId: string) =>
   invoke("refresh_workspace_pr", { workspaceId });
 
-export const suggestIssueBranchName = (issueNumber: number, issueTitle: string) =>
-  invoke<string>("suggest_issue_branch_name", { issueNumber, issueTitle });
+export const suggestIssueBranchName = (
+  issueNumber: number,
+  issueTitle: string,
+) => invoke<string>("suggest_issue_branch_name", { issueNumber, issueTitle });
 
 // ── Database ──
 
@@ -700,7 +714,10 @@ export const dbAddRecentProject = (path: string, name: string) =>
   invoke("db_add_recent_project", { path, name });
 
 export const dbGetRecentProjects = (limit?: number) =>
-  invoke<Array<{ path: string; name: string; last_opened_at: string }>>("db_get_recent_projects", { limit });
+  invoke<Array<{ path: string; name: string; last_opened_at: string }>>(
+    "db_get_recent_projects",
+    { limit },
+  );
 
 // ── Git ──
 
@@ -751,8 +768,11 @@ export const getGitDiffStat = (path: string) =>
 export const getBaseBranchDiff = (path: string, baseBranch: string) =>
   invoke<BaseBranchDiff>("get_base_branch_diff", { path, baseBranch });
 
-export const getBaseBranchFileDiff = (path: string, baseBranch: string, file: string) =>
-  invoke<string>("get_base_branch_file_diff", { path, baseBranch, file });
+export const getBaseBranchFileDiff = (
+  path: string,
+  baseBranch: string,
+  file: string,
+) => invoke<string>("get_base_branch_file_diff", { path, baseBranch, file });
 
 export const getDefaultBranch = (path: string) =>
   invoke<string>("get_default_branch", { path });
@@ -784,8 +804,7 @@ export const gitFetchPrune = (path: string) =>
 export const gitStashPush = (path: string, includeUntracked: boolean) =>
   invoke("git_stash_push", { path, includeUntracked });
 
-export const gitStashPop = (path: string) =>
-  invoke("git_stash_pop", { path });
+export const gitStashPop = (path: string) => invoke("git_stash_pop", { path });
 
 export const gitAmendCommit = (path: string, message: string | null = null) =>
   invoke("git_amend_commit", { path, message });
@@ -816,15 +835,37 @@ export const listWorktrees = (path: string) =>
 export const mergeBranch = (path: string, sourceBranch: string) =>
   invoke<string>("merge_branch", { path, sourceBranch });
 
-export const mergeIntoBase = (path: string, baseBranch: string, deleteSourceBranch: boolean) =>
-  invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch, deleteSourceBranch });
+export const mergeIntoBase = (
+  path: string,
+  baseBranch: string,
+  deleteSourceBranch: boolean,
+) =>
+  invoke<MergeIntoBaseResult>("merge_into_base", {
+    path,
+    baseBranch,
+    deleteSourceBranch,
+  });
 
 export const completeMergeIntoBase = (
-  path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,
-) => invoke("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
+  path: string,
+  baseBranch: string,
+  tempBranch: string,
+  sourceBranch: string,
+  deleteSourceBranch: boolean,
+) =>
+  invoke("complete_merge_into_base", {
+    path,
+    baseBranch,
+    tempBranch,
+    sourceBranch,
+    deleteSourceBranch,
+  });
 
-export const abortMergeIntoBase = (path: string, sourceBranch: string, tempBranch: string) =>
-  invoke("abort_merge_into_base", { path, sourceBranch, tempBranch });
+export const abortMergeIntoBase = (
+  path: string,
+  sourceBranch: string,
+  tempBranch: string,
+) => invoke("abort_merge_into_base", { path, sourceBranch, tempBranch });
 
 export const getMergeState = (path: string) =>
   invoke<MergeState>("get_merge_state", { path });
@@ -841,8 +882,7 @@ export const resolveConflictTheirs = (path: string, file: string) =>
 export const markConflictResolved = (path: string, file: string) =>
   invoke("mark_conflict_resolved", { path, file });
 
-export const abortMerge = (path: string) =>
-  invoke("abort_merge", { path });
+export const abortMerge = (path: string) => invoke("abort_merge", { path });
 
 export const continueMerge = (path: string, message: string) =>
   invoke("continue_merge", { path, message });
@@ -852,19 +892,36 @@ export const continueMerge = (path: string, message: string) =>
 export const createResolverBranch = (path: string, targetBranch: string) =>
   invoke<ResolverBranchInfo>("create_resolver_branch", { path, targetBranch });
 
-export const applyResolution = (path: string, tempBranch: string, originalBranch: string, message: string) =>
-  invoke("apply_resolution", { path, tempBranch, originalBranch, message });
+export const applyResolution = (
+  path: string,
+  tempBranch: string,
+  originalBranch: string,
+  message: string,
+) => invoke("apply_resolution", { path, tempBranch, originalBranch, message });
 
-export const abortResolution = (path: string, tempBranch: string, originalBranch: string) =>
-  invoke("abort_resolution", { path, tempBranch, originalBranch });
+export const abortResolution = (
+  path: string,
+  tempBranch: string,
+  originalBranch: string,
+) => invoke("abort_resolution", { path, tempBranch, originalBranch });
 
 export const getResolutionDiff = (path: string) =>
   invoke<string>("get_resolution_diff", { path });
 
 export const resolveConflictsWithAgent = (
-  path: string, cli: string, model: string | null, strategy: string, files: string[]
+  path: string,
+  cli: string,
+  model: string | null,
+  strategy: string,
+  files: string[],
 ) =>
-  invoke<string>("resolve_conflicts_with_agent", { path, cli, model, strategy, files });
+  invoke<string>("resolve_conflicts_with_agent", {
+    path,
+    cli,
+    model,
+    strategy,
+    files,
+  });
 
 // ── AI ──
 
@@ -916,14 +973,16 @@ export const browserSetLoadingState = (
   browserId: string,
   isLoading: boolean,
   error: string | null,
-) =>
-  invoke("browser_set_loading_state", { browserId, isLoading, error });
+) => invoke("browser_set_loading_state", { browserId, isLoading, error });
 
 export const agentBrowserSpawn = (browserId: string) =>
   invoke("agent_browser_spawn", { browserId });
 
-export const agentBrowserRun = (browserId: string, action: string, params: unknown) =>
-  invoke("agent_browser_run", { browserId, action, params });
+export const agentBrowserRun = (
+  browserId: string,
+  action: string,
+  params: unknown,
+) => invoke("agent_browser_run", { browserId, action, params });
 
 export const agentBrowserClose = (browserId: string) =>
   invoke("agent_browser_close", { browserId });
@@ -936,14 +995,11 @@ export const startBrowserStream = (browserId: string) =>
 
 // ── Browser Data ──
 
-export const getBrowserDataSize = () =>
-  invoke<number>("get_browser_data_size");
+export const getBrowserDataSize = () => invoke<number>("get_browser_data_size");
 
-export const clearBrowserCookies = () =>
-  invoke<void>("clear_browser_cookies");
+export const clearBrowserCookies = () => invoke<void>("clear_browser_cookies");
 
-export const clearAllBrowserData = () =>
-  invoke<void>("clear_all_browser_data");
+export const clearAllBrowserData = () => invoke<void>("clear_all_browser_data");
 
 // ── Memory ──
 
@@ -973,16 +1029,14 @@ export const generateProjectHandoff = () =>
 
 // ── Theme ──
 
-export const getCurrentTheme = () =>
-  invoke<ThemeColors>("get_current_theme");
+export const getCurrentTheme = () => invoke<ThemeColors>("get_current_theme");
 
 export const getShellAppearance = () =>
   invoke<ShellAppearance>("get_shell_appearance");
 
 // ── Presets ──
 
-export const getPresets = () =>
-  invoke<PresetStoreSnapshot>("get_presets");
+export const getPresets = () => invoke<PresetStoreSnapshot>("get_presets");
 
 export const createPreset = (params: {
   name: string;
@@ -994,8 +1048,7 @@ export const createPreset = (params: {
   icon: string | null;
   /** Structured agent-launcher source, or null for raw presets. */
   launchConfig?: PresetLaunchConfig | null;
-}) =>
-  invoke<string>("create_preset", params);
+}) => invoke<string>("create_preset", params);
 
 export const updatePreset = (params: {
   id: string;
@@ -1011,11 +1064,9 @@ export const updatePreset = (params: {
   launchConfig?: PresetLaunchConfig | null;
   /** Remove the structured config (switching to a raw command preset). */
   clearLaunchConfig?: boolean;
-}) =>
-  invoke("update_preset", params);
+}) => invoke("update_preset", params);
 
-export const deletePreset = (id: string) =>
-  invoke("delete_preset", { id });
+export const deletePreset = (id: string) => invoke("delete_preset", { id });
 
 export const setPresetPinned = (id: string, pinned: boolean) =>
   invoke("set_preset_pinned", { id, pinned });
@@ -1146,7 +1197,10 @@ export const saveTerminalScrollback = (payload: ScrollbackPayload) =>
   invoke("save_terminal_scrollback", { payload });
 
 export const getTerminalScrollback = (workspaceId: string, paneId: string) =>
-  invoke<ScrollbackRestore | null>("get_terminal_scrollback", { workspaceId, paneId });
+  invoke<ScrollbackRestore | null>("get_terminal_scrollback", {
+    workspaceId,
+    paneId,
+  });
 
 export const cacheTerminalScrollback = (payload: ScrollbackPayload) =>
   invoke("cache_terminal_scrollback", { payload });
@@ -1171,10 +1225,19 @@ export const searchInFiles = (
   caseSensitive: boolean,
   maxResults: number,
 ) =>
-  invoke<SearchResult[]>("search_in_files", { path, query, regex, caseSensitive, maxResults });
+  invoke<SearchResult[]>("search_in_files", {
+    path,
+    query,
+    regex,
+    caseSensitive,
+    maxResults,
+  });
 
-export const searchFileNames = (path: string, query: string, maxResults: number) =>
-  invoke<string[]>("search_file_names", { path, query, maxResults });
+export const searchFileNames = (
+  path: string,
+  query: string,
+  maxResults: number,
+) => invoke<string[]>("search_file_names", { path, query, maxResults });
 
 export const revealInFileManager = (path: string) =>
   invoke<void>("reveal_in_file_manager", { path });
@@ -1182,8 +1245,7 @@ export const revealInFileManager = (path: string) =>
 export const listDirectory = (path: string, showHidden?: boolean) =>
   invoke<FileEntry[]>("list_directory", { path, showHidden });
 
-export const readFile = (path: string) =>
-  invoke<string>("read_file", { path });
+export const readFile = (path: string) => invoke<string>("read_file", { path });
 
 export const writeFile = (path: string, content: string) =>
   invoke<void>("write_file", { path, content });
@@ -1280,8 +1342,7 @@ export const pickOpenFileDialog = (opts: OpenDialogOptions = {}) =>
 
 // ── Update ──
 
-export const getPackageFormat = () =>
-  invoke<string>("get_package_format");
+export const getPackageFormat = () => invoke<string>("get_package_format");
 
 // ── Agent Chat ──
 //
@@ -1364,8 +1425,7 @@ export const agentChatStartSession = (
   paneId: string,
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
-) =>
-  invoke<string>("agent_chat_start_session", { paneId, provider, input });
+) => invoke<string>("agent_chat_start_session", { paneId, provider, input });
 
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
@@ -1597,6 +1657,48 @@ export interface AgentChatSessionRecord {
   fast_mode?: boolean;
 }
 
+/** Provider-neutral conversation row for the composer's `@session:` picker.
+ *  `preview` is the newest persisted user/assistant prose; hidden reasoning
+ *  and tool output are excluded by the backend conversation index. */
+export interface AgentChatSessionMention {
+  thread_id: string;
+  workspace_id: string;
+  cwd: string | null;
+  provider: string;
+  title: string | null;
+  last_active_at: string;
+  preview: string;
+  message_count: number;
+}
+
+/** Safe, size-bounded handoff payload materialised from one persisted chat. */
+export interface AgentChatSessionContext {
+  thread_id: string;
+  workspace_id: string;
+  cwd: string | null;
+  provider: string;
+  title: string | null;
+  last_active_at: string;
+  content: string;
+  message_count: number;
+  included_message_count: number;
+  truncated: boolean;
+  handoff_kind: "summary" | "direct";
+  summary_cached: boolean;
+  summary_error: string | null;
+  summarizer_provider: string | null;
+  summarizer_model: string | null;
+  summarizer_effort: string | null;
+  revision_message_id: number;
+  full_history_available: boolean;
+}
+
+export interface UtilityModelSelection {
+  provider: AgentChatProviderKind;
+  model: string;
+  effort: string | null;
+}
+
 /** One SQLite FTS5 hit in the persisted conversation store. A content hit
  * carries the durable message row id used for transcript deep-linking; a
  * title-only hit carries `null` and opens at the start of the thread. */
@@ -1641,6 +1743,30 @@ export const agentChatListSessions = (
     limit,
   });
 
+export const agentChatListSessionMentions = (
+  workspaceId: string,
+  currentCwd: string | null,
+  excludeThreadId: string | null,
+  limit = 30,
+) =>
+  invoke<AgentChatSessionMention[]>("agent_chat_list_session_mentions", {
+    workspaceId,
+    currentCwd,
+    excludeThreadId,
+    limit,
+  });
+
+export const agentChatGetSessionContext = (
+  workspaceId: string,
+  threadId: string,
+  utilitySelection: UtilityModelSelection | null = null,
+) =>
+  invoke<AgentChatSessionContext>("agent_chat_get_session_context", {
+    workspaceId,
+    threadId,
+    utilitySelection,
+  });
+
 export const agentChatSearch = (
   query: string,
   workspaceIds: string[],
@@ -1680,8 +1806,7 @@ export const agentChatGetSession = (threadId: string) =>
 export const agentChatUpdateSessionConfig = (
   threadId: string,
   config: AgentChatSessionConfigUpdate,
-) =>
-  invoke<void>("agent_chat_update_session_config", { threadId, config });
+) => invoke<void>("agent_chat_update_session_config", { threadId, config });
 
 /**
  * Return the persisted message envelopes for a thread, in original
@@ -1791,10 +1916,8 @@ export const attachAgentChatOutput = (
 
 /** Tear down the channel installed by `attachAgentChatOutput`.
  *  Idempotent; a mismatched generation is a silent no-op. */
-export const detachAgentChatOutput = (
-  threadId: string,
-  generation: number,
-) => invoke<void>("detach_agent_chat_output", { threadId, generation });
+export const detachAgentChatOutput = (threadId: string, generation: number) =>
+  invoke<void>("detach_agent_chat_output", { threadId, generation });
 
 // ── OpenCode (Step 12 Stage 1) ──
 //
@@ -1813,9 +1936,7 @@ export const detachAgentChatOutput = (
  *  HTTP round-trip. The settings panel (later stage) will pass a
  *  candidate URL so the user can validate "is this endpoint
  *  reachable" before saving the change. */
-export const opencodeCheckAvailability = (
-  serverUrl: string | null = null,
-) =>
+export const opencodeCheckAvailability = (serverUrl: string | null = null) =>
   invoke<OpenCodeAvailability>("opencode_check_availability", {
     serverUrl,
   });
@@ -1832,8 +1953,7 @@ export const opencodeCheckAvailability = (
 export const opencodePing = (
   baseUrl: string,
   serverPassword: string | null = null,
-) =>
-  invoke<void>("opencode_ping", { baseUrl, serverPassword });
+) => invoke<void>("opencode_ping", { baseUrl, serverPassword });
 
 /** Step 12 Stage 2 — fetch the running OpenCode server's full
  *  provider catalogue. The Rust side spawns `opencode serve`
@@ -1875,8 +1995,7 @@ export const listToolPermissions = (projectRoot: string | null) =>
 export const removeToolPermission = (
   rule: PermissionRule,
   projectRoot: string | null,
-) =>
-  invoke<void>("remove_tool_permission", { rule, projectRoot });
+) => invoke<void>("remove_tool_permission", { rule, projectRoot });
 
 // ── Usage ──
 
@@ -2049,24 +2168,12 @@ export const usageScanProviderHistory = () =>
 
 export type SkillProvider = "claude" | "codex" | "opencode" | "codemux";
 export type SkillScope =
-  | "user"
-  | "project"
-  | "plugin"
-  | "managed"
-  | "admin"
-  | "system"
-  | "configured";
+  "user" | "project" | "plugin" | "managed" | "admin" | "system" | "configured";
 export type SkillCompatibility = "compatible" | "soft-warn" | "hard-warn";
 export type SkillAvailability =
-  | "native"
-  | "explicit-portable"
-  | "native-only"
-  | "unavailable";
+  "native" | "explicit-portable" | "native-only" | "unavailable";
 export type SkillInvocationKind =
-  | "native-command"
-  | "codex-skill-item"
-  | "prompt-prefix"
-  | "none";
+  "native-command" | "codex-skill-item" | "prompt-prefix" | "none";
 export type SkillProvenance = "filesystem" | "provider_catalog";
 
 export interface SkillProjection {
@@ -2117,7 +2224,8 @@ export const listSkills = (
   projectRoot: string | null,
   includePlugins: boolean,
   force = false,
-) => invoke<SkillInventory>("list_skills", { projectRoot, includePlugins, force });
+) =>
+  invoke<SkillInventory>("list_skills", { projectRoot, includePlugins, force });
 
 /** One provider-native slash command (e.g. Claude Code's `/compact`,
  *  `/init`, `/review`, or a custom `.claude/commands` entry).
@@ -2152,11 +2260,9 @@ export const listChatSlashCommands = (
 export const startSkillsWatcher = (
   projectRoot: string | null,
   includePlugins: boolean,
-) =>
-  invoke<number>("start_skills_watcher", { projectRoot, includePlugins });
+) => invoke<number>("start_skills_watcher", { projectRoot, includePlugins });
 
-export const stopSkillsWatcher = () =>
-  invoke<void>("stop_skills_watcher");
+export const stopSkillsWatcher = () => invoke<void>("stop_skills_watcher");
 
 /** Tauri event name emitted whenever a watched skill file changes. */
 export const SKILLS_CHANGED_EVENT = "skills-changed";
@@ -2194,9 +2300,8 @@ export interface McpServerConfig {
 
 /** Discover all configured MCP servers across providers, plus Codemux's
  *  hardcoded entry. Stateless — no spawn, no caching. */
-export const listMcpServers = (
-  projectRoot: string | null,
-) => invoke<McpServerConfig[]>("list_mcp_servers", { projectRoot });
+export const listMcpServers = (projectRoot: string | null) =>
+  invoke<McpServerConfig[]>("list_mcp_servers", { projectRoot });
 
 // ── MCP runtime (Stage 2) ──
 
@@ -2211,11 +2316,7 @@ export const MCP_CODEMUX_SELF_ID = "codemux-self";
 export const MCP_STATUS_CHANGED_EVENT = "mcp-status-changed";
 
 export type McpServerStatusKind =
-  | "discovered"
-  | "starting"
-  | "running"
-  | "errored"
-  | "stopped";
+  "discovered" | "starting" | "running" | "errored" | "stopped";
 
 /** Discriminated by `kind` so TS exhaustiveness checks catch missing
  *  arms in the UI. Mirrors the Rust `McpServerStatus` enum. */
@@ -2331,8 +2432,7 @@ export const hostsAdd = (name: string, sshTarget: string) =>
 export const hostsUpdate = (id: number, name: string, sshTarget: string) =>
   invoke<HostView>("hosts_update", { id, name, sshTarget });
 
-export const hostsDelete = (id: number) =>
-  invoke<void>("hosts_delete", { id });
+export const hostsDelete = (id: number) => invoke<void>("hosts_delete", { id });
 
 export const hostsTestConnection = (id: number) =>
   invoke<HostTestResult>("hosts_test_connection", { id });
@@ -2476,7 +2576,10 @@ export interface WorkspacePullOutcome {
  *  workspace's host_id only on successful rsync — no need for the
  *  frontend to do an optimistic-set + rollback dance. */
 export const workspacePushToHost = (workspaceId: string, hostId: number) =>
-  invoke<WorkspacePushOutcome>("workspace_push_to_host", { workspaceId, hostId });
+  invoke<WorkspacePushOutcome>("workspace_push_to_host", {
+    workspaceId,
+    hostId,
+  });
 
 /** Pull a remote workspace back to local. Clears host_id on success. */
 export const workspacePullBack = (workspaceId: string) =>
@@ -2545,8 +2648,7 @@ export const workspacesSyncList = () =>
 /** Force an immediate pull + push pass. The background loop runs
  *  every 30s; use this only when the user explicitly hits a "Sync
  *  now" affordance. Returns Ok even if the user isn't signed in. */
-export const workspacesSyncNow = () =>
-  invoke<void>("workspaces_sync_now");
+export const workspacesSyncNow = () => invoke<void>("workspaces_sync_now");
 
 // ── Cross-device adoption (Phase 2) ──
 //
@@ -2791,4 +2893,6 @@ export const searchMarketplaceThemes = (query: string) =>
   invoke<MarketplaceTheme[]>("vscode_marketplace_search", { query });
 
 export const fetchMarketplaceThemes = (vsixUrl: string) =>
-  invoke<MarketplaceThemeVariant[]>("vscode_marketplace_fetch_themes", { vsixUrl });
+  invoke<MarketplaceThemeVariant[]>("vscode_marketplace_fetch_themes", {
+    vsixUrl,
+  });

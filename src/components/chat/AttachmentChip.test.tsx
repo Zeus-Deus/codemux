@@ -18,6 +18,55 @@ function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
 }
 
 describe("AttachmentChip", () => {
+  describe("session handoff kind", () => {
+    it("renders a compact provider-neutral conversation chip", () => {
+      const attachment = makeAttachment({
+        kind: "session",
+        ref: "thread-auth",
+        metadata: {
+          label: "Harden authentication",
+          mentionToken: "harden-auth-123456",
+          sourceProvider: "codex",
+          messageCount: 18,
+          includedMessageCount: 12,
+          isContextTruncated: true,
+        },
+        resolvedContent: "User:\nFix auth",
+      });
+      const { getByRole, getByText } = render(
+        <AttachmentChip attachment={attachment} onRemove={vi.fn()} />,
+      );
+      const chip = getByRole("status");
+      expect(chip).toHaveAttribute("data-attachment-kind", "session");
+      expect(chip.className).toContain("bg-primary/10");
+      expect(getByText("Harden authentication")).toBeInTheDocument();
+    });
+
+    it("shows a summary status and summarizer details", () => {
+      const attachment = makeAttachment({
+        kind: "session",
+        ref: "thread-summary",
+        metadata: {
+          label: "Provider handoff",
+          handoffKind: "summary",
+          summaryCached: true,
+          sourceProvider: "codex",
+          summarizerModel: "gpt-5.6-luna",
+          summarizerEffort: "low",
+          messageCount: 24,
+          includedMessageCount: 24,
+          fullHistoryAvailable: true,
+        },
+        resolvedContent: "## Goal\nContinue the work",
+      });
+      const { getByText, getByTestId } = render(
+        <AttachmentChip attachment={attachment} onRemove={vi.fn()} />,
+      );
+      expect(getByText("Summary")).toBeInTheDocument();
+      expect(getByTestId("session-handoff-kind")).toHaveTextContent("Summary");
+    });
+  });
+
   describe("file kind (Stage 1 fully-tested path)", () => {
     it("renders the label and line count", () => {
       const { getByText } = render(
@@ -203,9 +252,7 @@ describe("AttachmentChip", () => {
           onRemove={vi.fn()}
         />,
       );
-      expect(getByRole("status").className).toContain(
-        "text-muted-foreground",
-      );
+      expect(getByRole("status").className).toContain("text-muted-foreground");
     });
 
     it("closed PR renders muted neutral", () => {
@@ -218,9 +265,7 @@ describe("AttachmentChip", () => {
           onRemove={vi.fn()}
         />,
       );
-      expect(getByRole("status").className).toContain(
-        "text-muted-foreground",
-      );
+      expect(getByRole("status").className).toContain("text-muted-foreground");
     });
 
     it("image uses the accent variant", () => {
@@ -414,10 +459,7 @@ describe("AttachmentChip", () => {
 
     it("omits the expand button when onToggleExpand is not provided", () => {
       const { queryByTestId } = render(
-        <AttachmentChip
-          attachment={makePrAttachment()}
-          onRemove={vi.fn()}
-        />,
+        <AttachmentChip attachment={makePrAttachment()} onRemove={vi.fn()} />,
       );
       expect(queryByTestId("attachment-chip-expand")).toBeNull();
     });

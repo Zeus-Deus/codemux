@@ -77,6 +77,7 @@ pub mod state;
 pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
+pub mod utility_ai;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
 pub mod trace;
@@ -2062,6 +2063,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
+            commands::agent_chat_list_session_mentions,
+            commands::agent_chat_get_session_context,
             commands::agent_chat_search,
             commands::agent_chat_open_search_result,
             commands::agent_chat_get_session,

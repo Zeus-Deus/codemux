@@ -29,10 +29,7 @@ import {
   materializeAndSend,
   type MaterializePhase,
 } from "@/lib/agent-chat/materialize";
-import type {
-  UserMessageImage,
-  UserMessageItem,
-} from "@/lib/agent-chat/types";
+import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
 import {
   resolveSkillSelection,
   skillsForProvider,
@@ -40,12 +37,16 @@ import {
 import { refreshSkillSelectionForCwd } from "@/lib/agent-chat/skill-selection-refresh";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
-import { toast } from "@/lib/toast";
 import {
-  useAgentChatStore,
-  type Attachment,
-} from "@/stores/agent-chat-store";
+  sessionMentionTitle,
+  sessionMentionToken,
+} from "@/lib/agent-chat/session-mentions";
+import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { toast } from "@/lib/toast";
+import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
@@ -63,9 +64,11 @@ import {
   getGithubIssueByPath,
   getGithubPrByPath,
   getGithubPrDiffByPath,
+  agentChatGetSessionContext,
   primeChatMcp,
   readFileForAttachment,
   readFolderForAttachment,
+  type AgentChatSessionMention,
 } from "@/tauri/commands";
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import type {
@@ -93,6 +96,8 @@ const CLEAR_AFTER_PROMOTION_MS = 5000;
  *  a fresh reference every render and retrigger the chip-strip render
  *  effect in an infinite loop. */
 const EMPTY_ATTACHMENTS: Attachment[] = [];
+const ATTACHMENT_HARD_LIMIT = 20;
+const SESSION_ATTACHMENT_LIMIT = 3;
 
 /**
  * Top-level draft surface. Reads the active draft, wires a Composer
@@ -154,7 +159,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const existingWorkspaceCwd = useAppStore((s) => {
     if (draft.target.kind !== "existing_workspace") return null;
     const wsId = draft.target.workspaceId;
-    return s.appState?.workspaces.find((w) => w.workspace_id === wsId)?.cwd ?? null;
+    return (
+      s.appState?.workspaces.find((w) => w.workspace_id === wsId)?.cwd ?? null
+    );
   });
 
   // Identity + project path of the currently active sidebar workspace.
@@ -182,7 +189,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     const ws = st.workspaces.find(
       (w) => w.workspace_id === st.active_workspace_id,
     );
-    return ws ? ws.project_root ?? ws.cwd ?? null : null;
+    return ws ? (ws.project_root ?? ws.cwd ?? null) : null;
   });
 
   // Seed the home draft's target with the active sidebar workspace on
@@ -266,6 +273,15 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     }
   }, [draft.target, existingWorkspaceCwd]);
 
+  // Session history is workspace-scoped. A brand-new Home/project draft has
+  // no workspace identity yet, so `@session:` stays unavailable until the
+  // user targets an existing workspace; once materialised, the live pane
+  // automatically exposes it.
+  const sessionWorkspaceId =
+    draft.target.kind === "existing_workspace"
+      ? draft.target.workspaceId
+      : null;
+
   // Synchronous guard against duplicate submissions while a single
   // materialise is in flight. Mirrors AgentChatPane's send-in-flight
   // ref pattern.
@@ -332,9 +348,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       });
       // Re-read after the mutation so the snapshot handed to
       // materializeAndSend carries the corrected target.
-      const refreshed = useChatDraftStore
-        .getState()
-        .draftsById[currentDraft.draftId];
+      const refreshed =
+        useChatDraftStore.getState().draftsById[currentDraft.draftId];
       if (refreshed) currentDraft = refreshed;
     }
 
@@ -372,11 +387,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // attachments whose `@<basename>` token is still in the textarea
     // text, so deleting a token excludes the file from the first
     // turn injection.
-    const liveSlice = useAgentChatStore.getState().threads[currentDraft.threadId];
+    const liveSlice =
+      useAgentChatStore.getState().threads[currentDraft.threadId];
     const liveAttachments = liveSlice?.stagedAttachments ?? [];
-    const attachmentBlock = buildAttachmentBlock(
-      activeAttachments(text, liveAttachments),
-    );
     // The staged images as `data:` URLs so both the pending conversation
     // below AND the optimistic user bubble in the new pane render their
     // thumbnails immediately (built from the in-memory bytes).
@@ -411,6 +424,44 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     updateDraftInput(finalDraft.draftId, "");
 
     void (async () => {
+      // A conversation in another tab can advance while this draft is open.
+      // Refresh every staged handoff at the last responsible moment so the
+      // first provider turn receives the newest visible progress.
+      const sourceWorkspaceId =
+        finalDraft.target.kind === "existing_workspace"
+          ? finalDraft.target.workspaceId
+          : null;
+      if (sourceWorkspaceId) {
+        const sessionAttachments =
+          useAgentChatStore
+            .getState()
+            .threads[finalDraft.threadId]?.stagedAttachments.filter(
+              (attachment) => attachment.kind === "session",
+            ) ?? [];
+        await Promise.all(
+          sessionAttachments.map(async (attachment) => {
+            try {
+              const context = await agentChatGetSessionContext(
+                sourceWorkspaceId,
+                attachment.ref,
+                utilitySelectionFromStores(),
+              );
+              updateStagedAttachment(finalDraft.threadId, attachment.id, {
+                resolvedContent: context.content,
+                metadata: metadataFromSessionContext(
+                  context,
+                  attachment.metadata,
+                ),
+              });
+            } catch (error) {
+              console.warn(
+                `[agent-chat] session handoff refresh failed for ${attachment.ref}`,
+                error,
+              );
+            }
+          }),
+        );
+      }
       // Images stage at attach time; await only stragglers, then read
       // fresh so staging patches (new attachment objects) are visible.
       const imageIds = imageAttachmentIds(liveAttachments);
@@ -431,6 +482,21 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         return;
       }
       const imageRefs = buildImageRefs(freshAttachments);
+      const activeFreshAttachments = activeAttachments(text, freshAttachments);
+      const unavailableSession = activeFreshAttachments.find(
+        (attachment) =>
+          attachment.kind === "session" && !attachment.resolvedContent?.trim(),
+      );
+      if (unavailableSession) {
+        setPending(null);
+        updateDraftInput(finalDraft.draftId, text);
+        toast.error("Conversation handoff could not be loaded", {
+          description: `Remove ${unavailableSession.metadata.label} or try again.`,
+        });
+        sendInFlightRef.current = false;
+        return;
+      }
+      const attachmentBlock = buildAttachmentBlock(activeFreshAttachments);
 
       const result = await materializeAndSend(
         finalDraft,
@@ -501,6 +567,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     setActiveDraft,
     clearDraft,
     clearStagedAttachments,
+    updateStagedAttachment,
     updateDraftInput,
   ]);
 
@@ -555,12 +622,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         }
       })();
     },
-    [
-      draft.threadId,
-      displayCwd,
-      addStagedAttachment,
-      updateStagedAttachment,
-    ],
+    [draft.threadId, displayCwd, addStagedAttachment, updateStagedAttachment],
   );
 
   /** Step 8 Stage 6 — image counterpart for the draft surface.
@@ -571,12 +633,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
    *  restart re-prompts the user to re-paste. */
   const handleAttachImage = useCallback(
     async (file: File) => {
-      const allowed = [
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "image/gif",
-      ];
+      const allowed = ["image/png", "image/jpeg", "image/webp", "image/gif"];
       if (!allowed.includes(file.type)) {
         toast.error("Image type not supported", {
           description: `${file.type || "unknown type"} — supported: png, jpeg, webp, gif`,
@@ -670,12 +727,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         }
       })();
     },
-    [
-      draft.threadId,
-      displayCwd,
-      addStagedAttachment,
-      updateStagedAttachment,
-    ],
+    [draft.threadId, displayCwd, addStagedAttachment, updateStagedAttachment],
   );
 
   /** Step 8 Stage 4 — issue counterpart for the draft surface. Same
@@ -688,9 +740,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const initialState = (summary.state.toLowerCase() === "closed"
-        ? "closed"
-        : "open") as "open" | "closed";
+      const initialState = (
+        summary.state.toLowerCase() === "closed" ? "closed" : "open"
+      ) as "open" | "closed";
       addStagedAttachment(draft.threadId, {
         id,
         kind: "issue",
@@ -727,12 +779,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         }
       })();
     },
-    [
-      draft.threadId,
-      displayCwd,
-      addStagedAttachment,
-      updateStagedAttachment,
-    ],
+    [draft.threadId, displayCwd, addStagedAttachment, updateStagedAttachment],
   );
 
   /** Step 8 Stage 5 — PR counterpart for the draft surface. */
@@ -798,9 +845,106 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         }
       })();
     },
+    [draft.threadId, displayCwd, addStagedAttachment, updateStagedAttachment],
+  );
+
+  const handleAttachSession = useCallback(
+    (session: AgentChatSessionMention) => {
+      if (!sessionWorkspaceId) return;
+      const liveAttachments =
+        useAgentChatStore.getState().threads[draft.threadId]
+          ?.stagedAttachments ?? [];
+      if (
+        liveAttachments.some(
+          (attachment) =>
+            attachment.kind === "session" &&
+            attachment.ref === session.thread_id,
+        )
+      ) {
+        return;
+      }
+      if (
+        liveAttachments.filter((attachment) => attachment.kind === "session")
+          .length >= SESSION_ATTACHMENT_LIMIT
+      ) {
+        toast.error("Conversation handoff limit reached", {
+          description: `Attach up to ${SESSION_ATTACHMENT_LIMIT} conversations per message.`,
+        });
+        return;
+      }
+      if (liveAttachments.length >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
+
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const label = sessionMentionTitle(session);
+      const mentionToken = sessionMentionToken(session);
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "session",
+        ref: session.thread_id,
+        metadata: {
+          label,
+          mentionToken,
+          sourceProvider: session.provider,
+          sourceCwd: session.cwd,
+          sourceUpdatedAt: session.last_active_at,
+          messageCount: session.message_count,
+          isLoading: true,
+        },
+      });
+      void agentChatGetSessionContext(
+        sessionWorkspaceId,
+        session.thread_id,
+        utilitySelectionFromStores(),
+      )
+        .then((context) => {
+          updateStagedAttachment(draft.threadId, id, {
+            resolvedContent: context.content,
+            metadata: metadataFromSessionContext(context, {
+              label,
+              mentionToken,
+            }),
+          });
+          if (
+            context.summary_error === "utility_model_required" ||
+            context.summary_error === "utility_agent_unavailable"
+          ) {
+            toast.warning("Direct transcript attached", {
+              description:
+                "Choose or change the Utility agent to generate clean handoff summaries.",
+              action: {
+                label: "Choose agent",
+                onClick: () =>
+                  useUIStore.getState().setShowSettings(true, "agent"),
+              },
+            });
+          }
+        })
+        .catch((error) => {
+          updateStagedAttachment(draft.threadId, id, {
+            metadata: {
+              label,
+              mentionToken,
+              sourceProvider: session.provider,
+              sourceCwd: session.cwd,
+              sourceUpdatedAt: session.last_active_at,
+              messageCount: session.message_count,
+              isLoading: false,
+              error: String(error),
+            },
+          });
+        });
+    },
     [
       draft.threadId,
-      displayCwd,
+      sessionWorkspaceId,
       addStagedAttachment,
       updateStagedAttachment,
     ],
@@ -810,8 +954,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // `null` means "not yet known"; the popup keeps GitHub entries
   // disabled while the preflight is in flight to avoid a flicker.
   const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
-  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
-  const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<
+    boolean | null
+  >(null);
+  const [providerAuthenticated, setProviderAuthenticated] = useState<
+    boolean | null
+  >(null);
   useEffect(() => {
     if (!displayCwd) {
       setRepoSupported(false);
@@ -899,13 +1047,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     [draft.draftId, updateDraftConfig],
   );
   const handleContextWindowChange = useCallback(
-    (next: string) =>
-      updateDraftConfig(draft.draftId, { contextWindow: next }),
+    (next: string) => updateDraftConfig(draft.draftId, { contextWindow: next }),
     [draft.draftId, updateDraftConfig],
   );
   const handleFastModeChange = useCallback(
-    (next: boolean) =>
-      updateDraftConfig(draft.draftId, { fastMode: next }),
+    (next: boolean) => updateDraftConfig(draft.draftId, { fastMode: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -951,7 +1097,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     [draft.draftId, updateDraftConfig],
   );
   const handleChangeBaseBranch = useCallback(
-    (branch: string) => updateDraftConfig(draft.draftId, { baseBranch: branch }),
+    (branch: string) =>
+      updateDraftConfig(draft.draftId, { baseBranch: branch }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -982,6 +1129,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       draft={draft.inputDraft}
       cwd={displayCwd}
       provider={draft.provider}
+      workspaceId={sessionWorkspaceId}
+      threadId={draft.threadId}
       model={draft.model}
       permissionMode={draft.permissionMode}
       effort={draft.effort}
@@ -1017,8 +1166,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         // was an image that already staged.
         const staged = useAgentChatStore
           .getState()
-          .threads[draft.threadId]?.stagedAttachments.find((a) => a.id === id)
-          ?.stagedImage;
+          .threads[draft.threadId]?.stagedAttachments.find(
+            (a) => a.id === id,
+          )?.stagedImage;
         if (staged) discardStagedImage(staged.path);
         removeStagedAttachment(draft.threadId, id);
       }}
@@ -1026,6 +1176,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
+      onAttachSession={handleAttachSession}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}

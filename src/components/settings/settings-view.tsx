@@ -74,6 +74,8 @@ import {
   type AutoSettleDays,
 } from "@/stores/settings-store";
 import { ThemeSettings } from "./theme-settings";
+import { UtilityAgentSetting } from "./utility-agent-setting";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
@@ -1957,7 +1959,9 @@ export function SettingsView() {
                     model anywhere (chat composer, this row, the resolver
                     row) and it's starred everywhere via the shared
                     `picker-favorites-store`. */}
-                <SettingRow label="Agent" description="Which AI agent (and model) generates commit messages.">
+                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model.">
+                  {config?.ai_commit_message_cli || config?.ai_commit_message_model ? (
+                    <div className="flex items-center gap-2">
                   <MultiProviderModelPicker
                     provider={(config?.ai_commit_message_cli ?? "claude") as AgentChatProviderKind}
                     model={config?.ai_commit_message_model ?? null}
@@ -1969,6 +1973,39 @@ export function SettingsView() {
                     }}
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 text-[11px] text-muted-foreground"
+                        onClick={() => {
+                          setAiCommitMessageCli(null).catch(console.error);
+                          storeSet("ai_commit_message_cli", "");
+                          setAiCommitMessageModel(null).catch(console.error);
+                          storeSet("ai_commit_message_model", "");
+                        }}
+                      >
+                        Use default
+                      </Button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="flex h-9 min-w-[220px] items-center gap-2 rounded-md border border-border/70 bg-muted/25 px-3 text-left transition-colors hover:bg-muted/45 disabled:opacity-50"
+                      disabled={!(config?.ai_commit_message_enabled ?? true)}
+                      onClick={() => {
+                        const utility = utilitySelectionFromStores();
+                        if (!utility) return;
+                        setAiCommitMessageCli(utility.provider).catch(console.error);
+                        storeSet("ai_commit_message_cli", utility.provider);
+                        setAiCommitMessageModel(utility.model).catch(console.error);
+                        storeSet("ai_commit_message_model", utility.model);
+                      }}
+                    >
+                      <Sparkles className="h-3.5 w-3.5 text-primary/70" />
+                      <span className="text-[11px] text-muted-foreground">Utility agent default</span>
+                      <span className="ml-auto text-[9px] uppercase tracking-[0.1em] text-muted-foreground/50">Customize</span>
+                    </button>
+                  )}
                 </SettingRow>
               </div>
             </SectionGroup>
@@ -2040,6 +2077,13 @@ export function SettingsView() {
               description="Configure how Codemux integrates with AI coding agents."
             />
             <div className="space-y-1">
+              <SettingRow
+                label="Utility agent"
+                description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+              >
+                <UtilityAgentSetting />
+              </SettingRow>
+              <Separator />
               <SettingRow
                 label="Auto-configure MCP for workspaces"
                 description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."

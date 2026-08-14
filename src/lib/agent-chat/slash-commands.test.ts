@@ -366,6 +366,10 @@ describe("parseMentionQuery", () => {
       category: "file",
       filter: "readme",
     });
+    expect(parseMentionQuery("session:auth")).toEqual({
+      category: "session",
+      filter: "auth",
+    });
   });
 
   it("accepts an empty filter (popup-on-trigger)", () => {

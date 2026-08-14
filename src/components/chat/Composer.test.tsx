@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -13,11 +13,15 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listChatSlashCommands: vi.fn(),
+    agentChatListSessionMentions: vi.fn(),
   };
 });
 
 import { Composer } from "./Composer";
-import { listChatSlashCommands } from "@/tauri/commands";
+import {
+  agentChatListSessionMentions,
+  listChatSlashCommands,
+} from "@/tauri/commands";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import type { ChatModelInfo } from "@/tauri/types";
 import type { Attachment } from "@/stores/agent-chat-store";
@@ -26,6 +30,8 @@ type ComposerProps = ComponentProps<typeof Composer>;
 
 const listChatSlashCommandsMock =
   listChatSlashCommands as unknown as ReturnType<typeof vi.fn>;
+const listSessionMentionsMock =
+  agentChatListSessionMentions as unknown as ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   // Reset the shared provider-commands cache + IPC mock so each test
@@ -33,6 +39,8 @@ beforeEach(() => {
   useProviderCommandsStore.getState().invalidate();
   listChatSlashCommandsMock.mockReset();
   listChatSlashCommandsMock.mockResolvedValue([]);
+  listSessionMentionsMock.mockReset();
+  listSessionMentionsMock.mockResolvedValue([]);
 });
 
 afterEach(() => cleanup());
@@ -861,6 +869,73 @@ describe("Composer", () => {
         shiftKey: true,
       });
       expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("@session: conversation handoff", () => {
+    function getTextarea(container: HTMLElement) {
+      return container.querySelector("textarea") as HTMLTextAreaElement;
+    }
+
+    it("lists scoped provider sessions and inserts the stable source token", async () => {
+      const source = {
+        thread_id: "source-thread-abc123",
+        workspace_id: "workspace-1",
+        cwd: "/home/user",
+        provider: "codex",
+        title: "Harden authentication",
+        last_active_at: new Date().toISOString(),
+        preview: "Implemented refresh token rotation and isolated one test.",
+        message_count: 18,
+      };
+      listSessionMentionsMock.mockResolvedValue([source]);
+      const onDraftChange = vi.fn();
+      const onAttachSession = vi.fn();
+      const { container, getByTestId, getByText } = renderComposer({
+        draft: "@session:",
+        workspaceId: "workspace-1",
+        threadId: "current-thread",
+        onDraftChange,
+        onAttachSession,
+      });
+      const textarea = getTextarea(container);
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      fireEvent.select(textarea);
+
+      await waitFor(() => {
+        expect(listSessionMentionsMock).toHaveBeenCalledWith(
+          "workspace-1",
+          "/home/user",
+          "current-thread",
+          30,
+        );
+      });
+      const row = await waitFor(() =>
+        getByTestId("slash-item-session:source-thread-abc123"),
+      );
+      expect(getByText("Harden authentication")).toBeInTheDocument();
+      expect(getByText(/Implemented refresh token rotation/)).toBeInTheDocument();
+      expect(row).toHaveTextContent("Codex");
+      expect(row).toHaveTextContent("just now");
+
+      fireEvent.click(row);
+      expect(onAttachSession).toHaveBeenCalledWith(source);
+      expect(onDraftChange).toHaveBeenCalledWith(
+        "@session:harden-authentication-abc123 ",
+      );
+    });
+
+    it("explains why history is unavailable before a workspace exists", () => {
+      const { container, getByText } = renderComposer({
+        draft: "@session:",
+        workspaceId: null,
+      });
+      const textarea = getTextarea(container);
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      fireEvent.select(textarea);
+      expect(
+        getByText("Choose an existing workspace before attaching a conversation."),
+      ).toBeInTheDocument();
     });
   });
 
