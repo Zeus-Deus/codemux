@@ -4,7 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspace, useHomeDir } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import {
   Popover,
@@ -73,6 +73,7 @@ import {
  */
 export function WorkspaceStatusCluster() {
   const workspace = useActiveWorkspace();
+  const homeDir = useHomeDir();
   const hosts = useHosts();
   const backgroundBrowserSession = useBackgroundBrowserSession(
     workspace?.workspace_id,
@@ -109,7 +110,7 @@ export function WorkspaceStatusCluster() {
 
   if (!workspace) return null;
   const gitBranch = workspace.git_branch;
-  const showNoGit = !gitBranch && showNoGitState(workspace);
+  const showNoGit = !gitBranch && showNoGitState(workspace, homeDir);
   if (
     !gitBranch &&
     !showNoGit &&

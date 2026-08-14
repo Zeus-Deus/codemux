@@ -27,10 +27,20 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 export function showNoGitState(
   workspace: Pick<
     WorkspaceSnapshot,
-    "is_git" | "workspace_type" | "attach_only" | "host_id"
+    | "is_git"
+    | "workspace_type"
+    | "attach_only"
+    | "host_id"
+    | "project_root"
+    | "cwd"
   >,
+  homeDir: string | null,
 ): boolean {
+  const projectRoot = workspace.project_root ?? workspace.cwd;
+
   return (
+    homeDir !== null &&
+    projectRoot !== homeDir &&
     workspace.is_git === false &&
     workspace.workspace_type === "standard" &&
     !workspace.attach_only &&
