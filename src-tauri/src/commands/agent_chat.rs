@@ -786,6 +786,7 @@ pub fn create_run_checkpoint_blocking(
     for namespace in [
         crate::git::CHECKPOINT_REF_PREFIX,
         crate::git::PRE_RESTORE_REF_PREFIX,
+        crate::git::PRE_RESTORE_FAILED_REF_PREFIX,
     ] {
         match crate::git::git_checkpoint_prune(
             repo_path,
@@ -945,6 +946,16 @@ fn turn_checkpoint_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .entry(thread_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Drop a deleted thread's dispatch lock so the map cannot grow without
+/// bound over a long-lived process. Only the map's std mutex is taken —
+/// never the async lock itself — so this can run from any cleanup path.
+/// A holder that is still mid-dispatch keeps its `Arc` alive and finishes
+/// normally; the thread's rows are already gone, so nothing can contend
+/// for a freshly-minted replacement.
+fn forget_turn_checkpoint_lock(thread_id: &str) {
+    turn_checkpoint_locks().lock().unwrap().remove(thread_id);
 }
 
 fn prepare_turn_checkpoint_blocking(
@@ -1146,17 +1157,22 @@ impl<R: Runtime> TurnDispatchCheckpoint for GitTurnDispatchCheckpoint<R> {
     }
 
     async fn abort(&self) {
-        if let Some(prepared) = self.prepared.lock().await.take() {
-            if let Some(record) = prepared.record {
-                let _ = crate::git::git_checkpoint_delete_ref(
-                    std::path::Path::new(&record.repo_path),
-                    &record.ref_name,
-                );
-            }
+        // Keep `prepared` (and with it the timeline guard) alive across the
+        // invalidation: releasing it first would let the next send commit a
+        // checkpoint that this late invalidation then wipes, silently losing
+        // the Revert affordance. `invalidate_timeline` only touches the DB
+        // and the event bus, never this lock, so holding it cannot deadlock.
+        let prepared = self.prepared.lock().await.take();
+        if let Some(record) = prepared.as_ref().and_then(|p| p.record.as_ref()) {
+            let _ = crate::git::git_checkpoint_delete_ref(
+                std::path::Path::new(&record.repo_path),
+                &record.ref_name,
+            );
         }
         // A transport/RPC failure can be ambiguous about whether the provider
         // accepted the turn. Conservatively discard the older timeline.
         self.invalidate_timeline().await;
+        drop(prepared);
     }
 }
 
@@ -1268,11 +1284,74 @@ fn compensate_failed_provider_rollback(
         &safety.snapshot_commit,
         &safety.head_commit,
         safety.branch.as_deref(),
-        &format!(
-            "{}/failed-provider-rollback",
-            crate::git::pre_restore_ref_name(&target.thread_id)
-        ),
+        &crate::git::pre_restore_failed_ref_name(&target.thread_id),
     )
+}
+
+/// Attachment paths stamped on a `{"type":"user_message"}` transcript
+/// envelope (see [`persist_user_message`]). Any other row shape yields
+/// nothing.
+fn chat_image_paths_in_payload(payload: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("user_message") {
+        return Vec::new();
+    }
+    value
+        .get("images")
+        .and_then(|images| images.as_array())
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|image| Some(image.get("path")?.as_str()?.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reclaim the image files that only the reverted rows referenced.
+///
+/// The transcript rows cascade away inside the revert transaction, but their
+/// attachments live on disk and would otherwise survive until the session is
+/// deleted. A file a retained row still references (the same finalized path
+/// can be re-sent on a later turn) is kept. Best-effort throughout: the
+/// revert already committed, so a rejected path or a failed unlink is only
+/// logged — session deletion still removes the whole thread dir later.
+fn delete_orphaned_chat_images(removed_payloads: &[String], retained_payloads: &[String]) {
+    let removed = removed_payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    if removed.is_empty() {
+        return;
+    }
+    let retained = retained_payloads
+        .iter()
+        .flat_map(|payload| chat_image_paths_in_payload(payload))
+        .collect::<std::collections::HashSet<_>>();
+    let Some(root) = chat_images_root() else {
+        return;
+    };
+    for path in removed.difference(&retained) {
+        // Containment check first: a transcript row is data, and only paths
+        // inside the chat-image root may ever be unlinked.
+        match resolve_within(&root, path) {
+            Ok(resolved) => {
+                if let Err(error) = std::fs::remove_file(&resolved) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "[codemux::agent_chat] failed to delete reverted image {}: {error}",
+                            resolved.display()
+                        );
+                    }
+                }
+            }
+            Err(error) => eprintln!(
+                "[codemux::agent_chat] skipped reverted image {path}: {error}"
+            ),
+        }
+    }
 }
 
 #[tauri::command]
@@ -1350,7 +1429,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         ));
     }
 
-    let removed_refs = {
+    let outcome = {
         let db: State<'_, DatabaseStore> = app.state();
         db.finalize_agent_chat_turn_revert(
             &thread_id,
@@ -1358,7 +1437,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
             target.transcript_cutoff_id,
         )?
     };
-    for (repo_path, ref_name) in removed_refs {
+    for (repo_path, ref_name) in outcome.removed_refs {
         if let Err(error) = crate::git::git_checkpoint_delete_ref(
             std::path::Path::new(&repo_path),
             &ref_name,
@@ -1366,6 +1445,10 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
             eprintln!("[codemux::agent_chat] failed to delete reverted ref: {error}");
         }
     }
+    delete_orphaned_chat_images(
+        &outcome.removed_image_payloads,
+        &outcome.retained_image_payloads,
+    );
     let remaining_checkpoints = {
         let db: State<'_, DatabaseStore> = app.state();
         db.list_agent_chat_turn_checkpoints(&thread_id)
@@ -3516,10 +3599,15 @@ pub async fn agent_chat_delete_session(
             safety_repos.insert(repo_path);
         }
     }
-    checkpoint_refs.extend(safety_repos.into_iter().map(|repo_path| {
-        (repo_path, crate::git::pre_restore_ref_name(&thread_id))
+    checkpoint_refs.extend(safety_repos.into_iter().flat_map(|repo_path| {
+        [
+            (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
+            (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+        ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
+    // The thread is gone; its dispatch lock can never be contended again.
+    forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
         if let Err(error) = crate::git::git_checkpoint_delete_ref(
             std::path::Path::new(&repo_path),
@@ -3536,14 +3624,23 @@ fn cleanup_collapsed_session_resources(cleanup: crate::database::AgentChatSessio
         if let Some(dir) = chat_images_dir(thread_id) {
             let _ = std::fs::remove_dir_all(dir);
         }
+        forget_turn_checkpoint_lock(thread_id);
     }
     let mut refs = cleanup
         .checkpoint_refs
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    refs.extend(cleanup.repo_paths.into_iter().map(|(thread_id, repo_path)| {
-        (repo_path, crate::git::pre_restore_ref_name(&thread_id))
-    }));
+    refs.extend(
+        cleanup
+            .repo_paths
+            .into_iter()
+            .flat_map(|(thread_id, repo_path)| {
+                [
+                    (repo_path.clone(), crate::git::pre_restore_ref_name(&thread_id)),
+                    (repo_path, crate::git::pre_restore_failed_ref_name(&thread_id)),
+                ]
+            }),
+    );
     for (repo_path, ref_name) in refs {
         if let Err(error) = crate::git::git_checkpoint_delete_ref(
             std::path::Path::new(&repo_path),
@@ -5591,10 +5688,14 @@ mod tests {
         let thread_id = "collapsed-thread";
         let checkpoint_ref = crate::git::turn_checkpoint_ref_name(thread_id, 1);
         let safety_ref = crate::git::pre_restore_ref_name(thread_id);
+        let failed_safety_ref = crate::git::pre_restore_failed_ref_name(thread_id);
         crate::git::git_checkpoint_create(repo, &checkpoint_ref, "checkpoint")
             .unwrap()
             .unwrap();
         crate::git::git_checkpoint_create(repo, &safety_ref, "safety")
+            .unwrap()
+            .unwrap();
+        crate::git::git_checkpoint_create(repo, &failed_safety_ref, "failed safety")
             .unwrap()
             .unwrap();
 
@@ -5604,7 +5705,7 @@ mod tests {
             checkpoint_refs: vec![(repo.to_string_lossy().to_string(), checkpoint_ref.clone())],
         });
 
-        for ref_name in [checkpoint_ref, safety_ref] {
+        for ref_name in [checkpoint_ref, safety_ref, failed_safety_ref] {
             let status = std::process::Command::new("git")
                 .args(["show-ref", "--verify", "--quiet", &ref_name])
                 .current_dir(repo)
@@ -5612,6 +5713,25 @@ mod tests {
                 .unwrap();
             assert!(!status.success(), "{ref_name} should be deleted");
         }
+    }
+
+    #[test]
+    fn chat_image_paths_read_only_user_message_attachments() {
+        let user = r#"{"type":"user_message","text":"hi","images":[
+            {"path":"/img/a.png","media_type":"image/png"},
+            {"path":"/img/b.png","media_type":"image/png"}]}"#;
+        assert_eq!(
+            chat_image_paths_in_payload(user),
+            vec!["/img/a.png".to_string(), "/img/b.png".to_string()]
+        );
+        // Image-less turns, provider rows and unparsable payloads contribute
+        // nothing to the revert cleanup set.
+        assert!(chat_image_paths_in_payload(r#"{"type":"user_message","text":"hi"}"#).is_empty());
+        assert!(chat_image_paths_in_payload(
+            r#"{"type":"item_completed","images":[{"path":"/img/c.png"}]}"#
+        )
+        .is_empty());
+        assert!(chat_image_paths_in_payload("not json").is_empty());
     }
 
     // ── lazy tool-result shaping (read path) ──

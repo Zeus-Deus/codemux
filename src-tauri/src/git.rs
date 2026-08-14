@@ -448,6 +448,13 @@ pub fn git_stash_pop(repo_path: &Path) -> Result<(), String> {
 pub const CHECKPOINT_REF_PREFIX: &str = "refs/codemux/checkpoints";
 /// Ref namespace for the safety snapshots taken right before a restore.
 pub const PRE_RESTORE_REF_PREFIX: &str = "refs/codemux/pre-restore";
+/// Ref namespace for the safety snapshots taken before compensating a
+/// revert whose provider rollback failed. A SIBLING of
+/// [`PRE_RESTORE_REF_PREFIX`] rather than a child of the per-thread ref:
+/// `refs/codemux/pre-restore/<thread>` is a loose ref (a file), so any
+/// `refs/codemux/pre-restore/<thread>/…` name is a directory/file conflict
+/// git refuses to create.
+pub const PRE_RESTORE_FAILED_REF_PREFIX: &str = "refs/codemux/pre-restore-failed";
 /// Namespace for exact pre-dispatch checkpoints, one ref per accepted turn.
 pub const TURN_CHECKPOINT_REF_PREFIX: &str = "refs/codemux/turn-checkpoints";
 /// How many refs to keep per namespace when pruning.
@@ -508,6 +515,15 @@ pub fn turn_checkpoint_ref_name(thread_id: &str, turn_index: i64) -> String {
 /// Full pre-restore safety ref for a thread id.
 pub fn pre_restore_ref_name(thread_id: &str) -> String {
     format!("{PRE_RESTORE_REF_PREFIX}/{}", sanitize_ref_component(thread_id))
+}
+
+/// Full safety ref for the compensating restore after a failed provider
+/// rollback.
+pub fn pre_restore_failed_ref_name(thread_id: &str) -> String {
+    format!(
+        "{PRE_RESTORE_FAILED_REF_PREFIX}/{}",
+        sanitize_ref_component(thread_id)
+    )
 }
 
 /// Drop one fully-qualified checkpoint ref. Deleting a missing ref is a

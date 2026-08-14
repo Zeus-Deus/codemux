@@ -171,6 +171,21 @@ pub struct AgentChatTurnCheckpointRecord {
     pub created_at: String,
 }
 
+/// Filesystem state a committed true revert left behind. Git refs and chat
+/// image files live outside SQLite, so the command layer reclaims them after
+/// the revert transaction commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentChatTurnRevertOutcome {
+    /// `(repo_path, ref_name)` checkpoint refs the revert made obsolete.
+    pub removed_refs: Vec<(String, String)>,
+    /// Payloads of the trimmed transcript rows that carried attachments.
+    pub removed_image_payloads: Vec<String>,
+    /// Payloads of the RETAINED rows that carried attachments — a file a
+    /// surviving turn still references must not be deleted (a re-sent
+    /// attachment can appear on both sides of the cutoff).
+    pub retained_image_payloads: Vec<String>,
+}
+
 /// Filesystem state whose owning session rows were removed while duplicate
 /// provider sessions were collapsed. The command layer uses this after the
 /// database transaction commits to remove external image directories and Git
@@ -4178,26 +4193,6 @@ impl DatabaseStore {
         .map_err(|error| format!("Failed to re-read turn checkpoint: {error}"))
     }
 
-    pub fn get_agent_chat_turn_checkpoint(
-        &self,
-        thread_id: &str,
-        turn_index: i64,
-    ) -> Option<AgentChatTurnCheckpointRecord> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT thread_id, workspace_id, repo_path, turn_index, client_nonce,
-                    transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
-                    branch, created_at
-             FROM agent_chat_turn_checkpoints
-             WHERE thread_id = ?1 AND turn_index = ?2",
-            params![thread_id, turn_index],
-            row_to_agent_chat_turn_checkpoint,
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
     /// Bind a committed checkpoint to the durable user-message row that
     /// materialized its accepted turn. The row immediately before that user
     /// message is the exact transcript boundary retained by revert.
@@ -4352,13 +4347,14 @@ impl DatabaseStore {
     }
 
     /// Atomically trim the local transcript and checkpoint timeline after the
-    /// provider rollback succeeds. Returns the refs made obsolete.
+    /// provider rollback succeeds. Returns what the caller must clean up
+    /// outside SQLite (see [`AgentChatTurnRevertOutcome`]).
     pub fn finalize_agent_chat_turn_revert(
         &self,
         thread_id: &str,
         turn_index: i64,
         transcript_cutoff_id: i64,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<AgentChatTurnRevertOutcome, String> {
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
             .transaction()
@@ -4380,6 +4376,27 @@ impl DatabaseStore {
                 .collect::<Vec<_>>();
             refs
         };
+        // Attachment payloads on both sides of the cutoff. Restricted to rows
+        // that actually carry an `images` array so a long transcript is never
+        // materialized; the caller diffs them to find files nothing
+        // references any more.
+        let image_payloads = |cutoff_clause: &str| -> Result<Vec<String>, String> {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "SELECT payload FROM agent_chat_messages
+                     WHERE thread_id = ?1 AND id {cutoff_clause} ?2
+                       AND payload LIKE '%\"images\":[%'"
+                ))
+                .map_err(|error| format!("Failed to list reverted attachments: {error}"))?;
+            let payloads = statement
+                .query_map(params![thread_id, transcript_cutoff_id], |row| row.get(0))
+                .map_err(|error| format!("Failed to read reverted attachments: {error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<String>>();
+            Ok(payloads)
+        };
+        let removed_image_payloads = image_payloads(">")?;
+        let retained_image_payloads = image_payloads("<=")?;
         transaction
             .execute(
                 "DELETE FROM agent_chat_messages WHERE thread_id = ?1 AND id > ?2",
@@ -4396,7 +4413,11 @@ impl DatabaseStore {
         transaction
             .commit()
             .map_err(|error| format!("Failed to commit turn revert: {error}"))?;
-        Ok(refs)
+        Ok(AgentChatTurnRevertOutcome {
+            removed_refs: refs,
+            removed_image_payloads,
+            retained_image_payloads,
+        })
     }
 }
 
@@ -4647,7 +4668,10 @@ mod tests {
         ))
         .unwrap();
         let user_1 = db
-            .append_agent_chat_message(thread_id, r#"{"type":"user_message","text":"one"}"#)
+            .append_agent_chat_message(
+                thread_id,
+                r#"{"type":"user_message","text":"one","images":[{"path":"/tmp/one.png"}]}"#,
+            )
             .unwrap()
             .unwrap();
         let first = db
@@ -4666,7 +4690,10 @@ mod tests {
         ))
         .unwrap();
         let user_2 = db
-            .append_agent_chat_message(thread_id, r#"{"type":"user_message","text":"two"}"#)
+            .append_agent_chat_message(
+                thread_id,
+                r#"{"type":"user_message","text":"two","images":[{"path":"/tmp/two.png"}]}"#,
+            )
             .unwrap()
             .unwrap();
         let second = db
@@ -4723,12 +4750,18 @@ mod tests {
             .finalize_agent_chat_turn_revert(thread_id, 2, second.transcript_cutoff_id)
             .unwrap();
         assert_eq!(
-            removed,
+            removed.removed_refs,
             vec![
                 (second.repo_path, second.ref_name),
                 (third.repo_path, third.ref_name),
             ]
         );
+        // Attachment payloads are partitioned across the cutoff so the
+        // command layer can unlink only the files nothing references now.
+        assert_eq!(removed.removed_image_payloads.len(), 1);
+        assert!(removed.removed_image_payloads[0].contains("/tmp/two.png"));
+        assert_eq!(removed.retained_image_payloads.len(), 1);
+        assert!(removed.retained_image_payloads[0].contains("/tmp/one.png"));
         assert_eq!(db.list_agent_chat_messages(thread_id).len(), 2);
         assert!(!db.has_agent_chat_turn_checkpoints(thread_id));
     }

@@ -1695,6 +1695,20 @@ async fn failed_provider_rollback_compensates_workspace_and_keeps_local_history(
     assert!(error.contains("workspace was restored"), "got: {error}");
     assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after");
     assert_eq!(std::fs::read_to_string(repo.join("artifact.txt")).unwrap(), "keep");
+    // The compensating restore takes its own safety snapshot; its ref must
+    // live in a namespace that cannot D/F-conflict with the pre-restore ref
+    // already written for this thread.
+    let compensation_safety_ref =
+        codemux_lib::git::pre_restore_failed_ref_name("thread-compensate");
+    let safety_status = std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &compensation_safety_ref])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        safety_status.success(),
+        "compensation safety ref {compensation_safety_ref} was not created"
+    );
     let db = handle.state::<DatabaseStore>();
     assert_eq!(db.list_agent_chat_messages("thread-compensate").len(), 2);
     assert_eq!(db.list_agent_chat_turn_checkpoints("thread-compensate").len(), 1);
@@ -1770,6 +1784,10 @@ async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
     codemux_lib::git::git_checkpoint_create(&repo, &safety_ref, "safety")
         .unwrap()
         .unwrap();
+    let failed_safety_ref = codemux_lib::git::pre_restore_failed_ref_name(thread_id);
+    codemux_lib::git::git_checkpoint_create(&repo, &failed_safety_ref, "failed safety")
+        .unwrap()
+        .unwrap();
 
     let app = tauri::test::mock_app();
     app.manage(db);
@@ -1780,7 +1798,7 @@ async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
 
     let db = handle.state::<DatabaseStore>();
     assert!(db.get_agent_chat_session(thread_id).is_none());
-    for ref_name in [legacy_ref, turn_ref, safety_ref] {
+    for ref_name in [legacy_ref, turn_ref, safety_ref, failed_safety_ref] {
         let status = std::process::Command::new("git")
             .args(["show-ref", "--verify", "--quiet", &ref_name])
             .current_dir(&repo)
