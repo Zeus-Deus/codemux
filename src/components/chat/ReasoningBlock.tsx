@@ -1,11 +1,12 @@
-import { ChevronRight, Lightbulb } from "lucide-react";
+import { ChevronDown, Lightbulb } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
 import { cn } from "@/lib/utils";
 import type { ReasoningItem } from "@/lib/agent-chat/types";
 
 /**
- * Collapsible "thinking" card (design D5). Driven entirely by the
+ * Collapsible thinking row. Driven entirely by the
  * reducer's `ReasoningItem`:
  *
  *  - While `streaming`: header shimmers "Thinking…", the block auto-opens
@@ -13,14 +14,23 @@ import type { ReasoningItem } from "@/lib/agent-chat/types";
  *  - Once sealed: header reads "Thought for Ns" (from `duration_ms`) and
  *    the block auto-collapses once — the user can still toggle it back.
  *
- * The body is rendered as plain italic prose (thinking traces are not
- * trusted markdown and we don't want a shiki/markdown pass on a hot
- * streaming row); inline `code`-fenced spans are left verbatim.
+ * The flat row follows the compact work-log treatment: no surrounding card,
+ * a single 20px glyph slot, quiet metadata, and inline detail on a hairline.
+ * The body remains plain italic prose (thinking traces are not trusted
+ * markdown and we don't want a shiki/markdown pass on a hot streaming row);
+ * inline `code`-fenced spans are left verbatim.
+ *
+ * `live` decides whether this row owns the animated orb. It defaults to the
+ * item's own `streaming` flag, which is right in the main transcript; the
+ * subagent drill-in passes `false` because its live tail already animates the
+ * run's single orb (one-orb doctrine — see `lib/agent-chat/orb-activity.ts`).
  */
 export const ReasoningBlock = memo(function ReasoningBlock({
   item,
+  live = item.streaming,
 }: {
   item: ReasoningItem;
+  live?: boolean;
 }) {
   // Auto-open while streaming; auto-collapse once (when streaming ends)
   // unless the reader has taken manual control.
@@ -38,7 +48,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
   const label = deriveLabel(item);
 
   return (
-    <div className="overflow-hidden rounded-[11px] border border-border/60 bg-foreground/[0.025]">
+    <div className="-mx-1 select-text px-1 py-0.5">
       <button
         type="button"
         onClick={() => {
@@ -46,32 +56,40 @@ export const ReasoningBlock = memo(function ReasoningBlock({
           setOpen((v) => !v);
         }}
         aria-expanded={open}
-        className="flex w-full items-center gap-[9px] px-3 py-[9px] text-left"
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
       >
-        <Lightbulb
-          className="h-3.5 w-3.5 shrink-0 text-accent-violet"
-          strokeWidth={1.5}
-          aria-hidden
-        />
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          {live ? (
+            <AgentOrb size={20} aria-hidden />
+          ) : (
+            <Lightbulb
+              className="size-3.5 text-accent-violet"
+              strokeWidth={1.5}
+              aria-hidden
+            />
+          )}
+        </span>
         <span
           className={cn(
-            "text-[13px] font-semibold text-muted-foreground",
+            "min-w-0 flex-1 truncate font-medium text-muted-foreground",
             item.streaming && "shimmer",
           )}
         >
           {label}
         </span>
-        <ChevronRight
+        <ChevronDown
           className={cn(
-            "ml-auto h-3 w-3 shrink-0 text-muted-foreground/70 transition-transform",
-            open && "rotate-90",
+            "size-3 shrink-0 text-muted-foreground/45 transition-transform",
+            open && "rotate-180",
           )}
           aria-hidden
         />
       </button>
       {open && item.text.length > 0 && (
-        <div className="select-text whitespace-pre-wrap break-words border-t border-border/60 py-[11px] pl-[33px] pr-3.5 text-[13px] italic leading-[1.65] text-muted-foreground">
-          {item.text}
+        <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
+          <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+            {item.text}
+          </p>
         </div>
       )}
     </div>
