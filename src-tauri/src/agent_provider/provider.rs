@@ -148,6 +148,19 @@ pub trait AgentProvider: Send + Sync {
         false
     }
 
+    /// Remove completed turns from the provider's durable conversation.
+    /// The safe default refuses so filesystem-only restoration can never be
+    /// exposed as a true revert.
+    async fn rollback_conversation(
+        &self,
+        _thread_id: ThreadId,
+        _num_turns: u32,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "provider does not support conversation rollback".into(),
+        })
+    }
+
     /// Subscribe to the canonical runtime event stream.
     ///
     /// Each call typically returns a fresh subscription; implementations are

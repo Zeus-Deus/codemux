@@ -21,13 +21,11 @@ const mocks = vi.hoisted(() => ({
   activateTab: vi.fn().mockResolvedValue(undefined),
   closeTab: vi.fn().mockResolvedValue(undefined),
   reorderTabs: vi.fn().mockResolvedValue(undefined),
-  getCheckpoint: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("@/tauri/commands", () => ({
   agentChatListSessions: (...a: unknown[]) => mocks.listSessions(...a),
   agentChatDeleteSession: (...a: unknown[]) => mocks.deleteSession(...a),
-  agentChatGetCheckpoint: (...a: unknown[]) => mocks.getCheckpoint(...a),
   activateTab: (...a: unknown[]) => mocks.activateTab(...a),
   closeTab: (...a: unknown[]) => mocks.closeTab(...a),
   reorderTabs: (...a: unknown[]) => mocks.reorderTabs(...a),
@@ -36,10 +34,6 @@ vi.mock("@/tauri/commands", () => ({
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
   agentChatListMessages: vi.fn().mockResolvedValue([]),
-}));
-
-vi.mock("@/tauri/events", () => ({
-  onAgentChatCheckpoint: vi.fn().mockResolvedValue(() => {}),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -127,8 +121,6 @@ beforeEach(() => {
   mocks.activateTab.mockClear();
   mocks.closeTab.mockClear();
   mocks.reorderTabs.mockClear();
-  mocks.getCheckpoint.mockReset();
-  mocks.getCheckpoint.mockResolvedValue(null);
 });
 
 // Stubs a tab pill's on-screen box so `useTabReorder`'s midpoint math

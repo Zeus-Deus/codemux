@@ -292,6 +292,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap()
@@ -328,6 +329,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap()
@@ -385,6 +387,7 @@ async fn send_turn_emits_session_state_changed_running_with_matching_turn_id() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -537,6 +540,7 @@ async fn interrupt_emits_session_state_changed_ready() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -635,6 +639,7 @@ async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
                 client_nonce: None,
                 display_text: None,
                 skill_invocations: vec![],
+                turn_checkpoint: None,
             })
             .await
             .unwrap_or_else(|e| {
@@ -717,6 +722,7 @@ async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed(
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -772,6 +778,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -821,6 +828,7 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -873,6 +881,7 @@ async fn request_opened_for_command_tool_routes_to_request_opened_event() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -941,6 +950,7 @@ async fn interrupt_turn_sends_interrupt_rpc() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -966,6 +976,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1064,6 +1075,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap_err();
@@ -1098,6 +1110,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1114,6 +1127,7 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             client_nonce: Some("nonce-2".into()),
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1192,6 +1206,7 @@ async fn queued_turns_dispatch_fifo_on_completion() {
                 client_nonce: Some(nonce.into()),
                 display_text: None,
                 skill_invocations: vec![],
+                turn_checkpoint: None,
             })
             .await
             .unwrap();
@@ -1239,6 +1254,7 @@ async fn cancel_queued_turn_removes_it() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1253,6 +1269,7 @@ async fn cancel_queued_turn_removes_it() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap()
@@ -1309,6 +1326,7 @@ async fn closing_session_cancels_queued_turns() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1323,6 +1341,7 @@ async fn closing_session_cancels_queued_turns() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap()
@@ -1394,6 +1413,7 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1458,6 +1478,7 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1530,6 +1551,7 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1577,6 +1599,7 @@ async fn turn_active_false_when_session_dead() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -1625,6 +1648,7 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1675,6 +1699,7 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1724,6 +1749,7 @@ async fn session_error_emits_session_state_changed_plus_warning() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1833,6 +1859,7 @@ async fn event_ordering_across_rapid_bursts() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1967,6 +1994,7 @@ async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -2120,6 +2148,7 @@ async fn claude_real_session() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();

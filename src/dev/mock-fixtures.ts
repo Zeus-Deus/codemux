@@ -162,7 +162,7 @@ function chatSurface(
     pane_id: paneId,
     title: label,
     thread_id: threadId,
-    provider: "claude",
+    provider: "codex",
     cwd,
   };
   const surface: SurfaceSnapshot = {

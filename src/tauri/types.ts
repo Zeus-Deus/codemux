@@ -128,8 +128,8 @@ export interface SessionRestoreSettings {
 }
 
 /** Mirrors src-tauri/src/settings_sync.rs:AgentChatSettings.
- *  `checkpoints_enabled` is the opt-in for the run-start rollback
- *  checkpoint (issue #80) — default OFF.
+ *  `checkpoints_enabled` opts into true per-turn revert checkpoints for
+ *  providers with native conversation rollback — default OFF.
  *  `background_browser_desktop_viewport` pins the GUI-mode background
  *  browser's peek popover (`BrowserPeekOverlay.tsx`) to a real desktop
  *  viewport (1280×800) instead of shrinking to the popover's pixel

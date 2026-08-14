@@ -1736,14 +1736,16 @@ export const agentChatThreadHeadId = (threadId: string) =>
 export const agentChatGetToolResult = (rowId: number) =>
   invoke<string>("agent_chat_get_tool_result", { rowId });
 
-// ── Run checkpoints (issue #80) ──
-
-/** Mirrors src-tauri/src/database.rs:AgentChatCheckpointRecord — the
- *  background working-tree snapshot taken when a run started. */
-export interface AgentChatCheckpointRecord {
+/** A filesystem baseline captured immediately before one accepted user turn.
+ *  The nonce binds it to the rendered user bubble; the cutoff is the durable
+ *  transcript row that remains after a true revert. */
+export interface AgentChatTurnCheckpointRecord {
   thread_id: string;
   workspace_id: string;
   repo_path: string;
+  turn_index: number;
+  client_nonce: string | null;
+  transcript_cutoff_id: number;
   ref_name: string;
   snapshot_commit: string;
   head_commit: string;
@@ -1751,15 +1753,22 @@ export interface AgentChatCheckpointRecord {
   created_at: string;
 }
 
-export const agentChatGetCheckpoint = (threadId: string) =>
-  invoke<AgentChatCheckpointRecord | null>("agent_chat_get_checkpoint", {
-    threadId,
-  });
+export const agentChatListTurnCheckpoints = (threadId: string) =>
+  invoke<AgentChatTurnCheckpointRecord[]>(
+    "agent_chat_list_turn_checkpoints",
+    { threadId },
+  );
 
-/** Roll the workspace back to the checkpoint taken when this run
- *  started. Mutates the working tree — confirm with the user first. */
-export const agentChatRestoreCheckpoint = (threadId: string) =>
-  invoke<void>("agent_chat_restore_checkpoint", { threadId });
+/** Rewind the workspace, provider conversation, and local transcript to just
+ *  before `turnIndex`. Returns the checkpoints that remain addressable. */
+export const agentChatRevertTurnCheckpoint = (
+  threadId: string,
+  turnIndex: number,
+) =>
+  invoke<AgentChatTurnCheckpointRecord[]>(
+    "agent_chat_revert_turn_checkpoint",
+    { threadId, turnIndex },
+  );
 
 /**
  * Register a per-thread `Channel` that receives every live

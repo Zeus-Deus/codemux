@@ -146,7 +146,6 @@ function emptyish() {
     hasDebugActivity: false,
     debugActivityResolved: false,
     stagedAttachments: [],
-    checkpoint: null,
     lastPersistedEventId: null,
   };
 }

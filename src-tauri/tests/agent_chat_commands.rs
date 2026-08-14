@@ -231,6 +231,7 @@ async fn send_turn_forwards_to_selected_provider() {
             client_nonce: None,
             display_text: None,
             skill_invocations: vec![],
+            turn_checkpoint: None,
         })
         .await
         .unwrap();
@@ -1018,6 +1019,7 @@ mod auto_resume {
                 client_nonce: None,
                 display_text: None,
                 skill_invocations: vec![],
+                turn_checkpoint: None,
             })
             .await
             .expect("send_turn succeeds on the resumed session");
@@ -1416,4 +1418,374 @@ async fn background_checkpoint_spawn_is_a_noop_when_gate_is_off() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let db = handle.state::<DatabaseStore>();
     assert!(db.get_agent_chat_checkpoint("thread-off").is_none());
+}
+
+/// Command-level E2E for the full true-revert transaction: real git
+/// snapshots and restore, provider-native rollback, transcript trim, and
+/// checkpoint-ref cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_revert_restores_workspace_provider_and_transcript_together() {
+    use codemux_lib::agent_provider::AgentProvider;
+    use codemux_lib::commands::agent_chat::agent_chat_revert_turn_checkpoint;
+    use codemux_lib::database::AgentChatTurnCheckpointRecord;
+
+    let dir = tempfile::TempDir::new().expect("temp repo");
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("code.txt"), "v1").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(
+        "thread-turn-revert",
+        "ws-1",
+        Some(&repo.to_string_lossy()),
+        "codex",
+    )
+    .unwrap();
+
+    let capture = |db: &DatabaseStore, index: i64, nonce: &str| {
+        let ref_name = codemux_lib::git::turn_checkpoint_ref_name(
+            "thread-turn-revert",
+            index,
+        );
+        let snapshot = codemux_lib::git::git_checkpoint_create(
+            &repo,
+            &ref_name,
+            &format!("before turn {index}"),
+        )
+        .unwrap()
+        .unwrap();
+        db.upsert_agent_chat_turn_checkpoint(&AgentChatTurnCheckpointRecord {
+            thread_id: "thread-turn-revert".into(),
+            workspace_id: "ws-1".into(),
+            repo_path: repo.to_string_lossy().to_string(),
+            turn_index: index,
+            client_nonce: Some(nonce.into()),
+            transcript_cutoff_id: db
+                .agent_chat_transcript_cutoff("thread-turn-revert")
+                .unwrap(),
+            ref_name: snapshot.ref_name,
+            snapshot_commit: snapshot.snapshot_commit,
+            head_commit: snapshot.head_commit,
+            branch: snapshot.branch,
+            created_at: String::new(),
+        })
+        .unwrap()
+    };
+
+    capture(&db, 1, "nonce-1");
+    db.append_agent_chat_message(
+        "thread-turn-revert",
+        r#"{"type":"user_message","text":"first"}"#,
+    )
+    .unwrap();
+    db.append_agent_chat_message("thread-turn-revert", r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v2").unwrap();
+    let second = capture(&db, 2, "nonce-2");
+    db.append_agent_chat_message(
+        "thread-turn-revert",
+        r#"{"type":"user_message","text":"second"}"#,
+    )
+    .unwrap();
+    db.append_agent_chat_message("thread-turn-revert", r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v3").unwrap();
+    let third = capture(&db, 3, "nonce-3");
+    db.append_agent_chat_message(
+        "thread-turn-revert",
+        r#"{"type":"user_message","text":"third"}"#,
+    )
+    .unwrap();
+    db.append_agent_chat_message("thread-turn-revert", r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "v4").unwrap();
+    std::fs::write(repo.join("agent-artifact.txt"), "remove me").unwrap();
+
+    let mock = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+    mock.start_session(start_input("thread-turn-revert"))
+        .await
+        .unwrap();
+    let registry = ProviderRegistry::new();
+    registry.set_codex(mock.clone()).await;
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    app.manage(test_observability(true));
+    app.manage(AppStateStore::default());
+    app.manage(registry);
+    let handle = app.handle().clone();
+
+    let remaining = agent_chat_revert_turn_checkpoint(
+        handle.clone(),
+        "thread-turn-revert".into(),
+        2,
+    )
+    .await
+    .expect("true revert succeeds");
+
+    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "v2");
+    assert!(!repo.join("agent-artifact.txt").exists());
+    let db = handle.state::<DatabaseStore>();
+    assert_eq!(db.list_agent_chat_messages("thread-turn-revert").len(), 2);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].turn_index, 1);
+    assert_eq!(
+        mock.calls.snapshot().last(),
+        Some(&MockCall::RollbackConversation(
+            ThreadId("thread-turn-revert".into()),
+            2,
+        ))
+    );
+    let removed_ref = std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &second.ref_name])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!removed_ref.success(), "reverted checkpoint ref is deleted");
+    let removed_third_ref = std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &third.ref_name])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        !removed_third_ref.success(),
+        "all later checkpoint refs are deleted"
+    );
+
+    // A second revert on the shortened timeline must count provider turns
+    // from the new tail, restore the older snapshot, and leave no stale
+    // transcript rows or checkpoint refs behind.
+    std::fs::write(repo.join("code.txt"), "v2-after-first-revert").unwrap();
+    std::fs::write(repo.join("second-artifact.txt"), "remove me too").unwrap();
+    let first_ref = remaining[0].ref_name.clone();
+    let remaining = agent_chat_revert_turn_checkpoint(
+        handle.clone(),
+        "thread-turn-revert".into(),
+        1,
+    )
+    .await
+    .expect("a consecutive true revert succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "v1"
+    );
+    assert!(!repo.join("second-artifact.txt").exists());
+    assert!(remaining.is_empty());
+    assert!(db.list_agent_chat_messages("thread-turn-revert").is_empty());
+    let rollback_counts = mock
+        .calls
+        .snapshot()
+        .into_iter()
+        .filter_map(|call| match call {
+            MockCall::RollbackConversation(_, count) => Some(count),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rollback_counts, vec![2, 1]);
+    let first_ref_status = std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &first_ref])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        !first_ref_status.success(),
+        "oldest checkpoint ref is deleted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_provider_rollback_compensates_workspace_and_keeps_local_history() {
+    use codemux_lib::agent_provider::AgentProvider;
+    use codemux_lib::commands::agent_chat::agent_chat_revert_turn_checkpoint;
+    use codemux_lib::database::AgentChatTurnCheckpointRecord;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("code.txt"), "before").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(
+        "thread-compensate",
+        "ws-1",
+        Some(&repo.to_string_lossy()),
+        "codex",
+    )
+    .unwrap();
+    let ref_name = codemux_lib::git::turn_checkpoint_ref_name("thread-compensate", 1);
+    let snapshot = codemux_lib::git::git_checkpoint_create(&repo, &ref_name, "before turn")
+        .unwrap()
+        .unwrap();
+    db.upsert_agent_chat_turn_checkpoint(&AgentChatTurnCheckpointRecord {
+        thread_id: "thread-compensate".into(),
+        workspace_id: "ws-1".into(),
+        repo_path: repo.to_string_lossy().to_string(),
+        turn_index: 1,
+        client_nonce: Some("nonce".into()),
+        transcript_cutoff_id: 0,
+        ref_name: snapshot.ref_name,
+        snapshot_commit: snapshot.snapshot_commit,
+        head_commit: snapshot.head_commit,
+        branch: snapshot.branch,
+        created_at: String::new(),
+    })
+    .unwrap();
+    db.append_agent_chat_message(
+        "thread-compensate",
+        r#"{"type":"user_message","text":"change"}"#,
+    )
+    .unwrap();
+    db.append_agent_chat_message("thread-compensate", r#"{"type":"turn_completed"}"#)
+        .unwrap();
+    std::fs::write(repo.join("code.txt"), "after").unwrap();
+    std::fs::write(repo.join("artifact.txt"), "keep").unwrap();
+
+    let mock = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+    mock.start_session(start_input("thread-compensate"))
+        .await
+        .unwrap();
+    mock.fail_next_rollback("upstream rejected rollback");
+    let registry = ProviderRegistry::new();
+    registry.set_codex(mock).await;
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    app.manage(test_observability(true));
+    app.manage(AppStateStore::default());
+    app.manage(registry);
+    let handle = app.handle().clone();
+
+    let error = agent_chat_revert_turn_checkpoint(
+        handle.clone(),
+        "thread-compensate".into(),
+        1,
+    )
+    .await
+    .expect_err("provider rollback fails");
+
+    assert!(error.contains("workspace was restored"), "got: {error}");
+    assert_eq!(std::fs::read_to_string(repo.join("code.txt")).unwrap(), "after");
+    assert_eq!(std::fs::read_to_string(repo.join("artifact.txt")).unwrap(), "keep");
+    let db = handle.state::<DatabaseStore>();
+    assert_eq!(db.list_agent_chat_messages("thread-compensate").len(), 2);
+    assert_eq!(db.list_agent_chat_turn_checkpoints("thread-compensate").len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
+    use codemux_lib::commands::agent_chat::agent_chat_delete_session;
+    use codemux_lib::database::{
+        AgentChatCheckpointRecord, AgentChatTurnCheckpointRecord,
+    };
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(repo.join("code.txt"), "base").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+
+    let thread_id = "thread-delete-checkpoints";
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(
+        thread_id,
+        "ws-1",
+        Some(&repo.to_string_lossy()),
+        "codex",
+    )
+    .unwrap();
+    let legacy_ref = codemux_lib::git::checkpoint_ref_name(thread_id);
+    let legacy = codemux_lib::git::git_checkpoint_create(&repo, &legacy_ref, "legacy")
+        .unwrap()
+        .unwrap();
+    db.upsert_agent_chat_checkpoint(&AgentChatCheckpointRecord {
+        thread_id: thread_id.into(),
+        workspace_id: "ws-1".into(),
+        repo_path: repo.to_string_lossy().to_string(),
+        ref_name: legacy.ref_name,
+        snapshot_commit: legacy.snapshot_commit,
+        head_commit: legacy.head_commit,
+        branch: legacy.branch,
+        created_at: String::new(),
+    })
+    .unwrap();
+    let turn_ref = codemux_lib::git::turn_checkpoint_ref_name(thread_id, 1);
+    let turn = codemux_lib::git::git_checkpoint_create(&repo, &turn_ref, "turn")
+        .unwrap()
+        .unwrap();
+    db.upsert_agent_chat_turn_checkpoint(&AgentChatTurnCheckpointRecord {
+        thread_id: thread_id.into(),
+        workspace_id: "ws-1".into(),
+        repo_path: repo.to_string_lossy().to_string(),
+        turn_index: 1,
+        client_nonce: Some("nonce".into()),
+        transcript_cutoff_id: 0,
+        ref_name: turn.ref_name,
+        snapshot_commit: turn.snapshot_commit,
+        head_commit: turn.head_commit,
+        branch: turn.branch,
+        created_at: String::new(),
+    })
+    .unwrap();
+    let safety_ref = codemux_lib::git::pre_restore_ref_name(thread_id);
+    codemux_lib::git::git_checkpoint_create(&repo, &safety_ref, "safety")
+        .unwrap()
+        .unwrap();
+
+    let app = tauri::test::mock_app();
+    app.manage(db);
+    let handle = app.handle().clone();
+    agent_chat_delete_session(handle.state(), thread_id.into())
+        .await
+        .unwrap();
+
+    let db = handle.state::<DatabaseStore>();
+    assert!(db.get_agent_chat_session(thread_id).is_none());
+    for ref_name in [legacy_ref, turn_ref, safety_ref] {
+        let status = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &ref_name])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "checkpoint ref leaked: {ref_name}");
+    }
 }

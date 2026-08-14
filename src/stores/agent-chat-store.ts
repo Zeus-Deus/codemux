@@ -24,10 +24,7 @@ import type {
   ToolCallItem,
   UserMessageImage,
 } from "@/lib/agent-chat/types";
-import type {
-  AgentChatCheckpointRecord,
-  AgentChatMessageRow,
-} from "@/tauri/commands";
+import type { AgentChatMessageRow } from "@/tauri/commands";
 import type {
   ApprovalDecision,
   ProviderRuntimeEvent,
@@ -156,10 +153,6 @@ export interface ChatThreadSlice extends ChatThreadState {
    *  this); Stage 1 only exposes the slice + actions. The slice itself
    *  imposes no cap — UI layer enforces 20 hard / 10 soft warn. */
   stagedAttachments: Attachment[];
-  /** Run-start rollback checkpoint (issue #80). `null` until the
-   *  background snapshot lands (event) or the on-mount fetch resolves.
-   *  Drives the pane header's "Restore checkpoint" affordance. */
-  checkpoint: AgentChatCheckpointRecord | null;
   /** Durable resume cursor: the highest `agent_chat_messages.id` whose
    *  effect this slice already holds. A remount asks the backend for
    *  everything after it instead of replaying from row zero.
@@ -195,7 +188,6 @@ function emptySlice(): ChatThreadSlice {
     hasDebugActivity: false,
     debugActivityResolved: false,
     stagedAttachments: [],
-    checkpoint: null,
     lastPersistedEventId: null,
   };
 }
@@ -365,13 +357,6 @@ interface AgentChatStore {
   /** Clear all staged attachments. Called by Stage 2's send-handler
    *  alongside the existing `inputDraft = ""` reset. */
   clearStagedAttachments: (threadId: string) => void;
-  /** Record (or clear) the thread's run-start rollback checkpoint.
-   *  Fed by the `agent_chat_checkpoint` event and the header's
-   *  on-mount fetch. */
-  setCheckpoint: (
-    threadId: string,
-    checkpoint: AgentChatCheckpointRecord | null,
-  ) => void;
 }
 
 function updateSlice(
@@ -666,12 +651,6 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         streaming: false,
         activeTurnId: null,
         pendingRequestIds: [],
-        // The old thread's checkpoint row dies with its session row
-        // (FK cascade on the restart-dedup path); the new session
-        // start takes a fresh checkpoint and its event re-populates
-        // this. Carrying the stale record would render a restore
-        // button pointing at a deleted row.
-        checkpoint: null,
         // The cursor belongs to the OLD thread's rows. The restart /
         // collapse paths re-home rows between threads keeping their
         // original ids, so the old head can sit above the new thread's
@@ -943,12 +922,6 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       ),
     ),
 
-  setCheckpoint: (threadId, checkpoint) =>
-    set((state) =>
-      updateSlice(state, threadId, (slice) =>
-        slice.checkpoint === checkpoint ? slice : { ...slice, checkpoint },
-      ),
-    ),
 }));
 
 export const selectThread =

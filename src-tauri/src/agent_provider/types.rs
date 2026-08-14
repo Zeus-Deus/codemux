@@ -7,7 +7,9 @@
 //! touching the engine.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// The set of CLI-backed coding agents the chat runtime can drive.
@@ -46,6 +48,20 @@ pub struct ProviderCapabilities {
     pub supports_interrupt: bool,
     /// A previously-closed session can be resumed from an opaque cursor.
     pub supports_session_resume: bool,
+    /// The provider can remove completed turns from its own durable
+    /// conversation, rather than merely hiding them in Codemux's UI.
+    #[serde(default)]
+    pub supports_conversation_rollback: bool,
+}
+
+/// Lifecycle hook executed at the provider's actual dispatch boundary.
+/// Provider queues call this immediately before an accepted turn so queued
+/// prompts capture the state at dispatch, not when they were typed.
+#[async_trait]
+pub trait TurnDispatchCheckpoint: Send + Sync + std::fmt::Debug {
+    async fn prepare(&self);
+    async fn commit(&self);
+    async fn abort(&self);
 }
 
 /// Opaque identifier a provider hands back for its own internal session.
@@ -213,6 +229,10 @@ pub struct SendTurnInput {
     /// `None` for non-queued sends and older callers.
     #[serde(default)]
     pub client_nonce: Option<String>,
+    /// Runtime-only pre-dispatch checkpoint wiring; never provider protocol
+    /// data and therefore deliberately skipped by serde.
+    #[serde(skip)]
+    pub turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>>,
 }
 
 // ---------------------------------------------------------------------------

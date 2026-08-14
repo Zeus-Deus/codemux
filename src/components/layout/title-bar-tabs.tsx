@@ -4,7 +4,6 @@ import {
   FileCode,
   GitCompare,
   Globe,
-  History,
   MessageSquare,
   Terminal,
   X,
@@ -13,17 +12,14 @@ import {
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { RestoreCheckpointDialog } from "@/components/chat/restore-checkpoint-dialog";
 import {
   SessionHistoryList,
   useSessionHistory,
 } from "@/components/chat/session-history-menu";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { StatusIndicator } from "@/components/ui/status-indicator";
-import { useAgentChatCheckpointRestore } from "@/hooks/use-agent-chat-checkpoint-restore";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
@@ -487,14 +483,6 @@ function ActiveChatTab({
     workspaceId,
     cwd,
   });
-  const {
-    checkpoint,
-    turnActive,
-    confirmOpen,
-    setConfirmOpen,
-    restoring,
-    handleRestoreConfirmed,
-  } = useAgentChatCheckpointRestore(pane.thread_id);
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
     closeTab(workspaceId, tab.tab_id).catch(console.error);
@@ -540,18 +528,6 @@ function ActiveChatTab({
               onNewChat={handleNewChat}
               onDelete={handleDelete}
               closeMenu={() => setOpen(false)}
-              footerItem={
-                checkpoint ? (
-                  <DropdownMenuItem
-                    disabled={turnActive || restoring}
-                    onSelect={() => setConfirmOpen(true)}
-                    data-testid="titlebar-restore-checkpoint"
-                  >
-                    <History className="h-3.5 w-3.5" />
-                    Restore checkpoint
-                  </DropdownMenuItem>
-                ) : undefined
-              }
             />
           </DropdownMenuContent>
         </DropdownMenu>
@@ -566,14 +542,6 @@ function ActiveChatTab({
           <X className="h-3 w-3" />
         </button>
       </div>
-
-      <RestoreCheckpointDialog
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        checkpoint={checkpoint}
-        restoring={restoring}
-        onConfirm={() => void handleRestoreConfirmed()}
-      />
     </>
   );
 }

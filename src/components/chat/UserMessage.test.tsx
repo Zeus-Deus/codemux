@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import type { UserMessageItem } from "@/lib/agent-chat/types";
 
@@ -19,6 +19,8 @@ vi.mock("@/lib/asset-url", async (importOriginal) => {
 });
 
 import { UserMessage } from "./UserMessage";
+
+afterEach(cleanup);
 
 function makeItem(images: UserMessageItem["images"]): UserMessageItem {
   return { kind: "user_message", id: "u1", seq: 0, text: "hi", images };
@@ -91,5 +93,34 @@ describe("UserMessage image fallback", () => {
     expect(img.getAttribute("src")).toBe(dataUrl);
     // No error fired → the read fallback is untouched.
     expect(readChatImageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("UserMessage turn revert", () => {
+  it("renders a checkpoint-bound action and delegates confirmation upstream", () => {
+    const onRevert = vi.fn();
+    const { getByRole } = render(
+      <UserMessage item={makeItem([])} onRevert={onRevert} />,
+    );
+
+    fireEvent.click(
+      getByRole("button", { name: "Revert to before this turn" }),
+    );
+
+    expect(onRevert).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not offer revert on a queued turn", () => {
+    const item = {
+      ...makeItem([]),
+      queued: { queuedId: "queued-1" },
+    };
+    const { queryByRole } = render(
+      <UserMessage item={item} onRevert={() => undefined} />,
+    );
+
+    expect(
+      queryByRole("button", { name: "Revert to before this turn" }),
+    ).toBeNull();
   });
 });

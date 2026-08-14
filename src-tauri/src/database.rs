@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -152,6 +152,36 @@ pub struct AgentChatCheckpointRecord {
     pub head_commit: String,
     pub branch: Option<String>,
     pub created_at: String,
+}
+
+/// One exact pre-dispatch workspace snapshot in a thread's contiguous
+/// provider conversation timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentChatTurnCheckpointRecord {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub repo_path: String,
+    pub turn_index: i64,
+    pub client_nonce: Option<String>,
+    pub transcript_cutoff_id: i64,
+    pub ref_name: String,
+    pub snapshot_commit: String,
+    pub head_commit: String,
+    pub branch: Option<String>,
+    pub created_at: String,
+}
+
+/// Filesystem state whose owning session rows were removed while duplicate
+/// provider sessions were collapsed. The command layer uses this after the
+/// database transaction commits to remove external image directories and Git
+/// refs that SQLite cannot cascade-delete itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentChatSessionCleanup {
+    pub thread_ids: Vec<String>,
+    /// `(thread_id, repo_path)` pairs that may own a pre-restore safety ref.
+    pub repo_paths: Vec<(String, String)>,
+    /// Exact `(repo_path, ref_name)` checkpoint refs to delete.
+    pub checkpoint_refs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -474,6 +504,32 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_checkpoints_ref
             ON agent_chat_checkpoints(ref_name);
+
+        -- Turn-addressable checkpoints. These are deliberately separate from
+        -- the legacy run-start row: a target is valid only while this ordered
+        -- timeline remains contiguous with the provider's native history.
+        CREATE TABLE IF NOT EXISTS agent_chat_turn_checkpoints (
+            thread_id TEXT NOT NULL,
+            turn_index INTEGER NOT NULL,
+            workspace_id TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            client_nonce TEXT,
+            transcript_cutoff_id INTEGER NOT NULL,
+            ref_name TEXT NOT NULL,
+            snapshot_commit TEXT NOT NULL,
+            head_commit TEXT NOT NULL,
+            branch TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (thread_id, turn_index),
+            FOREIGN KEY (thread_id)
+                REFERENCES agent_chat_sessions(thread_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_chat_turn_checkpoints_ref
+            ON agent_chat_turn_checkpoints(repo_path, ref_name);
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_turn_checkpoints_nonce
+            ON agent_chat_turn_checkpoints(thread_id, client_nonce);
 
         -- Hosts (Step 2 of cloud push — Settings → Hosts pane data model).
         --
@@ -3559,10 +3615,13 @@ impl DatabaseStore {
     pub fn collapse_duplicate_agent_chat_sessions(
         &self,
         sdk_session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
+    ) -> Result<AgentChatSessionCleanup, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|e| format!("Failed to start duplicate-session merge: {e}"))?;
         // Pick the most-recently-active row as the survivor.
-        let survivor: Option<String> = conn
+        let survivor: Option<String> = transaction
             .query_row(
                 "SELECT thread_id FROM agent_chat_sessions
                  WHERE sdk_session_id = ?1
@@ -3572,8 +3631,79 @@ impl DatabaseStore {
             )
             .ok();
         let Some(survivor) = survivor else {
-            return Ok(());
+            return Ok(AgentChatSessionCleanup::default());
         };
+
+        // Capture every external resource owned by rows that the FK cascade is
+        // about to remove. Git refs and chat images live outside SQLite, so the
+        // caller must delete them after this transaction commits.
+        let removed_sessions = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT thread_id, cwd FROM agent_chat_sessions
+                     WHERE sdk_session_id = ?1 AND thread_id != ?2",
+                )
+                .map_err(|e| format!("Failed to prepare duplicate-session cleanup: {e}"))?;
+            let sessions = statement
+                .query_map(params![sdk_session_id, survivor], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| format!("Failed to read duplicate-session cleanup: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect duplicate-session cleanup: {e}"))?;
+            sessions
+        };
+        let mut cleanup = AgentChatSessionCleanup {
+            thread_ids: removed_sessions
+                .iter()
+                .map(|(thread_id, _)| thread_id.clone())
+                .collect(),
+            ..AgentChatSessionCleanup::default()
+        };
+        let mut repo_paths = removed_sessions
+            .iter()
+            .filter_map(|(thread_id, cwd)| {
+                cwd.as_ref().map(|cwd| (thread_id.clone(), cwd.clone()))
+            })
+            .collect::<HashSet<_>>();
+        let mut checkpoint_refs = HashSet::new();
+        for (thread_id, _) in &removed_sessions {
+            let mut turn_statement = transaction
+                .prepare(
+                    "SELECT repo_path, ref_name FROM agent_chat_turn_checkpoints
+                     WHERE thread_id = ?1",
+                )
+                .map_err(|e| format!("Failed to prepare turn-checkpoint cleanup: {e}"))?;
+            let turn_refs = turn_statement
+                .query_map(params![thread_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("Failed to read turn-checkpoint cleanup: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect turn-checkpoint cleanup: {e}"))?;
+            for (repo_path, ref_name) in turn_refs {
+                repo_paths.insert((thread_id.clone(), repo_path.clone()));
+                checkpoint_refs.insert((repo_path, ref_name));
+            }
+            let legacy_ref = transaction
+                .query_row(
+                    "SELECT repo_path, ref_name FROM agent_chat_checkpoints
+                     WHERE thread_id = ?1",
+                    params![thread_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to read run-checkpoint cleanup: {e}"))?;
+            if let Some((repo_path, ref_name)) = legacy_ref {
+                repo_paths.insert((thread_id.clone(), repo_path.clone()));
+                checkpoint_refs.insert((repo_path, ref_name));
+            }
+        }
+        cleanup.repo_paths = repo_paths.into_iter().collect();
+        cleanup.checkpoint_refs = checkpoint_refs.into_iter().collect();
+        cleanup.thread_ids.sort();
+        cleanup.repo_paths.sort();
+        cleanup.checkpoint_refs.sort();
         // Merge identity + config fields onto the survivor: keep the
         // earliest created_at, and carry forward any non-null title /
         // per-thread config (model / effort / context_window /
@@ -3585,7 +3715,7 @@ impl DatabaseStore {
         // when the original row is DELETEd below. Each config column
         // prefers the survivor's own non-null value, then the
         // most-recently-active non-null value across the group.
-        conn.execute(
+        transaction.execute(
             "UPDATE agent_chat_sessions
                  SET created_at = COALESCE(
                      (SELECT MIN(created_at) FROM agent_chat_sessions
@@ -3637,7 +3767,7 @@ impl DatabaseStore {
         // survivor BEFORE the DELETE — otherwise ON DELETE CASCADE
         // wipes the transcript history of the prior thread_ids whose
         // messages we want to keep visible after resume.
-        conn.execute(
+        transaction.execute(
             "UPDATE agent_chat_messages
              SET thread_id = ?2
              WHERE thread_id IN (
@@ -3648,13 +3778,16 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
         // Delete the non-survivors.
-        conn.execute(
+        transaction.execute(
             "DELETE FROM agent_chat_sessions
              WHERE sdk_session_id = ?1 AND thread_id != ?2",
             params![sdk_session_id, survivor],
         )
         .map_err(|e| format!("Failed to drop duplicate sessions: {e}"))?;
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|e| format!("Failed to commit duplicate-session merge: {e}"))?;
+        Ok(cleanup)
     }
 
     /// Delete a session row. Idempotent.
@@ -3956,6 +4089,317 @@ impl DatabaseStore {
     }
 }
 
+// ── Agent Chat Turn Checkpoints ──
+
+fn row_to_agent_chat_turn_checkpoint(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentChatTurnCheckpointRecord> {
+    Ok(AgentChatTurnCheckpointRecord {
+        thread_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        repo_path: row.get(2)?,
+        turn_index: row.get(3)?,
+        client_nonce: row.get(4)?,
+        transcript_cutoff_id: row.get(5)?,
+        ref_name: row.get(6)?,
+        snapshot_commit: row.get(7)?,
+        head_commit: row.get(8)?,
+        branch: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+impl DatabaseStore {
+    pub fn next_agent_chat_turn_checkpoint_index(&self, thread_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(MAX(turn_index), 0) + 1
+             FROM agent_chat_turn_checkpoints WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Failed to allocate turn checkpoint index: {error}"))
+    }
+
+    pub fn agent_chat_transcript_cutoff(&self, thread_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM agent_chat_messages WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Failed to read transcript cutoff: {error}"))
+    }
+
+    pub fn upsert_agent_chat_turn_checkpoint(
+        &self,
+        record: &AgentChatTurnCheckpointRecord,
+    ) -> Result<AgentChatTurnCheckpointRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_turn_checkpoints
+                 (thread_id, turn_index, workspace_id, repo_path, client_nonce,
+                  transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
+                  branch, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))
+             ON CONFLICT(thread_id, turn_index) DO UPDATE SET
+                 workspace_id = excluded.workspace_id,
+                 repo_path = excluded.repo_path,
+                 client_nonce = excluded.client_nonce,
+                 transcript_cutoff_id = excluded.transcript_cutoff_id,
+                 ref_name = excluded.ref_name,
+                 snapshot_commit = excluded.snapshot_commit,
+                 head_commit = excluded.head_commit,
+                 branch = excluded.branch,
+                 created_at = datetime('now')",
+            params![
+                record.thread_id,
+                record.turn_index,
+                record.workspace_id,
+                record.repo_path,
+                record.client_nonce,
+                record.transcript_cutoff_id,
+                record.ref_name,
+                record.snapshot_commit,
+                record.head_commit,
+                record.branch,
+            ],
+        )
+        .map_err(|error| format!("Failed to persist turn checkpoint: {error}"))?;
+        conn.query_row(
+            "SELECT thread_id, workspace_id, repo_path, turn_index, client_nonce,
+                    transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
+                    branch, created_at
+             FROM agent_chat_turn_checkpoints
+             WHERE thread_id = ?1 AND turn_index = ?2",
+            params![record.thread_id, record.turn_index],
+            row_to_agent_chat_turn_checkpoint,
+        )
+        .map_err(|error| format!("Failed to re-read turn checkpoint: {error}"))
+    }
+
+    pub fn get_agent_chat_turn_checkpoint(
+        &self,
+        thread_id: &str,
+        turn_index: i64,
+    ) -> Option<AgentChatTurnCheckpointRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT thread_id, workspace_id, repo_path, turn_index, client_nonce,
+                    transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
+                    branch, created_at
+             FROM agent_chat_turn_checkpoints
+             WHERE thread_id = ?1 AND turn_index = ?2",
+            params![thread_id, turn_index],
+            row_to_agent_chat_turn_checkpoint,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Bind a committed checkpoint to the durable user-message row that
+    /// materialized its accepted turn. The row immediately before that user
+    /// message is the exact transcript boundary retained by revert.
+    pub fn bind_agent_chat_turn_checkpoint_transcript(
+        &self,
+        thread_id: &str,
+        client_nonce: &str,
+        user_message_id: i64,
+    ) -> Result<Option<AgentChatTurnCheckpointRecord>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_turn_checkpoints
+             SET transcript_cutoff_id = ?3
+             WHERE thread_id = ?1 AND turn_index = (
+                 SELECT MAX(turn_index) FROM agent_chat_turn_checkpoints
+                 WHERE thread_id = ?1 AND client_nonce = ?2
+             )",
+            params![thread_id, client_nonce, user_message_id - 1],
+        )
+        .map_err(|error| format!("Failed to bind turn checkpoint transcript: {error}"))?;
+        conn.query_row(
+            "SELECT thread_id, workspace_id, repo_path, turn_index, client_nonce,
+                    transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
+                    branch, created_at
+             FROM agent_chat_turn_checkpoints
+             WHERE thread_id = ?1 AND client_nonce = ?2
+             ORDER BY turn_index DESC LIMIT 1",
+            params![thread_id, client_nonce],
+            row_to_agent_chat_turn_checkpoint,
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read bound turn checkpoint: {error}"))
+    }
+
+    pub fn list_agent_chat_turn_checkpoints(
+        &self,
+        thread_id: &str,
+    ) -> Vec<AgentChatTurnCheckpointRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = match conn.prepare(
+            "SELECT thread_id, workspace_id, repo_path, turn_index, client_nonce,
+                    transcript_cutoff_id, ref_name, snapshot_commit, head_commit,
+                    branch, created_at
+             FROM agent_chat_turn_checkpoints
+             WHERE thread_id = ?1 ORDER BY turn_index ASC",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        statement
+            .query_map(params![thread_id], row_to_agent_chat_turn_checkpoint)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Cheap hot-path probe used when a turn is dispatched without checkpoint
+    /// support. Avoid materializing as many as 500 timeline rows merely to
+    /// decide whether stale refs need invalidating.
+    pub fn has_agent_chat_turn_checkpoints(&self, thread_id: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM agent_chat_turn_checkpoints
+                 WHERE thread_id = ?1 LIMIT 1
+             )",
+            params![thread_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    }
+
+    /// Invalidate the entire contiguous timeline, returning refs for cleanup.
+    pub fn clear_agent_chat_turn_checkpoints(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to begin checkpoint invalidation: {error}"))?;
+        let refs = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT repo_path, ref_name FROM agent_chat_turn_checkpoints
+                     WHERE thread_id = ?1",
+                )
+                .map_err(|error| format!("Failed to list invalidated refs: {error}"))?;
+            let refs = statement
+                .query_map(params![thread_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| format!("Failed to read invalidated refs: {error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            refs
+        };
+        transaction
+            .execute(
+                "DELETE FROM agent_chat_turn_checkpoints WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .map_err(|error| format!("Failed to invalidate turn checkpoints: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit checkpoint invalidation: {error}"))?;
+        Ok(refs)
+    }
+
+    /// Keep only the newest `keep` checkpoints for a thread, returning the
+    /// shadow refs belonging to rows removed from the oldest edge.
+    pub fn prune_agent_chat_turn_checkpoints(
+        &self,
+        thread_id: &str,
+        keep: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to begin turn checkpoint prune: {error}"))?;
+        let stale = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT turn_index, repo_path, ref_name
+                     FROM agent_chat_turn_checkpoints
+                     WHERE thread_id = ?1
+                     ORDER BY turn_index DESC LIMIT -1 OFFSET ?2",
+                )
+                .map_err(|error| format!("Failed to prepare turn checkpoint prune: {error}"))?;
+            let rows = statement
+                .query_map(params![thread_id, keep as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|error| format!("Failed to list old turn checkpoints: {error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            rows
+        };
+        for (turn_index, _, _) in &stale {
+            transaction
+                .execute(
+                    "DELETE FROM agent_chat_turn_checkpoints
+                     WHERE thread_id = ?1 AND turn_index = ?2",
+                    params![thread_id, turn_index],
+                )
+                .map_err(|error| format!("Failed to prune turn checkpoint: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit turn checkpoint prune: {error}"))?;
+        Ok(stale
+            .into_iter()
+            .map(|(_, repo_path, ref_name)| (repo_path, ref_name))
+            .collect())
+    }
+
+    /// Atomically trim the local transcript and checkpoint timeline after the
+    /// provider rollback succeeds. Returns the refs made obsolete.
+    pub fn finalize_agent_chat_turn_revert(
+        &self,
+        thread_id: &str,
+        turn_index: i64,
+        transcript_cutoff_id: i64,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| format!("Failed to begin turn revert: {error}"))?;
+        let refs = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT repo_path, ref_name FROM agent_chat_turn_checkpoints
+                     WHERE thread_id = ?1 AND turn_index >= ?2
+                     ORDER BY turn_index ASC",
+                )
+                .map_err(|error| format!("Failed to list reverted refs: {error}"))?;
+            let refs = statement
+                .query_map(params![thread_id, turn_index], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|error| format!("Failed to read reverted refs: {error}"))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            refs
+        };
+        transaction
+            .execute(
+                "DELETE FROM agent_chat_messages WHERE thread_id = ?1 AND id > ?2",
+                params![thread_id, transcript_cutoff_id],
+            )
+            .map_err(|error| format!("Failed to trim reverted transcript: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM agent_chat_turn_checkpoints
+                 WHERE thread_id = ?1 AND turn_index >= ?2",
+                params![thread_id, turn_index],
+            )
+            .map_err(|error| format!("Failed to trim reverted checkpoints: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Failed to commit turn revert: {error}"))?;
+        Ok(refs)
+    }
+}
+
 // ── Auth Tokens ──
 
 impl DatabaseStore {
@@ -4160,6 +4604,134 @@ impl DatabaseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_turn_checkpoint(
+        thread_id: &str,
+        turn_index: i64,
+        nonce: &str,
+        transcript_cutoff_id: i64,
+    ) -> AgentChatTurnCheckpointRecord {
+        AgentChatTurnCheckpointRecord {
+            thread_id: thread_id.to_string(),
+            workspace_id: "ws-checkpoint".to_string(),
+            repo_path: "/tmp/checkpoint-repo".to_string(),
+            turn_index,
+            client_nonce: Some(nonce.to_string()),
+            transcript_cutoff_id,
+            ref_name: format!("refs/codemux/turn-checkpoints/{thread_id}/{turn_index}"),
+            snapshot_commit: format!("snapshot-{turn_index}"),
+            head_commit: "head".to_string(),
+            branch: Some("main".to_string()),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn turn_checkpoint_timeline_binds_prunes_and_finalizes_exactly() {
+        let db = init_test_database();
+        let thread_id = "turn-timeline";
+        db.upsert_agent_chat_session(
+            thread_id,
+            "ws-checkpoint",
+            Some("/tmp/checkpoint-repo"),
+            "codex",
+        )
+        .unwrap();
+        assert!(!db.has_agent_chat_turn_checkpoints(thread_id));
+
+        db.upsert_agent_chat_turn_checkpoint(&sample_turn_checkpoint(
+            thread_id,
+            1,
+            "nonce-1",
+            0,
+        ))
+        .unwrap();
+        let user_1 = db
+            .append_agent_chat_message(thread_id, r#"{"type":"user_message","text":"one"}"#)
+            .unwrap()
+            .unwrap();
+        let first = db
+            .bind_agent_chat_turn_checkpoint_transcript(thread_id, "nonce-1", user_1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.transcript_cutoff_id, user_1 - 1);
+        db.append_agent_chat_message(thread_id, r#"{"type":"turn_completed"}"#)
+            .unwrap();
+
+        db.upsert_agent_chat_turn_checkpoint(&sample_turn_checkpoint(
+            thread_id,
+            2,
+            "nonce-2",
+            db.agent_chat_transcript_cutoff(thread_id).unwrap(),
+        ))
+        .unwrap();
+        let user_2 = db
+            .append_agent_chat_message(thread_id, r#"{"type":"user_message","text":"two"}"#)
+            .unwrap()
+            .unwrap();
+        let second = db
+            .bind_agent_chat_turn_checkpoint_transcript(thread_id, "nonce-2", user_2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.transcript_cutoff_id, user_2 - 1);
+        db.append_agent_chat_message(thread_id, r#"{"type":"turn_completed"}"#)
+            .unwrap();
+
+        db.upsert_agent_chat_turn_checkpoint(&sample_turn_checkpoint(
+            thread_id,
+            3,
+            "nonce-3",
+            db.agent_chat_transcript_cutoff(thread_id).unwrap(),
+        ))
+        .unwrap();
+        let user_3 = db
+            .append_agent_chat_message(
+                thread_id,
+                r#"{"type":"user_message","text":"three"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let third = db
+            .bind_agent_chat_turn_checkpoint_transcript(thread_id, "nonce-3", user_3)
+            .unwrap()
+            .unwrap();
+        db.append_agent_chat_message(thread_id, r#"{"type":"turn_completed"}"#)
+            .unwrap();
+
+        assert!(db.has_agent_chat_turn_checkpoints(thread_id));
+        assert_eq!(
+            db.next_agent_chat_turn_checkpoint_index(thread_id).unwrap(),
+            4
+        );
+        assert!(db
+            .bind_agent_chat_turn_checkpoint_transcript(thread_id, "missing", user_3)
+            .unwrap()
+            .is_none());
+
+        let pruned = db.prune_agent_chat_turn_checkpoints(thread_id, 2).unwrap();
+        assert_eq!(pruned, vec![(first.repo_path, first.ref_name)]);
+        let retained = db.list_agent_chat_turn_checkpoints(thread_id);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|checkpoint| checkpoint.turn_index)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let removed = db
+            .finalize_agent_chat_turn_revert(thread_id, 2, second.transcript_cutoff_id)
+            .unwrap();
+        assert_eq!(
+            removed,
+            vec![
+                (second.repo_path, second.ref_name),
+                (third.repo_path, third.ref_name),
+            ]
+        );
+        assert_eq!(db.list_agent_chat_messages(thread_id).len(), 2);
+        assert!(!db.has_agent_chat_turn_checkpoints(thread_id));
+    }
 
     #[test]
     fn migration_drops_retired_orchestration_history() {
@@ -4640,6 +5212,33 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v14_upgrade_creates_turn_checkpoints_and_advances_to_v15() {
+        let db = init_test_database();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "DROP TABLE agent_chat_turn_checkpoints;
+             UPDATE schema_version SET version = 14;",
+        )
+        .unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_chat_turn_checkpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
     }
 
     // ── Settings Persistence ──
@@ -5513,6 +6112,72 @@ mod tests {
         db.collapse_duplicate_agent_chat_sessions("sdk-missing")
             .unwrap();
         assert!(db.get_agent_chat_session("t").is_some());
+    }
+
+    #[test]
+    fn collapse_duplicate_agent_chat_sessions_returns_external_cleanup() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, cwd, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-cleanup', 'ws', '/repo/cwd', 'codex', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, cwd, provider, created_at, last_active_at)
+                 VALUES ('new', 'sdk-cleanup', 'ws', '/repo/new', 'codex', '2025-02-01', '2025-02-01')",
+                [],
+            )
+            .unwrap();
+        }
+        db.upsert_agent_chat_turn_checkpoint(&sample_turn_checkpoint("old", 1, "nonce", 0))
+            .unwrap();
+        db.upsert_agent_chat_checkpoint(&AgentChatCheckpointRecord {
+            thread_id: "old".to_string(),
+            workspace_id: "ws".to_string(),
+            repo_path: "/repo/legacy".to_string(),
+            ref_name: "refs/codemux/checkpoints/old".to_string(),
+            snapshot_commit: "legacy-snapshot".to_string(),
+            head_commit: "head".to_string(),
+            branch: Some("main".to_string()),
+            created_at: String::new(),
+        })
+        .unwrap();
+
+        let cleanup = db
+            .collapse_duplicate_agent_chat_sessions("sdk-cleanup")
+            .unwrap();
+
+        assert_eq!(cleanup.thread_ids, vec!["old"]);
+        assert_eq!(
+            cleanup.repo_paths,
+            vec![
+                ("old".to_string(), "/repo/cwd".to_string()),
+                ("old".to_string(), "/repo/legacy".to_string()),
+                ("old".to_string(), "/tmp/checkpoint-repo".to_string()),
+            ]
+        );
+        assert_eq!(
+            cleanup.checkpoint_refs,
+            vec![
+                (
+                    "/repo/legacy".to_string(),
+                    "refs/codemux/checkpoints/old".to_string(),
+                ),
+                (
+                    "/tmp/checkpoint-repo".to_string(),
+                    "refs/codemux/turn-checkpoints/old/1".to_string(),
+                ),
+            ]
+        );
+        assert!(db.get_agent_chat_session("old").is_none());
+        assert!(db.list_agent_chat_turn_checkpoints("old").is_empty());
+        assert!(db.get_agent_chat_checkpoint("old").is_none());
+        assert!(db.get_agent_chat_session("new").is_some());
     }
 
     #[test]

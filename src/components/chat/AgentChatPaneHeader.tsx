@@ -1,9 +1,7 @@
-import { History, SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
+import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 
-import { RestoreCheckpointDialog } from "@/components/chat/restore-checkpoint-dialog";
 import { SessionSelector } from "@/components/chat/SessionSelector";
 import { Button } from "@/components/ui/button";
-import { useAgentChatCheckpointRestore } from "@/hooks/use-agent-chat-checkpoint-restore";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import { closePane, splitPane } from "@/tauri/commands";
@@ -39,17 +37,6 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
   // title-bar chat tab so both paths stop → hydrate → resume identically.
   const { cwd, handleSelect, handleNewChat } = useAgentChatSessionActions(pane);
 
-  // Run-start rollback checkpoint (issue #80), shared with the GUI-chrome
-  // title-bar chat tab. `checkpoint` stays null when the opt-in setting is
-  // off / the snapshot hasn't landed, which hides the restore affordance.
-  const {
-    checkpoint,
-    turnActive,
-    confirmOpen,
-    setConfirmOpen,
-    restoring,
-    handleRestoreConfirmed,
-  } = useAgentChatCheckpointRestore(pane.thread_id ?? null);
   const handleSplit = (direction: "horizontal" | "vertical") => {
     splitPane(pane.pane_id, direction).catch(console.error);
   };
@@ -89,26 +76,6 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           target, 14px glyph, drop close to destructive-foreground when
           its red hover bg kicks in. */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-        {checkpoint && (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="text-muted-foreground hover:text-foreground"
-            onClick={() => setConfirmOpen(true)}
-            // Restoring under a running agent would yank files out
-            // from under its tools — stop the turn first.
-            disabled={turnActive || restoring}
-            aria-label="Restore checkpoint"
-            title={
-              turnActive
-                ? "Stop the running turn before restoring"
-                : "Restore workspace to before this run"
-            }
-            data-testid="restore-checkpoint-button"
-          >
-            <History className="h-3.5 w-3.5" />
-          </Button>
-        )}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -140,13 +107,6 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <X className="h-3.5 w-3.5" />
         </Button>
       </div>
-      <RestoreCheckpointDialog
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        checkpoint={checkpoint}
-        restoring={restoring}
-        onConfirm={() => void handleRestoreConfirmed()}
-      />
     </header>
   );
 }

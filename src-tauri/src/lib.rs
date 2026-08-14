@@ -2074,6 +2074,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_get_tool_result,
             commands::agent_chat_get_checkpoint,
             commands::agent_chat_restore_checkpoint,
+            commands::agent_chat_list_turn_checkpoints,
+            commands::agent_chat_revert_turn_checkpoint,
             commands::attach_agent_chat_output,
             commands::detach_agent_chat_output,
             commands::opencode_check_availability,

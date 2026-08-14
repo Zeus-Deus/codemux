@@ -428,10 +428,27 @@ impl ClaudeSession {
                 return Ok(SendOutcome::Queued(queued_id));
             }
         }
-        let turn_id = self
+        let checkpoint = input.turn_checkpoint.clone();
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint.prepare().await;
+        }
+        let sent = self
             .do_send(input.text, input.images, input.model_override)
-            .await?;
-        Ok(SendOutcome::Started(turn_id))
+            .await;
+        match sent {
+            Ok(turn_id) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.commit().await;
+                }
+                Ok(SendOutcome::Started(turn_id))
+            }
+            Err(error) => {
+                if let Some(checkpoint) = checkpoint.as_ref() {
+                    checkpoint.abort().await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Pop the next queued turn (if the session is idle) and dispatch it.
@@ -470,6 +487,10 @@ impl ClaudeSession {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| queued.input.text.clone());
+            let checkpoint = queued.input.turn_checkpoint.clone();
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                checkpoint.prepare().await;
+            }
             match self
                 .do_send(
                     queued.input.text,
@@ -479,6 +500,9 @@ impl ClaudeSession {
                 .await
             {
                 Ok(turn_id) => {
+                    if let Some(checkpoint) = checkpoint.as_ref() {
+                        checkpoint.commit().await;
+                    }
                     {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
@@ -492,6 +516,9 @@ impl ClaudeSession {
                     return;
                 }
                 Err(err) => {
+                    if let Some(checkpoint) = checkpoint.as_ref() {
+                        checkpoint.abort().await;
+                    }
                     {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
@@ -1554,6 +1581,7 @@ mod tests {
                 client_nonce: None,
                 display_text: None,
                 skill_invocations: vec![],
+                turn_checkpoint: None,
             },
         }
     }

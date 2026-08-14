@@ -351,6 +351,12 @@ vi.mock("@/hooks/use-agent-chat-events", () => ({
   useAgentChatEvents: () => {},
 }));
 
+vi.mock("@/tauri/events", () => ({
+  onAgentChatTurnCheckpoint: vi.fn().mockResolvedValue(() => {}),
+  onAgentChatTurnCheckpointReverted: vi.fn().mockResolvedValue(() => {}),
+  onAgentChatTurnCheckpointsInvalidated: vi.fn().mockResolvedValue(() => {}),
+}));
+
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
@@ -376,6 +382,8 @@ vi.mock("@/tauri/commands", () => ({
   // persisted sessions list; default to empty so it clears to the plain
   // divider unless a test seeds a record.
   agentChatListSessions: vi.fn().mockResolvedValue([]),
+  agentChatListTurnCheckpoints: vi.fn().mockResolvedValue([]),
+  agentChatRevertTurnCheckpoint: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatCancelQueuedTurn: vi.fn().mockResolvedValue(true),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),

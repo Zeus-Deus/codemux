@@ -539,23 +539,38 @@ export interface AgentChatEventPayload {
   persisted_id?: number | null;
 }
 
-/** Emitted when the background run-start checkpoint (issue #80) lands,
- *  so the pane header can reveal the restore affordance without
- *  polling. Stays on the GLOBAL event bus (not the per-thread
- *  Channel): the checkpoint task outlives the start_session command
- *  and there is exactly one event per run, so a broadcast with a
- *  thread-id filter on the subscriber side is the right transport.
- *  Mirrors AgentChatCheckpointEventPayload in
- *  src-tauri/src/commands/agent_chat.rs. */
-export interface AgentChatCheckpointPayload {
+export interface AgentChatTurnCheckpointPayload {
   thread_id: string;
-  checkpoint: import("./commands").AgentChatCheckpointRecord;
+  checkpoint: import("./commands").AgentChatTurnCheckpointRecord;
+  oldest_turn_index: number;
 }
 
-export const onAgentChatCheckpoint = (
-  cb: EventCallback<AgentChatCheckpointPayload>,
+export interface AgentChatTurnCheckpointRevertedPayload {
+  thread_id: string;
+  turn_index: number;
+  transcript_cutoff_id: number;
+  remaining_checkpoints: import("./commands").AgentChatTurnCheckpointRecord[];
+}
+
+export const onAgentChatTurnCheckpoint = (
+  cb: EventCallback<AgentChatTurnCheckpointPayload>,
 ): Promise<UnlistenFn> =>
-  listen<AgentChatCheckpointPayload>("agent_chat_checkpoint", (e) =>
+  listen<AgentChatTurnCheckpointPayload>("agent_chat_turn_checkpoint", (e) =>
+    cb(e.payload),
+  );
+
+export const onAgentChatTurnCheckpointReverted = (
+  cb: EventCallback<AgentChatTurnCheckpointRevertedPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatTurnCheckpointRevertedPayload>(
+    "agent_chat_turn_checkpoint_reverted",
+    (e) => cb(e.payload),
+  );
+
+export const onAgentChatTurnCheckpointsInvalidated = (
+  cb: EventCallback<string>,
+): Promise<UnlistenFn> =>
+  listen<string>("agent_chat_turn_checkpoints_invalidated", (e) =>
     cb(e.payload),
   );
 

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // ── Settings Types ──────────────────────────────────────────────
 
@@ -190,11 +190,10 @@ pub struct FileTreeSettings {
 }
 
 /// Agent-chat behavior knobs. `checkpoints_enabled` is the opt-in for
-/// the run-start rollback checkpoint (issue #80): when on, starting an
-/// agent-chat session snapshots the working tree in the background so
-/// the run's changes can be rolled back. Defaults to OFF — the
-/// snapshot writes objects into the user's repo, which must be a
-/// deliberate choice.
+/// provider-aware per-turn revert checkpoints: before a supported provider
+/// dispatches a turn, Codemux snapshots the workspace so files, native
+/// conversation history, and the transcript can be rewound together.
+/// Defaults to OFF because snapshots write objects into the user's repo.
 ///
 /// `background_browser_desktop_viewport` pins a GUI-mode background
 /// browser's CDP viewport to a real desktop size (1280×800, matching
@@ -292,6 +291,30 @@ fn dirty_flag_path() -> PathBuf {
     cache_dir().join("settings-dirty")
 }
 
+// Turn dispatch is latency-sensitive. Reading and deserializing the complete
+// settings file for every prompt is unnecessary because every in-process
+// settings mutation funnels through `save_cache`/`clear_cache`. Zero means
+// uninitialized, one means disabled, and two means enabled.
+static CHECKPOINTS_ENABLED_CACHE: AtomicU8 = AtomicU8::new(0);
+
+fn set_cached_checkpoints_enabled(enabled: bool) {
+    CHECKPOINTS_ENABLED_CACHE.store(if enabled { 2 } else { 1 }, Ordering::Release);
+}
+
+pub fn agent_chat_checkpoints_enabled() -> bool {
+    match CHECKPOINTS_ENABLED_CACHE.load(Ordering::Acquire) {
+        1 => false,
+        2 => true,
+        _ => {
+            let enabled = load_cache()
+                .map(|settings| settings.agent_chat.checkpoints_enabled)
+                .unwrap_or(false);
+            set_cached_checkpoints_enabled(enabled);
+            enabled
+        }
+    }
+}
+
 pub fn save_cache(settings: &UserSettings) -> Result<(), String> {
     let path = cache_file_path();
     if let Some(parent) = path.parent() {
@@ -308,6 +331,7 @@ pub fn save_cache(settings: &UserSettings) -> Result<(), String> {
 
     let json = serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
     fs::write(&path, json).map_err(|e| format!("write cache: {e}"))?;
+    set_cached_checkpoints_enabled(settings.agent_chat.checkpoints_enabled);
 
     if host_mapping_changed {
         crate::git_provider::invalidate_detection_cache(None);
@@ -323,6 +347,7 @@ pub fn load_cache() -> Option<UserSettings> {
 pub fn clear_cache() {
     let _ = fs::remove_file(cache_file_path());
     let _ = fs::remove_file(dirty_flag_path());
+    set_cached_checkpoints_enabled(false);
 }
 
 pub fn set_dirty(dirty: bool) {
@@ -572,6 +597,27 @@ mod tests {
 
         clear_cache();
         assert!(load_cache().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_flag_cache_tracks_settings_writes_and_clear() {
+        clear_cache();
+        assert!(!agent_chat_checkpoints_enabled());
+
+        let mut settings = UserSettings::default();
+        settings.agent_chat.checkpoints_enabled = true;
+        save_cache(&settings).unwrap();
+        assert!(agent_chat_checkpoints_enabled());
+
+        settings.agent_chat.checkpoints_enabled = false;
+        save_cache(&settings).unwrap();
+        assert!(!agent_chat_checkpoints_enabled());
+
+        settings.agent_chat.checkpoints_enabled = true;
+        save_cache(&settings).unwrap();
+        clear_cache();
+        assert!(!agent_chat_checkpoints_enabled());
     }
 
     #[test]
