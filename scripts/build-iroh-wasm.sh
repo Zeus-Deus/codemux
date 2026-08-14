@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the browser (WASM) iroh relay client and stage the generated web-target
 # glue + wasm into public/iroh-wasm/ so `vite build` copies it to the deploy
-# root (served at /iroh-wasm/…). The artifact is multi-MB and gitignored; the
+# root (served at /iroh-wasm/…). Release builds set CODEMUX_IROH_WASM_VERSION
+# to stage under a versioned subdirectory, keeping older browser tabs isolated
+# from later wasm-bindgen output. The artifact is multi-MB and gitignored; the
 # main build stays green without it (relay mode degrades to "build the wasm",
 # the LAN/mesh WebSocket path is the default). Mirrors how the repo treats the
 # bundled agent sidecar: a build script produces a bundled binary, not committed.
@@ -17,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRATE_DIR="$REPO_ROOT/iroh-wasm"
-OUT_DIR="$REPO_ROOT/public/iroh-wasm"
+OUT_ROOT="$REPO_ROOT/public/iroh-wasm"
 TOOLS_DIR="$CRATE_DIR/.tools"
 TARGET="wasm32-unknown-unknown"
 
@@ -33,6 +35,16 @@ WASM_BINDGEN_VERSION="$(
 log "wasm-bindgen version: $WASM_BINDGEN_VERSION"
 
 command -v cargo >/dev/null 2>&1 || die "cargo not found — install Rust."
+
+IROH_WASM_VERSION="${CODEMUX_IROH_WASM_VERSION:-}"
+if [ -n "$IROH_WASM_VERSION" ]; then
+  if [[ ! "$IROH_WASM_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+    die "CODEMUX_IROH_WASM_VERSION must be a v-prefixed semantic version"
+  fi
+  OUT_DIR="$OUT_ROOT/$IROH_WASM_VERSION"
+else
+  OUT_DIR="$OUT_ROOT"
+fi
 
 # ── 1. wasm target ──────────────────────────────────────────────────
 if ! rustc --print target-list 2>/dev/null | grep -qx "$TARGET"; then
@@ -71,13 +83,13 @@ fi
 # the crates' `wasm_js` features in Cargo.toml); 0.2 uses its `js` feature.
 export RUSTFLAGS="${RUSTFLAGS:-} --cfg getrandom_backend=\"wasm_js\""
 log "compiling (release, opt-level=z) for $TARGET"
-(cd "$CRATE_DIR" && cargo build --release --target "$TARGET")
+(cd "$CRATE_DIR" && cargo build --locked --release --target "$TARGET")
 
 WASM_IN="$CRATE_DIR/target/$TARGET/release/iroh_wasm.wasm"
 [ -f "$WASM_IN" ] || die "expected wasm at $WASM_IN not found"
 
 # ── 4. generate the web-target JS glue + bindings ───────────────────
-rm -rf "$OUT_DIR"
+rm -rf "$OUT_ROOT"
 mkdir -p "$OUT_DIR"
 log "running wasm-bindgen (--target web) → $OUT_DIR"
 "$WASM_BINDGEN" \
@@ -91,7 +103,8 @@ log "running wasm-bindgen (--target web) → $OUT_DIR"
 WASM_OUT="$OUT_DIR/iroh_wasm_bg.wasm"
 if command -v wasm-opt >/dev/null 2>&1; then
   log "wasm-opt -Oz"
-  wasm-opt -Oz --strip-debug "$WASM_OUT" -o "$WASM_OUT.opt" && mv "$WASM_OUT.opt" "$WASM_OUT"
+  wasm-opt --all-features -Oz --strip-debug "$WASM_OUT" -o "$WASM_OUT.opt" &&
+    mv "$WASM_OUT.opt" "$WASM_OUT"
 else
   log "wasm-opt not found — skipping (install binaryen for a smaller artifact)"
 fi

@@ -349,3 +349,114 @@ jobs:
           # — Authenticode is what Windows SmartScreen checks on install,
           # Ed25519 is what the Tauri auto-updater checks before applying
           # an update.
+
+  hosted-web:
+    name: hosted web release asset
+    # Wait for both desktop matrix legs so this job never races tauri-action
+    # while it is creating or updating the GitHub release. `!cancelled()` is
+    # deliberate: Windows is best-effort, so a Windows-only failure must not
+    # prevent a successful Linux release from getting its hosted client.
+    needs: release
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify the Linux release is published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+          for pattern in '\.AppImage$' '\.deb$' '\.rpm$'; do
+            if ! grep -qE "$pattern" <<<"$assets"; then
+              echo "::error::Refusing to publish the hosted client: the Linux release is missing an asset matching $pattern"
+              exit 1
+            fi
+          done
+
+      - name: Install WASM system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang binaryen
+
+      - name: Setup Rust with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: iroh-wasm -> target
+          key: hosted-web-wasm32-unknown-unknown
+
+      - name: Cache wasm-bindgen CLI
+        uses: actions/cache@v4
+        with:
+          path: iroh-wasm/.tools
+          key: wasm-bindgen-cli-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('iroh-wasm/Cargo.toml') }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build hosted client
+        env:
+          CODEMUX_IROH_WASM_VERSION: ${{ github.ref_name }}
+          VITE_CODEMUX_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          npm run build:iroh-wasm
+          npm run build
+
+      - name: Package and verify hosted client
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s dist/index.html
+          test -s "dist/iroh-wasm/$GITHUB_REF_NAME/iroh_wasm.js"
+          test -s "dist/iroh-wasm/$GITHUB_REF_NAME/iroh_wasm_bg.wasm"
+          test "$(od -An -tx1 -N4 "dist/iroh-wasm/$GITHUB_REF_NAME/iroh_wasm_bg.wasm" | tr -d '[:space:]')" = "0061736d"
+          wasm_loader_asset="$(grep -Rl '/iroh-wasm' dist/assets | sed -n '1p')"
+          test -n "$wasm_loader_asset"
+          grep -Fq "$GITHUB_REF_NAME" "$wasm_loader_asset"
+
+          version="${GITHUB_REF_NAME#v}"
+          archive="codemux-web-${version}.tar.gz"
+          mkdir -p release-assets
+          tar -C dist -czf "release-assets/$archive" .
+          (cd release-assets && sha256sum "$archive" > "$archive.sha256")
+
+          tar -tzf "release-assets/$archive" > release-assets/archive-contents.txt
+          grep -qE '^(\./)?index\.html$' release-assets/archive-contents.txt
+          grep -qE '^(\./)?assets/.+\.js$' release-assets/archive-contents.txt
+          grep -qE "^(\\./)?iroh-wasm/$GITHUB_REF_NAME/iroh_wasm\\.js$" release-assets/archive-contents.txt
+          grep -qE "^(\\./)?iroh-wasm/$GITHUB_REF_NAME/iroh_wasm_bg\\.wasm$" release-assets/archive-contents.txt
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload hosted client to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" \
+            "release-assets/$ARCHIVE" \
+            "release-assets/$ARCHIVE.sha256" \
+            --clobber
