@@ -160,9 +160,6 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
 
 // ── React hook selectors (trigger re-renders on specific value change) ──
 
-export const selectTerminalFontSize = (s: SyncedSettingsState): number =>
-  s.settings.appearance.terminal_font_size;
-
 export const selectAppearanceTheme = (s: SyncedSettingsState): string =>
   s.settings.appearance.theme || "default";
 

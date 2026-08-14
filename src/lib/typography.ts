@@ -17,10 +17,8 @@ export const TYPOGRAPHY_DEFAULTS = {
 export const TYPOGRAPHY_RANGES = {
   interface: { min: 13, max: 19 },
   conversation: { min: 12, max: 20 },
-  // Keep the ceiling aligned with the pre-existing terminal range. A synced
-  // blob from before the shared developer-font setting existed uses its
-  // terminal size as the code-size migration fallback, without silently
-  // shrinking a user's 20–22px accessibility choice.
+  // Code shares the terminal ceiling: a pre-migration blob adopts its terminal
+  // size as the code size, and that must not shrink a 20–22px choice.
   code: { min: 10, max: 22 },
   terminal: { min: 10, max: 22 },
 } as const;
@@ -71,9 +69,9 @@ export function clampTypographySize(
 }
 
 /**
- * Preferences store one family, never executable CSS. Keeping normalization
- * here means synced values from a newer client, hand-edited settings, and the
- * picker all travel through the same bounded path before touching a style.
+ * Preferences store one family, never executable CSS. Synced values,
+ * hand-edited settings, and the picker share this bounded path before any of
+ * them reaches a style.
  */
 export function normalizeFontFamily(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -98,9 +96,8 @@ export function resolveTypographySettings(
 
   const interfacePreference = normalizeFontFamily(appearance?.interface_font_family);
   const storedConversationPreference = normalizeFontFamily(appearance?.conversation_font_family);
-  // `shell_font` was Codemux's original terminal-family preference. Treat it
-  // as the initial shared developer face until the user makes any choice in
-  // the richer UI; those writes clear the legacy field.
+  // `shell_font` was the original terminal-family preference. It stands in as
+  // the shared developer face until a write in the richer UI clears it.
   const codePreference = normalizeFontFamily(
     appearance?.code_font_family ?? appearance?.shell_font,
   );
@@ -126,15 +123,16 @@ export function resolveTypographySettings(
   const codeSize = clampTypographySize(
     appearance?.code_font_size,
     TYPOGRAPHY_RANGES.code,
-    // Older settings only had terminal_font_size. Rust preserves a missing
-    // code size as null, so the new linked mode adopts that exact choice.
+    // Older settings only had terminal_font_size, and Rust preserves a missing
+    // code size as null. The settings UI materializes it before Advanced mode
+    // presents the two sizes as independent.
     storedTerminalSize,
   );
 
-  // Simple mode intentionally has two decisions: interface and developer.
-  // Conversation follows the interface family at a quieter -2px rhythm;
-  // terminal follows the developer font exactly. Advanced mode reveals the
-  // stored per-surface overrides without destroying them when users switch.
+  // Simple mode has two decisions: interface and developer. Conversation
+  // follows the interface family at a quieter -2px rhythm; terminal follows
+  // the developer font exactly. Advanced mode reveals the stored per-surface
+  // overrides without destroying them when users switch.
   const conversationPreference =
     mode === "advanced" ? storedConversationPreference ?? interfacePreference : interfacePreference;
   const terminalPreference =
@@ -173,10 +171,28 @@ export function resolveTypographySettings(
   };
 }
 
+/**
+ * The machine-local `terminal.font_family` override predates synced
+ * typography. It only wins while the synced blob carries no terminal family of
+ * its own, so any choice in the settings UI retires it.
+ */
+export function resolveTerminalFontFamily(
+  typography: ResolvedTypography,
+  legacyLocalFamily: string | null | undefined,
+): string {
+  if (typography.terminalPreference || !legacyLocalFamily) return typography.terminalFamily;
+  return legacyLocalFamily;
+}
+
 /** Apply the resolved contract once; every text renderer consumes these tokens. */
 export function applyTypography(root: HTMLElement, typography: ResolvedTypography): void {
-  root.dataset.typographyMode = typography.mode;
-  root.style.fontSize = `${typography.interfaceSize}px`;
+  // At the default size the root stays untouched so browser-level font scaling
+  // keeps working; only an explicit interface size pins it to pixels.
+  if (typography.interfaceSize === TYPOGRAPHY_DEFAULTS.interfaceSize) {
+    root.style.removeProperty("font-size");
+  } else {
+    root.style.fontSize = `${typography.interfaceSize}px`;
+  }
   root.style.setProperty("--font-interface", typography.interfaceFamily);
   root.style.setProperty("--font-conversation", typography.conversationFamily);
   root.style.setProperty("--font-code", typography.codeFamily);

@@ -203,9 +203,10 @@ vi.mock("@/stores/synced-settings-store", () => {
 });
 
 vi.mock("@/stores/settings-store", () => ({
-  getTerminalFontSize: () => 13,
   getTerminalCursorStyle: () => "bar",
-  getTerminalFontFamily: () => "monospace",
+  selectLegacyTerminalFontFamily: () => undefined,
+  useSettingsStore: (selector: (state: { settings: Record<string, string> }) => unknown) =>
+    selector({ settings: {} }),
 }));
 
 vi.mock("@/stores/app-store", () => ({

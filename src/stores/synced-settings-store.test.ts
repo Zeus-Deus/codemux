@@ -17,7 +17,6 @@ vi.mock("@/tauri/commands", () => ({
 import {
   useSyncedSettingsStore,
   DEFAULT_SETTINGS,
-  selectTerminalFontSize,
   selectTerminalCursorStyle,
   selectDefaultEditor,
   selectDefaultBaseBranch,
@@ -236,15 +235,6 @@ describe("synced-settings-store", () => {
   });
 
   describe("typed selectors", () => {
-    it("selectTerminalFontSize returns font size", () => {
-      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
-      expect(selectTerminalFontSize(useSyncedSettingsStore.getState())).toBe(16);
-    });
-
-    it("selectTerminalFontSize returns default", () => {
-      expect(selectTerminalFontSize(useSyncedSettingsStore.getState())).toBe(13);
-    });
-
     it("selectTerminalCursorStyle returns cursor style", () => {
       useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
       expect(selectTerminalCursorStyle(useSyncedSettingsStore.getState())).toBe("block");

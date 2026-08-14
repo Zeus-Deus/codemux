@@ -89,44 +89,55 @@ export function TypographySettings() {
     void updateSetting("appearance", field, value).catch(console.error);
   };
 
+  const updateAppearance = (next: Partial<AppearanceSettings>) => {
+    void updateSettings({
+      ...settings,
+      appearance: { ...appearance, ...next },
+    }).catch(console.error);
+  };
+
+  // A pre-migration blob has no code size of its own and borrows the terminal
+  // size. Materialize it the moment the two surfaces are presented as
+  // independent, otherwise editing the terminal size drags code along.
+  const codeSizeIsBorrowed = appearance.code_font_size == null;
+
   const updateMode = (mode: TypographyMode) => {
+    if (mode === "advanced" && codeSizeIsBorrowed) {
+      updateAppearance({ typography_mode: mode, code_font_size: typography.codeSize });
+      return;
+    }
     void updateSetting("appearance", "typography_mode", mode).catch(console.error);
   };
 
   const updateDeveloperSize = (size: number) => {
     // The linked view presents one developer size, so persist code + terminal
     // atomically. Advanced values then start from exactly what users saw.
-    void updateSettings({
-      ...settings,
-      appearance: {
-        ...appearance,
-        code_font_size: size,
-        terminal_font_size: size,
-      },
-    }).catch(console.error);
+    updateAppearance({ code_font_size: size, terminal_font_size: size });
+  };
+
+  const updateTerminalSize = (size: number) => {
+    if (codeSizeIsBorrowed) {
+      updateAppearance({ code_font_size: typography.codeSize, terminal_font_size: size });
+      return;
+    }
+    updateField("terminal_font_size", size);
   };
 
   const updateCodeFamily = (family: string | null) => {
-    void updateSettings({
-      ...settings,
-      appearance: {
-        ...appearance,
-        shell_font: null,
-        code_font_family: family,
-      },
-    }).catch(console.error);
+    updateAppearance({ shell_font: null, code_font_family: family });
   };
 
   const updateTerminalFamily = (family: string | null) => {
-    void updateSettings({
-      ...settings,
-      appearance: {
-        ...appearance,
-        shell_font: null,
-        terminal_font_family: family,
-      },
-    }).catch(console.error);
+    updateAppearance({ shell_font: null, terminal_font_family: family });
   };
+
+  // The pickers show what actually renders, so they read the resolved
+  // preference rather than the raw field: a migrated blob keeps its choice in
+  // `shell_font` until the first write here clears it.
+  const storedConversationFamily = normalizeFontFamily(appearance.conversation_font_family);
+  const storedTerminalFamily = normalizeFontFamily(
+    appearance.terminal_font_family ?? appearance.shell_font,
+  );
 
   const restoreDefaults = () => {
     const nextAppearance: AppearanceSettings = {
@@ -149,8 +160,8 @@ export function TypographySettings() {
     typography.mode !== TYPOGRAPHY_DEFAULTS.mode ||
     typography.interfacePreference !== null ||
     typography.codePreference !== null ||
-    appearance.conversation_font_family != null ||
-    appearance.terminal_font_family != null ||
+    storedConversationFamily !== null ||
+    storedTerminalFamily !== null ||
     typography.interfaceSize !== TYPOGRAPHY_DEFAULTS.interfaceSize ||
     (appearance.conversation_font_size ?? TYPOGRAPHY_DEFAULTS.conversationSize) !==
       TYPOGRAPHY_DEFAULTS.conversationSize ||
@@ -188,7 +199,7 @@ export function TypographySettings() {
               {...SURFACE_COPY.interface}
               title="Interface & conversation"
               description="One typeface across the app; conversation text follows two pixels smaller for a calmer reading rhythm."
-              family={appearance.interface_font_family ?? null}
+              family={typography.interfacePreference}
               defaultFamily="DM Sans"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
@@ -210,7 +221,7 @@ export function TypographySettings() {
               {...SURFACE_COPY.code}
               title="Developer font"
               description="One monospace face and size shared by code, diffs, the editor, and terminal cells."
-              family={appearance.code_font_family ?? null}
+              family={typography.codePreference}
               defaultFamily="JetBrains Mono"
               defaultStack={DEFAULT_CODE_FONT_STACK}
               monospace
@@ -234,7 +245,7 @@ export function TypographySettings() {
           <>
             <TypographySurfaceCard
               {...SURFACE_COPY.interface}
-              family={appearance.interface_font_family ?? null}
+              family={typography.interfacePreference}
               defaultFamily="DM Sans"
               defaultStack={DEFAULT_INTERFACE_FONT_STACK}
               size={typography.interfaceSize}
@@ -248,7 +259,7 @@ export function TypographySettings() {
             />
             <TypographySurfaceCard
               {...SURFACE_COPY.conversation}
-              family={appearance.conversation_font_family ?? null}
+              family={storedConversationFamily}
               defaultFamily="Follow interface"
               defaultStack={typography.interfaceFamily}
               size={typography.conversationSize}
@@ -265,7 +276,7 @@ export function TypographySettings() {
             />
             <TypographySurfaceCard
               {...SURFACE_COPY.code}
-              family={appearance.code_font_family ?? null}
+              family={typography.codePreference}
               defaultFamily="JetBrains Mono"
               defaultStack={DEFAULT_CODE_FONT_STACK}
               monospace
@@ -278,7 +289,7 @@ export function TypographySettings() {
             />
             <TypographySurfaceCard
               {...SURFACE_COPY.terminal}
-              family={appearance.terminal_font_family ?? null}
+              family={storedTerminalFamily}
               defaultFamily="Follow code"
               defaultStack={typography.codeFamily}
               monospace
@@ -286,7 +297,7 @@ export function TypographySettings() {
               sizeLabel="Terminal font size"
               range={TYPOGRAPHY_RANGES.terminal}
               onFamilyChange={updateTerminalFamily}
-              onSizeChange={(size) => updateField("terminal_font_size", size)}
+              onSizeChange={updateTerminalSize}
               preview={
                 <TerminalPreview family={typography.terminalFamily} size={typography.terminalSize} />
               }

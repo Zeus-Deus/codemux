@@ -7,6 +7,7 @@ import {
   fontStack,
   normalizeFontFamily,
   quoteFontFamily,
+  resolveTerminalFontFamily,
   resolveTypographySettings,
 } from "./typography";
 
@@ -89,18 +90,42 @@ describe("typography settings", () => {
     expect(fontStack("Fira Code", DEFAULT_CODE_FONT_STACK)).toContain('"Fira Code"');
   });
 
+  it("keeps the legacy machine-local terminal family until a synced choice exists", () => {
+    const untouched = resolveTypographySettings({});
+    expect(resolveTerminalFontFamily(untouched, "'Fira Code', monospace")).toBe(
+      "'Fira Code', monospace",
+    );
+    expect(resolveTerminalFontFamily(untouched, undefined)).toBe(untouched.terminalFamily);
+
+    const chosen = resolveTypographySettings({ code_font_family: "Iosevka" });
+    expect(resolveTerminalFontFamily(chosen, "'Fira Code', monospace")).toBe(chosen.terminalFamily);
+  });
+
   it("applies the complete CSS contract to the document root", () => {
     const root = document.createElement("html");
     const resolved = resolveTypographySettings({});
 
     applyTypography(root, resolved);
 
-    expect(root.dataset.typographyMode).toBe("simple");
-    expect(root.style.fontSize).toBe("16px");
     expect(root.style.getPropertyValue("--font-interface")).toBe(DEFAULT_INTERFACE_FONT_STACK);
     expect(root.style.getPropertyValue("--font-code")).toBe(DEFAULT_CODE_FONT_STACK);
     expect(root.style.getPropertyValue("--font-size-conversation")).toBe("14px");
     expect(root.style.getPropertyValue("--font-size-code")).toBe("13px");
     expect(root.style.getPropertyValue("--font-size-terminal")).toBe("13px");
+  });
+
+  // Pinning the root at the default would override the browser's own font
+  // scaling, which is the only text-size control the hosted client has.
+  it("only pins the root font size once the interface size is customized", () => {
+    const root = document.createElement("html");
+
+    applyTypography(root, resolveTypographySettings({}));
+    expect(root.style.fontSize).toBe("");
+
+    applyTypography(root, resolveTypographySettings({ interface_font_size: 18 }));
+    expect(root.style.fontSize).toBe("18px");
+
+    applyTypography(root, resolveTypographySettings({ interface_font_size: 16 }));
+    expect(root.style.fontSize).toBe("");
   });
 });

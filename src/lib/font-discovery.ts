@@ -111,33 +111,60 @@ export function normalizeDiscoveredFamilies(families: readonly string[]): string
 type LocalFontRecord = { family?: unknown };
 type LocalFontQuery = () => Promise<readonly LocalFontRecord[]>;
 
-let discoveryPromise: Promise<readonly string[]> | null = null;
+/** How long a fallback catalog stands in before another open re-asks. Long
+ * enough that four pickers opening together share one answer. */
+const FALLBACK_CACHE_MS = 30_000;
+
+interface Discovery {
+  families: Promise<readonly string[]>;
+  retryAfter: number;
+}
+
+let discovery: Discovery | null = null;
+
+async function enumerateOrProbe(): Promise<{
+  families: readonly string[];
+  enumerated: boolean;
+}> {
+  const query = (window as unknown as { queryLocalFonts?: LocalFontQuery }).queryLocalFonts;
+  if (typeof query === "function") {
+    try {
+      const records = await query.call(window);
+      return {
+        families: normalizeDiscoveredFamilies(
+          records.flatMap((record) => (typeof record.family === "string" ? [record.family] : [])),
+        ),
+        enumerated: true,
+      };
+    } catch {
+      // Permission denied is a normal outcome, and a later grant should still
+      // reach the picker without a restart.
+    }
+  }
+  return {
+    families: normalizeDiscoveredFamilies(
+      CURATED_FONTS.filter((family) => isFontFamilyAvailable(family)),
+    ),
+    enumerated: false,
+  };
+}
 
 /**
  * Enumerate every installed family where Chromium exposes Local Font Access;
- * otherwise return a metric-probed catalog. The result is cached across all
- * four pickers so opening Advanced never repeats a permission request.
+ * otherwise return a metric-probed catalog. A real enumeration is cached for
+ * the session so opening Advanced never repeats a permission request, while a
+ * denied or unavailable query only holds its fallback briefly.
  */
 export function discoverInstalledFontFamilies(): Promise<readonly string[]> {
-  if (discoveryPromise) return discoveryPromise;
-  discoveryPromise = (async () => {
-    const query = (window as unknown as { queryLocalFonts?: LocalFontQuery }).queryLocalFonts;
-    if (typeof query === "function") {
-      try {
-        const records = await query.call(window);
-        return normalizeDiscoveredFamilies(
-          records.flatMap((record) =>
-            typeof record.family === "string" ? [record.family] : [],
-          ),
-        );
-      } catch {
-        // Permission denied is a normal outcome. The probed catalog below is
-        // still useful and never opens another browser permission prompt.
-      }
-    }
-    return normalizeDiscoveredFamilies(
-      CURATED_FONTS.filter((family) => isFontFamilyAvailable(family)),
-    );
-  })();
-  return discoveryPromise;
+  const active = discovery;
+  if (active && Date.now() < active.retryAfter) return active.families;
+  // In flight, every caller shares the same request; the settled result then
+  // decides whether it is kept for the session or allowed to expire.
+  const entry: Discovery = { families: Promise.resolve([]), retryAfter: Number.POSITIVE_INFINITY };
+  entry.families = enumerateOrProbe().then(({ families, enumerated }) => {
+    entry.retryAfter = enumerated ? Number.POSITIVE_INFINITY : Date.now() + FALLBACK_CACHE_MS;
+    return families;
+  });
+  discovery = entry;
+  return entry.families;
 }

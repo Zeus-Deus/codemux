@@ -20,8 +20,10 @@ import { endSubMeasure, startSubMeasure } from "@/lib/perf/interaction-trace";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
   getTerminalCursorStyle,
+  selectLegacyTerminalFontFamily,
+  useSettingsStore,
 } from "@/stores/settings-store";
-import { resolveTypographySettings } from "@/lib/typography";
+import { resolveTerminalFontFamily, resolveTypographySettings } from "@/lib/typography";
 import { applyTerminalTypography } from "@/lib/terminal-typography";
 import {
   writeToPty,
@@ -89,10 +91,12 @@ function isAltScreen(t: Terminal): boolean {
 export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const syntaxTheme = useSyntaxThemeColors();
   const typographyAppearance = useSyncedSettingsStore((s) => s.settings.appearance);
+  const legacyTerminalFamily = useSettingsStore(selectLegacyTerminalFontFamily);
   const typography = useMemo(
     () => resolveTypographySettings(typographyAppearance),
     [typographyAppearance],
   );
+  const terminalFamily = resolveTerminalFontFamily(typography, legacyTerminalFamily);
 
   // Refs for mutable state that persists across renders
   const shellRef = useRef<HTMLDivElement>(null);
@@ -275,7 +279,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
     // ── Create terminal ──
     const term = new Terminal({
-      fontFamily: typography.terminalFamily,
+      fontFamily: terminalFamily,
       theme: themeColorsToXtermTheme(syntaxTheme),
       convertEol: false,
       cursorBlink: true,
@@ -1056,19 +1060,19 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     if (termRef.current) termRef.current.options.theme = themeColorsToXtermTheme(syntaxTheme);
   }, [syntaxTheme]);
 
-  // Font changes are truly live: update the existing xterm instance, clear
-  // its renderer atlas, refit the cell grid, and tell the PTY its new rows /
-  // columns. Recreating the terminal here would lose modes, selection, and
-  // scroll position—the exact state users are inspecting while tuning type.
+  // Font changes are live: update the existing xterm instance, clear its
+  // renderer atlas, refit the cell grid, and tell the PTY its new rows /
+  // columns. Recreating the terminal would lose modes, selection, and scroll
+  // position — the state users are looking at while tuning type.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
-    if (!applyTerminalTypography(term, typography.terminalFamily, typography.terminalSize)) return;
+    if (!applyTerminalTypography(term, terminalFamily, typography.terminalSize)) return;
     const frame = requestAnimationFrame(() => {
       void syncTerminalSize();
     });
     return () => cancelAnimationFrame(frame);
-  }, [syncTerminalSize, typography.terminalFamily, typography.terminalSize]);
+  }, [syncTerminalSize, terminalFamily, typography.terminalSize]);
 
   // ── Focus management ──
   // Depends on `sessionId` as well as `focused`: when a new tab is created

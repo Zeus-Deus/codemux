@@ -459,11 +459,6 @@ body.pane-resizing iframe {
   font-size: var(--font-size-conversation, 14px);
 }
 
-.chat-markdown.conversation-text {
-  font-family: var(--font-conversation, var(--font-sans));
-  font-size: var(--font-size-conversation, 14px);
-}
-
 .code-surface {
   font-family: var(--font-mono);
   font-size: var(--font-size-code, 13px);

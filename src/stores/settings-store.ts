@@ -2,7 +2,6 @@ import { create } from "zustand";
 import { dbGetAllSettings, dbSetSetting } from "@/tauri/commands";
 import { useSyncedSettingsStore } from "./synced-settings-store";
 import { setTerminalThemeMode } from "@/lib/terminal-theme-mode";
-import { resolveTypographySettings } from "@/lib/typography";
 
 /** Machine-local settings only. Per-user settings live in synced-settings-store. */
 export const SETTINGS_DEFAULTS: Record<string, string> = {
@@ -112,27 +111,7 @@ export function getTerminalColorTheme(): string {
   return raw("terminal.color_theme");
 }
 
-export function getTerminalFontFamily(): string {
-  const appearance = useSyncedSettingsStore.getState().settings.appearance;
-  const hasSyncedPreference = Boolean(
-    appearance.terminal_font_family ||
-      appearance.code_font_family ||
-      appearance.shell_font,
-  );
-  // Honor the dormant machine-local override from older development builds
-  // until the user makes a choice in the new synced typography UI.
-  const legacyLocal = useSettingsStore.getState().settings["terminal.font_family"];
-  if (!hasSyncedPreference && legacyLocal) return legacyLocal;
-  return resolveTypographySettings(appearance).terminalFamily;
-}
-
 // ── Per-user imperative getters (redirect to synced store for backward compat) ──
-
-export function getTerminalFontSize(): number {
-  return resolveTypographySettings(
-    useSyncedSettingsStore.getState().settings.appearance,
-  ).terminalSize;
-}
 
 export function getTerminalCursorStyle(): string {
   return useSyncedSettingsStore.getState().settings.terminal.cursor_style;
@@ -151,8 +130,10 @@ export function getDefaultBaseBranch(): string {
 export const selectTerminalColorTheme = (s: SettingsStore): string =>
   s.settings["terminal.color_theme"] ?? SETTINGS_DEFAULTS["terminal.color_theme"]!;
 
-export const selectTerminalFontFamily = (s: SettingsStore): string =>
-  s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;
+/** Only a value an older build actually persisted; unset installs resolve
+ * their terminal family from synced typography instead of this default. */
+export const selectLegacyTerminalFontFamily = (s: SettingsStore): string | undefined =>
+  s.settings["terminal.font_family"];
 
 export const selectPalette = (s: SettingsStore): AppearancePalette =>
   (s.settings["appearance.palette"] ??
