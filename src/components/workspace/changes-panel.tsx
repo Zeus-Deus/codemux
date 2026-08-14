@@ -435,14 +435,19 @@ export function ChangesPanel({
         return;
       }
     }
+    // An explicit commit-message CLI wins; otherwise the Utility agent
+    // supplies the provider. Its model only rides along when the provider
+    // matches, so an override CLI is never handed another provider's model
+    // name (`claude --model <codex model>` fails every commit).
     const utility = utilitySelectionFromStores();
-    const configuredCli =
-      config?.ai_commit_message_cli ?? utility?.provider ?? null;
-    const canUseAi =
-      aiEnabled && (configuredCli !== null || claudeReady !== false);
+    const cli = config?.ai_commit_message_cli ?? utility?.provider ?? "claude";
+    const model =
+      config?.ai_commit_message_model ??
+      (utility?.provider === cli ? utility.model : null);
+    // Only claude has an availability preflight; when it says "missing" we
+    // fall back to the manual textarea instead of a doomed spawn.
+    const canUseAi = aiEnabled && (cli !== "claude" || claudeReady !== false);
     if (canUseAi) {
-      const cli = configuredCli ?? "claude";
-      const model = config?.ai_commit_message_model ?? utility?.model ?? null;
       requestGeneration(workspace.workspace_id, cwd, cli, model);
     } else {
       setEditedMsg("");

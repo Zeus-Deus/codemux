@@ -8,6 +8,7 @@ import {
 } from "react";
 import { LoaderCircle } from "lucide-react";
 
+import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
@@ -37,16 +38,11 @@ import {
 import { refreshSkillSelectionForCwd } from "@/lib/agent-chat/skill-selection-refresh";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
-import {
-  sessionMentionTitle,
-  sessionMentionToken,
-} from "@/lib/agent-chat/session-mentions";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
-import { useUIStore } from "@/stores/ui-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
@@ -68,7 +64,6 @@ import {
   primeChatMcp,
   readFileForAttachment,
   readFolderForAttachment,
-  type AgentChatSessionMention,
 } from "@/tauri/commands";
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import type {
@@ -96,8 +91,6 @@ const CLEAR_AFTER_PROMOTION_MS = 5000;
  *  a fresh reference every render and retrigger the chip-strip render
  *  effect in an infinite loop. */
 const EMPTY_ATTACHMENTS: Attachment[] = [];
-const ATTACHMENT_HARD_LIMIT = 20;
-const SESSION_ATTACHMENT_LIMIT = 3;
 
 /**
  * Top-level draft surface. Reads the active draft, wires a Composer
@@ -458,6 +451,20 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
                 `[agent-chat] session handoff refresh failed for ${attachment.ref}`,
                 error,
               );
+              // Fail closed. The read only fails when the conversation is
+              // gone or out of this workspace's scope, and sending the
+              // previously resolved transcript anyway would hand the agent a
+              // stale — possibly cross-workspace — history. Clearing the
+              // content trips the unresolved-handoff guard below, which
+              // restores the composer with an actionable toast.
+              updateStagedAttachment(finalDraft.threadId, attachment.id, {
+                resolvedContent: "",
+                metadata: {
+                  ...attachment.metadata,
+                  isLoading: false,
+                  error: String(error),
+                },
+              });
             }
           }),
         );
@@ -848,107 +855,37 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     [draft.threadId, displayCwd, addStagedAttachment, updateStagedAttachment],
   );
 
-  const handleAttachSession = useCallback(
-    (session: AgentChatSessionMention) => {
-      if (!sessionWorkspaceId) return;
-      const liveAttachments =
-        useAgentChatStore.getState().threads[draft.threadId]
-          ?.stagedAttachments ?? [];
-      if (
-        liveAttachments.some(
-          (attachment) =>
-            attachment.kind === "session" &&
-            attachment.ref === session.thread_id,
-        )
-      ) {
-        return;
-      }
-      if (
-        liveAttachments.filter((attachment) => attachment.kind === "session")
-          .length >= SESSION_ATTACHMENT_LIMIT
-      ) {
-        toast.error("Conversation handoff limit reached", {
-          description: `Attach up to ${SESSION_ATTACHMENT_LIMIT} conversations per message.`,
-        });
-        return;
-      }
-      if (liveAttachments.length >= ATTACHMENT_HARD_LIMIT) {
-        toast.error("Attachment limit reached", {
-          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
-        });
-        return;
-      }
-
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const label = sessionMentionTitle(session);
-      const mentionToken = sessionMentionToken(session);
-      addStagedAttachment(draft.threadId, {
-        id,
-        kind: "session",
-        ref: session.thread_id,
-        metadata: {
-          label,
-          mentionToken,
-          sourceProvider: session.provider,
-          sourceCwd: session.cwd,
-          sourceUpdatedAt: session.last_active_at,
-          messageCount: session.message_count,
-          isLoading: true,
-        },
-      });
-      void agentChatGetSessionContext(
-        sessionWorkspaceId,
-        session.thread_id,
-        utilitySelectionFromStores(),
-      )
-        .then((context) => {
-          updateStagedAttachment(draft.threadId, id, {
-            resolvedContent: context.content,
-            metadata: metadataFromSessionContext(context, {
-              label,
-              mentionToken,
-            }),
-          });
-          if (
-            context.summary_error === "utility_model_required" ||
-            context.summary_error === "utility_agent_unavailable"
-          ) {
-            toast.warning("Direct transcript attached", {
-              description:
-                "Choose or change the Utility agent to generate clean handoff summaries.",
-              action: {
-                label: "Choose agent",
-                onClick: () =>
-                  useUIStore.getState().setShowSettings(true, "agent"),
-              },
-            });
-          }
-        })
-        .catch((error) => {
-          updateStagedAttachment(draft.threadId, id, {
-            metadata: {
-              label,
-              mentionToken,
-              sourceProvider: session.provider,
-              sourceCwd: session.cwd,
-              sourceUpdatedAt: session.last_active_at,
-              messageCount: session.message_count,
-              isLoading: false,
-              error: String(error),
-            },
-          });
-        });
-    },
-    [
-      draft.threadId,
-      sessionWorkspaceId,
-      addStagedAttachment,
-      updateStagedAttachment,
-    ],
+  const handleAttachSession = useAttachSessionHandoff(
+    draft.threadId,
+    sessionWorkspaceId,
   );
+
+  // Session handoffs are workspace-scoped: a conversation staged while the
+  // draft targeted workspace A is not readable from workspace B, and the
+  // backend would reject the pre-send refresh with
+  // `conversation_outside_workspace`. Drop those chips as soon as the target
+  // moves so the composer never carries a transcript the new target can't
+  // legitimately see.
+  const stagedSessionWorkspaceRef = useRef(sessionWorkspaceId);
+  useEffect(() => {
+    const previous = stagedSessionWorkspaceRef.current;
+    stagedSessionWorkspaceRef.current = sessionWorkspaceId;
+    if (previous === null || previous === sessionWorkspaceId) return;
+    const staged =
+      useAgentChatStore.getState().threads[draft.threadId]?.stagedAttachments ??
+      EMPTY_ATTACHMENTS;
+    const orphaned = staged.filter(
+      (attachment) => attachment.kind === "session",
+    );
+    if (orphaned.length === 0) return;
+    for (const attachment of orphaned) {
+      removeStagedAttachment(draft.threadId, attachment.id);
+    }
+    toast.warning("Conversation handoffs removed", {
+      description:
+        "They belonged to the previous workspace — attach them again from the new one.",
+    });
+  }, [sessionWorkspaceId, draft.threadId, removeStagedAttachment]);
 
   // Step 8 Stage 4 — preflight GitHub status. Mirrors AgentChatPane.
   // `null` means "not yet known"; the popup keeps GitHub entries

@@ -24,6 +24,10 @@ import { cn } from "@/lib/utils";
 import { resolveProvider } from "@/lib/source-control";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import {
+  ATTACHMENT_HARD_LIMIT,
+  SESSION_ATTACHMENT_LIMIT,
+} from "@/lib/agent-chat/attachment-limits";
+import {
   compactSessionPreview,
   removeSessionMentionToken,
   sessionMentionTitle,
@@ -112,15 +116,11 @@ const MENTION_FETCH_LIMIT = 20;
  *  search (search lives on `@`). 30 entries fits the popup's max-h
  *  cap with room to scroll. */
 const ATTACH_BROWSE_LIMIT = 30;
-/** Step 8 Stage 7 — soft / hard caps for the staged-attachment list.
- *  The pane handlers reject adds beyond the hard cap with a toast;
- *  the composer surfaces the warning copy so the user knows where
- *  they sit relative to those thresholds. Mirrors the constants in
- *  AgentChatPane.tsx — kept in sync by hand because there's no other
- *  shared module owning these values. */
+/** Step 8 Stage 7 — soft cap for the staged-attachment list. The attach
+ *  handlers reject adds beyond the hard cap (see
+ *  `@/lib/agent-chat/attachment-limits`) with a toast; the composer surfaces
+ *  the warning copy so the user knows where they sit relative to it. */
 const ATTACHMENT_SOFT_LIMIT = 10;
-const ATTACHMENT_HARD_LIMIT = 20;
-const SESSION_ATTACHMENT_LIMIT = 3;
 
 /** Views the `+` popup can show. `main` lists categories +
  *  navigation nudges; `file` / `folder` list browsable rows that
@@ -921,6 +921,7 @@ export function Composer({
     setFileMatches(EMPTY_FILE_MATCHES);
     setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
     setMentionPrMatches(EMPTY_PR_MATCHES);
+    setMentionSessionMatches(EMPTY_SESSION_MATCHES);
     setMentionSessionsLoading(false);
     setMentionSessionsError(null);
   }, []);

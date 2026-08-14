@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // ── Module mocks ──
@@ -692,6 +692,61 @@ describe("DraftChatSurface", () => {
       expect(attachmentBlock).toContain(
         "current user request and current workspace are authoritative",
       );
+    });
+
+    it("drops staged session handoffs when the draft is retargeted", async () => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "ws-a",
+          workspaces: [
+            {
+              workspace_id: "ws-a",
+              cwd: "/projects/foo",
+              project_root: "/projects/foo",
+            },
+            {
+              workspace_id: "ws-b",
+              cwd: "/projects/bar",
+              project_root: "/projects/bar",
+            },
+          ],
+        } as never,
+      });
+      const draft = seedProjectDraft(
+        "@session:authentication-abc123 continue the work",
+      );
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-a",
+      });
+      useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "session-att-1",
+        kind: "session",
+        ref: "source-thread-abc123",
+        metadata: {
+          label: "Authentication follow-up",
+          mentionToken: "authentication-abc123",
+          sourceProvider: "codex",
+          isLoading: false,
+        },
+        resolvedContent: "User:\nHarden authentication.",
+      });
+
+      renderSurface();
+      act(() => {
+        useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+          kind: "existing_workspace",
+          workspaceId: "ws-b",
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(
+          useAgentChatStore.getState().threads[draft.threadId]
+            ?.stagedAttachments ?? [],
+        ).toHaveLength(0);
+      });
+      expect(toast.warning).toHaveBeenCalled();
     });
 
     it("on success, setActiveDraft(null) is called and clearDraft is scheduled after 5s", async () => {
