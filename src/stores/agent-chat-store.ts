@@ -25,10 +25,7 @@ import type {
   UserMessageImage,
 } from "@/lib/agent-chat/types";
 import type { AgentChatMessageRow } from "@/tauri/commands";
-import type {
-  ApprovalDecision,
-  ProviderRuntimeEvent,
-} from "@/tauri/events";
+import type { ApprovalDecision, ProviderRuntimeEvent } from "@/tauri/events";
 
 /**
  * Default for new threads: launch in `bypassPermissions`
@@ -46,7 +43,8 @@ export type ChatMode = "default" | "plan" | "ask" | "debug";
 /** Step 8 Stage 1 — attachment kinds drive icon + color in the chip,
  *  injection format at send time (Stage 2+), and UI affordances
  *  (e.g. images need paste/drop handlers, others don't). */
-export type AttachmentKind = "file" | "folder" | "issue" | "pr" | "image";
+export type AttachmentKind =
+  "file" | "folder" | "issue" | "pr" | "image" | "session";
 
 export interface AttachmentMetadata {
   /** Chip display text. For files: filename; for issues/PRs:
@@ -77,16 +75,42 @@ export interface AttachmentMetadata {
    *  swap from name-only diff to the full unified diff. Toggling this
    *  triggers a re-fetch + re-render of the resolved content. */
   expandFullDiff?: boolean;
+  /** Session-only: provider that authored the attached conversation. Kept
+   *  as a string so a newly-added GUI provider can flow through before this
+   *  frontend learns a bespoke icon or colour for it. */
+  sourceProvider?: string;
+  /** Session-only: compact stable token shown after `@session:` in the
+   *  textarea. The full source thread id remains in `Attachment.ref`. */
+  mentionToken?: string;
+  /** Session-only: checkout the source conversation was opened from. */
+  sourceCwd?: string | null;
+  /** Session-only: source conversation activity timestamp. */
+  sourceUpdatedAt?: string;
+  /** Session-only: total and included visible prose counts. */
+  messageCount?: number;
+  includedMessageCount?: number;
+  /** Session-only: true when the middle of a long transcript was omitted. */
+  isContextTruncated?: boolean;
+  /** Session-only: model-written summary or deterministic transcript fallback. */
+  handoffKind?: "summary" | "direct";
+  summaryCached?: boolean;
+  summaryError?: string | null;
+  summarizerProvider?: string | null;
+  summarizerModel?: string | null;
+  summarizerEffort?: string | null;
+  sourceRevision?: number;
+  fullHistoryAvailable?: boolean;
 }
 
 export interface Attachment {
   /** Stable id for chip dedup + removal. Caller-generated (uuid). */
   id: string;
   kind: AttachmentKind;
-  /** Discriminator-specific reference: path | "#1234" | "image:<id>". */
+  /** Discriminator-specific reference: path | "#1234" | "image:<id>" |
+   *  source thread id. */
   ref: string;
   metadata: AttachmentMetadata;
-  /** Resolved text payload for files / folders / issues / PRs. Populated
+  /** Resolved text payload for files / folders / issues / PRs / sessions. Populated
    *  at attach time for files, at fetch time for GitHub kinds. */
   resolvedContent?: string;
   /** Image-only: decoded bytes. Not persisted; re-attached if the user
@@ -704,17 +728,13 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
           cursor == null ? rows : rows.filter((row) => row.id > cursor);
         if (fresh.length === 0) return slice;
         const timed = parseTimedReplayPayloads(fresh);
-        const merged = applyTimedReplayTail(
-          slice,
-          timed,
-          {
+        const merged = applyTimedReplayTail(slice, timed, {
             ...opts,
             // Summarizes the prefix for the unsettled-tail scan: a slice
             // that is streaming or already flagged interrupted ends on an
             // unsettled user turn.
             previousUnsettled: slice.interrupted || slice.streaming,
-          },
-        );
+        });
         return {
           ...slice,
           ...merged,
@@ -784,7 +804,8 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
             !isSliceBusy(slice),
         )
         .sort(
-          (a, b) => (lastTouchedAt.get(a[0]) ?? 0) - (lastTouchedAt.get(b[0]) ?? 0),
+          (a, b) =>
+            (lastTouchedAt.get(a[0]) ?? 0) - (lastTouchedAt.get(b[0]) ?? 0),
         );
       const evicted = new Set<string>();
       for (const [threadId] of candidates) {
@@ -927,7 +948,7 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
 export const selectThread =
   (threadId: string | null) =>
   (state: AgentChatStore): ChatThreadSlice | null =>
-    threadId == null ? null : state.threads[threadId] ?? null;
+    threadId == null ? null : (state.threads[threadId] ?? null);
 
 export const selectMessages =
   (threadId: string | null) =>

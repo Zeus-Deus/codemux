@@ -74,6 +74,8 @@ import {
   type AutoSettleDays,
 } from "@/stores/settings-store";
 import { ThemeSettings } from "./theme-settings";
+import { UtilityAgentSetting } from "./utility-agent-setting";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
@@ -1249,6 +1251,69 @@ function PresetEditorSheet({
   );
 }
 
+/** Commit-message agent row. With no override stored, commit messages run on
+ *  whatever the Utility agent resolves to *at generation time*, so the picker
+ *  only displays that resolution — writing it into the override keys would
+ *  freeze today's automatic pick forever. Picking a model here is the
+ *  deliberate override; "Use default" clears it again. */
+function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
+  const config = useAppStore((s) => s.appState?.config);
+  const storeSet = useSettingsStore((s) => s.set);
+  // Subscribed purely so the displayed fallback re-resolves when the Utility
+  // agent setting or a provider's model catalog changes.
+  const settings = useSettingsStore((s) => s.settings);
+  const capabilities = useProviderCapabilities();
+  const utility = useMemo(
+    () => utilitySelectionFromStores(),
+    [settings, capabilities],
+  );
+  const hasOverride = Boolean(
+    config?.ai_commit_message_cli || config?.ai_commit_message_model,
+  );
+  const provider = (config?.ai_commit_message_cli ??
+    utility?.provider ??
+    "claude") as AgentChatProviderKind;
+  const model =
+    config?.ai_commit_message_model ??
+    (utility?.provider === provider ? utility.model : null);
+
+  return (
+    <div className="flex items-center gap-2">
+      <MultiProviderModelPicker
+        provider={provider}
+        model={model}
+        onProviderModelChange={(nextProvider, nextModel) => {
+          setAiCommitMessageCli(nextProvider).catch(console.error);
+          storeSet("ai_commit_message_cli", nextProvider);
+          setAiCommitMessageModel(nextModel).catch(console.error);
+          storeSet("ai_commit_message_model", nextModel);
+        }}
+        disabled={disabled}
+      />
+      {hasOverride ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 text-[11px] text-muted-foreground"
+          onClick={() => {
+            setAiCommitMessageCli(null).catch(console.error);
+            storeSet("ai_commit_message_cli", "");
+            setAiCommitMessageModel(null).catch(console.error);
+            storeSet("ai_commit_message_model", "");
+          }}
+        >
+          Use default
+        </Button>
+      ) : (
+        <span className="flex items-center gap-1 whitespace-nowrap text-[11px] text-muted-foreground">
+          <Sparkles className="h-3.5 w-3.5 text-primary/70" />
+          Utility agent
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function SettingsView() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
@@ -1957,16 +2022,8 @@ export function SettingsView() {
                     model anywhere (chat composer, this row, the resolver
                     row) and it's starred everywhere via the shared
                     `picker-favorites-store`. */}
-                <SettingRow label="Agent" description="Which AI agent (and model) generates commit messages.">
-                  <MultiProviderModelPicker
-                    provider={(config?.ai_commit_message_cli ?? "claude") as AgentChatProviderKind}
-                    model={config?.ai_commit_message_model ?? null}
-                    onProviderModelChange={(provider, model) => {
-                      setAiCommitMessageCli(provider).catch(console.error);
-                      storeSet("ai_commit_message_cli", provider);
-                      setAiCommitMessageModel(model).catch(console.error);
-                      storeSet("ai_commit_message_model", model);
-                    }}
+                <SettingRow label="Agent override" description="Uses the Utility agent by default. Set an override only when commit messages need a different model.">
+                  <AiCommitMessageAgentRow
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
                 </SettingRow>
@@ -2040,6 +2097,13 @@ export function SettingsView() {
               description="Configure how Codemux integrates with AI coding agents."
             />
             <div className="space-y-1">
+              <SettingRow
+                label="Utility agent"
+                description="One inexpensive default for conversation handoffs and lightweight generation. Automatic prefers Codex Luna, then Claude Haiku; individual features can still offer an override when it matters."
+              >
+                <UtilityAgentSetting />
+              </SettingRow>
+              <Separator />
               <SettingRow
                 label="Auto-configure MCP for workspaces"
                 description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."

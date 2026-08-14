@@ -570,6 +570,57 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             let state: State<'_, AppStateStore> = app.state();
             serde_json::to_value(state.snapshot()).map_err(|error| error.to_string())
         }
+        "conversation_read" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("conversation_read requires a scoped workspace")?;
+            let conversation_id = request
+                .params
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("conversation_read requires `conversation_id`")?;
+            let cursor = request.params.get("cursor").and_then(Value::as_i64);
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20) as u32;
+            db.read_agent_chat_history_page(workspace_id, conversation_id, cursor, limit)
+                .and_then(|page| serde_json::to_value(page).map_err(|error| error.to_string()))
+        })(),
+        "conversation_search" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("conversation_search requires a scoped workspace")?;
+            let conversation_id = request
+                .params
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("conversation_search requires `conversation_id`")?;
+            let query = request
+                .params
+                .get("query")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("conversation_search requires `query`")?;
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(12) as u32;
+            db.search_agent_chat_history(workspace_id, conversation_id, query, limit)
+                .and_then(|hits| serde_json::to_value(hits).map_err(|error| error.to_string()))
+        })(),
         "create_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
             let db: State<'_, crate::database::DatabaseStore> = app.state();

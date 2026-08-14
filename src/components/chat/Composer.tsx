@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   ListTodo,
   MessageCircleQuestion,
+  MessagesSquare,
   RotateCw,
   Server,
   Settings,
@@ -18,9 +19,22 @@ import {
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { basename } from "@/lib/path";
+import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 import { resolveProvider } from "@/lib/source-control";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
+import {
+  ATTACHMENT_HARD_LIMIT,
+  SESSION_ATTACHMENT_LIMIT,
+} from "@/lib/agent-chat/attachment-limits";
+import {
+  compactSessionPreview,
+  removeSessionMentionToken,
+  sessionMentionTitle,
+  sessionMentionToken,
+  sessionProviderLabel,
+} from "@/lib/agent-chat/session-mentions";
+import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -50,6 +64,7 @@ import {
 import {
   getGithubIssueByPath,
   getGithubPrByPath,
+  agentChatListSessionMentions,
   listGithubIssuesByPath,
   listMcpServers,
   listProjectFiles,
@@ -58,6 +73,7 @@ import {
   MCP_CODEMUX_SELF_ID,
   pasteClipboardImage,
   startSkillsWatcher,
+  type AgentChatSessionMention,
   type McpServerConfig,
 } from "@/tauri/commands";
 import { Switch } from "@/components/ui/switch";
@@ -88,6 +104,7 @@ const EMPTY_FILE_MATCHES: FileMatch[] = [];
 const EMPTY_FOLDER_MATCHES: FolderMatch[] = [];
 const EMPTY_ISSUE_MATCHES: GitHubIssue[] = [];
 const EMPTY_PR_MATCHES: PullRequestInfo[] = [];
+const EMPTY_SESSION_MATCHES: AgentChatSessionMention[] = [];
 /** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
  *  typing doesn't flood the backend during the popup's open lifetime. */
 const MENTION_FETCH_DEBOUNCE_MS = 100;
@@ -99,14 +116,11 @@ const MENTION_FETCH_LIMIT = 20;
  *  search (search lives on `@`). 30 entries fits the popup's max-h
  *  cap with room to scroll. */
 const ATTACH_BROWSE_LIMIT = 30;
-/** Step 8 Stage 7 — soft / hard caps for the staged-attachment list.
- *  The pane handlers reject adds beyond the hard cap with a toast;
- *  the composer surfaces the warning copy so the user knows where
- *  they sit relative to those thresholds. Mirrors the constants in
- *  AgentChatPane.tsx — kept in sync by hand because there's no other
- *  shared module owning these values. */
+/** Step 8 Stage 7 — soft cap for the staged-attachment list. The attach
+ *  handlers reject adds beyond the hard cap (see
+ *  `@/lib/agent-chat/attachment-limits`) with a toast; the composer surfaces
+ *  the warning copy so the user knows where they sit relative to it. */
 const ATTACHMENT_SOFT_LIMIT = 10;
-const ATTACHMENT_HARD_LIMIT = 20;
 
 /** Views the `+` popup can show. `main` lists categories +
  *  navigation nudges; `file` / `folder` list browsable rows that
@@ -235,6 +249,8 @@ interface Props {
    *  has already inserted the inline `@!<number>` token; the parent
    *  stages the chip + drives the detail + diff fetch. */
   onAttachPr?: (pr: PullRequestInfo) => void;
+  /** Attach one persisted GUI conversation as a safe, budgeted handoff. */
+  onAttachSession?: (session: AgentChatSessionMention) => void;
   /** Step 8 Stage 6 — invoked when the user attaches an image via
    *  paste, drag-drop, or the `+ → Image…` picker. Composer just
    *  forwards the raw File; the parent runs the allowlist check and
@@ -271,6 +287,10 @@ interface Props {
    *  attach rows and footer hints name the right product and CLI.
    *  Absent means GitHub, matching the rest of the app. */
   providerKind?: string | null;
+  /** Workspace/session scope for `@session:` discovery. Omit on an
+   *  unmaterialised Home/project draft where no workspace exists yet. */
+  workspaceId?: string | null;
+  threadId?: string | null;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -336,12 +356,15 @@ export function Composer({
   onAttachFolder,
   onAttachIssue,
   onAttachPr,
+  onAttachSession,
   onAttachImage,
   modelSupportsImages = false,
   repoSupported = null,
   providerCliInstalled = null,
   providerAuthenticated = null,
   providerKind = null,
+  workspaceId = null,
+  threadId = null,
   onDraftChange,
   onSubmit,
   onStop,
@@ -443,6 +466,13 @@ export function Composer({
    *  numeric direct-fetch produces a single-row result. */
   const [mentionPrMatches, setMentionPrMatches] = useState<PullRequestInfo[]>(
     EMPTY_PR_MATCHES,
+  );
+  const [mentionSessionMatches, setMentionSessionMatches] = useState<
+    AgentChatSessionMention[]
+  >(EMPTY_SESSION_MATCHES);
+  const [mentionSessionsLoading, setMentionSessionsLoading] = useState(false);
+  const [mentionSessionsError, setMentionSessionsError] = useState<string | null>(
+    null,
   );
   const mentionOpen = mentionAnchor !== null;
   const mentionQuery = mentionAnchor?.query ?? "";
@@ -848,6 +878,38 @@ export function Composer({
     providerAuthenticated,
   ]);
 
+  // `@session:` is intentionally a GUI-session index, not provider-specific
+  // filesystem scraping. One workspace-scoped query supplies every provider's
+  // persisted conversations; adding another GUI provider therefore requires
+  // no picker changes as long as it writes the standard session records.
+  useEffect(() => {
+    if (!mentionOpen || parsedMention.category !== "session") return;
+    if (!workspaceId) {
+      setMentionSessionMatches(EMPTY_SESSION_MATCHES);
+      setMentionSessionsLoading(false);
+      setMentionSessionsError(null);
+      return;
+    }
+    let cancelled = false;
+    setMentionSessionsLoading(true);
+    setMentionSessionsError(null);
+    void agentChatListSessionMentions(workspaceId, cwd, threadId, 30)
+      .then((sessions) => {
+        if (!cancelled) setMentionSessionMatches(sessions);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setMentionSessionMatches(EMPTY_SESSION_MATCHES);
+        setMentionSessionsError(String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setMentionSessionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mentionOpen, parsedMention.category, workspaceId, cwd, threadId]);
+
   const closeSlash = () => {
     setSlashAnchor(null);
     setSlashHighlighted(null);
@@ -859,6 +921,9 @@ export function Composer({
     setFileMatches(EMPTY_FILE_MATCHES);
     setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
     setMentionPrMatches(EMPTY_PR_MATCHES);
+    setMentionSessionMatches(EMPTY_SESSION_MATCHES);
+    setMentionSessionsLoading(false);
+    setMentionSessionsError(null);
   }, []);
 
   const closeAttachPopup = useCallback(() => {
@@ -1034,6 +1099,63 @@ export function Composer({
   // Stage 4 — branched by `parsedMention.category`. The id prefix
   // (`file:` vs `issue:`) routes the pick handler.
   const mentionItems = useMemo<SlashCommandItem[]>(() => {
+    if (parsedMention.category === "session") {
+      const filter = parsedMention.filter.trim().toLowerCase();
+      const alreadyAttached = new Set(
+        stagedAttachments
+          .filter((attachment) => attachment.kind === "session")
+          .map((attachment) => attachment.ref),
+      );
+      return mentionSessionMatches
+        .filter((session) => !alreadyAttached.has(session.thread_id))
+        .filter((session) => {
+          if (!filter) return true;
+          return [
+            sessionMentionTitle(session),
+            session.preview,
+            session.provider,
+            session.cwd ?? "",
+          ].some((value) => value.toLowerCase().includes(filter));
+        })
+        .map((session) => {
+          const timestamp = parseSqliteTimestamp(session.last_active_at);
+          const when = Number.isFinite(timestamp)
+            ? relativeTime(new Date(timestamp))
+            : "Earlier";
+          const sourceProvider = session.provider.toLowerCase();
+          const providerTint =
+            sourceProvider === "claude"
+              ? "text-warning"
+              : sourceProvider === "codex"
+                ? "text-success"
+                : sourceProvider === "opencode"
+                  ? "text-chart-4"
+                  : "text-muted-foreground";
+          return {
+            id: `session:${session.thread_id}`,
+            label: sessionMentionTitle(session),
+            description:
+              compactSessionPreview(session.preview) ||
+              `${session.message_count} visible messages`,
+            command: `@session:${sessionMentionToken(session)}`,
+            icon: MessagesSquare,
+            iconClassName: providerTint,
+            group: cwd && session.cwd === cwd ? "CURRENT CHECKOUT" : "WORKSPACE",
+            stacked: true,
+            rightAdornment: (
+              <span className="flex h-full min-w-24 flex-col items-end justify-center leading-none">
+                <span className="text-[10px] font-medium text-foreground/70">
+                  {sessionProviderLabel(session.provider)}
+                </span>
+                <span className="mt-1 whitespace-nowrap font-mono text-[9px] text-muted-foreground/60">
+                  {when}
+                </span>
+              </span>
+            ),
+            onSelect: () => {},
+          };
+        });
+    }
     if (parsedMention.category === "issue") {
       // Match the IssuePickerPanel's visual language so users see
       // the same chrome whether they got here via `+` or `@`:
@@ -1102,7 +1224,10 @@ export function Composer({
     parsedMention.category,
     mentionIssueMatches,
     mentionPrMatches,
+    mentionSessionMatches,
     fileMatches,
+    stagedAttachments,
+    cwd,
   ]);
 
   // Why the hosting affordances are inert, in the product's own words:
@@ -1133,6 +1258,47 @@ export function Composer({
   // oriented when the popup is empty for *reasons* rather than just
   // no-matches.
   const mentionPopupFooter = useMemo(() => {
+    if (parsedMention.category === "session") {
+      if (!workspaceId) {
+        return {
+          tone: "muted" as const,
+          message: "Choose an existing workspace before attaching a conversation.",
+        };
+      }
+      const attachedCount = stagedAttachments.filter(
+        (attachment) => attachment.kind === "session",
+      ).length;
+      if (attachedCount >= SESSION_ATTACHMENT_LIMIT) {
+        return {
+          tone: "muted" as const,
+          message: `Conversation handoff limit reached (${SESSION_ATTACHMENT_LIMIT}).`,
+        };
+      }
+      if (mentionSessionsLoading) {
+        return {
+          tone: "muted" as const,
+          message: "Finding conversations in this workspace…",
+        };
+      }
+      if (mentionSessionsError) {
+        return {
+          tone: "error" as const,
+          message: "Could not load conversation history.",
+        };
+      }
+      if (mentionItems.length === 0) {
+        return {
+          tone: "muted" as const,
+          message: parsedMention.filter
+            ? "No conversations match this search."
+            : "No other conversations in this workspace yet.",
+        };
+      }
+      return {
+        tone: "muted" as const,
+        message: `Shares visible chat prose with ${sessionProviderLabel(provider)} · tools and hidden reasoning stay private.`,
+      };
+    }
     if (
       parsedMention.category === "issue" ||
       parsedMention.category === "pr"
@@ -1176,6 +1342,13 @@ export function Composer({
     return null;
   }, [
     parsedMention.category,
+    parsedMention.filter,
+    workspaceId,
+    stagedAttachments,
+    mentionSessionsLoading,
+    mentionSessionsError,
+    mentionItems.length,
+    provider,
     cwd,
     repoSupported,
     providerCliInstalled,
@@ -1621,6 +1794,20 @@ export function Composer({
 
   const handleMentionPopupSelect = useCallback(
     (item: SlashCommandItem) => {
+      if (item.id.startsWith("session:")) {
+        const sourceThreadId = item.id.slice("session:".length);
+        const session = mentionSessionMatches.find(
+          (candidate) => candidate.thread_id === sourceThreadId,
+        );
+        if (!session) {
+          closeMention();
+          return;
+        }
+        replaceMentionWithToken(`session:${sessionMentionToken(session)}`);
+        closeMention();
+        onAttachSession?.(session);
+        return;
+      }
       // Stage 4 — `@issue:` picks. Insert `@#<number>` as the
       // inline token and let the parent stage the chip + drive the
       // detail fetch. The id is `issue:<num>`, minted by the popup
@@ -1674,10 +1861,12 @@ export function Composer({
       fileMatches,
       mentionIssueMatches,
       mentionPrMatches,
+      mentionSessionMatches,
       replaceMentionWithToken,
       onAttachFile,
       onAttachIssue,
       onAttachPr,
+      onAttachSession,
       closeMention,
     ],
   );
@@ -2233,7 +2422,10 @@ export function Composer({
               unified `+` popup. */}
           {(mode !== "default" ||
             stagedAttachments.some(
-              (a) => a.kind === "image" || a.kind === "pr",
+              (a) =>
+                a.kind === "image" ||
+                a.kind === "pr" ||
+                a.kind === "session",
             ) ||
             (interrupted && !streaming && !sending && !!onContinueRun)) && (
             <div
@@ -2261,12 +2453,30 @@ export function Composer({
                 />
               )}
               {stagedAttachments
-                .filter((a) => a.kind === "image" || a.kind === "pr")
+                .filter(
+                  (a) =>
+                    a.kind === "image" ||
+                    a.kind === "pr" ||
+                    a.kind === "session",
+                )
                 .map((attachment) => (
                   <AttachmentChip
                     key={attachment.id}
                     attachment={attachment}
-                    onRemove={(id) => onRemoveAttachment?.(id)}
+                    onRemove={(id) => {
+                      if (
+                        attachment.kind === "session" &&
+                        attachment.metadata.mentionToken
+                      ) {
+                        onDraftChange(
+                          removeSessionMentionToken(
+                            draft,
+                            attachment.metadata.mentionToken,
+                          ),
+                        );
+                      }
+                      onRemoveAttachment?.(id);
+                    }}
                     onToggleExpand={
                       attachment.kind === "pr" && onToggleExpandPr
                         ? (id) => onToggleExpandPr(id)
@@ -2364,6 +2574,25 @@ export function Composer({
                       data-error={seg.hasError || undefined}
                       className={cn(
                         "rounded-sm bg-foreground/10 text-foreground",
+                        seg.isLoading && "opacity-60",
+                        seg.hasError &&
+                          "bg-destructive/15 text-destructive",
+                      )}
+                    >
+                      {seg.text}
+                    </span>
+                  );
+                }
+                if (seg.kind === "session-attachment") {
+                  return (
+                    <span
+                      key={i}
+                      data-testid={`composer-session-token-${seg.ref}`}
+                      data-provider={seg.provider}
+                      data-loading={seg.isLoading || undefined}
+                      data-error={seg.hasError || undefined}
+                      className={cn(
+                        "rounded-sm bg-primary/10 text-primary",
                         seg.isLoading && "opacity-60",
                         seg.hasError &&
                           "bg-destructive/15 text-destructive",

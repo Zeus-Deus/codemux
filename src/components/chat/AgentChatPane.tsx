@@ -3,6 +3,7 @@ import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
+import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
 import {
   planCapabilityCompatReset,
@@ -40,21 +41,18 @@ import {
   resolveSkillSelection,
   skillsForProvider,
 } from "@/lib/agent-chat/skill-tokens";
-import {
-  selectActiveSkills,
-  useSkillsStore,
-} from "@/stores/skills-store";
+import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
-import {
-  findSubagentView,
-  subagentOrdinal,
-} from "@/lib/agent-chat/subagents";
+import { findSubagentView, subagentOrdinal } from "@/lib/agent-chat/subagents";
 import { taskChipSummary } from "@/lib/agent-chat/task-summary";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
+import { ATTACHMENT_HARD_LIMIT } from "@/lib/agent-chat/attachment-limits";
+import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
 import {
   findWorkspaceIdForPane,
@@ -81,6 +79,7 @@ import {
   agentChatCancelQueuedTurn,
   agentChatSendQueuedTurnNow,
   agentChatGetSession,
+  agentChatGetSessionContext,
   agentChatInterruptTurn,
   agentChatListMessagesAfter,
   agentChatListSessions,
@@ -165,12 +164,6 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   opencode: "OpenCode",
 };
 
-/** Step 8 Stage 7 — hard cap on staged attachments. Above this we
- *  toast and reject the next attach so prompts can't silently grow
- *  into a token-budget cliff. The matching soft-warning copy lives
- *  in Composer.tsx (rendering concern); this constant gates the
- *  attach handlers. */
-const ATTACHMENT_HARD_LIMIT = 20;
 /** Step 8 Stage 7 — issue/PR fetches go stale at this age. On send,
  *  we re-fetch any GitHub-kind attachment whose `fetchedAt` is older
  *  so the agent always sees fresh detail (state flips, new comments)
@@ -197,11 +190,7 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
   const bytes = new Uint8Array(buffer);
   let frameCount = 0;
   for (let i = 0; i < bytes.length - 3; i++) {
-    if (
-      bytes[i] === 0x21 &&
-      bytes[i + 1] === 0xf9 &&
-      bytes[i + 2] === 0x04
-    ) {
+    if (bytes[i] === 0x21 && bytes[i + 1] === 0xf9 && bytes[i + 2] === 0x04) {
       frameCount++;
       if (frameCount > 1) return true;
     }
@@ -211,7 +200,8 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
-  const [provider, setProvider] = useState<AgentChatProviderKind>(initialProvider);
+  const [provider, setProvider] =
+    useState<AgentChatProviderKind>(initialProvider);
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
   const conversationSearchJumpRequest = useConversationSearchStore((state) =>
     state.target?.threadId === threadId ? state.target : null,
@@ -291,8 +281,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // (treat as not-a-github-repo) which gives the user a reachable
   // disabled-state instead of a crashing popup.
   const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
-  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
-  const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<
+    boolean | null
+  >(null);
+  const [providerAuthenticated, setProviderAuthenticated] = useState<
+    boolean | null
+  >(null);
   useEffect(() => {
     if (!cwd) {
       setRepoSupported(false);
@@ -438,7 +432,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
       (w) =>
-        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        w.workspace_id ===
+        (workspaceIdForPane ?? s.appState!.active_workspace_id),
     );
     return ws?.project_root ?? ws?.cwd ?? null;
   });
@@ -449,12 +444,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
       (w) =>
-        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        w.workspace_id ===
+        (workspaceIdForPane ?? s.appState!.active_workspace_id),
     );
     return ws?.provider_kind ?? null;
   });
-  const isHomeWorkspace =
-    homeDir !== null && workspaceProjectRoot === homeDir;
+  const isHomeWorkspace = homeDir !== null && workspaceProjectRoot === homeDir;
   // Identity of the pane's workspace, for the current-checkout
   // first-send rename (see `handleCurrentCheckoutFirstSubmit`). A plain
   // scalar, so this selector doesn't re-render on unrelated snapshot
@@ -465,7 +460,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
   );
   const rightPanelTab = useUIStore((state) =>
-    paneWorkspaceId ? state.rightPanelTabs?.[paneWorkspaceId] ?? null : null,
+    paneWorkspaceId ? (state.rightPanelTabs?.[paneWorkspaceId] ?? null) : null,
   );
   const toggleRightPanel = useUIStore((state) => state.toggleRightPanel);
   // The pane workspace's actual checked-out branch (from the workspace
@@ -476,7 +471,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
       (w) =>
-        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        w.workspace_id ===
+        (workspaceIdForPane ?? s.appState!.active_workspace_id),
     );
     return ws?.git_branch ?? null;
   });
@@ -485,9 +481,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
   const setStoreModel = useAgentChatStore((s) => s.setModel);
   const setStorePermissionMode = useAgentChatStore((s) => s.setPermissionMode);
-  const setSessionLaunchMode = useAgentChatStore(
-    (s) => s.setSessionLaunchMode,
-  );
+  const setSessionLaunchMode = useAgentChatStore((s) => s.setSessionLaunchMode);
   const removeStagedAttachment = useAgentChatStore(
     (s) => s.removeStagedAttachment,
   );
@@ -529,9 +523,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (s) => s.markRequestResponding,
   );
   const markRequestPending = useAgentChatStore((s) => s.markRequestPending);
-  const markRequestResolved = useAgentChatStore(
-    (s) => s.markRequestResolved,
-  );
+  const markRequestResolved = useAgentChatStore((s) => s.markRequestResolved);
 
   // Chat-side capabilities for the active provider. `null` until the
   // refresh hook resolves (or when the backend errors — pickers render
@@ -548,8 +540,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // typing therefore leaves `timeline` identical, and the memo boundary on
   // `ChatTranscript` turns that into zero timeline rows rendered per
   // keystroke. (The pane itself still re-renders — it owns the composer.)
-  const draft = useAgentChatStore(
-    (s) => (threadId ? s.threads[threadId]?.inputDraft ?? "" : ""),
+  const draft = useAgentChatStore((s) =>
+    threadId ? (s.threads[threadId]?.inputDraft ?? "") : "",
   );
   const timeline = useAgentChatStore(
     useShallow((s) => {
@@ -591,7 +583,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // rather than riding the timeline group: a task update must not invalidate
   // `messages`, and a keystroke must not invalidate `tasks`.
   const tasks = useAgentChatStore((s) =>
-    threadId ? s.threads[threadId]?.tasks ?? null : null,
+    threadId ? (s.threads[threadId]?.tasks ?? null) : null,
   );
   // The chip's spinner is a LIVE affordance, so `taskChipSummary` gates it
   // on the thread actually streaming rather than on the snapshot alone —
@@ -653,7 +645,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // It raises a one-shot request instead; consume and clear it here.
   const subagentEnterRequest = useUIStore((s) => s.subagentEnterRequest);
   useEffect(() => {
-    if (!subagentEnterRequest || subagentEnterRequest.threadId !== threadId) return;
+    if (!subagentEnterRequest || subagentEnterRequest.threadId !== threadId)
+      return;
     setEnteredSubagentId(subagentEnterRequest.subagentId);
     useUIStore.getState().clearSubagentEnterRequest();
   }, [subagentEnterRequest, threadId]);
@@ -846,7 +839,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // usage lands once per provider report while a turn streams, and folding it
   // into `settings` would re-run every settings consumer on each report.
   const contextUsage = useAgentChatStore((s) =>
-    threadId ? s.threads[threadId]?.contextUsage ?? null : null,
+    threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
   );
   const contextUsageSeedMaxTokens = resolveContextWindowTokens(
     activeModel,
@@ -979,8 +972,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             // before capabilities hydrate.
             current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE ||
             current.permissionMode ===
-              (providerDefaultPermissionMode ??
-                DEFAULT_THREAD_PERMISSION_MODE))
+              (providerDefaultPermissionMode ?? DEFAULT_THREAD_PERMISSION_MODE))
         )
           setStorePermissionMode(seedThreadId, record.permission_mode);
         // Resume cursor is independent of the model pick, so seed it even
@@ -1316,10 +1308,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     clearDraft,
   ]);
 
-  const handleSubmit = useCallback((
-    textOverride?: string,
-    options?: { continueRun?: boolean },
-  ) => {
+  const handleSubmit = useCallback(
+    (textOverride?: string, options?: { continueRun?: boolean }) => {
     // Synchronous ref check BEFORE any React state reads — closes the
     // same-tick race that the `useState` guard can't (captured closure
     // sees the pre-set snapshot when two Enter presses fire in one
@@ -1338,7 +1328,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // attachments; resuming a dead run should leave that draft + its chips
     // untouched and send a plain "Continue" with no images.
     const isContinue = options?.continueRun === true;
-    const rawText = (typeof textOverride === "string" ? textOverride : draft).trim();
+      const rawText = (
+        typeof textOverride === "string" ? textOverride : draft
+      ).trim();
     if (!rawText) return;
     // Snapshot the pre-append interrupted state + composer draft so a failed
     // send can restore both (the optimistic append clears `interrupted` and
@@ -1364,8 +1356,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? undefined
           : useAgentChatStore.getState().threads[threadId];
         const staleList = (preStale?.stagedAttachments ?? []).filter((a) => {
-          if (a.kind !== "issue" && a.kind !== "pr") return false;
+          // A source conversation may still be active in another tab, so
+          // always rematerialise its handoff immediately before send. This
+          // also closes the pick-then-immediate-Enter race: the submit waits
+          // for its own authoritative read instead of silently omitting a
+          // chip whose attach-time read is still in flight.
+          if (a.kind === "session") return true;
           if (a.metadata.isLoading) return false;
+          if (a.kind !== "issue" && a.kind !== "pr") return false;
           const fetchedAt = a.metadata.fetchedAt ?? 0;
           return Date.now() - fetchedAt > STALE_ATTACHMENT_THRESHOLD_MS;
         });
@@ -1374,7 +1372,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           await Promise.all(
             staleList.map(async (att) => {
               try {
-                if (att.kind === "issue") {
+                if (att.kind === "session") {
+                  if (!paneWorkspaceId) return;
+                  const context = await agentChatGetSessionContext(
+                    paneWorkspaceId,
+                    att.ref,
+                    utilitySelectionFromStores(),
+                  );
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: context.content,
+                    metadata: metadataFromSessionContext(context, att.metadata),
+                  });
+                } else if (att.kind === "issue") {
                   const num = Number.parseInt(att.ref.replace(/^#/, ""), 10);
                   if (!Number.isFinite(num)) return;
                   const detail = await getGithubIssueByPath(repoPath, num);
@@ -1423,6 +1432,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                   `[agent-chat] stale re-fetch failed for ${att.ref}`,
                   err,
                 );
+                // GitHub chips fail open (see above), but a conversation
+                // handoff fails closed exactly like the draft surface: the
+                // read only fails when the source conversation is gone or out
+                // of this workspace's scope, so shipping the previously
+                // resolved transcript would hand the agent a stale — possibly
+                // cross-workspace — history. Clearing the content trips the
+                // unresolved-handoff guard below with an actionable toast.
+                if (att.kind === "session") {
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: "",
+                    metadata: {
+                      ...att.metadata,
+                      isLoading: false,
+                      error: String(err),
+                    },
+                  });
+                }
               }
             }),
           );
@@ -1451,10 +1477,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // A Continue send never carries attachments or images: it leaves the
       // user's staged chips intact for their real next message and sends plain
       // "Continue". An empty list makes every downstream builder a no-op.
-      const liveAttachments = isContinue ? [] : (liveSlice?.stagedAttachments ?? []);
-      const attachmentBlock = buildAttachmentBlock(
-        activeAttachments(rawText, liveAttachments),
+      const liveAttachments = isContinue
+        ? []
+        : (liveSlice?.stagedAttachments ?? []);
+      const activeLiveAttachments = activeAttachments(rawText, liveAttachments);
+      const unavailableSession = activeLiveAttachments.find(
+        (attachment) =>
+          attachment.kind === "session" && !attachment.resolvedContent?.trim(),
       );
+      if (unavailableSession) {
+        toast.error("Conversation handoff could not be loaded", {
+          description: `Remove ${unavailableSession.metadata.label} or try again.`,
+        });
+        sendInFlightRef.current = false;
+        setIsSending(false);
+        return;
+      }
+      const attachmentBlock = buildAttachmentBlock(activeLiveAttachments);
       // Images travel as native multimodal content blocks at the SDK
       // layer, NOT inside the text body. They were staged to disk at
       // attach time (`agent_chat_stage_image`), so the turn carries only
@@ -1478,7 +1517,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
+        appendUserMessage(
+          threadId,
+          plan.text,
+          clientNonce,
+          imageDisplaySources,
+        );
       // Same batch as the optimistic append, naming that exact bubble: the
       // transcript parks it near the top and reserves the space the answer
       // streams into, then follows until the reader deliberately leaves.
@@ -1499,7 +1543,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (imageIds.length > 0) await awaitImageStaging(imageIds);
       const freshAttachments = isContinue
         ? []
-        : useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? [];
+          : (useAgentChatStore.getState().threads[threadId]
+              ?.stagedAttachments ?? []);
       const unstaged = unstagedImageAttachments(freshAttachments);
       if (unstaged.length > 0) {
         // A staged image never landed (upload failed). The raw-bytes
@@ -1565,7 +1610,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setIsSending(false);
       }
     })();
-  }, [
+    },
+    [
     threadId,
     draft,
     provider,
@@ -1580,7 +1626,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     updateStagedAttachment,
     requestSendAnchor,
     clearSendAnchor,
-  ]);
+    paneWorkspaceId,
+  ],
+  );
 
   /** One-click "Continue run" (issue #154): resume an interrupted run by
    *  sending the fixed text "Continue" through the normal send path — the
@@ -1677,7 +1725,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       });
       void (async () => {
         try {
-          const info = await readFolderForAttachment(match.absolute_path, cwd, 2);
+          const info = await readFolderForAttachment(
+            match.absolute_path,
+            cwd,
+            2,
+          );
           updateStagedAttachment(threadId, id, {
             resolvedContent: buildFolderResolvedContent(info),
             metadata: {
@@ -1718,9 +1770,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const initialState = (summary.state.toLowerCase() === "closed"
-        ? "closed"
-        : "open") as "open" | "closed";
+      const initialState = (
+        summary.state.toLowerCase() === "closed" ? "closed" : "open"
+      ) as "open" | "closed";
       addStagedAttachment(threadId, {
         id,
         kind: "issue",
@@ -1844,6 +1896,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, cwd, addStagedAttachment, updateStagedAttachment],
   );
 
+  const handleAttachSession = useAttachSessionHandoff(
+    threadId,
+    paneWorkspaceId,
+  );
+
   /** Step 8 Stage 7 — flip the `expandFullDiff` flag on a staged PR
    *  attachment and re-resolve its content with the matching diff
    *  shape. The chip's expand affordance calls this; the resolved
@@ -1855,7 +1912,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (attachmentId: string) => {
       if (!threadId) return;
       const liveSlice = useAgentChatStore.getState().threads[threadId];
-      const att = liveSlice?.stagedAttachments.find((a) => a.id === attachmentId);
+      const att = liveSlice?.stagedAttachments.find(
+        (a) => a.id === attachmentId,
+      );
       if (!att || att.kind !== "pr") return;
       const num = Number.parseInt(att.ref.replace(/^!/, ""), 10);
       if (!Number.isFinite(num)) return;
@@ -1929,12 +1988,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
         return;
       }
-      const allowed = [
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "image/gif",
-      ];
+      const allowed = ["image/png", "image/jpeg", "image/webp", "image/gif"];
       if (!allowed.includes(file.type)) {
         toast.error("Image type not supported", {
           description: `${file.type || "unknown type"} — supported: png, jpeg, webp, gif`,
@@ -2067,10 +2121,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       try {
         const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
-        const newId = await agentChatStartSession(
-          pane.pane_id,
-          provider,
-          {
+        const newId = await agentChatStartSession(pane.pane_id, provider, {
             thread_id: newLocalThreadId,
             cwd,
             model: currentSlice.model,
@@ -2082,8 +2133,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             fast_mode: currentSlice.fastMode,
             additional_directories: [],
             env: null,
-          },
-        );
+        });
         migrateThreadId(threadId, newId);
         setThreadId(newId);
         setSessionLaunchMode(
@@ -2167,7 +2217,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
         );
       const anchoredNonce =
-        queuedItem?.kind === "user_message" ? queuedItem.clientNonce : undefined;
+        queuedItem?.kind === "user_message"
+          ? queuedItem.clientNonce
+          : undefined;
       if (anchoredNonce) requestSendAnchor(anchoredNonce);
       agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
         // Unlike a composer send there is no bubble to roll back — the
@@ -2201,12 +2253,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (propagateFailure) throw err;
       });
     },
-    [
-      threadId,
-      provider,
-      markRequestResponding,
-      markRequestPending,
-    ],
+    [threadId, provider, markRequestResponding, markRequestPending],
   );
 
   /**
@@ -2520,10 +2567,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       return;
     }
     if (currentSlice.mode === "debug") {
-      if (
-        currentSlice.hasDebugActivity &&
-        currentSlice.debugActivityResolved
-      ) {
+      if (currentSlice.hasDebugActivity && currentSlice.debugActivityResolved) {
         const choice = await confirmDebugExit();
         if (choice === "cancel") return;
         if (choice === "cleanup") {
@@ -2575,8 +2619,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // testable in isolation (see `planModelChange`). Reads from the
       // fallback capability snapshot so the reset is correct even
       // while live data is still loading.
-      const nextModel =
-        capabilities?.models.find((m) => m.id === next) ?? null;
+      const nextModel = capabilities?.models.find((m) => m.id === next) ?? null;
       const plan = planModelChange({
         newModel: nextModel,
         currentEffort: effort,
@@ -2764,8 +2807,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (!currentSlice) return;
       const defaults = capabilityDefaults(nextProvider, nextModel);
       const nextLaunchMode = defaults.permissionMode;
-      const nextDisplayMode =
-        nextLaunchMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+      const nextDisplayMode = nextLaunchMode ?? DEFAULT_THREAD_PERMISSION_MODE;
       const oldProvider = provider;
       const oldThreadId = threadId;
       const oldLaunchMode =
@@ -3071,6 +3113,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       tasksOpen={rightPanelTab === "tasks"}
       onTasksClick={handleTasksClick}
       provider={provider}
+      workspaceId={paneWorkspaceId}
+      threadId={threadId}
       model={model}
       permissionMode={permissionMode}
       effort={effort}
@@ -3102,8 +3146,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // was an image that already staged.
         const staged = useAgentChatStore
           .getState()
-          .threads[threadId]?.stagedAttachments.find((a) => a.id === id)
-          ?.stagedImage;
+          .threads[threadId]?.stagedAttachments.find(
+            (a) => a.id === id,
+          )?.stagedImage;
         if (staged) discardStagedImage(staged.path);
         removeStagedAttachment(threadId, id);
       }}
@@ -3112,6 +3157,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
+      onAttachSession={handleAttachSession}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}

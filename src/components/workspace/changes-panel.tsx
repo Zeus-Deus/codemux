@@ -71,6 +71,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
+import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -434,10 +435,19 @@ export function ChangesPanel({
         return;
       }
     }
-    const canUseAi = aiEnabled && claudeReady !== false;
+    // An explicit commit-message CLI wins; otherwise the Utility agent
+    // supplies the provider. Its model only rides along when the provider
+    // matches, so an override CLI is never handed another provider's model
+    // name (`claude --model <codex model>` fails every commit).
+    const utility = utilitySelectionFromStores();
+    const cli = config?.ai_commit_message_cli ?? utility?.provider ?? "claude";
+    const model =
+      config?.ai_commit_message_model ??
+      (utility?.provider === cli ? utility.model : null);
+    // Only claude has an availability preflight; when it says "missing" we
+    // fall back to the manual textarea instead of a doomed spawn.
+    const canUseAi = aiEnabled && (cli !== "claude" || claudeReady !== false);
     if (canUseAi) {
-      const cli = config?.ai_commit_message_cli ?? "claude";
-      const model = config?.ai_commit_message_model ?? null;
       requestGeneration(workspace.workspace_id, cwd, cli, model);
     } else {
       setEditedMsg("");

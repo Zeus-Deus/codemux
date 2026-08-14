@@ -69,6 +69,10 @@ export interface SlashCommandItem {
    *  When present, the row's onSelect is suppressed because the
    *  trailing control owns the click target. */
   rightAdornment?: React.ReactNode;
+  /** Opt into a roomier two-line row with the description below the
+   *  label. Useful for entity results (such as conversations) whose
+   *  names and previews need independent truncation. */
+  stacked?: boolean;
   /** Redesigned `+` command menu — tone of the row's 24px icon chip.
    *  Optional; the menu falls back to `muted` when unset. Ignored by
    *  the legacy `SlashCommandPopup` (slash / mention surfaces). */
@@ -142,7 +146,7 @@ export function findSlashAtCursor(
  *  popups (Stage 4 ships `issue`, Stage 5 wires `pr`). `folder` is
  *  reserved so the future `@folder:` autocomplete can use the same
  *  routing without a second parser. */
-export type MentionCategory = "file" | "folder" | "issue" | "pr";
+export type MentionCategory = "file" | "folder" | "issue" | "pr" | "session";
 
 export interface ParsedMentionQuery {
   category: MentionCategory;
@@ -152,12 +156,12 @@ export interface ParsedMentionQuery {
 }
 
 /** Parse a mention query into a `(category, filter)` pair. Recognised
- *  prefixes: `file:`, `folder:`, `issue:`, `pr:`. Anything else is
+ *  prefixes: `file:`, `folder:`, `issue:`, `pr:`, `session:`. Anything else is
  *  treated as a bare file query so existing `@<name>` autocomplete
  *  keeps working unchanged. The category match is case-insensitive
  *  to forgive copy-pastes from a stylised hint. */
 export function parseMentionQuery(query: string): ParsedMentionQuery {
-  const match = query.match(/^(file|folder|issue|pr):(.*)$/i);
+  const match = query.match(/^(file|folder|issue|pr|session):(.*)$/i);
   if (match) {
     const category = match[1]!.toLowerCase() as MentionCategory;
     return { category, filter: match[2] ?? "" };

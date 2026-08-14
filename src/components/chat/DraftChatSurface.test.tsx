@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // ── Module mocks ──
@@ -30,6 +30,8 @@ vi.mock("@/tauri/commands", () => ({
   readChatImage: vi
     .fn()
     .mockResolvedValue({ bytes: new Uint8Array(), media_type: "image/png" }),
+  agentChatListSessionMentions: vi.fn().mockResolvedValue([]),
+  agentChatGetSessionContext: vi.fn(),
   // Step 8 Stage 2 — Composer's mention popup useEffect calls
   // `listProjectFiles` whenever `@` is open; default to an empty
   // resolution so the popup-not-opened tests don't flap.
@@ -168,6 +170,7 @@ vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
 import { DraftChatSurface } from "./DraftChatSurface";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { toast } from "@/lib/toast";
+import { agentChatGetSessionContext } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
@@ -248,6 +251,7 @@ describe("DraftChatSurface", () => {
   beforeEach(() => {
     resetStores();
     vi.mocked(materializeAndSend).mockReset();
+    vi.mocked(agentChatGetSessionContext).mockReset();
     vi.mocked(toast.error).mockReset();
   });
 
@@ -608,6 +612,141 @@ describe("DraftChatSurface", () => {
       expect(passedDraft.draftId).toBe(draft.draftId);
       expect(text).toBe("hello");
       expect(cwd).toBe("/projects/foo");
+    });
+
+    it("refreshes an in-flight session handoff before the first provider turn", async () => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "ws-existing",
+          workspaces: [
+            {
+              workspace_id: "ws-existing",
+              cwd: "/projects/foo",
+              project_root: "/projects/foo",
+            },
+          ],
+        } as never,
+      });
+      vi.mocked(agentChatGetSessionContext).mockResolvedValue({
+        thread_id: "source-thread-abc123",
+        workspace_id: "ws-existing",
+        cwd: "/projects/foo",
+        provider: "codex",
+        title: "Authentication follow-up",
+        last_active_at: "2026-08-14T09:00:00Z",
+        content: "User:\nHarden authentication.\n\nAssistant:\nRotation is implemented.",
+        message_count: 8,
+        included_message_count: 8,
+        truncated: false,
+        handoff_kind: "summary",
+        summary_cached: false,
+        summary_error: null,
+        summarizer_provider: "codex",
+        summarizer_model: "gpt-5.6-luna",
+        summarizer_effort: "low",
+        revision_message_id: 44,
+        full_history_available: true,
+      });
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({
+        success: true,
+        workspaceId: "ws-existing",
+        paneId: "pane-new",
+        threadId: "tid-p",
+      });
+
+      const draft = seedProjectDraft(
+        "@session:authentication-abc123 continue the work",
+      );
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-existing",
+      });
+      useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "session-att-1",
+        kind: "session",
+        ref: "source-thread-abc123",
+        metadata: {
+          label: "Authentication follow-up",
+          mentionToken: "authentication-abc123",
+          sourceProvider: "codex",
+          isLoading: true,
+        },
+      });
+
+      const { container } = renderSurface();
+      fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+
+      await vi.waitFor(() => {
+        expect(agentChatGetSessionContext).toHaveBeenCalledWith(
+          "ws-existing",
+          "source-thread-abc123",
+          null,
+        );
+        expect(materializeAndSend).toHaveBeenCalled();
+      });
+      const attachmentBlock = vi.mocked(materializeAndSend).mock.calls[0][5];
+      expect(attachmentBlock).toContain(
+        "## Conversation handoff: Authentication follow-up",
+      );
+      expect(attachmentBlock).toContain("Rotation is implemented.");
+      expect(attachmentBlock).toContain(
+        "current user request and current workspace are authoritative",
+      );
+    });
+
+    it("drops staged session handoffs when the draft is retargeted", async () => {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "ws-a",
+          workspaces: [
+            {
+              workspace_id: "ws-a",
+              cwd: "/projects/foo",
+              project_root: "/projects/foo",
+            },
+            {
+              workspace_id: "ws-b",
+              cwd: "/projects/bar",
+              project_root: "/projects/bar",
+            },
+          ],
+        } as never,
+      });
+      const draft = seedProjectDraft(
+        "@session:authentication-abc123 continue the work",
+      );
+      useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-a",
+      });
+      useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "session-att-1",
+        kind: "session",
+        ref: "source-thread-abc123",
+        metadata: {
+          label: "Authentication follow-up",
+          mentionToken: "authentication-abc123",
+          sourceProvider: "codex",
+          isLoading: false,
+        },
+        resolvedContent: "User:\nHarden authentication.",
+      });
+
+      renderSurface();
+      act(() => {
+        useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+          kind: "existing_workspace",
+          workspaceId: "ws-b",
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(
+          useAgentChatStore.getState().threads[draft.threadId]
+            ?.stagedAttachments ?? [],
+        ).toHaveLength(0);
+      });
+      expect(toast.warning).toHaveBeenCalled();
     });
 
     it("on success, setActiveDraft(null) is called and clearDraft is scheduled after 5s", async () => {

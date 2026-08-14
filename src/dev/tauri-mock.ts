@@ -139,7 +139,8 @@ function findChatPaneLocation(threadId: string): {
   paneId: string;
 } | null {
   const walk = (node: PaneNodeSnapshot): string | null => {
-    if (node.kind === "agent_chat" && node.thread_id === threadId) return node.pane_id;
+    if (node.kind === "agent_chat" && node.thread_id === threadId)
+      return node.pane_id;
     if (node.kind === "split") {
       for (const child of node.children) {
         const found = walk(child);
@@ -390,7 +391,9 @@ function writeScrollbackDisk(payload: ScrollbackPayload): void {
   });
 }
 
-function buildScrollbackRestore(entry: MockScrollbackDiskEntry): ScrollbackRestore {
+function buildScrollbackRestore(
+  entry: MockScrollbackDiskEntry,
+): ScrollbackRestore {
   const p = entry.payload;
   const meta: ScrollbackMeta = {
     pane_id: p.pane_id,
@@ -438,9 +441,7 @@ function emitOsc7(cwd: string, sessionId?: string): void {
     const entry = ptyChannels.get(id);
     if (entry) ptyChannelPush(entry, seq);
   }
-  console.info(
-    `[mock::terminal] osc7 cwd=${cwd} sessions=${targets.length}`,
-  );
+  console.info(`[mock::terminal] osc7 cwd=${cwd} sessions=${targets.length}`);
 }
 
 /**
@@ -565,7 +566,10 @@ const SYNCED_SETTINGS: UserSettings = {
   },
   // Checkpoints ON in the mock so the seeded chat pane exercises the
   // restore affordance (issue #80) without a real backend.
-  agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: true },
+  agent_chat: {
+    checkpoints_enabled: true,
+    background_browser_desktop_viewport: true,
+  },
   browser: { default_viewport: null },
 };
 
@@ -783,6 +787,25 @@ const CLAUDE_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+const CODEX_UTILITY_CAPABILITIES: ProviderChatCapabilities = {
+  models: [
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "gpt-5.6-luna",
+      label: "GPT-5.6 Luna",
+      description: "Fast, inexpensive model for high-volume utility work",
+      effort_levels: ["low", "medium", "high"],
+      default_effort: "low",
+      supports_images: true,
+    },
+  ],
+  effort_granularity: "per_turn",
+  effort_label_map: { low: "Low", medium: "Medium", high: "High" },
+  permission_modes: [],
+  default_permission_mode: "danger-full-access",
+  permission_granularity: "per_session",
+};
+
 /** Number of simulated turns in the seeded transcript. Every 5th turn
  * includes an 8-call tool burst (exercises run folding). At 520 turns the
  * derived transcript still has more than 1,100 independently virtualized
@@ -824,7 +847,8 @@ function mockThreadPayloads(threadId: string): string[] {
   const fixture = getStressFixture();
   if (
     fixture &&
-    (threadId.startsWith(STRESS_THREAD_PREFIX) || threadId === MOCK_CHAT_THREAD_ID)
+    (threadId.startsWith(STRESS_THREAD_PREFIX) ||
+      threadId === MOCK_CHAT_THREAD_ID)
   ) {
     return stressChatTranscript(threadId, fixture);
   }
@@ -870,12 +894,14 @@ export function mockShapePayload(rowId: number, payload: string): string {
   }
   if (value.type !== "item_completed") return payload;
   const item = value.item as Record<string, unknown> | undefined;
-  if (!item || item.kind !== "tool_result" || item.content == null) return payload;
+  if (!item || item.kind !== "tool_result" || item.content == null)
+    return payload;
   const content = item.content;
   // The same accept-set the Rust side mirrors — this IS the frontend's.
   if (hasToolResultImages(content)) return payload;
   const serialized = JSON.stringify(content);
-  if (serialized.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES) return payload;
+  if (serialized.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES)
+    return payload;
   const text = mockStringifyToolContent(content);
   item.content = {
     __codemux_lazy_tool_result: {
@@ -1161,7 +1187,10 @@ function mockWorkflowTranscript(threadId: string): string[] | null {
 /** `workspace_id` + `cwd` for each workflow-demo thread — keeps
  *  `agent_chat_list_sessions` / `agent_chat_get_session` in sync with
  *  the panes/worktree paths seeded in `mock-fixtures.ts`. */
-const WORKFLOW_THREAD_WORKSPACE: Record<string, { workspaceId: string; cwd: string }> = {
+const WORKFLOW_THREAD_WORKSPACE: Record<
+  string,
+  { workspaceId: string; cwd: string }
+> = {
   [MOCK_WORKFLOW_APPROVAL_THREAD_ID]: {
     workspaceId: "ws-codemux-workflow-approval",
     cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-workflow-approval`,
@@ -1307,7 +1336,11 @@ function streamMockChatReply(
   }> = [
     {
       tool_name: "Read",
-      input: { file_path: "src-tauri/src/terminal/mod.rs", offset: 1450, limit: 62 },
+      input: {
+        file_path: "src-tauri/src/terminal/mod.rs",
+        offset: 1450,
+        limit: 62,
+      },
       content:
         "fn spawn_pty(&self) -> Result<Pty> {\n    let mut cmd = CommandBuilder::new(&shell);\n    cmd.envs(std::env::vars());\n    // ... env assembled from the process only\n}",
     },
@@ -1336,7 +1369,8 @@ function streamMockChatReply(
     {
       tool_name: "Bash",
       input: { command: "cargo check -p codemux" },
-      content: "    Checking codemux v0.10.0\n    Finished dev [unoptimized] target(s) in 4.12s",
+      content:
+        "    Checking codemux v0.10.0\n    Finished dev [unoptimized] target(s) in 4.12s",
     },
   ];
   let phase: "thinking" | "tools" | "text" = "thinking";
@@ -1418,9 +1452,7 @@ function streamMockChatReply(
     }
     emitted += 1;
     const chunk =
-      emitted % 12 === 0
-        ? `token ${emitted}.\n\n`
-        : `token ${emitted} `;
+      emitted % 12 === 0 ? `token ${emitted}.\n\n` : `token ${emitted} `;
     fullText += chunk;
     send({
       type: "content_delta",
@@ -1488,9 +1520,20 @@ function streamMockSubagents(
     id: string,
     toolName: string,
     input: Record<string, unknown>,
-  ) => item(subagentId, { kind: "tool_use", tool_name: toolName, tool_use_id: id, input });
+  ) =>
+    item(subagentId, {
+      kind: "tool_use",
+      tool_name: toolName,
+      tool_use_id: id,
+      input,
+    });
   const toolResult = (subagentId: string, id: string, content: string) =>
-    item(subagentId, { kind: "tool_result", tool_use_id: id, content, is_error: false });
+    item(subagentId, {
+      kind: "tool_result",
+      tool_use_id: id,
+      content,
+      is_error: false,
+    });
 
   // Scripted timeline — one frame per tick so the lifecycle is watchable.
   const frames: Array<() => void> = [
@@ -1526,16 +1569,28 @@ function streamMockSubagents(
         model: "opus · xhigh",
         status: "running",
       }),
-    () => toolUse("explore", "ex-1", "Grep", { pattern: "handlePaste", path: "src" }),
+    () =>
+      toolUse("explore", "ex-1", "Grep", {
+        pattern: "handlePaste",
+        path: "src",
+      }),
     () => toolResult("explore", "ex-1", "7 matches"),
-    () => snap({ subagent_id: "explore", activity: "mapping the paste handler call graph…" }),
-    () => toolUse("build", "b-1", "Edit", {
+    () =>
+      snap({
+        subagent_id: "explore",
+        activity: "mapping the paste handler call graph…",
+      }),
+    () =>
+      toolUse("build", "b-1", "Edit", {
       file_path: "src-tauri/src/clipboard.rs",
       old_string: "",
       new_string: "pub fn read_image() {}\n",
     }),
     () => toolResult("build", "b-1", "Applied edit"),
-    () => toolUse("explore", "ex-2", "Read", { file_path: "src/components/chat/Composer.tsx" }),
+    () =>
+      toolUse("explore", "ex-2", "Read", {
+        file_path: "src/components/chat/Composer.tsx",
+      }),
     () => toolResult("explore", "ex-2", "// Composer.tsx\n"),
     () =>
       snap({
@@ -1545,7 +1600,10 @@ function streamMockSubagents(
         tool_use_count: 2,
         duration_ms: 12000,
       }),
-    () => toolUse("build", "b-2", "Bash", { command: "cargo test clipboard_fallback" }),
+    () =>
+      toolUse("build", "b-2", "Bash", {
+        command: "cargo test clipboard_fallback",
+      }),
     () => toolResult("build", "b-2", "test result: ok. 1 passed"),
     () =>
       snap({
@@ -1697,7 +1755,9 @@ window.addEventListener(
 // A small, mutable preset store so the preset bar + structured editor are
 // exercisable in the browser dev environment. Mirrors the real backend:
 // mutations update this object and re-emit `presets-changed`.
-function mkPreset(p: Partial<TerminalPreset> & { id: string; name: string }): TerminalPreset {
+function mkPreset(
+  p: Partial<TerminalPreset> & { id: string; name: string },
+): TerminalPreset {
   return {
     description: null,
     commands: [],
@@ -1949,7 +2009,10 @@ type Handler = (args: Args) => unknown;
 /** In-memory staging store for `agent_chat_stage_image` (keyed by the
  *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
  *  so the IPC-read image fallback works end-to-end in `npm run dev`. */
-const stagedImages = new Map<string, { bytes: Uint8Array; mediaType: string }>();
+const stagedImages = new Map<
+  string,
+  { bytes: Uint8Array; mediaType: string }
+>();
 let stagedImageSeq = 0;
 
 const handlers: Record<string, Handler> = {
@@ -1962,8 +2025,7 @@ const handlers: Record<string, Handler> = {
   // ── Usage ──
   // `tzOffsetMinutes` is accepted and ignored: the fixture derives its
   // buckets from the local `Date` already, so it is local by construction.
-  usage_summary: (args: Args) =>
-    mockUsageSummary(String(args.period ?? "7d")),
+  usage_summary: (args: Args) => mockUsageSummary(String(args.period ?? "7d")),
   usage_export_csv: (args: Args) =>
     mockUsageExportCsv(String(args.period ?? "7d")),
   // The dev mock has no provider history to read; report a plausible scan. The
@@ -2010,7 +2072,9 @@ const handlers: Record<string, Handler> = {
     // Mirrors `resolve_agent_browser_session`: the session is minted on
     // first use, keyed by workspace, with a name derived from its cwd.
     if (!session) {
-      const ws = appState.workspaces.find((w) => w.workspace_id === workspaceId);
+      const ws = appState.workspaces.find(
+        (w) => w.workspace_id === workspaceId,
+      );
       const fresh: AgentBrowserSession = {
         session_id: `agent-browser-${workspaceId}`,
         workspace_id: workspaceId,
@@ -2123,9 +2187,7 @@ const handlers: Record<string, Handler> = {
       "src/stores/ui-store.ts",
       "src-tauri/Cargo.toml",
     ];
-    return query
-      ? paths.filter((p) => p.toLowerCase().includes(query))
-      : paths;
+    return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
   },
 
   // Enough content for the editor surfaces (main-area tab and the right
@@ -2144,7 +2206,11 @@ const handlers: Record<string, Handler> = {
   // start_session echoes back the frontend-minted thread id;
   // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
-    a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
+    a.provider === "claude"
+      ? CLAUDE_CAPABILITIES
+      : a.provider === "codex"
+        ? CODEX_UTILITY_CAPABILITIES
+        : EMPTY_CAPABILITIES,
   // Provider slash commands — in production these are harvested live
   // from the deployed Claude Code CLI (SDK `supportedCommands()`),
   // including custom `.claude/commands` entries. The mock serves a
@@ -2154,7 +2220,8 @@ const handlers: Record<string, Handler> = {
       ? [
           {
             name: "compact",
-            description: "Clear conversation history but keep a summary in context",
+            description:
+              "Clear conversation history but keep a summary in context",
             argumentHint: "<optional summary instructions>",
           },
           {
@@ -2164,7 +2231,8 @@ const handlers: Record<string, Handler> = {
           },
           {
             name: "init",
-            description: "Initialize a new CLAUDE.md file with codebase documentation",
+            description:
+              "Initialize a new CLAUDE.md file with codebase documentation",
             argumentHint: "",
           },
           {
@@ -2258,9 +2326,97 @@ const handlers: Record<string, Handler> = {
       },
     ];
   },
+  // Provider-neutral `@session:` picker fixture. Two source chats share the
+  // main demo workspace: one in the current checkout and one in a worktree,
+  // making grouping, provider labels, filtering, and the handoff chip easy to
+  // verify under `npm run dev`.
+  agent_chat_list_session_mentions: (a) => {
+    if (a.workspaceId !== "ws-codemux-chat") return [];
+    const excluded = String(a.excludeThreadId ?? "");
+    return [
+      {
+        thread_id: "mock-session-codex-auth",
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "codex",
+        title: "Harden workspace authentication",
+        last_active_at: new Date(Date.now() - 8 * 60_000).toISOString(),
+        preview:
+          "Implemented token rotation and isolated the remaining failing refresh test.",
+        message_count: 18,
+      },
+      {
+        thread_id: "mock-session-claude-index",
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/search-index`,
+        provider: "claude",
+        title: "Conversation search indexing",
+        last_active_at: new Date(Date.now() - 52 * 60_000).toISOString(),
+        preview:
+          "The FTS migration is complete; next step is validating ranked snippets in the palette.",
+        message_count: 27,
+      },
+    ].filter((session) => session.thread_id !== excluded);
+  },
+  agent_chat_get_session_context: (a) => {
+    const threadId = String(a.threadId ?? "");
+    const sessions: Record<string, Record<string, unknown>> = {
+      "mock-session-codex-auth": {
+        thread_id: threadId,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "codex",
+        title: "Harden workspace authentication",
+        last_active_at: new Date(Date.now() - 8 * 60_000).toISOString(),
+        content:
+          "## Goal\nHarden workspace authentication and add token rotation.\n\n## Current state\nToken rotation is implemented; one refresh-path test remains isolated.\n\n## Changes and evidence\n- Added bounded refresh-token replacement.\n- Invalidated the previous token after a successful exchange.\n\n## Tests and results\nThe authentication suite passes except for the isolated refresh race.\n\n## Next steps\nFix the delayed refresh assertion and rerun the focused suite.",
+        message_count: 18,
+        included_message_count: 18,
+        truncated: false,
+        handoff_kind: "summary",
+        summary_cached: false,
+        summary_error: null,
+        summarizer_provider: "codex",
+        summarizer_model: "gpt-5.6-luna",
+        summarizer_effort: "low",
+        revision_message_id: 118,
+        full_history_available: true,
+      },
+      "mock-session-claude-index": {
+        thread_id: threadId,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/search-index`,
+        provider: "claude",
+        title: "Conversation search indexing",
+        last_active_at: new Date(Date.now() - 52 * 60_000).toISOString(),
+        content:
+          "User:\nBuild durable conversation search.\n\nAssistant:\nThe FTS migration is complete; validate ranked snippets next.",
+        message_count: 27,
+        included_message_count: 27,
+        truncated: false,
+        handoff_kind: "summary",
+        summary_cached: true,
+        summary_error: null,
+        summarizer_provider: "codex",
+        summarizer_model: "gpt-5.6-luna",
+        summarizer_effort: "low",
+        revision_message_id: 227,
+        full_history_available: true,
+      },
+    };
+    const context = sessions[threadId];
+    if (!context || a.workspaceId !== "ws-codemux-chat") {
+      throw new Error(`conversation_not_found: ${threadId}`);
+    }
+    return context;
+  },
   agent_chat_search: (a) => {
-    const query = String(a.query ?? "").trim().toLocaleLowerCase();
-    const workspaceIds = new Set((a.workspaceIds as string[] | undefined) ?? []);
+    const query = String(a.query ?? "")
+      .trim()
+      .toLocaleLowerCase();
+    const workspaceIds = new Set(
+      (a.workspaceIds as string[] | undefined) ?? [],
+    );
     const limit = Math.max(1, Math.min(50, Number(a.limit ?? 12)));
     if (!query || workspaceIds.size === 0) return [];
     const mainRecord = {
@@ -2324,7 +2480,10 @@ const handlers: Record<string, Handler> = {
         if (envelope.type === "user_message") {
           role = "user";
           text = String(envelope.text ?? "");
-        } else if (envelope.type === "item_completed" && !envelope.subagent_id) {
+        } else if (
+          envelope.type === "item_completed" &&
+          !envelope.subagent_id
+        ) {
           const item = envelope.item as Record<string, unknown> | undefined;
           if (item?.kind === "assistant_text") {
             role = "assistant";
@@ -2343,9 +2502,14 @@ const handlers: Record<string, Handler> = {
           provider: record.provider,
           session_title: record.title,
           role,
-          turn_id: role === "assistant" ? String(envelope.turn_id ?? "") || null : null,
+          turn_id:
+            role === "assistant"
+              ? String(envelope.turn_id ?? "") || null
+              : null,
           snippet: `${from > 0 ? "… " : ""}${text.slice(from, to)}${to < text.length ? " …" : ""}`,
-          created_at: new Date(firstCreatedAt + sourceIndex * 725).toISOString(),
+          created_at: new Date(
+            firstCreatedAt + sourceIndex * 725,
+          ).toISOString(),
         });
         if (results.length >= limit) return results.slice(0, limit);
       }
@@ -2363,7 +2527,10 @@ const handlers: Record<string, Handler> = {
       (candidate) => candidate.surface_id === location.surface.surface_id,
     );
     if (tab) location.workspace.active_tab_id = tab.tab_id;
-    appState = { ...appState, active_workspace_id: location.workspace.workspace_id };
+    appState = {
+      ...appState,
+      active_workspace_id: location.workspace.workspace_id,
+    };
     emitAppState();
     return {
       pane_id: location.paneId,
@@ -2421,7 +2588,9 @@ const handlers: Record<string, Handler> = {
   agent_chat_read_local_image: () => {
     const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
     return {
-      bytes: Array.from(Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0))),
+      bytes: Array.from(
+        Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0)),
+      ),
       media_type: "image/png",
     };
   },
@@ -2432,8 +2601,7 @@ const handlers: Record<string, Handler> = {
   // MCP warmup is a real background prime in the app; the mock has no MCP
   // host, so this is a no-op that returns immediately.
   agent_chat_prime_mcp: () => undefined,
-  agent_chat_start_session: (a) =>
-    (a.input as { thread_id: string }).thread_id,
+  agent_chat_start_session: (a) => (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) => {
     const input = a.input as {
       thread_id: string;
@@ -2636,7 +2804,8 @@ const handlers: Record<string, Handler> = {
         description: (a.description as string | null) ?? null,
         commands: (a.commands as string[]) ?? [],
         working_directory: (a.workingDirectory as string | null) ?? null,
-        launch_mode: (a.launchMode as TerminalPreset["launch_mode"]) ?? "new_tab",
+        launch_mode:
+          (a.launchMode as TerminalPreset["launch_mode"]) ?? "new_tab",
         icon: (a.icon as string | null) ?? null,
         pinned: (a.pinned as boolean) ?? true,
         launch_config:
@@ -2650,13 +2819,18 @@ const handlers: Record<string, Handler> = {
     const p = presetState.presets.find((x) => x.id === a.id);
     if (p) {
       if (a.name != null) p.name = a.name as string;
-      if (a.description !== undefined) p.description = (a.description as string | null) ?? null;
+      if (a.description !== undefined)
+        p.description = (a.description as string | null) ?? null;
       if (a.commands != null) p.commands = a.commands as string[];
-      if (a.launchMode != null) p.launch_mode = a.launchMode as TerminalPreset["launch_mode"];
+      if (a.launchMode != null)
+        p.launch_mode = a.launchMode as TerminalPreset["launch_mode"];
       if (a.icon !== undefined) p.icon = (a.icon as string | null) ?? null;
-      if (a.autoRunOnWorkspace != null) p.auto_run_on_workspace = a.autoRunOnWorkspace as boolean;
-      if (a.autoRunOnNewTab != null) p.auto_run_on_new_tab = a.autoRunOnNewTab as boolean;
-      if (a.launchConfig != null) p.launch_config = a.launchConfig as TerminalPreset["launch_config"];
+      if (a.autoRunOnWorkspace != null)
+        p.auto_run_on_workspace = a.autoRunOnWorkspace as boolean;
+      if (a.autoRunOnNewTab != null)
+        p.auto_run_on_new_tab = a.autoRunOnNewTab as boolean;
+      if (a.launchConfig != null)
+        p.launch_config = a.launchConfig as TerminalPreset["launch_config"];
       else if (a.clearLaunchConfig === true) p.launch_config = null;
       emitPresets();
     }
@@ -3008,17 +3182,72 @@ const handlers: Record<string, Handler> = {
     const now = Math.floor(Date.now() / 1000);
     const DAY = 86_400;
     return [
-      { name: "main", last_commit_unix: now - 2 * DAY, is_local: true, is_remote: true },
-      { name: "feature/auth-refactor", last_commit_unix: now - 3 * DAY, is_local: true, is_remote: true },
-      { name: "fix/sidebar-flicker", last_commit_unix: now - 5 * DAY, is_local: true, is_remote: false },
-      { name: "feature/40-dev-mock-tauri-runtime", last_commit_unix: now - 8 * DAY, is_local: true, is_remote: true },
-      { name: "chore/port-detection", last_commit_unix: now - 12 * DAY, is_local: true, is_remote: false },
-      { name: "feature/75-chat-channel", last_commit_unix: now - 15 * DAY, is_local: true, is_remote: true },
-      { name: "agent/094b1560", last_commit_unix: now - 21 * DAY, is_local: true, is_remote: false },
-      { name: "feature-208-address-and-sector-support", last_commit_unix: now - 35 * DAY, is_local: false, is_remote: true },
-      { name: "feature-189-search-history-delete", last_commit_unix: now - 38 * DAY, is_local: false, is_remote: true },
-      { name: "fix-prod-dockerfile", last_commit_unix: now - 44 * DAY, is_local: false, is_remote: true },
-      { name: "feature-186-roleGuard", last_commit_unix: now - 60 * DAY, is_local: false, is_remote: true },
+      {
+        name: "main",
+        last_commit_unix: now - 2 * DAY,
+        is_local: true,
+        is_remote: true,
+      },
+      {
+        name: "feature/auth-refactor",
+        last_commit_unix: now - 3 * DAY,
+        is_local: true,
+        is_remote: true,
+      },
+      {
+        name: "fix/sidebar-flicker",
+        last_commit_unix: now - 5 * DAY,
+        is_local: true,
+        is_remote: false,
+      },
+      {
+        name: "feature/40-dev-mock-tauri-runtime",
+        last_commit_unix: now - 8 * DAY,
+        is_local: true,
+        is_remote: true,
+      },
+      {
+        name: "chore/port-detection",
+        last_commit_unix: now - 12 * DAY,
+        is_local: true,
+        is_remote: false,
+      },
+      {
+        name: "feature/75-chat-channel",
+        last_commit_unix: now - 15 * DAY,
+        is_local: true,
+        is_remote: true,
+      },
+      {
+        name: "agent/094b1560",
+        last_commit_unix: now - 21 * DAY,
+        is_local: true,
+        is_remote: false,
+      },
+      {
+        name: "feature-208-address-and-sector-support",
+        last_commit_unix: now - 35 * DAY,
+        is_local: false,
+        is_remote: true,
+      },
+      {
+        name: "feature-189-search-history-delete",
+        last_commit_unix: now - 38 * DAY,
+        is_local: false,
+        is_remote: true,
+      },
+      {
+        name: "fix-prod-dockerfile",
+        last_commit_unix: now - 44 * DAY,
+        is_local: false,
+        is_remote: true,
+      },
+      {
+        name: "feature-186-roleGuard",
+        last_commit_unix: now - 60 * DAY,
+        is_local: false,
+        is_remote: true,
+      },
     ];
   },
 
@@ -3106,7 +3335,9 @@ const handlers: Record<string, Handler> = {
     const paneId = a.paneId as string;
     const entry = scrollbackDisk.get(diskKey(workspaceId, paneId));
     if (!entry) {
-      logScrollback(`get ws=${shortId(workspaceId)} pane=${shortId(paneId)} -> miss`);
+      logScrollback(
+        `get ws=${shortId(workspaceId)} pane=${shortId(paneId)} -> miss`,
+      );
       return null;
     }
     logScrollback(
@@ -3190,11 +3421,7 @@ const handlers: Record<string, Handler> = {
   // Mirrors src-tauri/src/commands/git.rs:GitCloneProgress (camelCase).
   git_clone_repo: async (a) => {
     const targetDir = String(a.targetDir ?? `${MOCK_HOME_DIR}/projects/cloned`);
-    const emit = (
-      phase: string,
-      percent: number | null,
-      detail: string,
-    ) =>
+    const emit = (phase: string, percent: number | null, detail: string) =>
       emitEvent("git-clone-progress", {
         targetDir,
         phase,
@@ -3206,7 +3433,11 @@ const handlers: Record<string, Handler> = {
     emit("Cloning", null, `Cloning into '${targetDir.split("/").pop()}'...`);
     await sleep(500);
     for (const pct of [20, 55, 88, 100]) {
-      emit("Counting objects", pct, `remote: Counting objects: ${pct}% (2934/2934)`);
+      emit(
+        "Counting objects",
+        pct,
+        `remote: Counting objects: ${pct}% (2934/2934)`,
+      );
       await sleep(300);
     }
     // Receiving objects climbs 5%→96% with a throughput detail line.
@@ -3379,10 +3610,7 @@ const handlers: Record<string, Handler> = {
       ...appState,
       workspaces: next,
       active_workspace_id: active,
-      archived_workspaces: [
-        ...(appState.archived_workspaces ?? []),
-        entry,
-      ],
+      archived_workspaces: [...(appState.archived_workspaces ?? []), entry],
     };
     emitAppState();
     return archiveId;
@@ -3401,9 +3629,7 @@ const handlers: Record<string, Handler> = {
       workspaces: [...appState.workspaces, ws],
       // The real backend activates the restored workspace.
       active_workspace_id: ws.workspace_id,
-      archived_workspaces: entries.filter(
-        (e) => e.archive_id !== a.archiveId,
-      ),
+      archived_workspaces: entries.filter((e) => e.archive_id !== a.archiveId),
     };
     emitAppState();
     return ws.workspace_id;
@@ -3429,9 +3655,7 @@ const handlers: Record<string, Handler> = {
     dirtyArchivedIds.delete(entry.archive_id);
     appState = {
       ...appState,
-      archived_workspaces: entries.filter(
-        (e) => e.archive_id !== a.archiveId,
-      ),
+      archived_workspaces: entries.filter((e) => e.archive_id !== a.archiveId),
     };
     emitAppState();
     return undefined;
@@ -3712,8 +3936,9 @@ async function invoke(
   if (args instanceof Uint8Array || args instanceof ArrayBuffer) {
     if (cmd === "agent_chat_stage_image") {
       const bytes = args instanceof Uint8Array ? args : new Uint8Array(args);
-      const headers = (options as { headers?: Record<string, string> } | undefined)
-        ?.headers;
+      const headers = (
+        options as { headers?: Record<string, string> } | undefined
+      )?.headers;
       const mediaType = headers?.["x-media-type"] ?? "image/png";
       const ext = mediaType.split("/")[1] ?? "png";
       const path = `${MOCK_HOME_DIR}/.codemux/staging/chat-image-${++stagedImageSeq}.${ext}`;
@@ -3764,8 +3989,9 @@ const internals: TauriInternals = {
 // deliberately DON'T set it — some app code uses it to distinguish real
 // runtime from web, and the mock should read as "not the real thing".
 
-(window as unknown as { __TAURI_INTERNALS__: TauriInternals }).__TAURI_INTERNALS__ =
-  internals;
+(
+  window as unknown as { __TAURI_INTERNALS__: TauriInternals }
+).__TAURI_INTERNALS__ = internals;
 
 (
   window as unknown as {

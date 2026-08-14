@@ -476,6 +476,33 @@ fn register_tools() -> Vec<McpTool> {
                 }
             }),
         },
+        // -- Attached conversation history tools --
+        McpTool {
+            name: "conversation_read",
+            description: "Read a provider-neutral conversation handoff source in chronological pages. Use the conversation_id included in an attached handoff. Returns only visible user messages and top-level assistant prose; hidden reasoning, raw tool payloads, requests, and subagent internals are excluded. Start without cursor, then pass next_cursor until it is null.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Conversation reference from the handoff attachment" },
+                    "cursor": { "type": "integer", "minimum": 0, "description": "Previous page's next_cursor; omit for the beginning" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Messages per page (default 20)" }
+                },
+                "required": ["conversation_id"]
+            }),
+        },
+        McpTool {
+            name: "conversation_search",
+            description: "Search the complete safe-visible source of an attached conversation before reading a focused page. Results include message ids that can be used as evidence; conversation_read remains chronological and cursor-based.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Conversation reference from the handoff attachment" },
+                    "query": { "type": "string", "description": "Words to find in the source conversation" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum matches (default 12)" }
+                },
+                "required": ["conversation_id", "query"]
+            }),
+        },
         // -- Notification tools --
         McpTool {
             name: "notify",
@@ -1211,6 +1238,45 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             call_socket("split_pane", json!({ "pane_id": pane_id, "direction": direction })).await
         }
 
+        // -- Attached conversation history --
+        "conversation_read" => {
+            let conversation_id = arguments.get("conversation_id").and_then(Value::as_str).unwrap_or_default();
+            if conversation_id.is_empty() {
+                Err("conversation_read: missing required argument 'conversation_id'".into())
+            } else {
+                let mut params = json!({
+                    "workspace_id": &workspace_id,
+                    "conversation_id": conversation_id,
+                });
+                if let Some(cursor) = arguments.get("cursor").and_then(Value::as_i64) {
+                    params["cursor"] = json!(cursor);
+                }
+                if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                    params["limit"] = json!(limit);
+                }
+                call_socket("conversation_read", params).await
+            }
+        }
+        "conversation_search" => {
+            let conversation_id = arguments.get("conversation_id").and_then(Value::as_str).unwrap_or_default();
+            let query = arguments.get("query").and_then(Value::as_str).unwrap_or_default();
+            if conversation_id.is_empty() {
+                Err("conversation_search: missing required argument 'conversation_id'".into())
+            } else if query.trim().is_empty() {
+                Err("conversation_search: missing required argument 'query'".into())
+            } else {
+                let mut params = json!({
+                    "workspace_id": &workspace_id,
+                    "conversation_id": conversation_id,
+                    "query": query,
+                });
+                if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                    params["limit"] = json!(limit);
+                }
+                call_socket("conversation_search", params).await
+            }
+        }
+
         // -- Notification tools --
         "notify" => {
             let message = arguments.get("message").and_then(Value::as_str).unwrap_or_default();
@@ -1857,11 +1923,12 @@ mod tests {
         let tools = register_tools();
         // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
         // issue tools, then 44 → 52 with the eight automation tools,
-        // then 52 → 55 with the workspace-archive tools
+        // then 52 → 55 with the workspace-archive tools, then 55 → 57
+        // with provider-neutral attached-conversation history
         // (workspace_archive / workspace_unarchive /
         // workspace_archive_list). Keep this number in sync with
         // register_tools() when adding new entries.
-        assert_eq!(tools.len(), 55);
+        assert_eq!(tools.len(), 57);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -1896,6 +1963,8 @@ mod tests {
         // breaks the integration.
         assert!(names.contains(&"terminal_write"));
         assert!(names.contains(&"terminal_read"));
+        assert!(names.contains(&"conversation_read"));
+        assert!(names.contains(&"conversation_search"));
         assert!(names.contains(&"workspace_open"));
         assert!(names.contains(&"app_status"));
         assert!(names.contains(&"port_list"));
@@ -2013,9 +2082,10 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
         // then 44 → 52 with the eight automation tools, then 52 → 55
-        // with the workspace-archive tools. See
+        // with the workspace-archive tools, then 55 → 57 with attached
+        // conversation history. See
         // tool_registry_has_all_tools for the canonical count.
-        assert_eq!(tools.len(), 55);
+        assert_eq!(tools.len(), 57);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

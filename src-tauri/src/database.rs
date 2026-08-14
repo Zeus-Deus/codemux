@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -54,6 +54,76 @@ pub struct AgentChatSessionRecord {
     /// `false` for rows created before this column existed.
     #[serde(default)]
     pub fast_mode: bool,
+}
+
+/// Lightweight provider-neutral conversation row used by the composer's
+/// `@session:` picker. Unlike the history dropdown this is not a resume
+/// surface: sessions only need human-visible transcript prose, not a live
+/// provider cursor. That lets completed conversations remain attachable even
+/// if their provider-side resume record has disappeared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatSessionMention {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub cwd: Option<String>,
+    pub provider: String,
+    pub title: Option<String>,
+    pub last_active_at: String,
+    pub preview: String,
+    pub message_count: u32,
+}
+
+/// One safe transcript entry for a session handoff. The backing FTS table
+/// deliberately contains only user messages and top-level assistant prose;
+/// tool output, hidden reasoning, requests, and subagent internals never enter
+/// this shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatVisibleMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// One cursor-addressable safe conversation message returned by the Codemux
+/// history tools. This is deliberately sourced from `agent_chat_search`, so
+/// hidden reasoning, tool payloads, requests, and subagent internals cannot
+/// leak through the on-demand handoff path either.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatHistoryMessage {
+    pub message_id: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatHistoryPage {
+    pub conversation_id: String,
+    pub title: Option<String>,
+    pub provider: String,
+    pub messages: Vec<AgentChatHistoryMessage>,
+    pub next_cursor: Option<i64>,
+    pub total_visible_messages: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatHistorySearchHit {
+    pub message_id: i64,
+    pub role: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
+/// Versioned cache for the expensive model-written portion of a conversation
+/// handoff. Direct transcript fallback is deterministic and is never cached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentChatHandoffSummaryCache {
+    pub revision_message_id: i64,
+    pub summarizer_provider: String,
+    pub summarizer_model: String,
+    pub summarizer_effort: Option<String>,
+    pub prompt_version: u32,
+    pub summary: String,
+    pub generated_at: String,
 }
 
 /// One hit in the durable conversation index. `message_id` points back to
@@ -340,6 +410,25 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Lazy, model-written conversation handoffs (schema v16). One cache
+        -- row per source conversation is sufficient: changing utility model,
+        -- prompt version, or source revision replaces it atomically. The
+        -- source transcript remains authoritative and cascade deletion keeps
+        -- this derived data from outliving it.
+        CREATE TABLE IF NOT EXISTS agent_chat_handoff_summaries (
+            thread_id TEXT PRIMARY KEY,
+            revision_message_id INTEGER NOT NULL,
+            summarizer_provider TEXT NOT NULL,
+            summarizer_model TEXT NOT NULL,
+            summarizer_effort TEXT,
+            prompt_version INTEGER NOT NULL,
+            summary TEXT NOT NULL,
+            generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (thread_id)
+                REFERENCES agent_chat_sessions(thread_id)
+                ON DELETE CASCADE
+        );
 
         -- Full-text conversation index (schema v14). Its rowid is the
         -- durable source message id. Keep only human-visible conversation
@@ -1057,7 +1146,9 @@ impl DatabaseStore {
             .prepare("SELECT key, value FROM settings WHERE user_id = 'local'")
             .unwrap();
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap();
         rows.filter_map(|r| r.ok()).collect()
     }
@@ -1145,7 +1236,6 @@ impl DatabaseStore {
         .filter_map(|r| r.ok())
         .collect()
     }
-
 }
 
 // ── Hosts (Step 2 of cloud push) ──
@@ -1265,12 +1355,7 @@ impl DatabaseStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    pub fn update_host(
-        &self,
-        id: i64,
-        name: &str,
-        ssh_target: &str,
-    ) -> Result<HostRecord, String> {
+    pub fn update_host(&self, id: i64, name: &str, ssh_target: &str) -> Result<HostRecord, String> {
         let conn = self.conn.lock().unwrap();
         let affected = conn
             .execute(
@@ -1313,11 +1398,7 @@ impl DatabaseStore {
 
     /// Clear the dirty flag on a host after a successful push. Optionally
     /// stamp `server_id` if this was the first upload.
-    pub fn mark_host_synced(
-        &self,
-        id: i64,
-        server_id: Option<&str>,
-    ) -> Result<(), String> {
+    pub fn mark_host_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         if let Some(sid) = server_id {
             conn.execute(
@@ -1794,10 +1875,7 @@ impl DatabaseStore {
     /// mark the row dirty: clearing a local-only link is not a change
     /// the cloud needs to hear about (the row's server_id/identity is
     /// unchanged), and the next inventory poll keeps it fresh.
-    pub fn unlink_workspace_sync_from_local(
-        &self,
-        server_id: &str,
-    ) -> Result<(), String> {
+    pub fn unlink_workspace_sync_from_local(&self, server_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workspaces_sync
@@ -2106,9 +2184,7 @@ impl DatabaseStore {
     }
 }
 
-fn row_to_workspace_sync(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<WorkspaceSyncRecord> {
+fn row_to_workspace_sync(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceSyncRecord> {
     let dirty_int: i64 = row.get(12)?;
     Ok(WorkspaceSyncRecord {
         id: row.get(0)?,
@@ -2220,10 +2296,7 @@ const AUTOMATION_RUN_COLUMNS: &str = "id, automation_id, status, scheduled_for, 
 
 impl DatabaseStore {
     /// Insert a new automation. Marked `dirty` so a future sync pushes it.
-    pub fn insert_automation(
-        &self,
-        input: &AutomationInput,
-    ) -> Result<AutomationRecord, String> {
+    pub fn insert_automation(&self, input: &AutomationInput) -> Result<AutomationRecord, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO automations
@@ -2473,11 +2546,7 @@ impl DatabaseStore {
     }
 
     /// Recent runs for an automation, newest fire first.
-    pub fn list_automation_runs(
-        &self,
-        automation_id: i64,
-        limit: u32,
-    ) -> Vec<AutomationRunRecord> {
+    pub fn list_automation_runs(&self, automation_id: i64, limit: u32) -> Vec<AutomationRunRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(&format!(
             "SELECT {AUTOMATION_RUN_COLUMNS} FROM automation_runs
@@ -2579,11 +2648,7 @@ impl DatabaseStore {
 
     /// Clear `dirty` after a successful push; optionally stamp the
     /// server-assigned id on the first upload.
-    pub fn mark_automation_synced(
-        &self,
-        id: i64,
-        server_id: Option<&str>,
-    ) -> Result<(), String> {
+    pub fn mark_automation_synced(&self, id: i64, server_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         if let Some(sid) = server_id {
             conn.execute(
@@ -2591,7 +2656,10 @@ impl DatabaseStore {
                 params![sid, id],
             )
         } else {
-            conn.execute("UPDATE automations SET dirty = 0 WHERE id = ?1", params![id])
+            conn.execute(
+                "UPDATE automations SET dirty = 0 WHERE id = ?1",
+                params![id],
+            )
         }
         .map_err(|e| format!("Failed to mark automation synced: {e}"))?;
         Ok(())
@@ -2630,9 +2698,19 @@ impl DatabaseStore {
                      dirty = 0
                  WHERE user_id = 'local' AND server_id = ?14",
                 params![
-                    name, prompt, agent, schedule, timezone, host_id,
-                    project_path, project_remote, enabled as i64,
-                    retention_limit, created_at, updated_at, deleted_at,
+                    name,
+                    prompt,
+                    agent,
+                    schedule,
+                    timezone,
+                    host_id,
+                    project_path,
+                    project_remote,
+                    enabled as i64,
+                    retention_limit,
+                    created_at,
+                    updated_at,
+                    deleted_at,
                     server_id,
                 ],
             )
@@ -2647,9 +2725,20 @@ impl DatabaseStore {
                  VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                          ?11, ?12, ?13, ?14, 0)",
                 params![
-                    server_id, name, prompt, agent, schedule, timezone,
-                    host_id, project_path, project_remote, enabled as i64,
-                    retention_limit, created_at, updated_at, deleted_at,
+                    server_id,
+                    name,
+                    prompt,
+                    agent,
+                    schedule,
+                    timezone,
+                    host_id,
+                    project_path,
+                    project_remote,
+                    enabled as i64,
+                    retention_limit,
+                    created_at,
+                    updated_at,
+                    deleted_at,
                 ],
             )
             .map_err(|e| format!("Failed to insert automation from server: {e}"))?;
@@ -2895,7 +2984,15 @@ impl DatabaseStore {
              FROM agent_usage_ledger
              WHERE thread_id = ?1 AND provider = ?2 AND subagent = 0",
             params![thread_id, provider],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(|e| format!("Failed to sum usage rows: {e}"))
     }
@@ -3381,11 +3478,7 @@ impl DatabaseStore {
     /// Set (or replace) the dropdown title for a session. Called
     /// once from the first-turn auto-title path and again any time
     /// the user renames the session from the dropdown.
-    pub fn set_agent_chat_title(
-        &self,
-        thread_id: &str,
-        title: &str,
-    ) -> Result<(), String> {
+    pub fn set_agent_chat_title(&self, thread_id: &str, title: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE agent_chat_sessions
@@ -3489,6 +3582,294 @@ impl DatabaseStore {
         }
     }
 
+    /// List conversations that can be attached through `@session:`.
+    ///
+    /// The workspace boundary is enforced in SQL, the current thread is
+    /// omitted to prevent self-referential prompts, and conversations in the
+    /// current checkout sort ahead of other worktrees in the same workspace.
+    /// A correlated lookup supplies the latest visible user/assistant prose as
+    /// a compact picker preview without hydrating full event transcripts.
+    pub fn list_agent_chat_session_mentions(
+        &self,
+        workspace_id: &str,
+        current_cwd: Option<&str>,
+        exclude_thread_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AgentChatSessionMention>, String> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 50);
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                     s.thread_id,
+                     s.workspace_id,
+                     s.cwd,
+                     s.provider,
+                     s.title,
+                     s.last_active_at,
+                     COALESCE((
+                         SELECT f.content
+                         FROM agent_chat_search f
+                         JOIN agent_chat_messages m ON m.id = f.rowid
+                         WHERE f.thread_id = s.thread_id
+                         ORDER BY m.id DESC
+                         LIMIT 1
+                     ), ''),
+                     (SELECT COUNT(*)
+                      FROM agent_chat_search f
+                      WHERE f.thread_id = s.thread_id)
+                 FROM agent_chat_sessions s
+                 WHERE s.workspace_id = ?1
+                   AND (?3 IS NULL OR s.thread_id <> ?3)
+                   AND EXISTS (
+                       SELECT 1 FROM agent_chat_search f
+                       WHERE f.thread_id = s.thread_id
+                   )
+                 ORDER BY
+                     CASE WHEN ?2 IS NOT NULL AND s.cwd = ?2 THEN 0 ELSE 1 END,
+                     s.last_active_at DESC
+                 LIMIT ?4",
+            )
+            .map_err(|e| format!("Failed to prepare session mention list: {e}"))?;
+        let rows = stmt
+            .query_map(
+                params![workspace_id, current_cwd, exclude_thread_id, limit],
+                |row| {
+                    Ok(AgentChatSessionMention {
+                        thread_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        cwd: row.get(2)?,
+                        provider: row.get(3)?,
+                        title: row.get(4)?,
+                        last_active_at: row.get(5)?,
+                        preview: row.get(6)?,
+                        message_count: row.get::<_, i64>(7)?.max(0) as u32,
+                    })
+                },
+            )
+            .map_err(|e| format!("Failed to list session mentions: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read session mention: {e}"))
+    }
+
+    /// Return the human-visible conversation stream for one thread. Callers
+    /// must independently validate the session's workspace before using this
+    /// method; the command surface does that before materialising a handoff.
+    pub fn list_agent_chat_visible_messages(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<AgentChatVisibleMessage>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.role, f.content
+                 FROM agent_chat_search f
+                 JOIN agent_chat_messages m ON m.id = f.rowid
+                 WHERE f.thread_id = ?1
+                 ORDER BY m.id ASC",
+            )
+            .map_err(|e| format!("Failed to prepare visible session messages: {e}"))?;
+        let rows = stmt
+            .query_map(params![thread_id], |row| {
+                Ok(AgentChatVisibleMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(|e| format!("Failed to list visible session messages: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read visible session message: {e}"))
+    }
+
+    /// Durable revision for the safe-visible transcript. The FTS row id is
+    /// the backing `agent_chat_messages.id`, so it advances exactly when the
+    /// summary input advances and is stable across app restarts.
+    pub fn agent_chat_visible_revision(&self, thread_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM agent_chat_search WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to read conversation revision: {e}"))
+    }
+
+    pub fn get_agent_chat_handoff_summary(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<AgentChatHandoffSummaryCache>, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT revision_message_id, summarizer_provider, summarizer_model,
+                    summarizer_effort, prompt_version, summary, generated_at
+             FROM agent_chat_handoff_summaries WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(AgentChatHandoffSummaryCache {
+                    revision_message_id: row.get(0)?,
+                    summarizer_provider: row.get(1)?,
+                    summarizer_model: row.get(2)?,
+                    summarizer_effort: row.get(3)?,
+                    prompt_version: row.get::<_, i64>(4)?.max(0) as u32,
+                    summary: row.get(5)?,
+                    generated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to read handoff summary cache: {e}"))
+    }
+
+    pub fn put_agent_chat_handoff_summary(
+        &self,
+        thread_id: &str,
+        revision_message_id: i64,
+        summarizer_provider: &str,
+        summarizer_model: &str,
+        summarizer_effort: Option<&str>,
+        prompt_version: u32,
+        summary: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_handoff_summaries
+                 (thread_id, revision_message_id, summarizer_provider,
+                  summarizer_model, summarizer_effort, prompt_version, summary,
+                  generated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 revision_message_id = excluded.revision_message_id,
+                 summarizer_provider = excluded.summarizer_provider,
+                 summarizer_model = excluded.summarizer_model,
+                 summarizer_effort = excluded.summarizer_effort,
+                 prompt_version = excluded.prompt_version,
+                 summary = excluded.summary,
+                 generated_at = datetime('now')",
+            params![
+                thread_id,
+                revision_message_id,
+                summarizer_provider,
+                summarizer_model,
+                summarizer_effort,
+                prompt_version,
+                summary,
+            ],
+        )
+        .map_err(|e| format!("Failed to cache handoff summary: {e}"))?;
+        Ok(())
+    }
+
+    /// Read the complete safe-visible conversation in bounded pages. Cursor
+    /// is the last message id already seen; `None` starts at the beginning.
+    pub fn read_agent_chat_history_page(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        after_message_id: Option<i64>,
+        limit: u32,
+    ) -> Result<AgentChatHistoryPage, String> {
+        let record = self
+            .get_agent_chat_session(thread_id)
+            .ok_or_else(|| "conversation_not_found".to_string())?;
+        if record.workspace_id != workspace_id {
+            return Err("conversation_outside_workspace".to_string());
+        }
+
+        let limit = limit.clamp(1, 100) as usize;
+        let cursor = after_message_id.unwrap_or(0).max(0);
+        let conn = self.conn.lock().unwrap();
+        let total_visible_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_chat_search WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count visible conversation messages: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.rowid, f.role, f.content, m.created_at
+                 FROM agent_chat_search f
+                 JOIN agent_chat_messages m ON m.id = f.rowid
+                 WHERE f.thread_id = ?1 AND f.rowid > ?2
+                 ORDER BY f.rowid ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("Failed to prepare conversation page: {e}"))?;
+        let rows = stmt
+            .query_map(params![thread_id, cursor, (limit + 1) as i64], |row| {
+                Ok(AgentChatHistoryMessage {
+                    message_id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to read conversation page: {e}"))?;
+        let mut messages = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode conversation page: {e}"))?;
+        let has_more = messages.len() > limit;
+        if has_more {
+            messages.truncate(limit);
+        }
+        let next_cursor = has_more
+            .then(|| messages.last().map(|message| message.message_id))
+            .flatten();
+        Ok(AgentChatHistoryPage {
+            conversation_id: thread_id.to_string(),
+            title: record.title,
+            provider: record.provider,
+            messages,
+            next_cursor,
+            total_visible_messages: total_visible_messages.max(0) as u32,
+        })
+    }
+
+    pub fn search_agent_chat_history(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<AgentChatHistorySearchHit>, String> {
+        let record = self
+            .get_agent_chat_session(thread_id)
+            .ok_or_else(|| "conversation_not_found".to_string())?;
+        if record.workspace_id != workspace_id {
+            return Err("conversation_outside_workspace".to_string());
+        }
+        let Some(fts_query) = conversation_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_chat_search.rowid, agent_chat_search.role,
+                        snippet(agent_chat_search, 0, '', '', ' … ', 24),
+                        m.created_at
+                 FROM agent_chat_search
+                 JOIN agent_chat_messages m ON m.id = agent_chat_search.rowid
+                 WHERE agent_chat_search MATCH ?1
+                   AND agent_chat_search.thread_id = ?2
+                 ORDER BY bm25(agent_chat_search), agent_chat_search.rowid DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("Failed to prepare conversation search: {e}"))?;
+        let rows = stmt
+            .query_map(params![fts_query, thread_id, limit.clamp(1, 50)], |row| {
+                Ok(AgentChatHistorySearchHit {
+                    message_id: row.get(0)?,
+                    role: row.get(1)?,
+                    snippet: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("Failed to search conversation: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode conversation search: {e}"))
+    }
+
     /// Search persisted conversation titles and human-visible transcript
     /// prose inside the supplied workspace scope. FTS prefix matching keeps
     /// partial words useful while the command palette is still being typed.
@@ -3521,11 +3902,7 @@ impl DatabaseStore {
              ORDER BY last_active_at DESC
              LIMIT {limit}"
         );
-        let mut title_params: Vec<Value> = workspace_ids
-            .iter()
-            .cloned()
-            .map(Value::Text)
-            .collect();
+        let mut title_params: Vec<Value> = workspace_ids.iter().cloned().map(Value::Text).collect();
         title_params.push(Value::Text(query.to_string()));
         let mut title_stmt = conn
             .prepare(&title_sql)
@@ -3559,8 +3936,10 @@ impl DatabaseStore {
         let Some(fts_query) = conversation_fts_query(query) else {
             return Ok(results);
         };
-        let title_threads: HashSet<String> =
-            results.iter().map(|result| result.thread_id.clone()).collect();
+        let title_threads: HashSet<String> = results
+            .iter()
+            .map(|result| result.thread_id.clone())
+            .collect();
         let content_fetch_limit = limit.saturating_mul(2);
         let content_sql = format!(
             "SELECT
@@ -3817,10 +4196,7 @@ impl DatabaseStore {
     }
 
     /// Fetch a single session record by thread_id.
-    pub fn get_agent_chat_session(
-        &self,
-        thread_id: &str,
-    ) -> Option<AgentChatSessionRecord> {
+    pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
@@ -3994,10 +4370,7 @@ impl DatabaseStore {
     /// prior conversation's messages once they've been explicitly
     /// abandoned). Idempotent.
     #[cfg(test)]
-    pub fn delete_agent_chat_messages_for_thread(
-        &self,
-        thread_id: &str,
-    ) -> Result<(), String> {
+    pub fn delete_agent_chat_messages_for_thread(&self, thread_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM agent_chat_messages WHERE thread_id = ?1",
@@ -4051,10 +4424,7 @@ impl DatabaseStore {
     }
 
     /// Fetch the checkpoint recorded for a thread, if any.
-    pub fn get_agent_chat_checkpoint(
-        &self,
-        thread_id: &str,
-    ) -> Option<AgentChatCheckpointRecord> {
+    pub fn get_agent_chat_checkpoint(&self, thread_id: &str) -> Option<AgentChatCheckpointRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT thread_id, workspace_id, repo_path, ref_name,
@@ -4796,26 +5166,70 @@ mod tests {
         let now = 1_800_000_000_000i64;
 
         db.insert_usage_row(
-            now, "t1", Some("ws1"), "claude", Some("claude-opus-4-5"), false,
-            100, 20, 3_000, 500, 0, Some(1.25), Some("table"),
+            now,
+            "t1",
+            Some("ws1"),
+            "claude",
+            Some("claude-opus-4-5"),
+            false,
+            100,
+            20,
+            3_000,
+            500,
+            0,
+            Some(1.25),
+            Some("table"),
         )
         .unwrap();
         // A subagent row on the same thread.
         db.insert_usage_row(
-            now, "t1", Some("ws1"), "claude", Some("claude-haiku-4-5"), true,
-            40, 10, 0, 0, 0, Some(0.01), Some("table"),
+            now,
+            "t1",
+            Some("ws1"),
+            "claude",
+            Some("claude-haiku-4-5"),
+            true,
+            40,
+            10,
+            0,
+            0,
+            0,
+            Some(0.01),
+            Some("table"),
         )
         .unwrap();
         // A metered row in another workspace.
         db.insert_usage_row(
-            now, "t2", Some("ws2"), "opencode", Some("openrouter/kimi-k2"), false,
-            5, 5, 0, 0, 0, None, None,
+            now,
+            "t2",
+            Some("ws2"),
+            "opencode",
+            Some("openrouter/kimi-k2"),
+            false,
+            5,
+            5,
+            0,
+            0,
+            0,
+            None,
+            None,
         )
         .unwrap();
         // Well outside any window the dashboard asks for.
         db.insert_usage_row(
-            now - 90 * day, "t9", Some("ws9"), "codex", None, false,
-            999, 999, 0, 0, 0, Some(50.0), Some("table"),
+            now - 90 * day,
+            "t9",
+            Some("ws9"),
+            "codex",
+            None,
+            false,
+            999,
+            999,
+            0,
+            0,
+            0,
+            Some(50.0),
+            Some("table"),
         )
         .unwrap();
 
@@ -4877,7 +5291,10 @@ mod tests {
         }
 
         let rows = db.usage_rows_since(0).unwrap();
-        let priced = rows.iter().find(|r| r.thread_id == "legacy-priced").unwrap();
+        let priced = rows
+            .iter()
+            .find(|r| r.thread_id == "legacy-priced")
+            .unwrap();
         let unpriced = rows
             .iter()
             .find(|r| r.thread_id == "legacy-unpriced")
@@ -4896,13 +5313,28 @@ mod tests {
     fn reasoning_round_trips_without_entering_the_total() {
         let db = init_test_database();
         db.insert_usage_row(
-            1_800_000_000_000, "t1", Some("ws"), "codex", Some("gpt-5-codex"), false,
-            10, 40, 0, 0, 25, Some(1.0), Some("table"),
+            1_800_000_000_000,
+            "t1",
+            Some("ws"),
+            "codex",
+            Some("gpt-5-codex"),
+            false,
+            10,
+            40,
+            0,
+            0,
+            25,
+            Some(1.0),
+            Some("table"),
         )
         .unwrap();
         let rows = db.usage_rows_since(0).unwrap();
         assert_eq!(rows[0].reasoning_tokens, 25);
-        assert_eq!(rows[0].total_tokens(), 50, "reasoning excluded from the sum");
+        assert_eq!(
+            rows[0].total_tokens(),
+            50,
+            "reasoning excluded from the sum"
+        );
         assert_eq!(rows[0].observed_input(), 10);
 
         // …but the baseline DOES carry it, so a resumed Codex thread
@@ -4919,8 +5351,19 @@ mod tests {
         let db = init_test_database();
         let insert = || {
             db.upsert_provider_usage_row(
-                "claude:sess-1:msg_A", 1_800_000_000_000, "claude:sess-1", "claude",
-                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
+                "claude:sess-1:msg_A",
+                1_800_000_000_000,
+                "claude:sess-1",
+                "claude",
+                Some("claude-opus-4-5"),
+                false,
+                100,
+                20,
+                0,
+                0,
+                0,
+                Some(1.0),
+                Some("table"),
             )
         };
         assert!(insert().unwrap(), "first scan writes the row");
@@ -4929,8 +5372,19 @@ mod tests {
 
         assert!(db
             .upsert_provider_usage_row(
-                "claude:sess-1:msg_A", 1_800_000_000_001, "claude:sess-1", "claude",
-                Some("claude-opus-4-5"), false, 100, 80, 0, 0, 0, Some(2.0), Some("table"),
+                "claude:sess-1:msg_A",
+                1_800_000_000_001,
+                "claude:sess-1",
+                "claude",
+                Some("claude-opus-4-5"),
+                false,
+                100,
+                80,
+                0,
+                0,
+                0,
+                Some(2.0),
+                Some("table"),
             )
             .unwrap());
         let grown = db.usage_rows_since(0).unwrap();
@@ -4940,8 +5394,19 @@ mod tests {
 
         // A different key is a different row.
         db.upsert_provider_usage_row(
-            "claude:sess-1:msg_B", 1_800_000_000_000, "claude:sess-1", "claude",
-            Some("claude-opus-4-5"), false, 5, 5, 0, 0, 0, None, None,
+            "claude:sess-1:msg_B",
+            1_800_000_000_000,
+            "claude:sess-1",
+            "claude",
+            Some("claude-opus-4-5"),
+            false,
+            5,
+            5,
+            0,
+            0,
+            0,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
@@ -4953,19 +5418,46 @@ mod tests {
     fn resetting_usage_history_clears_all_rows_and_state() {
         let db = init_test_database();
         db.upsert_provider_usage_row(
-            "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
-            Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(1.0), Some("table"),
+            "claude:msg_A:req_1",
+            1_800_000_000_000,
+            "claude:sess-1",
+            "claude",
+            Some("claude-opus-4-5"),
+            false,
+            100,
+            20,
+            0,
+            0,
+            0,
+            Some(1.0),
+            Some("table"),
         )
         .unwrap();
         db.insert_usage_row(
-            1_800_000_000_000, "thread-live", None, "claude",
-            Some("claude-opus-4-5"), false, 10, 40, 0, 0, 0, Some(2.0), Some("table"),
+            1_800_000_000_000,
+            "thread-live",
+            None,
+            "claude",
+            Some("claude-opus-4-5"),
+            false,
+            10,
+            40,
+            0,
+            0,
+            0,
+            Some(2.0),
+            Some("table"),
         )
         .unwrap();
-        db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3).unwrap();
+        db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3)
+            .unwrap();
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
 
-        assert_eq!(db.reset_usage_history().unwrap(), 2, "both cache generations");
+        assert_eq!(
+            db.reset_usage_history().unwrap(),
+            2,
+            "both cache generations"
+        );
 
         let rows = db.usage_rows_since(0).unwrap();
         assert!(rows.is_empty());
@@ -4976,8 +5468,19 @@ mod tests {
         // And the same key can be re-imported afterwards.
         assert!(db
             .upsert_provider_usage_row(
-                "claude:msg_A:req_1", 1_800_000_000_000, "claude:sess-1", "claude",
-                Some("claude-opus-4-5"), false, 100, 20, 0, 0, 0, Some(3.0), Some("table"),
+                "claude:msg_A:req_1",
+                1_800_000_000_000,
+                "claude:sess-1",
+                "claude",
+                Some("claude-opus-4-5"),
+                false,
+                100,
+                20,
+                0,
+                0,
+                0,
+                Some(3.0),
+                Some("table"),
             )
             .unwrap());
     }
@@ -4986,8 +5489,19 @@ mod tests {
     fn provider_rows_are_tagged_and_carry_no_workspace() {
         let db = init_test_database();
         db.upsert_provider_usage_row(
-            "codex:roll-1", 1_800_000_000_000, "codex:roll-1", "codex",
-            Some("gpt-5-codex"), false, 10, 40, 0, 0, 25, Some(2.0), Some("table"),
+            "codex:roll-1",
+            1_800_000_000_000,
+            "codex:roll-1",
+            "codex",
+            Some("gpt-5-codex"),
+            false,
+            10,
+            40,
+            0,
+            0,
+            25,
+            Some(2.0),
+            Some("table"),
         )
         .unwrap();
         let rows = db.usage_rows_since(0).unwrap();
@@ -5048,8 +5562,19 @@ mod tests {
         db.upsert_agent_chat_session("t1", "ws1", Some("/tmp"), "claude")
             .unwrap();
         db.insert_usage_row(
-            now, "t1", Some("ws1"), "claude", Some("claude-opus-4-5"), false,
-            10, 10, 0, 0, 0, Some(0.5), Some("table"),
+            now,
+            "t1",
+            Some("ws1"),
+            "claude",
+            Some("claude-opus-4-5"),
+            false,
+            10,
+            10,
+            0,
+            0,
+            0,
+            Some(0.5),
+            Some("table"),
         )
         .unwrap();
 
@@ -5067,8 +5592,19 @@ mod tests {
     fn usage_row_accepts_a_null_workspace() {
         let db = init_test_database();
         db.insert_usage_row(
-            1_800_000_000_000, "orphan", None, "opencode", None, false,
-            1, 1, 0, 0, 0, None, None,
+            1_800_000_000_000,
+            "orphan",
+            None,
+            "opencode",
+            None,
+            false,
+            1,
+            1,
+            0,
+            0,
+            0,
+            None,
+            None,
         )
         .unwrap();
         let rows = db.usage_rows_since(0).unwrap();
@@ -5151,22 +5687,12 @@ mod tests {
             create_schema(&conn).unwrap();
         }
 
-        let mode = |thread: &str| {
-            db.get_agent_chat_session(thread)
-                .unwrap()
-                .permission_mode
-        };
+        let mode = |thread: &str| db.get_agent_chat_session(thread).unwrap().permission_mode;
         assert_eq!(mode("t-claude").as_deref(), Some("bypassPermissions"));
         assert_eq!(mode("t-codex").as_deref(), Some("danger-full-access"));
         assert_eq!(mode("t-opencode"), None, "opencode rows stay NULL");
-        assert_eq!(
-            mode("t-codex-cross").as_deref(),
-            Some("danger-full-access")
-        );
-        assert_eq!(
-            mode("t-claude-cross").as_deref(),
-            Some("bypassPermissions")
-        );
+        assert_eq!(mode("t-codex-cross").as_deref(), Some("danger-full-access"));
+        assert_eq!(mode("t-claude-cross").as_deref(), Some("bypassPermissions"));
         assert_eq!(
             mode("t-claude-set").as_deref(),
             Some("plan"),
@@ -5248,11 +5774,12 @@ mod tests {
     }
 
     #[test]
-    fn schema_v14_upgrade_creates_turn_checkpoints_and_advances_to_v15() {
+    fn schema_v14_upgrade_creates_new_tables_and_advances_to_current() {
         let db = init_test_database();
         let conn = db.conn.lock().unwrap();
         conn.execute_batch(
             "DROP TABLE agent_chat_turn_checkpoints;
+             DROP TABLE agent_chat_handoff_summaries;
              UPDATE schema_version SET version = 14;",
         )
         .unwrap();
@@ -5262,16 +5789,20 @@ mod tests {
         let version: u32 = conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
-        let table_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'agent_chat_turn_checkpoints'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(table_count, 1);
+        assert_eq!(version, SCHEMA_VERSION);
+        // v15 added turn checkpoints, v16 the handoff summary cache; both are
+        // plain `CREATE ... IF NOT EXISTS`, so one upgrade pass restores both.
+        for table in ["agent_chat_turn_checkpoints", "agent_chat_handoff_summaries"] {
+            let table_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 1, "{table} should be recreated");
+        }
     }
 
     // ── Settings Persistence ──
@@ -5326,8 +5857,12 @@ mod tests {
         assert_eq!(db.get_setting("empty"), Some("".into()));
 
         // Value with special characters
-        db.set_setting("special", "hello \"world\" 'test' \n\t").unwrap();
-        assert_eq!(db.get_setting("special"), Some("hello \"world\" 'test' \n\t".into()));
+        db.set_setting("special", "hello \"world\" 'test' \n\t")
+            .unwrap();
+        assert_eq!(
+            db.get_setting("special"),
+            Some("hello \"world\" 'test' \n\t".into())
+        );
 
         // Long value
         let long_val = "x".repeat(10_000);
@@ -5342,12 +5877,23 @@ mod tests {
         let db = init_test_database();
 
         // Save collapse states for multiple project groups
-        db.set_ui_state("collapsed:project:/home/user/project-a", "true").unwrap();
-        db.set_ui_state("collapsed:project:/home/user/project-b", "false").unwrap();
+        db.set_ui_state("collapsed:project:/home/user/project-a", "true")
+            .unwrap();
+        db.set_ui_state("collapsed:project:/home/user/project-b", "false")
+            .unwrap();
 
-        assert_eq!(db.get_ui_state("collapsed:project:/home/user/project-a"), Some("true".into()));
-        assert_eq!(db.get_ui_state("collapsed:project:/home/user/project-b"), Some("false".into()));
-        assert_eq!(db.get_ui_state("collapsed:project:/home/user/project-c"), None);
+        assert_eq!(
+            db.get_ui_state("collapsed:project:/home/user/project-a"),
+            Some("true".into())
+        );
+        assert_eq!(
+            db.get_ui_state("collapsed:project:/home/user/project-b"),
+            Some("false".into())
+        );
+        assert_eq!(
+            db.get_ui_state("collapsed:project:/home/user/project-c"),
+            None
+        );
     }
 
     #[test]
@@ -5366,12 +5912,20 @@ mod tests {
     fn ui_state_active_workspace() {
         let db = init_test_database();
 
-        db.set_ui_state("active_workspace", "workspace-abc123").unwrap();
-        assert_eq!(db.get_ui_state("active_workspace"), Some("workspace-abc123".into()));
+        db.set_ui_state("active_workspace", "workspace-abc123")
+            .unwrap();
+        assert_eq!(
+            db.get_ui_state("active_workspace"),
+            Some("workspace-abc123".into())
+        );
 
         // Switch workspace
-        db.set_ui_state("active_workspace", "workspace-def456").unwrap();
-        assert_eq!(db.get_ui_state("active_workspace"), Some("workspace-def456".into()));
+        db.set_ui_state("active_workspace", "workspace-def456")
+            .unwrap();
+        assert_eq!(
+            db.get_ui_state("active_workspace"),
+            Some("workspace-def456".into())
+        );
     }
 
     #[test]
@@ -5477,7 +6031,9 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore { conn: Mutex::new(conn) };
+            let db = DatabaseStore {
+                conn: Mutex::new(conn),
+            };
 
             db.set_setting("theme", "dark").unwrap();
             db.set_ui_state("window_width", "1920").unwrap();
@@ -5489,7 +6045,9 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap(); // Should be idempotent
-            let db = DatabaseStore { conn: Mutex::new(conn) };
+            let db = DatabaseStore {
+                conn: Mutex::new(conn),
+            };
 
             assert_eq!(db.get_setting("theme"), Some("dark".into()));
             assert_eq!(db.get_ui_state("window_width"), Some("1920".into()));
@@ -5497,7 +6055,6 @@ mod tests {
             let projects = db.get_recent_projects(10);
             assert_eq!(projects.len(), 1);
             assert_eq!(projects[0].name, "myapp");
-
         }
     }
 
@@ -5513,14 +6070,17 @@ mod tests {
         conn.execute(
             "INSERT INTO settings (user_id, key, value) VALUES ('local', 'test', 'hello')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Run schema creation again
         create_schema(&conn).unwrap();
 
         // Data preserved
         let val: String = conn
-            .query_row("SELECT value FROM settings WHERE key = 'test'", [], |row| row.get(0))
+            .query_row("SELECT value FROM settings WHERE key = 'test'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(val, "hello");
     }
@@ -5592,10 +6152,14 @@ mod tests {
         let db = init_test_database();
 
         // 1. "Settings panel" saves values (what dbSetSetting does)
-        db.set_setting("notification_sound_enabled", "true").unwrap();
-        db.set_setting("ai_commit_message_enabled", "false").unwrap();
-        db.set_setting("ai_resolver_strategy", "smart_merge").unwrap();
-        db.set_setting("ai_commit_message_model", "claude-sonnet-4-20250514").unwrap();
+        db.set_setting("notification_sound_enabled", "true")
+            .unwrap();
+        db.set_setting("ai_commit_message_enabled", "false")
+            .unwrap();
+        db.set_setting("ai_resolver_strategy", "smart_merge")
+            .unwrap();
+        db.set_setting("ai_commit_message_model", "claude-sonnet-4-20250514")
+            .unwrap();
 
         // 2. "App startup" loads all settings (what dbGetAllSettings does)
         let all = db.get_all_settings();
@@ -5604,10 +6168,16 @@ mod tests {
         assert_eq!(all.get("notification_sound_enabled"), Some(&"true".into()));
         assert_eq!(all.get("ai_commit_message_enabled"), Some(&"false".into()));
         assert_eq!(all.get("ai_resolver_strategy"), Some(&"smart_merge".into()));
-        assert_eq!(all.get("ai_commit_message_model"), Some(&"claude-sonnet-4-20250514".into()));
+        assert_eq!(
+            all.get("ai_commit_message_model"),
+            Some(&"claude-sonnet-4-20250514".into())
+        );
 
         // 4. Individual get also works (for targeted reads)
-        assert_eq!(db.get_setting("notification_sound_enabled"), Some("true".into()));
+        assert_eq!(
+            db.get_setting("notification_sound_enabled"),
+            Some("true".into())
+        );
 
         // 5. Settings not in DB return None → app uses defaults
         assert_eq!(db.get_setting("theme_preset"), None);
@@ -5619,11 +6189,14 @@ mod tests {
         let db = init_test_database();
 
         // 1. "activate_workspace" saves active workspace ID
-        db.set_ui_state("active_workspace", "workspace-abc123").unwrap();
+        db.set_ui_state("active_workspace", "workspace-abc123")
+            .unwrap();
 
         // 2. Also save collapse states for sidebar project groups
-        db.set_ui_state("collapsed:project:/home/user/codemux", "true").unwrap();
-        db.set_ui_state("collapsed:project:/home/user/other", "false").unwrap();
+        db.set_ui_state("collapsed:project:/home/user/codemux", "true")
+            .unwrap();
+        db.set_ui_state("collapsed:project:/home/user/other", "false")
+            .unwrap();
 
         // 3. Save window dimensions
         db.set_ui_state("window_width", "1920").unwrap();
@@ -5633,16 +6206,29 @@ mod tests {
         db.set_ui_state("right_panel_width", "320").unwrap();
 
         // 5. "App restart" reads everything back
-        assert_eq!(db.get_ui_state("active_workspace"), Some("workspace-abc123".into()));
-        assert_eq!(db.get_ui_state("collapsed:project:/home/user/codemux"), Some("true".into()));
-        assert_eq!(db.get_ui_state("collapsed:project:/home/user/other"), Some("false".into()));
+        assert_eq!(
+            db.get_ui_state("active_workspace"),
+            Some("workspace-abc123".into())
+        );
+        assert_eq!(
+            db.get_ui_state("collapsed:project:/home/user/codemux"),
+            Some("true".into())
+        );
+        assert_eq!(
+            db.get_ui_state("collapsed:project:/home/user/other"),
+            Some("false".into())
+        );
         assert_eq!(db.get_ui_state("window_width"), Some("1920".into()));
         assert_eq!(db.get_ui_state("window_height"), Some("1080".into()));
         assert_eq!(db.get_ui_state("right_panel_width"), Some("320".into()));
 
         // 6. Switch workspace → update
-        db.set_ui_state("active_workspace", "workspace-def456").unwrap();
-        assert_eq!(db.get_ui_state("active_workspace"), Some("workspace-def456".into()));
+        db.set_ui_state("active_workspace", "workspace-def456")
+            .unwrap();
+        assert_eq!(
+            db.get_ui_state("active_workspace"),
+            Some("workspace-def456".into())
+        );
     }
 
     #[test]
@@ -5656,7 +6242,9 @@ mod tests {
         {
             let conn = open_connection(&db_path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore { conn: Mutex::new(conn) };
+            let db = DatabaseStore {
+                conn: Mutex::new(conn),
+            };
             db.set_setting("important", "data").unwrap();
             db.set_ui_state("window_width", "1920").unwrap();
         }
@@ -5684,7 +6272,9 @@ mod tests {
                 let schema_result = create_schema(&conn);
                 if schema_result.is_ok() {
                     // Fresh DB was created — old data is gone but app works
-                    let db = DatabaseStore { conn: Mutex::new(conn) };
+                    let db = DatabaseStore {
+                        conn: Mutex::new(conn),
+                    };
                     assert_eq!(db.get_setting("important"), None); // Data lost, but no crash
                     db.set_setting("new_key", "works").unwrap(); // Can still write
                     assert_eq!(db.get_setting("new_key"), Some("works".into()));
@@ -5713,7 +6303,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        assert!(large_json.len() > 10_000, "Test value should be >10KB, got {} bytes", large_json.len());
+        assert!(
+            large_json.len() > 10_000,
+            "Test value should be >10KB, got {} bytes",
+            large_json.len()
+        );
 
         db.set_setting("layout_state", &large_json).unwrap();
         let read_back = db.get_setting("layout_state");
@@ -5721,7 +6315,10 @@ mod tests {
 
         // 10KB ui_state value
         db.set_ui_state("scrollback_buffer", &large_json).unwrap();
-        assert_eq!(db.get_ui_state("scrollback_buffer"), Some(large_json.clone()));
+        assert_eq!(
+            db.get_ui_state("scrollback_buffer"),
+            Some(large_json.clone())
+        );
 
         // 50KB value
         let huge = "x".repeat(50_000);
@@ -5792,12 +6389,7 @@ mod tests {
     #[test]
     fn agent_chat_sessions_upsert_and_fetch() {
         let db = init_test_database();
-        db.upsert_agent_chat_session(
-            "thread-1",
-            "ws-1",
-            Some("/tmp/proj"),
-            "claude",
-        )
+        db.upsert_agent_chat_session("thread-1", "ws-1", Some("/tmp/proj"), "claude")
         .unwrap();
 
         let rec = db
@@ -5892,14 +6484,18 @@ mod tests {
             &["refs/codemux/checkpoints/shared".to_string()],
         )
         .unwrap();
-        assert!(db.get_agent_chat_checkpoint("t1").is_none(), "pruned row gone");
+        assert!(
+            db.get_agent_chat_checkpoint("t1").is_none(),
+            "pruned row gone"
+        );
         assert!(
             db.get_agent_chat_checkpoint("t2").is_some(),
             "other repo's row untouched"
         );
 
         // Empty list is a no-op.
-        db.delete_agent_chat_checkpoints_by_refs("/repo/b", &[]).unwrap();
+        db.delete_agent_chat_checkpoints_by_refs("/repo/b", &[])
+            .unwrap();
         assert!(db.get_agent_chat_checkpoint("t2").is_some());
     }
 
@@ -5940,7 +6536,11 @@ mod tests {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws-1", None, "claude")
             .unwrap();
-        assert!(db.get_agent_chat_session("t").unwrap().sdk_session_id.is_none());
+        assert!(db
+            .get_agent_chat_session("t")
+            .unwrap()
+            .sdk_session_id
+            .is_none());
 
         db.set_agent_chat_sdk_session_id("t", "sdk-uuid-abc")
             .unwrap();
@@ -5975,7 +6575,8 @@ mod tests {
 
         // Idempotent — clearing an already-null / unknown row is a no-op.
         db.clear_agent_chat_sdk_session_id("t").unwrap();
-        db.clear_agent_chat_sdk_session_id("no-such-thread").unwrap();
+        db.clear_agent_chat_sdk_session_id("no-such-thread")
+            .unwrap();
     }
 
     #[test]
@@ -6034,7 +6635,8 @@ mod tests {
         let db = init_test_database();
         db.upsert_agent_chat_session("with-id", "ws", Some("/p"), "claude")
             .unwrap();
-        db.set_agent_chat_sdk_session_id("with-id", "sdk-uuid").unwrap();
+        db.set_agent_chat_sdk_session_id("with-id", "sdk-uuid")
+            .unwrap();
         db.upsert_agent_chat_session("no-id", "ws", Some("/p"), "claude")
             .unwrap();
 
@@ -6560,12 +7162,7 @@ mod tests {
     fn agent_chat_sessions_limit_caps_rows() {
         let db = init_test_database();
         for i in 0..10 {
-            db.upsert_agent_chat_session(
-                &format!("t{i}"),
-                "ws",
-                None,
-                "claude",
-            )
+            db.upsert_agent_chat_session(&format!("t{i}"), "ws", None, "claude")
             .unwrap();
             db.set_agent_chat_sdk_session_id(&format!("t{i}"), &format!("sdk-{i}"))
                 .unwrap();
@@ -6582,10 +7179,79 @@ mod tests {
     }
 
     #[test]
+    fn session_mentions_are_workspace_scoped_safe_and_checkout_first() {
+        let db = init_test_database();
+        seed_session(&db, "current");
+        db.set_agent_chat_title("current", "Current checkout work")
+            .unwrap();
+        db.append_agent_chat_message(
+            "current",
+            r#"{"type":"user_message","text":"opening task"}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            "current",
+            r#"{"type":"item_completed","item":{"kind":"tool_result","content":"private tool bytes"}}"#,
+        )
+        .unwrap();
+        db.append_agent_chat_message(
+            "current",
+            r#"{"type":"item_completed","item":{"kind":"assistant_text","text":"latest safe progress"}}"#,
+        )
+        .unwrap();
+
+        db.upsert_agent_chat_session("other-cwd", "ws", Some("/worktree"), "codex")
+            .unwrap();
+        db.append_agent_chat_message(
+            "other-cwd",
+            r#"{"type":"user_message","text":"worktree task"}"#,
+        )
+        .unwrap();
+        db.upsert_agent_chat_session("outside", "other", Some("/p"), "claude")
+            .unwrap();
+        db.append_agent_chat_message(
+            "outside",
+            r#"{"type":"user_message","text":"must stay outside"}"#,
+        )
+        .unwrap();
+
+        let rows = db
+            .list_agent_chat_session_mentions("ws", Some("/p"), None, 20)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thread_id, "current");
+        assert_eq!(rows[0].preview, "latest safe progress");
+        assert_eq!(rows[0].message_count, 2, "tool output is not indexed");
+        assert_eq!(rows[1].thread_id, "other-cwd");
+
+        let excluded = db
+            .list_agent_chat_session_mentions("ws", Some("/p"), Some("current"), 20)
+            .unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].thread_id, "other-cwd");
+
+        let visible = db.list_agent_chat_visible_messages("current").unwrap();
+        assert_eq!(
+            visible,
+            vec![
+                AgentChatVisibleMessage {
+                    role: "user".into(),
+                    content: "opening task".into(),
+                },
+                AgentChatVisibleMessage {
+                    role: "assistant".into(),
+                    content: "latest safe progress".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn agent_chat_search_indexes_only_visible_conversation_prose() {
         let db = init_test_database();
         seed_session(&db, "t");
-        db.set_agent_chat_title("t", "Release investigation").unwrap();
+        db.set_agent_chat_title("t", "Release investigation")
+            .unwrap();
 
         let user_id = db
             .append_agent_chat_message(
@@ -6638,6 +7304,135 @@ mod tests {
     }
 
     #[test]
+    fn conversation_history_tools_page_search_and_enforce_workspace_scope() {
+        let db = init_test_database();
+        seed_session(&db, "source");
+        let first = db
+            .append_agent_chat_message(
+                "source",
+                r#"{"type":"user_message","text":"Investigate the azure timeout"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        db.append_agent_chat_message(
+            "source",
+            r#"{"type":"item_completed","turn_id":"turn-1","item":{"kind":"tool_result","content":"azure-tool-secret"}}"#,
+        )
+        .unwrap();
+        let second = db
+            .append_agent_chat_message(
+                "source",
+                r#"{"type":"item_completed","turn_id":"turn-1","item":{"kind":"assistant_text","text":"The retry now uses bounded backoff."}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let third = db
+            .append_agent_chat_message(
+                "source",
+                r#"{"type":"user_message","text":"Verify the timeout test"}"#,
+            )
+            .unwrap()
+            .unwrap();
+
+        let first_page = db
+            .read_agent_chat_history_page("ws", "source", None, 2)
+            .unwrap();
+        assert_eq!(first_page.total_visible_messages, 3);
+        assert_eq!(
+            first_page
+                .messages
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(first_page.next_cursor, Some(second));
+
+        let second_page = db
+            .read_agent_chat_history_page("ws", "source", first_page.next_cursor, 2)
+            .unwrap();
+        assert_eq!(second_page.messages.len(), 1);
+        assert_eq!(second_page.messages[0].message_id, third);
+        assert_eq!(second_page.next_cursor, None);
+
+        let hits = db
+            .search_agent_chat_history("ws", "source", "timeout", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.snippet.contains("timeout")));
+        assert!(db
+            .search_agent_chat_history("ws", "source", "azure-tool-secret", 10)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            db.read_agent_chat_history_page("other", "source", None, 10)
+                .unwrap_err(),
+            "conversation_outside_workspace"
+        );
+        assert_eq!(
+            db.search_agent_chat_history("other", "source", "timeout", 10)
+                .unwrap_err(),
+            "conversation_outside_workspace"
+        );
+    }
+
+    #[test]
+    fn handoff_summary_cache_is_revisioned_replaceable_and_cascades() {
+        let db = init_test_database();
+        seed_session(&db, "source");
+        let revision = db
+            .append_agent_chat_message(
+                "source",
+                r#"{"type":"user_message","text":"Build a handoff"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.agent_chat_visible_revision("source").unwrap(), revision);
+
+        db.put_agent_chat_handoff_summary(
+            "source",
+            revision,
+            "codex",
+            "gpt-5.6-luna",
+            Some("low"),
+            1,
+            "## Goal\nBuild a handoff",
+        )
+        .unwrap();
+        let cached = db
+            .get_agent_chat_handoff_summary("source")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.revision_message_id, revision);
+        assert_eq!(cached.summarizer_model, "gpt-5.6-luna");
+
+        db.put_agent_chat_handoff_summary(
+            "source",
+            revision,
+            "claude",
+            "claude-haiku-4-5",
+            None,
+            2,
+            "## Goal\nUpdated",
+        )
+        .unwrap();
+        let replaced = db
+            .get_agent_chat_handoff_summary("source")
+            .unwrap()
+            .unwrap();
+        assert_eq!(replaced.summarizer_provider, "claude");
+        assert_eq!(replaced.prompt_version, 2);
+        assert_eq!(replaced.summary, "## Goal\nUpdated");
+
+        db.delete_agent_chat_session("source").unwrap();
+        assert!(db
+            .get_agent_chat_handoff_summary("source")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn agent_chat_search_includes_titles_and_respects_workspace_scope() {
         let db = init_test_database();
         seed_session(&db, "inside");
@@ -6656,7 +7451,10 @@ mod tests {
         assert_eq!(hits[0].role, "title");
         assert_eq!(hits[0].message_id, None);
         assert_eq!(hits[0].workspace_id, "ws");
-        assert!(db.search_agent_chat("transcript", &[], 10).unwrap().is_empty());
+        assert!(db
+            .search_agent_chat("transcript", &[], 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -6734,7 +7532,10 @@ mod tests {
         assert!(first.is_some() && second.is_some());
         assert!(second.unwrap() > first.unwrap());
         // The swallowed FK case wrote nothing, so it has no position.
-        assert_eq!(db.append_agent_chat_message("ghost", r#"{}"#).unwrap(), None);
+        assert_eq!(
+            db.append_agent_chat_message("ghost", r#"{}"#).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6764,7 +7565,9 @@ mod tests {
         assert_eq!(tail[0].1, r#"{"i":3}"#);
 
         // Warm revisit with nothing new.
-        assert!(db.list_agent_chat_messages_after("t", Some(ids[4])).is_empty());
+        assert!(db
+            .list_agent_chat_messages_after("t", Some(ids[4]))
+            .is_empty());
         // A cursor above the head reads as "nothing new" — the frontend
         // catches that case with `max_agent_chat_message_id`.
         assert!(db
@@ -6793,12 +7596,21 @@ mod tests {
         seed_session(&db, "t");
         assert_eq!(db.max_agent_chat_message_id("t"), None);
 
-        let first = db.append_agent_chat_message("t", r#"{"i":0}"#).unwrap().unwrap();
-        let second = db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap().unwrap();
+        let first = db
+            .append_agent_chat_message("t", r#"{"i":0}"#)
+            .unwrap()
+            .unwrap();
+        let second = db
+            .append_agent_chat_message("t", r#"{"i":1}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(db.max_agent_chat_message_id("t"), Some(second));
         assert_eq!(db.max_agent_chat_message_id("nope"), None);
 
-        assert_eq!(db.get_agent_chat_message(first).as_deref(), Some(r#"{"i":0}"#));
+        assert_eq!(
+            db.get_agent_chat_message(first).as_deref(),
+            Some(r#"{"i":0}"#)
+        );
         assert_eq!(db.get_agent_chat_message(second + 999), None);
     }
 
@@ -6847,10 +7659,7 @@ mod tests {
         // has deleted the session.
         let db = init_test_database();
         let result = db.append_agent_chat_message("ghost", r#"{"x":1}"#);
-        assert!(
-            result.is_ok(),
-            "FK violation should be swallowed silently"
-        );
+        assert!(result.is_ok(), "FK violation should be swallowed silently");
         assert!(db.list_agent_chat_messages("ghost").is_empty());
     }
 
@@ -6864,9 +7673,7 @@ mod tests {
         let db = init_test_database();
         seed_session(&db, "t");
         // Sanity: the happy path still returns Ok on a real row.
-        assert!(db
-            .append_agent_chat_message("t", r#"{"ok":true}"#)
-            .is_ok());
+        assert!(db.append_agent_chat_message("t", r#"{"ok":true}"#).is_ok());
     }
 
     #[test]
@@ -6887,7 +7694,10 @@ mod tests {
         // Messages now live under "new", and the source row is gone.
         assert!(db.list_agent_chat_messages("old").is_empty());
         let migrated = db.list_agent_chat_messages("new");
-        assert_eq!(migrated, vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]);
+        assert_eq!(
+            migrated,
+            vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]
+        );
         assert!(db.get_agent_chat_session("old").is_none());
     }
 
@@ -6924,7 +7734,8 @@ mod tests {
         db.append_agent_chat_message("newest", r#"{"i":"new1"}"#)
             .unwrap();
 
-        db.collapse_duplicate_agent_chat_sessions("sdk-xyz").unwrap();
+        db.collapse_duplicate_agent_chat_sessions("sdk-xyz")
+            .unwrap();
 
         // Survivor "newest" now owns every message; the merged-out
         // row is gone.
@@ -7000,7 +7811,9 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore { conn: Mutex::new(conn) };
+            let db = DatabaseStore {
+                conn: Mutex::new(conn),
+            };
             db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
                 .unwrap();
             db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap();
@@ -7009,9 +7822,14 @@ mod tests {
 
         let conn = open_connection(&path).unwrap();
         create_schema(&conn).unwrap();
-        let db = DatabaseStore { conn: Mutex::new(conn) };
+        let db = DatabaseStore {
+            conn: Mutex::new(conn),
+        };
         let rows = db.list_agent_chat_messages("t");
-        assert_eq!(rows, vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]);
+        assert_eq!(
+            rows,
+            vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]
+        );
     }
 
     #[test]
@@ -7024,7 +7842,9 @@ mod tests {
         {
             let conn = open_connection(&path).unwrap();
             create_schema(&conn).unwrap();
-            let db = DatabaseStore { conn: Mutex::new(conn) };
+            let db = DatabaseStore {
+                conn: Mutex::new(conn),
+            };
             db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
                 .unwrap();
             db.set_agent_chat_title("t", "Persisted").unwrap();
@@ -7032,7 +7852,9 @@ mod tests {
 
         let conn = open_connection(&path).unwrap();
         create_schema(&conn).unwrap();
-        let db = DatabaseStore { conn: Mutex::new(conn) };
+        let db = DatabaseStore {
+            conn: Mutex::new(conn),
+        };
         let version: u32 = db
             .conn
             .lock()
@@ -7059,7 +7881,10 @@ mod tests {
         let h = db.insert_host("homelab", "zeus@10.0.0.5").unwrap();
         assert_eq!(h.name, "homelab");
         assert_eq!(h.ssh_target, "zeus@10.0.0.5");
-        assert!(h.dirty, "new rows must be marked dirty so sync picks them up");
+        assert!(
+            h.dirty,
+            "new rows must be marked dirty so sync picks them up"
+        );
         assert!(h.server_id.is_none(), "fresh inserts have no server_id");
         assert!(h.deleted_at.is_none());
 
@@ -7239,7 +8064,10 @@ mod tests {
             .filter_map(|h| h.server_id)
             .collect();
         sids.sort();
-        assert_eq!(sids, vec!["srv-desktop".to_string(), "srv-laptop".to_string()]);
+        assert_eq!(
+            sids,
+            vec!["srv-desktop".to_string(), "srv-laptop".to_string()]
+        );
     }
 
     // ── Automations ──
@@ -7394,7 +8222,9 @@ mod tests {
     #[test]
     fn automation_runs_are_listed_newest_fire_first() {
         let db = init_test_database();
-        let a = db.insert_automation(&sample_automation("Ordering")).unwrap();
+        let a = db
+            .insert_automation(&sample_automation("Ordering"))
+            .unwrap();
         db.record_automation_run(a.id, "succeeded", "2026-01-01T09:00:00Z", None, None)
             .unwrap();
         db.record_automation_run(a.id, "succeeded", "2026-01-03T09:00:00Z", None, None)
@@ -7417,7 +8247,9 @@ mod tests {
     #[test]
     fn reconcile_stale_runs_fails_only_non_terminal_runs() {
         let db = init_test_database();
-        let a = db.insert_automation(&sample_automation("Reconcile")).unwrap();
+        let a = db
+            .insert_automation(&sample_automation("Reconcile"))
+            .unwrap();
         let scheduled = db
             .record_automation_run(a.id, "scheduled", "2026-01-01T09:00:00Z", None, None)
             .unwrap()
@@ -7436,9 +8268,7 @@ mod tests {
         assert_eq!(reconciled, 2, "only the two non-terminal runs are stale");
 
         let runs = db.list_automation_runs(a.id, 10);
-        let status = |id: i64| {
-            runs.iter().find(|r| r.id == id).unwrap().status.clone()
-        };
+        let status = |id: i64| runs.iter().find(|r| r.id == id).unwrap().status.clone();
         assert_eq!(status(scheduled.id), "failed");
         assert_eq!(status(running.id), "failed");
         assert_eq!(status(done.id), "succeeded", "terminal runs are untouched");
@@ -7467,7 +8297,9 @@ mod tests {
         // hides the bug — this one uses a same-day ceiling so only
         // correct `datetime()` normalisation passes it.
         let db = init_test_database();
-        let a = db.insert_automation(&sample_automation("MixedFmt")).unwrap();
+        let a = db
+            .insert_automation(&sample_automation("MixedFmt"))
+            .unwrap();
         db.record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
             .unwrap();
         let ceiling = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();

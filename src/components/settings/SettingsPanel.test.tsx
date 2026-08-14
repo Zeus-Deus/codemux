@@ -59,14 +59,20 @@ vi.mock("@/stores/settings-store", () => {
     "agents.orb_match_activity": "true",
     "chat.code_wrap": "false",
   };
+  // Built lazily: `mockSettingsSet` is hoisted below this factory.
+  const state = () => ({
+    set: mockSettingsSet,
+    get: (key: string) => defaults[key] ?? "",
+    settings: defaults,
+  });
   return {
     SETTINGS_DEFAULTS: defaults,
-    useSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
-      sel({
-        set: mockSettingsSet,
-        get: (key: string) => defaults[key] ?? "",
-        settings: defaults,
-      }),
+    // `getState` too: the commit-message row resolves the Utility agent
+    // through `utilitySelectionFromStores()` while rendering.
+    useSettingsStore: Object.assign(
+      (sel: (s: Record<string, unknown>) => unknown) => sel(state()),
+      { getState: state },
+    ),
     selectTerminalColorTheme: () => "app",
     selectPalette: () => "cool",
     selectDensity: () => "comfortable",

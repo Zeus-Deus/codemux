@@ -31,7 +31,8 @@ export interface AttachmentTokenMatch {
 // the characters typically found in filenames (letters, digits, dots,
 // dashes, underscores). Matching ends at the first non-name character
 // or end-of-text, so trailing prose doesn't bleed into the token.
-const FILE_TOKEN_RE = /(?<=^|\s)@([A-Za-z0-9._-]+)(?=[^A-Za-z0-9._-]|$)/g;
+const FILE_TOKEN_RE =
+  /(?<=^|\s)@(?!session:)([A-Za-z0-9._-]+)(?=[^A-Za-z0-9._-]|$)/g;
 
 // `@#<number>` for GitHub issue refs (Stage 4). Kept as a separate
 // regex from FILE_TOKEN_RE because the leading `#` is significant —
@@ -50,6 +51,13 @@ const ISSUE_TOKEN_RE = /(?<=^|\s)@#(\d+)(?=\D|$)/g;
 // convention — the resolved-content injection makes the PR-vs-issue
 // distinction explicit anyway.
 const PR_TOKEN_RE = /(?<=^|\s)@!(\d+)(?=\D|$)/g;
+
+// `@session:<readable-id>` is backed by the full source thread id stored on
+// the staged attachment. The compact token combines a title slug with a
+// thread-id suffix, so it remains readable and same-titled sessions do not
+// collide.
+const SESSION_TOKEN_RE =
+  /(?<=^|\s)@session:([A-Za-z0-9._-]+)(?=[^A-Za-z0-9._-]|$)/g;
 
 /**
  * Find every `@<basename>` token in `text` whose basename matches a
@@ -172,6 +180,40 @@ export function parseIssueTokens(
   return matches;
 }
 
+/** Find every stable `@session:<readable-id>` reference backed by a staged
+ *  session attachment. */
+export function parseSessionTokens(
+  text: string,
+  attachments: Attachment[],
+): AttachmentTokenMatch[] {
+  if (!text || attachments.length === 0) return [];
+
+  const byRef = new Map<string, Attachment>();
+  for (const attachment of attachments) {
+    if (attachment.kind !== "session") continue;
+    byRef.set(attachment.metadata.mentionToken ?? attachment.ref, attachment);
+  }
+  if (byRef.size === 0) return [];
+
+  const matches: AttachmentTokenMatch[] = [];
+  SESSION_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SESSION_TOKEN_RE.exec(text)) !== null) {
+    const mentionToken = match[1];
+    if (!mentionToken) continue;
+    const attachment = byRef.get(mentionToken);
+    if (!attachment) continue;
+    matches.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      token: match[0],
+      basename: mentionToken,
+      attachment,
+    });
+  }
+  return matches;
+}
+
 /**
  * Filter slice attachments to the subset whose `@<basename>` token
  * still appears in `text`. Used at send time so deleting a token
@@ -195,7 +237,13 @@ export function activeAttachments(
   const fileTokens = parseFileTokens(text, attachments);
   const issueTokens = parseIssueTokens(text, attachments);
   const prTokens = parsePrTokens(text, attachments);
-  const tokens = [...fileTokens, ...issueTokens, ...prTokens].sort(
+  const sessionTokens = parseSessionTokens(text, attachments);
+  const tokens = [
+    ...fileTokens,
+    ...issueTokens,
+    ...prTokens,
+    ...sessionTokens,
+  ].sort(
     (a, b) => a.start - b.start,
   );
   const seenIds = new Set<string>();
@@ -253,6 +301,14 @@ export type DraftHighlightSegment =
       text: string;
       ref: string;
       state: "open" | "merged" | "closed" | "draft";
+      isLoading: boolean;
+      hasError: boolean;
+    }
+  | {
+      kind: "session-attachment";
+      text: string;
+      ref: string;
+      provider: string;
       isLoading: boolean;
       hasError: boolean;
     };
@@ -334,6 +390,22 @@ export function segmentDraftHighlight(
         text: slice,
         ref: m.basename,
         state,
+        isLoading,
+        hasError,
+      }),
+    });
+  }
+  for (const m of parseSessionTokens(text, attachments)) {
+    const isLoading = m.attachment.metadata.isLoading === true;
+    const hasError = typeof m.attachment.metadata.error === "string";
+    annotations.push({
+      start: m.start,
+      end: m.end,
+      build: (slice) => ({
+        kind: "session-attachment",
+        text: slice,
+        ref: m.basename,
+        provider: m.attachment.metadata.sourceProvider ?? "session",
         isLoading,
         hasError,
       }),

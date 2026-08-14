@@ -19,7 +19,9 @@ import type {
   PullRequestInfo,
 } from "@/tauri/types";
 
-function makePrDetail(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
+function makePrDetail(
+  overrides: Partial<PullRequestInfo> = {},
+): PullRequestInfo {
   return {
     number: 42,
     url: "https://github.com/u/r/pull/42",
@@ -58,9 +60,7 @@ function makeIssueDetail(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
   };
 }
 
-function makeFileAttachment(
-  overrides: Partial<Attachment> = {},
-): Attachment {
+function makeFileAttachment(overrides: Partial<Attachment> = {}): Attachment {
   return {
     id: "att-1",
     kind: "file",
@@ -71,7 +71,9 @@ function makeFileAttachment(
   };
 }
 
-function makeInfo(overrides: Partial<FileAttachmentInfo> = {}): FileAttachmentInfo {
+function makeInfo(
+  overrides: Partial<FileAttachmentInfo> = {},
+): FileAttachmentInfo {
   return {
     absolutePath: "/abs/Composer.tsx",
     relativePath: "src/components/chat/Composer.tsx",
@@ -230,7 +232,9 @@ describe("buildFolderResolvedContent (Step 8 Stage 3)", () => {
     expect(out).toContain("```");
     expect(out).toContain("├── Composer.tsx");
     expect(out).toContain("└── pickers/");
-    expect(out).toContain('Use the Read or Grep tool with path "/repo/src/components/chat"');
+    expect(out).toContain(
+      'Use the Read or Grep tool with path "/repo/src/components/chat"',
+    );
   });
 
   it("uses singular form when itemCount is 1", () => {
@@ -252,7 +256,8 @@ describe("buildAttachmentBlock with folder kind (Step 8 Stage 3)", () => {
       kind: "folder",
       ref: "/repo/src/components/chat",
       metadata: { label: "chat" },
-      resolvedContent: "Tree (depth-bounded, 3 items):\n```\nchat\n├── A.tsx\n└── B.tsx\n```\nUse the Read or Grep tool with path \"/repo/src/components/chat\" to explore further.",
+      resolvedContent:
+        'Tree (depth-bounded, 3 items):\n```\nchat\n├── A.tsx\n└── B.tsx\n```\nUse the Read or Grep tool with path "/repo/src/components/chat" to explore further.',
       ...overrides,
     };
   }
@@ -297,8 +302,8 @@ describe("Stage 2 sample — full applyAllPrefixes pipeline with file attachment
       language: "tsx",
       isText: true,
       content:
-        "import { File as FileIcon } from \"lucide-react\";\n" +
-        "import { useState } from \"react\";\n" +
+        'import { File as FileIcon } from "lucide-react";\n' +
+        'import { useState } from "react";\n' +
         "// (truncated in fixture)\n",
       truncated: false,
       outline: null,
@@ -323,7 +328,9 @@ describe("Stage 2 sample — full applyAllPrefixes pipeline with file attachment
     expect(wrapped).toContain("Ultrathink");
     expect(wrapped).toContain("=== Attached context ===");
     expect(wrapped).toContain("## File: Composer.tsx");
-    expect(wrapped).toContain("Full path: /repo/src/components/chat/Composer.tsx");
+    expect(wrapped).toContain(
+      "Full path: /repo/src/components/chat/Composer.tsx",
+    );
     expect(wrapped).toContain("Lines: 421");
     expect(wrapped).toContain("```tsx");
     expect(wrapped).toContain("=== End context ===");
@@ -361,9 +368,7 @@ describe("buildIssueResolvedContent", () => {
         totalComments: 1,
       }),
     );
-    expect(out).toContain(
-      "### Comments (1 total, showing first 1)",
-    );
+    expect(out).toContain("### Comments (1 total, showing first 1)");
     expect(out).toContain("**alice** (2026-01-02T00:00:00Z):");
     expect(out).toContain("agreed!");
     // Only one comment shown total — no truncation footer.
@@ -434,10 +439,7 @@ describe("buildPrResolvedContent", () => {
   });
 
   it("flags drafts in the state header", () => {
-    const out = buildPrResolvedContent(
-      makePrDetail({ is_draft: true }),
-      "",
-    );
+    const out = buildPrResolvedContent(makePrDetail({ is_draft: true }), "");
     expect(out).toContain("State: OPEN (draft)");
   });
 
@@ -464,9 +466,9 @@ describe("buildPrResolvedContent", () => {
   });
 
   it("falls back to '(no body)' when body is empty", () => {
-    expect(
-      buildPrResolvedContent(makePrDetail({ body: null }), ""),
-    ).toContain("(no body)");
+    expect(buildPrResolvedContent(makePrDetail({ body: null }), "")).toContain(
+      "(no body)",
+    );
   });
 
   it("renders comments + truncation footer for long threads", () => {
@@ -496,6 +498,65 @@ describe("buildPrResolvedContent", () => {
     const block = buildAttachmentBlock([att]);
     expect(block).toContain("## Pull Request #42 Add dark mode [open]");
     expect(block).toContain("State: OPEN");
+  });
+});
+
+describe("buildAttachmentBlock with session handoffs", () => {
+  it("labels the source and establishes the historical trust boundary", () => {
+    const attachment: Attachment = {
+      id: "session-1",
+      kind: "session",
+      ref: "thread-auth",
+      metadata: {
+        label: "Harden authentication",
+        mentionToken: "harden-auth-123456",
+        sourceProvider: "codex",
+        sourceCwd: "/repo",
+        messageCount: 18,
+        includedMessageCount: 18,
+        isContextTruncated: false,
+        handoffKind: "summary",
+        summaryCached: true,
+        fullHistoryAvailable: true,
+      },
+      resolvedContent:
+        "## Goal\nRotate tokens\n\n## Current state\nImplemented rotation",
+    };
+    const block = buildAttachmentBlock([attachment]);
+    expect(block).toContain("## Conversation handoff: Harden authentication");
+    expect(block).toContain("Source provider: codex");
+    expect(block).toContain("Handoff format: Utility-agent summary (cached");
+    expect(block).toContain("Included: 18/18 visible messages");
+    expect(block).toContain("conversation_search");
+    expect(block).toContain("conversation_read");
+    expect(block).toContain("current user request and current workspace");
+    expect(block).toContain("## Current state\nImplemented rotation");
+  });
+
+  it("marks deterministic fallback as direct and explains truncation", () => {
+    const attachment: Attachment = {
+      id: "session-direct",
+      kind: "session",
+      ref: "thread-direct",
+      metadata: {
+        label: "Long source chat",
+        mentionToken: "long-source-123456",
+        sourceProvider: "claude",
+        messageCount: 80,
+        includedMessageCount: 14,
+        isContextTruncated: true,
+        handoffKind: "direct",
+        summaryError: "utility_model_required",
+        fullHistoryAvailable: true,
+      },
+      resolvedContent:
+        "User:\nOpening task\n\n[… earlier conversation omitted …]",
+    };
+    const block = buildAttachmentBlock([attachment]);
+    expect(block).toContain("Handoff format: Direct transcript fallback");
+    expect(block).toContain("Included: 14/80 visible messages");
+    expect(block).toContain("older middle turns were omitted");
+    expect(block).toContain("complete safe-visible source remains available");
   });
 });
 

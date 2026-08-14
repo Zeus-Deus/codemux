@@ -1597,6 +1597,48 @@ export interface AgentChatSessionRecord {
   fast_mode?: boolean;
 }
 
+/** Provider-neutral conversation row for the composer's `@session:` picker.
+ *  `preview` is the newest persisted user/assistant prose; hidden reasoning
+ *  and tool output are excluded by the backend conversation index. */
+export interface AgentChatSessionMention {
+  thread_id: string;
+  workspace_id: string;
+  cwd: string | null;
+  provider: string;
+  title: string | null;
+  last_active_at: string;
+  preview: string;
+  message_count: number;
+}
+
+/** Safe, size-bounded handoff payload materialised from one persisted chat. */
+export interface AgentChatSessionContext {
+  thread_id: string;
+  workspace_id: string;
+  cwd: string | null;
+  provider: string;
+  title: string | null;
+  last_active_at: string;
+  content: string;
+  message_count: number;
+  included_message_count: number;
+  truncated: boolean;
+  handoff_kind: "summary" | "direct";
+  summary_cached: boolean;
+  summary_error: string | null;
+  summarizer_provider: string | null;
+  summarizer_model: string | null;
+  summarizer_effort: string | null;
+  revision_message_id: number;
+  full_history_available: boolean;
+}
+
+export interface UtilityModelSelection {
+  provider: AgentChatProviderKind;
+  model: string;
+  effort: string | null;
+}
+
 /** One SQLite FTS5 hit in the persisted conversation store. A content hit
  * carries the durable message row id used for transcript deep-linking; a
  * title-only hit carries `null` and opens at the start of the thread. */
@@ -1639,6 +1681,30 @@ export const agentChatListSessions = (
     workspaceId,
     cwd,
     limit,
+  });
+
+export const agentChatListSessionMentions = (
+  workspaceId: string,
+  currentCwd: string | null,
+  excludeThreadId: string | null,
+  limit = 30,
+) =>
+  invoke<AgentChatSessionMention[]>("agent_chat_list_session_mentions", {
+    workspaceId,
+    currentCwd,
+    excludeThreadId,
+    limit,
+  });
+
+export const agentChatGetSessionContext = (
+  workspaceId: string,
+  threadId: string,
+  utilitySelection: UtilityModelSelection | null = null,
+) =>
+  invoke<AgentChatSessionContext>("agent_chat_get_session_context", {
+    workspaceId,
+    threadId,
+    utilitySelection,
   });
 
 export const agentChatSearch = (

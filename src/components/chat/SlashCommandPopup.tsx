@@ -210,6 +210,7 @@ export function SlashCommandPopup({
                       data-disabled={disabled || undefined}
                       className={cn(
                         "flex items-center gap-2 rounded px-2 py-1.5 text-sm",
+                        item.stacked && "gap-2.5 py-2",
                         "cursor-pointer outline-none select-none",
                         "data-[selected=true]:bg-muted",
                         "data-[selected=true]:text-foreground",
@@ -217,6 +218,12 @@ export function SlashCommandPopup({
                       )}
                     >
                       {Icon && (
+                        <span
+                          className={cn(
+                            item.stacked &&
+                              "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/35",
+                          )}
+                        >
                         <Icon
                           className={cn(
                             "h-3.5 w-3.5 shrink-0",
@@ -226,16 +233,35 @@ export function SlashCommandPopup({
                           )}
                           aria-hidden
                         />
+                        </span>
                       )}
+                      {item.stacked ? (
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium text-foreground">
+                            {item.label}
+                          </span>
+                          {item.description && (
+                            <span className="mt-0.5 block truncate text-[11px] leading-4 text-muted-foreground">
+                              {item.description}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <>
                       <span className="text-foreground">{item.label}</span>
                       {item.description && (
                         <span className="truncate text-xs text-muted-foreground">
                           {item.description}
                         </span>
                       )}
+                        </>
+                      )}
                       {item.rightAdornment ? (
                         <span
-                          className="ml-auto"
+                          className={cn(
+                            "ml-auto",
+                            item.stacked && "shrink-0 self-stretch",
+                          )}
                           // Stop the trailing control's clicks from
                           // bubbling up and triggering row selection
                           // (e.g. inline Switch in the MCP submenu).
