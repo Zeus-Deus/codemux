@@ -93,6 +93,14 @@ const chatPresetSnapshot: PresetStoreSnapshot = {
 // chat favorite without affecting the other describe blocks.
 let presetSnapshot: PresetStoreSnapshot = chatPresetSnapshot;
 
+// Measured sidebar width. jsdom renders no `[data-slot="sidebar-gap"]`
+// node, so without this mock the hook would always sit on its 256px
+// fallback and the collapsed-rail alignment branch would be untestable.
+let sidebarGapWidth = 256;
+vi.mock("@/hooks/use-sidebar-gap-width", () => ({
+  useSidebarGapWidth: () => sidebarGapWidth,
+}));
+
 vi.mock("@/hooks/use-preset-store", () => ({
   usePresetStore: () => presetSnapshot,
 }));
@@ -257,6 +265,7 @@ function renderBar() {
 }
 
 beforeEach(() => {
+  sidebarGapWidth = 256;
   state.enableAgentChat = false;
   state.enableLazy = false;
   state.activeDraftId = null;
@@ -382,7 +391,7 @@ describe("TitleBar chrome gating", () => {
     expect(utilities).toContainElement(getByTestId("resource-monitor"));
     expect(getByTestId("resource-monitor")).toHaveAttribute(
       "data-variant",
-      "toolbar",
+      "ghost",
     );
     // The panel toggle deliberately does *not* live here any more: this
     // island tracks the panel's left edge, so the toggle used to jump across
@@ -397,10 +406,13 @@ describe("TitleBar chrome gating", () => {
       primary.compareDocumentPosition(utilities) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(utilities).toHaveClass("ml-1");
+    // One uninterrupted action run: the utility group carries no leading
+    // margin of its own, just the band's shared 2px rhythm.
+    expect(utilities).toHaveClass("gap-[2px]");
+    expect(utilities).not.toHaveClass("ml-1");
   });
 
-  it("keeps overlap surfaces dormant in the normal frameless state", () => {
+  it("keeps overlap washes dormant in the normal frameless state", () => {
     state.enableAgentChat = true;
     const { getByTestId } = renderBar();
 
@@ -408,11 +420,13 @@ describe("TitleBar chrome gating", () => {
       "data-chat-overlap",
     );
     expect(getByTestId("titlebar-workspace-island")).toHaveClass(
-      "titlebar-overlap-surface",
+      "titlebar-overlap-wash",
+      "titlebar-overlap-wash-start",
       "h-8",
     );
     expect(getByTestId("titlebar-action-island")).toHaveClass(
-      "titlebar-overlap-surface",
+      "titlebar-overlap-wash",
+      "titlebar-overlap-wash-end",
       "h-8",
     );
   });
@@ -541,8 +555,13 @@ describe("TitleBar GUI chrome — floating placement", () => {
     // cluster (one 28px button + 6px) plus the window controls (104). The
     // hidden expand control must not leave an empty slot while the panel is
     // closed.
+    //
+    // The trailing +8 on the right is the band's one deliberate break in
+    // its 2px rhythm: 6 + 8 = the single 14px gap between the action run
+    // and the fixed corner cluster, so the corner reads as separate
+    // chrome rather than the tail of the workspace's own controls.
     expect(band.style.left).toBe("262px");
-    expect(band.style.right).toBe("138px");
+    expect(band.style.right).toBe("146px");
   });
 
   it("moves the workspace actions left of an open right panel", () => {
@@ -550,6 +569,21 @@ describe("TitleBar GUI chrome — floating placement", () => {
     state.rightPanelTab = "files";
     const { getByTestId } = renderBar();
     expect(getByTestId("titlebar-floating-band").style.right).toBe("328px");
+  });
+
+  it("keeps the sidebar toggle at the corner inset beside an expanded sidebar", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-sidebar-cluster").style.left).toBe("6px");
+  });
+
+  it("centres the sidebar toggle over the collapsed icon rail", () => {
+    state.enableAgentChat = true;
+    // `--sidebar-width-icon` = 3.25rem: the rail centres its 28px icon
+    // column, so the 28px toggle sits at (52 - 28) / 2 to join that axis.
+    sidebarGapWidth = 52;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-sidebar-cluster").style.left).toBe("12px");
   });
 
   it("renders the sidebar toggle as a compact frameless cluster", () => {

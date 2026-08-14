@@ -21,6 +21,10 @@ import {
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
+import {
+  BAND_ACTIVE_FILL,
+  BAND_CONTROL_RADIUS,
+} from "@/components/layout/titlebar-control-style";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
@@ -59,9 +63,17 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
   return tabKindIcon[tab.kind];
 }
 
-const PILL_BASE =
-  "group/tab flex h-7 shrink-0 items-center gap-1 rounded-lg pl-2.5 pr-1 text-xs transition-colors";
-const PILL_ACTIVE = "bg-background text-foreground font-semibold";
+// Only the active tab wears a pill. Inactive tabs are bare label text at
+// rest — no fill, no border — and pick up a quiet hover fill on approach,
+// so a strip of five tabs reads as one label row with one thing selected
+// rather than five competing boxes stacked over the transcript. Radius is
+// the band-wide control token, shared with the panel toggle and the 28px
+// icon buttons.
+const PILL_BASE = cn(
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-xs transition-colors",
+  BAND_CONTROL_RADIUS,
+);
+const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
 const PILL_INACTIVE =
   "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
 const CLOSE_BTN =
@@ -330,7 +342,7 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   return (
     <div
       ref={setScrollerNode}
-      className="relative flex min-w-0 items-center gap-1 overflow-x-auto"
+      className="relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
       data-testid="titlebar-tabs-scroll"
     >
