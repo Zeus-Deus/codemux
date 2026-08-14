@@ -29,7 +29,7 @@ function SplitSideLine({
 
   if (line.type === "hunk-header") {
     return (
-      <div className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0">
+      <div data-diff-hunk className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0">
         <span className="w-10 shrink-0 select-none" />
         <span className="text-muted-foreground/60 text-[11px] px-2 truncate">
           {line.content}
@@ -96,39 +96,26 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
 
     const pairs = buildSplitPairs(lines);
 
-    const hunkIndices = pairs.reduce<number[]>((acc, pair, i) => {
-      if (pair.left?.type === "hunk-header") acc.push(i);
-      return acc;
-    }, []);
-
     const scrollToHunk = useCallback(
       (direction: 1 | -1) => {
         const container = leftRef.current;
-        if (!container || hunkIndices.length === 0) return;
-
-        const scrollTop = container.scrollTop;
-        const lineHeight = 18;
-        const currentLine = Math.floor(scrollTop / lineHeight);
-
-        let targetIdx: number | undefined;
-        if (direction === 1) {
-          targetIdx = hunkIndices.find((i) => i > currentLine + 1);
-        } else {
-          for (let j = hunkIndices.length - 1; j >= 0; j--) {
-            if (hunkIndices[j] < currentLine) {
-              targetIdx = hunkIndices[j];
-              break;
-            }
-          }
-        }
-
-        if (targetIdx !== undefined) {
-          const top = targetIdx * lineHeight;
+        if (!container) return;
+        const hunks = Array.from(
+          container.querySelectorAll<HTMLElement>("[data-diff-hunk]"),
+        );
+        const target =
+          direction === 1
+            ? hunks.find((hunk) => hunk.offsetTop > container.scrollTop + 1)
+            : [...hunks]
+                .reverse()
+                .find((hunk) => hunk.offsetTop < container.scrollTop - 1);
+        if (target) {
+          const top = target.offsetTop;
           leftRef.current?.scrollTo({ top, behavior: "smooth" });
           rightRef.current?.scrollTo({ top, behavior: "smooth" });
         }
       },
-      [hunkIndices],
+      [],
     );
 
     useImperativeHandle(ref, () => ({ scrollToHunk }), [scrollToHunk]);
@@ -146,11 +133,13 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
       };
 
     return (
-      <div className="select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden font-mono text-xs leading-[18px]">
-        {/* Left — deletions / old */}
+      <div className="code-surface select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden">
+        {/* Left — deletions / old. `relative` is load-bearing: it makes this
+            the offsetParent, so each hunk's offsetTop is a scroll position
+            rather than a page coordinate measured from the app shell. */}
         <div
           ref={leftRef}
-          className="overflow-auto bg-card"
+          className="relative overflow-auto bg-card"
           onScroll={handleScroll("left")}
         >
           <div className="py-0.5">
@@ -166,7 +155,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         {/* Right — additions / new */}
         <div
           ref={rightRef}
-          className="overflow-auto bg-card"
+          className="relative overflow-auto bg-card"
           onScroll={handleScroll("right")}
         >
           <div className="py-0.5">

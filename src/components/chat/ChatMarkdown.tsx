@@ -239,7 +239,7 @@ export function ChatMarkdown({
   return (
     <ChatFileLinkContext.Provider value={fileContext}>
       <ChatMarkdownStreamingContext.Provider value={streaming}>
-        <div className={cn("chat-markdown", proseClasses)}>
+        <div className={cn("chat-markdown conversation-text", proseClasses)}>
           <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
             <Streamdown
               parseIncompleteMarkdown

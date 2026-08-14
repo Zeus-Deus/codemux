@@ -12,6 +12,14 @@ const DEFAULT_SETTINGS: UserSettings = {
     theme: "default",
     custom_themes: [],
     shell_font: null,
+    typography_mode: "simple",
+    interface_font_family: null,
+    interface_font_size: 16,
+    conversation_font_family: null,
+    conversation_font_size: 14,
+    code_font_family: null,
+    code_font_size: 13,
+    terminal_font_family: null,
     terminal_font_size: 13,
     show_resource_monitor: true,
   },
@@ -151,9 +159,6 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
 }));
 
 // ── React hook selectors (trigger re-renders on specific value change) ──
-
-export const selectTerminalFontSize = (s: SyncedSettingsState): number =>
-  s.settings.appearance.terminal_font_size;
 
 export const selectAppearanceTheme = (s: SyncedSettingsState): string =>
   s.settings.appearance.theme || "default";

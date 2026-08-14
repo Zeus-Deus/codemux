@@ -32,10 +32,9 @@ vi.mock("./synced-settings-store", () => ({
 import {
   useSettingsStore,
   SETTINGS_DEFAULTS,
-  getTerminalFontSize,
   getTerminalCursorStyle,
   getTerminalColorTheme,
-  getTerminalFontFamily,
+  selectLegacyTerminalFontFamily,
   getDefaultEditor,
   getDefaultBaseBranch,
   selectSidebarShowGitStats,
@@ -66,10 +65,13 @@ describe("settings-store", () => {
       expect(getTerminalColorTheme()).toBe("app");
     });
 
-    it("terminalFontFamily defaults to JetBrains Mono", () => {
-      expect(getTerminalFontFamily()).toBe(
-        "'JetBrains Mono Variable', monospace",
-      );
+    // The legacy machine-local terminal family is an override, not a default:
+    // an install that never persisted one resolves from synced typography.
+    it("selectLegacyTerminalFontFamily is undefined until a build persisted one", () => {
+      expect(selectLegacyTerminalFontFamily(stateWith({}))).toBeUndefined();
+      expect(
+        selectLegacyTerminalFontFamily(stateWith({ "terminal.font_family": "Fira Code" })),
+      ).toBe("Fira Code");
     });
 
     it("get() returns default for known key", () => {
@@ -168,17 +170,6 @@ describe("settings-store", () => {
   // ── Redirected per-user getters (read from synced store) ──
 
   describe("per-user getters redirect to synced store", () => {
-    it("getTerminalFontSize reads from synced store", () => {
-      const defaults = mockSyncedState.settings;
-      mockSyncedGetState.mockReturnValue({
-        settings: {
-          ...defaults,
-          appearance: { ...defaults.appearance, terminal_font_size: 20 },
-        },
-      });
-      expect(getTerminalFontSize()).toBe(20);
-    });
-
     it("getTerminalCursorStyle reads from synced store", () => {
       const defaults = mockSyncedState.settings;
       mockSyncedGetState.mockReturnValue({
@@ -224,7 +215,6 @@ describe("settings-store", () => {
     });
 
     it("per-user getters return synced defaults when synced store is default", () => {
-      expect(getTerminalFontSize()).toBe(13);
       expect(getTerminalCursorStyle()).toBe("bar");
       expect(getDefaultEditor()).toBe("");
       expect(getDefaultBaseBranch()).toBe("main");
@@ -244,7 +234,7 @@ describe("settings-store", () => {
 
       expect(useSettingsStore.getState().loaded).toBe(true);
       expect(getTerminalColorTheme()).toBe("system");
-      expect(getTerminalFontFamily()).toBe("Fira Code");
+      expect(useSettingsStore.getState().get("terminal.font_family")).toBe("Fira Code");
     });
 
     it("sets loaded=true even with empty database", async () => {
@@ -298,7 +288,7 @@ describe("settings-store", () => {
       useSettingsStore.getState().set("terminal.font_family", "Fira Code");
 
       expect(getTerminalColorTheme()).toBe("system");
-      expect(getTerminalFontFamily()).toBe("Fira Code");
+      expect(useSettingsStore.getState().get("terminal.font_family")).toBe("Fira Code");
     });
   });
 });

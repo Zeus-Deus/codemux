@@ -29,9 +29,9 @@
 @theme inline {
     /* Headings use the UI sans (DM Sans), NOT mono — per the design
      * system, mono is reserved for code-like metadata only. */
-    --font-heading: var(--font-sans);
-    --font-sans: 'DM Sans Variable', ui-sans-serif, system-ui, sans-serif;
-    --font-mono: 'JetBrains Mono Variable', monospace;
+    --font-heading: var(--font-interface);
+    --font-sans: var(--font-interface);
+    --font-mono: var(--font-code);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -88,6 +88,17 @@
 }
 
 :root {
+    /* Keep the runtime choices one level below Tailwind's theme names.
+     * `@theme inline` then compiles font-sans/font-mono utilities against
+     * these live tokens instead of baking the bundled families into CSS. */
+    --font-interface: 'DM Sans Variable', 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+    --font-code: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-conversation: var(--font-interface);
+    --font-terminal: var(--font-code);
+    --font-size-conversation: 14px;
+    --font-size-code: 13px;
+    --font-size-terminal: 13px;
+    --line-height-code: 20px;
     --background: oklch(1 0 0);
     --foreground: oklch(0.147 0.004 49.25);
     --card: oklch(1 0 0);
@@ -440,11 +451,25 @@ body.pane-resizing iframe {
     }
 }
 
+/* Typography settings use named surfaces rather than trying to globally
+ * rewrite every compact UI label. This keeps chrome rhythm stable while
+ * conversation and developer text remain independently readable. */
+.conversation-text {
+  font-family: var(--font-conversation, var(--font-sans));
+  font-size: var(--font-size-conversation, 14px);
+}
+
+.code-surface {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code, 13px);
+  line-height: var(--line-height-code, 20px);
+}
+
 /* ── Rendered markdown ── */
 .markdown-rendered {
   color: var(--foreground);
-  font-family: system-ui, -apple-system, sans-serif;
-  font-size: 14px;
+  font-family: var(--font-conversation, var(--font-sans));
+  font-size: var(--font-size-conversation, 14px);
   line-height: 1.7;
 }
 .markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3,
@@ -476,7 +501,7 @@ body.pane-resizing iframe {
   color: var(--muted-foreground);
 }
 .markdown-rendered code {
-  font-family: 'JetBrains Mono Variable', monospace;
+  font-family: var(--font-mono);
   font-size: 0.85em;
   background: var(--muted);
   padding: 0.15em 0.35em;
@@ -564,7 +589,7 @@ body.pane-resizing iframe {
   align-items: center;
   gap: 0.4rem;
   border-radius: 3px;
-  font-family: 'JetBrains Mono Variable', monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1;
 }
@@ -660,9 +685,9 @@ body.pane-resizing iframe {
 .chat-markdown [data-chat-code-body] code {
   margin: 0;
   padding: 0;
-  font-family: 'JetBrains Mono Variable', monospace;
-  font-size: 12px;
-  line-height: 1.4;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-code, 13px);
+  line-height: 1.5;
   background: transparent;
 }
 
@@ -685,7 +710,7 @@ body.pane-resizing iframe {
 /* Inline code — streamdown emits its own pill; the prose chain in
  * `ChatMarkdown.tsx` only strips the typography plugin's backticks. */
 .chat-markdown [data-streamdown="inline-code"] {
-  font-family: 'JetBrains Mono Variable', monospace;
+  font-family: var(--font-mono);
   font-size: 0.82em;
   background: var(--muted);
   color: var(--foreground);

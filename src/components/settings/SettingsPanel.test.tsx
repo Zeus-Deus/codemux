@@ -101,7 +101,6 @@ vi.mock("@/stores/synced-settings-store", () => ({
       },
       updateSetting: vi.fn(),
     }),
-  selectTerminalFontSize: () => 13,
   selectTerminalCursorStyle: () => "bar",
   selectDefaultEditor: () => "",
   selectDefaultBaseBranch: () => "main",

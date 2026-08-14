@@ -537,6 +537,14 @@ const SYNCED_SETTINGS: UserSettings = {
   appearance: {
     theme: "system",
     shell_font: null,
+    typography_mode: "simple",
+    interface_font_family: null,
+    interface_font_size: 16,
+    conversation_font_family: null,
+    conversation_font_size: 14,
+    code_font_family: null,
+    code_font_size: 13,
+    terminal_font_family: null,
     terminal_font_size: 13,
     show_resource_monitor: true,
   },
@@ -2014,10 +2022,19 @@ const handlers: Record<string, Handler> = {
   get_package_format: () => "AppImage",
 
   // ── Settings ──
-  get_synced_settings: () => SYNCED_SETTINGS,
-  update_synced_settings: (a) => (a.settings as UserSettings) ?? SYNCED_SETTINGS,
-  update_setting: () => SYNCED_SETTINGS,
-  reset_synced_settings: () => SYNCED_SETTINGS,
+  get_synced_settings: () => structuredClone(SYNCED_SETTINGS),
+  update_synced_settings: (a) => {
+    if (a.settings) Object.assign(SYNCED_SETTINGS, structuredClone(a.settings as UserSettings));
+    return structuredClone(SYNCED_SETTINGS);
+  },
+  update_setting: (a) => {
+    const section = a.section as keyof UserSettings;
+    const key = String(a.key ?? "");
+    const target = SYNCED_SETTINGS[section] as unknown as Record<string, unknown> | undefined;
+    if (target && key) target[key] = structuredClone(a.value);
+    return structuredClone(SYNCED_SETTINGS);
+  },
+  reset_synced_settings: () => structuredClone(SYNCED_SETTINGS),
   db_get_all_settings: () => ({}),
   db_get_ui_state: () => null,
   db_set_ui_state: () => undefined,

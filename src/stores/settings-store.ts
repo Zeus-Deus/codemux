@@ -111,15 +111,7 @@ export function getTerminalColorTheme(): string {
   return raw("terminal.color_theme");
 }
 
-export function getTerminalFontFamily(): string {
-  return raw("terminal.font_family");
-}
-
 // ── Per-user imperative getters (redirect to synced store for backward compat) ──
-
-export function getTerminalFontSize(): number {
-  return useSyncedSettingsStore.getState().settings.appearance.terminal_font_size;
-}
 
 export function getTerminalCursorStyle(): string {
   return useSyncedSettingsStore.getState().settings.terminal.cursor_style;
@@ -138,8 +130,10 @@ export function getDefaultBaseBranch(): string {
 export const selectTerminalColorTheme = (s: SettingsStore): string =>
   s.settings["terminal.color_theme"] ?? SETTINGS_DEFAULTS["terminal.color_theme"]!;
 
-export const selectTerminalFontFamily = (s: SettingsStore): string =>
-  s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;
+/** Only a value an older build actually persisted; unset installs resolve
+ * their terminal family from synced typography instead of this default. */
+export const selectLegacyTerminalFontFamily = (s: SettingsStore): string | undefined =>
+  s.settings["terminal.font_family"];
 
 export const selectPalette = (s: SettingsStore): AppearancePalette =>
   (s.settings["appearance.palette"] ??

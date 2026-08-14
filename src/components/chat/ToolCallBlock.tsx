@@ -33,7 +33,7 @@ export function ToolCallBlock({ content, error, text }: Props) {
   return (
     <div
       className={cn(
-        "select-text rounded-md bg-muted/40 font-mono text-[12px] leading-5",
+        "code-surface select-text rounded-md bg-muted/40",
         "text-foreground whitespace-pre-wrap break-words",
         error && "text-foreground",
       )}
