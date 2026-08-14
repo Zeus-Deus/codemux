@@ -572,7 +572,16 @@ const SettledRow = memo(function SettledRow({
         activateFromSidebar(workspace.workspace_id);
       }}
       className={cn(
-        "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_52px_48px] items-center gap-2 rounded-lg px-2",
+        // The four tracks are the single source of truth for this row's
+        // columns — avatar, title, PR, meta — and the slots below deliberately
+        // carry no widths of their own. Both fixed tracks are measured, not
+        // guessed: the PR badge is `px-1` (8px) + a 12px icon + a 4px gap + a
+        // 10px JetBrains Mono ref, which is 6px per glyph, so `#1234` needs
+        // 54px and 56px leaves it a hair of slack. The meta track holds the
+        // hover-revealed Un-settle button (62.7px at 10.5px DM Sans semibold
+        // with its 10px glyph and gap), so 64px keeps that control inside its
+        // own column instead of reaching left across the PR badge's hit area.
+        "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_56px_64px] items-center gap-2 rounded-lg px-2",
         // Same off-screen containment as the cards (see `SidebarInboxCard`):
         // the Settled shelf is the list that actually grows without bound, and
         // paging only limits what is *rendered*, not what the forced-visible
@@ -601,7 +610,7 @@ const SettledRow = memo(function SettledRow({
       />
       <span
         className={cn(
-          "min-w-0 flex-1 truncate text-xs font-medium transition-colors duration-150",
+          "min-w-0 truncate text-xs font-medium transition-colors duration-150",
           dimmed
             ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
             : "text-foreground",
@@ -612,11 +621,10 @@ const SettledRow = memo(function SettledRow({
       {/* Every settled row reserves the same PR column, including rows without
           one. Together with the fixed age/action column below, this keeps the
           historical shelf on one quiet vertical rhythm instead of letting
-          variable title, PR-number and elapsed-label widths nudge each other. */}
-      <div
-        data-settled-pr-slot
-        className="flex h-5 w-[52px] min-w-0 items-center"
-      >
+          variable title, PR-number and elapsed-label widths nudge each other.
+          The slot takes its width from the grid track above and states none of
+          its own — two places to edit is how a column drifts. */}
+      <div data-settled-pr-slot className="flex h-5 min-w-0 items-center">
         {prState && (
           <button
             type="button"
@@ -670,9 +678,15 @@ const SettledRow = memo(function SettledRow({
           </button>
         )}
       </div>
+      {/* Age and Un-settle share one cell: the age is what the row says at
+          rest, the button is what it says under the cursor, and stacking them
+          means the swap costs no reflow. `overflow-hidden` is the guarantee
+          that goes with that — whatever the label measures, it is clipped at
+          this column's edge rather than allowed to reach left and swallow
+          clicks meant for the PR badge. Width comes from the grid track. */}
       <div
         data-settled-meta-slot
-        className="relative h-5 w-12 justify-self-end whitespace-nowrap"
+        className="relative h-5 overflow-hidden whitespace-nowrap"
       >
         {time && (
           <span className="absolute inset-y-0 right-0 flex items-center font-mono text-[11px] tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
@@ -693,7 +707,10 @@ const SettledRow = memo(function SettledRow({
             // row's own affordance. The word stays — this is the one control on
             // the shelf that changes a lifecycle, and an undo arrow alone is too
             // close to "go back" to be trusted with it.
-            "absolute inset-y-0 right-0 hidden items-center gap-1 border-none bg-transparent p-0",
+            // Filling the slot (`inset-0`, right-aligned content) makes the
+            // control's hit area exactly its own column — never a pixel of it
+            // over the PR badge next door.
+            "absolute inset-0 hidden items-center justify-end gap-1 border-none bg-transparent p-0",
             "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
             "hover:text-foreground",
             "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
@@ -810,9 +827,13 @@ const SnoozeRow = memo(function SnoozeRow({
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
           {workspace.title}
         </span>
+        {/* Same face as a settled row's age (`font-mono tabular-nums`): the two
+            shelves sit directly on top of each other, and a proportional "3h"
+            beside a mono one is exactly the kind of half-match the eye reads as
+            a mistake. */}
         <span
           aria-label={`Wakes in ${timeUntil}`}
-          className="shrink-0 text-[11px] tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
+          className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
         >
           {timeUntil}
         </span>

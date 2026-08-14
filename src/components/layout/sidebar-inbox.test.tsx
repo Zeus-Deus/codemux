@@ -1552,13 +1552,27 @@ describe("SidebarInbox — settle / un-settle", () => {
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
+    // The grid tracks are the row's only column widths — 56px fits a 4-digit
+    // ref like `#1234`, 64px fits the hover-revealed Un-settle button. The
+    // slots themselves must not restate either number, or the two copies drift.
     expect(row.className).toContain(
-      "grid-cols-[auto_minmax(0,1fr)_52px_48px]",
+      "grid-cols-[auto_minmax(0,1fr)_56px_64px]",
     );
-    expect(row.querySelector("[data-settled-pr-slot]")).toHaveClass(
-      "w-[52px]",
-    );
-    expect(row.querySelector("[data-settled-meta-slot]")).toHaveClass("w-12");
+    const prSlot = row.querySelector("[data-settled-pr-slot]") as HTMLElement;
+    const metaSlot = row.querySelector(
+      "[data-settled-meta-slot]",
+    ) as HTMLElement;
+    expect(prSlot.className).not.toMatch(/(^|\s)w-/);
+    expect(metaSlot.className).not.toMatch(/(^|\s)w-/);
+    // The hover-revealed Un-settle button is bounded by that meta column —
+    // it fills the slot and the slot clips — so it can never sit on top of the
+    // PR badge and take clicks meant for it.
+    const unsettle = within(row).getByRole("button", {
+      name: 'Un-settle "Implement sidebar v2"',
+    });
+    expect(unsettle.parentElement).toBe(metaSlot);
+    expect(unsettle).toHaveClass("absolute", "inset-0");
+    expect(metaSlot).toHaveClass("overflow-hidden");
     // In a slim settled-history row, the PR remains visible and directly
     // reachable instead of degrading to an unlabeled merge glyph. Its fixed
     // slot makes the PR and age columns line up across the whole shelf.
