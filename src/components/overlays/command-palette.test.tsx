@@ -225,12 +225,54 @@ describe("command palette — theme picker", () => {
     expect(mocks.ui.openThemeStudio).toHaveBeenCalledWith({ mode: "import" });
   });
 
-  it("opens on the seed query handed to it by Settings' Change button", async () => {
+  it("keeps the seeded Change flow anchored on Themes through crowded results", async () => {
+    const workspaces = Array.from({ length: 30 }, (_, index) => ({
+      workspace_id: `ws-theme-${index}`,
+      title: `Theme investigation ${index}`,
+      cwd: `/repo-${index}`,
+      git_branch: `feature/theme-investigation-${index}`,
+      project_root: `/repo-${index}`,
+      surfaces: [],
+      active_surface_id: "",
+    }));
+    mocks.app.appState = {
+      active_workspace_id: "ws-theme-0",
+      pane_statuses: {},
+      workspaces,
+    };
+    mocks.backend.agentChatSearch.mockResolvedValue([
+      {
+        message_id: 91,
+        thread_id: "thread-theme",
+        workspace_id: "ws-theme-0",
+        cwd: "/repo-0",
+        provider: "codex",
+        session_title: "Theme notes from an older conversation",
+        role: "assistant",
+        turn_id: "turn-theme",
+        snippet: "The theme keyword also appears in this conversation.",
+        created_at: "2026-08-14 00:00:00",
+      },
+    ]);
     mocks.ui.takeCommandPaletteQuery.mockReturnValue("theme");
     renderPalette();
 
     expect(screen.getByRole("combobox")).toHaveValue("theme");
+    expect(screen.getByText("Workspaces")).toBeInTheDocument();
+    expect(screen.getByText("24 of 30")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("Ember")).toBeInTheDocument());
+    const themesHeader = document.querySelector('[data-palette-group="Themes"]');
+    const workspacesHeader = document.querySelector('[data-palette-group="Workspaces"]');
+    expect(themesHeader?.compareDocumentPosition(workspacesHeader!)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+    // Conversation hits arrive later, but the deep link keeps Themes first
+    // instead of allowing that asynchronous result to shift the target away.
+    const conversation = await screen.findByText("Theme notes from an older conversation");
+    expect(themesHeader?.compareDocumentPosition(conversation)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
   });
 });
 

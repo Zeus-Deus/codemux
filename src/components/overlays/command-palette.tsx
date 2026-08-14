@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
 import {
   ArrowLeft,
@@ -291,16 +291,14 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
   const listRef = useRef<HTMLDivElement>(null);
+  // A seeded `theme` query is a deep link from Settings ▸ Appearance, not
+  // an ordinary palette search. Remember that distinction after the store's
+  // one-shot seed has been consumed so only that entry point puts Themes
+  // ahead of otherwise valid workspace/project/conversation matches.
+  const openedForThemesRef = useRef(rawQuery === "theme");
   const searchRequestRef = useRef(0);
   const [conversationRows, setConversationRows] = useState<AgentChatSearchResult[]>([]);
   const [conversationSearching, setConversationSearching] = useState(false);
-
-  // Every keystroke re-ranks the list and cmdk re-selects the top row, but it
-  // only scrolls on arrow navigation — so without this the user can be left
-  // staring at the middle of a list whose selection is far above.
-  useEffect(() => {
-    listRef.current?.scrollTo({ top: 0 });
-  }, [rawQuery]);
 
   const appState = useAppStore((s) => s.appState);
   const homeDir = useHomeDir();
@@ -570,6 +568,17 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     0,
     searching ? PROJECT_CAP_SEARCH : PROJECT_CAP_RESTING,
   );
+  const themeResultsFirst =
+    openedForThemesRef.current &&
+    rawQuery === "theme" &&
+    matchedThemes.length + matchedThemeStudio.length > 0;
+
+  // Every keystroke re-ranks the list and cmdk re-selects the first row, but
+  // it only scrolls on arrow navigation. Resetting here keeps ordinary search
+  // results (and the seeded Themes-first ordering) aligned with that row.
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: 0 });
+  }, [rawQuery]);
   const totalShown =
     shownWorkspaces.length +
     shownProjects.length +
@@ -676,6 +685,34 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     row.open();
   };
 
+  const themeResults = (
+    <Fragment>
+      {matchedThemes.length + matchedThemeStudio.length > 0 && (
+        <GroupHeader
+          label="Themes"
+          count={`${matchedThemes.length}`}
+          first={
+            themeResultsFirst ||
+            (shownWorkspaces.length === 0 &&
+              shownProjects.length === 0 &&
+              conversationRows.length === 0)
+          }
+        />
+      )}
+      {matchedThemes.map((row) => (
+        <ThemeItemRow
+          key={row.key}
+          row={row}
+          applied={row.theme.id === appliedTheme.id}
+          onSelect={() => keepTheme(row.theme)}
+        />
+      ))}
+      {matchedThemeStudio.map((row) => (
+        <ThemeStudioItemRow key={row.key} row={row} onSelect={() => openStudio(row)} />
+      ))}
+    </Fragment>
+  );
+
   return (
     <CommandPrimitive
       shouldFilter={false}
@@ -744,11 +781,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             </div>
           )}
 
+          {themeResultsFirst && themeResults}
+
           {shownWorkspaces.length > 0 && (
             <GroupHeader
               label="Workspaces"
               count={groupCountLabel(shownWorkspaces.length, matchedWorkspaces.length)}
-              first
+              first={!themeResultsFirst}
             />
           )}
           {shownWorkspaces.map((row) => (
@@ -764,7 +803,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <GroupHeader
               label="Projects"
               count={groupCountLabel(shownProjects.length, matchedProjects.length)}
-              first={shownWorkspaces.length === 0}
+              first={!themeResultsFirst && shownWorkspaces.length === 0}
             />
           )}
           {shownProjects.map((row) => (
@@ -775,7 +814,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <GroupHeader
               label="Conversations"
               count={`${conversationRows.length}`}
-              first={shownWorkspaces.length === 0 && shownProjects.length === 0}
+              first={
+                !themeResultsFirst && shownWorkspaces.length === 0 && shownProjects.length === 0
+              }
             />
           )}
           {conversationRows.map((row) => (
@@ -788,28 +829,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             />
           ))}
 
-          {matchedThemes.length + matchedThemeStudio.length > 0 && (
-            <GroupHeader
-              label="Themes"
-              count={`${matchedThemes.length}`}
-              first={
-                shownWorkspaces.length === 0 &&
-                shownProjects.length === 0 &&
-                conversationRows.length === 0
-              }
-            />
-          )}
-          {matchedThemes.map((row) => (
-            <ThemeItemRow
-              key={row.key}
-              row={row}
-              applied={row.theme.id === appliedTheme.id}
-              onSelect={() => keepTheme(row.theme)}
-            />
-          ))}
-          {matchedThemeStudio.map((row) => (
-            <ThemeStudioItemRow key={row.key} row={row} onSelect={() => openStudio(row)} />
-          ))}
+          {!themeResultsFirst && themeResults}
 
           {matchedCommands.length > 0 && (
             <GroupHeader
@@ -873,6 +893,7 @@ function GroupHeader({
 }) {
   return (
     <div
+      data-palette-group={label}
       className={cn(
         "sticky top-0 z-10 flex h-7 items-center gap-2.5 bg-popover px-2.5",
         !first && "mt-2",
