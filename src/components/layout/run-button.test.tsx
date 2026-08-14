@@ -275,17 +275,19 @@ describe("RunButton — split variant", () => {
     );
   });
 
-  it("renders one bordered container with a main segment, a divider, and a 24px caret segment", async () => {
+  it("renders a borderless 28px run segment plus a 20px caret segment", async () => {
     const { container } = renderSplitRunButton();
     await flushPromises();
     const outer = container.firstElementChild;
-    expect(outer?.className).toContain("border");
-    expect(outer?.className).toContain("rounded-[7px]");
+    // No chip: in the titlebar band this control carries no border and no
+    // resting fill, only a hover fill, like the panel toggle opposite it.
+    expect(outer?.className).not.toContain("border");
+    expect(outer?.className).not.toContain("bg-secondary");
     expect(outer?.className).toContain("h-7");
     const buttons = container.querySelectorAll("button");
     expect(buttons).toHaveLength(2);
-    // Caret segment is 24px wide (w-6) and carries the aria-label.
+    // Caret segment is 20px wide (w-5) and carries the aria-label.
     const caret = screen.getByRole("button", { name: "Configure run command" });
-    expect(caret.className).toContain("w-6");
+    expect(caret.className).toContain("w-5");
   });
 });

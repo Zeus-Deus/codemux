@@ -6,6 +6,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
+import {
+  BAND_CONTROL_HOVER,
+  BAND_CONTROL_RADIUS,
+} from "@/components/layout/titlebar-control-style";
 import { useActiveWorkspaceProjectRoot } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { cn } from "@/lib/utils";
@@ -88,26 +92,27 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
     // configure lives only behind the caret, matching the IDE launcher's
     // [icon][caret] shape.
     //
-    // Mock-faithful restyle (`.design/top-bar.dc.html`, "Set Run split
-    // icon button"): ONE bordered/backgrounded container (border-border +
-    // bg-secondary/50, the same chip tokens the compact IDE launcher chip
-    // already uses in this bar) with the two segments transparent inside
-    // it, rather than two independently-bordered halves. The inline
-    // keyboard-shortcut badge is gone — the shortcut now lives in the
-    // main segment's tooltip instead of eating horizontal space.
+    // The two segments carry no border, no resting fill and no divider —
+    // only a hover fill, exactly like the panel toggle at the other end of
+    // the band. A chip outline here would make Run the one boxed control
+    // in a row of borderless ones; without it the green play glyph and the
+    // semibold label are what mark it as the primary action. The inline
+    // keyboard-shortcut badge is gone — the shortcut lives in the main
+    // segment's tooltip instead of eating horizontal space.
     const mainTooltip = isConfigured
       ? `${runCommand} · Ctrl+Shift+G`
       : "Set Run · Ctrl+Shift+G";
     return (
-      <div className="flex h-7 shrink-0 items-center overflow-hidden rounded-[7px] border border-border bg-secondary/50">
+      <div className="flex h-7 shrink-0 items-center gap-[2px]">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               type="button"
               onClick={isConfigured ? handleRun : handleConfigure}
               className={cn(
-                "flex h-full items-center gap-1.5 px-[9px] text-[12px] font-semibold text-foreground",
-                "transition-colors duration-150 hover:bg-secondary",
+                "flex h-7 items-center gap-1.5 px-2 text-xs font-semibold text-foreground",
+                BAND_CONTROL_RADIUS,
+                BAND_CONTROL_HOVER,
                 !isConfigured && "text-muted-foreground",
               )}
             >
@@ -120,8 +125,6 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
           </TooltipContent>
         </Tooltip>
 
-        <div className="h-4 w-px shrink-0 bg-border" aria-hidden />
-
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -129,8 +132,9 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               onClick={handleConfigure}
               aria-label="Configure run command"
               className={cn(
-                "flex h-full w-6 items-center justify-center text-muted-foreground",
-                "transition-colors duration-150 hover:bg-secondary hover:text-foreground",
+                "flex h-7 w-5 items-center justify-center text-muted-foreground",
+                BAND_CONTROL_RADIUS,
+                BAND_CONTROL_HOVER,
               )}
             >
               <ChevronDown className="h-3 w-3" />

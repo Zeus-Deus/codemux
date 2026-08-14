@@ -23,6 +23,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { PresetIcon } from "@/components/icons/preset-icon";
+import { BAND_CONTROL_RADIUS } from "@/components/layout/titlebar-control-style";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
 import { cn } from "@/lib/utils";
@@ -368,7 +369,8 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
           aria-label="Launch an agent"
           data-testid="agent-launcher-trigger"
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors",
+            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"
               : "text-muted-foreground hover:bg-accent hover:text-foreground",
@@ -531,7 +533,8 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           data-testid="draft-agent-launcher-trigger"
           disabled={draft.promoting}
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition-colors",
+            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"
               : "text-muted-foreground hover:bg-accent hover:text-foreground",

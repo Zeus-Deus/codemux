@@ -314,21 +314,70 @@
 
 /* The GUI titlebar remains fully transparent by default. When runtime
  * geometry says its controls physically intersect the centered chat column
- * AND that transcript has scrolled underneath, only the two 32px control
- * groups lift above it. This is an opaque, borderless surface—not a fading
- * header—so the controls stay crisp without changing the empty drag region. */
-.titlebar-overlap-surface {
-  transition:
-    background-color 120ms ease-out,
-    box-shadow 120ms ease-out;
+ * AND that transcript has scrolled underneath, each control run lights a
+ * soft radial wash of the window background centred on itself.
+ *
+ * A wash, not a plate: there is no rectangle, no border and no shadow, so
+ * nothing reads as a floating card sitting on the conversation — the light
+ * just fades out in every direction until the transcript is untouched.
+ * Crucially each island lights only its own neighbourhood, so between the
+ * two runs the transcript still runs clean to the very top edge; there is
+ * no full-width layer anywhere in this treatment. */
+.titlebar-overlap-wash {
+  /* Positioning context + own stacking context, so the z-index: -1 wash
+     below tucks under this island's controls without falling behind the
+     app background painted by an ancestor. */
+  position: relative;
+  isolation: isolate;
 }
 
-[data-chat-overlap="true"] .titlebar-overlap-surface {
-  border-radius: calc(var(--radius) + 2px);
-  background: color-mix(in oklch, var(--background) 94%, var(--card));
-  box-shadow:
-    0 5px 16px color-mix(in oklch, var(--foreground) 10%, transparent),
-    inset 0 1px 0 color-mix(in oklch, var(--foreground) 7%, transparent);
+.titlebar-overlap-wash::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+/* Tab run. The islands are 32px tall inset 4px from the top of the 40px
+   band, so -4px pins the wash to the physical top of the window; it spills
+   past both island edges to give the fade room to resolve. */
+.titlebar-overlap-wash-start::before {
+  top: -4px;
+  left: -24px;
+  right: -24px;
+  height: 44px;
+  background: radial-gradient(
+    120% 150% at 50% 0%,
+    var(--background) 0%,
+    var(--background) 46%,
+    color-mix(in oklch, var(--background) 62%, transparent) 72%,
+    transparent 100%
+  );
+}
+
+/* Action run. Centred on the top-right corner and extended out to the
+   window's right edge (`--wash-right-extend` is set inline from the title
+   bar and equals the band's own right inset), so the panel toggle and the
+   native window buttons sit in the same light as the actions themselves
+   instead of being stranded on bare transcript. */
+.titlebar-overlap-wash-end::before {
+  top: -4px;
+  left: -28px;
+  right: calc(-1 * var(--wash-right-extend, 28px));
+  height: 48px;
+  background: radial-gradient(
+    155% 165% at 100% 0%,
+    var(--background) 0%,
+    var(--background) 50%,
+    color-mix(in oklch, var(--background) 60%, transparent) 74%,
+    transparent 100%
+  );
+}
+
+[data-chat-overlap="true"] .titlebar-overlap-wash::before {
+  opacity: 1;
 }
 
 /* Terminal lifecycle overlay (starting / migrating / failed). Opacity is

@@ -36,6 +36,11 @@ import { clampRightPanelWidth } from "@/lib/right-panel-width";
 import { panelClusterRight, topRightReserve } from "@/lib/titlebar-geometry";
 import { PaneActionButton } from "./right-panel/pane-actions";
 import {
+  BAND_ACTIVE_FILL,
+  BAND_CONTROL_HOVER,
+  BAND_CONTROL_RADIUS,
+} from "./titlebar-control-style";
+import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -134,7 +139,9 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
       : "Open in editor";
 
   return (
-    <div className="flex items-center">
+    // Compact keeps the band's 2px rhythm between the icon and its caret;
+    // the legacy shape's two halves are one joined chip, so no gap there.
+    <div className={cn("flex items-center", compact && "gap-[2px]")}>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
@@ -142,17 +149,19 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             onClick={() => defaultEditor && handleOpen(defaultEditor.id)}
             disabled={isLoading || !defaultEditor}
             className={cn(
-              "flex items-center gap-1 border border-r-0 bg-secondary/50 text-xs font-medium",
-              // `compact` (GUI-chrome only) is sized to match the Run
-              // split button's 28px bordered-chip shape (h-7, rounded-[7px],
-              // full-opacity border-border) so the two titlebar chips read
-              // as one family, per the mock. Non-compact (legacy bar) stays
-              // byte-identical to before.
+              "flex items-center gap-1",
+              // `compact` (GUI-chrome only) joins the band's one control
+              // family: 28px tall on the shared radius token, with no
+              // border and no resting fill — a hover fill is the whole
+              // treatment, same as the panel toggle. Non-compact (legacy
+              // bar) keeps its bordered chip and stays byte-identical.
+              !compact && "border border-r-0 bg-secondary/50",
+              "text-xs font-medium",
               compact
-                ? "h-7 w-7 justify-center rounded-l-[7px] border-border px-0"
+                ? cn("h-7 w-7 justify-center px-0", BAND_CONTROL_RADIUS)
                 : "h-6 rounded-l-md border-border/60 px-2",
-              "transition-colors duration-150",
-              "hover:bg-secondary hover:border-border",
+              compact ? BAND_CONTROL_HOVER : "transition-colors duration-150",
+              !compact && "hover:bg-secondary hover:border-border",
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
@@ -178,12 +187,14 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             type="button"
             disabled={isLoading}
             className={cn(
-              "flex items-center justify-center border bg-secondary/50 text-muted-foreground",
+              "flex items-center justify-center",
+              !compact && "border bg-secondary/50",
+              "text-muted-foreground",
               compact
-                ? "h-7 w-6 rounded-r-[7px] border-border"
+                ? cn("h-7 w-5", BAND_CONTROL_RADIUS)
                 : "h-6 w-5 rounded-r-md border-border/60",
-              "transition-colors duration-150",
-              "hover:bg-secondary hover:border-border hover:text-foreground",
+              compact ? BAND_CONTROL_HOVER : "transition-colors duration-150",
+              !compact && "hover:bg-secondary hover:border-border hover:text-foreground",
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
@@ -357,7 +368,12 @@ function PinnedPresetTile({
           data-testid={testId}
           aria-label={preset.name}
           className={cn(
-            "flex h-[27px] w-[27px] shrink-0 items-center justify-center rounded-lg transition-colors",
+            // 28px on the band's shared radius like every other control.
+            // The tinted treatments stay: these tiles are shortcuts to
+            // *launch* something, so unlike Run and the editor launcher
+            // they keep a fill that says which agent family they belong to.
+            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            BAND_CONTROL_RADIUS,
             variant === "ember"
               ? "border border-accent-ember/40 bg-accent-ember/14 text-accent-ember hover:bg-accent-ember/20"
               : "border border-border bg-secondary/50 text-muted-foreground hover:bg-secondary hover:text-foreground",
@@ -448,7 +464,7 @@ function TitleBarWorkspaceSlots() {
   if (!workspace) return null;
   return (
     <div
-      className="flex min-w-0 items-center gap-1"
+      className="flex min-w-0 items-center gap-[2px]"
       onPointerDown={(e) => e.stopPropagation()}
     >
       <TitleBarTabs workspace={workspace} />
@@ -473,12 +489,18 @@ function TitleBarDraftSlots() {
   if (!draft) return null;
   return (
     <div
-      className="flex min-w-0 items-center gap-1"
+      className="flex min-w-0 items-center gap-[2px]"
       onPointerDown={(e) => e.stopPropagation()}
     >
       <div
         data-testid="titlebar-draft-tab"
-        className="flex h-7 shrink-0 items-center gap-1.5 rounded-lg bg-background pl-2.5 pr-2.5 text-xs font-semibold text-foreground"
+        // The draft's stand-in for the active tab, so it wears exactly the
+        // active pill: same radius token, same 6% selected fill.
+        className={cn(
+          "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-xs font-semibold text-foreground",
+          BAND_CONTROL_RADIUS,
+          BAND_ACTIVE_FILL,
+        )}
       >
         <MessageSquare className="h-3 w-3" />
         <span>Agent Chat</span>
@@ -496,6 +518,15 @@ interface TitleBarProps {
 }
 
 const CHAT_READING_COLUMN_MAX_WIDTH = 792;
+
+/**
+ * Any measured sidebar width at or below this is the collapsed icon rail
+ * (3.25rem = 52px — see `SIDEBAR_WIDTH_ICON` in `ui/sidebar.tsx`), never an
+ * expanded sidebar: `SidebarRail` drag and every preset keep expanded widths
+ * far above it. Used to centre the floating sidebar toggle over the rail's
+ * icon column.
+ */
+const COLLAPSED_RAIL_MAX_WIDTH = 64;
 
 /**
  * Measure the real transcript and control rectangles. This keeps the raised
@@ -633,6 +664,33 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const { actionIslandRef, overlapsChat, workspaceIslandRef } =
     useTitlebarChatOverlap(guiChrome, transcriptVersion);
 
+  // The band's right inset, measured from the window's right edge.
+  //
+  // Panel closed, the workspace branch has to stop before the fixed panel
+  // cluster: `topRightReserve` clears that cluster with 6px of breath, and
+  // the extra 8px turns it into the single 14px gap the mock puts between
+  // the action run and the corner cluster. That is the one deliberate
+  // break in the band — everything inside a run is on a 2px rhythm, and
+  // the 14px is what tells the eye the corner cluster is a separate,
+  // fixed thing rather than the tail of the workspace's own controls.
+  // (Panel open, the band tracks the panel's edge; that offset is left
+  // exactly as it was.) A draft has no panel cluster to clear, only the
+  // native window buttons.
+  const bandRightInset = rightPanelOpen
+    ? panelBandWidth + 8
+    : guiChrome
+      ? topRightReserve(remoteClient, false) + 8
+      : remoteClient
+        ? 6
+        : 104;
+
+  // How far past its own right edge the action island's overlap wash
+  // reaches. Panel closed that is the whole remaining strip, so the panel
+  // toggle and the native window buttons are lit by the same wash as the
+  // actions. Panel open, the panel owns that strip and paints its own
+  // background, so the wash stays inside the workspace column.
+  const actionWashRightExtend = rightPanelOpen ? 28 : bandRightInset;
+
   if (!guiChrome && !draftGuiChrome) {
     return (
       <div
@@ -701,10 +759,24 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       )}
 
       {/* Sidebar control island. The sidebar surface itself now reaches the
-          top edge; its first local row reserves this small collision area. */}
+          top edge; its first local row reserves this small collision area.
+
+          The collapsed sidebar is a 52px icon rail (`--sidebar-width-icon`)
+          that centres its 28px controls, so the toggle joins that vertical
+          axis instead of hugging the window edge 6px to its left — the
+          floating button is the top of the rail's icon column and must
+          read as part of it. Beside an expanded sidebar there is no icon
+          axis to join and the toggle keeps its corner inset. */}
       <div
         data-testid="titlebar-sidebar-cluster"
-        className="pointer-events-auto absolute left-1.5 top-1 z-10 flex h-8 items-center"
+        className="pointer-events-auto absolute top-1 z-10 flex h-8 items-center"
+        style={{
+          left: `${
+            sidebarGapWidth <= COLLAPSED_RAIL_MAX_WIDTH
+              ? Math.max(6, (sidebarGapWidth - 28) / 2)
+              : 6
+          }px`,
+        }}
         onPointerDown={(e) => e.stopPropagation()}
       >
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
@@ -727,17 +799,13 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         )}
         style={{
           left: `${sidebarGapWidth + 6}px`,
-          right: rightPanelOpen
-            ? `${panelBandWidth + 8}px`
-            : // The workspace branch stops before the fixed panel cluster;
-              // a draft has no panel cluster to clear, only window buttons.
-              `${guiChrome ? topRightReserve(remoteClient, false) : remoteClient ? 6 : 104}px`,
+          right: `${bandRightInset}px`,
         }}
       >
         <div
           ref={workspaceIslandRef}
           data-testid="titlebar-workspace-island"
-          className="titlebar-overlap-surface pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
+          className="titlebar-overlap-wash titlebar-overlap-wash-start pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
           onPointerDown={(e) => e.stopPropagation()}
         >
           {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
@@ -759,14 +827,19 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         <div
           ref={actionIslandRef}
           data-testid="titlebar-action-island"
-          className="titlebar-overlap-surface pointer-events-auto flex h-8 shrink-0 items-center gap-1"
+          className="titlebar-overlap-wash titlebar-overlap-wash-end pointer-events-auto flex h-8 shrink-0 items-center gap-[2px]"
+          style={
+            {
+              "--wash-right-extend": `${actionWashRightExtend}px`,
+            } as React.CSSProperties
+          }
           onPointerDown={(e) => e.stopPropagation()}
         >
           {guiChrome ? (
             <>
               <div
                 data-testid="titlebar-primary-actions"
-                className="flex items-center gap-1"
+                className="flex items-center gap-[2px]"
               >
                 {activeWorkspaceId && (
                   <RunButton workspaceId={activeWorkspaceId} variant="split" />
@@ -778,9 +851,15 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
                   tracks the panel's left edge and the toggle must not. */}
               <div
                 data-testid="titlebar-utility-actions"
-                className="ml-1 flex items-center gap-0.5"
+                // Same 2px as the primary run and no leading margin: the
+                // mock has one uninterrupted action run, with the only
+                // real gap being the 14px before the fixed corner cluster.
+                className="flex items-center gap-[2px]"
               >
-                <ResourceMonitor variant="toolbar" />
+                {/* Ghost, not the bordered toolbar chip: the band is one
+                    frameless family, and this glyph sits mid-run between
+                    the equally frameless IDE launcher and panel toggle. */}
+                <ResourceMonitor variant="ghost" />
               </div>
             </>
           ) : (
