@@ -1232,7 +1232,7 @@ async fn push_mcp_refresh(
     session: &Arc<ClaudeSession>,
     registry: &crate::mcp::registry::McpRegistry,
 ) {
-    let tools = registry.list_all_tools().await;
+    let tools = collect_shared_tools_for_claude(registry).await;
     let entries: Vec<super::protocol::McpToolEntry> = tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1278,7 +1278,7 @@ async fn collect_mcp_tools(
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let tools = registry.list_all_tools().await;
+    let tools = collect_shared_tools_for_claude(registry).await;
     tools
         .into_iter()
         .map(|t| super::protocol::McpToolEntry {
@@ -1289,6 +1289,18 @@ async fn collect_mcp_tools(
             server_id: t.server_id,
         })
         .collect()
+}
+
+async fn collect_shared_tools_for_claude(
+    registry: &crate::mcp::registry::McpRegistry,
+) -> Vec<crate::mcp::runtime::McpTool> {
+    registry
+        .list_all_tools_excluding_sources(&[
+            crate::mcp::McpConfigSource::ClaudeUser,
+            crate::mcp::McpConfigSource::ClaudeLocal,
+            crate::mcp::McpConfigSource::ClaudeProject,
+        ])
+        .await
 }
 
 /// Format a tool result payload the way Anthropic's MCP SDK expects:

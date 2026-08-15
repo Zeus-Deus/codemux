@@ -132,10 +132,43 @@ pub struct ThreadStartParams {
     /// "danger-full-access"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Provider-neutral tools supplied by Codemux for this thread. Codex
+    /// persists these definitions with the thread, so resumed threads keep
+    /// the same tool surface while calls are routed through the live registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     /// Whether to subscribe to raw experimental events. We always send
     /// `false` — the canonical event schema is synthesised from the
     /// documented notifications.
     pub experimental_raw_events: bool,
+}
+
+/// A function-style dynamic tool accepted by `thread/start`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum DynamicToolSpec {
+    /// A top-level callable function. Codemux uses the registry's stable,
+    /// server-prefixed tool name to avoid collisions across MCP servers.
+    Function {
+        name: String,
+        description: String,
+        #[serde(rename = "inputSchema")]
+        input_schema: Value,
+        #[serde(rename = "deferLoading", skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+}
+
+/// Parameters Codex sends with an `item/tool/call` server request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolCallParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub namespace: Option<String>,
+    pub tool: String,
+    pub arguments: Value,
 }
 
 /// Parameters for the `thread/resume` JSON-RPC method. Shares most fields
@@ -1910,5 +1943,26 @@ mod tests {
             }
             other => panic!("expected TurnPlanUpdated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn thread_start_serializes_dynamic_function_tools() {
+        let params = ThreadStartParams {
+            dynamic_tools: Some(vec![DynamicToolSpec::Function {
+                name: "codemux_mcp__demo__search".into(),
+                description: "Search".into(),
+                input_schema: json!({"type": "object"}),
+                defer_loading: None,
+            }]),
+            experimental_raw_events: false,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["dynamicTools"][0]["type"], "function");
+        assert_eq!(
+            value["dynamicTools"][0]["name"],
+            "codemux_mcp__demo__search"
+        );
+        assert_eq!(value["dynamicTools"][0]["inputSchema"]["type"], "object");
     }
 }

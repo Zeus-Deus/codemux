@@ -41,12 +41,16 @@ pub struct OpenCodeProviderConfig {
     /// Capacity of the broadcast channel that fans canonical events
     /// out to subscribers. Mirrors the Claude provider's default.
     pub event_channel_capacity: usize,
+    /// Process-wide MCP registry exposed to OpenCode through Codemux's
+    /// authenticated loopback gateway.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 impl Default for OpenCodeProviderConfig {
     fn default() -> Self {
         Self {
             event_channel_capacity: 1024,
+            mcp_registry: None,
         }
     }
 }
@@ -68,6 +72,7 @@ pub struct OpenCodeAgentProvider {
     manager: Arc<OpenCodeServerManager>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<OpenCodeSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    mcp_registry: Option<crate::mcp::registry::McpRegistry>,
     /// Token accounting keyed by **OpenCode session id**, outliving the
     /// `OpenCodeSession` objects that use it.
     ///
@@ -97,6 +102,7 @@ impl OpenCodeAgentProvider {
             manager,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            mcp_registry: config.mcp_registry,
             usage_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -219,6 +225,7 @@ impl AgentProvider for OpenCodeAgentProvider {
         };
         let session = OpenCodeSession::start(
             self.manager.clone(),
+            self.mcp_registry.clone(),
             thread_id.clone(),
             input.model.clone(),
             input.effort.clone(),

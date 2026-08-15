@@ -34,6 +34,7 @@ use crate::agent_provider::types::{
     ApprovalDecision, ImageInput, ProviderKind, ProviderSessionId, RequestId, SessionStatus,
     ThreadId, TurnId,
 };
+use crate::mcp::registry::McpRegistry;
 
 use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
 use super::protocol::{
@@ -90,6 +91,7 @@ impl OpenCodeSession {
     /// emits `SessionConfigured` on the provider's broadcast channel.
     pub async fn start(
         manager: Arc<OpenCodeServerManager>,
+        mcp_registry: Option<McpRegistry>,
         thread_id: ThreadId,
         initial_model: Option<String>,
         initial_variant: Option<String>,
@@ -120,6 +122,24 @@ impl OpenCodeSession {
                 message: "failed to build HTTP client".into(),
                 source: Some(err.to_string()),
             })?;
+
+        // Shared MCP is best-effort: OpenCode only grew the runtime
+        // `POST /mcp` endpoint in 1.18.18, and older binaries must still be
+        // able to start a session — just without Codemux-configured servers.
+        // Failures surface as a RuntimeWarning instead of killing the session.
+        if let Some(registry) = mcp_registry.as_ref() {
+            if let Err(error) = attach_mcp_gateway(&http, &server_handle, registry).await {
+                eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
+                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(thread_id.clone()),
+                    message: format!(
+                        "Codemux MCP servers are unavailable in this OpenCode session \
+                         (gateway attach failed: {error}). Update OpenCode to 1.18.18 or later."
+                    ),
+                    original_payload: None,
+                });
+            }
+        }
 
         // Best-effort resume: readopt the persisted server-side session id when
         // it still exists on the OpenCode server (it persists sessions on disk,
@@ -506,6 +526,55 @@ impl OpenCodeSession {
     }
 }
 
+/// Register Codemux's process-wide MCP facade with the live OpenCode server.
+/// The remote config is runtime-only: no provider config files are rewritten,
+/// and the bearer credential never leaves this process.
+async fn attach_mcp_gateway(
+    http: &reqwest::Client,
+    server: &OpenCodeServerHandle,
+    registry: &McpRegistry,
+) -> Result<(), ProviderError> {
+    let connection = registry
+        .gateway_connection()
+        .await
+        .map_err(|message| ProviderError::ProcessError {
+            message: "failed to start Codemux MCP gateway".into(),
+            source: Some(message),
+        })?;
+    let url = format!("{}/mcp", server.base_url.trim_end_matches('/'));
+    let response = http
+        .post(url)
+        .basic_auth("opencode", Some(&server.server_password))
+        .json(&serde_json::json!({
+            "name": "codemux",
+            "config": {
+                "type": "remote",
+                "url": connection.url,
+                "enabled": true,
+                "oauth": false,
+                "headers": {
+                    "Authorization": format!("Bearer {}", connection.bearer_token)
+                }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|error| ProviderError::RpcError {
+            message: format!("opencode_mcp_attach_send_failed: {error}"),
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(ProviderError::RpcError {
+            message: format!(
+                "opencode_mcp_attach_http_status_{}: {detail}",
+                status.as_u16()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Pull the OpenCode server-side session id out of the resume cursor
 /// `ensure_live_session` threads in (`{"resume": <session_id>}`). Returns
 /// `None` for an absent/mis-shaped cursor so the caller starts fresh.
@@ -629,6 +698,142 @@ mod tests {
     use super::*;
     use crate::agent_provider::types::{ImageInput, ThreadId};
     use mockito::Server;
+
+    #[tokio::test]
+    async fn attaches_shared_gateway_through_opencode_runtime_api() {
+        let mut server = Server::new_async().await;
+        let attach = server
+            .mock("POST", "/mcp")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "codemux",
+                "config": {"type": "remote", "enabled": true, "oauth": false}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let handle = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "pw".into(),
+        };
+        attach_mcp_gateway(
+            &reqwest::Client::new(),
+            &handle,
+            &McpRegistry::new(),
+        )
+        .await
+        .unwrap();
+        attach.assert_async().await;
+    }
+
+    /// An OpenCode binary without the runtime `POST /mcp` endpoint (pre
+    /// 1.18.18) must still get a working session — just without Codemux's
+    /// shared MCP servers — with the loss reported as a RuntimeWarning.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(opencode_path)]
+    async fn session_starts_when_gateway_attach_is_unsupported() {
+        use super::super::manager::write_fake_opencode_binary;
+
+        let mut backend = Server::new_async().await;
+        let attach = backend
+            .mock("POST", "/mcp")
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+        let create = backend
+            .mock("POST", "/session")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"ses_no_mcp"}"#)
+            .create_async()
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fake_opencode_binary(tmp.path());
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: serial_test serialises this against every other opencode
+        // test that touches PATH / FAKE_OPENCODE_URL.
+        unsafe {
+            std::env::set_var("PATH", tmp.path());
+            std::env::set_var("FAKE_OPENCODE_URL", backend.url());
+        }
+
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let (tx, mut rx) = broadcast::channel(64);
+        let started = OpenCodeSession::start(
+            manager.clone(),
+            Some(McpRegistry::new()),
+            ThreadId("t-mcp-degraded".into()),
+            None,
+            None,
+            None,
+            tx,
+            None,
+        )
+        .await;
+
+        unsafe {
+            std::env::set_var("PATH", original_path);
+            std::env::remove_var("FAKE_OPENCODE_URL");
+        }
+        manager.stop().await;
+
+        let session = started.expect("session must start without the shared MCP gateway");
+        assert_eq!(session.provider_session_id.0, "ses_no_mcp");
+        attach.assert_async().await;
+        create.assert_async().await;
+        let mut warned = false;
+        while let Ok(event) = rx.try_recv() {
+            if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = event {
+                warned |= message.contains("gateway attach failed");
+            }
+        }
+        assert!(warned, "a failed attach must surface as a RuntimeWarning");
+        session.shutdown().await;
+    }
+
+    /// Developer smoke test against the installed OpenCode binary. Ignored in
+    /// CI because OpenCode is an optional external provider.
+    #[tokio::test]
+    #[ignore]
+    async fn live_opencode_server_connects_codemux_gateway() {
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let registry = McpRegistry::new();
+        let (tx, _rx) = broadcast::channel(64);
+        let session = OpenCodeSession::start(
+            manager.clone(),
+            Some(registry.clone()),
+            ThreadId("live-mcp-smoke".into()),
+            None,
+            None,
+            None,
+            tx,
+            None,
+        )
+        .await
+        .expect("OpenCode session should start with shared MCP gateway");
+        let handle = manager.ensure_running().await.unwrap();
+        // A second chat session re-registers the same facade; this must be an
+        // idempotent update rather than a duplicate-name failure.
+        attach_mcp_gateway(&reqwest::Client::new(), &handle, &registry)
+            .await
+            .expect("reattaching the gateway should be idempotent");
+        let status: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/mcp", handle.base_url.trim_end_matches('/')))
+            .basic_auth("opencode", Some(&handle.server_password))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["codemux"]["status"], "connected", "{status}");
+        session.shutdown().await;
+        manager.stop().await;
+    }
 
     /// Helper: spawn a manager whose `ensure_running` returns a
     /// pre-built handle pointing at the supplied mock URL. Bypasses
@@ -952,6 +1157,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let started = OpenCodeSession::start(
             manager.clone(),
+            None,
             ThreadId("t-respawn".into()),
             None,
             None,

@@ -61,6 +61,9 @@ pub struct CodexProviderConfig {
     /// Client identification to report at `initialize` time. Affects
     /// Codex's server-side logs/tracing only.
     pub client_info: ClientInfo,
+    /// Process-wide MCP registry whose tools are exposed as Codex dynamic
+    /// tools. `None` keeps the adapter usable in isolated tests.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 impl Default for CodexProviderConfig {
@@ -74,6 +77,7 @@ impl Default for CodexProviderConfig {
                 title: "Codemux".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
+            mcp_registry: None,
         }
     }
 }
@@ -102,6 +106,7 @@ impl CodexAgentProvider {
             codex_binary: self.config.codex_binary.clone(),
             codex_home: self.config.codex_home.clone(),
             client_info: self.config.client_info.clone(),
+            mcp_registry: self.config.mcp_registry.clone(),
         }
     }
 

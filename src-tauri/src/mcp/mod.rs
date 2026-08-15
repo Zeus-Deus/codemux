@@ -7,6 +7,8 @@
 // Stage 2 will wire `JsonRpcChild` against the discovered specs.
 
 pub mod codemux_self;
+pub mod gateway;
+pub mod http_client;
 pub mod parser;
 pub mod paths;
 pub mod registry;
@@ -38,15 +40,20 @@ pub enum McpConfigSource {
     CursorUser,
     /// `<project>/.cursor/mcp.json`
     CursorProject,
+    /// `~/.codex/config.toml`
+    CodexUser,
+    /// `~/.config/opencode/opencode.json{,c}`
+    OpenCodeUser,
+    /// `<project>/opencode.json{,c}`
+    OpenCodeProject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     Stdio,
-    /// HTTP transport is parsed but Stage 2 only spawns stdio servers; the
-    /// variant exists so we don't lose the user's config when surfacing the
-    /// list. Defer real HTTP support to v2.
+    /// Streamable HTTP (and legacy `sse` entries where the endpoint also
+    /// accepts POST requests).
     Http,
 }
 
@@ -109,6 +116,9 @@ pub fn source_rank(s: McpConfigSource) -> u8 {
         McpConfigSource::ClaudeProject => 5,
         McpConfigSource::CursorUser => 6,
         McpConfigSource::CursorProject => 7,
+        McpConfigSource::CodexUser => 8,
+        McpConfigSource::OpenCodeUser => 9,
+        McpConfigSource::OpenCodeProject => 10,
     }
 }
 
@@ -130,7 +140,14 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
     use std::collections::HashMap as Map;
 
     // (name, command, args, env-as-sorted-pairs) → index in `out`.
-    type Key = (String, String, Vec<String>, Vec<(String, String)>);
+    type Key = (
+        String,
+        String,
+        Vec<String>,
+        Vec<(String, String)>,
+        u8,
+        Vec<(String, String)>,
+    );
     let mut by_key: Map<Key, usize> = Map::new();
     let mut out: Vec<McpServerConfig> = Vec::with_capacity(servers.len());
 
@@ -148,7 +165,37 @@ pub fn dedupe_servers(servers: Vec<McpServerConfig>) -> Vec<McpServerConfig> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env_pairs.sort();
-        let key: Key = (srv.name.clone(), srv.command.clone(), srv.args.clone(), env_pairs);
+        let mut http_headers = Vec::new();
+        for field in ["headers", "http_headers", "env_http_headers"] {
+            if let Some(values) = srv.raw.get(field).and_then(serde_json::Value::as_object) {
+                for (name, value) in values {
+                    http_headers.push((
+                        name.to_ascii_lowercase(),
+                        value.as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(env_name) = srv
+            .raw
+            .get("bearer_token_env_var")
+            .and_then(serde_json::Value::as_str)
+        {
+            http_headers.push(("authorization".into(), format!("env:{env_name}")));
+        }
+        http_headers.sort();
+        let transport = match srv.transport {
+            McpTransport::Stdio => 0,
+            McpTransport::Http => 1,
+        };
+        let key: Key = (
+            srv.name.clone(),
+            srv.command.clone(),
+            srv.args.clone(),
+            env_pairs,
+            transport,
+            http_headers,
+        );
 
         if let Some(&idx) = by_key.get(&key) {
             // Merge: append the additional source(s) onto the canonical

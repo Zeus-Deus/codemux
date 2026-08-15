@@ -2237,7 +2237,10 @@ export type McpConfigSource =
   | "claudeLocal"
   | "claudeProject"
   | "cursorUser"
-  | "cursorProject";
+  | "cursorProject"
+  | "codexUser"
+  | "openCodeUser"
+  | "openCodeProject";
 
 export type McpTransport = "stdio" | "http";
 

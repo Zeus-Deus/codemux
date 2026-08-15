@@ -588,6 +588,12 @@ function sourceHeading(source: McpConfigSource): string {
       return "Cursor · User";
     case "cursorProject":
       return "Cursor · Project";
+    case "codexUser":
+      return "Codex · User";
+    case "openCodeUser":
+      return "OpenCode · User";
+    case "openCodeProject":
+      return "OpenCode · Project";
   }
 }
 
@@ -600,6 +606,9 @@ const SOURCE_ORDER: McpConfigSource[] = [
   "claudeProject",
   "cursorUser",
   "cursorProject",
+  "codexUser",
+  "openCodeUser",
+  "openCodeProject",
 ];
 
 interface ServerGroupData {

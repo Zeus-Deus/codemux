@@ -52,6 +52,15 @@ pub fn enumerate_mcp_paths_with_home(
         all.push((home.join(".claude.json"), McpConfigSource::ClaudeUser));
         // Cursor — same shape as Claude's `mcpServers`. Surface only.
         all.push((home.join(".cursor").join("mcp.json"), McpConfigSource::CursorUser));
+        all.push((home.join(".codex").join("config.toml"), McpConfigSource::CodexUser));
+        all.push((
+            home.join(".config").join("opencode").join("opencode.json"),
+            McpConfigSource::OpenCodeUser,
+        ));
+        all.push((
+            home.join(".config").join("opencode").join("opencode.jsonc"),
+            McpConfigSource::OpenCodeUser,
+        ));
     }
 
     if let Some(root) = project_root {
@@ -59,6 +68,8 @@ pub fn enumerate_mcp_paths_with_home(
         // Claude Code project scope is at the repo root, NOT under .claude/.
         all.push((root.join(".mcp.json"), McpConfigSource::ClaudeProject));
         all.push((root.join(".cursor").join("mcp.json"), McpConfigSource::CursorProject));
+        all.push((root.join("opencode.json"), McpConfigSource::OpenCodeProject));
+        all.push((root.join("opencode.jsonc"), McpConfigSource::OpenCodeProject));
     }
 
     // Skip non-existent paths — discovery is silent.

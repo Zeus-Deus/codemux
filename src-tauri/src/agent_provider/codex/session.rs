@@ -21,9 +21,11 @@ use crate::agent_provider::{
     PlanAuthMode, SessionStatus, ThreadId, TurnId, UsageBaseline,
 };
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
+use crate::mcp::registry::McpRegistry;
 
 use super::protocol::{
-    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo,
+    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, DynamicToolCallParams,
+    DynamicToolSpec,
     GetAccountRateLimitsResponse, InitializeParams,
     NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadRollbackParams,
     ThreadStartParams, ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams,
@@ -57,6 +59,8 @@ pub struct CodexSpawnConfig {
     pub codex_home: Option<PathBuf>,
     /// Client identification block to hand Codex at `initialize` time.
     pub client_info: ClientInfo,
+    /// Shared MCP registry used to publish and execute dynamic tools.
+    pub mcp_registry: Option<McpRegistry>,
 }
 
 /// Runtime-mutable state inside a [`CodexSession`].
@@ -264,6 +268,35 @@ impl CodexSession {
                 message: format!("initialized notification failed: {e}"),
             })?;
 
+        // Capture the live registry tool surface once for thread/start.
+        // Codex persists dynamic tool definitions in the rollout, while the
+        // request handler below always dispatches through the live registry.
+        let dynamic_tools = match spawn.mcp_registry.as_ref() {
+            Some(registry) => {
+                let tools = if spawn.codex_home.is_none() {
+                    registry
+                        .list_all_tools_excluding_source(
+                            crate::mcp::McpConfigSource::CodexUser,
+                        )
+                        .await
+                } else {
+                    registry.list_all_tools().await
+                };
+                Some(
+                    tools
+                        .into_iter()
+                        .map(|tool| DynamicToolSpec::Function {
+                            name: codex_dynamic_tool_name(&tool.prefixed_name),
+                            description: tool.description.unwrap_or_default(),
+                            input_schema: tool.input_schema,
+                            defer_loading: None,
+                        })
+                        .collect(),
+                )
+            }
+            None => None,
+        };
+
         // Best-effort probes. Failures are non-fatal — we log via
         // RuntimeWarning and continue.
         match child.request("model/list", json!({})).await {
@@ -408,7 +441,7 @@ impl CodexSession {
                                     ),
                                     original_payload: None,
                                 });
-                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?
+                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?
                             }
                             Err(e) => {
                                 return Err(ProviderError::RpcError {
@@ -417,10 +450,10 @@ impl CodexSession {
                             }
                         }
                     }
-                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?,
+                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
                 }
             }
-            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?,
+            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode, dynamic_tools.clone()).await?,
         };
 
         // --- assemble session handle ----------------------------------------
@@ -468,6 +501,8 @@ impl CodexSession {
         );
         let requests_task = spawn_incoming_requests_task(
             Arc::clone(&session),
+            Arc::clone(&child),
+            spawn.mcp_registry.clone(),
             incoming_rx,
             event_tx.clone(),
             shutdown_tx.subscribe(),
@@ -1016,6 +1051,7 @@ async fn start_fresh_thread(
     model: Option<String>,
     permission_mode: Option<String>,
     fast_mode: bool,
+    dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> Result<String, ProviderError> {
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
@@ -1031,6 +1067,7 @@ async fn start_fresh_thread(
         collaboration_mode: None,
         approval_policy,
         sandbox,
+        dynamic_tools,
         experimental_raw_events: false,
     };
     let params_value = serde_json::to_value(&params).unwrap();
@@ -1178,6 +1215,8 @@ fn spawn_notifications_task(
 /// JSON-RPC id for later resolution, and emit a `RequestOpened` event.
 fn spawn_incoming_requests_task(
     session: Arc<CodexSession>,
+    child: Arc<JsonRpcChild>,
+    mcp_registry: Option<McpRegistry>,
     mut incoming: tokio::sync::mpsc::Receiver<crate::json_rpc_child::IncomingRequest>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -1189,6 +1228,17 @@ fn spawn_incoming_requests_task(
                 maybe_req = incoming.recv() => {
                     let Some(req) = maybe_req else { break; };
                     let msg = ServerRequestMessage::from_raw(&req.method, req.params.clone());
+                    if let ServerRequestMessage::ToolCall(params) = msg {
+                        let result = handle_dynamic_tool_call(mcp_registry.as_ref(), params).await;
+                        if let Err(error) = child.respond(req.id, Ok(result)).await {
+                            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                thread_id: Some(session.thread_id.clone()),
+                                message: format!("failed to answer Codex dynamic tool call: {error}"),
+                                original_payload: None,
+                            });
+                        }
+                        continue;
+                    }
                     let request_id = mint_request_id();
                     {
                         let mut state = session.state.lock().await;
@@ -1200,6 +1250,89 @@ fn spawn_incoming_requests_task(
             }
         }
     })
+}
+
+/// Execute a Codex dynamic-tool request through the process-wide registry and
+/// translate the MCP content envelope into Codex's input-content shape.
+async fn handle_dynamic_tool_call(registry: Option<&McpRegistry>, raw: Value) -> Value {
+    let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
+    let (success, result) = match (registry, parsed) {
+        (Some(registry), Ok(call)) => match registry
+            .dispatch_tool_call(&registry_tool_name(&call.tool), call.arguments)
+            .await
+        {
+            Ok(result) => {
+                let success = !result
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (success, result)
+            }
+            Err(message) => (
+                false,
+                json!({ "content": [{ "type": "text", "text": message }] }),
+            ),
+        },
+        (None, _) => (
+            false,
+            json!({ "content": [{ "type": "text", "text": "Codemux MCP registry is unavailable" }] }),
+        ),
+        (_, Err(error)) => (
+            false,
+            json!({ "content": [{ "type": "text", "text": format!("invalid dynamic tool call: {error}") }] }),
+        ),
+    };
+
+    let content_items = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(mcp_content_to_codex).collect::<Vec<_>>())
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| vec![json!({ "type": "inputText", "text": result.to_string() })]);
+    json!({ "contentItems": content_items, "success": success })
+}
+
+/// Codex reserves the `mcp__` prefix for MCP servers configured directly in
+/// Codex. Shared tools arrive through the dynamic-tool API instead, so expose
+/// a distinct, reversible namespace while keeping the registry's canonical
+/// dispatch key provider-neutral.
+fn codex_dynamic_tool_name(registry_name: &str) -> String {
+    match registry_name.strip_prefix("mcp__") {
+        Some(name) => format!("codemux_mcp__{name}"),
+        None => format!("codemux_mcp__{registry_name}"),
+    }
+}
+
+fn registry_tool_name(codex_name: &str) -> String {
+    match codex_name.strip_prefix("codemux_mcp__") {
+        Some(name) => format!("mcp__{name}"),
+        None => codex_name.to_owned(),
+    }
+}
+
+fn mcp_content_to_codex(item: &Value) -> Value {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => json!({
+            "type": "inputText",
+            "text": item.get("text").and_then(Value::as_str).unwrap_or_default()
+        }),
+        Some("image") => binary_mcp_content(item, "inputImage", "imageUrl"),
+        Some("audio") => binary_mcp_content(item, "inputAudio", "audioUrl"),
+        _ => json!({ "type": "inputText", "text": item.to_string() }),
+    }
+}
+
+fn binary_mcp_content(item: &Value, kind: &str, url_field: &str) -> Value {
+    let data = item.get("data").and_then(Value::as_str).unwrap_or_default();
+    let mime = item
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream");
+    let url = format!("data:{mime};base64,{data}");
+    match url_field {
+        "imageUrl" => json!({ "type": kind, "imageUrl": url }),
+        _ => json!({ "type": kind, "audioUrl": url }),
+    }
 }
 
 /// Background task: watch for child process exit. If the child dies
@@ -1449,5 +1582,47 @@ mod tests {
         restore_queued_position(&mut q, "c", 9);
         let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn mcp_binary_content_becomes_codex_data_urls() {
+        assert_eq!(
+            mcp_content_to_codex(&json!({
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "YWJj"
+            })),
+            json!({"type": "inputImage", "imageUrl": "data:image/png;base64,YWJj"})
+        );
+    }
+
+    #[test]
+    fn codex_dynamic_tool_alias_is_reversible_and_not_reserved() {
+        let registry_name = "mcp__omarchy-kb__search_documentation";
+        let codex_name = codex_dynamic_tool_name(registry_name);
+        assert_eq!(codex_name, "codemux_mcp__omarchy-kb__search_documentation");
+        assert!(!codex_name.starts_with("mcp__"));
+        assert_eq!(registry_tool_name(&codex_name), registry_name);
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_call_without_registry_returns_failed_response() {
+        let response = handle_dynamic_tool_call(
+            None,
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "mcp__demo__search",
+                "arguments": {}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], false);
+        assert!(response["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("registry is unavailable"));
     }
 }

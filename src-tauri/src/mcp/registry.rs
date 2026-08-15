@@ -25,10 +25,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, OnceCell};
 
 use super::codemux_self::codemux_self_config;
-use super::parser::{parse_claude_wrapped_config, parse_mcp_config_file};
+use super::parser::{
+    parse_claude_wrapped_config, parse_codex_config_file, parse_mcp_config_file,
+    parse_opencode_config_file,
+};
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{
     aggregate_tools, apply_tool_cap, start_mcp_server, CappedTools, McpServerHandle,
@@ -98,6 +101,9 @@ pub struct McpRegistry {
     /// touched is already `Starting`/`Running`, so the second prime is the
     /// cheap no-op the design wants.
     prime_lock: Arc<Mutex<()>>,
+    /// Lazily-started authenticated loopback gateway shared by provider
+    /// adapters that need a remote MCP URL (OpenCode and future providers).
+    gateway: Arc<OnceCell<Arc<super::gateway::McpGatewayRuntime>>>,
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -151,6 +157,7 @@ impl Default for McpRegistry {
             })),
             status_tx,
             prime_lock: Arc::new(Mutex::new(())),
+            gateway: Arc::new(OnceCell::new()),
         }
     }
 }
@@ -158,6 +165,21 @@ impl Default for McpRegistry {
 impl McpRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return the process-wide authenticated MCP gateway, starting it on an
+    /// ephemeral loopback port on first use.
+    pub async fn gateway_connection(
+        &self,
+    ) -> Result<super::gateway::McpGatewayConnection, String> {
+        let registry = self.clone();
+        let runtime = self
+            .gateway
+            .get_or_try_init(|| async move {
+                super::gateway::start_gateway(registry).await.map(Arc::new)
+            })
+            .await?;
+        Ok(runtime.connection())
     }
 
     /// Mirror the frontend's disabled-set into the registry. The next
@@ -251,6 +273,7 @@ impl McpRegistry {
                 server_info: None,
                 started_at_ms: Some(starting_ms),
                 child: None,
+                remote: None,
                 stderr_tail: None,
             };
             inner.handles.insert(id.clone(), placeholder);
@@ -297,6 +320,7 @@ impl McpRegistry {
                 None => return Err(format!("no such server: {id}")),
             };
             let child = handle.child.take();
+            handle.remote.take();
             handle.status = McpServerStatus::Stopped;
             handle.tools.clear();
             handle.server_info = None;
@@ -358,8 +382,7 @@ impl McpRegistry {
         let _prime_guard = self.prime_lock.lock().await;
         let configs = discover_configs(project_root);
         for cfg in configs {
-            // Skip non-stdio for Stage 2 (HTTP support deferred).
-            if !matches!(cfg.transport, super::McpTransport::Stdio) {
+            if cfg.disabled {
                 continue;
             }
             let _ = self.ensure_started(app, cfg).await;
@@ -386,6 +409,71 @@ impl McpRegistry {
     /// the Settings UI) needs to know whether the cap was triggered.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
         self.list_all_tools_with_cap_info().await.tools
+    }
+
+    /// Running tools except servers already native to `source`. This lets a
+    /// provider keep its own authenticated/native MCPs while Codemux injects
+    /// only the tools it would otherwise be missing.
+    pub async fn list_all_tools_excluding_source(
+        &self,
+        source: McpConfigSource,
+    ) -> Vec<McpTool> {
+        self.list_all_tools_excluding_sources(&[source]).await
+    }
+
+    /// Running tools except servers already native to any of `sources`.
+    /// Providers with multiple configuration scopes (Claude user/local/
+    /// project, for example) use this to avoid duplicate tool surfaces while
+    /// preserving provider-owned authentication such as OAuth sessions.
+    pub async fn list_all_tools_excluding_sources(
+        &self,
+        sources: &[McpConfigSource],
+    ) -> Vec<McpTool> {
+        let inner = self.inner.lock().await;
+        let mut tools = Vec::new();
+        for handle in inner.handles.values() {
+            let provider_native = handle
+                .config
+                .sources
+                .iter()
+                .any(|source| sources.contains(source));
+            if handle.status.is_running() && !provider_native {
+                tools.extend(handle.tools.iter().cloned());
+            }
+        }
+        super::runtime::apply_tool_cap(tools).tools
+    }
+
+    /// Stage a running server with a single tool, for tests in sibling
+    /// modules (the gateway) that need a populated registry without
+    /// spawning real MCP children.
+    #[cfg(test)]
+    pub(crate) async fn insert_running_server_for_test(
+        &self,
+        id: &str,
+        sources: Vec<McpConfigSource>,
+    ) {
+        let config = McpServerConfig {
+            id: id.into(),
+            name: id.into(),
+            sources,
+            command: "/bin/true".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            disabled: false,
+            transport: super::McpTransport::Stdio,
+            raw: serde_json::Value::Null,
+        };
+        let mut handle = McpServerHandle::discovered(config);
+        handle.status = McpServerStatus::Running { tool_count: 1 };
+        handle.tools.push(McpTool {
+            name: "tool".into(),
+            prefixed_name: format!("mcp__{id}__tool"),
+            description: None,
+            input_schema: serde_json::json!({}),
+            server_id: id.into(),
+        });
+        self.inner.lock().await.handles.insert(id.into(), handle);
     }
 
     /// Like [`Self::list_all_tools`] but returns the full
@@ -436,11 +524,12 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let (raw_name, child) = {
+        let (raw_name, child, remote) = {
             let inner = self.inner.lock().await;
             let mut found: Option<(
                 String,
-                std::sync::Arc<crate::json_rpc_child::JsonRpcChild>,
+                Option<std::sync::Arc<crate::json_rpc_child::JsonRpcChild>>,
+                Option<std::sync::Arc<super::http_client::HttpMcpClient>>,
             )> = None;
             for handle in inner.handles.values() {
                 for tool in &handle.tools {
@@ -451,16 +540,15 @@ impl McpRegistry {
                                 handle.config.name
                             ));
                         }
-                        let child = match &handle.child {
-                            Some(c) => c.clone(),
-                            None => {
-                                return Err(format!(
-                                    "MCP server '{}' has no child process",
-                                    handle.config.name
-                                ));
-                            }
-                        };
-                        found = Some((tool.name.clone(), child));
+                        let child = handle.child.clone();
+                        let remote = handle.remote.clone();
+                        if child.is_none() && remote.is_none() {
+                            return Err(format!(
+                                "MCP server '{}' has no live transport",
+                                handle.config.name
+                            ));
+                        }
+                        found = Some((tool.name.clone(), child, remote));
                         break;
                     }
                 }
@@ -474,16 +562,26 @@ impl McpRegistry {
             }
         };
 
-        child
-            .request(
-                "tools/call",
-                serde_json::json!({
-                    "name": raw_name,
-                    "arguments": arguments,
-                }),
+        let params = serde_json::json!({
+            "name": raw_name,
+            "arguments": arguments,
+        });
+        if let Some(child) = child {
+            child
+                .request("tools/call", params)
+                .await
+                .map_err(|e| format!("tools/call failed: {e}"))
+        } else if let Some(remote) = remote {
+            tokio::time::timeout(
+                super::runtime::DEFAULT_REQUEST_TIMEOUT,
+                remote.request("tools/call", params),
             )
             .await
+            .map_err(|_| "tools/call timed out".to_string())?
             .map_err(|e| format!("tools/call failed: {e}"))
+        } else {
+            Err("MCP transport disappeared before tools/call".into())
+        }
     }
 
     /// Tear every spawned child down. Called from the
@@ -497,6 +595,7 @@ impl McpRegistry {
                 if let Some(child) = handle.child.take() {
                     out.push(child);
                 }
+                handle.remote.take();
                 handle.status = McpServerStatus::Stopped;
                 handle.tools.clear();
             }
@@ -545,10 +644,9 @@ fn now_ms() -> i64 {
 }
 
 /// Walk the configured MCP files for a project root and produce a flat
-/// `Vec<McpServerConfig>` suitable for spawning. Mirrors the logic in
-/// `commands/mcp::list_mcp_servers` but without dedupe — the runtime
-/// already tracks one handle per `id`, and dedupe at the spawn layer
-/// would obscure which file an error originated from.
+/// `Vec<McpServerConfig>` suitable for spawning. Identical definitions from
+/// multiple providers are deduplicated before launch so Codemux owns one
+/// child/connection and one stable tool namespace for all adapters.
 fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConfig> {
     let mut out: Vec<McpServerConfig> = vec![codemux_self_config()];
 
@@ -558,22 +656,22 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
     for (path, source) in scan.paths {
         let parsed = if is_claude_wrapped_path(&path) {
             parse_claude_wrapped_config(&path, project_path.as_deref())
+        } else if source == McpConfigSource::CodexUser {
+            parse_codex_config_file(&path)
+        } else if matches!(
+            source,
+            McpConfigSource::OpenCodeUser | McpConfigSource::OpenCodeProject
+        ) {
+            parse_opencode_config_file(&path, source)
         } else {
             parse_mcp_config_file(&path, source)
         };
         match parsed {
             Ok(parsed) => {
                 for srv in parsed {
-                    // Same filter as the list command: drop the
-                    // auto-written project `.mcp.json` codemux entry so
-                    // we don't try to spawn a second copy of it.
-                    if srv.name == "codemux"
-                        && matches!(
-                            source,
-                            McpConfigSource::ClaudeProject
-                                | McpConfigSource::CodemuxProject
-                        )
-                    {
+                    // Same filter as the list command: drop provider-written
+                    // `codemux` entries so we don't spawn the built-in twice.
+                    if srv.name == "codemux" {
                         continue;
                     }
                     out.push(srv);
@@ -584,7 +682,12 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
             }
         }
     }
-    out
+    out.sort_by(|a, b| {
+        super::source_rank(a.primary_source())
+            .cmp(&super::source_rank(b.primary_source()))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    super::dedupe_servers(out)
 }
 
 #[cfg(test)]
@@ -718,6 +821,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_native_sources_can_be_excluded_from_injected_tools() {
+        let reg = McpRegistry::new();
+        {
+            let mut inner = reg.inner.lock().await;
+            for (id, source) in [
+                ("codex-native", McpConfigSource::CodexUser),
+                ("claude-only", McpConfigSource::ClaudeUser),
+            ] {
+                let mut config = make_config(id, id, "/bin/true");
+                config.sources = vec![source];
+                let mut handle = McpServerHandle::discovered(config);
+                handle.status = McpServerStatus::Running { tool_count: 1 };
+                handle.tools.push(McpTool {
+                    name: "tool".into(),
+                    prefixed_name: format!("mcp__{id}__tool"),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    server_id: id.into(),
+                });
+                inner.handles.insert(id.into(), handle);
+            }
+        }
+        let tools = reg
+            .list_all_tools_excluding_source(McpConfigSource::CodexUser)
+            .await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].server_id, "claude-only");
+        let tools = reg
+            .list_all_tools_excluding_sources(&[
+                McpConfigSource::CodexUser,
+                McpConfigSource::ClaudeUser,
+            ])
+            .await;
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_tool_call_unknown_tool_errors() {
         let reg = McpRegistry::new();
         let err = reg
@@ -749,6 +889,138 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("not running"));
+    }
+
+    #[tokio::test]
+    async fn remote_http_server_lists_and_dispatches_tools() {
+        use mockito::Matcher;
+
+        let mut server = mockito::Server::new_async().await;
+        let initialize = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "initialize"
+            })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test", "version": "1"}
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let initialized = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "notifications/initialized"
+            })))
+            .with_status(202)
+            .create_async()
+            .await;
+        let list = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/list"
+            })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [{
+                        "name": "echo",
+                        "description": "Echo",
+                        "inputSchema": {"type": "object"}
+                    }]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let call = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"text": "hi"}}
+            })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {"content": [{"type": "text", "text": "hi"}]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let reg = McpRegistry::new();
+        let config = McpServerConfig {
+            id: "remote".into(),
+            name: "remote".into(),
+            sources: vec![McpConfigSource::CodexUser],
+            command: format!("{}/mcp", server.url()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            disabled: false,
+            transport: McpTransport::Http,
+            raw: serde_json::json!({}),
+        };
+        let row = reg
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+            .await;
+        assert!(matches!(row.status, McpServerStatus::Running { tool_count: 1 }));
+        let result = reg
+            .dispatch_tool_call(
+                "mcp__remote__echo",
+                serde_json::json!({"text": "hi"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "hi");
+        initialize.assert_async().await;
+        initialized.assert_async().await;
+        list.assert_async().await;
+        call.assert_async().await;
+    }
+
+    /// Developer smoke test against the user's real cross-provider config.
+    /// Kept ignored for CI because it requires the local Omarchy container.
+    #[tokio::test]
+    #[ignore]
+    async fn live_omarchy_server_lists_and_executes_search() {
+        let config = discover_configs(None)
+            .into_iter()
+            .find(|config| config.name == "omarchy-kb")
+            .expect("omarchy-kb should be discovered from a provider config");
+        let reg = McpRegistry::new();
+        let row = reg
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+            .await;
+        assert!(matches!(row.status, McpServerStatus::Running { .. }), "{row:?}");
+        let tool = reg
+            .list_all_tools()
+            .await
+            .into_iter()
+            .find(|tool| tool.name == "search_documentation")
+            .expect("search_documentation tool should be listed");
+        let result = reg
+            .dispatch_tool_call(
+                &tool.prefixed_name,
+                serde_json::json!({"query": "default browser"}),
+            )
+            .await
+            .expect("real MCP tool call should succeed");
+        assert!(result.get("content").and_then(serde_json::Value::as_array).is_some());
+        reg.shutdown_all().await;
     }
 
     #[tokio::test]
