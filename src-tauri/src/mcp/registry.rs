@@ -444,6 +444,38 @@ impl McpRegistry {
         super::runtime::apply_tool_cap(tools).tools
     }
 
+    /// Stage a running server with a single tool, for tests in sibling
+    /// modules (the gateway) that need a populated registry without
+    /// spawning real MCP children.
+    #[cfg(test)]
+    pub(crate) async fn insert_running_server_for_test(
+        &self,
+        id: &str,
+        sources: Vec<McpConfigSource>,
+    ) {
+        let config = McpServerConfig {
+            id: id.into(),
+            name: id.into(),
+            sources,
+            command: "/bin/true".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            disabled: false,
+            transport: super::McpTransport::Stdio,
+            raw: serde_json::Value::Null,
+        };
+        let mut handle = McpServerHandle::discovered(config);
+        handle.status = McpServerStatus::Running { tool_count: 1 };
+        handle.tools.push(McpTool {
+            name: "tool".into(),
+            prefixed_name: format!("mcp__{id}__tool"),
+            description: None,
+            input_schema: serde_json::json!({}),
+            server_id: id.into(),
+        });
+        self.inner.lock().await.handles.insert(id.into(), handle);
+    }
+
     /// Like [`Self::list_all_tools`] but returns the full
     /// [`CappedTools`] envelope so the Settings UI can render a
     /// "23 tools dropped to fit cap" banner.

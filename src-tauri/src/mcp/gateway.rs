@@ -17,6 +17,16 @@ use rand::distributions::{Alphanumeric, DistString};
 use serde_json::{json, Value};
 
 use super::registry::McpRegistry;
+use super::McpConfigSource;
+
+/// Sources the gateway hides from `tools/list`, mirroring the native-source
+/// exclusions the Claude and Codex paths apply. OpenCode is the gateway's only
+/// consumer today and `opencode serve` already spawns the servers from its own
+/// config, so serving them back would double every tool. If another provider
+/// ever attaches, the gateway will need per-consumer identity (a token or path
+/// per consumer) instead of this fixed list.
+const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] =
+    [McpConfigSource::OpenCodeUser, McpConfigSource::OpenCodeProject];
 
 /// Connection details handed to a provider adapter. The token is generated
 /// once per Codemux process and never written to disk.
@@ -158,7 +168,10 @@ async fn handle_post(
         }
         "ping" => rpc_result(id, json!({})).into_response(),
         "tools/list" => {
-            let tools = state.registry.list_all_tools().await;
+            let tools = state
+                .registry
+                .list_all_tools_excluding_sources(&GATEWAY_NATIVE_SOURCES)
+                .await;
             let data: Vec<Value> = tools
                 .into_iter()
                 .map(|tool| {
@@ -284,6 +297,46 @@ mod tests {
             value["result"]["capabilities"]["tools"]["listChanged"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn tools_list_hides_opencode_native_servers() {
+        let registry = McpRegistry::new();
+        registry
+            .insert_running_server_for_test("shared", vec![McpConfigSource::CodemuxUser])
+            .await;
+        registry
+            .insert_running_server_for_test("oc-user", vec![McpConfigSource::OpenCodeUser])
+            .await;
+        registry
+            .insert_running_server_for_test("oc-project", vec![McpConfigSource::OpenCodeProject])
+            .await;
+        let state = GatewayState {
+            registry,
+            bearer_token: Arc::from("test-token"),
+        };
+
+        let response = router(state)
+            .oneshot(request(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["mcp__shared__tool"], "{value}");
     }
 
     #[tokio::test]
