@@ -12,7 +12,10 @@ use tauri::{AppHandle, Runtime, State};
 use crate::mcp::{
     codemux_self::codemux_self_config,
     dedupe_servers,
-    parser::{parse_claude_wrapped_config, parse_mcp_config_file},
+    parser::{
+        parse_claude_wrapped_config, parse_codex_config_file, parse_mcp_config_file,
+        parse_opencode_config_file,
+    },
     paths::{enumerate_mcp_paths, is_claude_wrapped_path},
     registry::{McpRegistry, McpServerRuntime},
     runtime::{CappedTools, McpTool},
@@ -38,6 +41,13 @@ pub async fn list_mcp_servers(
         // standard `mcpServers`-key shape.
         let parsed_result = if is_claude_wrapped_path(&path) {
             parse_claude_wrapped_config(&path, project_path.as_deref())
+        } else if source == McpConfigSource::CodexUser {
+            parse_codex_config_file(&path)
+        } else if matches!(
+            source,
+            McpConfigSource::OpenCodeUser | McpConfigSource::OpenCodeProject
+        ) {
+            parse_opencode_config_file(&path, source)
         } else {
             parse_mcp_config_file(&path, source)
         };
@@ -46,17 +56,10 @@ pub async fn list_mcp_servers(
             Ok(parsed) => {
                 for srv in parsed {
                     // The Codemux self-row already represents Codemux's
-                    // built-in MCP. When Codemux's auto-write puts a
-                    // `codemux` entry into a project's `.mcp.json` we
-                    // suppress it here — otherwise users see the
-                    // always-on row twice.
-                    if srv.name == "codemux"
-                        && matches!(
-                            source,
-                            McpConfigSource::ClaudeProject
-                                | McpConfigSource::CodemuxProject
-                        )
-                    {
+                    // built-in MCP. Provider CLIs may auto-write the same
+                    // `codemux` entry into their own config; suppress every
+                    // discovered copy so users see the always-on row once.
+                    if srv.name == "codemux" {
                         continue;
                     }
                     servers.push(srv);
@@ -205,6 +208,13 @@ fn find_config(id: &str, project_root: Option<&Path>) -> Option<McpServerConfig>
     for (path, source) in scan.paths {
         let parsed = if is_claude_wrapped_path(&path) {
             parse_claude_wrapped_config(&path, project_path.as_deref())
+        } else if source == McpConfigSource::CodexUser {
+            parse_codex_config_file(&path)
+        } else if matches!(
+            source,
+            McpConfigSource::OpenCodeUser | McpConfigSource::OpenCodeProject
+        ) {
+            parse_opencode_config_file(&path, source)
         } else {
             parse_mcp_config_file(&path, source)
         };

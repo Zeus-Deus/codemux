@@ -50,6 +50,51 @@ pub fn parse_mcp_config_file(
     Ok(out)
 }
 
+/// Parse Codex's TOML configuration (`[mcp_servers.<name>]`). Both local
+/// `command` entries and remote `url` entries are normalized into the shared
+/// registry representation.
+pub fn parse_codex_config_file(path: &Path) -> Result<Vec<McpServerConfig>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let root: toml::Value = toml::from_str(&content)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let root = serde_json::to_value(root)
+        .map_err(|e| format!("normalize {}: {}", path.display(), e))?;
+    let Some(servers) = root.get("mcp_servers").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let mut out = extract_servers(
+        servers,
+        &path.display().to_string(),
+        McpConfigSource::CodexUser,
+    );
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Parse OpenCode's JSON/JSONC configuration. Current OpenCode stores server
+/// names directly under `mcp`; the v2 preview nests them under `mcp.servers`,
+/// so the importer accepts both without coupling Codemux to one release line.
+pub fn parse_opencode_config_file(
+    path: &Path,
+    source: McpConfigSource,
+) -> Result<Vec<McpServerConfig>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let root: Value = json5::from_str(&content)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let Some(mcp) = root.get("mcp").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let servers = mcp
+        .get("servers")
+        .and_then(Value::as_object)
+        .unwrap_or(mcp);
+    let mut out = extract_servers(servers, &path.display().to_string(), source);
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
 /// Parse `~/.claude.json` — a multi-section file. Returns the union of
 /// the top-level user-scope `mcpServers` (tagged `ClaudeUser`) and the
 /// per-project local-scope entries under
@@ -127,14 +172,17 @@ fn extract_servers(
             .map(str::to_lowercase)
             .unwrap_or_else(|| "stdio".to_string());
         let transport = match transport_str.as_str() {
-            "http" | "sse" => McpTransport::Http,
+            "http" | "sse" | "remote" | "streamable-http" => McpTransport::Http,
+            _ if obj.contains_key("url") => McpTransport::Http,
             _ => McpTransport::Stdio,
         };
 
+        let command_array = obj.get("command").and_then(Value::as_array);
         let command = match transport {
             McpTransport::Stdio => obj
                 .get("command")
                 .and_then(Value::as_str)
+                .or_else(|| command_array.and_then(|parts| parts.first()).and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string(),
             McpTransport::Http => obj
@@ -144,7 +192,7 @@ fn extract_servers(
                 .to_string(),
         };
 
-        let args: Vec<String> = obj
+        let mut args: Vec<String> = obj
             .get("args")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -153,9 +201,21 @@ fn extract_servers(
                     .collect()
             })
             .unwrap_or_default();
+        if args.is_empty() {
+            args = command_array
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .skip(1)
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
 
         let env: HashMap<String, String> = obj
             .get("env")
+            .or_else(|| obj.get("environment"))
             .and_then(Value::as_object)
             .map(|m| {
                 m.iter()
@@ -173,7 +233,8 @@ fn extract_servers(
             command,
             args,
             env,
-            disabled: false,
+            disabled: obj.get("disabled").and_then(Value::as_bool).unwrap_or(false)
+                || obj.get("enabled").and_then(Value::as_bool) == Some(false),
             transport,
             raw: value.clone(),
         });
@@ -480,5 +541,63 @@ mod tests {
         write(&p, "{}");
         let parsed = parse_claude_wrapped_config(&p, None).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parses_codex_stdio_and_remote_servers() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        write(
+            &path,
+            r#"
+              [mcp_servers.local]
+              command = "docker"
+              args = ["exec", "-i", "server"]
+              env = { TOKEN = "x" }
+
+              [mcp_servers.docs]
+              url = "https://example.test/mcp"
+              http_headers = { X-Test = "yes" }
+            "#,
+        );
+        let parsed = parse_codex_config_file(&path).unwrap();
+        assert_eq!(parsed.len(), 2);
+        let docs = parsed.iter().find(|server| server.name == "docs").unwrap();
+        assert!(matches!(docs.transport, McpTransport::Http));
+        assert_eq!(docs.command, "https://example.test/mcp");
+        let local = parsed.iter().find(|server| server.name == "local").unwrap();
+        assert_eq!(local.command, "docker");
+        assert_eq!(local.args, vec!["exec", "-i", "server"]);
+    }
+
+    #[test]
+    fn parses_opencode_jsonc_command_arrays_and_disabled_state() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("opencode.jsonc");
+        write(
+            &path,
+            r#"{
+              // JSONC is the documented OpenCode format.
+              "mcp": {
+                "local": {
+                  "type": "local",
+                  "command": ["uvx", "demo-server", "--flag"],
+                  "environment": {"TOKEN": "x"}
+                },
+                "off": {
+                  "type": "remote",
+                  "url": "https://example.test/mcp",
+                  "enabled": false
+                }
+              }
+            }"#,
+        );
+        let parsed =
+            parse_opencode_config_file(&path, McpConfigSource::OpenCodeUser).unwrap();
+        let local = parsed.iter().find(|server| server.name == "local").unwrap();
+        assert_eq!(local.command, "uvx");
+        assert_eq!(local.args, vec!["demo-server", "--flag"]);
+        assert_eq!(local.env.get("TOKEN").map(String::as_str), Some("x"));
+        assert!(parsed.iter().find(|server| server.name == "off").unwrap().disabled);
     }
 }

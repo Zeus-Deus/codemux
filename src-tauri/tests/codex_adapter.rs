@@ -62,7 +62,56 @@ fn provider_with_fixture_and_binary(bin: PathBuf) -> CodexAgentProvider {
             title: "Codemux Test".into(),
             version: "0.0.0-test".into(),
         },
+        mcp_registry: None,
     })
+}
+
+/// Developer smoke test against the installed Codex app-server and the real
+/// local Omarchy MCP. Ignored in CI because both are optional user services.
+#[tokio::test]
+#[ignore]
+async fn live_codex_app_server_accepts_shared_dynamic_tools() {
+    let registry = codemux_lib::mcp::registry::McpRegistry::new();
+    let config = codemux_lib::mcp::McpServerConfig {
+        id: "live-omarchy".into(),
+        name: "omarchy-kb".into(),
+        sources: vec![codemux_lib::mcp::McpConfigSource::ClaudeUser],
+        command: "docker".into(),
+        args: vec![
+            "exec".into(),
+            "-i".into(),
+            "omarchy-mcp-server".into(),
+            "python".into(),
+            "/app/mcp_server/main.py".into(),
+        ],
+        env: std::collections::HashMap::new(),
+        disabled: false,
+        transport: codemux_lib::mcp::McpTransport::Stdio,
+        raw: serde_json::Value::Null,
+    };
+    let row = registry
+        .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+        .await;
+    assert!(
+        matches!(
+            row.status,
+            codemux_lib::mcp::runtime::McpServerStatus::Running { .. }
+        ),
+        "{row:?}"
+    );
+    let mut config = CodexProviderConfig::default();
+    config.mcp_registry = Some(registry.clone());
+    let provider = CodexAgentProvider::new(config);
+    let session = provider
+        .start_session(start_input("live-codex-mcp"))
+        .await
+        .expect("real Codex app-server should accept registry dynamicTools");
+    assert_eq!(session.provider, codemux_lib::agent_provider::ProviderKind::Codex);
+    provider
+        .stop_session(ThreadId("live-codex-mcp".into()))
+        .await
+        .unwrap();
+    registry.shutdown_all().await;
 }
 
 fn start_input(thread_id: &str) -> StartSessionInput {

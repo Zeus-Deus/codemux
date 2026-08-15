@@ -932,8 +932,19 @@ fn build_core_app<R: tauri::Runtime>(
                             commands::agent_chat::ProviderRegistry,
                         > = registry_handle.state();
 
+                        // Every provider adapter receives the same process-wide
+                        // MCP registry. Provider config files are discovery
+                        // inputs, never provider-specific runtime dependencies.
+                        let mcp_registry: tauri::State<'_, mcp::registry::McpRegistry> =
+                            registry_handle.state();
+                        let mcp_registry = mcp_registry.inner().clone();
+
+                        let mut claude_config =
+                            agent_provider::claude::ClaudeProviderConfig::default();
+                        claude_config.mcp_registry = Some(mcp_registry.clone());
+
                         match agent_provider::claude::ClaudeAgentProvider::new(
-                            agent_provider::claude::ClaudeProviderConfig::default(),
+                            claude_config,
                         )
                         .await
                         {
@@ -950,9 +961,11 @@ fn build_core_app<R: tauri::Runtime>(
                             }
                         }
 
-                        let codex = agent_provider::codex::CodexAgentProvider::new(
-                            agent_provider::codex::CodexProviderConfig::default(),
-                        );
+                        let mut codex_config =
+                            agent_provider::codex::CodexProviderConfig::default();
+                        codex_config.mcp_registry = Some(mcp_registry.clone());
+                        let codex =
+                            agent_provider::codex::CodexAgentProvider::new(codex_config);
                         registry
                             .set_codex(std::sync::Arc::new(codex) as _)
                             .await;
@@ -972,10 +985,13 @@ fn build_core_app<R: tauri::Runtime>(
                             '_,
                             std::sync::Arc<agent_provider::opencode::OpenCodeServerManager>,
                         > = registry_handle.state();
+                        let mut opencode_config =
+                            agent_provider::opencode::OpenCodeProviderConfig::default();
+                        opencode_config.mcp_registry = Some(mcp_registry);
                         let opencode_provider =
                             agent_provider::opencode::OpenCodeAgentProvider::new(
                                 opencode_manager.inner().clone(),
-                                agent_provider::opencode::OpenCodeProviderConfig::default(),
+                                opencode_config,
                             );
                         registry
                             .set_opencode(std::sync::Arc::new(opencode_provider) as _)

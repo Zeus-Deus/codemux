@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
 
 use super::{McpConfigSource, McpServerConfig, McpTransport};
+use super::http_client::HttpMcpClient;
 
 /// Per the spec — clients SHOULD send the highest version they support.
 /// The Codemux MCP server (`mcp_server.rs:411`) speaks the same version,
@@ -103,6 +104,8 @@ pub struct McpServerHandle {
     /// `Some` when the child is alive. `None` after `stop_server` or
     /// when the spawn itself failed.
     pub child: Option<Arc<JsonRpcChild>>,
+    /// Streamable-HTTP client for remote MCP servers.
+    pub remote: Option<Arc<HttpMcpClient>>,
     /// Last 8 KB of the child's stderr captured before exit (or while
     /// alive when JsonRpcChild surfaces it via ChildExited). Used for
     /// the Settings-row error tooltip.
@@ -118,6 +121,7 @@ impl McpServerHandle {
             server_info: None,
             started_at_ms: None,
             child: None,
+            remote: None,
             stderr_tail: None,
         }
     }
@@ -128,27 +132,16 @@ impl McpServerHandle {
 /// populated. On failure status is `Errored { message }` and `child` is
 /// `None` (we drop the child handle so the watchdog reaps it).
 ///
-/// Non-stdio transports are rejected up-front — Stage 2 ships stdio only
-/// (HTTP is parsed and surfaced in Settings, but spawning is deferred).
 pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
-    if !matches!(config.transport, McpTransport::Stdio) {
-        return McpServerHandle {
-            stderr_tail: None,
-            child: None,
-            tools: Vec::new(),
-            server_info: None,
-            started_at_ms: None,
-            status: McpServerStatus::Errored {
-                message: "HTTP transport not supported in v1".into(),
-            },
-            config,
-        };
+    if matches!(config.transport, McpTransport::Http) {
+        return start_http_mcp_server(config).await;
     }
 
     if config.command.is_empty() {
         return McpServerHandle {
             stderr_tail: None,
             child: None,
+            remote: None,
             tools: Vec::new(),
             server_info: None,
             started_at_ms: None,
@@ -177,6 +170,7 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
             return McpServerHandle {
                 stderr_tail: stderr_tail_from(&err),
                 child: None,
+                remote: None,
                 tools: Vec::new(),
                 server_info: None,
                 started_at_ms: None,
@@ -198,6 +192,7 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
                 server_info: Some(server_info),
                 started_at_ms: Some(now_ms()),
                 child: Some(child),
+                remote: None,
                 stderr_tail: None,
             }
         }
@@ -211,6 +206,7 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
             McpServerHandle {
                 stderr_tail,
                 child: None,
+                remote: None,
                 tools: Vec::new(),
                 server_info: None,
                 started_at_ms: None,
@@ -220,6 +216,101 @@ pub async fn start_mcp_server(config: McpServerConfig) -> McpServerHandle {
                 config,
             }
         }
+    }
+}
+
+async fn start_http_mcp_server(config: McpServerConfig) -> McpServerHandle {
+    if config.command.is_empty() {
+        return McpServerHandle {
+            stderr_tail: None,
+            child: None,
+            remote: None,
+            tools: Vec::new(),
+            server_info: None,
+            started_at_ms: None,
+            status: McpServerStatus::Errored {
+                message: "no URL in config".into(),
+            },
+            config,
+        };
+    }
+    let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, HttpMcpClient::connect(&config)).await;
+    match connected {
+        Err(_) => McpServerHandle {
+            stderr_tail: None,
+            child: None,
+            remote: None,
+            tools: Vec::new(),
+            server_info: None,
+            started_at_ms: None,
+            status: McpServerStatus::Errored {
+                message: "handshake timed out".into(),
+            },
+            config,
+        },
+        Ok(Ok(client)) => {
+            let client = Arc::new(client);
+            match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                client.request("tools/list", json!({})),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    let tools = parse_tools_list(&response, &config.id, &config.name);
+                    let tool_count = tools.len();
+                    McpServerHandle {
+                        server_info: Some(McpServerInfo {
+                            name: config.name.clone(),
+                            version: String::new(),
+                        }),
+                        config,
+                        status: McpServerStatus::Running { tool_count },
+                        tools,
+                        started_at_ms: Some(now_ms()),
+                        child: None,
+                        remote: Some(client),
+                        stderr_tail: None,
+                    }
+                }
+                Ok(Err(error)) => McpServerHandle {
+                    stderr_tail: None,
+                    child: None,
+                    remote: None,
+                    tools: Vec::new(),
+                    server_info: None,
+                    started_at_ms: None,
+                    status: McpServerStatus::Errored {
+                        message: format!("tools/list failed: {error}"),
+                    },
+                    config,
+                },
+                Err(_) => McpServerHandle {
+                    stderr_tail: None,
+                    child: None,
+                    remote: None,
+                    tools: Vec::new(),
+                    server_info: None,
+                    started_at_ms: None,
+                    status: McpServerStatus::Errored {
+                        message: "tools/list timed out".into(),
+                    },
+                    config,
+                },
+            }
+        }
+        Ok(Err(error)) => McpServerHandle {
+            stderr_tail: None,
+            child: None,
+            remote: None,
+            tools: Vec::new(),
+            server_info: None,
+            started_at_ms: None,
+            status: McpServerStatus::Errored {
+                message: format!("handshake failed: {error}"),
+            },
+            config,
+        },
     }
 }
 
@@ -492,7 +583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_transport_is_rejected_with_clear_error() {
+    async fn http_transport_with_invalid_url_has_clear_error() {
         let cfg = make_config("h1", "linear", McpTransport::Http);
         let h = start_mcp_server(cfg).await;
         match h.status {
@@ -502,6 +593,7 @@ mod tests {
             _ => panic!("expected Errored, got {:?}", h.status),
         }
         assert!(h.child.is_none());
+        assert!(h.remote.is_none());
     }
 
     #[tokio::test]

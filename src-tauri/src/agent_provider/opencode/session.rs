@@ -34,6 +34,7 @@ use crate::agent_provider::types::{
     ApprovalDecision, ImageInput, ProviderKind, ProviderSessionId, RequestId, SessionStatus,
     ThreadId, TurnId,
 };
+use crate::mcp::registry::McpRegistry;
 
 use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
 use super::protocol::{
@@ -90,6 +91,7 @@ impl OpenCodeSession {
     /// emits `SessionConfigured` on the provider's broadcast channel.
     pub async fn start(
         manager: Arc<OpenCodeServerManager>,
+        mcp_registry: Option<McpRegistry>,
         thread_id: ThreadId,
         initial_model: Option<String>,
         initial_variant: Option<String>,
@@ -120,6 +122,10 @@ impl OpenCodeSession {
                 message: "failed to build HTTP client".into(),
                 source: Some(err.to_string()),
             })?;
+
+        if let Some(registry) = mcp_registry.as_ref() {
+            attach_mcp_gateway(&http, &server_handle, registry).await?;
+        }
 
         // Best-effort resume: readopt the persisted server-side session id when
         // it still exists on the OpenCode server (it persists sessions on disk,
@@ -506,6 +512,55 @@ impl OpenCodeSession {
     }
 }
 
+/// Register Codemux's process-wide MCP facade with the live OpenCode server.
+/// The remote config is runtime-only: no provider config files are rewritten,
+/// and the bearer credential never leaves this process.
+async fn attach_mcp_gateway(
+    http: &reqwest::Client,
+    server: &OpenCodeServerHandle,
+    registry: &McpRegistry,
+) -> Result<(), ProviderError> {
+    let connection = registry
+        .gateway_connection()
+        .await
+        .map_err(|message| ProviderError::ProcessError {
+            message: "failed to start Codemux MCP gateway".into(),
+            source: Some(message),
+        })?;
+    let url = format!("{}/mcp", server.base_url.trim_end_matches('/'));
+    let response = http
+        .post(url)
+        .basic_auth("opencode", Some(&server.server_password))
+        .json(&serde_json::json!({
+            "name": "codemux",
+            "config": {
+                "type": "remote",
+                "url": connection.url,
+                "enabled": true,
+                "oauth": false,
+                "headers": {
+                    "Authorization": format!("Bearer {}", connection.bearer_token)
+                }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|error| ProviderError::RpcError {
+            message: format!("opencode_mcp_attach_send_failed: {error}"),
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(ProviderError::RpcError {
+            message: format!(
+                "opencode_mcp_attach_http_status_{}: {detail}",
+                status.as_u16()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Pull the OpenCode server-side session id out of the resume cursor
 /// `ensure_live_session` threads in (`{"resume": <session_id>}`). Returns
 /// `None` for an absent/mis-shaped cursor so the caller starts fresh.
@@ -629,6 +684,74 @@ mod tests {
     use super::*;
     use crate::agent_provider::types::{ImageInput, ThreadId};
     use mockito::Server;
+
+    #[tokio::test]
+    async fn attaches_shared_gateway_through_opencode_runtime_api() {
+        let mut server = Server::new_async().await;
+        let attach = server
+            .mock("POST", "/mcp")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "name": "codemux",
+                "config": {"type": "remote", "enabled": true, "oauth": false}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let handle = OpenCodeServerHandle {
+            base_url: server.url(),
+            server_password: "pw".into(),
+        };
+        attach_mcp_gateway(
+            &reqwest::Client::new(),
+            &handle,
+            &McpRegistry::new(),
+        )
+        .await
+        .unwrap();
+        attach.assert_async().await;
+    }
+
+    /// Developer smoke test against the installed OpenCode binary. Ignored in
+    /// CI because OpenCode is an optional external provider.
+    #[tokio::test]
+    #[ignore]
+    async fn live_opencode_server_connects_codemux_gateway() {
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let registry = McpRegistry::new();
+        let (tx, _rx) = broadcast::channel(64);
+        let session = OpenCodeSession::start(
+            manager.clone(),
+            Some(registry.clone()),
+            ThreadId("live-mcp-smoke".into()),
+            None,
+            None,
+            None,
+            tx,
+            None,
+        )
+        .await
+        .expect("OpenCode session should start with shared MCP gateway");
+        let handle = manager.ensure_running().await.unwrap();
+        // A second chat session re-registers the same facade; this must be an
+        // idempotent update rather than a duplicate-name failure.
+        attach_mcp_gateway(&reqwest::Client::new(), &handle, &registry)
+            .await
+            .expect("reattaching the gateway should be idempotent");
+        let status: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/mcp", handle.base_url.trim_end_matches('/')))
+            .basic_auth("opencode", Some(&handle.server_password))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["codemux"]["status"], "connected", "{status}");
+        session.shutdown().await;
+        manager.stop().await;
+    }
 
     /// Helper: spawn a manager whose `ensure_running` returns a
     /// pre-built handle pointing at the supplied mock URL. Bypasses
@@ -952,6 +1075,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let started = OpenCodeSession::start(
             manager.clone(),
+            None,
             ThreadId("t-respawn".into()),
             None,
             None,
