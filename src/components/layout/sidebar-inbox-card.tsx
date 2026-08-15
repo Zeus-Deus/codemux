@@ -523,24 +523,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   "opacity-70 hover:opacity-100 focus-within:opacity-100",
               )}
             >
-              {/* Jump-shortcut hint: the digit that activates this card while
-                  the jump modifier is held. Absolutely positioned so it
-                  overlays the top-right corner without shifting layout. */}
-              {jumpHint != null && (
-                <span
-                  aria-hidden="true"
-                  className={cn(
-                    // Hangs off the card's corner so it never covers the
-                    // state label at the row's right edge.
-                    "absolute -right-1 -top-1 z-10 flex h-4 min-w-4 items-center justify-center",
-                    "rounded border border-border bg-muted px-1",
-                    "font-mono text-[9px] text-muted-foreground",
-                  )}
-                >
-                  {jumpHint}
-                </span>
-              )}
-
               {/* Eyebrow: repo identity + agent state / Settle swap */}
               <div className="flex min-h-5 items-center gap-1.5">
                 <ProjectAvatar
@@ -711,6 +693,23 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   )}
                 </span>
                 {stateCluster}
+                {/* The held-Alt jump hint belongs to the eyebrow's right-hand
+                    readout, not to the card border. A quiet keycap here keeps
+                    all visible digits in one column, preserves the card's
+                    silhouette, and lets the status remain readable beside it. */}
+                {jumpHint != null && (
+                  <kbd
+                    aria-hidden="true"
+                    className={cn(
+                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
+                      "border border-border/80 bg-background/80 font-mono text-[10px] font-semibold leading-none tabular-nums text-foreground/80",
+                      "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
+                      "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
+                    )}
+                  >
+                    {jumpHint}
+                  </kbd>
+                )}
               </div>
 
               {/* Title line: work title + linked-issue chip */}
