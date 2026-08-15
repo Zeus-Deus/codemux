@@ -218,7 +218,7 @@ export function ComposerFooter({
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium leading-none transition-colors",
+                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-sm font-medium leading-none transition-colors",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
