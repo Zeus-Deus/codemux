@@ -840,6 +840,26 @@ fn translate_assistant(
     let turn_id = extract_turn_id(msg);
     let parent = parent_tool_use_id(msg);
     let subagent_id = parent.as_ref().map(|p| demux.root_for(p));
+    // The launch tool's `model` input is optional when a Claude subagent
+    // inherits its model. The child assistant envelope is authoritative and
+    // always describes the model that actually produced this message, so
+    // merge it into the row as soon as it arrives. This is the same in-band
+    // source the usage ledger relies on below and avoids guessing from parent
+    // session state (which can differ from an explicitly-routed child).
+    if let (Some(id), Some(model)) = (
+        subagent_id.as_deref(),
+        msg.get("message")
+            .and_then(|message| message.get("model"))
+            .and_then(|model| model.as_str())
+            .filter(|model| !model.is_empty()),
+    ) {
+        let mut snapshot = base_snapshot(id);
+        snapshot.model = Some(model.to_string());
+        out.push(ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: thread_id.clone(),
+            subagent: snapshot,
+        });
+    }
     if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
         out.push(ProviderRuntimeEvent::RuntimeWarning {
             thread_id: Some(thread_id.clone()),
@@ -3183,14 +3203,23 @@ mod tests {
             "type": "assistant",
             "parent_tool_use_id": "toolu_root",
             "turn_id": "turn-1",
-            "message": { "content": [
+            "message": { "model": "claude-opus-4-8", "content": [
                 {"type": "text", "text": "working on it"},
                 {"type": "tool_use", "id": "tu-bash", "name": "Bash", "input": {"command": "ls"}}
             ]}
         });
         let events = translate_sdk_message_with(&tid(), &inner, &mut demux);
-        assert_eq!(events.len(), 2);
-        for e in &events {
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+                if subagent.subagent_id == "toolu_root"
+                    && subagent.model.as_deref() == Some("claude-opus-4-8")
+        )));
+        for e in events
+            .iter()
+            .filter(|event| matches!(event, ProviderRuntimeEvent::ItemCompleted { .. }))
+        {
             match e {
                 ProviderRuntimeEvent::ItemCompleted { subagent_id, .. } => {
                     assert_eq!(subagent_id.as_deref(), Some("toolu_root"));

@@ -39,10 +39,16 @@ describe("SubagentsPane — focused watch surface", () => {
       <SubagentsPane
         threadId="thread-1"
         messages={messages([
-          subagent({ id: "live", name: "Pricing audit", toolUseCount: 12 }),
+          subagent({
+            id: "live",
+            name: "Pricing audit",
+            model: "anthropic/claude-opus-4-8",
+            toolUseCount: 12,
+          }),
           subagent({
             id: "done",
             name: "Verification pass",
+            model: "openai/gpt-5.4",
             status: "completed",
             activity: "All checks pass",
             durationMs: 16_000,
@@ -57,7 +63,27 @@ describe("SubagentsPane — focused watch surface", () => {
     expect(screen.getByText("Finished · 1")).toBeInTheDocument();
     expect(screen.getByText("Pricing audit")).toBeInTheDocument();
     expect(screen.getByText("Verification pass")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
+    expect(
+      screen.getByTitle("Model: anthropic/claude-opus-4-8"),
+    ).toHaveTextContent("anthropic/claude-opus-4-8");
+    expect(screen.getByTitle("Model: openai/gpt-5.4")).toHaveTextContent(
+      "openai/gpt-5.4",
+    );
+    expect(screen.getByRole("progressbar")).toHaveAttribute(
+      "aria-valuenow",
+      "1",
+    );
+  });
+
+  it("omits the model capsule when the provider has not reported one", () => {
+    const { container } = render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([subagent({ model: undefined })])}
+      />,
+    );
+
+    expect(container.querySelector("[data-subagent-model]")).toBeNull();
   });
 
   it("opens a live subagent thread from the panel", () => {

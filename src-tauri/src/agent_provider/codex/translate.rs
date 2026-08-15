@@ -679,7 +679,14 @@ fn handle_collab_agent_tool_call(
             };
             let mut snap = subagent_snapshot(&tid, status);
             snap.parent_item_id = Some(call.id.clone());
-            snap.model = call.model.clone();
+            // An explicit child override wins. When app-server omits the
+            // field, the spawned child inherits the active session model;
+            // carrying that known value is more useful (and more accurate)
+            // than leaving the cross-provider model slot blank.
+            snap.model = call
+                .model
+                .clone()
+                .or_else(|| demux.active_model.clone());
             snap.activity = activity;
             ProviderRuntimeEvent::SubagentUpdated {
                 thread_id: thread_id.clone(),
@@ -1960,15 +1967,18 @@ mod tests {
 
     #[test]
     fn collab_spawn_in_progress_maps_agents_states_pending() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        demux.set_active_model(Some("gpt-5.4".into()));
         let msg = collab_item(json!({
             "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
             "status": "inProgress", "senderThreadId": "c-1", "receiverThreadIds": ["c-child"],
             "agentsStates": {"c-child": {"status": "pendingInit"}}
         }));
-        let events = translate_notification(&tid(), msg);
+        let events = translate_notification_with(&mut demux, &tid(), msg);
         match &events[0] {
             ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
                 assert_eq!(subagent.status, SubagentStatus::Pending);
+                assert_eq!(subagent.model.as_deref(), Some("gpt-5.4"));
             }
             other => panic!("expected SubagentUpdated, got {other:?}"),
         }

@@ -862,7 +862,23 @@ fn translate_message_tokens(
     // below is a context-meter hygiene rule, not an accounting one.
     let mut events = record_usage(info, ctx, subagent_id.is_some(), usage);
 
-    if subagent_id.is_some() {
+    if let Some(id) = subagent_id {
+        // Task metadata normally reports the child's model at launch, but
+        // some upstream agents omit it. Each assistant message carries the
+        // concrete federated model pair, so use that authoritative fallback
+        // to make model identity reliable across OpenCode providers.
+        if let Some(model) = info.qualified_model_id() {
+            events.push(subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: id.to_string(),
+                    model: Some(model),
+                    status: SubagentStatus::Running,
+                    provider_ref: Some(id.to_string()),
+                    ..empty_snapshot(id)
+                },
+            ));
+        }
         return events;
     }
     let Some(tokens) = info.tokens.as_ref() else {
@@ -2183,6 +2199,13 @@ mod usage_ledger_tests {
         assert_eq!(r.len(), 1);
         assert!(r[0].4, "subagent flag must be set");
         assert_eq!(r[0].0, 200);
+        assert!(first.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+                if subagent.subagent_id == "child_session"
+                    && subagent.model.as_deref()
+                        == Some("anthropic/claude-haiku-4-5")
+        )));
         assert!(
             !first
                 .iter()
