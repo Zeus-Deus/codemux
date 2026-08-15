@@ -200,6 +200,7 @@ vi.mock("./Composer", () => ({
     belowComposerSlot,
     topStripSlot,
     onSubmit,
+    onStop,
     onContinueRun,
     onModeRemove,
     onModeActivate,
@@ -215,6 +216,7 @@ vi.mock("./Composer", () => ({
     belowComposerSlot?: React.ReactNode;
     topStripSlot?: React.ReactNode;
     onSubmit: () => void;
+    onStop: () => void;
     onContinueRun?: () => void;
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
@@ -240,6 +242,7 @@ vi.mock("./Composer", () => ({
       <div data-testid="zone1">{zone1Override}</div>
       <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
+      <button data-testid="composer-stop" onClick={() => onStop()} />
       <button
         data-testid="composer-continue"
         onClick={() => onContinueRun?.()}
@@ -616,6 +619,7 @@ vi.mock("@/stores/agent-chat-store", () => {
 import { AgentChatPane } from "./AgentChatPane";
 import {
   agentChatGetSession,
+  agentChatInterruptTurn,
   agentChatListMessages,
   agentChatListMessagesAfter,
   agentChatThreadHeadId,
@@ -2052,6 +2056,48 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
   });
 });
 
+describe("AgentChatPane Stop preserves its durable thread", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {
+      "thread-x": { streaming: true },
+    };
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(undefined);
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
+  });
+
+  afterEach(() => cleanup());
+
+  it.each(["claude", "codex", "opencode"] as const)(
+    "interrupts %s without stopping, restarting, or replacing the thread",
+    async (provider) => {
+      const { getByTestId } = render(
+        <AgentChatPane pane={{ ...pane, provider }} />,
+      );
+
+      fireEvent.click(getByTestId("composer-stop"));
+
+      await waitFor(() =>
+        expect(agentChatInterruptTurn).toHaveBeenCalledWith(
+          provider,
+          "thread-x",
+          null,
+        ),
+      );
+      expect(agentChatStopSession).not.toHaveBeenCalled();
+      expect(agentChatStartSession).not.toHaveBeenCalled();
+      expect(getByTestId("transcript")).toHaveAttribute(
+        "data-thread-key",
+        "thread-x",
+      );
+    },
+  );
+});
+
 describe("AgentChatPane provider handoff", () => {
   beforeEach(() => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
@@ -2168,7 +2214,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     setPermissionModeMock.mockClear();
     setModelMock.mockClear();
     markRequestResolvedMock.mockClear();
-    vi.mocked(agentChatStartSession).mockClear().mockResolvedValue("thread-restarted");
+    vi.mocked(agentChatStartSession).mockClear().mockResolvedValue("thread-x");
     vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatSetPermissionMode).mockClear().mockResolvedValue(undefined);
   });
@@ -2202,6 +2248,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     // so the SDK re-applies `--dangerously-skip-permissions`.
     expect(agentChatStartSession).toHaveBeenCalled();
     const startInput = vi.mocked(agentChatStartSession).mock.calls[0][2];
+    expect(startInput.thread_id).toBe("thread-x");
     expect(startInput.permission_mode).toBe("bypassPermissions");
     // UI snap: slice.permissionMode flips immediately, slice.mode
     // returns to "default", priorPermissionMode is cleared.

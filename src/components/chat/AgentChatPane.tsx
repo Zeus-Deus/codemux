@@ -2076,76 +2076,24 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [isSending, streaming, activeTurnId]);
 
-  // Interrupt mechanic: the SDK's `query.interrupt()` causes its
-  // async iterator to exit, so the underlying SDK query is dead after
-  // an interrupt. The sidecar now recovers from that transparently —
-  // like the reference multi-provider client, its next `send-turn`
-  // rebuilds a resumed SDK query for the (surviving) session, so a bare
-  // interrupt already lets subsequent turns land on a live query.
-  // The Stop button still performs a deliberate hard reset: interrupt
-  // for the immediate turn abort, then stop + start the session (fresh
-  // thread id, resume cursor) so subsequent turns land on a known-good
-  // SDK query and any wedged sidecar state is cleared. Transcript and
-  // picker state persist via `migrateThreadId`.
+  // Stop is turn-scoped, not conversation-scoped. Every provider recovers
+  // its query/stream after an interrupt, and a dead provider process is
+  // rebuilt by the backend on the next send. Keep the durable CodeMux thread
+  // id untouched here: minting another id made an ordinary Stop look like a
+  // new conversation whenever the in-memory resume cursor was missing.
   const handleStop = useCallback(() => {
     if (!threadId) return;
     if (restarting) return;
-    const currentSlice = useAgentChatStore.getState().threads[threadId];
-    if (!currentSlice) return;
     setRestarting(true);
     void (async () => {
-      // Await the interrupt BEFORE tearing the session down. The provider
-      // settles a user stop with a persisted `turn_completed{interrupted}`
-      // (Claude via the sidecar's `session-ended`, Codex via the app-server's
-      // `turn/completed`) that flows asynchronously. If we fired the interrupt
-      // and immediately killed the child, that settlement could lose the race
-      // and the stopped turn would hydrate as an unsettled — i.e. "Run
-      // interrupted" — turn after a restart. Awaiting orders the interrupt
-      // ahead of `stop_session`, whose graceful shutdown (EOF → grace → kill)
-      // then gives the settlement time to reach the event bridge (which
-      // persists from the broadcast independent of the child's liveness). An
-      // interrupt failure is safe to swallow — the stop below tears down anyway.
       try {
         await agentChatInterruptTurn(provider, threadId, null);
-      } catch {
-        // Non-fatal: the teardown below still restarts the session.
-      }
-      try {
-        await agentChatStopSession(provider, threadId);
       } catch (err) {
-        console.warn("[agent-chat] stop_session during Stop failed", err);
-      }
-      if (!cwd) {
-        setRestarting(false);
-        return;
-      }
-      try {
-        const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
-        const newId = await agentChatStartSession(pane.pane_id, provider, {
-            thread_id: newLocalThreadId,
-            cwd,
-            model: currentSlice.model,
-            resume_cursor: currentSlice.resumeCursor,
-            permission_mode:
-              provider === "opencode" ? null : currentSlice.permissionMode,
-            effort: currentSlice.effort,
-            context_window: currentSlice.contextWindow,
-            fast_mode: currentSlice.fastMode,
-            additional_directories: [],
-            env: null,
-        });
-        migrateThreadId(threadId, newId);
-        setThreadId(newId);
-        setSessionLaunchMode(
-          newId,
-          provider === "opencode" ? null : currentSlice.permissionMode,
-        );
-      } catch (err) {
-        toast.error(`Failed to restart session after stop: ${err}`);
+        toast.error(`Failed to stop turn: ${err}`);
       } finally {
         setRestarting(false);
-        // Belt-and-braces: restart cleared any in-flight state, so
-        // drop the local send guard.
+        // The provider's interrupted settlement clears the durable turn state;
+        // release the pane-local guard even if that event is still in flight.
         sendInFlightRef.current = false;
         setIsSending(false);
       }
@@ -2153,11 +2101,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [
     threadId,
     provider,
-    cwd,
-    pane.pane_id,
     restarting,
-    migrateThreadId,
-    setSessionLaunchMode,
   ]);
 
   // Follow-up queueing: cancel a queued (not-yet-dispatched) turn. The
@@ -2259,10 +2203,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   /**
    * Shared silent-restart helper. Permission-mode, effort, and
    * context-window all trigger the same flow on Claude: stop the
-   * current session, start a new one with the updated launch params,
-   * migrate the thread id. Transcript + model + draft survive via
-   * `migrateThreadId`; resume cursor carries session state when
-   * available. Codex-side callers don't route through here.
+   * current provider process, then rebuild it under the SAME durable
+   * CodeMux thread id with the updated launch params. The resume cursor
+   * carries provider-native state when available; the stable thread id
+   * keeps the visible transcript authoritative even if native resume
+   * ultimately has to fall back. Codex-side callers only route through
+   * here for launch-scoped features such as Fast mode.
    *
    * Declared above the mode handlers so `handleModeRemove` can use
    * it for the silent-restart restore path (the SDK rejects live
@@ -2283,7 +2229,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (restarting) return;
       setRestarting(true);
       const resumeCursor = currentSlice.resumeCursor;
-      const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
       const nextMode =
         provider === "opencode"
           ? null
@@ -2308,7 +2253,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         }
         try {
           const newId = await agentChatStartSession(pane.pane_id, provider, {
-            thread_id: newLocalThreadId,
+            thread_id: threadId,
             cwd: cwd ?? "",
             model: nextModel,
             resume_cursor: resumeCursor,
@@ -2319,8 +2264,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             additional_directories: [],
             env: null,
           });
-          migrateThreadId(threadId, newId);
-          setThreadId(newId);
+          if (newId !== threadId) {
+            throw new Error(
+              `Provider restart changed durable thread id from ${threadId} to ${newId}`,
+            );
+          }
           setSessionLaunchMode(newId, nextMode);
         } catch (err) {
           toast.error(`Failed to restart session: ${err}`);
@@ -2335,7 +2283,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cwd,
       pane.pane_id,
       restarting,
-      migrateThreadId,
       setSessionLaunchMode,
     ],
   );
