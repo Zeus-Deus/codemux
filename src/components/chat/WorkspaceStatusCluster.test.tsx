@@ -13,6 +13,7 @@ import type {
 // close over lives in `vi.hoisted`. ──
 const mocks = vi.hoisted(() => ({
   workspace: null as WorkspaceSnapshot | null,
+  homeDir: "/home/dev" as string | null,
   hosts: [] as Array<{ id: number; name: string }>,
   openUrl: vi.fn().mockResolvedValue(undefined),
   getGithubPrByPath: vi.fn().mockResolvedValue(null as PullRequestInfo | null),
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => mocks.workspace,
+  useHomeDir: () => mocks.homeDir,
   // `useBackgroundBrowserSession` (shared with the terminal header) reads
   // `agent_browser_sessions` off the app state via `useAppStore`.
   useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -100,6 +102,7 @@ function makeBackgroundSession(
 
 beforeEach(() => {
   mocks.workspace = null;
+  mocks.homeDir = "/home/dev";
   mocks.hosts = [];
   mocks.openUrl.mockClear();
   mocks.getGithubPrByPath.mockReset().mockResolvedValue(null);
@@ -120,6 +123,33 @@ describe("WorkspaceStatusCluster", () => {
 
   it("renders nothing when the workspace has no git branch (and no background browser)", () => {
     mocks.workspace = makeWorkspace({ git_branch: null });
+    const { container } = render(<WorkspaceStatusCluster />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("offers Git initialization for a non-git project folder", () => {
+    mocks.workspace = makeWorkspace({ git_branch: null, is_git: false });
+    render(<WorkspaceStatusCluster />);
+    expect(
+      screen.getByRole("button", { name: /Initialize a git repository/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer Git initialization for a home-rooted workspace", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      is_git: false,
+      cwd: "/home/dev",
+      project_root: "/home/dev",
+      worktree_path: null,
+    });
+    const { container } = render(<WorkspaceStatusCluster />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("waits for the home directory before offering Git initialization", () => {
+    mocks.homeDir = null;
+    mocks.workspace = makeWorkspace({ git_branch: null, is_git: false });
     const { container } = render(<WorkspaceStatusCluster />);
     expect(container).toBeEmptyDOMElement();
   });

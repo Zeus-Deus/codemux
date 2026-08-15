@@ -67,7 +67,7 @@ import { toast } from "@/lib/toast";
 import { keepIfUnchanged } from "@/lib/poll-equality";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDiffStore } from "@/stores/diff-store";
-import { useAppStore } from "@/stores/app-store";
+import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
@@ -316,6 +316,7 @@ export function ChangesPanel({
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const config = useAppStore((s) => s.appState?.config);
+  const homeDir = useHomeDir();
   const aiEnabled = config?.ai_commit_message_enabled ?? true;
   const generation = useAiCommitStore((s) => s.getGeneration(workspace.workspace_id));
   const requestGeneration = useAiCommitStore((s) => s.requestGeneration);
@@ -334,7 +335,7 @@ export function ChangesPanel({
   // Non-git project folder: `getGitStatus` errors (swallowed to `[]`), so
   // without this flag the panel would render a false "Working tree clean".
   // Instead we name the state and offer the explicit, opt-in `git init`.
-  const showNoGit = showNoGitState(workspace);
+  const showNoGit = showNoGitState(workspace, homeDir);
   const { initialize, initializing } = useInitializeGit(workspace);
 
   const refresh = useCallback(() => {
