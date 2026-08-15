@@ -28,6 +28,7 @@ import {
 import { useEditorStore } from "@/stores/editor-store";
 import { useUIStore } from "@/stores/ui-store";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CHAT_SELECTION_TEXT_ATTRIBUTE } from "@/lib/agent-chat/selection-safe-text";
 
 import { ChatMarkdown } from "./ChatMarkdown";
 import { resetFaviconFailureCache } from "./MarkdownLinkFavicon";
@@ -48,6 +49,22 @@ function middleClick(element: Element): boolean {
     new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
   );
 }
+
+describe("ChatMarkdown selection compatibility", () => {
+  it("renders prose fragments in real inline boxes for WebKit highlights", () => {
+    const { container } = render(
+      <ChatMarkdown>{"plain **emphasized**"}</ChatMarkdown>,
+    );
+    const fragments = container.querySelectorAll(
+      `[${CHAT_SELECTION_TEXT_ATTRIBUTE}]`,
+    );
+
+    expect(Array.from(fragments, (node) => node.textContent)).toEqual([
+      "plain ",
+      "emphasized",
+    ]);
+  });
+});
 
 describe("ChatMarkdown rich external links", () => {
   it("adds the destination favicon to any labelled http(s) link", () => {
