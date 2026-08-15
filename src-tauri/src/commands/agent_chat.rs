@@ -574,6 +574,29 @@ pub async fn agent_chat_start_session<R: Runtime>(
         permission_mode: Some(input.permission_mode.clone()),
         fast_mode: Some(input.fast_mode),
     };
+    // A restart of an existing durable CodeMux thread must not depend solely
+    // on the frontend's in-memory cursor. That slice can be cold after sleep,
+    // remount, or event-stream recovery even though the authoritative session
+    // row already has the provider-native id. Recover it here when the caller
+    // kept the same thread/provider. New Chat uses a new thread id, and a
+    // provider handoff has a different provider, so neither can accidentally
+    // inherit an old provider's cursor through this fallback.
+    if input.resume_cursor.is_none() {
+        let provider_name = match provider {
+            ProviderKind::Claude => "claude",
+            ProviderKind::Codex => "codex",
+            ProviderKind::OpenCode => "opencode",
+        };
+        let persisted_sdk_session_id = {
+            let db: State<'_, DatabaseStore> = app.state();
+            db.get_agent_chat_session(&input.thread_id.0)
+                .filter(|record| record.provider == provider_name)
+                .and_then(|record| record.sdk_session_id)
+        };
+        if let Some(sdk_session_id) = persisted_sdk_session_id {
+            input.resume_cursor = Some(serde_json::json!({ "resume": sdk_session_id }));
+        }
+    }
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
     // shape. Helps distinguish "frontend didn't send it" from
