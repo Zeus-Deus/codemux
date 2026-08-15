@@ -212,12 +212,13 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
   ])("keeps the %s Tasks treatment borderless", (_state, tasks) => {
     renderFooter({ tasks, onTasksClick: vi.fn() });
 
-    const classes = screen
-      .getByTestId("composer-tasks-toggle")
-      .className.split(/\s+/);
+    const toggle = screen.getByTestId("composer-tasks-toggle");
+    const classes = toggle.className.split(/\s+/);
+    expect(toggle).toHaveClass("border-0");
     expect(
       classes.some((className) =>
-        className === "border" || className.startsWith("border-"),
+        className === "border" ||
+        (className.startsWith("border-") && className !== "border-0"),
       ),
     ).toBe(false);
   });
