@@ -1,6 +1,7 @@
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CHAT_SELECTION_TEXT_ATTRIBUTE } from "@/lib/agent-chat/selection-safe-text";
 import {
   TRANSCRIPT_SELECTION_CLASS,
   TRANSCRIPT_SELECTION_HIGHLIGHT,
@@ -126,6 +127,67 @@ describe("collectTranscriptSelectionRanges", () => {
       "\n",
       "omega",
     ]);
+  });
+
+  it("sees through selection-text wrappers when trimming structural edges", () => {
+    // Assistant markdown wraps each prose text node in its own span, so a
+    // soft-wrapped line next to emphasis has no siblings of its own. The
+    // trailing newline is still the collapsed space before "omega".
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <p id="prose" style="user-select: text"><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>alpha\n</span><em><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>omega</span></em></p>
+      </div>
+    `;
+    const prose = document.querySelector("#prose")!;
+    const first = prose.firstChild!.firstChild as Text;
+    const second = prose.lastChild!.firstChild!.firstChild as Text;
+    const selection = selectBetween(first, 0, second, second.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    expect(pieces.map((range) => range.toString())).toEqual([
+      "alpha\n",
+      "omega",
+    ]);
+  });
+
+  it("sees through selection-text wrappers on a leading collapsed space", () => {
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <p id="prose" style="user-select: text"><em><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>alpha</span></em><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>\nomega</span></p>
+      </div>
+    `;
+    const prose = document.querySelector("#prose")!;
+    const first = prose.firstChild!.firstChild!.firstChild as Text;
+    const second = prose.lastChild!.firstChild as Text;
+    const selection = selectBetween(first, 0, second, second.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    expect(pieces.map((range) => range.toString())).toEqual([
+      "alpha",
+      "\nomega",
+    ]);
+  });
+
+  it("still trims structural edges for a wrapper at a block boundary", () => {
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <div style="user-select: text">
+          <p id="prose"><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>alpha\n</span></p>
+          <p id="tail"><span ${CHAT_SELECTION_TEXT_ATTRIBUTE}>omega</span></p>
+        </div>
+      </div>
+    `;
+    const first = document.querySelector("#prose")!.firstChild!
+      .firstChild as Text;
+    const second = document.querySelector("#tail")!.firstChild!
+      .firstChild as Text;
+    const selection = selectBetween(first, 0, second, second.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    expect(pieces.map((range) => range.toString())).toEqual(["alpha", "omega"]);
   });
 
   it("preserves structural-looking whitespace in preformatted content", () => {
