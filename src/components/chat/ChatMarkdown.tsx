@@ -21,6 +21,7 @@ import {
   rehypeChatFileLinks,
   resolveChatFileLink,
 } from "@/lib/agent-chat/file-links";
+import { rehypeSelectionSafeText } from "@/lib/agent-chat/selection-safe-text";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
 import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
@@ -205,6 +206,7 @@ const rehypePlugins = [
   rehypeRichExternalLinks,
   rehypeLocalImageLinks,
   rehypeChatFileLinks,
+  rehypeSelectionSafeText,
 ];
 
 /**

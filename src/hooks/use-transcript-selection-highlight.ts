@@ -1,5 +1,7 @@
 import { useEffect } from "react";
 
+import { CHAT_SELECTION_TEXT_ATTRIBUTE } from "@/lib/agent-chat/selection-safe-text";
+
 export const TRANSCRIPT_SELECTION_HIGHLIGHT =
   "codemux-transcript-selection";
 export const TRANSCRIPT_SELECTION_CLASS =
@@ -49,6 +51,16 @@ function rendersInline(node: ChildNode | null): boolean {
   return display === "" || INLINE_DISPLAY.test(display);
 }
 
+/** Assistant markdown gives every prose text node its own wrapper span so
+ *  WebKit can paint it (see `rehypeSelectionSafeText`). That wrapper is a
+ *  rendering device, not structure: left alone it makes every text node look
+ *  like an only child sitting at a block boundary. Ask the wrapper about its
+ *  neighbours instead so the real inline context is what gets measured. */
+function siblingHost(text: Text): ChildNode {
+  const parent = text.parentElement;
+  return parent?.hasAttribute(CHAT_SELECTION_TEXT_ATTRIBUTE) ? parent : text;
+}
+
 /**
  * Whitespace-only text nodes are two different things wearing one face. The
  * newline between two block rows of rendered markup is scaffolding — painting
@@ -59,7 +71,8 @@ function rendersInline(node: ChildNode | null): boolean {
  * know anything about the surrounding row scaffolding.
  */
 function isPaintableWhitespace(text: Text): boolean {
-  return rendersInline(text.previousSibling) && rendersInline(text.nextSibling);
+  const host = siblingHost(text);
+  return rendersInline(host.previousSibling) && rendersInline(host.nextSibling);
 }
 
 // A renderer may keep a hard break and its source indentation inside the same
@@ -85,17 +98,18 @@ function appendTextRange(
   const whitespace = text.parentElement
     ? getComputedStyle(text.parentElement).whiteSpace
     : "";
+  const host = siblingHost(text);
 
   if (
     !PRESERVED_WHITESPACE.test(whitespace) &&
-    !rendersInline(text.previousSibling)
+    !rendersInline(host.previousSibling)
   ) {
     const leading = text.data.match(LEADING_STRUCTURAL_BREAK);
     if (leading) start = Math.max(start, leading[0].length);
   }
   if (
     !PRESERVED_WHITESPACE.test(whitespace) &&
-    !rendersInline(text.nextSibling)
+    !rendersInline(host.nextSibling)
   ) {
     const trailing = text.data.match(TRAILING_STRUCTURAL_BREAK);
     if (trailing?.index !== undefined) end = Math.min(end, trailing.index);
