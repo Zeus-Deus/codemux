@@ -123,8 +123,22 @@ impl OpenCodeSession {
                 source: Some(err.to_string()),
             })?;
 
+        // Shared MCP is best-effort: OpenCode only grew the runtime
+        // `POST /mcp` endpoint in 1.18.18, and older binaries must still be
+        // able to start a session — just without Codemux-configured servers.
+        // Failures surface as a RuntimeWarning instead of killing the session.
         if let Some(registry) = mcp_registry.as_ref() {
-            attach_mcp_gateway(&http, &server_handle, registry).await?;
+            if let Err(error) = attach_mcp_gateway(&http, &server_handle, registry).await {
+                eprintln!("[codemux::opencode] shared MCP gateway attach failed: {error}");
+                let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(thread_id.clone()),
+                    message: format!(
+                        "Codemux MCP servers are unavailable in this OpenCode session \
+                         (gateway attach failed: {error}). Update OpenCode to 1.18.18 or later."
+                    ),
+                    original_payload: None,
+                });
+            }
         }
 
         // Best-effort resume: readopt the persisted server-side session id when
@@ -711,6 +725,74 @@ mod tests {
         .await
         .unwrap();
         attach.assert_async().await;
+    }
+
+    /// An OpenCode binary without the runtime `POST /mcp` endpoint (pre
+    /// 1.18.18) must still get a working session — just without Codemux's
+    /// shared MCP servers — with the loss reported as a RuntimeWarning.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(opencode_path)]
+    async fn session_starts_when_gateway_attach_is_unsupported() {
+        use super::super::manager::write_fake_opencode_binary;
+
+        let mut backend = Server::new_async().await;
+        let attach = backend
+            .mock("POST", "/mcp")
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+        let create = backend
+            .mock("POST", "/session")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"ses_no_mcp"}"#)
+            .create_async()
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fake_opencode_binary(tmp.path());
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: serial_test serialises this against every other opencode
+        // test that touches PATH / FAKE_OPENCODE_URL.
+        unsafe {
+            std::env::set_var("PATH", tmp.path());
+            std::env::set_var("FAKE_OPENCODE_URL", backend.url());
+        }
+
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let (tx, mut rx) = broadcast::channel(64);
+        let started = OpenCodeSession::start(
+            manager.clone(),
+            Some(McpRegistry::new()),
+            ThreadId("t-mcp-degraded".into()),
+            None,
+            None,
+            None,
+            tx,
+            None,
+        )
+        .await;
+
+        unsafe {
+            std::env::set_var("PATH", original_path);
+            std::env::remove_var("FAKE_OPENCODE_URL");
+        }
+        manager.stop().await;
+
+        let session = started.expect("session must start without the shared MCP gateway");
+        assert_eq!(session.provider_session_id.0, "ses_no_mcp");
+        attach.assert_async().await;
+        create.assert_async().await;
+        let mut warned = false;
+        while let Ok(event) = rx.try_recv() {
+            if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = event {
+                warned |= message.contains("gateway attach failed");
+            }
+        }
+        assert!(warned, "a failed attach must surface as a RuntimeWarning");
+        session.shutdown().await;
     }
 
     /// Developer smoke test against the installed OpenCode binary. Ignored in
