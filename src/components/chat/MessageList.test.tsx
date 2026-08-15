@@ -16,11 +16,17 @@ import type {
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 import {
+  docEditorTabId,
+  docPaneId,
+} from "@/components/layout/right-panel/pane-registry";
+import {
   getTitlebarContentUnder,
   getTitlebarTranscriptElements,
 } from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
+import { useEditorStore } from "@/stores/editor-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 import { MessageList } from "./MessageList";
@@ -358,6 +364,51 @@ const noopHandlers = {
 };
 
 describe("MessageList dispatch", () => {
+  it("opens a relative file from the agent's cross-project tool directory", () => {
+    useEditorStore.setState({ tabs: {} });
+    useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
+    const workspaceId = "ws-home";
+    const projectCwd = "/home/me/projects/omarchy";
+    const tool: ToolCallItem = {
+      kind: "tool_call",
+      id: "tool-project-cwd",
+      seq: 1,
+      turn_id: "turn-cross-project",
+      tool_use_id: "tu-project-cwd",
+      tool_name: "exec_command",
+      input: { cmd: "git status --short", workdir: projectCwd },
+      status: "done",
+      result_content: "",
+      approval_request_id: null,
+    };
+    const answer: ChatViewItem = {
+      kind: "assistant_message",
+      id: "answer-cross-project",
+      seq: 2,
+      turn_id: "turn-cross-project",
+      text: "Updated `AGENTS.md` minimally.",
+      streaming: false,
+    };
+
+    render(
+      <MessageList
+        messages={[tool, answer]}
+        workspaceId={workspaceId}
+        cwd="/home/me"
+        {...noopHandlers}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "AGENTS.md" }));
+
+    const filePath = `${projectCwd}/AGENTS.md`;
+    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+      docPaneId(filePath),
+    );
+    expect(
+      useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
+    ).toMatchObject({ filePath });
+  });
+
   it("routes request_kind=plan to PlanProposalBlock", () => {
     renderList([planReq()]);
     expect(screen.getByText("Plan proposed")).toBeInTheDocument();

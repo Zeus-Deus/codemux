@@ -12,8 +12,9 @@ describe("resolveChatFileLink", () => {
     ["src/components/Chat.tsx#L9C3", "/work/codemux/src/components/Chat.tsx", 9, 3],
     ["src/My%20File.ts:11", "/work/codemux/src/My File.ts", 11, undefined],
     ["/work/codemux/src/lib.ts:5", "/work/codemux/src/lib.ts", 5, undefined],
+    ["/work/another-project/AGENTS.md", "/work/another-project/AGENTS.md", undefined, undefined],
     ["WORKFLOW.md", "/work/codemux/WORKFLOW.md", undefined, undefined],
-  ])("resolves %s inside the active worktree", (input, filePath, line, column) => {
+  ])("resolves source reference %s", (input, filePath, line, column) => {
     const resolved = resolveChatFileLink(input as string, cwd);
     expect(resolved?.filePath).toBe(filePath);
     expect(resolved?.line).toBe(line);
@@ -31,7 +32,6 @@ describe("resolveChatFileLink", () => {
     "https://example.com/file.ts",
     "mailto:dev@example.com",
     "../outside.ts",
-    "/tmp/outside.ts",
     "package@1.2.3",
     "v1.2.3",
     "not a source reference",

@@ -25,6 +25,7 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import { assistantReferenceCwds } from "@/lib/agent-chat/reference-cwd";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -242,6 +243,10 @@ export const MessageList = memo(function MessageList({
     copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
     return copy;
   }, [messages]);
+  const referenceCwdByMessageId = useMemo(
+    () => assistantReferenceCwds(ordered),
+    [ordered],
+  );
 
   // Turn-fold expansion lives above the virtualized rows so recycling or
   // measurement churn never loses the user's disclosure choice.
@@ -1109,6 +1114,7 @@ export const MessageList = memo(function MessageList({
           }
           workspaceId={workspaceId}
           cwd={cwd}
+          referenceCwd={referenceCwdByMessageId.get(slot.messageId)}
           onRespondToRequest={onRespondToRequest}
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
@@ -1129,6 +1135,7 @@ export const MessageList = memo(function MessageList({
       onSendQueuedNow,
       onRevertTurn,
       requestsById,
+      referenceCwdByMessageId,
       revertingTurnIndex,
       subagentNames,
       toggleTurnFold,
@@ -1483,6 +1490,7 @@ function ItemRow({
   revertingTurnIndex,
   workspaceId,
   cwd,
+  referenceCwd,
 }: {
   item: ChatViewItem;
   approval: PermissionRequestItem | null;
@@ -1497,6 +1505,7 @@ function ItemRow({
   revertingTurnIndex?: number | null;
   workspaceId?: string | null;
   cwd?: string | null;
+  referenceCwd?: string | null;
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -1562,6 +1571,7 @@ function ItemRow({
     subagentName,
     workspaceId,
     cwd,
+    referenceCwd,
     handleDecide,
     handleAcceptPlan,
     handleRejectPlan,
@@ -1575,6 +1585,7 @@ function renderAssistantBody(
     subagentName: string | null;
     workspaceId?: string | null;
     cwd?: string | null;
+    referenceCwd?: string | null;
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -1587,6 +1598,7 @@ function renderAssistantBody(
           item={item}
           workspaceId={handlers.workspaceId}
           cwd={handlers.cwd}
+          referenceCwd={handlers.referenceCwd}
         />
       );
     case "reasoning":
@@ -1748,6 +1760,7 @@ function SlotRow({
   subagentName,
   workspaceId,
   cwd,
+  referenceCwd,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -1763,6 +1776,7 @@ function SlotRow({
   subagentName: string | null;
   workspaceId?: string | null;
   cwd?: string | null;
+  referenceCwd?: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -1823,6 +1837,7 @@ function SlotRow({
           revertingTurnIndex={revertingTurnIndex}
           workspaceId={workspaceId}
           cwd={cwd}
+          referenceCwd={referenceCwd}
         />
       )}
     </div>

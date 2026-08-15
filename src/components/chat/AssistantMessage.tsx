@@ -16,17 +16,19 @@ export const AssistantMessage = memo(function AssistantMessage({
   item,
   workspaceId,
   cwd,
+  referenceCwd,
 }: {
   item: AssistantMessageItem;
   workspaceId?: string | null;
   cwd?: string | null;
+  referenceCwd?: string | null;
 }) {
   return (
     <div className="conversation-text leading-relaxed text-foreground break-words">
       <ChatMarkdown
         streaming={item.streaming}
         workspaceId={workspaceId}
-        cwd={cwd}
+        cwd={referenceCwd ?? cwd}
       >
         {item.text}
       </ChatMarkdown>

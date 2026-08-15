@@ -1,4 +1,4 @@
-/** Workspace-safe parsing for source references emitted in agent Markdown. */
+/** Parsing for source references emitted in agent Markdown. */
 
 export const CHAT_FILE_LINK_TAG = "chat-file-link";
 
@@ -132,12 +132,22 @@ export function resolveChatFileLink(
   if (options.allowSpaces === false && /\s/.test(location.path)) return null;
   if (!looksLikeFile(location.path)) return null;
   const root = normalizePath(cwd);
-  const resolved = isAbsolute(location.path)
+  const absoluteReference = isAbsolute(location.path);
+  const resolved = absoluteReference
     ? normalizePath(location.path)
     : normalizePath(`${root}/${location.path}`);
-  if (!withinRoot(resolved, root)) return null;
 
-  const relative = resolved === root ? basename(resolved) : resolved.slice(root.length + 1);
+  // Relative references are only meaningful inside the directory they were
+  // emitted from. Keep rejecting `../outside.ts`, but do not apply that rule
+  // to an explicit absolute path: agents can work in another project from a
+  // Home workspace, and the absolute path is already the unambiguous target.
+  if (!absoluteReference && !withinRoot(resolved, root)) return null;
+
+  const relative = withinRoot(resolved, root)
+    ? resolved === root
+      ? basename(resolved)
+      : resolved.slice(root.length + 1)
+    : resolved;
   return {
     filePath: resolved,
     basename: basename(resolved),
