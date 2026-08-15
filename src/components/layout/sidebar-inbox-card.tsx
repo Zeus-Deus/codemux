@@ -101,9 +101,8 @@ interface Props {
   leaving: boolean;
   /** True briefly after an un-settle so the returning card eases back in. */
   justUnsettled: boolean;
-  /** 1-9 digit shown as an overlay badge while the jump modifier is held, or
-   *  null when no hint should show. Rendered as an overlay so it never shifts
-   *  the card layout. */
+  /** 1-9 digit rendered as a keycap in the card eyebrow while the jump modifier
+   *  is held, or null when no hint should show. */
   jumpHint?: number | null;
   onSettle: (workspaceId: string) => void;
   onSnooze: (workspaceId: string, until: number) => void;
