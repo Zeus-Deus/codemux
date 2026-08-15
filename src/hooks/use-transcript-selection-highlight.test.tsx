@@ -85,6 +85,63 @@ describe("collectTranscriptSelectionRanges", () => {
     ]);
   });
 
+  it("omits an embedded hard break and its indentation from the paint ranges", () => {
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <div style="user-select: text">
+          <p id="prose">alpha<br>\n    omega</p>
+        </div>
+      </div>
+    `;
+    const prose = document.querySelector("#prose")!;
+    const first = prose.firstChild as Text;
+    const second = prose.lastChild as Text;
+    const selection = selectBetween(first, 0, second, second.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    // The native selection still contains the hard break for copying, but
+    // WebKitGTK must not receive it as part of a painted custom range.
+    expect(selection.toString()).toContain("\n");
+    expect(pieces.map((range) => range.toString())).toEqual(["alpha", "omega"]);
+  });
+
+  it("preserves a newline that collapses to a space inside inline prose", () => {
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <p id="prose" style="user-select: text"><em>alpha</em>\n<em>omega</em></p>
+      </div>
+    `;
+    const prose = document.querySelector("#prose")!;
+    const first = prose.firstChild!.firstChild as Text;
+    const space = prose.childNodes[1] as Text;
+    const second = prose.lastChild!.firstChild as Text;
+    const selection = selectBetween(first, 0, second, second.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    expect(space.data).toBe("\n");
+    expect(pieces.map((range) => range.toString())).toEqual([
+      "alpha",
+      "\n",
+      "omega",
+    ]);
+  });
+
+  it("preserves structural-looking whitespace in preformatted content", () => {
+    document.body.innerHTML = `
+      <div data-slot="transcript-list">
+        <pre id="code" style="user-select: text; white-space: pre-wrap">\n\n  omega\n</pre>
+      </div>
+    `;
+    const code = document.querySelector("#code")!.firstChild as Text;
+    const selection = selectBetween(code, 0, code, code.length);
+
+    const pieces = collectTranscriptSelectionRanges(selection);
+
+    expect(pieces.map((range) => range.toString())).toEqual(["\n  omega\n"]);
+  });
+
   it("returns no paint ranges for a collapsed caret", () => {
     const { first } = transcriptFixture();
     const selection = selectBetween(first, 2, first, 2);

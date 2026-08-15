@@ -42,6 +42,7 @@ function rendersInline(node: ChildNode | null): boolean {
     return (node as Text).data.trim().length > 0;
   }
   if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  if ((node as Element).tagName === "BR") return false;
   const display = getComputedStyle(node as Element).display;
   // A tree with no default style sheet reports no display at all. Treat that
   // as inline so prose spacing still paints instead of silently dropping out.
@@ -59,6 +60,52 @@ function rendersInline(node: ChildNode | null): boolean {
  */
 function isPaintableWhitespace(text: Text): boolean {
   return rendersInline(text.previousSibling) && rendersInline(text.nextSibling);
+}
+
+// A renderer may keep a hard break and its source indentation inside the same
+// text node as visible prose (`<br>\n    next line`). Checking only whether the
+// whole node is whitespace therefore misses it. WebKitGTK paints a Range that
+// contains that hidden break as the gap between the two line boxes. Limit the
+// trim to structural edges: a newline between inline prose is a real collapsed
+// space, while whitespace in preformatted content must remain selectable.
+const LEADING_STRUCTURAL_BREAK =
+  /^[ \t\f\v]*(?:(?:\r\n?|\n|\u2028|\u2029)[ \t\f\v]*)+/;
+const TRAILING_STRUCTURAL_BREAK =
+  /(?:[ \t\f\v]*(?:\r\n?|\n|\u2028|\u2029))+[ \t\f\v]*$/;
+const PRESERVED_WHITESPACE = /^(?:pre|pre-wrap|break-spaces)$/;
+
+function appendTextRange(
+  pieces: Range[],
+  text: Text,
+  rawStart: number,
+  rawEnd: number,
+): void {
+  let start = rawStart;
+  let end = rawEnd;
+  const whitespace = text.parentElement
+    ? getComputedStyle(text.parentElement).whiteSpace
+    : "";
+
+  if (
+    !PRESERVED_WHITESPACE.test(whitespace) &&
+    !rendersInline(text.previousSibling)
+  ) {
+    const leading = text.data.match(LEADING_STRUCTURAL_BREAK);
+    if (leading) start = Math.max(start, leading[0].length);
+  }
+  if (
+    !PRESERVED_WHITESPACE.test(whitespace) &&
+    !rendersInline(text.nextSibling)
+  ) {
+    const trailing = text.data.match(TRAILING_STRUCTURAL_BREAK);
+    if (trailing?.index !== undefined) end = Math.min(end, trailing.index);
+  }
+
+  if (start >= end) return;
+  const piece = text.ownerDocument.createRange();
+  piece.setStart(text, start);
+  piece.setEnd(text, end);
+  pieces.push(piece);
 }
 
 /**
@@ -104,12 +151,7 @@ export function collectTranscriptSelectionRanges(
               ? selectionRange.endOffset
               : text.length;
 
-          if (start < end) {
-            const piece = transcript.ownerDocument.createRange();
-            piece.setStart(text, start);
-            piece.setEnd(text, end);
-            pieces.push(piece);
-          }
+          if (start < end) appendTextRange(pieces, text, start, end);
         }
         current = walker.nextNode();
       }
