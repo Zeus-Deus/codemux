@@ -939,11 +939,17 @@ export function ReviewDetail(props: ReviewDetailProps) {
         data-testid="review-scroll"
       >
       {activeTab === "timeline" ? (
-        <ReviewTimeline
-          entries={timelineEntries}
-          loading={timelineQuery.isFetching && !timelineQuery.data}
-          staleAgeMs={timelineStaleAgeMs}
-        />
+        /* Reading surfaces share one measure: every row ends at the
+           same right edge instead of individual elements capping
+           themselves while their controls drift to the window edge.
+           The Code tab opts out — a diff earns the full width. */
+        <div className="max-w-[920px]">
+          <ReviewTimeline
+            entries={timelineEntries}
+            loading={timelineQuery.isFetching && !timelineQuery.data}
+            staleAgeMs={timelineStaleAgeMs}
+          />
+        </div>
       ) : activeTab === "code" ? (
         <ReviewCodeTab
           draftKey={key}
@@ -966,7 +972,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       /* Status before description, deliberately: what you need to know
          about this PR right now is whether it's healthy, not what its
          author wrote about it a day ago. */
-      <div className="flex flex-1 flex-col gap-3 px-3.5 py-3">
+      <div className="flex max-w-[920px] flex-1 flex-col gap-3 px-3.5 py-3">
         <ReviewChecks
           checks={checks}
           isLoading={checksLoading}

@@ -547,7 +547,9 @@ body.pane-resizing iframe {
   font-size: var(--font-size-conversation, 14px);
   line-height: 1.7;
   color: var(--foreground);
-  max-width: 860px;
+  /* No max-width here: the detail surface caps its whole reading
+   * column in one place, so prose and the rows around it share a
+   * right edge instead of each capping itself. */
 }
 .markdown-rendered-inline p { margin: 0 0 0.5em; }
 .markdown-rendered-inline > *:last-child { margin-bottom: 0; }
