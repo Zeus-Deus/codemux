@@ -509,7 +509,7 @@ fn gitlab_adapter_round_trips_against_a_live_instance() {
     // ── Merge, and the state round trip ──
 
     provider
-        .merge_pull_request(dir, number, "merge")
+        .merge_pull_request(dir, number, "merge", true, None, None)
         .expect("merge");
 
     let merged = provider.get_pull_request(dir, number).expect("get merged");

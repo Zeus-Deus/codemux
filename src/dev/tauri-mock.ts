@@ -45,6 +45,14 @@ import {
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
+  MOCK_CHECK_LOG_EXCERPT,
+  MOCK_LOCAL_ONLY_PATH,
+  MOCK_PR_CHECKS,
+  MOCK_PR_INLINE_COMMENTS,
+  MOCK_PR_PATH_TO_NUMBER,
+  MOCK_PR_REVIEWS,
+  MOCK_PULL_REQUESTS,
+  MOCK_SUBMIT_FAILURE_PR,
   createSeedAppState,
   mockListDirectory,
   mockReadFile,
@@ -78,6 +86,8 @@ import type {
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
+  PullRequestInfo,
+  ReviewComment,
   SurfaceSnapshot,
   TabSnapshot,
   TerminalPreset,
@@ -105,6 +115,38 @@ let appState: AppStateSnapshot = createSeedAppState();
 
 function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
   return appState.workspaces.find((w) => w.workspace_id === id);
+}
+
+// ── Pull request mock state ──
+//
+// The fixture map is the seed; this is the copy the mutators write to,
+// so merging or editing a PR in the browser sticks for the session
+// without the fixture module ever being touched.
+const mutablePrs: Record<number, PullRequestInfo> = structuredClone(MOCK_PULL_REQUESTS);
+const mutablePrReviews: Record<number, ReviewComment[]> = {};
+
+function mutablePr(number: number): PullRequestInfo | undefined {
+  return mutablePrs[number];
+}
+
+/** The PR for a checkout path, via the seeded path→number map. */
+function prForPath(path: unknown): PullRequestInfo | undefined {
+  const number = MOCK_PR_PATH_TO_NUMBER[String(path ?? "")];
+  return number == null ? undefined : mutablePrs[number];
+}
+
+/** Mirror a PR state change onto every workspace carrying that PR, so
+ *  the sidebar icon and the panel agree — the real backend does this
+ *  through its 60s poll. */
+function syncWorkspacePrState(number: number, state: string): void {
+  let mutated = false;
+  for (const ws of appState.workspaces) {
+    if (ws.pr_number === number) {
+      ws.pr_state = state;
+      mutated = true;
+    }
+  }
+  if (mutated) emitAppState();
 }
 
 /** Re-emit the current snapshot so subscribers (`useAppStateInit`) pick
@@ -3199,6 +3241,139 @@ const handlers: Record<string, Handler> = {
   },
   list_incoming_prs: () => [],
 
+  // ── Review panel ──
+  //
+  // Without `check_github_repo` the panel's gate resolves `repoSupported`
+  // to null, every PR query stays disabled and the pane sits on a
+  // skeleton forever — so this is load-bearing, not decoration.
+  check_github_repo: () => true,
+
+  get_branch_pull_request: (a) => prForPath(a.path) ?? null,
+
+  // Which of the two no-PR empty states applies turns on whether the
+  // branch is on the remote at all, so one seeded checkout is
+  // deliberately local-only and everything else is pushed.
+  get_git_branch_info: (a) => {
+    const path = String(a.path ?? "");
+    const ws = appState.workspaces.find((w) => (w.worktree_path ?? w.cwd) === path);
+    return {
+      branch: ws?.git_branch ?? null,
+      ahead: ws?.git_ahead ?? 0,
+      behind: ws?.git_behind ?? 0,
+      has_upstream: path !== MOCK_LOCAL_ONLY_PATH,
+    };
+  },
+
+  get_pull_request_checks: (a) => {
+    const pr = prForPath(a.path);
+    return pr ? (MOCK_PR_CHECKS[pr.number] ?? []) : [];
+  },
+
+  get_pr_review_comments: (a) => {
+    const pr = prForPath(a.path);
+    return pr ? (MOCK_PR_REVIEWS[pr.number] ?? []) : [];
+  },
+
+  get_pr_inline_comments: (a) => {
+    const num = Number(a.prNumber);
+    return MOCK_PR_INLINE_COMMENTS[num] ?? [];
+  },
+
+  get_check_log_excerpt: (a) => {
+    const checks = MOCK_PR_CHECKS[Number(a.prNumber)] ?? [];
+    const check = checks.find((c) => c.name === a.checkName);
+    // Only failing checks carry an excerpt, mirroring
+    // `gh run view --log-failed`.
+    return check?.conclusion === "fail" ? MOCK_CHECK_LOG_EXCERPT : "";
+  },
+
+  submit_pr_review: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      // The one PR that always refuses, so the submit-failed drift
+      // notice (and the "your text survived" promise behind it) can be
+      // re-triggered on demand instead of once per session.
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const reviews = (mutablePrReviews[num] ??= [
+      ...(MOCK_PR_REVIEWS[num] ?? []),
+    ]);
+    const event = String(a.event ?? "comment");
+    reviews.push({
+      id: Date.now(),
+      author: "mock-dev",
+      body: String(a.body ?? ""),
+      state:
+        event === "approve"
+          ? "APPROVED"
+          : event === "request-changes"
+            ? "CHANGES_REQUESTED"
+            : "COMMENTED",
+      created_at: new Date().toISOString(),
+    });
+    const pr = mutablePr(num);
+    if (pr && event === "approve") pr.review_decision = "APPROVED";
+    if (pr && event === "request-changes") pr.review_decision = "CHANGES_REQUESTED";
+    emitAppState();
+    return undefined;
+  },
+
+  merge_pull_request: (a) => {
+    const num = Number(a.prNumber);
+    const pr = mutablePr(num);
+    if (!pr) return Promise.reject(`No merge target for #${num}`);
+    pr.state = "MERGED";
+    pr.is_draft = false;
+    pr.merged_by = "mock-dev";
+    pr.merged_at = new Date().toISOString();
+    syncWorkspacePrState(num, "merged");
+    return undefined;
+  },
+
+  close_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.state = "CLOSED";
+    syncWorkspacePrState(pr.number, "closed");
+    return undefined;
+  },
+
+  reopen_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.state = "OPEN";
+    syncWorkspacePrState(pr.number, "open");
+    return undefined;
+  },
+
+  set_pr_ready: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.is_draft = !a.ready;
+    syncWorkspacePrState(pr.number, a.ready ? "open" : "draft");
+    return undefined;
+  },
+
+  update_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    if (typeof a.title === "string") pr.title = a.title;
+    if (typeof a.body === "string") pr.body = a.body;
+    pr.updated_at = new Date().toISOString();
+    return undefined;
+  },
+
+  request_pr_review: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    const reviewer = String(a.reviewer ?? "").trim();
+    if (!reviewer) return Promise.reject("A reviewer name is required.");
+    if (!pr.review_requests.includes(reviewer)) pr.review_requests.push(reviewer);
+    return undefined;
+  },
+
   // ── Hosts (remote devices) ──
   //
   // Seed one host so the Settings → Hosts detail pane (Test connection,
@@ -3603,7 +3778,6 @@ const handlers: Record<string, Handler> = {
   // the non-git `scratchpad` seed exercise the "Not a git repository"
   // empty state (`is_git: false` → showNoGitState).
   get_git_status: () => [],
-  get_git_branch_info: () => null,
   get_merge_state: () => null,
   check_claude_available: () => false,
 

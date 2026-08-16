@@ -27,9 +27,13 @@ import type {
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   AuthUser,
+  CheckInfo,
   CodemuxConfigSnapshot,
   FileEntry,
+  InlineReviewComment,
   LinkedIssue,
+  PullRequestInfo,
+  ReviewComment,
   PaneNodeSnapshot,
   PaneStatus,
   PersistenceSchema,
@@ -2550,3 +2554,362 @@ export function mockUsageExportCsv(period: string): string {
   }
   return out;
 }
+
+// ── Pull request fixtures ───────────────────────────────────────────
+//
+// The Review panel is the densest read-only surface in the app, so the
+// mock has to be able to reach every state it can render: a healthy PR,
+// one with a failing and a running check, a draft, a merged record, a
+// closed one, and a GitLab merge request. Each seeded workspace's
+// checkout path maps to exactly one of these.
+//
+// Why a path map instead of `find(w => w.cwd === path)`: three codemux
+// workspaces share `/home/dev/projects/codemux`, and only one of them
+// carries a PR. A naive lookup returns the wrong workspace and the
+// panel sits on a skeleton forever.
+
+const MOCK_PR_AUTHOR = "mock-dev";
+const OTHER_AUTHOR = "juliusm";
+
+function minutesAgo(minutes: number): string {
+  return new Date(Date.now() - minutes * 60_000).toISOString();
+}
+
+/** Fill in the fields every `PullRequestInfo` carries so each fixture
+ *  below only has to state what makes it interesting. */
+function makePr(seed: Partial<PullRequestInfo> & { number: number; title: string }): PullRequestInfo {
+  return {
+    url: `https://github.com/example/codemux/pull/${seed.number}`,
+    state: "OPEN",
+    head_branch: null,
+    base_branch: "main",
+    is_draft: false,
+    mergeable: "MERGEABLE",
+    additions: null,
+    deletions: null,
+    review_decision: null,
+    checks_passing: null,
+    updated_at: minutesAgo(38),
+    body: null,
+    comments: [],
+    totalComments: 0,
+    author: MOCK_PR_AUTHOR,
+    // Distinct per PR so the panel's force-push watch has something
+    // real to compare across polls.
+    head_ref_oid: `mock${seed.number}headsha0000000000000000000`.slice(0, 40),
+    head_repository_owner: "example",
+    merge_state_status: "CLEAN",
+    changed_files: null,
+    merged_by: null,
+    merged_at: null,
+    review_requests: [],
+    latest_reviews: [],
+    ...seed,
+  };
+}
+
+const PR_172_BODY = `Unsent prompts currently disappear from the user's working context when they navigate away, even though the client already models pre-materialized chat drafts. This makes it easy to lose an invested prompt or accidentally reuse it when starting another agent.
+
+This change keeps invested drafts as independent sessions and surfaces them one click away above the workspace inbox.
+
+## Verification
+
+- 237 affected tests across the draft store, sidebar rail and empty-state lifecycle
+- browser E2E: create, navigate away, restore, reload, promote on \`Send\`, discard
+
+Closes #168.`;
+
+/** Long enough to exercise the description fold (>40 rendered lines). */
+const PR_482_BODY = [
+  "Adds a monitoring pane that watches long-running agent sessions.",
+  "",
+  ...Array.from({ length: 46 }, (_, i) => `- step ${i + 1}: verified against the staging cluster`),
+].join("\n");
+
+/** Keyed by PR number. The panel's queries resolve a path to a number
+ *  through `MOCK_PR_PATH_TO_NUMBER` first. */
+export const MOCK_PULL_REQUESTS: Record<number, PullRequestInfo> = {
+  // The canonical open PR: one failing check, one running, reviewers
+  // not yet requested. This is the panel screenshot state.
+  172: makePr({
+    number: 172,
+    title: "feat: keep unsent drafts in the sidebar",
+    head_branch: "agent/investigate-draft-mode",
+    additions: 1180,
+    deletions: 33,
+    changed_files: 8,
+    body: PR_172_BODY,
+    updated_at: minutesAgo(38),
+    merge_state_status: "UNSTABLE",
+    author: MOCK_PR_AUTHOR,
+  }),
+  // Someone else's PR, so the reviewer bar renders — and the one whose
+  // submissions always fail, so the submit-failed notice (and the
+  // promise that your text survives it) is reachable on demand.
+  142: makePr({
+    number: 142,
+    title: "chore: detect dev-server ports without polling",
+    head_branch: "chore/port-detection",
+    author: OTHER_AUTHOR,
+    additions: 58,
+    deletions: 4,
+    changed_files: 2,
+    mergeable: "CONFLICTING",
+    merge_state_status: "DIRTY",
+    review_decision: "CHANGES_REQUESTED",
+    updated_at: minutesAgo(12),
+    body: "Replaces the 500ms port poll with an inotify watch on the project root.",
+    latest_reviews: [{ author: OTHER_AUTHOR, state: "CHANGES_REQUESTED" }],
+  }),
+  // Author + everything green: the merge-sheet path.
+  482: makePr({
+    number: 482,
+    title: "feat(monitoring): watch long-running agent sessions",
+    head_branch: "demo/monitoring",
+    additions: 902,
+    deletions: 114,
+    changed_files: 17,
+    review_decision: "APPROVED",
+    merge_state_status: "CLEAN",
+    updated_at: minutesAgo(4),
+    body: PR_482_BODY,
+    latest_reviews: [{ author: OTHER_AUTHOR, state: "APPROVED" }],
+  }),
+  // Author + draft: Close / Ready for review.
+  140: makePr({
+    number: 140,
+    title: "dev: mock Tauri runtime so the UI boots in a plain browser",
+    head_branch: "feature/40-dev-mock-tauri-runtime",
+    is_draft: true,
+    additions: 214,
+    deletions: 37,
+    changed_files: 6,
+    merge_state_status: "BLOCKED",
+    updated_at: minutesAgo(95),
+    body: "Seeds a full in-memory Tauri runtime so every surface is reachable in a plain browser.",
+  }),
+  // A merged record — the panel is read-only here.
+  128: makePr({
+    number: 128,
+    title: "Refactor auth token refresh to avoid mid-session expiry",
+    head_branch: "feature/auth-refactor",
+    state: "MERGED",
+    additions: 340,
+    deletions: 288,
+    changed_files: 11,
+    review_decision: "APPROVED",
+    merged_by: OTHER_AUTHOR,
+    merged_at: minutesAgo(40 / 60),
+    updated_at: minutesAgo(1),
+    body: "Moves the refresh to a background timer keyed on token expiry.",
+    latest_reviews: [{ author: OTHER_AUTHOR, state: "APPROVED" }],
+  }),
+  // Closed without merging.
+  131: makePr({
+    number: 131,
+    title: "fix: stop the sidebar flickering on workspace switch",
+    head_branch: "fix/sidebar-flicker",
+    state: "CLOSED",
+    additions: 22,
+    deletions: 19,
+    changed_files: 3,
+    updated_at: minutesAgo(2880),
+    body: "Superseded by the pane-deck rewrite.",
+  }),
+  // Reviewer state: someone else's PR, awaiting your verdict.
+  12: makePr({
+    number: 12,
+    title: "design: refresh the landing hero",
+    url: "https://github.com/example/personal-site/pull/12",
+    head_branch: "design/landing-refresh",
+    author: OTHER_AUTHOR,
+    additions: 401,
+    deletions: 220,
+    changed_files: 11,
+    review_requests: [MOCK_PR_AUTHOR],
+    updated_at: minutesAgo(22),
+    body: "New hero type scale, plus a reduced-motion path for the gradient.",
+  }),
+  // GitLab merge request (sigil `!`).
+  88: makePr({
+    number: 88,
+    title: "feat: CUDA variant of the inference runtime",
+    url: "https://gitlab.example.com/acme/vexis/-/merge_requests/88",
+    head_branch: "feat/cuda-variant",
+    additions: 512,
+    deletions: 40,
+    changed_files: 9,
+    updated_at: minutesAgo(58),
+    body: "Builds a second AppImage against the CUDA toolkit.",
+  }),
+  90: makePr({
+    number: 90,
+    title: "perf: add a benchmark suite",
+    url: "https://gitlab.example.com/acme/vexis/-/merge_requests/90",
+    head_branch: "perf/bench-suite",
+    is_draft: true,
+    additions: 132,
+    deletions: 9,
+    changed_files: 4,
+    merge_state_status: "BLOCKED",
+    updated_at: minutesAgo(310),
+    body: "Criterion-based, runs nightly.",
+  }),
+};
+
+/** Checkout path → PR number. Mirrors `worktree_path ?? cwd`, which is
+ *  what the Review panel passes to every PR query. */
+export const MOCK_PR_PATH_TO_NUMBER: Record<string, number> = {
+  [`${HOME}/projects/codemux`]: 172,
+  [`${HOME}/.codemux/worktrees/codemux/chore-port-detection`]: 142,
+  [`${HOME}/.codemux/worktrees/codemux/demo-monitoring`]: 482,
+  [`${HOME}/.codemux/worktrees/codemux/feature-40-dev-mock`]: 140,
+  [`${HOME}/.codemux/worktrees/codemux/feature-auth-refactor`]: 128,
+  [`${HOME}/.codemux/worktrees/codemux/fix-sidebar-flicker`]: 131,
+  [`${HOME}/.codemux/worktrees/personal-site/design-landing-refresh`]: 12,
+  [`${HOME}/.codemux/worktrees/vexis/feat-cuda-variant`]: 88,
+  [`${HOME}/.codemux/worktrees/vexis/perf-bench-suite`]: 90,
+};
+
+/**
+ * The PR whose review submissions always fail.
+ *
+ * Deliberately a fixed PR rather than a call counter: the submit-failed
+ * drift notice is the one state that has to be re-triggerable on demand
+ * (its whole point is that the typed text survives a retry), and a
+ * counter makes the second attempt succeed just when you want to look
+ * at the failure again.
+ */
+export const MOCK_SUBMIT_FAILURE_PR = 142;
+
+/** Checks per PR. #172 is the interesting one: four green, one failing,
+ *  one still running. */
+export const MOCK_PR_CHECKS: Record<number, CheckInfo[]> = {
+  172: [
+    checkOf("build (ubuntu-latest)", "pass", "1m 02s"),
+    checkOf("lint", "pass", "24s"),
+    checkOf("typecheck", "pass", "41s"),
+    checkOf("test (ubuntu-latest)", "pass", "3m 18s"),
+    checkOf("rust (windows-latest)", "fail", "2m 14s"),
+    checkOf("e2e (chromium)", "pending", "2m 14s"),
+  ],
+  142: [
+    checkOf("build (ubuntu-latest)", "pass", "58s"),
+    checkOf("lint", "fail", "19s"),
+  ],
+  482: [
+    checkOf("build (ubuntu-latest)", "pass", "1m 11s"),
+    checkOf("lint", "pass", "22s"),
+    checkOf("typecheck", "pass", "38s"),
+    checkOf("test (ubuntu-latest)", "pass", "2m 55s"),
+  ],
+  140: [checkOf("lint", "pass", "20s"), checkOf("typecheck", "pending", "11s")],
+  128: [checkOf("build (ubuntu-latest)", "pass", "1m 04s")],
+  131: [],
+  12: [checkOf("build", "pass", "33s"), checkOf("visual-diff", "pass", "1m 12s")],
+  88: [checkOf("cargo build", "pass", "4m 02s"), checkOf("cargo test", "pending", "1m 30s")],
+  90: [checkOf("cargo build", "pass", "3m 48s")],
+};
+
+function checkOf(name: string, bucket: string, elapsed: string): CheckInfo {
+  const done = bucket !== "pending";
+  return {
+    name,
+    status: done ? "COMPLETED" : "IN_PROGRESS",
+    conclusion: bucket,
+    elapsed_time: elapsed,
+    detail_url: `https://github.com/example/codemux/actions/runs/9${name.length}${bucket.length}`,
+    started_at: minutesAgo(6),
+    completed_at: done ? minutesAgo(3) : null,
+  };
+}
+
+/** Canned 2-line failure tail for the failing-check card. */
+export const MOCK_CHECK_LOG_EXCERPT =
+  "error[E0432]: unresolved import `crate::pty::winpty`\n" +
+  "  --> src/pty/mod.rs:14:5   |   14 | use crate::pty::winpty::Session;";
+
+export const MOCK_PR_REVIEWS: Record<number, ReviewComment[]> = {
+  142: [
+    {
+      id: 9001,
+      author: OTHER_AUTHOR,
+      body: "The inotify watch leaks a descriptor when the project root is deleted while watching.",
+      state: "CHANGES_REQUESTED",
+      created_at: minutesAgo(30),
+    },
+  ],
+  482: [
+    {
+      id: 9002,
+      author: OTHER_AUTHOR,
+      body: "Reads well. The buffering on the status stream is the right call.",
+      state: "APPROVED",
+      created_at: minutesAgo(9),
+    },
+  ],
+  128: [
+    {
+      id: 9003,
+      author: OTHER_AUTHOR,
+      body: "Confirmed against a 12-hour session — no mid-session expiry.",
+      state: "APPROVED",
+      created_at: minutesAgo(120),
+    },
+  ],
+  172: [
+    {
+      id: 9004,
+      author: OTHER_AUTHOR,
+      body: "Left two notes on the draft store; nothing blocking.",
+      state: "COMMENTED",
+      created_at: minutesAgo(20),
+    },
+  ],
+};
+
+export const MOCK_PR_INLINE_COMMENTS: Record<number, InlineReviewComment[]> = {
+  172: [
+    {
+      id: 8001,
+      author: OTHER_AUTHOR,
+      body: "Worth a comment on why this survives a reload but not a quit.",
+      path: "src/stores/draft-store.ts",
+      line: 84,
+      created_at: minutesAgo(20),
+      in_reply_to_id: null,
+      pull_request_review_id: 9004,
+    },
+    {
+      id: 8002,
+      author: OTHER_AUTHOR,
+      body: "Nit: this map never shrinks.",
+      path: "src/components/sidebar/draft-rail.tsx",
+      line: 132,
+      created_at: minutesAgo(19),
+      in_reply_to_id: null,
+      pull_request_review_id: 9004,
+    },
+  ],
+  142: [
+    {
+      id: 8003,
+      author: OTHER_AUTHOR,
+      body: "Descriptor leak: this needs a close on the error path.",
+      path: "src-tauri/src/ports/watch.rs",
+      line: 61,
+      created_at: minutesAgo(30),
+      in_reply_to_id: null,
+      pull_request_review_id: 9001,
+    },
+  ],
+};
+
+/**
+ * The one seeded checkout that has never been pushed.
+ *
+ * The "no pull request yet" and "nothing pushed yet" empty states differ
+ * only by whether the branch exists on the remote, so the mock needs at
+ * least one of each to be reachable.
+ */
+export const MOCK_LOCAL_ONLY_PATH = `${HOME}/.codemux/worktrees/vexis/fix-installer-detect`;

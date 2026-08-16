@@ -61,6 +61,37 @@ pub struct PullRequestInfo {
     /// Author login. Useful for chip tooltips + injection header.
     #[serde(default)]
     pub author: Option<String>,
+    /// gh's `mergeStateStatus`: CLEAN / BLOCKED / DIRTY / BEHIND /
+    /// UNSTABLE / HAS_HOOKS / UNKNOWN. `mergeable` alone cannot tell
+    /// "conflicts with base" from "a required check is still running",
+    /// and the action bar has to name the blocking reason in words.
+    #[serde(alias = "mergeStateStatus", default)]
+    pub merge_state_status: Option<String>,
+    /// File count for the meta row ("8 files").
+    #[serde(alias = "changedFiles", default)]
+    pub changed_files: Option<u32>,
+    /// Login that merged it — the merged-elsewhere drift notice names
+    /// a person, not an event.
+    #[serde(alias = "mergedBy", default)]
+    pub merged_by: Option<String>,
+    #[serde(alias = "mergedAt", default)]
+    pub merged_at: Option<String>,
+    /// Logins with a review *requested* but not yet given. Drives the
+    /// "Nobody is reviewing this yet" vs. pending-chips branch.
+    #[serde(alias = "reviewRequests", default)]
+    pub review_requests: Vec<String>,
+    /// One entry per reviewer who has actually submitted a verdict.
+    #[serde(alias = "latestReviews", default)]
+    pub latest_reviews: Vec<PrReviewSummary>,
+}
+
+/// A reviewer's most recent verdict, flattened from gh's
+/// `latestReviews[].author.login` + `.state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrReviewSummary {
+    pub author: String,
+    /// APPROVED / CHANGES_REQUESTED / COMMENTED / PENDING / DISMISSED.
+    pub state: String,
 }
 
 impl PullRequestInfo {
@@ -596,7 +627,7 @@ pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo
         repo_path,
         &[
             "pr", "view", &number_str,
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,author,body,comments",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,author,body,comments,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
         ],
         ISSUE_FETCH_TIMEOUT,
     )?;
@@ -861,7 +892,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
 /// The `--json` field set every branch-PR query asks for. Shared by the
 /// per-branch lookup and the repo-wide fallback list so `parse_pr_json` can
 /// never be handed a row that is missing a field one caller relies on.
-const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner";
+const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner,author,body,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews";
 
 /// The current branch's PR plus the branch context that produced it.
 ///
@@ -1376,17 +1407,24 @@ pub fn list_incoming_prs(
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
 
-// NOTE: As of 2026-04-26 the Review tab UI no longer exposes its own
-// merge controls — that section was removed in the visual-match PR
-// (`feature/review-tab-visual-match`). The Changes panel toolbar's
-// split-button merge dropdown still uses this command, so this is not
-// dead code; it's the active merge surface for Codemux. Comment kept
-// for future archeology in case someone wonders why the Review tab
-// doesn't have its own merge UI.
+/// Merge a PR. Both the Review panel's merge sheet and the Changes
+/// panel toolbar go through here.
+///
+/// `delete_branch` used to be unconditional, which made the one
+/// irreversible action in the app also silently destroy the branch the
+/// user might still be standing in. The merge sheet asks now, so the
+/// answer has to be able to be "no".
+///
+/// `commit_title` / `commit_body` map to `--subject` / `--body`. gh
+/// rejects both on `--rebase` (there is no merge commit to title), so
+/// they are only passed for squash and merge commits.
 pub fn merge_pull_request(
     repo_path: &Path,
     pr_number: u32,
     method: &str,
+    delete_branch: bool,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
 ) -> Result<(), String> {
     let number_str = pr_number.to_string();
     let method_flag = match method {
@@ -1394,11 +1432,206 @@ pub fn merge_pull_request(
         "rebase" => "--rebase",
         _ => "--merge",
     };
+    let mut args: Vec<&str> = vec!["pr", "merge", &number_str, method_flag];
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+    let is_rebase = method == "rebase";
+    let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
+    let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
+    if !is_rebase {
+        if let Some(title) = title {
+            args.push("--subject");
+            args.push(title);
+        }
+        if let Some(body) = body {
+            args.push("--body");
+            args.push(body);
+        }
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+pub fn close_pull_request(repo_path: &Path, pr_number: u32) -> Result<(), String> {
+    run_gh(repo_path, &["pr", "close", &pr_number.to_string()])?;
+    Ok(())
+}
+
+pub fn reopen_pull_request(repo_path: &Path, pr_number: u32) -> Result<(), String> {
+    run_gh(repo_path, &["pr", "reopen", &pr_number.to_string()])?;
+    Ok(())
+}
+
+/// Flip draft ↔ ready. `gh pr ready --undo` is the documented way back
+/// to draft; there is no `gh pr draft`.
+pub fn set_pull_request_ready(
+    repo_path: &Path,
+    pr_number: u32,
+    ready: bool,
+) -> Result<(), String> {
+    let number_str = pr_number.to_string();
+    let mut args: Vec<&str> = vec!["pr", "ready", &number_str];
+    if !ready {
+        args.push("--undo");
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+/// Edit title and/or body. A `None` field is left untouched — passing
+/// an empty `--body` would erase a description the user never opened.
+pub fn update_pull_request(
+    repo_path: &Path,
+    pr_number: u32,
+    title: Option<&str>,
+    body: Option<&str>,
+) -> Result<(), String> {
+    let number_str = pr_number.to_string();
+    let mut args: Vec<&str> = vec!["pr", "edit", &number_str];
+    if let Some(title) = title {
+        args.push("--title");
+        args.push(title);
+    }
+    if let Some(body) = body {
+        args.push("--body");
+        args.push(body);
+    }
+    if args.len() == 3 {
+        // Nothing to change; `gh pr edit` with no field flags opens an
+        // interactive prompt, which would hang the blocking pool.
+        return Ok(());
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+pub fn request_pull_request_review(
+    repo_path: &Path,
+    pr_number: u32,
+    reviewer: &str,
+) -> Result<(), String> {
+    let reviewer = reviewer.trim();
+    if reviewer.is_empty() {
+        return Err("A reviewer name is required.".to_string());
+    }
     run_gh(
         repo_path,
-        &["pr", "merge", &number_str, method_flag, "--delete-branch"],
+        &[
+            "pr",
+            "edit",
+            &pr_number.to_string(),
+            "--add-reviewer",
+            reviewer,
+        ],
     )?;
     Ok(())
+}
+
+/// How many trailing log lines a failing check's excerpt keeps.
+const CHECK_LOG_EXCERPT_LINES: usize = 40;
+
+/// Best-effort tail of a failing check's log.
+///
+/// Deliberately forgiving: the excerpt is a nicety on the failing-check
+/// card, so every way this can come up empty (no matching run, a check
+/// that isn't a GitHub Actions job, `gh run view` refusing) returns
+/// `Ok("")` and the card renders without it. Only a hard CLI failure is
+/// an `Err`, and even that the UI treats as "no excerpt".
+pub fn get_check_log_excerpt(
+    repo_path: &Path,
+    pr_number: u32,
+    check_name: &str,
+) -> Result<String, String> {
+    let number_str = pr_number.to_string();
+    // Resolve the PR's head sha, then the failing workflow run on it.
+    // `gh run list` is branch/commit scoped, so this avoids fetching a
+    // run from an unrelated branch that happens to share a job name.
+    let Some(sha) = run_gh_optional(
+        repo_path,
+        &[
+            "pr", "view", &number_str, "--json", "headRefOid", "--jq", ".headRefOid",
+        ],
+    ) else {
+        return Ok(String::new());
+    };
+    let sha = sha.trim();
+    if sha.is_empty() {
+        return Ok(String::new());
+    }
+
+    let Some(run_id) = run_gh_optional(
+        repo_path,
+        &[
+            "run",
+            "list",
+            "--commit",
+            sha,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,conclusion,name",
+            "--jq",
+            ".[] | select(.conclusion == \"failure\") | .databaseId",
+        ],
+    ) else {
+        return Ok(String::new());
+    };
+    // The jq filter can yield several ids, one per line; the first is
+    // the most recent run.
+    let Some(run_id) = run_id.lines().next().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(String::new());
+    };
+
+    let Some(log) = run_gh_optional(repo_path, &["run", "view", run_id, "--log-failed"]) else {
+        return Ok(String::new());
+    };
+
+    Ok(tail_check_log(&log, check_name))
+}
+
+/// Trim a `gh run view --log-failed` dump to the interesting tail.
+///
+/// The dump prefixes every line with `job\tstep\ttimestamp `. Lines for
+/// the named job are preferred; when the name doesn't match anything
+/// (job names and check names diverge on matrix builds) the whole log's
+/// tail is used rather than returning nothing.
+fn tail_check_log(log: &str, check_name: &str) -> String {
+    let needle = check_name.trim();
+    let matching: Vec<&str> = if needle.is_empty() {
+        Vec::new()
+    } else {
+        log.lines().filter(|l| l.starts_with(needle)).collect()
+    };
+    let lines: Vec<&str> = if matching.is_empty() {
+        log.lines().collect()
+    } else {
+        matching
+    };
+    let start = lines.len().saturating_sub(CHECK_LOG_EXCERPT_LINES);
+    lines[start..]
+        .iter()
+        .map(|l| strip_log_prefix(l))
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drop the `job\tstep\t2026-01-01T00:00:00.000Z ` prefix gh puts on
+/// every log line, leaving the message the user actually wants to read.
+fn strip_log_prefix(line: &str) -> &str {
+    let rest = match line.rsplit_once('\t') {
+        Some((_, rest)) => rest,
+        None => line,
+    };
+    // The timestamp is the first whitespace-delimited token of what's
+    // left; it is only a prefix when it parses as one.
+    match rest.split_once(' ') {
+        Some((first, tail)) if first.len() >= 20 && first.contains('T') && first.ends_with('Z') => {
+            tail
+        }
+        _ => rest,
+    }
 }
 
 pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
@@ -1668,11 +1901,70 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
             .filter(|s| !s.is_empty()),
         // Detail-only fields. List paths leave these None / empty so
         // the cheap query stays cheap.
-        body: None,
+        body: v["body"]
+            .as_str()
+            .map(truncate_pr_body)
+            .filter(|s| !s.is_empty()),
         comments: Vec::new(),
         total_comments: 0,
         author,
+        merge_state_status: v["mergeStateStatus"].as_str().map(|s| s.to_string()),
+        changed_files: v["changedFiles"].as_u64().map(|n| n as u32),
+        merged_by: v["mergedBy"]["login"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        merged_at: v["mergedAt"].as_str().map(|s| s.to_string()),
+        review_requests: parse_review_requests(&v["reviewRequests"]),
+        latest_reviews: parse_latest_reviews(&v["latestReviews"]),
     }
+}
+
+/// Truncate a PR body at [`MAX_ISSUE_BODY_BYTES`] on a char boundary.
+fn truncate_pr_body(body: &str) -> String {
+    if body.len() <= MAX_ISSUE_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ISSUE_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n[Description truncated]", &body[..end])
+}
+
+/// `reviewRequests` is a list of requested reviewers; a team request has
+/// `name` where a user request has `login`. Both are worth naming.
+fn parse_review_requests(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    r["login"]
+                        .as_str()
+                        .or_else(|| r["name"].as_str())
+                        .or_else(|| r["slug"].as_str())
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_latest_reviews(v: &serde_json::Value) -> Vec<PrReviewSummary> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let author = r["author"]["login"].as_str().filter(|s| !s.is_empty())?;
+                    Some(PrReviewSummary {
+                        author: author.to_string(),
+                        state: r["state"].as_str().unwrap_or("COMMENTED").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn summarize_checks_status(v: &serde_json::Value) -> Option<String> {
@@ -1800,6 +2092,12 @@ mod tests {
             comments: Vec::new(),
             total_comments: 0,
             author: None,
+            merge_state_status: None,
+            changed_files: None,
+            merged_by: None,
+            merged_at: None,
+            review_requests: Vec::new(),
+            latest_reviews: Vec::new(),
         }
     }
 
@@ -2400,6 +2698,15 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
             }],
             total_comments: 1,
             author: Some("zeus".into()),
+            merge_state_status: Some("CLEAN".into()),
+            changed_files: Some(3),
+            merged_by: None,
+            merged_at: None,
+            review_requests: vec!["juliusm".into()],
+            latest_reviews: vec![PrReviewSummary {
+                author: "alice".into(),
+                state: "APPROVED".into(),
+            }],
         };
         let json = serde_json::to_string(&pr).unwrap();
         assert!(json.contains("\"totalComments\":1"));

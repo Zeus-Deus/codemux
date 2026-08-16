@@ -514,6 +514,35 @@ export interface PullRequestInfo {
   /** PR author login. Null when gh JSON didn't carry the field
    *  (e.g. ghost users / list rows that didn't request author). */
   author: string | null;
+  /** Head commit SHA. Association is branch-based, not SHA-based — this
+   *  is metadata, and the panel watches it across polls to notice a
+   *  force-push. */
+  head_ref_oid: string | null;
+  /** Owner of the repository holding the head branch (the fork owner on
+   *  a cross-repository PR). */
+  head_repository_owner: string | null;
+  /** gh `mergeStateStatus` — CLEAN / BLOCKED / DIRTY / BEHIND /
+   *  UNSTABLE / HAS_HOOKS / UNKNOWN. `mergeable` alone can't tell a
+   *  conflict from a still-running required check, and the action bar
+   *  has to name the blocking reason in words. */
+  merge_state_status: string | null;
+  /** File count for the header meta row. */
+  changed_files: number | null;
+  /** Login that merged it — the merged-elsewhere notice names a
+   *  person, not an event. */
+  merged_by: string | null;
+  merged_at: string | null;
+  /** Logins with a review requested but not yet given. */
+  review_requests: string[];
+  /** One entry per reviewer who has submitted a verdict. */
+  latest_reviews: PrReviewSummary[];
+}
+
+/** A reviewer's most recent verdict. */
+export interface PrReviewSummary {
+  author: string;
+  /** APPROVED / CHANGES_REQUESTED / COMMENTED / PENDING / DISMISSED. */
+  state: string;
 }
 
 export interface IncomingPrItem {

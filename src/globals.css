@@ -521,6 +521,32 @@ body.pane-resizing iframe {
   font-size: var(--font-size-conversation, 14px);
   line-height: 1.7;
 }
+/* Inline variant: the same markdown inside a dense panel (the PR
+ * description in the Review pane). The document scale is right for a
+ * full-width reading surface and far too loud in a 452px column beside
+ * 11px check rows, so the inline variant steps the whole block down and
+ * tightens its vertical rhythm. Nothing else about the rendering
+ * changes. */
+.markdown-rendered-inline {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--muted-foreground);
+}
+.markdown-rendered-inline p { margin: 0 0 0.5em; }
+.markdown-rendered-inline > *:last-child { margin-bottom: 0; }
+.markdown-rendered-inline h1 { font-size: 1.2em; }
+.markdown-rendered-inline h2 { font-size: 1.1em; border-bottom: 0; padding-bottom: 0; }
+.markdown-rendered-inline h3, .markdown-rendered-inline h4 { font-size: 1em; }
+.markdown-rendered-inline h1, .markdown-rendered-inline h2,
+.markdown-rendered-inline h3, .markdown-rendered-inline h4 {
+  margin: 0.7em 0 0.3em;
+  color: var(--foreground);
+}
+.markdown-rendered-inline ul, .markdown-rendered-inline ol { margin: 0.35em 0; padding-left: 1.1em; }
+.markdown-rendered-inline li { margin: 0.15em 0; }
+.markdown-rendered-inline pre { font-size: 10px; padding: 0.5em 0.6em; margin: 0.5em 0; }
+.markdown-rendered-inline code { font-size: 10.5px; }
+
 .markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3,
 .markdown-rendered h4, .markdown-rendered h5, .markdown-rendered h6 {
   color: var(--foreground);

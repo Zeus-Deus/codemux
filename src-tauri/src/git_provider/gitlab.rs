@@ -422,6 +422,57 @@ pub(crate) fn parse_mr_json(v: &Value) -> PullRequestInfo {
             .as_str()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty()),
+        merge_state_status: merge_state_label(v),
+        // GitLab reports this as a string ("3"), and as "3+" once the
+        // diff exceeds the project's limit — take the leading digits.
+        changed_files: v["changes_count"].as_str().and_then(|s| {
+            s.trim_end_matches('+')
+                .parse::<u32>()
+                .ok()
+        }),
+        merged_by: v["merged_by"]["username"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        merged_at: v["merged_at"].as_str().map(|s| s.to_string()),
+        review_requests: v["reviewers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r["username"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Approvals are a separate endpoint on GitLab; the aggregate
+        // already arrives via `review_decision` on the detail path, and
+        // paying a round trip per list row for per-reviewer verdicts is
+        // not worth it.
+        latest_reviews: Vec::new(),
+    }
+}
+
+/// `mergeStateStatus` in gh's vocabulary, so the action bar can name one
+/// blocking reason regardless of which product answered.
+fn merge_state_label(v: &Value) -> Option<String> {
+    if v["has_conflicts"].as_bool() == Some(true) {
+        return Some("DIRTY".to_string());
+    }
+    match v["detailed_merge_status"]
+        .as_str()
+        .or_else(|| v["merge_status"].as_str())?
+    {
+        "mergeable" | "can_be_merged" => Some("CLEAN".to_string()),
+        "conflict" | "broken_status" | "cannot_be_merged" | "cannot_be_merged_recheck" => {
+            Some("DIRTY".to_string())
+        }
+        "ci_still_running" | "ci_must_pass" => Some("UNSTABLE".to_string()),
+        "not_approved" | "blocked_status" | "draft_status" | "discussions_not_resolved" => {
+            Some("BLOCKED".to_string())
+        }
+        "need_rebase" => Some("BEHIND".to_string()),
+        _ => Some("UNKNOWN".to_string()),
     }
 }
 
@@ -933,7 +984,15 @@ impl SourceControlProvider for GitLabProvider {
         Ok(parse_mr_json(&value))
     }
 
-    fn merge_pull_request(&self, repo_path: &Path, number: u32, method: &str) -> Result<(), String> {
+    fn merge_pull_request(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        method: &str,
+        delete_branch: bool,
+        commit_title: Option<&str>,
+        commit_body: Option<&str>,
+    ) -> Result<(), String> {
         self.require_ready()?;
         let number_str = number.to_string();
         let mut args: Vec<&str> = vec![
@@ -947,17 +1006,141 @@ impl SourceControlProvider for GitLabProvider {
             // be turned off explicitly or the button would appear to do
             // nothing on any project with CI.
             "--auto-merge=false",
-            // Mirrors `gh pr merge --delete-branch`.
-            "--remove-source-branch",
         ];
+        if delete_branch {
+            // Mirrors `gh pr merge --delete-branch`.
+            args.push("--remove-source-branch");
+        }
         match method {
             "squash" => args.push("--squash"),
             "rebase" => args.push("--rebase"),
             _ => {}
         }
+        // glab spells the squash-commit subject `--squash-message` and
+        // the merge-commit subject `--message`; neither applies to a
+        // rebase, which produces no commit of its own.
+        let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
+        let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
+        let combined = match (title, body) {
+            (Some(t), Some(b)) => Some(format!("{t}\n\n{b}")),
+            (Some(t), None) => Some(t.to_string()),
+            _ => None,
+        };
+        if let Some(message) = combined.as_deref() {
+            match method {
+                "squash" => {
+                    args.push("--squash-message");
+                    args.push(message);
+                }
+                "rebase" => {}
+                _ => {
+                    args.push("--message");
+                    args.push(message);
+                }
+            }
+        }
         run_glab_timed(repo_path, &args, LIST_TIMEOUT)?;
         invalidate_cache(Some(repo_path));
         Ok(())
+    }
+
+    fn close_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        self.require_ready()?;
+        run_glab_timed(repo_path, &["mr", "close", &number.to_string()], CALL_TIMEOUT)?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    fn reopen_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        self.require_ready()?;
+        run_glab_timed(
+            repo_path,
+            &["mr", "reopen", &number.to_string()],
+            CALL_TIMEOUT,
+        )?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    /// GitLab has no draft flag: draft state is a `Draft:` title prefix,
+    /// which is also how `create_pull_request` sets it. Going ready
+    /// strips the prefix; going back to draft restores it.
+    fn set_pull_request_ready(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        ready: bool,
+    ) -> Result<(), String> {
+        self.require_ready()?;
+        let number_str = number.to_string();
+        let args: Vec<&str> = if ready {
+            vec!["mr", "update", &number_str, "--ready"]
+        } else {
+            vec!["mr", "update", &number_str, "--draft"]
+        };
+        run_glab_timed(repo_path, &args, CALL_TIMEOUT)?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    fn update_pull_request(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), String> {
+        self.require_ready()?;
+        let number_str = number.to_string();
+        let mut args: Vec<&str> = vec!["mr", "update", &number_str];
+        if let Some(title) = title {
+            args.push("--title");
+            args.push(title);
+        }
+        if let Some(body) = body {
+            args.push("--description");
+            args.push(body);
+        }
+        if args.len() == 3 {
+            return Ok(());
+        }
+        run_glab_timed(repo_path, &args, CALL_TIMEOUT)?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    fn request_pull_request_review(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        reviewer: &str,
+    ) -> Result<(), String> {
+        let reviewer = reviewer.trim();
+        if reviewer.is_empty() {
+            return Err("A reviewer name is required.".to_string());
+        }
+        self.require_ready()?;
+        run_glab_timed(
+            repo_path,
+            &["mr", "update", &number.to_string(), "--reviewer", reviewer],
+            CALL_TIMEOUT,
+        )?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    /// GitLab job traces are a per-job endpoint, and mapping a check
+    /// name back to a job id costs two more round trips than the card
+    /// is worth. The UI renders the failing-check card without an
+    /// excerpt when this is empty, which is the same path a GitHub run
+    /// with no matching log takes.
+    fn check_log_excerpt(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _check_name: &str,
+    ) -> Result<String, String> {
+        Ok(String::new())
     }
 
     fn pull_request_diff(

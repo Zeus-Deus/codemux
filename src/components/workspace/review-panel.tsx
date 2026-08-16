@@ -12,11 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  GitPullRequest,
-  AlertCircle,
-  ChevronLeft,
-} from "lucide-react";
+import { ChevronLeft } from "lucide-react";
 import {
   checkGithubRepo,
   getBranchPullRequest,
@@ -24,6 +20,8 @@ import {
   getPullRequestChecks,
   getPrReviewComments,
   getPrInlineComments,
+  getGitBranchInfo,
+  gitPushChanges,
   listBranches,
   getDefaultBranch,
 } from "@/tauri/commands";
@@ -38,7 +36,6 @@ import type {
 } from "@/tauri/types";
 import {
   providerForWorkspace,
-  unsupportedRepoMessage,
   type ProviderPresentation,
 } from "@/lib/source-control";
 import {
@@ -48,10 +45,19 @@ import {
   _resetProviderAuthCache,
 } from "@/lib/provider-auth";
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
-import { ReviewHeader } from "./review/review-header";
-import { ReviewChecks } from "./review/review-checks";
+import { toast } from "@/lib/toast";
+import { useUIStore } from "@/stores/ui-store";
+import { ReviewDetail } from "./review/review-detail";
 import { ReviewThreads } from "./review/review-threads";
 import { IncomingPrsView } from "./review/incoming-prs-view";
+import {
+  BranchLocalOnlyState,
+  CliMissingState,
+  NoPullRequestState,
+  RepoUnreachableState,
+  SignedOutState,
+  UnsupportedHostState,
+} from "./review/review-empty-states";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -120,9 +126,6 @@ export function _resetCaches(): void {
  * One host-scoped probe for every product, including GitHub: the backend
  * resolves the checkout's provider and asks *that* adapter, which for
  * GitHub is the same `gh auth status` call this used to make directly.
- * The previous non-GitHub path ran the whole settings-pane sweep, which
- * probed every CLI and answered for no instance in particular — wrong on
- * a self-hosted deployment and wasteful everywhere.
  */
 async function fetchProviderAuthStatus(
   cwd: string,
@@ -149,21 +152,27 @@ function branchToTitle(branch: string | null): string {
     .replace(/^\w/, (c) => c.toUpperCase());
 }
 
-// ── Small sub-components ──
-
-function StatusMessage({
-  icon,
-  message,
-}: {
-  icon: React.ReactNode;
-  message: string;
-}) {
-  return (
-    <div className="flex flex-col items-center justify-center py-8 text-muted-foreground gap-2">
-      {icon}
-      <p className="text-xs text-center px-4">{message}</p>
-    </div>
-  );
+/**
+ * `owner/name` from a PR URL.
+ *
+ * Both products put the repository path directly after the host, and
+ * GitLab inserts a `/-/` separator before the merge-request segment, so
+ * taking everything before `/pull/`, `/merge_requests/` or `/-/` works
+ * for both without a per-product branch.
+ */
+export function repoSlugFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const path = new URL(url).pathname.replace(/^\/+/, "");
+    const stopped = path.split(/\/(?:-|pull|merge_requests|pulls)\//)[0];
+    const parts = stopped.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    // Subgroups are real on GitLab; the last two segments are the ones
+    // that identify the project.
+    return parts.slice(-2).join("/");
+  } catch {
+    return null;
+  }
 }
 
 function ReviewSkeleton() {
@@ -189,6 +198,10 @@ function ReviewSkeleton() {
 }
 
 // ── CreatePrForm ──
+//
+// Untouched by this ship: the create form gets its own redesign later,
+// and half-redesigning it would leave two visual languages on the same
+// surface.
 
 function CreatePrForm({
   cwd,
@@ -248,12 +261,7 @@ function CreatePrForm({
   return (
     <div className="space-y-2 p-3">
       <div className="flex items-center gap-1">
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={onCancel}
-          title="Back"
-        >
+        <Button size="icon-xs" variant="ghost" onClick={onCancel} title="Back">
           <ChevronLeft className="h-3 w-3" />
         </Button>
         <p className="text-xs font-medium text-muted-foreground">
@@ -323,87 +331,6 @@ function CreatePrForm({
   );
 }
 
-// ── NoReviewView ──
-
-function NoReviewView({
-  cwd,
-  branchName,
-  provider,
-  onCreated,
-}: {
-  cwd: string;
-  branchName: string | null;
-  provider: ProviderPresentation;
-  onCreated: (pr: PullRequestInfo) => void;
-}) {
-  const [showForm, setShowForm] = useState(false);
-
-  if (showForm) {
-    return (
-      <CreatePrForm
-        cwd={cwd}
-        branchName={branchName}
-        provider={provider}
-        onCreated={onCreated}
-        onCancel={() => setShowForm(false)}
-      />
-    );
-  }
-
-  return (
-    <div className="flex flex-col items-center justify-center py-8 gap-3">
-      <GitPullRequest className="h-8 w-8 text-muted-foreground/30" />
-      <p className="text-xs text-muted-foreground">
-        No {provider.noun} for this branch
-      </p>
-      <Button variant="secondary" size="xs" className="text-xs" onClick={() => setShowForm(true)}>
-        Create {provider.nounTitleCase}
-      </Button>
-    </div>
-  );
-}
-
-// ── ReviewView ──
-
-function ReviewView({
-  pr,
-  checks,
-  reviews,
-  inlineComments,
-  checksLoading,
-  commentsLoading,
-}: {
-  pr: PullRequestInfo;
-  checks: CheckInfo[];
-  reviews: ReviewComment[];
-  inlineComments: InlineReviewComment[];
-  checksLoading: boolean;
-  commentsLoading: boolean;
-}) {
-  // Stripped to match Superset's resting layout: title + status badge
-  // + checks + comments only. Composer (Approve / Request changes /
-  // Comment), merge controls, and deployments were intentionally
-  // removed — composer because Superset has no equivalent (verified
-  // against the reference clone), merge controls because the Changes
-  // panel toolbar already has a merge dropdown, deployments because
-  // it's not part of Superset's Review surface. Backends for the
-  // composer and merge are retained for potential future re-wire.
-  return (
-    <div className="space-y-2 p-3">
-      <ReviewHeader pr={pr} />
-
-      <div className="border-t border-border/30" />
-
-      <ReviewChecks checks={checks} isLoading={checksLoading} />
-      <ReviewThreads
-        reviews={reviews}
-        inlineComments={inlineComments}
-        isLoading={commentsLoading}
-      />
-    </div>
-  );
-}
-
 // ── Main ReviewPanel ──
 
 export function ReviewPanel({ workspace }: Props) {
@@ -429,13 +356,10 @@ export function ReviewPanel({ workspace }: Props) {
     cachedStatus(cwd, provider.kind) === null ||
       getCachedRepoCheck(cwd) === undefined,
   );
+  const [showCreateForm, setShowCreateForm] = useState(false);
 
   const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
-  // The IncomingPrsView used to be re-fetched via the now-removed
-  // refresh button. Auto-poll covers regular PR data; the incoming
-  // list relies on its own internal mount cycle (and on the 60s Rust
-  // background poll updating workspace.pr_state for each row).
   const incomingRefreshKey = 0;
 
   const isBaseBranch = defaultBranch != null && workspace.git_branch === defaultBranch;
@@ -450,8 +374,6 @@ export function ReviewPanel({ workspace }: Props) {
     let cancelled = false;
     (async () => {
       try {
-        // `fetchProviderAuth` owns the TTL cache, so this is a
-        // no-op call when a usable verdict is still warm.
         const status = await fetchProviderAuthStatus(cwd, provider);
         if (cancelled) return;
         setGhStatus(status);
@@ -477,37 +399,21 @@ export function ReviewPanel({ workspace }: Props) {
     return () => {
       cancelled = true;
     };
-    // `provider` is a stable module-level singleton per kind, so this
-    // re-runs only when the workspace actually changes product.
   }, [cwd, provider]);
 
   // ── React Query: PR data ──
   //
   // Each query is keyed by (workspaceId, pr_number) so switching
-  // workspaces auto-cancels in-flight calls for the previous workspace
-  // — the stale-data-flashing bug the analysis (§4) called out.
-  // staleTime + refetchInterval keep the surface honest without
-  // hammering `gh`. Reviews/inline comments are slower (30s) than
-  // PR/checks/deploys (10s) since they change less often.
-  //
-  // Caveat: AbortSignal is plumbed through but the underlying Rust
-  // commands are sync `pub fn` using `std::process::Command`, so a
-  // canceled query stops the JS from caring about the result; the
-  // `gh` subprocess keeps running until natural completion (already
-  // bounded by the existing 10s timeout in `run_gh_timed`). Wasted
-  // CPU on a stale call is minimal; the fix that matters here is that
-  // the *result* never lands in the new workspace's UI.
+  // workspaces auto-cancels in-flight calls for the previous workspace.
+  // Cadence: PR detail + checks at 2.5s so a check going green shows up
+  // without a manual refresh; reviews + inline comments at 30s, since
+  // they change far less often and carry larger payloads.
   const detailsEnabled =
     !initialLoading &&
     ghStatus?.status === "Authenticated" &&
     repoSupported === true &&
     hasPr;
 
-  // Cadence per Superset (`ChangesView.tsx:105` polls at 2500ms when
-  // active). PR detail + checks update fast so the user sees their
-  // PR move from pending → success without a manual refresh.
-  // Reviews + inline comments stay at 30s — they change less often
-  // and the JSON payloads are larger.
   const prDetailQuery = useQuery({
     queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
     queryFn: () => getBranchPullRequest(cwd),
@@ -544,20 +450,34 @@ export function ReviewPanel({ workspace }: Props) {
     refetchInterval: 30_000,
   });
 
+  // Is this branch on the remote at all? Decides which of the two
+  // no-PR empty states applies.
+  const branchInfoQuery = useQuery({
+    queryKey: ["pr", "branch-info", workspace.workspace_id, workspace.git_branch] as const,
+    queryFn: () => getGitBranchInfo(cwd),
+    enabled: !initialLoading && !hasPr,
+    staleTime: 10_000,
+  });
+
   const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
   const checks: CheckInfo[] = checksQuery.data ?? [];
   const reviews: ReviewComment[] = reviewsQuery.data ?? [];
   const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
-  // Only the primary detail query's error feeds the banner — the
-  // others swallow their errors via empty-array fallbacks below since
-  // their failures are usually transient and the empty sections
-  // render fine.
-  const fetchError = prDetailQuery.error
-    ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
-    : null;
 
-  // Helper to invalidate every PR query for this workspace at once —
-  // used by manual refresh and (in §3.3) by commit/push/merge events.
+  /**
+   * How old the newest good data is, when the polls are currently
+   * failing — null while they're healthy.
+   *
+   * Binding rule 2: a failed refresh never blanks what is being read.
+   * The panel keeps rendering the last good PR and says how old it is;
+   * only a PR that has *never* loaded gets a skeleton.
+   */
+  const staleAgeMs =
+    prDetailQuery.isError && prDetailQuery.dataUpdatedAt > 0
+      ? Date.now() - prDetailQuery.dataUpdatedAt
+      : null;
+
+  // Helper to invalidate every PR query for this workspace at once.
   const invalidatePrQueries = useCallback(() => {
     queryClient.invalidateQueries({
       predicate: (q) =>
@@ -566,15 +486,19 @@ export function ReviewPanel({ workspace }: Props) {
     });
   }, [queryClient, workspace.workspace_id]);
 
+  const openChangesPane = useCallback(() => {
+    useUIStore.getState().setRightPanelTab(workspace.workspace_id, "changes");
+  }, [workspace.workspace_id]);
+
   const handlePrCreated = (newPr: PullRequestInfo) => {
-    // Seed the detail cache directly so the user sees the new PR
-    // immediately without waiting for the workspace state push to
-    // flip pr_number. Then invalidate the rest so checks/reviews/
-    // deploys fetch fresh.
+    // Seed the detail cache directly so the new PR shows up immediately
+    // rather than waiting for the workspace state push to flip
+    // pr_number, then refresh the rest.
     queryClient.setQueryData(
       ["pr", "detail", workspace.workspace_id, newPr.number],
       newPr,
     );
+    setShowCreateForm(false);
     invalidatePrQueries();
   };
 
@@ -584,64 +508,85 @@ export function ReviewPanel({ workspace }: Props) {
     return <ReviewSkeleton />;
   }
 
-  // Both no-adapter-for-this-host and no-repo-behind-this-checkout land
-  // here, and both must be answered before the CLI states below: an
-  // unsupported host is not a missing-CLI problem, and telling a user
-  // with `gh` on their PATH to go install it is simply wrong.
+  // A host with no adapter is not a missing-CLI problem, and telling a
+  // user with `gh` on their PATH to install it is simply wrong — so
+  // both no-adapter cases are answered before the CLI states below.
   if (ghStatus?.status === "Unsupported" || repoSupported === false) {
     return (
-      <StatusMessage
-        icon={<GitPullRequest className="h-6 w-6 opacity-40" />}
-        message={unsupportedRepoMessage(provider)}
-      />
+      <UnsupportedHostState provider={provider} url={workspace.pr_url ?? null} />
     );
   }
 
   if (ghStatus?.status === "NotInstalled") {
-    return (
-      <StatusMessage
-        icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message={
-          provider.cliLabel
-            ? `${provider.cliLabel} is not installed. Install it from ${provider.installUrl}`
-            : unsupportedRepoMessage(provider)
-        }
-      />
-    );
+    return <CliMissingState provider={provider} />;
   }
 
   if (ghStatus?.status === "NotAuthenticated") {
+    return <SignedOutState provider={provider} />;
+  }
+
+  // Authenticated and the repo is supported, but the PR itself can't be
+  // fetched and never has been: that is a reachability problem, not an
+  // empty state.
+  if (hasPr && !pr && prDetailQuery.isError) {
     return (
-      <StatusMessage
-        icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message={`Not authenticated. Run: ${provider.loginCommand}`}
+      <RepoUnreachableState
+        repoSlug={repoSlugFromUrl(workspace.pr_url)}
+        provider={provider}
+        onRetry={invalidatePrQueries}
       />
     );
   }
 
-  return (
-    <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
-      {/* No refresh button — auto-poll handles freshness (2.5s for PR
-          detail and checks, 30s for reviews + inline comments while the
-          tab is active). Mirrors Superset's pattern. */}
-      {fetchError && (
-        <div className="mx-3 mb-1 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
-          <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
-          <span className="break-words">{fetchError}</span>
-        </div>
-      )}
-      {hasPr && pr ? (
-        <ReviewView
+  if (hasPr && pr) {
+    return (
+      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
+        <ReviewDetail
           pr={pr}
           checks={checks}
           reviews={reviews}
           inlineComments={inlineComments}
           checksLoading={checksQuery.isFetching}
           commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
+          cwd={cwd}
+          workspaceId={workspace.workspace_id}
+          provider={provider}
+          repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
+          viewerLogin={
+            ghStatus?.status === "Authenticated" ? ghStatus.username || null : null
+          }
+          checkedOutHere={isPrOnCurrentBranch(pr.head_branch, workspace.git_branch)}
+          gitBehind={workspace.git_behind ?? 0}
+          gitDirtyFiles={workspace.git_changed_files ?? 0}
+          staleAgeMs={staleAgeMs}
+          onRefresh={invalidatePrQueries}
+          onOpenChanges={openChangesPane}
         />
-      ) : hasPr && !pr ? (
-        <ReviewSkeleton />
-      ) : isBaseBranch ? (
+      </ScrollArea>
+    );
+  }
+
+  if (hasPr && !pr) {
+    return <ReviewSkeleton />;
+  }
+
+  if (showCreateForm) {
+    return (
+      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
+        <CreatePrForm
+          cwd={cwd}
+          branchName={workspace.git_branch}
+          provider={provider}
+          onCreated={handlePrCreated}
+          onCancel={() => setShowCreateForm(false)}
+        />
+      </ScrollArea>
+    );
+  }
+
+  if (isBaseBranch) {
+    return (
+      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
         <IncomingPrsView
           cwd={cwd}
           baseBranch={defaultBranch!}
@@ -649,14 +594,50 @@ export function ReviewPanel({ workspace }: Props) {
           providerKind={workspace.provider_kind}
           refreshKey={incomingRefreshKey}
         />
-      ) : (
-        <NoReviewView
-          cwd={cwd}
-          branchName={workspace.git_branch}
+      </ScrollArea>
+    );
+  }
+
+  const pushed = branchInfoQuery.data?.has_upstream ?? false;
+  const dirtyFiles = workspace.git_changed_files ?? 0;
+
+  return (
+    <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
+      {pushed ? (
+        <NoPullRequestState
+          branch={workspace.git_branch}
+          baseBranch={defaultBranch ?? "main"}
+          commitsAhead={workspace.git_ahead ?? 0}
           provider={provider}
-          onCreated={handlePrCreated}
+          onCreate={() => setShowCreateForm(true)}
+          onViewCommits={openChangesPane}
+        />
+      ) : (
+        <BranchLocalOnlyState
+          changedFiles={dirtyFiles}
+          pushOnly={dirtyFiles === 0}
+          onOpenChanges={openChangesPane}
+          onCommitAndPush={() => {
+            if (dirtyFiles > 0) {
+              // Committing needs a message, and the Changes pane is
+              // where that conversation already happens.
+              openChangesPane();
+              return;
+            }
+            gitPushChanges(cwd, true)
+              .then(() => {
+                toast.success("Branch pushed");
+                invalidatePrQueries();
+                void branchInfoQuery.refetch();
+              })
+              .catch((err) => toast.error(String(err)));
+          }}
         />
       )}
     </ScrollArea>
   );
 }
+
+// Re-exported so the pane keeps a single import surface for the review
+// subtree even though the threads list now renders inside ReviewDetail.
+export { ReviewThreads };

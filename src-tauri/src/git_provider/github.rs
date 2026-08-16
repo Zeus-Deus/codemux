@@ -87,8 +87,63 @@ impl SourceControlProvider for GitHubProvider {
         repo_path: &Path,
         number: u32,
         method: &str,
+        delete_branch: bool,
+        commit_title: Option<&str>,
+        commit_body: Option<&str>,
     ) -> Result<(), String> {
-        github::merge_pull_request(repo_path, number, method)
+        github::merge_pull_request(
+            repo_path,
+            number,
+            method,
+            delete_branch,
+            commit_title,
+            commit_body,
+        )
+    }
+
+    fn close_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        github::close_pull_request(repo_path, number)
+    }
+
+    fn reopen_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        github::reopen_pull_request(repo_path, number)
+    }
+
+    fn set_pull_request_ready(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        ready: bool,
+    ) -> Result<(), String> {
+        github::set_pull_request_ready(repo_path, number, ready)
+    }
+
+    fn update_pull_request(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), String> {
+        github::update_pull_request(repo_path, number, title, body)
+    }
+
+    fn request_pull_request_review(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        reviewer: &str,
+    ) -> Result<(), String> {
+        github::request_pull_request_review(repo_path, number, reviewer)
+    }
+
+    fn check_log_excerpt(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        check_name: &str,
+    ) -> Result<String, String> {
+        github::get_check_log_excerpt(repo_path, number, check_name)
     }
 
     fn pull_request_diff(

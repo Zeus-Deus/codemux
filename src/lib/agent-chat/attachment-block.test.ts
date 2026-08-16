@@ -40,6 +40,14 @@ function makePrDetail(
     comments: [],
     totalComments: 0,
     author: "alice",
+    head_ref_oid: null,
+    head_repository_owner: null,
+    merge_state_status: null,
+    changed_files: null,
+    merged_by: null,
+    merged_at: null,
+    review_requests: [],
+    latest_reviews: [],
     ...overrides,
   };
 }

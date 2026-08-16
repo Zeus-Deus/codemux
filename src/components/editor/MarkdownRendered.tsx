@@ -30,6 +30,14 @@ interface Props {
    * remote URLs render.
    */
   filePath?: string | null;
+  /**
+   * Drop the page chrome — the scroll container, the measure cap and the
+   * document padding — so the rendered markdown can sit inside a dense
+   * surface that owns its own scrolling and spacing (the PR description
+   * in the Review panel). The markdown itself renders identically; only
+   * the wrapper differs.
+   */
+  inline?: boolean;
 }
 
 /**
@@ -46,7 +54,7 @@ interface Props {
  * non-skipped render. Wrapping the wrapper itself is what skips the
  * `<ReactMarkdown>` call entirely.
  */
-function MarkdownRenderedImpl({ content, filePath }: Props) {
+function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
   const remarkPlugins = useMemo(() => [remarkGfm], []);
   // `rehypeRaw` re-parses the raw HTML that GFM leaves as opaque nodes
   // (e.g. a README's `<div align="center">` wrapper and `<img>` logo) so
@@ -65,24 +73,32 @@ function MarkdownRenderedImpl({ content, filePath }: Props) {
     [filePath],
   );
 
-  return (
-    <div className="flex-1 min-h-0 overflow-auto bg-[var(--background)]">
-      <div className="markdown-rendered max-w-3xl px-8 py-6">
-        <ReactMarkdown
-          remarkPlugins={remarkPlugins}
-          rehypePlugins={rehypePlugins}
-          components={components}
-          // react-markdown's default urlTransform strips data: URIs and
-          // other non-http schemes for safety. The content here is the
-          // user's own local markdown — we resolve filesystem paths via
-          // `resolveAssetSrc` and want data: image URIs to render. Our
-          // transform keeps those but still blocks executable schemes.
-          urlTransform={safeUrlTransform}
-        >
-          {content}
-        </ReactMarkdown>
-      </div>
+  const body = (
+    <div
+      className={
+        inline ? "markdown-rendered markdown-rendered-inline" : "markdown-rendered max-w-3xl px-8 py-6"
+      }
+    >
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        components={components}
+        // react-markdown's default urlTransform strips data: URIs and
+        // other non-http schemes for safety. The content here is the
+        // user's own local markdown — we resolve filesystem paths via
+        // `resolveAssetSrc` and want data: image URIs to render. Our
+        // transform keeps those but still blocks executable schemes.
+        urlTransform={safeUrlTransform}
+      >
+        {content}
+      </ReactMarkdown>
     </div>
+  );
+
+  if (inline) return body;
+
+  return (
+    <div className="flex-1 min-h-0 overflow-auto bg-[var(--background)]">{body}</div>
   );
 }
 

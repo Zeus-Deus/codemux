@@ -105,12 +105,56 @@ pub trait SourceControlProvider: Send + Sync {
         draft: bool,
     ) -> Result<PullRequestInfo, String>;
 
+    /// `commit_title` / `commit_body` are the merge-commit subject and
+    /// body the merge sheet collects; products that cannot set them (or
+    /// strategies that have no merge commit) ignore them.
     fn merge_pull_request(
         &self,
         repo_path: &Path,
         number: u32,
         method: &str,
+        delete_branch: bool,
+        commit_title: Option<&str>,
+        commit_body: Option<&str>,
     ) -> Result<(), String>;
+
+    fn close_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String>;
+
+    fn reopen_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String>;
+
+    /// Flip draft ↔ ready-for-review.
+    fn set_pull_request_ready(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        ready: bool,
+    ) -> Result<(), String>;
+
+    /// Edit title and/or body. `None` leaves a field untouched.
+    fn update_pull_request(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), String>;
+
+    fn request_pull_request_review(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        reviewer: &str,
+    ) -> Result<(), String>;
+
+    /// Best-effort tail of a failing check's log. An empty string means
+    /// "nothing to show" and is not an error — the card renders without
+    /// the excerpt.
+    fn check_log_excerpt(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        check_name: &str,
+    ) -> Result<String, String>;
 
     /// `full = false` yields a name-only diff; `true` a unified diff.
     fn pull_request_diff(

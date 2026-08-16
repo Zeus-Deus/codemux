@@ -151,12 +151,106 @@ pub async fn list_incoming_prs(
 }
 
 #[tauri::command]
-pub async fn merge_pull_request(path: String, pr_number: u32, method: String) -> Result<(), String> {
+pub async fn merge_pull_request(
+    path: String,
+    pr_number: u32,
+    method: String,
+    delete_branch: Option<bool>,
+    commit_title: Option<String>,
+    commit_body: Option<String>,
+) -> Result<(), String> {
+    // `delete_branch` is optional so an older caller that only passes
+    // (path, number, method) keeps the previous behaviour instead of
+    // silently flipping to "keep the branch".
+    let delete_branch = delete_branch.unwrap_or(true);
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).merge_pull_request(Path::new(&path), pr_number, &method)
+        provider_at(&path).merge_pull_request(
+            Path::new(&path),
+            pr_number,
+            &method,
+            delete_branch,
+            commit_title.as_deref(),
+            commit_body.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("merge_pull_request task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn close_pull_request(path: String, pr_number: u32) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).close_pull_request(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("close_pull_request task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn reopen_pull_request(path: String, pr_number: u32) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).reopen_pull_request(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("reopen_pull_request task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn set_pr_ready(path: String, pr_number: u32, ready: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).set_pull_request_ready(Path::new(&path), pr_number, ready)
+    })
+    .await
+    .map_err(|e| format!("set_pr_ready task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn update_pull_request(
+    path: String,
+    pr_number: u32,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).update_pull_request(
+            Path::new(&path),
+            pr_number,
+            title.as_deref(),
+            body.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("update_pull_request task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn request_pr_review(
+    path: String,
+    pr_number: u32,
+    reviewer: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).request_pull_request_review(Path::new(&path), pr_number, &reviewer)
+    })
+    .await
+    .map_err(|e| format!("request_pr_review task join failed: {e}"))?
+}
+
+/// Best-effort log tail for a failing check. Never an error the UI has
+/// to show: an unavailable excerpt resolves to an empty string so the
+/// failing-check card renders without it.
+#[tauri::command]
+pub async fn get_check_log_excerpt(
+    path: String,
+    pr_number: u32,
+    check_name: String,
+) -> Result<String, String> {
+    let excerpt = tokio::task::spawn_blocking(move || {
+        provider_at(&path).check_log_excerpt(Path::new(&path), pr_number, &check_name)
+    })
+    .await
+    .map_err(|e| format!("get_check_log_excerpt task join failed: {e}"))?;
+    Ok(excerpt.unwrap_or_default())
 }
 
 #[tauri::command]

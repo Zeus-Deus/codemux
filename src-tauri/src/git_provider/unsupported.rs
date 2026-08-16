@@ -124,8 +124,56 @@ impl SourceControlProvider for UnsupportedProvider {
         _repo_path: &Path,
         _number: u32,
         _method: &str,
+        _delete_branch: bool,
+        _commit_title: Option<&str>,
+        _commit_body: Option<&str>,
     ) -> Result<(), String> {
         self.err("merge a pull request")
+    }
+
+    fn close_pull_request(&self, _repo_path: &Path, _number: u32) -> Result<(), String> {
+        self.err("close a pull request")
+    }
+
+    fn reopen_pull_request(&self, _repo_path: &Path, _number: u32) -> Result<(), String> {
+        self.err("reopen a pull request")
+    }
+
+    fn set_pull_request_ready(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _ready: bool,
+    ) -> Result<(), String> {
+        self.err("change a pull request's draft state")
+    }
+
+    fn update_pull_request(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _title: Option<&str>,
+        _body: Option<&str>,
+    ) -> Result<(), String> {
+        self.err("edit a pull request")
+    }
+
+    fn request_pull_request_review(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _reviewer: &str,
+    ) -> Result<(), String> {
+        self.err("request a review")
+    }
+
+    fn check_log_excerpt(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _check_name: &str,
+    ) -> Result<String, String> {
+        self.err("read a check log")
     }
 
     fn pull_request_diff(
@@ -264,7 +312,9 @@ mod tests {
         );
         let provider = UnsupportedProvider::from_detection(&detected);
         for message in [
-            provider.merge_pull_request(Path::new("/tmp"), 1, "squash").unwrap_err(),
+            provider
+                .merge_pull_request(Path::new("/tmp"), 1, "squash", true, None, None)
+                .unwrap_err(),
             provider.list_issues(Path::new("/tmp"), None).unwrap_err(),
             provider.pull_request_checks(Path::new("/tmp")).unwrap_err(),
         ] {

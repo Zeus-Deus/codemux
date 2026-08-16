@@ -1,86 +1,151 @@
-import { ArrowUpRight } from "lucide-react";
+import { useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { MoreHorizontal } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { PrStatusIcon } from "@/components/github/pr-status-icon";
+import { toast } from "@/lib/toast";
+import { normalizePrState } from "@/components/github/pr-status-icon";
 import type { PullRequestInfo } from "@/tauri/types";
+import type { ProviderPresentation } from "@/lib/source-control";
+import { groupDigits, relativeAge } from "./review-ui";
 
-interface ReviewDecisionConfig {
-  label: string;
-  className: string;
-}
-
-// Mirrors Superset's reviewDecisionConfig — state-coloured pill style
-// matching the existing Codemux semantic tokens.
-const REVIEW_DECISION_CONFIG: Record<string, ReviewDecisionConfig> = {
-  APPROVED: {
-    label: "Approved",
-    className: "border border-status-open/20 bg-status-open/10 text-status-open",
-  },
-  CHANGES_REQUESTED: {
-    label: "Changes requested",
-    className: "border border-status-attention/20 bg-status-attention/10 text-status-attention",
-  },
-  REVIEW_REQUIRED: {
-    label: "Review pending",
-    className: "border border-status-working/20 bg-status-working/10 text-status-working",
-  },
+/** State pill tones, matching the sidebar PR icon so one PR reads the
+ *  same colour everywhere it appears. */
+const STATE_PILL: Record<string, { label: string; className: string }> = {
+  open: { label: "Open", className: "bg-status-open/12 text-status-open" },
+  draft: { label: "Draft", className: "bg-muted text-muted-foreground" },
+  merged: { label: "Merged", className: "bg-accent-violet/12 text-accent-violet" },
+  closed: { label: "Closed", className: "bg-destructive/12 text-destructive" },
 };
-
-const DEFAULT_DECISION: ReviewDecisionConfig = REVIEW_DECISION_CONFIG.REVIEW_REQUIRED;
 
 interface Props {
   pr: PullRequestInfo;
+  provider: ProviderPresentation;
+  /** `owner/name`, when the checkout could name it. */
+  repoSlug: string | null;
+  /** True when the workspace is standing in the PR's head branch — the
+   *  panel says so instead of offering a Check out button. */
+  checkedOutHere: boolean;
+  onRefresh: () => void;
 }
 
-// Minimal header that mirrors Superset's resting layout (analysis §6
-// Feature 3, screenshot reference). The chrome that used to live here —
-// state pill, PR number, branch arrows, diff stats, age, GitHub link,
-// Copy URL — was redundant once the sidebar PR icon, the Changes-panel
-// "open PR" button, and the Diffs tab carry the same info. Title is
-// the click target now (right-click → Copy Link Address replaces the
-// removed Copy URL button).
-export function ReviewHeader({ pr }: Props) {
-  const decision: ReviewDecisionConfig =
-    !pr.is_draft && pr.review_decision
-      ? REVIEW_DECISION_CONFIG[pr.review_decision] ?? DEFAULT_DECISION
-      : DEFAULT_DECISION;
+export function ReviewHeader({
+  pr,
+  provider,
+  repoSlug,
+  checkedOutHere,
+  onRefresh,
+}: Props) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const state = pr.is_draft && pr.state === "OPEN" ? "draft" : normalizePrState(pr.state) ?? "open";
+  const pill = STATE_PILL[state] ?? STATE_PILL.open;
+  const age = relativeAge(pr.updated_at);
 
-  const handleOpen = (e: React.MouseEvent) => {
-    e.preventDefault();
-    openUrl(pr.url).catch(console.error);
+  const openInBrowser = () => {
+    openUrl(pr.url).catch((err) => toast.error(String(err)));
+  };
+
+  const copyUrl = () => {
+    navigator.clipboard
+      .writeText(pr.url)
+      .then(() => toast.success("Link copied"))
+      .catch(() => toast.error("Couldn't copy the link"));
   };
 
   return (
-    <div className="space-y-1.5">
-      <a
-        href={pr.url}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={handleOpen}
-        className="group flex items-center gap-1.5 cursor-pointer rounded-sm px-1 -mx-1 py-0.5 -my-0.5 no-underline hover:bg-accent/30 transition-colors"
-      >
-        <PrStatusIcon
-          state={pr.is_draft ? "draft" : pr.state}
-          size={4}
-          className="shrink-0"
-        />
-        <span
-          className="min-w-0 flex-1 truncate text-xs font-medium text-foreground no-underline"
-          title={pr.title}
-        >
-          {pr.title}
+    <div
+      className="flex flex-col gap-2 border-b border-border/40 px-3.5 pb-2.5 pt-3"
+      data-testid="review-header"
+    >
+      <div className="flex items-center gap-1.5">
+        {repoSlug && (
+          <span className="truncate text-[10.5px] text-muted-foreground">{repoSlug}</span>
+        )}
+        <span className="shrink-0 font-mono text-[10.5px] text-foreground/70">
+          {provider.sigil}
+          {pr.number}
         </span>
-        <ArrowUpRight className="size-3.5 shrink-0 text-muted-foreground/70 opacity-0 transition-opacity group-hover:opacity-100" />
-      </a>
-      <div>
         <span
           className={cn(
-            "inline-block shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] font-medium",
-            decision.className,
+            "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold",
+            pill.className,
           )}
+          data-testid="pr-state-pill"
         >
-          {decision.label}
+          {pill.label}
         </span>
+        <span className="flex-1" />
+        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Pull request actions"
+              className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            >
+              <MoreHorizontal className="size-3.5" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-40">
+            <DropdownMenuItem onSelect={openInBrowser}>Open in browser</DropdownMenuItem>
+            <DropdownMenuItem onSelect={copyUrl}>Copy URL</DropdownMenuItem>
+            <DropdownMenuItem onSelect={onRefresh}>Refresh</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {/* Two lines maximum: past that a title stops being a title and
+          starts pushing the checks below the fold. */}
+      <h2
+        className="line-clamp-2 text-[13.5px] font-semibold leading-snug text-foreground"
+        title={pr.title}
+      >
+        {pr.title}
+      </h2>
+
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+        {pr.author && <span className="text-foreground/70">{pr.author}</span>}
+        {age && <span>{age}</span>}
+        {pr.changed_files != null && (
+          <>
+            <span className="opacity-40">·</span>
+            <span>
+              {pr.changed_files} {pr.changed_files === 1 ? "file" : "files"}
+            </span>
+          </>
+        )}
+        {pr.additions != null && (
+          <span className="font-mono text-status-open">+{groupDigits(pr.additions)}</span>
+        )}
+        {pr.deletions != null && (
+          <span className="font-mono text-destructive">−{groupDigits(pr.deletions)}</span>
+        )}
+      </div>
+
+      <div className="flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
+        <span className="shrink-0">{pr.base_branch ?? "main"}</span>
+        <span className="shrink-0 opacity-60">←</span>
+        {/* Truncated from the LEFT: the tail of a branch name is what
+            identifies it, the `agent/` prefix is not. */}
+        <span
+          dir="rtl"
+          className="min-w-0 flex-1 truncate text-left text-foreground/70"
+          title={pr.head_branch ?? ""}
+        >
+          &lrm;{pr.head_branch ?? ""}
+        </span>
+        {checkedOutHere && (
+          <span
+            className="shrink-0 font-sans text-[10px] text-status-open"
+            data-testid="checked-out-here"
+          >
+            checked out here
+          </span>
+        )}
       </div>
     </div>
   );

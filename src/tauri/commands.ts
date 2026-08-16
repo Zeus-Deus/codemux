@@ -641,8 +641,50 @@ export const getGithubPrDiffByPath = (
 export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
-export const mergePullRequest = (path: string, prNumber: number, method: string) =>
-  invoke("merge_pull_request", { path, prNumber, method });
+/** Merge a PR. `deleteBranch` defaults to true on the backend, matching
+ *  the behaviour before the merge sheet made it a question. */
+export const mergePullRequest = (
+  path: string,
+  prNumber: number,
+  method: string,
+  deleteBranch?: boolean,
+  commitTitle?: string | null,
+  commitBody?: string | null,
+) =>
+  invoke("merge_pull_request", {
+    path,
+    prNumber,
+    method,
+    deleteBranch,
+    commitTitle,
+    commitBody,
+  });
+
+export const closePullRequest = (path: string, prNumber: number) =>
+  invoke("close_pull_request", { path, prNumber });
+
+export const reopenPullRequest = (path: string, prNumber: number) =>
+  invoke("reopen_pull_request", { path, prNumber });
+
+/** Flip draft ↔ ready-for-review. */
+export const setPrReady = (path: string, prNumber: number, ready: boolean) =>
+  invoke("set_pr_ready", { path, prNumber, ready });
+
+/** Edit title and/or body; an omitted field is left untouched. */
+export const updatePullRequest = (
+  path: string,
+  prNumber: number,
+  title: string | null,
+  body: string | null,
+) => invoke("update_pull_request", { path, prNumber, title, body });
+
+export const requestPrReview = (path: string, prNumber: number, reviewer: string) =>
+  invoke("request_pr_review", { path, prNumber, reviewer });
+
+/** Best-effort log tail for a failing check. Empty string means "no
+ *  excerpt available" — the failing-check card renders without one. */
+export const getCheckLogExcerpt = (path: string, prNumber: number, checkName: string) =>
+  invoke<string>("get_check_log_excerpt", { path, prNumber, checkName });
 
 export const getPullRequestChecks = (path: string) =>
   invoke<CheckInfo[]>("get_pull_request_checks", { path });
