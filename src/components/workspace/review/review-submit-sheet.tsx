@@ -25,6 +25,9 @@ interface Props {
   initialVerdict: string;
   /** GitLab has no request-changes verdict, so it isn't offered. */
   canRequestChanges: boolean;
+  /** Declared separately from request-changes: a host can serve one
+   *  verdict and not the other. */
+  canApprove: boolean;
   submitting: boolean;
   /** Why this can't be sent, in words. Null when it can. */
   blockedReason: string | null;
@@ -47,6 +50,7 @@ export function ReviewSubmitSheet({
   initialBody,
   initialVerdict,
   canRequestChanges,
+  canApprove,
   submitting,
   blockedReason,
   onReanchor,
@@ -56,9 +60,13 @@ export function ReviewSubmitSheet({
   const [verdict, setVerdict] = useState(initialVerdict);
   const [body, setBody] = useState(initialBody);
 
-  const options = canRequestChanges
-    ? VERDICTS
-    : VERDICTS.filter((v) => v.id !== "request-changes");
+  // Rendered from the declarations, so the sheet and the action bar
+  // cannot disagree about which verdicts this host has.
+  const options = VERDICTS.filter(
+    (v) =>
+      (v.id !== "request-changes" || canRequestChanges) &&
+      (v.id !== "approve" || canApprove),
+  );
 
   return (
     <Dialog

@@ -9,6 +9,7 @@ import {
   getPullRequestChecks,
 } from "@/tauri/commands";
 import { resolveProvider } from "@/lib/source-control";
+import { fetchProviderAuth } from "@/lib/provider-auth";
 import type { PrRow } from "@/lib/pr-overview";
 import { ReviewDetail } from "@/components/workspace/review/review-detail";
 import { RepoUnreachableState } from "@/components/workspace/review/review-empty-states";
@@ -64,6 +65,20 @@ export function PrDetailColumn({
     refetchInterval: CONVERSATION_POLL_MS,
   });
 
+  /**
+   * Per-operation declarations for this repository.
+   *
+   * The same `check_provider_auth` the panel asks, through the same
+   * one-minute cache — so this is not a second command, it is the second
+   * *caller* of one. Long stale time: what a host can do does not change
+   * between two polls of a pull request.
+   */
+  const opsQuery = useQuery({
+    queryKey: ["pr", "page-ops", path] as const,
+    queryFn: () => fetchProviderAuth(path, row.providerKind),
+    staleTime: 60_000,
+  });
+
   const inlineQuery = useQuery({
     queryKey: ["pr", "page-inline", path, number] as const,
     queryFn: () => getPrInlineComments(path, number),
@@ -86,10 +101,14 @@ export function PrDetailColumn({
   }, [queryClient, path, number]);
 
   const pr = detailQuery.data ?? null;
+  const operations = opsQuery.data?.operations ?? null;
 
   // Binding rule 2: only a PR that has *never* loaded gets a skeleton.
-  if (!pr) {
-    if (detailQuery.isError) {
+  // The declarations are waited for alongside the PR rather than
+  // defaulted to: a control drawn on a guess and then withdrawn is worse
+  // than one that arrives a moment later with the data it gates on.
+  if (!pr || !operations) {
+    if (detailQuery.isError || opsQuery.isError) {
       return (
         <RepoUnreachableState
           repoSlug={row.repo}
@@ -125,6 +144,7 @@ export function PrDetailColumn({
       workspaceId={null}
       projectRoot={path}
       provider={resolveProvider(row.providerKind)}
+      operations={operations}
       repoSlug={row.repo}
       viewerLogin={viewerLogin}
       checkedOutHere={false}

@@ -24,6 +24,7 @@ import type { ModelSelection, TerminalPreset, WorkspaceSnapshot } from "@/tauri/
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { usePrAgentRunsStore } from "@/stores/pr-agent-runs-store";
 import { toast } from "@/lib/toast";
 
 // ── Task shapes ───────────────────────────────────────────────────────
@@ -328,9 +329,23 @@ async function startThreadIn(
   presetId: string,
   prompt: string,
   modelSelection: ModelSelection | null,
-): Promise<void> {
-  await createTab(workspaceId, "terminal");
+): Promise<string | null> {
+  // The id is kept so the timeline's "Open thread" can land on this
+  // conversation rather than merely on the workspace containing it.
+  const tabId = await createTab(workspaceId, "terminal");
   await applyPreset(workspaceId, presetId, "current_terminal", prompt, modelSelection);
+  return tabId ?? null;
+}
+
+/** What the run's card says it was pointed at. */
+function runSummary(task: HandoffTask, pr: HandoffPr): string {
+  if (task.kind === "failing-check") return task.checkName;
+  if (task.kind === "review-thread") {
+    return task.path
+      ? `${task.path}${task.line != null ? `:${task.line}` : ""}`
+      : `${task.reviewer}'s comment`;
+  }
+  return `Conflicts with ${pr.base_branch ?? "the base branch"}`;
 }
 
 /**
@@ -341,6 +356,37 @@ async function startThreadIn(
  */
 export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcome> {
   const { pr, task, projectRoot, cwd, currentWorkspaceId } = req;
+
+  /**
+   * Write the run into the local history the Timeline merges.
+   *
+   * Recorded on the way out of `finish`, so only a handoff that actually
+   * started a thread appears — a failed one throws before this and leaves
+   * no trace, which is right: the timeline is a record of what happened,
+   * not of what was attempted.
+   *
+   * Never sent to the host. See `pr-agent-runs-store`.
+   */
+  const remember = (
+    workspaceId: string,
+    workspaceTitle: string,
+    threadTabId: string | null,
+  ) => {
+    usePrAgentRunsStore.getState().record({
+      id: `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      prRef: req.prRef,
+      projectRoot,
+      prNumber: pr.number,
+      kind: task.kind,
+      summary: runSummary(task, pr),
+      workspaceId,
+      workspaceTitle,
+      threadTabId,
+      createdAt: Date.now(),
+      // No diff stats: at this instant the agent has not written
+      // anything, so any number here would describe the wrong commit.
+    });
+  };
 
   // Only the check card can be missing its excerpt (the card fetches
   // lazily and may not have been expanded), and a prompt without the
@@ -353,7 +399,11 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   const prompt = buildHandoffPrompt(req, excerpt);
   const { presetId, presetName, modelSelection } = await resolveAgentPreset();
 
-  const finish = (route: HandoffRoute, workspaceId: string): HandoffOutcome => {
+  const finish = (
+    route: HandoffRoute,
+    workspaceId: string,
+    threadTabId: string | null,
+  ): HandoffOutcome => {
     const title = workspaceById(workspaceId)?.title ?? pr.head_branch ?? "a new workspace";
     const where =
       route === "current"
@@ -361,6 +411,7 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
         : route === "worktree"
           ? `in a new worktree for ${pr.head_branch}`
           : `in ${title}`;
+    remember(workspaceId, title, threadTabId);
     toast.success(`${presetName} is ${taskLabel(task, pr)} — new thread ${where}`);
     return { route, workspaceId, workspaceTitle: title, presetName, prompt };
   };
@@ -368,8 +419,8 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   // (a) You are standing in the branch: the worktree already exists and
   // it is the one on screen.
   if (currentWorkspaceId) {
-    await startThreadIn(currentWorkspaceId, presetId, prompt, modelSelection);
-    return finish("current", currentWorkspaceId);
+    const tabId = await startThreadIn(currentWorkspaceId, presetId, prompt, modelSelection);
+    return finish("current", currentWorkspaceId, tabId);
   }
 
   if (!pr.head_branch) {
@@ -381,8 +432,8 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   const existing = findWorkspaceForBranch(projectRoot, pr.head_branch);
   if (existing) {
     await activateWorkspaceInteraction(existing.workspace_id);
-    await startThreadIn(existing.workspace_id, presetId, prompt, modelSelection);
-    return finish("existing", existing.workspace_id);
+    const tabId = await startThreadIn(existing.workspace_id, presetId, prompt, modelSelection);
+    return finish("existing", existing.workspace_id, tabId);
   }
 
   // (c) Nowhere to land: cut the worktree, with the prompt attached.
@@ -403,9 +454,11 @@ export async function handOffToAgent(req: HandoffRequest): Promise<HandoffOutcom
   // telling the user their instruction went nowhere, start the thread
   // the second way.
   if (result.adopted) {
-    await startThreadIn(result.workspaceId, presetId, prompt, modelSelection);
-    return finish("adopted", result.workspaceId);
+    const tabId = await startThreadIn(result.workspaceId, presetId, prompt, modelSelection);
+    return finish("adopted", result.workspaceId, tabId);
   }
 
-  return finish("worktree", result.workspaceId);
+  // The worktree route carried the prompt at creation time, so no tab was
+  // created here and there is no id to point "Open thread" at.
+  return finish("worktree", result.workspaceId, null);
 }

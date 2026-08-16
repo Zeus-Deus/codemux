@@ -11,6 +11,16 @@ interface Props {
   tabs: ReviewTab[];
   activeId: string;
   onSelect: (id: string) => void;
+  /**
+   * Right-hand slot, for a control that belongs to the active tab rather
+   * than to the strip — currently the Timeline's filter.
+   *
+   * It lives here rather than inside the tab body because the strip is
+   * the one row whose height is already fixed: putting the filter in the
+   * body would push the first entry of every other tab down by its
+   * height, or make the tabs change height between tabs.
+   */
+  trailing?: React.ReactNode;
 }
 
 /**
@@ -21,7 +31,7 @@ interface Props {
  * it — changing height. A single-tab strip still renders its underline,
  * which is why the panel's resting geometry is already final.
  */
-export function ReviewTabStrip({ tabs, activeId, onSelect }: Props) {
+export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
   return (
     <div
       role="tablist"
@@ -52,6 +62,12 @@ export function ReviewTabStrip({ tabs, activeId, onSelect }: Props) {
           </button>
         );
       })}
+      {trailing && (
+        <>
+          <span className="flex-1" />
+          {trailing}
+        </>
+      )}
     </div>
   );
 }

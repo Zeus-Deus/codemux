@@ -71,6 +71,10 @@ import {
   type HandoffRequest,
   type HandoffTask,
 } from "./pr-agent-handoff";
+import {
+  selectRunsForPr,
+  usePrAgentRunsStore,
+} from "@/stores/pr-agent-runs-store";
 
 const PR = {
   number: 285,
@@ -357,5 +361,56 @@ describe("handOffToAgent — routes", () => {
       handOffToAgent(req(CHECK_TASK, { pr: { ...PR, head_branch: null } })),
     ).rejects.toThrow(/head branch/);
     expect(mockCreateWorktree).not.toHaveBeenCalled();
+  });
+});
+
+// ── The local record the Timeline merges ──
+
+describe("handOffToAgent — the run it records", () => {
+  beforeEach(() => usePrAgentRunsStore.getState().clear());
+
+  it("records the run against the PR, with the thread it opened", async () => {
+    await handOffToAgent(req(CHECK_TASK, { currentWorkspaceId: "ws-here" }));
+
+    const runs = selectRunsForPr(usePrAgentRunsStore.getState().runs, {
+      prRef: "acme/app#285",
+      projectRoot: "/repo",
+      prNumber: 285,
+    });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      kind: "failing-check",
+      // The check name is what the card shows.
+      summary: "rust (ubuntu-latest)",
+      workspaceId: "ws-here",
+      threadTabId: "tab-1",
+      prNumber: 285,
+    });
+    // Never invented — the agent has written nothing yet.
+    expect(runs[0].files).toBeUndefined();
+  });
+
+  it("summarizes a review thread by its file:line anchor", async () => {
+    await handOffToAgent(
+      req(
+        {
+          kind: "review-thread",
+          reviewer: "juliusm",
+          body: "Worth a line here.",
+          path: "AGENTS.md",
+          line: 12,
+        },
+        { currentWorkspaceId: "ws-here" },
+      ),
+    );
+    expect(usePrAgentRunsStore.getState().runs[0].summary).toBe("AGENTS.md:12");
+  });
+
+  it("records nothing when the handoff never started a thread", async () => {
+    await expect(
+      handOffToAgent(req(CHECK_TASK, { pr: { ...PR, head_branch: null } })),
+    ).rejects.toThrow();
+    // The timeline is a record of what happened, not of what was tried.
+    expect(usePrAgentRunsStore.getState().runs).toEqual([]);
   });
 });

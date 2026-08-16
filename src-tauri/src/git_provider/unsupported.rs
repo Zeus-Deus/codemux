@@ -11,10 +11,10 @@
 use std::path::Path;
 
 use super::detect::{DetectedProvider, ProviderKind};
-use super::provider::{Capabilities, SourceControlProvider};
+use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrsOverview, PullRequestInfo, ReviewComment,
+    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 pub struct UnsupportedProvider {
@@ -62,6 +62,18 @@ impl SourceControlProvider for UnsupportedProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
+    }
+
+    /// Nothing, and deliberately so.
+    ///
+    /// Bitbucket and Azure DevOps have not been verified against their
+    /// real CLI surfaces. Declaring an operation we have not tested would
+    /// draw a control that fails at the server; declaring none renders
+    /// the read-only sentence and an offer of the browser, which is true.
+    /// Fill this in from the CLI — not from documentation — if either
+    /// host ever ships.
+    fn operations(&self) -> OperationCapabilities {
+        OperationCapabilities::default()
     }
 
     fn is_implemented(&self) -> bool {
@@ -259,6 +271,14 @@ impl SourceControlProvider for UnsupportedProvider {
         _number: u32,
     ) -> Result<Vec<DeploymentInfo>, String> {
         self.err("read deployments")
+    }
+
+    fn pull_request_timeline(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String> {
+        self.err("read this pull request's timeline")
     }
 
     fn list_issues(

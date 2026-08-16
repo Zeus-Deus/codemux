@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use crate::execution::{host_command, sanitize_gui_env_std};
 use crate::git_provider::exec::run_timed;
 use crate::git_provider::{
-    self, Capabilities, DetectedProvider, GitLabProvider, ProviderKind, SourceControlProvider,
+    self, Capabilities, DetectedProvider, GitLabProvider, OperationCapabilities, ProviderKind,
+    SourceControlProvider,
 };
 use crate::github::GhStatus;
 
@@ -113,6 +114,13 @@ pub struct ProviderAuthStatus {
     /// Account the CLI reports. `None` when signed out, or when it
     /// authenticated without naming one.
     pub username: Option<String>,
+    /// What may be *done* on this checkout, per operation.
+    ///
+    /// Carried here rather than behind a second command because every
+    /// surface that renders a review control already asks this question
+    /// once per checkout — and a control whose right to exist arrives one
+    /// round trip after the control does is a control that flickers.
+    pub operations: OperationCapabilities,
 }
 
 impl ProviderAuthStatus {
@@ -125,6 +133,7 @@ impl ProviderAuthStatus {
             installed: false,
             authenticated: false,
             username: None,
+            operations: OperationCapabilities::default(),
         }
     }
 }
@@ -274,6 +283,10 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
     let provider = git_provider::provider_for_detection(&detected);
     let kind = detected.kind.as_str().to_string();
 
+    // Declared by the adapter, not inferred from `kind` here: the
+    // declaration has exactly one home, and this is a reader of it.
+    let operations = provider.operations();
+
     if !provider.is_implemented() {
         return ProviderAuthStatus {
             kind,
@@ -281,6 +294,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             installed: false,
             authenticated: false,
             username: None,
+            operations,
         };
     }
 
@@ -291,6 +305,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             installed: false,
             authenticated: false,
             username: None,
+            operations,
         },
         GhStatus::NotAuthenticated => ProviderAuthStatus {
             kind,
@@ -298,6 +313,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             installed: true,
             authenticated: false,
             username: None,
+            operations,
         },
         GhStatus::Authenticated { username } => ProviderAuthStatus {
             kind,
@@ -305,6 +321,7 @@ fn provider_auth_blocking(repo_path: &std::path::Path) -> ProviderAuthStatus {
             installed: true,
             authenticated: true,
             username: Some(username).filter(|u| !u.trim().is_empty()),
+            operations,
         },
     }
 }

@@ -45,9 +45,17 @@ interface Props {
   diffText: string;
   loading: boolean;
   error: string | null;
-  /** "Comment now" needs a host that takes one comment outside a
-   *  review. GitLab wants a version triple we don't build yet, so the
-   *  button isn't drawn there. */
+  /**
+   * Whether line notes can be written against this host at all.
+   *
+   * False leaves the diff readable and inert: no gutter selection, no
+   * composer, no pending notes. Drafting a note that can never be
+   * submitted is worse than not offering one — the work is lost at the
+   * last step, which is the step that matters.
+   */
+  canDraftLineNotes: boolean;
+  /** "Comment now" additionally needs a host that takes one comment
+   *  outside a review. */
   canCommentNow: boolean;
   onPosted: () => void;
   intent: CodeTabIntent | null;
@@ -70,6 +78,7 @@ export function ReviewCodeTab({
   diffText,
   loading,
   error,
+  canDraftLineNotes,
   canCommentNow,
   onPosted,
   intent,
@@ -185,6 +194,9 @@ export function ReviewCodeTab({
     (path: string, line: DiffLine, side: DiffRowSide, shiftKey: boolean) => {
       const no = side === "LEFT" ? line.oldLine : line.newLine;
       if (no == null) return;
+      // Re-pinning an existing note stays available: those notes were
+      // written when the host could still take them.
+      if (!canDraftLineNotes && !repinId) return;
 
       if (repinId) {
         repin(repinId, path, side, no);
@@ -358,6 +370,7 @@ export function ReviewCodeTab({
       editingId,
       draftKey,
       posting,
+      canDraftLineNotes,
       addNote,
       commentNow,
       canCommentNow,

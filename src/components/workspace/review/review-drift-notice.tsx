@@ -70,13 +70,18 @@ export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
       role="status"
       data-testid="drift-notice"
       data-drift-kind={notice.kind}
-      className="flex items-center gap-2 border-t border-border/40 bg-muted/30 px-3 py-2"
+      // Wraps rather than compresses. At panel width three actions can
+      // take the whole row, and a message squeezed into the leftover
+      // 20px is the one thing this notice may never do — the reason a
+      // control is blocked has to stay readable in words (binding rule
+      // 5). So the buttons drop to a second line instead.
+      className="flex flex-wrap items-center gap-2 border-t border-border/40 bg-muted/30 px-3 py-2"
     >
       <span
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", TONE_DOT[notice.tone])}
       />
-      <span className="min-w-0 flex-1 text-[11px] leading-snug text-foreground/80">
+      <span className="min-w-[11rem] flex-1 text-[11px] leading-snug text-foreground/80">
         {notice.message}
       </span>
       {notice.actions.map((action) => (

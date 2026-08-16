@@ -31,7 +31,7 @@ pub mod unsupported;
 
 pub use detect::{detect_provider, invalidate_detection_cache, DetectedProvider, ProviderKind};
 pub use gitlab::GitLabProvider;
-pub use provider::{Capabilities, SourceControlProvider};
+pub use provider::{Capabilities, Operation, OperationCapabilities, SourceControlProvider};
 pub use registry::{
     github_provider, provider_for_detection, provider_for_detection_or_default, provider_for_path,
     provider_for_path_or_default, provider_kind_field, repo_has_supported_provider,

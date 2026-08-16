@@ -36,11 +36,12 @@ use serde_json::Value;
 use super::cache::{TtlCache, DETAIL_TTL, LIST_TTL};
 use super::detect::{run_git, DetectedProvider, ProviderKind};
 use super::exec::{run_timed, TimedFailure};
-use super::provider::{Capabilities, SourceControlProvider};
+use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    IssueComment, IssueState, PrOverviewItem, PrsOverview, PullRequestInfo, ReviewComment,
+    IssueComment, IssueState, PrOverviewItem, PrTimelineEvent, PrTimelineEventKind, PrsOverview,
+    PullRequestInfo, ReviewComment,
     MAX_ISSUE_BODY_BYTES,
     MAX_ISSUE_COMMENTS, MAX_PR_DIFF_BYTES,
 };
@@ -405,6 +406,7 @@ pub(crate) fn parse_mr_json(v: &Value) -> PullRequestInfo {
         review_decision: None,
         checks_passing: None,
         updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
+        created_at: v["created_at"].as_str().map(|s| s.to_string()),
         head_ref_oid: v["sha"]
             .as_str()
             .map(|s| s.to_string())
@@ -750,6 +752,133 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
     (threads, inline)
 }
 
+/// Merge three GitLab payloads into the timeline model.
+///
+/// Pulled out of the trait method so it can be tested against recorded
+/// payloads: the merging and the classification are the parts that break,
+/// not the three HTTP calls around them.
+pub(crate) fn map_gitlab_timeline(
+    states: &Value,
+    versions: &Value,
+    notes: &Value,
+) -> Vec<PrTimelineEvent> {
+    let mut out: Vec<PrTimelineEvent> = Vec::new();
+
+    // ── State changes ──
+    if let Some(arr) = states.as_array() {
+        for (i, ev) in arr.iter().enumerate() {
+            let state = ev["state"].as_str().unwrap_or("");
+            let kind = match state {
+                "closed" => PrTimelineEventKind::Closed,
+                "reopened" => PrTimelineEventKind::Reopened,
+                "merged" => PrTimelineEventKind::Merged { sha: None },
+                other => PrTimelineEventKind::Other {
+                    label: other.replace('_', " "),
+                },
+            };
+            out.push(PrTimelineEvent {
+                id: format!("state-{}:{i}", ev["id"].as_u64().unwrap_or(i as u64)),
+                actor: ev["user"]["username"].as_str().map(|s| s.to_string()),
+                created_at: ev["created_at"].as_str().map(|s| s.to_string()),
+                kind,
+            });
+        }
+    }
+
+    // ── Versions ──
+    //
+    // A version is created per push, so each one is the counterpart of
+    // GitHub's `committed` row. GitLab does not say whether a push
+    // rewrote history, so nothing here ever claims a force-push.
+    if let Some(arr) = versions.as_array() {
+        for (i, version) in arr.iter().enumerate() {
+            let sha = version["head_commit_sha"].as_str().unwrap_or("").to_string();
+            if sha.is_empty() {
+                continue;
+            }
+            out.push(PrTimelineEvent {
+                id: format!("version-{}:{i}", version["id"].as_u64().unwrap_or(i as u64)),
+                actor: None,
+                created_at: version["created_at"].as_str().map(|s| s.to_string()),
+                kind: PrTimelineEventKind::Committed {
+                    sha,
+                    message: String::new(),
+                },
+            });
+        }
+    }
+
+    // ── Notes ──
+    if let Some(arr) = notes.as_array() {
+        for (i, note) in arr.iter().enumerate() {
+            let body = note["body"].as_str().unwrap_or("").trim().to_string();
+            if body.is_empty() {
+                continue;
+            }
+            let system = note["system"].as_bool() == Some(true);
+            let actor = note["author"]["username"].as_str().map(|s| s.to_string());
+            let created_at = note["created_at"].as_str().map(|s| s.to_string());
+            let id = format!("note-{}:{i}", note["id"].as_u64().unwrap_or(i as u64));
+
+            if !system {
+                // An inline note already renders in the Code tab and in
+                // the threads list; the timeline shows the conversation.
+                if !note["position"].is_null() {
+                    continue;
+                }
+                out.push(PrTimelineEvent {
+                    id,
+                    actor,
+                    created_at,
+                    kind: PrTimelineEventKind::Commented { body },
+                });
+                continue;
+            }
+
+            let lower = body.to_lowercase();
+            let kind = if lower.starts_with("approved this") {
+                PrTimelineEventKind::Reviewed {
+                    verdict: "APPROVED".to_string(),
+                    body: String::new(),
+                    anchor: None,
+                }
+            } else if lower.starts_with("unapproved this") {
+                PrTimelineEventKind::Reviewed {
+                    verdict: "COMMENTED".to_string(),
+                    body: "withdrew their approval".to_string(),
+                    anchor: None,
+                }
+            } else if lower.starts_with("requested review from") {
+                PrTimelineEventKind::ReviewRequested {
+                    // "requested review from @juliusm"
+                    reviewer: body
+                        .split('@')
+                        .nth(1)
+                        .map(|s| s.trim().trim_end_matches(['.', ',']).to_string()),
+                }
+            } else {
+                // Title changes, label changes, milestones, "added 3
+                // commits" — real history this build has no specific row
+                // for. One line each, never dropped.
+                PrTimelineEventKind::Other {
+                    label: body.lines().next().unwrap_or("").to_string(),
+                }
+            };
+            out.push(PrTimelineEvent {
+                id,
+                actor,
+                created_at,
+                kind,
+            });
+        }
+    }
+
+    // Three sources means three orderings; the rail reads oldest first.
+    // Undated rows sort to the top rather than being discarded.
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out
+}
+
 /// Pipeline jobs (or, for an externally reported pipeline, the commit
 /// statuses that stand in for them) → the checks list.
 pub(crate) fn parse_checks(jobs: &Value) -> Vec<CheckInfo> {
@@ -877,6 +1006,34 @@ impl SourceControlProvider for GitLabProvider {
             has_deployments: false,
             has_reviews: true,
             has_fork_pr_fetch: true,
+        }
+    }
+
+    /// Everything except requesting changes and line comments.
+    ///
+    /// Two different reasons, and the difference matters:
+    ///
+    /// - **request_changes** — GitLab has no such verdict. An unresolved
+    ///   discussion expresses the same intent, but no API call means
+    ///   "changes requested", so the control is not drawn rather than
+    ///   drawn and quietly downgraded to a comment.
+    /// - **line_comments** — GitLab *does* have them; this build cannot
+    ///   post them. `add_inline_comment` and the comment-carrying arm of
+    ///   `submit_review_with_comments` both refuse, because GitLab wants
+    ///   a `{base,start,head}` version triple where GitHub takes a commit
+    ///   and a line, and that triple isn't built yet.
+    ///
+    /// The second is the whole point of this struct being separate from
+    /// [`Capabilities`]: that one records what the *host* has (and still
+    /// says `has_inline_comments: true`, correctly), this one records
+    /// what Codemux can actually perform. Declaring the host's ability
+    /// here would draw a control that fails at submit — the exact
+    /// wrong-declaration failure these declarations exist to prevent.
+    fn operations(&self) -> OperationCapabilities {
+        OperationCapabilities {
+            request_changes: false,
+            line_comments: false,
+            ..OperationCapabilities::all()
         }
     }
 
@@ -1483,6 +1640,48 @@ impl SourceControlProvider for GitLabProvider {
         _number: u32,
     ) -> Result<Vec<DeploymentInfo>, String> {
         Err(self.unsupported("list deployments for a merge request"))
+    }
+
+    /// GitLab has no single timeline endpoint, so this is three calls
+    /// merged: state changes, versions (each one a push), and notes.
+    ///
+    /// Only the state events and versions map cleanly. Notes are a mixed
+    /// bag — a human comment, an approval, and "changed title from X to
+    /// Y" are all notes — so the ones with a recognisable shape are
+    /// mapped and the rest become one-liners rather than being guessed at
+    /// or dropped.
+    fn pull_request_timeline(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String> {
+        let base = format!("projects/:id/merge_requests/{number}");
+
+        // Each leg is independently optional: a self-managed instance
+        // with one endpoint disabled should cost that leg, not the tab.
+        let states = self
+            .api(
+                repo_path,
+                &format!("{base}/resource_state_events?per_page=100"),
+                CALL_TIMEOUT,
+            )
+            .unwrap_or(Value::Null);
+        let versions = self
+            .api(
+                repo_path,
+                &format!("{base}/versions?per_page=100"),
+                CALL_TIMEOUT,
+            )
+            .unwrap_or(Value::Null);
+        let notes = self
+            .api(
+                repo_path,
+                &format!("{base}/notes?per_page=100&sort=asc"),
+                CALL_TIMEOUT,
+            )
+            .unwrap_or(Value::Null);
+
+        Ok(map_gitlab_timeline(&states, &versions, &notes))
     }
 
     fn list_issues(
@@ -2099,6 +2298,54 @@ gitlab.com
         let (threads, inline) = split_discussions(&Value::Null);
         assert!(threads.is_empty());
         assert!(inline.is_empty());
+    }
+
+    // ── Timeline ──
+
+    #[test]
+    fn three_gitlab_payloads_merge_into_one_ordered_rail() {
+        let states = serde_json::json!([
+            {"id": 9, "user": {"username": "juliusm"}, "state": "closed",
+             "created_at": "2026-08-16T12:00:00Z"}
+        ]);
+        let versions = serde_json::json!([
+            {"id": 4, "head_commit_sha": "a1f9c2e", "created_at": "2026-08-16T10:00:00Z"},
+            // No head sha means no push we can name; dropping it beats
+            // rendering "Pushed" with a blank where the sha goes.
+            {"id": 5, "created_at": "2026-08-16T10:30:00Z"}
+        ]);
+        let notes = serde_json::json!([
+            {"id": 1, "system": false, "author": {"username": "juliusm"},
+             "created_at": "2026-08-16T09:00:00Z", "body": "Worth a line here.", "position": null},
+            {"id": 2, "system": true, "author": {"username": "octocat"},
+             "created_at": "2026-08-16T11:00:00Z", "body": "approved this merge request"},
+            {"id": 3, "system": true, "author": {"username": "juliusm"},
+             "created_at": "2026-08-16T11:30:00Z", "body": "changed title from **wip** to **feat**"},
+            // Already rendered by the Code tab and the threads list.
+            {"id": 6, "system": false, "author": {"username": "juliusm"},
+             "created_at": "2026-08-16T09:10:00Z", "body": "nit", "position": {"new_line": 12}}
+        ]);
+
+        let events = map_gitlab_timeline(&states, &versions, &notes);
+        let kinds: Vec<&PrTimelineEventKind> = events.iter().map(|e| &e.kind).collect();
+
+        assert_eq!(events.len(), 5, "one comment, one push, one approval, one other, one close");
+        assert!(matches!(kinds[0], PrTimelineEventKind::Commented { body } if body == "Worth a line here."));
+        assert!(matches!(kinds[1], PrTimelineEventKind::Committed { sha, .. } if sha == "a1f9c2e"));
+        assert!(matches!(kinds[2], PrTimelineEventKind::Reviewed { verdict, .. } if verdict == "APPROVED"));
+        // A system note this build has no row for keeps its own words.
+        assert!(matches!(kinds[3], PrTimelineEventKind::Other { label } if label.starts_with("changed title")));
+        assert!(matches!(kinds[4], PrTimelineEventKind::Closed));
+    }
+
+    #[test]
+    fn a_leg_that_returns_nothing_costs_only_that_leg() {
+        let notes = serde_json::json!([
+            {"id": 1, "system": false, "author": {"username": "juliusm"},
+             "created_at": "2026-08-16T09:00:00Z", "body": "still here", "position": null}
+        ]);
+        let events = map_gitlab_timeline(&Value::Null, &Value::Null, &notes);
+        assert_eq!(events.len(), 1);
     }
 
     // ── Notes / issues ──

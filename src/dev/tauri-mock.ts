@@ -48,6 +48,7 @@ import {
   MOCK_CHECK_LOG_EXCERPT,
   MOCK_LOCAL_ONLY_PATH,
   MOCK_PR_CHECKS,
+  MOCK_PR_TIMELINES,
   MOCK_PR_DIFFS,
   MOCK_PR_HISTORY,
   MOCK_PR_OVERVIEW,
@@ -91,6 +92,7 @@ import type {
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
+  ProviderOperations,
   PullRequestInfo,
   ReviewComment,
   InlineReviewComment,
@@ -2290,6 +2292,45 @@ const stagedImages = new Map<
 >();
 let stagedImageSeq = 0;
 
+/**
+ * What each host declares, mirroring the Rust adapters.
+ *
+ * GitHub: everything. GitLab: everything but the verdict it does not
+ * have. Anything else: nothing — an unverified declaration is worse than
+ * none, because the backend refuses undeclared operations, so the honest
+ * blank renders read-only rather than drawing controls that would fail.
+ */
+const NO_MOCK_OPERATIONS: ProviderOperations = {
+  list_read: false,
+  comment: false,
+  approve: false,
+  request_changes: false,
+  line_comments: false,
+  merge_with_strategies: false,
+  draft_ready_close_reopen: false,
+  checks_status: false,
+  timeline: false,
+};
+
+const ALL_MOCK_OPERATIONS: ProviderOperations = {
+  list_read: true,
+  comment: true,
+  approve: true,
+  request_changes: true,
+  line_comments: true,
+  merge_with_strategies: true,
+  draft_ready_close_reopen: true,
+  checks_status: true,
+  timeline: true,
+};
+
+const MOCK_PROVIDER_OPERATIONS: Record<string, ProviderOperations> = {
+  github: ALL_MOCK_OPERATIONS,
+  // No request-changes verdict on the host, and no line-comment route
+  // in this build — see `GitLabProvider::operations`.
+  gitlab: { ...ALL_MOCK_OPERATIONS, request_changes: false, line_comments: false },
+};
+
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -3205,6 +3246,11 @@ const handlers: Record<string, Handler> = {
       installed: true,
       authenticated: true,
       username: kind === "gitlab" ? "mock-glab" : "mock-dev",
+      // Standing in for the adapters' own declarations — see
+      // `git_provider/provider.rs`. GitLab is missing exactly one
+      // operation, and Bitbucket declares nothing at all, so both the
+      // partial and the empty case are reachable in the running app.
+      operations: MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS,
     };
   },
   // Settings → Source Control. Deliberately mixed so both diagnostic
@@ -3349,6 +3395,9 @@ const handlers: Record<string, Handler> = {
   // The page opens a PR by number, not by whatever branch a checkout
   // happens to be standing on.
   get_github_pr_by_path: (a) => mutablePrs[Number(a.prNumber)] ?? null,
+  // Host events only. An agent run reaches the rail by being recorded
+  // locally during a real handoff, never from here.
+  get_pr_timeline: (a) => MOCK_PR_TIMELINES[Number(a.prNumber)] ?? [],
 
   // ── Review panel ──
   //

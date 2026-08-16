@@ -49,6 +49,7 @@ import type {
   PrsOverview,
   ReviewComment,
   InlineReviewComment,
+  PrTimelineEvent,
   PrDraftComment,
   MergeState,
   MergeIntoBaseResult,
@@ -717,6 +718,14 @@ export const submitPrReview = (path: string, prNumber: number, event: string, bo
  *  backend so a force-push shows the new patch immediately. */
 export const getPrReviewDiff = (path: string, prNumber: number) =>
   invoke<string>("get_pr_review_diff", { path, prNumber });
+
+/** The host's own history of a pull request, oldest first.
+ *
+ *  Carries neither the "opened" row nor the checks row: the first is
+ *  synthesized from the PR the caller already holds, and checks are not a
+ *  timeline event at any host — they are the live checks query. */
+export const getPrTimeline = (path: string, prNumber: number) =>
+  invoke<PrTimelineEvent[]>("get_pr_timeline", { path, prNumber });
 
 /** Post one line comment now. `commitId` must be the head the rendered
  *  diff came from — a stale one pins the comment to a superseded commit

@@ -2201,6 +2201,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
             commands::get_pr_deployments,
+            commands::get_pr_timeline,
             commands::list_github_issues,
             commands::list_github_issues_by_path,
             commands::get_github_issue_by_path,

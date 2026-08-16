@@ -32,6 +32,7 @@ import type {
   FileEntry,
   InlineReviewComment,
   LinkedIssue,
+  PrTimelineEvent,
   PullRequestInfo,
   ReviewComment,
   PaneNodeSnapshot,
@@ -766,6 +767,47 @@ const wsVexisInstaller = makeWorkspace({
 
 // Project 3 — personal-site: 1 primary + 1 worktree (open PR + diff).
 
+// ── Bitbucket: a host that declares nothing ─────────────────────────
+//
+// Seeded so the undeclared-host state can be walked end to end rather
+// than only reasoned about. The workspace has a real pull request with
+// real data behind it — that is the point: Codemux can *see* it, and
+// still draws no write control anywhere, because the adapter declares
+// no operations and the backend would refuse them.
+const ledgerRoot = `${PROJECTS}/ledger-api`;
+const ledgerUid = "uid-ledger-api";
+
+const wsLedgerMain = makeWorkspace({
+  workspace_id: "ws-ledger-main",
+  title: "ledger-api",
+  cwd: ledgerRoot,
+  project_root: ledgerRoot,
+  project_uid: ledgerUid,
+  workspace_kind: "main",
+  protected: true,
+  git_branch: "main",
+  provider_kind: "bitbucket",
+});
+
+const wsLedgerRates = makeWorkspace({
+  workspace_id: "ws-ledger-rates",
+  title: "fx-rates-cache",
+  cwd: `${HOME}/.codemux/worktrees/ledger-api/feat-fx-rates-cache`,
+  worktree_path: `${HOME}/.codemux/worktrees/ledger-api/feat-fx-rates-cache`,
+  project_root: ledgerRoot,
+  project_uid: ledgerUid,
+  workspace_kind: "worktree",
+  git_branch: "feat/fx-rates-cache",
+  pr_number: 64,
+  pr_state: "open",
+  pr_url: "https://bitbucket.org/acme/ledger-api/pull-requests/64",
+  provider_kind: "bitbucket",
+  git_ahead: 3,
+  git_additions: 128,
+  git_deletions: 19,
+  git_changed_files: 4,
+});
+
 const siteRoot = `${PROJECTS}/personal-site`;
 const siteUid = "uid-personal-site";
 
@@ -834,6 +876,8 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsVexisInstaller,
   wsSiteMain,
   wsSiteRedesign,
+  wsLedgerMain,
+  wsLedgerRates,
   wsScratchpad,
 ];
 
@@ -2590,6 +2634,7 @@ function makePr(seed: Partial<PullRequestInfo> & { number: number; title: string
     review_decision: null,
     checks_passing: null,
     updated_at: minutesAgo(38),
+    created_at: minutesAgo(190),
     body: null,
     comments: [],
     totalComments: 0,
@@ -2773,6 +2818,138 @@ export const MOCK_PULL_REQUESTS: Record<number, PullRequestInfo> = {
     updated_at: minutesAgo(310),
     body: "Criterion-based, runs nightly.",
   }),
+  // Bitbucket: readable, and nothing else. Every write control is
+  // absent here because the adapter declares no operations.
+  64: makePr({
+    number: 64,
+    title: "feat: cache FX rates for the settlement job",
+    url: "https://bitbucket.org/acme/ledger-api/pull-requests/64",
+    head_branch: "feat/fx-rates-cache",
+    additions: 128,
+    deletions: 19,
+    changed_files: 4,
+    updated_at: minutesAgo(74),
+    body: "Adds a 60s in-process cache in front of the rates provider.",
+  }),
+};
+
+// ── Timelines ───────────────────────────────────────────────────────
+//
+// The host half of the Timeline tab. Agent runs are deliberately NOT
+// here: they are local records written by a real handoff (see
+// `pr-agent-runs-store`), so the only way one appears in the mock is by
+// actually handing something off — which is exactly the property worth
+// being able to check by hand.
+//
+// #172 carries the force-push that ties this tab to the Code tab's
+// re-anchoring simulator, plus one event type this build has never seen,
+// so the never-drop-an-unknown-event rule is visible in the running app.
+export const MOCK_PR_TIMELINES: Record<number, PrTimelineEvent[]> = {
+  172: [
+    {
+      id: "tl-172-1",
+      actor: OTHER_AUTHOR,
+      created_at: minutesAgo(160),
+      kind: "review_requested",
+      reviewer: MOCK_PR_AUTHOR,
+    },
+    {
+      id: "tl-172-2",
+      actor: "juliusm",
+      created_at: minutesAgo(64),
+      kind: "reviewed",
+      verdict: "CHANGES_REQUESTED",
+      body: "The discoverability leg is a separate follow-up — worth a line here saying so.",
+      anchor: "AGENTS.md:12",
+    },
+    {
+      id: "tl-172-3",
+      actor: MOCK_PR_AUTHOR,
+      created_at: minutesAgo(50),
+      kind: "committed",
+      sha: "a1f9c2e5d41b0c7a",
+      message: "docs: note the follow-up and link the tracking issue",
+    },
+    {
+      id: "tl-172-4",
+      actor: MOCK_PR_AUTHOR,
+      created_at: minutesAgo(41),
+      kind: "head_ref_force_pushed",
+      sha: "bb31d70e9c2f4a18",
+    },
+    // Renders as a plain one-liner rather than vanishing.
+    {
+      id: "tl-172-5",
+      actor: MOCK_PR_AUTHOR,
+      created_at: minutesAgo(39),
+      kind: "other",
+      label: "automatic base change succeeded",
+    },
+    // Deliberately very recent, so an agent run started during a dev
+    // session lands *between* host events rather than always last —
+    // which is the arrangement the rail exists to show.
+    {
+      id: "tl-172-6",
+      actor: "juliusm",
+      created_at: minutesAgo(1),
+      kind: "commented",
+      body: "Thanks — that reads much better.",
+    },
+  ],
+  142: [
+    {
+      id: "tl-142-1",
+      actor: OTHER_AUTHOR,
+      created_at: minutesAgo(220),
+      kind: "commented",
+      body: "Opening early to get eyes on the polling removal.",
+    },
+    {
+      id: "tl-142-2",
+      actor: OTHER_AUTHOR,
+      created_at: minutesAgo(96),
+      kind: "committed",
+      sha: "77c40be1aa9d3e02",
+      message: "chore: drop the port poller",
+    },
+  ],
+  88: [
+    {
+      id: "tl-88-1",
+      actor: "mock-glab",
+      created_at: minutesAgo(120),
+      kind: "committed",
+      sha: "d41f77b2c9e01a55",
+      message: "",
+    },
+    {
+      id: "tl-88-2",
+      actor: "juliusm",
+      created_at: minutesAgo(74),
+      kind: "reviewed",
+      verdict: "APPROVED",
+      body: "",
+      anchor: null,
+    },
+    // GitLab system notes this build has no specific row for.
+    {
+      id: "tl-88-3",
+      actor: "mock-glab",
+      created_at: minutesAgo(70),
+      kind: "other",
+      label: "changed target branch from **develop** to **main**",
+    },
+  ],
+  64: [
+    {
+      id: "tl-64-1",
+      actor: MOCK_PR_AUTHOR,
+      created_at: minutesAgo(70),
+      kind: "committed",
+      sha: "5c0ffee1234abcd0",
+      message: "feat: add the rates cache",
+    },
+  ],
 };
 
 /** Checkout path → PR number. Mirrors `worktree_path ?? cwd`, which is
@@ -2787,6 +2964,7 @@ export const MOCK_PR_PATH_TO_NUMBER: Record<string, number> = {
   [`${HOME}/.codemux/worktrees/personal-site/design-landing-refresh`]: 12,
   [`${HOME}/.codemux/worktrees/vexis/feat-cuda-variant`]: 88,
   [`${HOME}/.codemux/worktrees/vexis/perf-bench-suite`]: 90,
+  [`${HOME}/.codemux/worktrees/ledger-api/feat-fx-rates-cache`]: 64,
 };
 
 /**
@@ -2803,6 +2981,9 @@ export const MOCK_PR_OVERVIEW: Record<string, { viewer: string; numbers: number[
   // A different account on a different product — which is why the page
   // resolves the viewer per root rather than once.
   [vexisRoot]: { viewer: "mock-glab", numbers: [88, 90] },
+  // A host that declares nothing still *lists* here — being unable to
+  // review is not the same as being invisible.
+  [ledgerRoot]: { viewer: MOCK_PR_AUTHOR, numbers: [64] },
 };
 
 /** Who each pull request is waiting on. */
@@ -3120,10 +3301,35 @@ const WATCH_RS_DIFF = [
  * `afterForcePush` is the same PR rewritten — see the mock's
  * `__codemuxMockForcePush` trigger.
  */
+/** A small GitLab diff, so the Code tab and its verdict sheet are
+ *  reachable on a host that declares no request-changes verdict. */
+const CUDA_RUNTIME_DIFF = [
+  "diff --git a/src/runtime/cuda.rs b/src/runtime/cuda.rs",
+  "index 3f1a2b4..9c0d5e6 100644",
+  "--- a/src/runtime/cuda.rs",
+  "+++ b/src/runtime/cuda.rs",
+  "@@ -18,6 +18,9 @@ impl Runtime {",
+  "     pub fn device_count() -> usize {",
+  "         unsafe { cuda_device_count() as usize }",
+  "     }",
+  "+",
+  "+    /// Returns None when the toolkit is present but no device is.",
+  "+    pub fn preferred_device() -> Option<Device> {",
+  "+        Self::devices().into_iter().max_by_key(|d| d.total_memory)",
+  "+    }",
+  " ",
+  "     fn devices() -> Vec<Device> {",
+  "         (0..Self::device_count()).map(Device::new).collect()",
+].join("\n");
+
 export const MOCK_PR_DIFFS: Record<
   number,
   { nameOnly: string; full: string; afterForcePush?: string }
 > = {
+  88: {
+    nameOnly: "src/runtime/cuda.rs",
+    full: CUDA_RUNTIME_DIFF,
+  },
   172: {
     nameOnly: [
       "src/stores/draft-store.ts",

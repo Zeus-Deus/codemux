@@ -638,7 +638,7 @@ import {
   checkProviderAuth,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
-import { _resetProviderAuthCache } from "@/lib/provider-auth";
+import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 
 const pane = {
   kind: "agent_chat" as const,
@@ -735,6 +735,7 @@ describe("AgentChatPane source-control preflight", () => {
       supported: true,
       installed: false,
       authenticated: false,
+      operations: NO_OPERATIONS,
       username: null,
     });
     const { container } = render(<AgentChatPane pane={pane} />);

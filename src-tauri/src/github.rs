@@ -29,6 +29,12 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
+    /// When the pull request was opened. One string field, added for the
+    /// timeline's synthesized "opened" row — the commit *count* that row
+    /// also shows is deliberately not fetched here, because `commits` is
+    /// an array and this struct is refreshed every 2.5s.
+    #[serde(alias = "createdAt", default)]
+    pub created_at: Option<String>,
     /// Head commit SHA reported by GitHub. Kept as useful PR metadata, but
     /// association is branch/repository based: a local worktree may
     /// legitimately be behind the final remote PR head after review commits
@@ -231,6 +237,221 @@ pub struct DeploymentInfo {
     pub state: String,
     pub url: Option<String>,
     pub created_at: String,
+}
+
+// ── PR timeline ──
+//
+// The host's own history of a pull request, mapped to the handful of
+// shapes the timeline rail actually draws. Two rules govern this model:
+//
+// 1. Every variant here is one the UI can render *specifically* — there
+//    is no variant that exists only to be turned back into a string.
+// 2. Anything else becomes [`PrTimelineEventKind::Other`] carrying a
+//    human label, and is drawn as a plain one-liner. A host that grows a
+//    new event type must never make an entry vanish (the reviewer would
+//    be reading an incomplete history without being told) and must never
+//    make the deserializer fail (which would blank the whole tab).
+
+/// What happened, in the vocabulary the rail draws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrTimelineEventKind {
+    /// Synthesized from the PR itself: the API's stream has no "opened".
+    Opened { commits: Option<u32> },
+    Commented { body: String },
+    Reviewed {
+        /// APPROVED / CHANGES_REQUESTED / COMMENTED.
+        verdict: String,
+        body: String,
+        /// `path:line` of the review's first inline note, when the
+        /// payload already carried one. Never fetched for: one extra
+        /// request per review to decorate a card is not a trade the
+        /// 30s poll can afford.
+        anchor: Option<String>,
+    },
+    Committed { sha: String, message: String },
+    HeadRefForcePushed { sha: Option<String> },
+    Merged { sha: Option<String> },
+    Closed,
+    Reopened,
+    ReviewRequested { reviewer: Option<String> },
+    Renamed { from: String, to: String },
+    /// Anything the host has that this build does not draw specifically.
+    Other { label: String },
+}
+
+/// One row of the host's history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrTimelineEvent {
+    /// Stable within one payload — the React key, so a poll that returns
+    /// the same event twice updates a row instead of duplicating it.
+    pub id: String,
+    pub actor: Option<String>,
+    /// ISO-8601. `None` sorts to the top rather than being dropped.
+    pub created_at: Option<String>,
+    #[serde(flatten)]
+    pub kind: PrTimelineEventKind,
+}
+
+/// Turn a raw event type into the label a one-liner shows.
+///
+/// `head_ref_deleted` → "head ref deleted". Underscores become spaces
+/// because a raw API token in a sentence reads like a leaked internal.
+fn humanize_event(raw: &str) -> String {
+    raw.replace('_', " ")
+}
+
+/// `gh api --paginate` on an array endpoint emits one JSON array per
+/// page, concatenated. `serde_json::from_str` sees the first array and
+/// then trailing characters, so a two-page timeline would either error or
+/// silently lose every page but the first — read the stream instead and
+/// flatten it.
+fn parse_paginated_array(json: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(json).into_iter::<serde_json::Value>();
+    for value in stream.flatten() {
+        match value {
+            serde_json::Value::Array(items) => out.extend(items),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Map one raw GitHub timeline row.
+///
+/// Public within the crate so the mapping can be tested against recorded
+/// payloads without a `gh` on PATH — the parsing is the part that breaks,
+/// not the subprocess call around it.
+pub(crate) fn map_github_timeline_event(
+    raw: &serde_json::Value,
+    index: usize,
+) -> Option<PrTimelineEvent> {
+    let event = raw["event"].as_str().unwrap_or("");
+
+    // `commented` rows carry the author under `user`; the rest under
+    // `actor`. A commit row has neither and names its author inline.
+    let actor = raw["actor"]["login"]
+        .as_str()
+        .or_else(|| raw["user"]["login"].as_str())
+        .or_else(|| raw["author"]["name"].as_str())
+        .or_else(|| raw["committer"]["name"].as_str())
+        .map(|s| s.to_string());
+
+    let created_at = raw["created_at"]
+        .as_str()
+        .or_else(|| raw["submitted_at"].as_str())
+        .or_else(|| raw["author"]["date"].as_str())
+        .or_else(|| raw["committer"]["date"].as_str())
+        .map(|s| s.to_string());
+
+    // Ids are per-resource and a commit row has a `sha` instead, so the
+    // index is folded in: two events can share neither.
+    let id = raw["id"]
+        .as_u64()
+        .map(|n| n.to_string())
+        .or_else(|| raw["sha"].as_str().map(|s| s.to_string()))
+        .or_else(|| raw["node_id"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("{event}-{index}"));
+    let id = format!("{id}:{index}");
+
+    let kind = match event {
+        "commented" => {
+            let body = raw["body"].as_str().unwrap_or("").trim().to_string();
+            // A comment with no text is a deletion artefact, not history.
+            if body.is_empty() {
+                return None;
+            }
+            PrTimelineEventKind::Commented { body }
+        }
+        "reviewed" => PrTimelineEventKind::Reviewed {
+            verdict: raw["state"]
+                .as_str()
+                .unwrap_or("COMMENTED")
+                .to_uppercase(),
+            body: raw["body"].as_str().unwrap_or("").trim().to_string(),
+            anchor: None,
+        },
+        "committed" => PrTimelineEventKind::Committed {
+            sha: raw["sha"].as_str().unwrap_or("").to_string(),
+            message: raw["message"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        },
+        "head_ref_force_pushed" => PrTimelineEventKind::HeadRefForcePushed {
+            sha: raw["commit_id"].as_str().map(|s| s.to_string()),
+        },
+        "merged" => PrTimelineEventKind::Merged {
+            sha: raw["commit_id"].as_str().map(|s| s.to_string()),
+        },
+        "closed" => PrTimelineEventKind::Closed,
+        "reopened" => PrTimelineEventKind::Reopened,
+        "review_requested" => PrTimelineEventKind::ReviewRequested {
+            reviewer: raw["requested_reviewer"]["login"]
+                .as_str()
+                .or_else(|| raw["requested_team"]["name"].as_str())
+                .map(|s| s.to_string()),
+        },
+        "renamed" => PrTimelineEventKind::Renamed {
+            from: raw["rename"]["from"].as_str().unwrap_or("").to_string(),
+            to: raw["rename"]["to"].as_str().unwrap_or("").to_string(),
+        },
+        // Includes the empty string: a row with no `event` at all is
+        // still a row, and saying "unknown event" is more honest than
+        // dropping it.
+        other => PrTimelineEventKind::Other {
+            label: humanize_event(if other.is_empty() { "unknown event" } else { other }),
+        },
+    };
+
+    Some(PrTimelineEvent {
+        id,
+        actor,
+        created_at,
+        kind,
+    })
+}
+
+/// Map a whole raw GitHub timeline payload.
+pub(crate) fn map_github_timeline(rows: &[serde_json::Value]) -> Vec<PrTimelineEvent> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, raw)| map_github_timeline_event(raw, i))
+        .collect()
+}
+
+/// The host's history of one pull request.
+///
+/// `GET /repos/{owner}/{repo}/issues/{n}/timeline` with a plain Accept
+/// header — the preview header this endpoint once needed is long retired,
+/// and sending it now is a way to get a 415 from GitHub Enterprise.
+///
+/// The stream has no "opened" event, so the caller synthesizes one from
+/// the pull request it already holds; doing it here would cost a second
+/// request for data every caller already has.
+pub fn get_pr_timeline(repo_path: &Path, pr_number: u32) -> Result<Vec<PrTimelineEvent>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/issues/{pr_number}/timeline");
+    let Some(json) = run_gh_optional(
+        repo_path,
+        &[
+            "api",
+            &endpoint,
+            "--paginate",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ],
+    ) else {
+        return Ok(Vec::new());
+    };
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(map_github_timeline(&parse_paginated_array(&json)))
 }
 
 pub fn check_gh_status() -> GhStatus {
@@ -671,7 +892,7 @@ pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo
         repo_path,
         &[
             "pr", "view", &number_str,
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,author,body,comments,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,author,body,comments,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
         ],
         ISSUE_FETCH_TIMEOUT,
     )?;
@@ -961,7 +1182,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
 /// The `--json` field set every branch-PR query asks for. Shared by the
 /// per-branch lookup and the repo-wide fallback list so `parse_pr_json` can
 /// never be handed a row that is missing a field one caller relies on.
-const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner,author,body,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews";
+const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,headRefOid,headRepositoryOwner,author,body,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews";
 
 /// The current branch's PR plus the branch context that produced it.
 ///
@@ -2214,6 +2435,7 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
         comments: Vec::new(),
         total_comments: 0,
         author,
+        created_at: v["createdAt"].as_str().map(|s| s.to_string()),
         merge_state_status: v["mergeStateStatus"].as_str().map(|s| s.to_string()),
         changed_files: v["changedFiles"].as_u64().map(|n| n as u32),
         merged_by: v["mergedBy"]["login"]
@@ -2392,6 +2614,7 @@ mod tests {
             review_decision: None,
             checks_passing: None,
             updated_at: Some(updated_at.into()),
+            created_at: None,
             head_ref_oid: head_ref_oid.map(|s| s.to_string()),
             head_repository_owner: None,
             body: None,
@@ -2994,6 +3217,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
             review_decision: Some("APPROVED".into()),
             checks_passing: None,
             updated_at: Some("2026-04-27T00:00:00Z".into()),
+            created_at: Some("2026-04-26T00:00:00Z".into()),
             head_ref_oid: Some("deadbeef".into()),
             head_repository_owner: Some("zeus".into()),
             body: Some("PR body here".into()),
@@ -3523,5 +3747,117 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
     fn test_summarize_checks_status_null() {
         let v = serde_json::Value::Null;
         assert_eq!(summarize_checks_status(&v), None);
+    }
+
+    // ── Timeline mapping ──
+
+    /// A recorded slice of `GET /issues/{n}/timeline`, including an event
+    /// type this build has never heard of.
+    fn timeline_fixture() -> Vec<serde_json::Value> {
+        serde_json::from_str(
+            r#"[
+              {"event":"commented","id":1001,"user":{"login":"juliusm"},
+               "created_at":"2026-08-16T09:00:00Z","body":"Worth a line here saying so."},
+              {"event":"reviewed","id":1002,"user":{"login":"juliusm"},"state":"changes_requested",
+               "submitted_at":"2026-08-16T09:05:00Z","body":"The discoverability leg is a follow-up."},
+              {"event":"committed","sha":"a1f9c2e5d","author":{"name":"Zeus-Deus","date":"2026-08-16T09:30:00Z"},
+               "message":"fix: address review\n\nlonger body that must not appear"},
+              {"event":"head_ref_force_pushed","id":1004,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T09:45:00Z","commit_id":"bb31d70"},
+              {"event":"review_requested","id":1005,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T09:50:00Z","requested_reviewer":{"login":"octocat"}},
+              {"event":"renamed","id":1006,"actor":{"login":"Zeus-Deus"},"created_at":"2026-08-16T09:55:00Z",
+               "rename":{"from":"wip: thing","to":"feat: thing"}},
+              {"event":"merged","id":1007,"actor":{"login":"Zeus-Deus"},"created_at":"2026-08-16T10:00:00Z",
+               "commit_id":"ff00aa1"},
+              {"event":"automatic_base_change_succeeded","id":1008,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T10:05:00Z"},
+              {"event":"commented","id":1009,"user":{"login":"ghost"},
+               "created_at":"2026-08-16T10:06:00Z","body":"   "}
+            ]"#,
+        )
+        .expect("fixture must parse")
+    }
+
+    #[test]
+    fn every_event_maps_to_a_renderable_variant() {
+        let events = map_github_timeline(&timeline_fixture());
+        let kinds: Vec<&PrTimelineEventKind> = events.iter().map(|e| &e.kind).collect();
+
+        assert!(matches!(kinds[0], PrTimelineEventKind::Commented { body } if body == "Worth a line here saying so."));
+        assert!(
+            matches!(kinds[1], PrTimelineEventKind::Reviewed { verdict, .. } if verdict == "CHANGES_REQUESTED"),
+            "the verdict is upper-cased so the UI has one vocabulary"
+        );
+        // Only the subject line: a commit body in a rail entry pushes
+        // everything after it off the screen.
+        assert!(
+            matches!(kinds[2], PrTimelineEventKind::Committed { sha, message }
+                if sha == "a1f9c2e5d" && message == "fix: address review"),
+        );
+        assert!(matches!(kinds[3], PrTimelineEventKind::HeadRefForcePushed { sha } if sha.as_deref() == Some("bb31d70")));
+        assert!(matches!(kinds[4], PrTimelineEventKind::ReviewRequested { reviewer } if reviewer.as_deref() == Some("octocat")));
+        assert!(matches!(kinds[5], PrTimelineEventKind::Renamed { to, .. } if to == "feat: thing"));
+        assert!(matches!(kinds[6], PrTimelineEventKind::Merged { .. }));
+    }
+
+    /// The rule that keeps the tab honest as GitHub grows event types:
+    /// never dropped, never a parse failure, always a readable label.
+    #[test]
+    fn an_unknown_event_survives_as_a_labelled_one_liner() {
+        let events = map_github_timeline(&timeline_fixture());
+        let unknown = events
+            .iter()
+            .find(|e| matches!(e.kind, PrTimelineEventKind::Other { .. }))
+            .expect("the unknown event must not be dropped");
+        let PrTimelineEventKind::Other { label } = &unknown.kind else {
+            unreachable!()
+        };
+        assert_eq!(label, "automatic base change succeeded");
+        assert_eq!(unknown.actor.as_deref(), Some("Zeus-Deus"));
+    }
+
+    /// The force-push row is what ties the timeline to re-anchoring, so
+    /// it gets its own assertion rather than riding on the sweep above.
+    #[test]
+    fn the_force_push_event_is_present_and_carries_its_sha() {
+        let events = map_github_timeline(&timeline_fixture());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, PrTimelineEventKind::HeadRefForcePushed { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_emptied_comment_is_not_history() {
+        let events = map_github_timeline(&timeline_fixture());
+        assert!(
+            !events.iter().any(|e| e.actor.as_deref() == Some("ghost")),
+            "a whitespace-only comment is a deletion artefact"
+        );
+    }
+
+    #[test]
+    fn event_ids_are_unique_even_when_the_host_reuses_one() {
+        // Two rows sharing an id would collapse into one React key and
+        // one of them would silently stop rendering.
+        let rows: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"event":"closed","id":7},{"event":"reopened","id":7}]"#,
+        )
+        .unwrap();
+        let events = map_github_timeline(&rows);
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].id, events[1].id);
+    }
+
+    /// `--paginate` concatenates one array per page; a naive parse would
+    /// keep page one and drop the rest.
+    #[test]
+    fn paginated_pages_are_flattened_rather_than_truncated() {
+        let joined = r#"[{"event":"closed","id":1}][{"event":"reopened","id":2}]"#;
+        assert_eq!(parse_paginated_array(joined).len(), 2);
     }
 }

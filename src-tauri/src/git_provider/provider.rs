@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::detect::ProviderKind;
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrsOverview, PullRequestInfo, ReviewComment,
+    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 /// What a provider can actually do, declared statically so the UI can
@@ -46,6 +46,114 @@ pub struct Capabilities {
     pub has_fork_pr_fetch: bool,
 }
 
+/// One reviewable operation, as the review surfaces think of them.
+///
+/// Deliberately coarser than the trait's method list: this is the
+/// vocabulary the *UI* gates on, so `approve` and `request_changes` are
+/// two operations even though both go through
+/// [`submit_pull_request_review`](SourceControlProvider::submit_pull_request_review),
+/// and every read path collapses into `ListRead` because no surface
+/// offers "list" without "read".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    ListRead,
+    Comment,
+    Approve,
+    RequestChanges,
+    LineComments,
+    MergeWithStrategies,
+    DraftReadyCloseReopen,
+    ChecksStatus,
+    Timeline,
+}
+
+impl Operation {
+    /// The verb phrase that completes "… cannot <op> on this host".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Operation::ListRead => "list or read pull requests",
+            Operation::Comment => "comment on a pull request",
+            Operation::Approve => "approve a pull request",
+            Operation::RequestChanges => "request changes on a pull request",
+            Operation::LineComments => "leave line comments on a diff",
+            Operation::MergeWithStrategies => "merge a pull request",
+            Operation::DraftReadyCloseReopen => "change a pull request's draft or open state",
+            Operation::ChecksStatus => "read check or pipeline status",
+            Operation::Timeline => "read a pull request's timeline",
+        }
+    }
+
+    /// Every operation, for exhaustive tests and for [`OperationCapabilities::all`].
+    pub const ALL: [Operation; 9] = [
+        Operation::ListRead,
+        Operation::Comment,
+        Operation::Approve,
+        Operation::RequestChanges,
+        Operation::LineComments,
+        Operation::MergeWithStrategies,
+        Operation::DraftReadyCloseReopen,
+        Operation::ChecksStatus,
+        Operation::Timeline,
+    ];
+}
+
+/// Per-operation declarations, from which the UI renders.
+///
+/// The point of the split from [`Capabilities`] is the difference between
+/// "this host has inline comments as a concept" and "this build of
+/// Codemux can perform the inline-comment operation against it". Only the
+/// second one may draw a button.
+///
+/// Defaults to all-false, and that default is the *correct* answer for a
+/// host nobody has verified: the command layer refuses undeclared
+/// operations, so a wrong declaration is worse than no declaration —
+/// an undeclared host degrades to read-only-with-a-sentence, while a
+/// wrongly declared one draws controls that fail at the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OperationCapabilities {
+    pub list_read: bool,
+    pub comment: bool,
+    pub approve: bool,
+    pub request_changes: bool,
+    pub line_comments: bool,
+    pub merge_with_strategies: bool,
+    pub draft_ready_close_reopen: bool,
+    pub checks_status: bool,
+    pub timeline: bool,
+}
+
+impl OperationCapabilities {
+    /// Everything declared — a host verified against its real CLI.
+    pub fn all() -> Self {
+        Self {
+            list_read: true,
+            comment: true,
+            approve: true,
+            request_changes: true,
+            line_comments: true,
+            merge_with_strategies: true,
+            draft_ready_close_reopen: true,
+            checks_status: true,
+            timeline: true,
+        }
+    }
+
+    pub fn allows(&self, op: Operation) -> bool {
+        match op {
+            Operation::ListRead => self.list_read,
+            Operation::Comment => self.comment,
+            Operation::Approve => self.approve,
+            Operation::RequestChanges => self.request_changes,
+            Operation::LineComments => self.line_comments,
+            Operation::MergeWithStrategies => self.merge_with_strategies,
+            Operation::DraftReadyCloseReopen => self.draft_ready_close_reopen,
+            Operation::ChecksStatus => self.checks_status,
+            Operation::Timeline => self.timeline,
+        }
+    }
+}
+
 /// Contract every hosting integration satisfies.
 ///
 /// Implementations are stateless handles held behind an `Arc` by the
@@ -56,6 +164,14 @@ pub trait SourceControlProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
     fn capabilities(&self) -> Capabilities;
+
+    /// Which review operations this adapter declares it can perform.
+    ///
+    /// No default implementation on purpose. A new adapter has to make
+    /// the claim explicitly, in one place, having actually checked its
+    /// CLI — which is exactly the discipline the blank Bitbucket and
+    /// Azure columns exist to enforce.
+    fn operations(&self) -> OperationCapabilities;
 
     /// False for the null object. This is the gate that used to be
     /// `github::is_github_repo`: "does a working integration exist for
@@ -238,6 +354,16 @@ pub trait SourceControlProvider: Send + Sync {
         repo_path: &Path,
         number: u32,
     ) -> Result<Vec<DeploymentInfo>, String>;
+
+    /// The host's own history of a pull request, oldest first.
+    ///
+    /// Excludes the "opened" event: no host serves one, and the caller
+    /// already holds the pull request it would be synthesized from.
+    fn pull_request_timeline(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String>;
 
     // ── Issues ──
 

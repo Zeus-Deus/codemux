@@ -60,6 +60,10 @@ vi.mock("@/lib/pr-agent-handoff", () => ({
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
 import { resolveProvider } from "@/lib/source-control";
+import { ALL_OPERATIONS } from "@/lib/provider-auth";
+
+/** GitLab's declaration: everything but the verdict it does not have. */
+const GITLAB_OPERATIONS = { ...ALL_OPERATIONS, request_changes: false };
 import type { CheckInfo, PullRequestInfo } from "@/tauri/types";
 
 const VIEWER = "mock-dev";
@@ -79,6 +83,7 @@ function makePr(over: Partial<PullRequestInfo> = {}): PullRequestInfo {
     review_decision: null,
     checks_passing: null,
     updated_at: new Date(Date.now() - 38 * 60_000).toISOString(),
+    created_at: new Date(Date.now() - 3 * 3_600_000).toISOString(),
     body: "Keeps invested drafts as independent sessions.",
     comments: [],
     totalComments: 0,
@@ -124,6 +129,7 @@ function renderDetail(over: Partial<Parameters<typeof ReviewDetail>[0]> = {}) {
     workspaceId: "ws-1",
     projectRoot: "/repo",
     provider: resolveProvider("github"),
+    operations: ALL_OPERATIONS,
     repoSlug: "example/codemux",
     viewerLogin: VIEWER,
     checkedOutHere: true,
@@ -587,6 +593,7 @@ describe("gitlab", () => {
   it("does not draw a request-changes verdict GitLab cannot record", async () => {
     renderDetail({
       provider: resolveProvider("gitlab"),
+      operations: GITLAB_OPERATIONS,
       pr: makePr({ author: "someone-else" }),
     });
     await flush();

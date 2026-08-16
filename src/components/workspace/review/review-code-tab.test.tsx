@@ -43,6 +43,12 @@ vi.mock("@/lib/pr-agent-handoff", () => ({
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
 import { resolveProvider } from "@/lib/source-control";
+import { ALL_OPERATIONS } from "@/lib/provider-auth";
+
+/** GitLab's declaration: everything but the verdict it does not have. */
+const GITLAB_OPERATIONS = { ...ALL_OPERATIONS, request_changes: false };
+/** GitLab has no line-comment route this build can use yet. */
+const GITLAB_NO_LINE_COMMENTS = { ...GITLAB_OPERATIONS, line_comments: false };
 import type { PullRequestInfo } from "@/tauri/types";
 
 // ── Fixture diff ──
@@ -120,6 +126,7 @@ function makePr(over: Partial<PullRequestInfo> = {}): PullRequestInfo {
     review_decision: null,
     checks_passing: null,
     updated_at: new Date().toISOString(),
+    created_at: null,
     body: "Body.",
     comments: [],
     totalComments: 0,
@@ -151,6 +158,7 @@ function renderDetail(over: Record<string, unknown> = {}) {
     workspaceId: "ws-1",
     projectRoot: "/repo",
     provider: resolveProvider("github"),
+    operations: ALL_OPERATIONS,
     repoSlug: "example/codemux",
     viewerLogin: VIEWER,
     checkedOutHere: true,
@@ -327,13 +335,23 @@ describe("selecting lines", () => {
     expect(screen.queryByTestId("draft-footer")).toBeNull();
   });
 
-  it("does not offer Comment now on GitLab", async () => {
+  it("offers no line composer at all where line comments are undeclared", async () => {
+    // GitLab has line comments; this build cannot post them (it needs a
+    // version triple it doesn't build). So the adapter declares the
+    // operation false, and the diff stays readable but inert — drafting
+    // a note that can only fail at submit is worse than not offering
+    // one, because the work is lost at the last step.
     const user = userEvent.setup();
-    renderDetail({ provider: resolveProvider("gitlab") });
+    renderDetail({
+      provider: resolveProvider("gitlab"),
+      operations: GITLAB_NO_LINE_COMMENTS,
+    });
     await openCodeTab(user);
     await user.click(gutter("RIGHT:11"));
-    expect(screen.getByTestId("add-to-review")).toBeInTheDocument();
+    expect(screen.queryByTestId("add-to-review")).toBeNull();
     expect(screen.queryByTestId("comment-now")).toBeNull();
+    // The diff itself is still fully readable.
+    expect(gutter("RIGHT:11")).toBeInTheDocument();
   });
 });
 
@@ -468,7 +486,10 @@ describe("submitting", () => {
 
   it("does not offer Request changes on GitLab", async () => {
     const user = userEvent.setup();
-    renderDetail({ provider: resolveProvider("gitlab") });
+    renderDetail({
+      provider: resolveProvider("gitlab"),
+      operations: GITLAB_OPERATIONS,
+    });
     await withOneNote(user);
     await user.click(screen.getByTestId("open-submit-sheet"));
     expect(screen.getByTestId("verdict-option-comment")).toBeInTheDocument();

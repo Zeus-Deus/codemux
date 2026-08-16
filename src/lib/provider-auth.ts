@@ -17,7 +17,41 @@
  */
 
 import { checkProviderAuth } from "@/tauri/commands";
-import type { ProviderAuthStatus } from "@/tauri/types";
+import type { ProviderAuthStatus, ProviderOperations } from "@/tauri/types";
+
+/** Nothing declared — what an unverified or unreachable host gets.
+ *
+ *  Also the right answer for a probe that failed: we do not know what
+ *  this host can do, and the backend refuses undeclared operations, so
+ *  drawing controls on a guess would draw controls that fail. */
+export const NO_OPERATIONS: ProviderOperations = {
+  list_read: false,
+  comment: false,
+  approve: false,
+  request_changes: false,
+  line_comments: false,
+  merge_with_strategies: false,
+  draft_ready_close_reopen: false,
+  checks_status: false,
+  timeline: false,
+};
+
+/** Everything declared — what the GitHub adapter returns.
+ *
+ *  Exists for the dev mock and for tests, which stand in for the backend
+ *  and therefore have to *be* the declaration. Product code must never
+ *  reach for this: the declaration has one home, and it is the adapter. */
+export const ALL_OPERATIONS: ProviderOperations = {
+  list_read: true,
+  comment: true,
+  approve: true,
+  request_changes: true,
+  line_comments: true,
+  merge_with_strategies: true,
+  draft_ready_close_reopen: true,
+  checks_status: true,
+  timeline: true,
+};
 
 export const PROVIDER_AUTH_TTL_MS = 60_000;
 
@@ -44,6 +78,7 @@ export function unusableProviderAuth(): ProviderAuthStatus {
     installed: false,
     authenticated: false,
     username: null,
+    operations: NO_OPERATIONS,
   };
 }
 

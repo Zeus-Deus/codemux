@@ -29,6 +29,7 @@ import type {
   WorkspaceSnapshot,
   GhStatus,
   ProviderAuthStatus,
+  ProviderOperations,
   PullRequestInfo,
   CheckInfo,
   ReviewComment,
@@ -42,6 +43,7 @@ import {
 import {
   fetchProviderAuth,
   getCachedProviderAuth,
+  NO_OPERATIONS,
   PROVIDER_AUTH_TTL_MS,
   _resetProviderAuthCache,
 } from "@/lib/provider-auth";
@@ -94,9 +96,8 @@ type ProviderGate = GhStatus | { status: "Unsupported" };
 const repoCheckCache = new Map<string, CacheEntry<boolean>>();
 
 /** Auth status for one checkout, if a usable verdict is still warm. */
-function cachedStatus(cwd: string, kind: string): ProviderGate | null {
-  const cached = getCachedProviderAuth(cwd, kind);
-  return cached ? toProviderGate(cached) : null;
+function cachedStatus(cwd: string, kind: string): ProviderAuthStatus | null {
+  return getCachedProviderAuth(cwd, kind);
 }
 
 export function getCachedRepoCheck(key: string): boolean | undefined {
@@ -131,8 +132,8 @@ export function _resetCaches(): void {
 async function fetchProviderAuthStatus(
   cwd: string,
   provider: ProviderPresentation,
-): Promise<ProviderGate> {
-  return toProviderGate(await fetchProviderAuth(cwd, provider.kind));
+): Promise<ProviderAuthStatus> {
+  return fetchProviderAuth(cwd, provider.kind);
 }
 
 /** The probe's verdict in the vocabulary this panel already renders. */
@@ -324,8 +325,15 @@ export function ReviewPanel({ workspace }: Props) {
     workspace.pr_number != null &&
     isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
 
-  const [ghStatus, setGhStatus] = useState<ProviderGate | null>(
-    cachedStatus(cwd, provider.kind),
+  const [ghStatus, setGhStatus] = useState<ProviderGate | null>(() => {
+    const cached = cachedStatus(cwd, provider.kind);
+    return cached ? toProviderGate(cached) : null;
+  });
+  // The per-operation declarations for this checkout, from the same
+  // probe that answers the auth gate — so no surface needs a second
+  // command, and no control renders before its right to exist is known.
+  const [operations, setOperations] = useState<ProviderOperations>(
+    () => cachedStatus(cwd, provider.kind)?.operations ?? NO_OPERATIONS,
   );
   const [repoSupported, setRepoSupported] = useState<boolean | null>(
     getCachedRepoCheck(cwd) ?? null,
@@ -354,9 +362,11 @@ export function ReviewPanel({ workspace }: Props) {
       try {
         const status = await fetchProviderAuthStatus(cwd, provider);
         if (cancelled) return;
-        setGhStatus(status);
+        const gate = toProviderGate(status);
+        setGhStatus(gate);
+        setOperations(status.operations ?? NO_OPERATIONS);
 
-        if (status.status !== "Authenticated") {
+        if (gate.status !== "Authenticated") {
           setInitialLoading(false);
           return;
         }
@@ -530,6 +540,7 @@ export function ReviewPanel({ workspace }: Props) {
           workspaceId={workspace.workspace_id}
           projectRoot={workspace.project_root ?? workspace.cwd}
           provider={provider}
+          operations={operations}
           repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
           viewerLogin={
             ghStatus?.status === "Authenticated" ? ghStatus.username || null : null

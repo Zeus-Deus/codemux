@@ -48,7 +48,14 @@ export interface ActionBarProps {
   merging: boolean;
   submitting: boolean;
   mergeStrategy: string;
+  /** Per-operation declarations. A control whose operation is undeclared
+   *  is not drawn — never drawn-and-disabled, which would need a reason
+   *  in words for something that can never work here (binding rule 5). */
   canRequestChanges: boolean;
+  canApprove: boolean;
+  canComment: boolean;
+  canMerge: boolean;
+  canChangeState: boolean;
   onSubmitReview: (event: string, body: string) => void;
   onOpenMergeSheet: () => void;
   onPickStrategy: (strategy: string) => void;
@@ -94,17 +101,21 @@ export function ReviewActionBar(props: ActionBarProps) {
             />
             Draft · reviewers aren't notified
           </span>
-          <button type="button" className={btnCard} onClick={props.onClose}>
-            Close
-          </button>
-          <button
-            type="button"
-            className={btnCardStrong}
-            data-testid="review-primary-action"
-            onClick={props.onReadyForReview}
-          >
-            Ready for review
-          </button>
+          {props.canChangeState && (
+            <>
+              <button type="button" className={btnCard} onClick={props.onClose}>
+                Close
+              </button>
+              <button
+                type="button"
+                className={btnCardStrong}
+                data-testid="review-primary-action"
+                onClick={props.onReadyForReview}
+              >
+                Ready for review
+              </button>
+            </>
+          )}
         </div>
       ) : (
         <div className="flex items-center gap-2">
@@ -133,13 +144,14 @@ export function ReviewActionBar(props: ActionBarProps) {
               room it takes is room the blocking reason needs to stay in
               words rather than an ellipsis (binding rule 5). It returns
               the moment the conflict does — Merge itself never moves. */}
-          {!props.blockedByConflicts && (
+          {!props.blockedByConflicts && props.canMerge && (
             <StrategyPicker
               value={props.mergeStrategy}
               onPick={props.onPickStrategy}
               disabled={merging}
             />
           )}
+          {props.canMerge && (
           <button
             type="button"
             data-testid="review-primary-action"
@@ -162,6 +174,7 @@ export function ReviewActionBar(props: ActionBarProps) {
               "Merge"
             )}
           </button>
+          )}
         </div>
       )}
     </div>
@@ -248,6 +261,8 @@ function ReviewerBar({
   draftKey,
   submitting,
   canRequestChanges,
+  canApprove,
+  canComment,
   onSubmitReview,
 }: ActionBarProps) {
   const [text, setText] = useState(() => getReviewDraft(draftKey));
@@ -282,6 +297,8 @@ function ReviewerBar({
     }
   };
 
+  if (!canComment && !canApprove && !canRequestChanges) return null;
+
   return (
     <div className="flex flex-col gap-2">
       {expanded ? (
@@ -308,17 +325,20 @@ function ReviewerBar({
       )}
       <div className="flex items-center gap-2">
         <span className="flex-1" />
-        <button
-          type="button"
-          className={btnGreenTint}
-          data-testid="verdict-approve"
-          onClick={() => submit("approve")}
-          disabled={submitting}
-        >
-          {submitting ? "Sending" : "Approve"}
-        </button>
-        {/* GitLab has no request-changes verdict, so on GitLab this
-            control is not drawn at all rather than drawn and refused. */}
+        {canApprove && (
+          <button
+            type="button"
+            className={btnGreenTint}
+            data-testid="verdict-approve"
+            onClick={() => submit("approve")}
+            disabled={submitting}
+          >
+            {submitting ? "Sending" : "Approve"}
+          </button>
+        )}
+        {/* GitLab has no request-changes verdict, so its adapter does not
+            declare the operation and this control is not drawn there at
+            all — rather than drawn and refused. */}
         {canRequestChanges && (
           <button
             type="button"
@@ -330,15 +350,17 @@ function ReviewerBar({
             Request changes
           </button>
         )}
-        <button
-          type="button"
-          className={btnCard}
-          data-testid="review-primary-action"
-          onClick={() => submit("comment")}
-          disabled={submitting}
-        >
-          Comment
-        </button>
+        {canComment && (
+          <button
+            type="button"
+            className={btnCard}
+            data-testid="review-primary-action"
+            onClick={() => submit("comment")}
+            disabled={submitting}
+          >
+            Comment
+          </button>
+        )}
       </div>
     </div>
   );

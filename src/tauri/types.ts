@@ -106,7 +106,70 @@ export interface ProviderAuthStatus {
   authenticated: boolean;
   /** Account the CLI reports, when it names one. Never a token. */
   username: string | null;
+  /** What may be *done* here, per operation — see `ProviderOperations`. */
+  operations: ProviderOperations;
 }
+
+/** Mirrors src-tauri/src/git_provider/provider.rs:OperationCapabilities.
+ *
+ *  The gate every review control renders from. Distinct from
+ *  `ProviderCapabilities`, which describes what a host *has* (an issue
+ *  tracker, inline comments as a concept); this describes what this build
+ *  of Codemux can actually perform against it. Only the second one may
+ *  draw a button.
+ *
+ *  All-false is the correct answer for an unverified host, not a
+ *  degraded one: the backend refuses undeclared operations, so a host
+ *  that declares nothing is read-only by construction. Never widen these
+ *  from a hostname on the frontend — the declaration has one home, and it
+ *  is the adapter. */
+export interface ProviderOperations {
+  list_read: boolean;
+  comment: boolean;
+  approve: boolean;
+  request_changes: boolean;
+  line_comments: boolean;
+  merge_with_strategies: boolean;
+  draft_ready_close_reopen: boolean;
+  checks_status: boolean;
+  timeline: boolean;
+}
+
+// ── PR timeline ──
+//
+// Mirrors src-tauri/src/github.rs:PrTimelineEvent. The `kind` tag is
+// flattened onto the event, so this is a discriminated union and every
+// `switch` over it is exhaustive — except for `other`, which exists
+// precisely so a host event this build has never seen still renders as a
+// one-liner instead of vanishing or throwing.
+
+export type PrTimelineEventKind =
+  | { kind: "opened"; commits: number | null }
+  | { kind: "commented"; body: string }
+  | {
+      kind: "reviewed";
+      /** APPROVED / CHANGES_REQUESTED / COMMENTED. */
+      verdict: string;
+      body: string;
+      /** `path:line` of the review's first inline note, when known. */
+      anchor: string | null;
+    }
+  | { kind: "committed"; sha: string; message: string }
+  | { kind: "head_ref_force_pushed"; sha: string | null }
+  | { kind: "merged"; sha: string | null }
+  | { kind: "closed" }
+  | { kind: "reopened" }
+  | { kind: "review_requested"; reviewer: string | null }
+  | { kind: "renamed"; from: string; to: string }
+  | { kind: "other"; label: string };
+
+export type PrTimelineEvent = {
+  /** Stable within a payload — the React key. */
+  id: string;
+  actor: string | null;
+  /** ISO-8601, or null for an event the host dated. */
+  created_at: string | null;
+} & PrTimelineEventKind;
 
 export interface KeyboardSettings {
   shortcuts: Record<string, string>;
@@ -502,6 +565,11 @@ export interface PullRequestInfo {
   review_decision: string | null;
   checks_passing: boolean | null;
   updated_at: string | null;
+  /** When it was opened — for the timeline's synthesized "opened" row.
+   *  The commit count beside it is derived from the timeline's own
+   *  commit events rather than fetched, since `commits` is an array and
+   *  the detail query polls every 2.5s. */
+  created_at: string | null;
   /** Stage 5 — populated by `get_github_pr_by_path` only. List paths
    *  leave it null so list queries stay cheap. Body is truncated at
    *  50 KB on a char boundary, mirroring the issue path. */

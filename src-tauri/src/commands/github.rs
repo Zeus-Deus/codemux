@@ -1,4 +1,4 @@
-use crate::git_provider::{self, SourceControlProvider};
+use crate::git_provider::{self, Operation, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, InlineReviewComment, LinkedIssue,
     PullRequestInfo,
@@ -25,6 +25,54 @@ use tauri::State;
 /// the call itself — detection is a subprocess too.
 fn provider_at(path: &str) -> Arc<dyn SourceControlProvider> {
     git_provider::provider_for_path_or_default(Path::new(path))
+}
+
+/// The single choke point for per-operation capabilities.
+///
+/// Every review command resolves its provider through this instead of
+/// [`provider_at`], so an operation a host has not declared is refused
+/// *here* rather than attempted and failed at the server. That is what
+/// makes a blank declaration safe: an unverified host is read-only by
+/// construction, not by everyone remembering to check.
+///
+/// The refusal names both the host and the operation, because the two
+/// audiences differ — the user needs to know which product can't do it,
+/// and whoever fills in a new adapter's declarations needs to know which
+/// line to add.
+fn provider_for(path: &str, op: Operation) -> Result<Arc<dyn SourceControlProvider>, String> {
+    let provider = provider_at(path);
+    check_operation(provider.as_ref(), op)?;
+    Ok(provider)
+}
+
+/// The refusal itself, split out so it can be tested without a
+/// repository on disk — the interesting part is the decision and the
+/// sentence, not the path resolution around them.
+pub(crate) fn check_operation(
+    provider: &dyn SourceControlProvider,
+    op: Operation,
+) -> Result<(), String> {
+    if provider.operations().allows(op) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} does not declare this operation — Codemux cannot {} here. \
+         Open it in the browser instead.",
+        provider.kind().display_name(),
+        op.describe(),
+    ))
+}
+
+/// Which operation a submitted verdict actually is.
+///
+/// One command carries three of them, and they are declared separately
+/// precisely because GitLab serves two and refuses the third.
+fn verdict_operation(event: &str) -> Operation {
+    match event {
+        "approve" => Operation::Approve,
+        "request-changes" => Operation::RequestChanges,
+        _ => Operation::Comment,
+    }
 }
 
 #[tauri::command]
@@ -66,7 +114,7 @@ pub async fn check_github_repo(path: String) -> bool {
 
 #[tauri::command]
 pub async fn get_branch_pull_request(path: String) -> Result<Option<PullRequestInfo>, String> {
-    tokio::task::spawn_blocking(move || provider_at(&path).branch_pull_request(Path::new(&path)))
+    tokio::task::spawn_blocking(move || provider_for(&path, Operation::ListRead)?.branch_pull_request(Path::new(&path)))
         .await
         .map_err(|e| format!("get_branch_pull_request task join failed: {e}"))?
 }
@@ -80,7 +128,7 @@ pub async fn create_pull_request(
     draft: bool,
 ) -> Result<PullRequestInfo, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).create_pull_request(
+        provider_for(&path, Operation::Comment)?.create_pull_request(
             Path::new(&path),
             &title,
             &body,
@@ -95,7 +143,7 @@ pub async fn create_pull_request(
 #[tauri::command]
 pub async fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequestInfo>, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).list_pull_requests(Path::new(&path), &state)
+        provider_for(&path, Operation::ListRead)?.list_pull_requests(Path::new(&path), &state)
     })
     .await
     .map_err(|e| format!("list_pull_requests task join failed: {e}"))?
@@ -110,7 +158,7 @@ pub async fn get_github_pr_by_path(
     pr_number: u32,
 ) -> Result<PullRequestInfo, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).get_pull_request(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ListRead)?.get_pull_request(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_github_pr_by_path task join failed: {e}"))?
@@ -127,7 +175,7 @@ pub async fn get_github_pr_diff_by_path(
     full: bool,
 ) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_diff(Path::new(&path), pr_number, full)
+        provider_for(&path, Operation::ListRead)?.pull_request_diff(Path::new(&path), pr_number, full)
     })
     .await
     .map_err(|e| format!("get_github_pr_diff_by_path task join failed: {e}"))?
@@ -144,7 +192,7 @@ pub async fn list_incoming_prs(
     // would pin a runtime thread for that whole duration and was the
     // root cause of the Review-tab freeze the user reported.
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).list_incoming_pull_requests(Path::new(&path), &base_branch)
+        provider_for(&path, Operation::ListRead)?.list_incoming_pull_requests(Path::new(&path), &base_branch)
     })
     .await
     .map_err(|e| format!("list_incoming_prs task join failed: {e}"))?
@@ -158,7 +206,7 @@ pub async fn list_incoming_prs(
 /// slowest field `gh pr list` serves.
 #[tauri::command]
 pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOverview, String> {
-    tokio::task::spawn_blocking(move || provider_at(&path).pull_requests_overview(Path::new(&path)))
+    tokio::task::spawn_blocking(move || provider_for(&path, Operation::ListRead)?.pull_requests_overview(Path::new(&path)))
         .await
         .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
 }
@@ -177,7 +225,7 @@ pub async fn merge_pull_request(
     // silently flipping to "keep the branch".
     let delete_branch = delete_branch.unwrap_or(true);
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).merge_pull_request(
+        provider_for(&path, Operation::MergeWithStrategies)?.merge_pull_request(
             Path::new(&path),
             pr_number,
             &method,
@@ -193,7 +241,7 @@ pub async fn merge_pull_request(
 #[tauri::command]
 pub async fn close_pull_request(path: String, pr_number: u32) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).close_pull_request(Path::new(&path), pr_number)
+        provider_for(&path, Operation::DraftReadyCloseReopen)?.close_pull_request(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("close_pull_request task join failed: {e}"))?
@@ -202,7 +250,7 @@ pub async fn close_pull_request(path: String, pr_number: u32) -> Result<(), Stri
 #[tauri::command]
 pub async fn reopen_pull_request(path: String, pr_number: u32) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).reopen_pull_request(Path::new(&path), pr_number)
+        provider_for(&path, Operation::DraftReadyCloseReopen)?.reopen_pull_request(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("reopen_pull_request task join failed: {e}"))?
@@ -211,7 +259,7 @@ pub async fn reopen_pull_request(path: String, pr_number: u32) -> Result<(), Str
 #[tauri::command]
 pub async fn set_pr_ready(path: String, pr_number: u32, ready: bool) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).set_pull_request_ready(Path::new(&path), pr_number, ready)
+        provider_for(&path, Operation::DraftReadyCloseReopen)?.set_pull_request_ready(Path::new(&path), pr_number, ready)
     })
     .await
     .map_err(|e| format!("set_pr_ready task join failed: {e}"))?
@@ -225,7 +273,7 @@ pub async fn update_pull_request(
     body: Option<String>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).update_pull_request(
+        provider_for(&path, Operation::Comment)?.update_pull_request(
             Path::new(&path),
             pr_number,
             title.as_deref(),
@@ -243,7 +291,7 @@ pub async fn request_pr_review(
     reviewer: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).request_pull_request_review(Path::new(&path), pr_number, &reviewer)
+        provider_for(&path, Operation::Comment)?.request_pull_request_review(Path::new(&path), pr_number, &reviewer)
     })
     .await
     .map_err(|e| format!("request_pr_review task join failed: {e}"))?
@@ -259,7 +307,7 @@ pub async fn get_check_log_excerpt(
     check_name: String,
 ) -> Result<String, String> {
     let excerpt = tokio::task::spawn_blocking(move || {
-        provider_at(&path).check_log_excerpt(Path::new(&path), pr_number, &check_name)
+        provider_for(&path, Operation::ChecksStatus)?.check_log_excerpt(Path::new(&path), pr_number, &check_name)
     })
     .await
     .map_err(|e| format!("get_check_log_excerpt task join failed: {e}"))?;
@@ -275,7 +323,7 @@ pub async fn get_pull_request_checks(
     // call unchanged; the page passes the selected PR's number because
     // the checkout it reads from is usually standing somewhere else.
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_checks(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ChecksStatus)?.pull_request_checks(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pull_request_checks task join failed: {e}"))?
@@ -287,7 +335,7 @@ pub async fn get_pr_review_comments(
     pr_number: Option<u32>,
 ) -> Result<Vec<crate::github::ReviewComment>, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_review_comments(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ListRead)?.pull_request_review_comments(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pr_review_comments task join failed: {e}"))?
@@ -296,7 +344,7 @@ pub async fn get_pr_review_comments(
 #[tauri::command]
 pub async fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<InlineReviewComment>, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_inline_comments(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ListRead)?.pull_request_inline_comments(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pr_inline_comments task join failed: {e}"))?
@@ -305,7 +353,7 @@ pub async fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<
 #[tauri::command]
 pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).submit_pull_request_review(Path::new(&path), pr_number, &event, &body)
+        provider_for(&path, verdict_operation(&event))?.submit_pull_request_review(Path::new(&path), pr_number, &event, &body)
     })
     .await
     .map_err(|e| format!("submit_pr_review task join failed: {e}"))?
@@ -317,7 +365,7 @@ pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body:
 #[tauri::command]
 pub async fn get_pr_review_diff(path: String, pr_number: u32) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_review_diff(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ListRead)?.pull_request_review_diff(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pr_review_diff task join failed: {e}"))?
@@ -333,7 +381,7 @@ pub async fn add_pr_inline_comment(
     commit_id: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).add_inline_comment(Path::new(&path), pr_number, &comment, &commit_id)
+        provider_for(&path, Operation::LineComments)?.add_inline_comment(Path::new(&path), pr_number, &comment, &commit_id)
     })
     .await
     .map_err(|e| format!("add_pr_inline_comment task join failed: {e}"))?
@@ -351,7 +399,13 @@ pub async fn submit_pr_review_with_comments(
     commit_id: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).submit_review_with_comments(
+        // A pending review with line notes is two declarations: the
+        // verdict, and the line comments carrying it.
+        let provider = provider_for(&path, verdict_operation(&event))?;
+        if !comments.is_empty() && !provider.operations().allows(Operation::LineComments) {
+            provider_for(&path, Operation::LineComments)?;
+        }
+        provider.submit_review_with_comments(
             Path::new(&path),
             pr_number,
             &event,
@@ -367,10 +421,34 @@ pub async fn submit_pr_review_with_comments(
 #[tauri::command]
 pub async fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_deployments(Path::new(&path), pr_number)
+        provider_for(&path, Operation::ListRead)?.pull_request_deployments(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pr_deployments task join failed: {e}"))?
+}
+
+/// The host's history of one pull request, oldest first.
+///
+/// No "opened" row and no checks row: the first is synthesized by the
+/// caller from the pull request it already holds, and the second is not a
+/// timeline event at any host — it is the live checks query, rendered
+/// last. Putting either here would mean re-fetching data the surface has.
+#[tauri::command]
+pub async fn get_pr_timeline(
+    path: String,
+    pr_number: u32,
+) -> Result<Vec<crate::github::PrTimelineEvent>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut events =
+            provider_for(&path, Operation::Timeline)?.pull_request_timeline(Path::new(&path), pr_number)?;
+        // One ordering for both hosts. Undated events sort first rather
+        // than being dropped — an event with no timestamp is still an
+        // event that happened.
+        events.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(events)
+    })
+    .await
+    .map_err(|e| format!("get_pr_timeline task join failed: {e}"))?
 }
 
 // ── GitHub Issues ──
@@ -593,4 +671,105 @@ fn resolve_workspace_cwd(state: &AppStateStore, workspace_id: &str) -> Result<St
         "Workspace {workspace_id} has no valid git repository path (project_root: {:?}, cwd: {})",
         ws.project_root, ws.cwd
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git_provider::detect::DetectedProvider;
+    use crate::git_provider::github::GitHubProvider;
+    use crate::git_provider::gitlab::GitLabProvider;
+    use crate::git_provider::unsupported::UnsupportedProvider;
+    use crate::git_provider::ProviderKind;
+
+    fn detected(kind: ProviderKind) -> DetectedProvider {
+        DetectedProvider {
+            kind,
+            host: Some("git.acme.test".to_string()),
+            base_url: Some("https://git.acme.test".to_string()),
+            remote_name: Some("origin".to_string()),
+        }
+    }
+
+    /// The footnote's rule, enforced: a host that declares nothing gets
+    /// every operation refused, and the refusal names the host and what
+    /// was refused so neither the user nor the next adapter author has to
+    /// guess which declaration is missing.
+    #[test]
+    fn an_undeclared_host_refuses_every_operation_by_name() {
+        for kind in [ProviderKind::Bitbucket, ProviderKind::AzureDevOps] {
+            let provider = UnsupportedProvider::from_detection(&detected(kind));
+            for op in Operation::ALL {
+                let err = check_operation(&provider, op)
+                    .expect_err("an undeclared operation must be refused");
+                assert!(
+                    err.contains(kind.display_name()),
+                    "{kind:?}/{op:?} refusal must name the host: {err}"
+                );
+                assert!(
+                    err.contains(op.describe()),
+                    "{kind:?}/{op:?} refusal must name the operation: {err}"
+                );
+            }
+        }
+    }
+
+    /// An unclassified checkout is served by the advisory GitHub route,
+    /// so it must not be caught by the guard — a self-hosted GitHub on a
+    /// bespoke domain has always worked through these commands.
+    #[test]
+    fn github_permits_every_operation() {
+        for op in Operation::ALL {
+            assert!(check_operation(&GitHubProvider, op).is_ok(), "{op:?}");
+        }
+    }
+
+    /// GitLab withholds exactly two, for two different reasons: it has
+    /// no request-changes verdict, and this build cannot post its line
+    /// comments (see `GitLabProvider::operations`).
+    #[test]
+    fn gitlab_withholds_request_changes_and_line_comments() {
+        let provider = GitLabProvider::from_detection(&detected(ProviderKind::GitLab));
+        for op in Operation::ALL {
+            let result = check_operation(&provider, op);
+            if matches!(op, Operation::RequestChanges | Operation::LineComments) {
+                let err = result.expect_err("GitLab does not declare this");
+                assert!(err.contains("GitLab"), "{err}");
+                assert!(err.contains(op.describe()), "{err}");
+            } else {
+                assert!(result.is_ok(), "{op:?} should be served by GitLab");
+            }
+        }
+    }
+
+    /// The declaration must match what the adapter can actually do — a
+    /// capability that says yes where the method says no is the failure
+    /// these declarations exist to prevent.
+    #[test]
+    fn gitlab_does_not_declare_an_operation_its_methods_refuse() {
+        use crate::git_provider::SourceControlProvider as _;
+        let provider = GitLabProvider::from_detection(&detected(ProviderKind::GitLab));
+        let comment = crate::github::PrDraftComment {
+            file: "src/a.rs".into(),
+            body: "note".into(),
+            side: "RIGHT".into(),
+            line: 12,
+            start_line: None,
+        };
+        // Both line-comment routes refuse, so the declaration must too.
+        assert!(provider
+            .add_inline_comment(std::path::Path::new("/tmp"), 1, &comment, "abc")
+            .is_err());
+        assert!(!provider.operations().line_comments);
+    }
+
+    /// The three verdicts one command carries are three declarations.
+    #[test]
+    fn verdicts_map_to_their_own_operations() {
+        assert_eq!(verdict_operation("approve"), Operation::Approve);
+        assert_eq!(verdict_operation("request-changes"), Operation::RequestChanges);
+        assert_eq!(verdict_operation("comment"), Operation::Comment);
+        // Anything unrecognised is the least privileged of the three.
+        assert_eq!(verdict_operation(""), Operation::Comment);
+    }
 }

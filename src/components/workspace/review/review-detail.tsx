@@ -6,6 +6,7 @@ import {
   checkoutDefaultBranchInWorkspace,
   closePullRequest,
   getPrReviewDiff,
+  getPrTimeline,
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
@@ -16,9 +17,16 @@ import {
 import type {
   CheckInfo,
   InlineReviewComment,
+  ProviderOperations,
   PullRequestInfo,
   ReviewComment,
 } from "@/tauri/types";
+import {
+  prRefKey,
+  selectRunsForPr,
+  usePrAgentRunsStore,
+} from "@/stores/pr-agent-runs-store";
+import { buildTimeline, type TimelineFilter } from "@/lib/pr-timeline";
 import { providerRef, type ProviderPresentation } from "@/lib/source-control";
 import {
   findWorkspaceForBranch,
@@ -47,6 +55,8 @@ import {
   shortAge,
 } from "./review-ui";
 import { ReviewCodeTab, type CodeTabIntent } from "./review-code-tab";
+import { ReviewTimeline, TimelineFilterPicker } from "./review-timeline";
+import { UnsupportedHostState } from "./review-empty-states";
 import { ReviewDraftFooter } from "./review-draft-footer";
 import { ReviewSubmitSheet } from "./review-submit-sheet";
 import {
@@ -114,6 +124,15 @@ export interface ReviewDetailProps {
   /** Repository root — where an agent handoff would cut a worktree. */
   projectRoot: string;
   provider: ProviderPresentation;
+  /**
+   * What may be *done* on this checkout, declared by the backend adapter.
+   *
+   * Every write control below renders from this rather than from
+   * `provider.kind`: a control whose operation is undeclared is never
+   * drawn, so there is no disabled button anyone has to explain and no
+   * request that can reach a host which would refuse it.
+   */
+  operations: ProviderOperations;
   repoSlug: string | null;
   /** Authenticated account, for author-vs-reviewer. Null ⇒ reviewer. */
   viewerLogin: string | null;
@@ -159,6 +178,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     workspaceId,
     projectRoot,
     provider,
+    operations,
     repoSlug,
     viewerLogin,
     checkedOutHere,
@@ -223,6 +243,52 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
   const blockedSubmitReason = submitBlockedReason(lineDrafts, pr.head_ref_oid);
+
+  // ── The timeline ──
+  //
+  // 30s, like the other conversation queries: history is not something
+  // you sit and watch change. Fetched only while the tab is open — the
+  // rail is the only thing that reads it, and a poll for a tab nobody is
+  // looking at is a request per PR per half-minute for nothing.
+  const timelineEnabled = activeTab === "timeline" && operations.timeline;
+  const timelineQuery = useQuery({
+    queryKey: ["pr", "timeline", cwd, pr.number] as const,
+    queryFn: () => getPrTimeline(cwd, pr.number),
+    enabled: timelineEnabled,
+    staleTime: 30_000,
+    refetchInterval: timelineEnabled ? 30_000 : false,
+  });
+
+  // Local agent runs for this PR. Subscribed to the store rather than
+  // read once, so a handoff started from the Summary tab shows up on the
+  // rail without a refetch — there is nothing to fetch, it is local.
+  const allRuns = usePrAgentRunsStore((s) => s.runs);
+  const prRef = prRefKey(repoSlug, pr.number);
+  const agentRuns = useMemo(
+    () => selectRunsForPr(allRuns, { prRef, projectRoot, prNumber: pr.number }),
+    [allRuns, prRef, projectRoot, pr.number],
+  );
+
+  const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>("everything");
+
+  const timelineEntries = useMemo(
+    () =>
+      buildTimeline({
+        pr,
+        events: timelineQuery.data ?? [],
+        runs: agentRuns,
+        // The live checks query, not the timeline payload — the last row
+        // is a fact about now.
+        checks,
+        filter: timelineFilter,
+      }),
+    [pr, timelineQuery.data, agentRuns, checks, timelineFilter],
+  );
+
+  const timelineStaleAgeMs =
+    timelineQuery.isError && timelineQuery.dataUpdatedAt > 0
+      ? Date.now() - timelineQuery.dataUpdatedAt
+      : null;
 
   const openCodeTab = useCallback((kind: CodeTabIntent["kind"]) => {
     setActiveTab("code");
@@ -513,7 +579,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   // A merged or closed PR is a record. Sending an agent to fix its
   // checks would be work with nowhere to land.
-  const canHandOff = !readOnly && provider.supported;
+  const canHandOff = !readOnly && operations.list_read;
 
   /**
    * What the button will do *here*, said in the panel's own terms.
@@ -804,12 +870,23 @@ export function ReviewDetail(props: ReviewDetailProps) {
       .catch(() => toast.error("Couldn't copy the branch name"));
   }, [pr.head_branch]);
 
-  // The strip takes a list, so Timeline can still arrive without the
-  // layout below it moving.
+  // The strip takes a list, so Timeline arrives without the layout below
+  // it moving. A host that does not declare the timeline operation gets
+  // no Timeline tab — not an empty one.
   const tabs: ReviewTab[] = [
     { id: "summary", label: "Summary" },
+    ...(operations.timeline ? [{ id: "timeline", label: "Timeline" }] : []),
     { id: "code", label: "Code", count: pr.changed_files ?? null },
   ];
+
+  // A host that declares nothing cannot even be read here, so there is
+  // no detail to render — only the sentence and the browser (4b). The
+  // backend refuses these operations anyway; drawing the surface first
+  // and letting each control fail would be the same answer delivered
+  // five times, badly.
+  if (!operations.list_read) {
+    return <UnsupportedHostState provider={provider} url={pr.url} />;
+  }
 
   return (
     <div className="flex min-h-full flex-col" data-testid="review-detail">
@@ -831,9 +908,24 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRefresh={onRefresh}
       />
 
-      <ReviewTabStrip tabs={tabs} activeId={activeTab} onSelect={setActiveTab} />
+      <ReviewTabStrip
+        tabs={tabs}
+        activeId={activeTab}
+        onSelect={setActiveTab}
+        trailing={
+          activeTab === "timeline" ? (
+            <TimelineFilterPicker value={timelineFilter} onChange={setTimelineFilter} />
+          ) : undefined
+        }
+      />
 
-      {activeTab === "code" ? (
+      {activeTab === "timeline" ? (
+        <ReviewTimeline
+          entries={timelineEntries}
+          loading={timelineQuery.isFetching && !timelineQuery.data}
+          staleAgeMs={timelineStaleAgeMs}
+        />
+      ) : activeTab === "code" ? (
         <ReviewCodeTab
           draftKey={key}
           cwd={cwd}
@@ -845,9 +937,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
           // is a worse lie than an empty state.
           loading={diffQuery.isFetching}
           error={diffQuery.error ? String(diffQuery.error) : null}
-          // GitLab wants a version triple we don't build yet, so the
-          // control that would need it is not drawn there.
-          canCommentNow={provider.kind === "github" && !readOnly}
+          // Rendered from the declaration, not from the host's name.
+          canDraftLineNotes={operations.line_comments && !readOnly}
+          canCommentNow={operations.line_comments && !readOnly}
           onPosted={onRefresh}
           intent={codeIntent}
         />
@@ -869,7 +961,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
           <ReviewReviewers
             pr={pr}
             cwd={cwd}
-            canRequestReview={provider.supported}
+            // No 4d row of its own: requesting a review is a write to the
+            // conversation, which is exactly what `comment` declares.
+            canRequestReview={operations.comment}
             onRequested={onRefresh}
           />
         )}
@@ -879,7 +973,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
           cwd={cwd}
           prNumber={pr.number}
           draftKey={key}
-          canEdit={provider.supported && isAuthor}
+          canEdit={operations.comment && isAuthor}
           readOnly={readOnly}
           onSaved={onRefresh}
         />
@@ -914,7 +1008,11 @@ export function ReviewDetail(props: ReviewDetailProps) {
         merging={merging}
         submitting={submitting}
         mergeStrategy={strategy}
-        canRequestChanges={provider.kind !== "gitlab"}
+        canRequestChanges={operations.request_changes}
+        canApprove={operations.approve}
+        canComment={operations.comment}
+        canMerge={operations.merge_with_strategies}
+        canChangeState={operations.draft_ready_close_reopen}
         onSubmitReview={(event, body) => void runSubmit(event, body)}
         onOpenMergeSheet={() => setMergeSheetOpen(true)}
         onPickStrategy={(next) => {
@@ -936,7 +1034,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           // is the same text this review's body starts from.
           initialBody={getReviewDraft(key)}
           initialVerdict={getLastVerdict(key)}
-          canRequestChanges={provider.kind !== "gitlab"}
+          canRequestChanges={operations.request_changes}
+          canApprove={operations.approve}
           submitting={submitting}
           blockedReason={blockedSubmitReason}
           onReanchor={() => {

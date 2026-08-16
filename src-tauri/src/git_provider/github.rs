@@ -8,10 +8,10 @@
 use std::path::Path;
 
 use super::detect::ProviderKind;
-use super::provider::{Capabilities, SourceControlProvider};
+use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrsOverview, PullRequestInfo, ReviewComment,
+    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 use crate::github_cache;
 
@@ -33,6 +33,12 @@ impl SourceControlProvider for GitHubProvider {
             has_reviews: true,
             has_fork_pr_fetch: true,
         }
+    }
+
+    /// Everything. GitHub is the host every one of these operations was
+    /// written against, and each is exercised by a shipped surface.
+    fn operations(&self) -> OperationCapabilities {
+        OperationCapabilities::all()
     }
 
     fn cli_available(&self) -> bool {
@@ -244,6 +250,14 @@ impl SourceControlProvider for GitHubProvider {
         number: u32,
     ) -> Result<Vec<DeploymentInfo>, String> {
         github::get_pr_deployments(repo_path, number)
+    }
+
+    fn pull_request_timeline(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String> {
+        github::get_pr_timeline(repo_path, number)
     }
 
     fn list_issues(

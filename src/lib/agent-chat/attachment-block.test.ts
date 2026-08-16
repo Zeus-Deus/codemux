@@ -36,6 +36,7 @@ function makePrDetail(
     review_decision: "APPROVED",
     checks_passing: null,
     updated_at: null,
+    created_at: null,
     body: "PR body here",
     comments: [],
     totalComments: 0,
