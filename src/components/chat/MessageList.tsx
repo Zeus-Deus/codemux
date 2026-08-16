@@ -25,7 +25,10 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
-import { assistantReferenceCwds } from "@/lib/agent-chat/reference-cwd";
+import {
+  assistantReferenceCwds,
+  assistantReferencePaths,
+} from "@/lib/agent-chat/reference-cwd";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -245,6 +248,10 @@ export const MessageList = memo(function MessageList({
   }, [messages]);
   const referenceCwdByMessageId = useMemo(
     () => assistantReferenceCwds(ordered),
+    [ordered],
+  );
+  const referencePathsByMessageId = useMemo(
+    () => assistantReferencePaths(ordered),
     [ordered],
   );
 
@@ -1115,6 +1122,7 @@ export const MessageList = memo(function MessageList({
           workspaceId={workspaceId}
           cwd={cwd}
           referenceCwd={referenceCwdByMessageId.get(slot.messageId)}
+          referencePaths={referencePathsByMessageId.get(slot.messageId)}
           onRespondToRequest={onRespondToRequest}
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
@@ -1136,6 +1144,7 @@ export const MessageList = memo(function MessageList({
       onRevertTurn,
       requestsById,
       referenceCwdByMessageId,
+      referencePathsByMessageId,
       revertingTurnIndex,
       subagentNames,
       toggleTurnFold,
@@ -1491,6 +1500,7 @@ function ItemRow({
   workspaceId,
   cwd,
   referenceCwd,
+  referencePaths,
 }: {
   item: ChatViewItem;
   approval: PermissionRequestItem | null;
@@ -1506,6 +1516,7 @@ function ItemRow({
   workspaceId?: string | null;
   cwd?: string | null;
   referenceCwd?: string | null;
+  referencePaths?: readonly string[];
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -1572,6 +1583,7 @@ function ItemRow({
     workspaceId,
     cwd,
     referenceCwd,
+    referencePaths,
     handleDecide,
     handleAcceptPlan,
     handleRejectPlan,
@@ -1586,6 +1598,7 @@ function renderAssistantBody(
     workspaceId?: string | null;
     cwd?: string | null;
     referenceCwd?: string | null;
+    referencePaths?: readonly string[];
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -1599,6 +1612,7 @@ function renderAssistantBody(
           workspaceId={handlers.workspaceId}
           cwd={handlers.cwd}
           referenceCwd={handlers.referenceCwd}
+          referencePaths={handlers.referencePaths}
         />
       );
     case "reasoning":
@@ -1761,6 +1775,7 @@ function SlotRow({
   workspaceId,
   cwd,
   referenceCwd,
+  referencePaths,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -1777,6 +1792,7 @@ function SlotRow({
   workspaceId?: string | null;
   cwd?: string | null;
   referenceCwd?: string | null;
+  referencePaths?: readonly string[];
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -1838,6 +1854,7 @@ function SlotRow({
           workspaceId={workspaceId}
           cwd={cwd}
           referenceCwd={referenceCwd}
+          referencePaths={referencePaths}
         />
       )}
     </div>

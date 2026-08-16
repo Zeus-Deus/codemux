@@ -364,7 +364,7 @@ const noopHandlers = {
 };
 
 describe("MessageList dispatch", () => {
-  it("opens a relative file from the agent's cross-project tool directory", () => {
+  it("opens a relative file from the agent's cross-project tool directory", async () => {
     useEditorStore.setState({ tabs: {} });
     useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
     const workspaceId = "ws-home";
@@ -401,8 +401,10 @@ describe("MessageList dispatch", () => {
     fireEvent.click(screen.getByRole("button", { name: "AGENTS.md" }));
 
     const filePath = `${projectCwd}/AGENTS.md`;
-    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
-      docPaneId(filePath),
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(filePath),
+      ),
     );
     expect(
       useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),

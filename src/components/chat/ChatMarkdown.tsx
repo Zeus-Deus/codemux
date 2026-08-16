@@ -220,11 +220,13 @@ export function ChatMarkdown({
   streaming = false,
   workspaceId,
   cwd,
+  referencePaths,
 }: {
   children: string;
   streaming?: boolean;
   workspaceId?: string | null;
   cwd?: string | null;
+  referencePaths?: readonly string[];
 }) {
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
@@ -234,8 +236,16 @@ export function ChatMarkdown({
     () => ({
       workspaceId: workspaceId ?? inheritedFileContext.workspaceId,
       cwd: cwd ?? inheritedFileContext.cwd,
+      referencePaths: referencePaths ?? inheritedFileContext.referencePaths,
     }),
-    [cwd, inheritedFileContext.cwd, inheritedFileContext.workspaceId, workspaceId],
+    [
+      cwd,
+      inheritedFileContext.cwd,
+      inheritedFileContext.referencePaths,
+      inheritedFileContext.workspaceId,
+      referencePaths,
+      workspaceId,
+    ],
   );
 
   return (

@@ -11,10 +11,16 @@ import {
 const mocks = vi.hoisted(() => ({
   openUrl: vi.fn().mockResolvedValue(undefined),
   toastError: vi.fn(),
+  fileExists: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mocks.openUrl(...args),
+}));
+
+vi.mock("@/tauri/commands", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/tauri/commands")>()),
+  fileExists: (...args: unknown[]) => mocks.fileExists(...args),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -39,6 +45,7 @@ beforeEach(() => {
   useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
   mocks.openUrl.mockReset().mockResolvedValue(undefined);
   mocks.toastError.mockReset();
+  mocks.fileExists.mockReset().mockResolvedValue(true);
 });
 afterEach(() => cleanup());
 
@@ -380,7 +387,7 @@ describe("ChatMarkdown source references", () => {
   const workspaceId = "ws-source-link";
   const cwd = "/work/codemux";
 
-  it("opens an explicit Markdown file reference in the right panel at its line", () => {
+  it("opens an explicit Markdown file reference in the right panel at its line", async () => {
     const { getByRole } = render(
       <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
         {"See [types.ts:42](src/lib/types.ts:42) for the contract."}
@@ -391,8 +398,10 @@ describe("ChatMarkdown source references", () => {
     fireEvent.click(sourceLink);
 
     const filePath = "/work/codemux/src/lib/types.ts";
-    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
-      docPaneId(filePath),
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(filePath),
+      ),
     );
     expect(
       useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
@@ -402,9 +411,50 @@ describe("ChatMarkdown source references", () => {
     });
 
     fireEvent.click(sourceLink);
-    expect(
-      useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
-    ).toMatchObject({ revealRequest: { line: 42, nonce: 2 } });
+    await waitFor(() =>
+      expect(
+        useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath)),
+      ).toMatchObject({ revealRequest: { line: 42, nonce: 2 } }),
+    );
+  });
+
+  it("falls back to a turn tool path when the resolved chip target is missing", async () => {
+    const shot = "/tmp/spec/screenshots/shot.png";
+    mocks.fileExists.mockImplementation(async (path: unknown) => path === shot);
+
+    const { getByRole } = render(
+      <ChatMarkdown
+        workspaceId={workspaceId}
+        cwd={cwd}
+        referencePaths={[shot]}
+      >
+        {"Compare [shot.png](shot.png) against the mock."}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(getByRole("button", { name: "shot.png" }));
+
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(shot),
+      ),
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("shows a not-found toast instead of opening a tab for a missing file", async () => {
+    mocks.fileExists.mockResolvedValue(false);
+
+    const { getByRole } = render(
+      <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
+        {"Compare [shot.png](shot.png) against the mock."}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(getByRole("button", { name: "shot.png" }));
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledOnce());
+    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBeNull();
   });
 
   it("keeps an inline-code file label as one accessible source button", () => {
@@ -452,7 +502,7 @@ describe("ChatMarkdown source references", () => {
     );
   });
 
-  it("makes a resolvable fenced-code title open the same source pane", () => {
+  it("makes a resolvable fenced-code title open the same source pane", async () => {
     const { getByRole } = render(
       <TooltipProvider>
         <ChatMarkdown workspaceId={workspaceId} cwd={cwd}>
@@ -464,8 +514,10 @@ describe("ChatMarkdown source references", () => {
     fireEvent.click(getByRole("button", { name: "src/lib/types.ts:7" }));
 
     const filePath = "/work/codemux/src/lib/types.ts";
-    expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
-      docPaneId(filePath),
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(filePath),
+      ),
     );
     expect(
       useEditorStore.getState().getTab(docEditorTabId(workspaceId, filePath))

@@ -997,6 +997,9 @@ const MOCK_DIR_TREE: Record<string, FileEntry[]> = {
   ],
   [`${HOME}/projects/codemux/docs`]: [
     mockFile(`${HOME}/projects/codemux/docs`, "INDEX.md", 300),
+    // No real filesystem backs browser dev, so opening this always 404s —
+    // which is exactly what makes the ImageViewer failure card reachable.
+    mockFile(`${HOME}/projects/codemux/docs`, "dashboard.png", 48211),
   ],
   [`${HOME}/projects/web-app`]: [
     mockDir(`${HOME}/projects/web-app`, "src"),

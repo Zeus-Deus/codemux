@@ -67,6 +67,53 @@ export function toolCallReferenceCwd(input: unknown): string | null {
   return directoryFromStructuredInput(input) ?? directoryFromFreeformInput(input);
 }
 
+/** Newest-last, deduped, and bounded: fallback resolution walks from the
+ *  end, so the most recent mention of a basename wins. */
+const MAX_REFERENCE_PATHS = 32;
+
+// Absolute file-path tokens embedded in freeform text (command lines,
+// prompts). Segment charset mirrors `FILE_BASENAME` in `file-links.ts`
+// minus whitespace — a spaced path inside a command line is ambiguous, and
+// these tokens are only ever *candidates* that a stat must confirm. The
+// lookbehind guards keep a mid-token slash from starting a match, so
+// `notes/todo.txt` and `https://host/x.png` contribute nothing.
+const POSIX_PATH_TOKEN =
+  /(?<![\w@+~.:\\/-])\/(?:[\w@+~.-]+\/)*[\w@+~.-]+\.[a-zA-Z][a-zA-Z\d]{0,11}(?![\w.])/g;
+const WINDOWS_PATH_TOKEN =
+  /(?<![\w@+~.:\\/-])[a-zA-Z]:[\\/](?:[\w@+~.-]+[\\/])*[\w@+~.-]+\.[a-zA-Z][a-zA-Z\d]{0,11}(?![\w.])/g;
+
+function rememberPath(path: string, into: string[]) {
+  const existing = into.indexOf(path);
+  if (existing !== -1) into.splice(existing, 1);
+  into.push(path);
+  if (into.length > MAX_REFERENCE_PATHS) into.shift();
+}
+
+function pathsFromString(value: string, into: string[]) {
+  for (const match of value.matchAll(POSIX_PATH_TOKEN)) rememberPath(match[0], into);
+  for (const match of value.matchAll(WINDOWS_PATH_TOKEN)) rememberPath(match[0], into);
+}
+
+function pathsFromStructuredInput(input: unknown, into: string[]) {
+  if (typeof input === "string") {
+    pathsFromString(input, into);
+    return;
+  }
+  if (Array.isArray(input)) {
+    for (const value of input) pathsFromStructuredInput(value, into);
+    return;
+  }
+  if (!isRecord(input)) return;
+  for (const value of Object.values(input)) pathsFromStructuredInput(value, into);
+}
+
+/** Every absolute file path a tool call's input mentions, newest last. */
+export function toolCallReferencePaths(input: unknown): string[] {
+  const paths: string[] = [];
+  pathsFromStructuredInput(input, paths);
+  return paths;
+}
+
 /**
  * Associate assistant prose with the most recent explicit tool working
  * directory in the same turn. A Home workspace can run tools in any project;
@@ -92,6 +139,38 @@ export function assistantReferenceCwds(
       continue;
     }
     if (item.kind === "turn_ended") turnCwd = null;
+  }
+
+  return byMessageId;
+}
+
+/**
+ * Associate assistant prose with every absolute file path the same turn's
+ * tool calls touched. When a chip's resolved path does not exist on disk
+ * (the agent linked a bare filename for a file living elsewhere — commonly
+ * a screenshot written to a temp directory), a basename match against these
+ * is the fallback candidate set. Stat-verified before use, never trusted.
+ */
+export function assistantReferencePaths(
+  orderedItems: readonly ChatViewItem[],
+): ReadonlyMap<string, readonly string[]> {
+  const byMessageId = new Map<string, readonly string[]>();
+  let turnPaths: string[] = [];
+
+  for (const item of orderedItems) {
+    if (item.kind === "user_message" || item.kind === "turn_ended") {
+      turnPaths = [];
+      continue;
+    }
+    if (item.kind === "tool_call") {
+      for (const path of toolCallReferencePaths(item.input)) {
+        rememberPath(path, turnPaths);
+      }
+      continue;
+    }
+    if (item.kind === "assistant_message" && turnPaths.length > 0) {
+      byMessageId.set(item.id, [...turnPaths]);
+    }
   }
 
   return byMessageId;
