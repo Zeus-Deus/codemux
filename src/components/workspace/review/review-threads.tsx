@@ -16,7 +16,6 @@ import { CollapsibleSection } from "./collapsible-section";
 import {
   btnEmberXs,
   tzBody,
-  tzBodyLg,
   tzEyebrow,
   tzMeta,
   tzRowTitle,
@@ -230,8 +229,7 @@ export function ReviewThreads({
                 <div className="group/comment flex items-start gap-1.5">
                   <p
                     className={cn(
-                      "select-text text-muted-foreground flex-1 whitespace-pre-wrap break-words",
-                      tzBodyLg,
+                      "select-text pr-reading flex-1 whitespace-pre-wrap break-words",
                     )}
                   >
                     {g.review.body}
@@ -279,12 +277,7 @@ export function ReviewThreads({
                   </span>
                   <CopyButton text={ic.body} />
                 </div>
-                <p
-                  className={cn(
-                    "select-text text-muted-foreground whitespace-pre-wrap break-words",
-                    tzBodyLg,
-                  )}
-                >
+                <p className="select-text pr-reading whitespace-pre-wrap break-words">
                   {ic.body}
                 </p>
                 {onSendToAgent && (
