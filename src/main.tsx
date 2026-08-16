@@ -18,6 +18,15 @@ const queryClient = new QueryClient({
   },
 });
 
+// Dev only: the mock's pull-request toast triggers need to make the
+// shared overview query refetch, and the query client is the only thing
+// that can do that. `import.meta.env.DEV` is statically false in
+// production, so this block is not in the shipped bundle.
+if (import.meta.env.DEV) {
+  (window as unknown as { __codemuxQueryClient: QueryClient }).__codemuxQueryClient =
+    queryClient;
+}
+
 document.documentElement.classList.add("dark");
 
 function dismissSplash() {

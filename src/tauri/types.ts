@@ -50,6 +50,10 @@ export interface GitSyncSettings {
  *  backend provider detection. Edited in Settings → Source Control. */
 export interface SourceControlSyncSettings {
   custom_hosts: Record<string, string>;
+  /** Opt out of routing host pull-request links to the Pull Requests
+   *  page. Absent on payloads written before the setting existed, which
+   *  is why every reader defaults it to `false`. */
+  open_pr_links_in_browser?: boolean;
 }
 
 /** One hosting product's readiness, from `discover_source_control`.
@@ -522,6 +526,14 @@ export interface GitLogEntry {
 export interface CommitFileEntry {
   path: string;
   status: string;
+}
+
+/** One commit ahead of the base branch. `body` is `""` when the commit
+ *  had only a subject line. */
+export interface CommitSummary {
+  short_hash: string;
+  subject: string;
+  body: string;
 }
 
 export interface EditorInfo {

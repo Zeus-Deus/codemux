@@ -154,10 +154,17 @@ impl Default for GitSettings {
 /// Values are read leniently: an entry naming a product this build does
 /// not know is skipped rather than failing the whole settings blob,
 /// because these sync across devices and versions.
+///
+/// `open_pr_links_in_browser` opts out of opening a host pull-request URL
+/// on the Pull Requests page: with it set, such a link goes to the
+/// system browser like any other. Defaults to `false` — the in-app page
+/// is the better destination — and is only ever read by the frontend.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct SourceControlSettings {
     #[serde(default)]
     pub custom_hosts: HashMap<String, String>,
+    #[serde(default)]
+    pub open_pr_links_in_browser: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -684,6 +691,7 @@ mod tests {
                     "git.acme.internal".into(),
                     "gitlab".into(),
                 )]),
+                open_pr_links_in_browser: false,
             },
             keyboard: KeyboardSettings {
                 shortcuts: {

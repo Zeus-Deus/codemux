@@ -4,6 +4,7 @@ import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 
 import { resolveAssetSrc } from "@/lib/asset-url";
+import { openExternalUrl } from "@/lib/open-url";
 
 /**
  * react-markdown's default `urlTransform` would strip the `data:` and
@@ -68,6 +69,33 @@ function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
       img: ({ src, alt, ...rest }) => (
         // eslint-disable-next-line jsx-a11y/alt-text
         <img src={resolveAssetSrc(src, filePath)} alt={alt ?? ""} {...rest} />
+      ),
+      /**
+       * Links go somewhere deliberate rather than nowhere.
+       *
+       * Without this override an `<a href>` here would try to navigate
+       * the webview itself — unloading the single-page app, or being
+       * dropped silently. So the click is taken over: a pull request in
+       * an open project opens the Pull Requests page, and everything
+       * else (and any shift-click) goes to the system browser.
+       *
+       * This is the second of the two shared markdown surfaces. It
+       * renders the PR description in the Review panel, which is exactly
+       * where "see #482" tends to be written.
+       */
+      a: ({ href, children, ...rest }) => (
+        <a
+          {...rest}
+          href={href}
+          rel="noopener noreferrer"
+          onClick={(event) => {
+            if (!href || !/^https?:\/\//i.test(href)) return;
+            event.preventDefault();
+            void openExternalUrl(href, { event });
+          }}
+        >
+          {children}
+        </a>
       ),
     }),
     [filePath],

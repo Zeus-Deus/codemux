@@ -23,6 +23,7 @@ import { ChevronRight, Loader2, Plus, RotateCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -52,7 +53,10 @@ const EMPTY_CAPABILITIES: ProviderCapabilities = {
   has_reviews: false,
   has_fork_pr_fetch: false,
 };
-import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import {
+  selectOpenPrLinksInBrowser,
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
 import { SubsectionHeader } from "./settings-primitives";
 
 // ── Diagnostics ──────────────────────────────────────────────────────
@@ -534,6 +538,55 @@ export function SourceControlSection() {
         />
         <CustomHostsEditor />
       </section>
+
+      <section className="mt-10">
+        <SubsectionHeader
+          title="Links"
+          description="What happens when you click a pull request link inside Codemux."
+        />
+        <PrLinkDestination />
+      </section>
+    </div>
+  );
+}
+
+/**
+ * The opt-out for in-app pull-request links.
+ *
+ * The interception is on by default because the page can do more with a
+ * pull request than a browser tab can. But "my review tooling is a
+ * browser extension" is a real answer, and shift-click every time is not
+ * a setting — so the preference lives here, and everything that opens a
+ * link reads it.
+ */
+function PrLinkDestination() {
+  const inBrowser = useSyncedSettingsStore(selectOpenPrLinksInBrowser);
+  const updateSetting = useSyncedSettingsStore((s) => s.updateSetting);
+
+  return (
+    <div className="flex items-center justify-between gap-8 py-4">
+      <div className="min-w-0 space-y-1">
+        <p className="text-[14px] font-semibold leading-tight text-foreground">
+          Open pull request links in the browser
+        </p>
+        <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+          Off, a link to a pull request in a project you have open goes to the Pull
+          Requests page instead of your browser. Shift-click always goes to the
+          browser either way.
+        </p>
+      </div>
+      <div className="shrink-0">
+        <Switch
+          checked={inBrowser}
+          aria-label="Open pull request links in the browser"
+          data-testid="pr-links-in-browser"
+          onCheckedChange={(checked) => {
+            void updateSetting("source_control", "open_pr_links_in_browser", checked).catch(
+              console.error,
+            );
+          }}
+        />
+      </div>
     </div>
   );
 }

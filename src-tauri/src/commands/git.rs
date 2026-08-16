@@ -192,6 +192,22 @@ pub async fn git_log_entries(path: String, count: usize) -> Result<Vec<GitLogEnt
         .map_err(|e| format!("git_log_entries task join failed: {e}"))?
 }
 
+/// Commits this branch has that `base` does not — the create-pull-request
+/// form's draft material. Capped by `limit` so a branch that never got
+/// rebased can't hand the form a thousand subjects.
+#[tauri::command]
+pub async fn git_commits_ahead(
+    path: String,
+    base: String,
+    limit: usize,
+) -> Result<Vec<crate::git::CommitSummary>, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_commits_ahead(Path::new(&path), &base, limit)
+    })
+    .await
+    .map_err(|e| format!("git_commits_ahead task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn get_commit_files(path: String, hash: String) -> Result<Vec<CommitFileEntry>, String> {
     tokio::task::spawn_blocking(move || crate::git::get_commit_files(Path::new(&path), &hash))

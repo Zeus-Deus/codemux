@@ -29,7 +29,9 @@ import type {
   AuthUser,
   CheckInfo,
   CodemuxConfigSnapshot,
+  CommitSummary,
   FileEntry,
+  GitFileStatus,
   InlineReviewComment,
   LinkedIssue,
   PrTimelineEvent,
@@ -3367,3 +3369,100 @@ export const MOCK_PR_DIFFS: Record<
  * least one of each to be reachable.
  */
 export const MOCK_LOCAL_ONLY_PATH = `${HOME}/.codemux/worktrees/vexis/fix-installer-detect`;
+
+// ── Opening a pull request (5a) ──────────────────────────────────────
+//
+// The create form's whole premise is that the branch already contains a
+// title and a description, so the mock has to contain commits worth
+// drafting from. This checkout is the seeded "no pull request yet"
+// branch: pushed, four commits ahead, and two files still uncommitted,
+// which is every row of the form at once.
+
+/** The account every seeded GitHub root is signed in as — who "yours"
+ *  and "needs your review" are measured against. */
+export const MOCK_PR_VIEWER = MOCK_PR_AUTHOR;
+
+/** The seeded checkout the create form is reachable from. */
+export const MOCK_CREATE_PR_PATH = `${HOME}/.codemux/worktrees/codemux/feature-75-chat-channel`;
+
+/**
+ * Commits ahead of the base, newest first — the same order `git log`
+ * returns and `git_commits_ahead` preserves.
+ *
+ * Written so the drafting heuristics are exercised rather than merely
+ * satisfied: all four share a `feat(chat)` prefix and the first two
+ * words of their subject, which is what produces a title, and one body
+ * carries a verification line, which is the only thing that puts a
+ * `Verification ·` line in the description.
+ */
+export const MOCK_COMMITS_AHEAD: Record<string, CommitSummary[]> = {
+  [MOCK_CREATE_PR_PATH]: [
+    {
+      short_hash: "9f2c1ab",
+      subject: "feat(chat): stream replies without buffering the whole turn",
+      body: "Verification · npm run check and the chat suite pass locally.",
+    },
+    {
+      short_hash: "41d7e05",
+      subject: "feat(chat): stream replies through a single channel",
+      body: "",
+    },
+    {
+      short_hash: "c08b3d9",
+      subject: "feat(chat): stream replies as runtime events",
+      body: "Co-Authored-By: someone <someone@example.com>",
+    },
+    {
+      short_hash: "77a41e2",
+      subject: "feat(chat): stream replies over a dedicated socket",
+      body: "",
+    },
+  ],
+};
+
+/** Uncommitted work in the create form's checkout, for the warning row. */
+export const MOCK_CREATE_PR_DIRTY: GitFileStatus[] = [
+  {
+    path: "src/components/chat/ChatChannel.tsx",
+    status: "modified",
+    is_staged: false,
+    is_unstaged: true,
+    additions: 14,
+    deletions: 2,
+    conflict_type: null,
+  },
+  {
+    path: "src/lib/agent-chat/channel.ts",
+    status: "modified",
+    is_staged: false,
+    is_unstaged: true,
+    additions: 6,
+    deletions: 0,
+    conflict_type: null,
+  },
+];
+
+/**
+ * The repository's pull-request template.
+ *
+ * Seeded for the codemux root only, so the chip's other half — a
+ * repository with no template, where the chip must not be drawn at all —
+ * is equally reachable in browser dev.
+ */
+export const MOCK_PR_TEMPLATE_ROOT = codemuxRoot;
+
+export const MOCK_PR_TEMPLATE = `## What changed
+
+<!-- One or two sentences. -->
+
+## Why
+
+## Verification
+
+- [ ] \`npm run check\`
+- [ ] Affected tests
+`;
+
+/** Every path a repository template is looked for at. */
+export const MOCK_TEMPLATE_PATH_PATTERN =
+  /(PULL_REQUEST_TEMPLATE|pull_request_template|merge_request_templates)/;

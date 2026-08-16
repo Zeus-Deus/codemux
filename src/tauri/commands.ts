@@ -36,6 +36,7 @@ import type {
   GitFileStatus,
   GitLogEntry,
   CommitFileEntry,
+  CommitSummary,
   HandoffPacket,
   LaunchMode,
   ProviderDiagnostic,
@@ -906,6 +907,12 @@ export const gitDiscardFile = (path: string, file: string) =>
 
 export const gitLogEntries = (path: string, count: number) =>
   invoke<GitLogEntry[]>("git_log_entries", { path, count });
+
+/** Commits this branch has that `base` does not, newest first, with
+ *  bodies — what the create-pull-request form drafts its title and
+ *  description from. Capped by `limit`. */
+export const gitCommitsAhead = (path: string, base: string, limit: number) =>
+  invoke<CommitSummary[]>("git_commits_ahead", { path, base, limit });
 
 export const getCommitFiles = (path: string, hash: string) =>
   invoke<CommitFileEntry[]>("get_commit_files", { path, hash });

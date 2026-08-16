@@ -61,6 +61,15 @@ pub struct GitLogEntry {
     pub is_pushed: bool,
 }
 
+/// One commit as the create-pull-request form reads it: what it says,
+/// and what it said at length. `body` is empty when the commit had none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitSummary {
+    pub short_hash: String,
+    pub subject: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitFileEntry {
     pub path: String,
@@ -797,6 +806,65 @@ pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
     // For untracked files, try clean
     run_git(repo_path, &["clean", "-f", "--", file])?;
     Ok(())
+}
+
+/// The commits this branch has that `base` does not, newest first.
+///
+/// Separate from [`git_log`] because the create-pull-request form needs
+/// two things that one cannot give it: the set bounded by the base
+/// branch (not the last N commits, which on a one-commit branch is
+/// mostly someone else's history), and each commit's body as well as its
+/// subject (the form drafts a description out of them).
+///
+/// Fields are joined with US (`\x1f`) and records with RS (`\x1e`),
+/// because a commit body contains newlines and very often contains every
+/// other separator a person would reach for.
+pub fn git_commits_ahead(
+    repo_path: &Path,
+    base: &str,
+    limit: usize,
+) -> Result<Vec<CommitSummary>, String> {
+    // `resolve_base_ref` prefers `origin/<base>`: the pull request will be
+    // opened against the remote's branch, and a local `main` that hasn't
+    // been pulled in a week would report commits as "ahead" that the base
+    // already has. A base that resolves to neither is not an error the
+    // user can act on here — the form simply drafts from the branch name
+    // instead, so an empty set is the honest answer.
+    let Ok(base_ref) = resolve_base_ref(repo_path, base) else {
+        return Ok(Vec::new());
+    };
+
+    let range = format!("{base_ref}..HEAD");
+    let limit_str = limit.to_string();
+    let output = run_git(
+        repo_path,
+        &[
+            "log",
+            "--no-merges",
+            "--format=%h%x1f%s%x1f%b%x1e",
+            "-n",
+            &limit_str,
+            &range,
+        ],
+    )?;
+
+    let mut commits = Vec::new();
+    for record in output.split('\u{1e}') {
+        let record = record.trim_start_matches('\n');
+        if record.trim().is_empty() {
+            continue;
+        }
+        let mut fields = record.split('\u{1f}');
+        let (Some(short_hash), Some(subject)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        commits.push(CommitSummary {
+            short_hash: short_hash.trim().to_string(),
+            subject: subject.trim().to_string(),
+            body: fields.next().unwrap_or_default().trim().to_string(),
+        });
+    }
+    Ok(commits)
 }
 
 pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, String> {

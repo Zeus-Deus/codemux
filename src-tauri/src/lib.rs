@@ -2019,6 +2019,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_commit_files,
             commands::git_discard_file,
             commands::git_log_entries,
+            commands::git_commits_ahead,
             commands::refresh_workspace_git_info,
             commands::checkout_default_branch_in_workspace,
             commands::create_browser_pane,

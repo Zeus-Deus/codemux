@@ -26,7 +26,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   editor: { default_ide: null },
   terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
   git: { default_base_branch: "main" },
-  source_control: { custom_hosts: {} },
+  source_control: { custom_hosts: {}, open_pr_links_in_browser: false },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
@@ -54,6 +54,8 @@ type SyncedSettingsStore = SyncedSettingsState & SyncedSettingsActions;
 export { DEFAULT_SETTINGS };
 
 const EMPTY_CUSTOM_THEMES: unknown[] = [];
+/** Stable identity so the selector doesn't re-render on every read. */
+const EMPTY_CUSTOM_HOSTS: Record<string, string> = {};
 
 // Each optimistic write increments this. Async responses only apply if
 // the generation matches, preventing stale backend responses from
@@ -180,6 +182,15 @@ export const selectNotificationSoundEnabled = (s: SyncedSettingsState): boolean 
 
 export const selectDesktopNotificationsEnabled = (s: SyncedSettingsState): boolean =>
   s.settings.notifications.desktop_enabled;
+
+/** Self-hosted instances the user has classified, host → product. */
+export const selectCustomHosts = (s: SyncedSettingsState): Record<string, string> =>
+  s.settings.source_control?.custom_hosts ?? EMPTY_CUSTOM_HOSTS;
+
+/** True when host pull-request links should keep going to the browser
+ *  instead of opening the Pull Requests page. */
+export const selectOpenPrLinksInBrowser = (s: SyncedSettingsState): boolean =>
+  s.settings.source_control?.open_pr_links_in_browser ?? false;
 
 export const selectKeyboardShortcuts = (s: SyncedSettingsState): Record<string, string> =>
   s.settings.keyboard.shortcuts;

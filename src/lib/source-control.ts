@@ -167,6 +167,11 @@ export const ALL_PROVIDER_KINDS: ProviderKind[] = [
 /** Products a user may classify a self-hosted instance as. */
 export const CUSTOM_HOST_KINDS: ProviderKind[] = ["github", "gitlab"];
 
+/** The hosted domains, re-exported so URL matching has one source for
+ *  them rather than a second copy of the same two strings. */
+export const GITHUB_HOSTS = GITHUB.canonicalHosts;
+export const GITLAB_HOSTS = GITLAB.canonicalHosts;
+
 /**
  * Presentation for a snapshot's `provider_kind`.
  *

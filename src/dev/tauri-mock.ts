@@ -46,16 +46,23 @@ import {
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
   MOCK_CHECK_LOG_EXCERPT,
+  MOCK_COMMITS_AHEAD,
+  MOCK_CREATE_PR_DIRTY,
+  MOCK_CREATE_PR_PATH,
   MOCK_LOCAL_ONLY_PATH,
   MOCK_PR_CHECKS,
   MOCK_PR_TIMELINES,
   MOCK_PR_DIFFS,
   MOCK_PR_HISTORY,
   MOCK_PR_OVERVIEW,
+  MOCK_PR_TEMPLATE,
+  MOCK_PR_TEMPLATE_ROOT,
+  MOCK_PR_VIEWER,
   MOCK_PR_REVIEW_REQUESTS,
   MOCK_PR_INLINE_COMMENTS,
   MOCK_PR_PATH_TO_NUMBER,
   MOCK_PR_REVIEWS,
+  MOCK_TEMPLATE_PATH_PATTERN,
   MOCK_UNREACHABLE_ROOT,
   MOCK_PULL_REQUESTS,
   MOCK_SUBMIT_FAILURE_PR,
@@ -88,6 +95,7 @@ import type {
   AgentBrowserSession,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
+  CheckInfo,
   ChatModelInfo,
   FeatureFlags,
   PaneNodeSnapshot,
@@ -154,9 +162,17 @@ function prDiffFor(number: number, full: boolean): string {
   return forcePushedPrs.has(number) ? (entry.afterForcePush ?? entry.full) : entry.full;
 }
 
+/** Pull requests opened through the form this session, by checkout path. */
+const createdPrPaths: Record<string, number> = {};
+
+/** Numbers for pull requests created during the session. Deliberately
+ *  above every seeded number so nothing can collide. */
+let nextMockPrNumber = 900;
+
 /** The PR for a checkout path, via the seeded path→number map. */
 function prForPath(path: unknown): PullRequestInfo | undefined {
-  const number = MOCK_PR_PATH_TO_NUMBER[String(path ?? "")];
+  const key = String(path ?? "");
+  const number = createdPrPaths[key] ?? MOCK_PR_PATH_TO_NUMBER[key];
   return number == null ? undefined : mutablePrs[number];
 }
 
@@ -169,6 +185,20 @@ function rollupOf(number: number): string {
   if (checks.some((c) => c.conclusion === "pending")) return "pending";
   return "passing";
 }
+
+/**
+ * Session overrides for the two things a pull-request toast watches.
+ *
+ * Written by `__codemuxMockReviewRequest` / `__codemuxMockCiFail` so the
+ * two toasts can be fired on demand rather than waited for: both are
+ * *transitions*, so nothing seeded as already-failing could ever raise
+ * one.
+ */
+const reviewRequestOverrides: Record<number, string[]> = {};
+const checksRollupOverrides: Record<number, string> = {};
+/** The per-check list behind a forced rollup, so the toast can name the
+ *  check that failed and [Fix] can hand an agent something specific. */
+const checksDetailOverrides: Record<number, CheckInfo[]> = {};
 
 /** One overview row, derived from the PR the detail column will open. */
 function overviewItem(number: number) {
@@ -183,8 +213,9 @@ function overviewItem(number: number) {
     additions: pr.additions,
     deletions: pr.deletions,
     review_decision: pr.review_decision,
-    checks: rollupOf(number),
-    review_requested_from: MOCK_PR_REVIEW_REQUESTS[number] ?? [],
+    checks: checksRollupOverrides[number] ?? rollupOf(number),
+    review_requested_from:
+      reviewRequestOverrides[number] ?? MOCK_PR_REVIEW_REQUESTS[number] ?? [],
     updated_at: pr.updated_at,
     url: pr.url,
   };
@@ -778,7 +809,13 @@ const SYNCED_SETTINGS: UserSettings = {
   // One seeded self-hosted mapping so the custom-hosts editor renders a
   // populated row (and its remove affordance) rather than only the empty
   // state under `npm run dev`.
-  source_control: { custom_hosts: { "git.acme.internal": "gitlab" } },
+  source_control: {
+    // `gitlab.example.com` is where the seeded merge requests live, and
+    // declaring it is what lets one of their URLs route to the page —
+    // the same path a user takes for a self-hosted instance.
+    custom_hosts: { "git.acme.internal": "gitlab", "gitlab.example.com": "gitlab" },
+    open_pr_links_in_browser: false,
+  },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
@@ -1270,6 +1307,34 @@ function mockChatTranscript(): string[] {
       usage: null,
     });
   }
+  // A pull-request URL in the transcript, so in-app link routing (5c) is
+  // exercisable in browser dev: this one names a seeded pull request in
+  // an open project, so clicking it opens the Pull Requests page on that
+  // pull request, and shift-clicking still goes to the browser.
+  const linkTurnId = "seed-pr-link";
+  push({
+    type: "user_message",
+    thread_id: T,
+    client_nonce: "seed-nonce-pr-link",
+    text: "Where did the monitoring work land?",
+  });
+  push({
+    type: "item_completed",
+    thread_id: T,
+    turn_id: linkTurnId,
+    item: {
+      kind: "assistant_text",
+      text: "It shipped as https://github.com/example/codemux/pull/482 — the checks are green there.",
+    },
+  });
+  push({
+    type: "turn_completed",
+    thread_id: T,
+    turn_id: linkTurnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+
   // Final showcase turn: the subagent work-log fixture — one completed
   // subagent, one still running — so the compact transcript row, panel
   // watch surface, and drill-in all render on open. Landing last keeps it
@@ -2484,8 +2549,14 @@ const handlers: Record<string, Handler> = {
   // Backs the web-remote path browser (Stage 3b). Serves a small static
   // tree (see `mockListDirectory`) and rejects unknown paths like the real
   // `list_directory` so manual-path validation is exercisable in dev.
-  list_directory: (a) =>
-    mockListDirectory(String(a.path ?? "/"), Boolean(a.showHidden)),
+  list_directory: (a) => {
+    const path = String(a.path ?? "/");
+    // No seeded repository keeps GitLab-style templates in a directory,
+    // and the generic listing would hand the form a stack of unrelated
+    // `.md` files to mistake for one.
+    if (path.includes("merge_request_templates")) return [];
+    return mockListDirectory(path, Boolean(a.showHidden));
+  },
 
   // Without a handler the mock returned its `undefined` default and the
   // file-search dialog crashed on `results.map`. Serve a small repo-shaped
@@ -2516,7 +2587,20 @@ const handlers: Record<string, Handler> = {
   // Browser dev has no filesystem; every path "exists" so chat file links
   // stay clickable against the synthetic contents `read_file` fabricates.
   file_exists: () => true,
-  read_file: (a) => mockReadFile(String(a.path ?? "")),
+  read_file: (a) => {
+    const path = String(a.path ?? "");
+    // Template lookup is a series of speculative reads, and the answer
+    // that matters most is "no". `mockReadFile` returns prose for any
+    // `.md`, which would make every repository look like it had a
+    // template — so the template paths are answered explicitly, and only
+    // the seeded root has one.
+    if (MOCK_TEMPLATE_PATH_PATTERN.test(path)) {
+      return path.startsWith(MOCK_PR_TEMPLATE_ROOT)
+        ? MOCK_PR_TEMPLATE
+        : Promise.reject(`No such file or directory: ${path}`);
+    }
+    return mockReadFile(path);
+  },
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
@@ -3408,6 +3492,65 @@ const handlers: Record<string, Handler> = {
 
   get_branch_pull_request: (a) => prForPath(a.path) ?? null,
 
+  // ── Opening a pull request (5a) ──
+
+  /** The commits the form drafts a title and a description from. */
+  git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+
+  /**
+   * Create, for real as far as the rest of the mock is concerned.
+   *
+   * The new pull request is registered under the checkout's path and
+   * written onto the workspace snapshot, so everything downstream — the
+   * panel flipping to the review view, the sidebar's PR pill, the
+   * overview row — behaves the way it would after a real create rather
+   * than needing its own special case.
+   */
+  create_pull_request: (a) => {
+    const path = String(a.path ?? "");
+    const workspace = appState.workspaces.find(
+      (w) => (w.worktree_path ?? w.cwd) === path,
+    );
+    const number = nextMockPrNumber++;
+    const pr: PullRequestInfo = {
+      ...structuredClone(MOCK_PULL_REQUESTS[142]),
+      number,
+      title: String(a.title ?? ""),
+      body: String(a.body ?? "") || null,
+      base_branch: String(a.base ?? "main"),
+      head_branch: workspace?.git_branch ?? null,
+      is_draft: Boolean(a.draft),
+      state: "OPEN",
+      url: `https://github.com/example/codemux/pull/${number}`,
+      // A pull request you just opened is yours, has no verdict on it
+      // and nobody has been asked to look at it yet — none of which is
+      // true of the fixture whose shape is being borrowed.
+      author: MOCK_PR_VIEWER,
+      review_decision: null,
+      review_requests: [],
+      latest_reviews: [],
+      mergeable: "MERGEABLE",
+      merge_state_status: "CLEAN",
+      merged_by: null,
+      merged_at: null,
+      checks_passing: null,
+      comments: [],
+      totalComments: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    mutablePrs[number] = pr;
+    createdPrPaths[path] = number;
+    if (workspace) {
+      workspace.pr_number = number;
+      workspace.pr_state = a.draft ? "draft" : "open";
+      workspace.pr_url = pr.url;
+      workspace.pr_head_branch = workspace.git_branch;
+      emitAppState();
+    }
+    return pr;
+  },
+
   // Which of the two no-PR empty states applies turns on whether the
   // branch is on the remote at all, so one seeded checkout is
   // deliberately local-only and everything else is pushed.
@@ -3424,7 +3567,8 @@ const handlers: Record<string, Handler> = {
 
   get_pull_request_checks: (a) => {
     const number = a.prNumber != null ? Number(a.prNumber) : prForPath(a.path)?.number;
-    return number == null ? [] : (MOCK_PR_CHECKS[number] ?? []);
+    if (number == null) return [];
+    return checksDetailOverrides[number] ?? MOCK_PR_CHECKS[number] ?? [];
   },
 
   get_pr_review_comments: (a) => {
@@ -4021,7 +4165,11 @@ const handlers: Record<string, Handler> = {
   // Empty status = "Working tree clean" for git workspaces, and lets
   // the non-git `scratchpad` seed exercise the "Not a git repository"
   // empty state (`is_git: false` → showNoGitState).
-  get_git_status: () => [],
+  // …with one exception: the checkout the create-pull-request form opens
+  // from has uncommitted work, because the form's warning row is only
+  // reachable when something is actually uncommitted.
+  get_git_status: (a) =>
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? MOCK_CREATE_PR_DIRTY : [],
   get_merge_state: () => null,
   check_claude_available: () => false,
 
@@ -4752,6 +4900,75 @@ const internals: TauriInternals = {
   pr.updated_at = new Date().toISOString();
   emitAppState();
   return `#${prNumber} head is now ${pr.head_ref_oid}`;
+};
+
+// Dev affordances: fire each of the two pull-request toasts on demand.
+//
+// Both toasts are raised by a *transition* between consecutive polls, so
+// neither can be reached by seeding a state — a pull request that is
+// already red at load has not just turned red, and correctly says
+// nothing. These flip the overview fixture and kick the shared query, so
+// the very next poll sees a change that did not exist a moment ago.
+//
+//   __codemuxMockReviewRequest()   // #482 starts waiting on you
+//   __codemuxMockCiFail()          // #285 goes red on rust (ubuntu-latest)
+//   __codemuxMockCiFail(285, false)  // back to green, so it can fire again
+function kickPrOverview(): void {
+  (
+    window as unknown as {
+      __codemuxQueryClient?: {
+        invalidateQueries: (filters: { predicate: (q: { queryKey: unknown[] }) => boolean }) => void;
+      };
+    }
+  ).__codemuxQueryClient?.invalidateQueries({
+    predicate: (q) => q.queryKey[0] === "prs",
+  });
+}
+
+(
+  window as unknown as {
+    __codemuxMockReviewRequest: (prNumber?: number, requested?: boolean) => string;
+  }
+).__codemuxMockReviewRequest = (prNumber = 482, requested = true) => {
+  if (!mutablePrs[prNumber]) return `no mock PR #${prNumber}`;
+  reviewRequestOverrides[prNumber] = requested ? [MOCK_PR_VIEWER] : [];
+  kickPrOverview();
+  return requested
+    ? `#${prNumber} is now waiting on ${MOCK_PR_VIEWER}`
+    : `#${prNumber} no longer needs your review`;
+};
+
+(
+  window as unknown as {
+    __codemuxMockCiFail: (prNumber?: number, failing?: boolean) => string;
+  }
+).__codemuxMockCiFail = (prNumber = 285, failing = true) => {
+  const pr = mutablePrs[prNumber];
+  if (!pr) return `no mock PR #${prNumber}`;
+  if (failing) {
+    checksRollupOverrides[prNumber] = "failing";
+    // The toast's second line and the [Fix] handoff both name a check,
+    // so the per-check list has to agree with the rollup.
+    checksDetailOverrides[prNumber] = [
+      ...(MOCK_PR_CHECKS[prNumber] ?? []),
+      {
+        name: "rust (ubuntu-latest)",
+        status: "COMPLETED",
+        conclusion: "fail",
+        elapsed_time: "2m 14s",
+        detail_url: `https://github.com/example/codemux/actions/runs/9${prNumber}`,
+        started_at: new Date(Date.now() - 134_000).toISOString(),
+        completed_at: new Date().toISOString(),
+      },
+    ];
+  } else {
+    delete checksRollupOverrides[prNumber];
+    delete checksDetailOverrides[prNumber];
+  }
+  kickPrOverview();
+  return failing
+    ? `#${prNumber} is now failing on rust (ubuntu-latest)`
+    : `#${prNumber} is green again`;
 };
 
 // Dev affordance: read back what the agent-handoff buttons actually sent.

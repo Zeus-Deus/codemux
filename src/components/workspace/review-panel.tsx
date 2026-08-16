@@ -1,29 +1,17 @@
 import { useState, useEffect, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { ChevronLeft } from "lucide-react";
-import {
   checkGithubRepo,
   getBranchPullRequest,
-  createPullRequest,
   getPullRequestChecks,
   getPrReviewComments,
   getPrInlineComments,
   getGitBranchInfo,
   gitPushChanges,
-  listBranches,
   getDefaultBranch,
+  refreshWorkspacePr,
 } from "@/tauri/commands";
 import type {
   WorkspaceSnapshot,
@@ -50,6 +38,7 @@ import {
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
+import { CreatePrForm } from "./review/create-pr-form";
 import { ReviewDetail } from "./review/review-detail";
 import { ReviewThreads } from "./review/review-threads";
 import { IncomingPrsView } from "./review/incoming-prs-view";
@@ -146,14 +135,6 @@ function toProviderGate(status: ProviderAuthStatus): ProviderGate {
 
 // ── Helpers ──
 
-function branchToTitle(branch: string | null): string {
-  if (!branch) return "";
-  return branch
-    .replace(/^(feature|fix|chore|docs|refactor|test)[/-]/, "")
-    .replace(/[-_]/g, " ")
-    .replace(/^\w/, (c) => c.toUpperCase());
-}
-
 function ReviewSkeleton() {
   return (
     <div className="space-y-3 p-3">
@@ -176,145 +157,22 @@ function ReviewSkeleton() {
   );
 }
 
-// ── CreatePrForm ──
-//
-// Untouched by this ship: the create form gets its own redesign later,
-// and half-redesigning it would leave two visual languages on the same
-// surface.
-
-function CreatePrForm({
-  cwd,
-  branchName,
-  provider,
-  onCreated,
-  onCancel,
-}: {
-  cwd: string;
-  branchName: string | null;
-  provider: ProviderPresentation;
-  onCreated: (pr: PullRequestInfo) => void;
-  onCancel: () => void;
-}) {
-  const [title, setTitle] = useState(() => branchToTitle(branchName));
-  const [body, setBody] = useState("");
-  const [baseBranch, setBaseBranch] = useState("main");
-  const [branches, setBranches] = useState<string[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
-  const [isDraft, setIsDraft] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-
-  const loadBranches = useCallback(() => {
-    if (branchesLoaded) return;
-    listBranches(cwd, false)
-      .then((b) => {
-        setBranches(b);
-        setBranchesLoaded(true);
-        if (b.includes("main")) setBaseBranch("main");
-        else if (b.includes("master")) setBaseBranch("master");
-        else if (b.length > 0) setBaseBranch(b[0]);
-      })
-      .catch(console.error);
-  }, [cwd, branchesLoaded]);
-
-  const handleCreate = async () => {
-    if (!title.trim() || creating) return;
-    setCreating(true);
-    setError(null);
-    try {
-      const pr = await createPullRequest(
-        cwd,
-        title.trim(),
-        body.trim(),
-        baseBranch,
-        isDraft,
-      );
-      onCreated(pr);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  return (
-    <div className="space-y-2 p-3">
-      <div className="flex items-center gap-1">
-        <Button size="icon-xs" variant="ghost" onClick={onCancel} title="Back">
-          <ChevronLeft className="h-3 w-3" />
-        </Button>
-        <p className="text-xs font-medium text-muted-foreground">
-          Create {provider.nounTitleCase}
-        </p>
-      </div>
-      <Input
-        placeholder={`${provider.shortNoun} title`}
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-        className="h-7 text-xs"
-      />
-      <Textarea
-        placeholder="Description (optional)"
-        value={body}
-        onChange={(e) => setBody(e.target.value)}
-        className="text-xs resize-none h-16 min-h-16"
-      />
-      <div className="flex items-center gap-2">
-        <div className="flex-1">
-          <Select
-            value={baseBranch}
-            onValueChange={setBaseBranch}
-            onOpenChange={(open) => {
-              if (open) loadBranches();
-            }}
-          >
-            <SelectTrigger className="h-7 text-xs">
-              <SelectValue placeholder="Base branch" />
-            </SelectTrigger>
-            <SelectContent>
-              {branches.length > 0 ? (
-                branches.map((b) => (
-                  <SelectItem key={b} value={b} className="text-xs">
-                    {b}
-                  </SelectItem>
-                ))
-              ) : (
-                <SelectItem value={baseBranch} className="text-xs">
-                  {baseBranch}
-                </SelectItem>
-              )}
-            </SelectContent>
-          </Select>
-        </div>
-        <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer">
-          <input
-            type="checkbox"
-            checked={isDraft}
-            onChange={(e) => setIsDraft(e.target.checked)}
-            className="rounded"
-          />
-          Draft
-        </label>
-      </div>
-      <Button
-        size="xs"
-        className="w-full text-xs h-7"
-        disabled={!title.trim() || creating}
-        onClick={handleCreate}
-      >
-        {creating ? "Creating..." : `Create ${provider.shortNoun}`}
-      </Button>
-      {error && <p className="text-xs text-danger break-words">{error}</p>}
-    </div>
-  );
-}
-
 // ── Main ReviewPanel ──
 
 export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const provider = providerForWorkspace(workspace);
+  /**
+   * A pull request this pane just opened, held until the backend's
+   * workspace snapshot catches up.
+   *
+   * `pr_number` arrives on the snapshot from a poll that runs on its own
+   * schedule, so without this the panel would drop back to "No pull
+   * request yet" for a few seconds immediately after creating one — the
+   * one moment the user is certain there is one.
+   */
+  const [justCreated, setJustCreated] = useState<PullRequestInfo | null>(null);
+
   // Strictly the checked-out branch's PR. The workspace snapshot may also
   // carry a *badge-only* side-branch association (a PR the workspace opened
   // from a branch it has since left — see `isPrOnCurrentBranch`), and this
@@ -322,8 +180,15 @@ export function ReviewPanel({ workspace }: Props) {
   // a branch the user is not on while hiding the "Create PR" affordance for
   // the branch they actually are on.
   const hasPr =
-    workspace.pr_number != null &&
-    isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
+    justCreated != null ||
+    (workspace.pr_number != null &&
+      isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch));
+  const prNumber = workspace.pr_number ?? justCreated?.number ?? null;
+
+  // The snapshot has caught up; the local hold is no longer needed.
+  useEffect(() => {
+    if (workspace.pr_number != null) setJustCreated(null);
+  }, [workspace.pr_number]);
 
   const [ghStatus, setGhStatus] = useState<ProviderGate | null>(() => {
     const cached = cachedStatus(cwd, provider.kind);
@@ -403,7 +268,7 @@ export function ReviewPanel({ workspace }: Props) {
     hasPr;
 
   const prDetailQuery = useQuery({
-    queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "detail", workspace.workspace_id, prNumber] as const,
     queryFn: () => getBranchPullRequest(cwd),
     enabled: detailsEnabled,
     staleTime: 2_500,
@@ -411,7 +276,7 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const checksQuery = useQuery({
-    queryKey: ["pr", "checks", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "checks", workspace.workspace_id, prNumber] as const,
     queryFn: () => getPullRequestChecks(cwd),
     enabled: detailsEnabled,
     staleTime: 2_500,
@@ -419,7 +284,7 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const reviewsQuery = useQuery({
-    queryKey: ["pr", "reviews", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "reviews", workspace.workspace_id, prNumber] as const,
     queryFn: () => getPrReviewComments(cwd),
     enabled: detailsEnabled,
     staleTime: 30_000,
@@ -427,13 +292,12 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const inlineQuery = useQuery({
-    queryKey: ["pr", "inline", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "inline", workspace.workspace_id, prNumber] as const,
     queryFn: () => {
-      const num = workspace.pr_number;
-      if (num == null) return Promise.resolve([] as InlineReviewComment[]);
-      return getPrInlineComments(cwd, num);
+      if (prNumber == null) return Promise.resolve([] as InlineReviewComment[]);
+      return getPrInlineComments(cwd, prNumber);
     },
-    enabled: detailsEnabled && workspace.pr_number != null,
+    enabled: detailsEnabled && prNumber != null,
     staleTime: 30_000,
     refetchInterval: 30_000,
   });
@@ -447,7 +311,10 @@ export function ReviewPanel({ workspace }: Props) {
     staleTime: 10_000,
   });
 
-  const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
+  // The pull request this pane just opened stands in until the first
+  // poll answers for it, so the panel never flashes a skeleton over a
+  // pull request the user has just watched itself create.
+  const pr: PullRequestInfo | null = prDetailQuery.data ?? justCreated ?? null;
   const checks: CheckInfo[] = checksQuery.data ?? [];
   const reviews: ReviewComment[] = reviewsQuery.data ?? [];
   const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
@@ -478,16 +345,24 @@ export function ReviewPanel({ workspace }: Props) {
     useUIStore.getState().setRightPanelTab(workspace.workspace_id, "changes");
   }, [workspace.workspace_id]);
 
+  /**
+   * The form's success path: the pane becomes the review view for the
+   * pull request that was just opened, without an intervening blank.
+   *
+   * Three things in order — hold the new pull request locally, seed the
+   * detail cache under its number so the first render has real data, and
+   * ask the backend to re-read the workspace's pull request so
+   * `pr_number` lands on the snapshot and the local hold can retire.
+   */
   const handlePrCreated = (newPr: PullRequestInfo) => {
-    // Seed the detail cache directly so the new PR shows up immediately
-    // rather than waiting for the workspace state push to flip
-    // pr_number, then refresh the rest.
+    setJustCreated(newPr);
     queryClient.setQueryData(
       ["pr", "detail", workspace.workspace_id, newPr.number],
       newPr,
     );
     setShowCreateForm(false);
     invalidatePrQueries();
+    void refreshWorkspacePr(workspace.workspace_id).catch(() => {});
   };
 
   // ── Render ──
@@ -565,10 +440,13 @@ export function ReviewPanel({ workspace }: Props) {
       <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
         <CreatePrForm
           cwd={cwd}
+          projectRoot={workspace.project_root ?? workspace.cwd}
           branchName={workspace.git_branch}
+          defaultBranch={defaultBranch}
           provider={provider}
           onCreated={handlePrCreated}
           onCancel={() => setShowCreateForm(false)}
+          onOpenChanges={openChangesPane}
         />
       </ScrollArea>
     );
