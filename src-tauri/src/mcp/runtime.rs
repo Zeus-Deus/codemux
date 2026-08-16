@@ -342,7 +342,8 @@ async fn handshake(
 
     // 3. tools/list — paginated per spec but we read one page for v1.
     //    Servers with > 100 tools paginate via `nextCursor` which we
-    //    deliberately don't follow yet (the 50-tool cap makes it moot).
+    //    deliberately don't follow yet (no real-world server has needed
+    //    a second page so far).
     let list_response = child
         .request_with_timeout("tools/list", json!({}), HANDSHAKE_TIMEOUT)
         .await?;
@@ -439,69 +440,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Cap on the total number of MCP tools the registry will expose to
-/// agents. Codemux ships ~29 native tools today, so 50 leaves headroom
-/// for a couple of small servers without bloating context windows.
-pub const TOOL_CAP: usize = 50;
-
-/// Outcome of `apply_tool_cap`. The `tools` field is the trimmed list
-/// the agent sees; the rest is metadata the Settings UI uses to render
-/// the cap banner. `dropped_count == 0` means no warning needed.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CappedTools {
-    pub tools: Vec<McpTool>,
-    /// Total tool count BEFORE the cap was applied.
-    pub total_before_cap: usize,
-    /// How many user-MCP tools were dropped to fit the cap. Zero when
-    /// no cap was triggered.
-    pub dropped_count: usize,
-    /// Distinct server names whose tools were dropped, sorted. Used by
-    /// the Settings UI to mark those rows with a "capped" indicator.
-    pub dropped_servers: Vec<String>,
-}
-
-/// Apply the cap to the aggregate tool list. Codemux's own MCP tools
-/// (server name `"codemux"`) are protected — they always survive the
-/// cap so the always-on row never loses its tools. Returns
-/// [`CappedTools`] so callers can render a banner showing what got
-/// dropped.
-pub fn apply_tool_cap(tools: Vec<McpTool>) -> CappedTools {
-    let total_before_cap = tools.len();
-    if total_before_cap <= TOOL_CAP {
-        return CappedTools {
-            tools,
-            total_before_cap,
-            dropped_count: 0,
-            dropped_servers: Vec::new(),
-        };
-    }
-    let mut codemux: Vec<McpTool> = Vec::new();
-    let mut others: Vec<McpTool> = Vec::new();
-    for t in tools {
-        if t.prefixed_name.starts_with("mcp__codemux__") {
-            codemux.push(t);
-        } else {
-            others.push(t);
-        }
-    }
-    let remaining = TOOL_CAP.saturating_sub(codemux.len());
-    let dropped: Vec<McpTool> = others.split_off(remaining.min(others.len()));
-    let mut dropped_servers: Vec<String> =
-        dropped.iter().map(|t| t.server_id.clone()).collect();
-    dropped_servers.sort();
-    dropped_servers.dedup();
-
-    let mut kept: Vec<McpTool> = codemux;
-    kept.extend(others);
-    CappedTools {
-        tools: kept,
-        total_before_cap,
-        dropped_count: dropped.len(),
-        dropped_servers,
-    }
 }
 
 // ── Helper: resolve a non-Codemux source name to a stable id key for
@@ -654,91 +592,4 @@ mod tests {
         assert_eq!(agg[0].prefixed_name, "mcp__a__t");
     }
 
-    #[test]
-    fn tool_cap_protects_codemux_tools() {
-        let mut tools: Vec<McpTool> = Vec::new();
-        for i in 0..40 {
-            tools.push(McpTool {
-                name: format!("c{}", i),
-                prefixed_name: format!("mcp__codemux__c{}", i),
-                description: None,
-                input_schema: json!({}),
-                server_id: "codemux-self".into(),
-            });
-        }
-        for i in 0..30 {
-            tools.push(McpTool {
-                name: format!("g{}", i),
-                prefixed_name: format!("mcp__github__g{}", i),
-                description: None,
-                input_schema: json!({}),
-                server_id: "github".into(),
-            });
-        }
-        let capped = apply_tool_cap(tools);
-        let codemux_count = capped
-            .tools
-            .iter()
-            .filter(|t| t.prefixed_name.starts_with("mcp__codemux__"))
-            .count();
-        assert_eq!(codemux_count, 40, "all 40 codemux tools must survive");
-        assert_eq!(capped.tools.len(), TOOL_CAP);
-        assert_eq!(capped.total_before_cap, 70);
-        assert_eq!(capped.dropped_count, 20);
-        assert_eq!(capped.dropped_servers, vec!["github".to_string()]);
-    }
-
-    #[test]
-    fn tool_cap_no_op_when_under_cap() {
-        let tools = vec![McpTool {
-            name: "x".into(),
-            prefixed_name: "mcp__a__x".into(),
-            description: None,
-            input_schema: json!({}),
-            server_id: "a".into(),
-        }];
-        let capped = apply_tool_cap(tools);
-        assert_eq!(capped.tools.len(), 1);
-        assert_eq!(capped.dropped_count, 0);
-        assert!(capped.dropped_servers.is_empty());
-    }
-
-    #[test]
-    fn tool_cap_dropped_servers_distinct_and_sorted() {
-        let mut tools: Vec<McpTool> = Vec::new();
-        // 5 codemux tools (protected) + 50 across two foreign servers
-        for i in 0..5 {
-            tools.push(McpTool {
-                name: format!("c{}", i),
-                prefixed_name: format!("mcp__codemux__c{}", i),
-                description: None,
-                input_schema: json!({}),
-                server_id: "codemux-self".into(),
-            });
-        }
-        for i in 0..30 {
-            tools.push(McpTool {
-                name: format!("a{}", i),
-                prefixed_name: format!("mcp__alpha__a{}", i),
-                description: None,
-                input_schema: json!({}),
-                server_id: "alpha".into(),
-            });
-        }
-        for i in 0..20 {
-            tools.push(McpTool {
-                name: format!("b{}", i),
-                prefixed_name: format!("mcp__beta__b{}", i),
-                description: None,
-                input_schema: json!({}),
-                server_id: "beta".into(),
-            });
-        }
-        let capped = apply_tool_cap(tools);
-        // Codemux: 5; remaining slot: 45; alpha listed first → fills
-        // remaining 30 slots, beta gets 15, dropping 5 beta entries.
-        assert_eq!(capped.tools.len(), TOOL_CAP);
-        assert_eq!(capped.dropped_count, 5);
-        assert_eq!(capped.dropped_servers, vec!["beta".to_string()]);
-    }
 }

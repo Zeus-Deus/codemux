@@ -18,7 +18,7 @@ use crate::mcp::{
     },
     paths::{enumerate_mcp_paths, is_claude_wrapped_path},
     registry::{McpRegistry, McpServerRuntime},
-    runtime::{CappedTools, McpTool},
+    runtime::McpTool,
     source_rank, McpConfigSource, McpServerConfig,
 };
 
@@ -163,9 +163,8 @@ pub async fn restart_mcp_server_cmd<R: Runtime>(
     registry.restart_server(Some(&app), &id).await
 }
 
-/// Aggregate every running server's tools, with the 50-tool cap
-/// applied. Stage 3 will use this to register tools with the Claude
-/// SDK; Stage 2 exposes it for debugging via DevTools.
+/// Aggregate every running server's tools. Used to register tools
+/// with agent providers and exposed for debugging via DevTools.
 #[tauri::command]
 pub async fn list_mcp_tools(
     registry: State<'_, McpRegistry>,
@@ -173,19 +172,8 @@ pub async fn list_mcp_tools(
     Ok(registry.list_all_tools().await)
 }
 
-/// Same as `list_mcp_tools` but returns the full [`CappedTools`]
-/// envelope so the Settings UI can render a "N tools dropped to fit
-/// cap" banner when the cap engaged.
-#[tauri::command]
-pub async fn list_mcp_tools_with_cap_info(
-    registry: State<'_, McpRegistry>,
-) -> Result<CappedTools, String> {
-    Ok(registry.list_all_tools_with_cap_info().await)
-}
-
-/// Tools registered by a single server, uncapped. Used by the
-/// Settings tool-list modal so the user sees the full surface even
-/// when some tools were dropped from the agent's view to fit the cap.
+/// Tools registered by a single server. Drives the Settings
+/// tool-list modal.
 #[tauri::command]
 pub async fn list_mcp_tools_for_server(
     registry: State<'_, McpRegistry>,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { AlertTriangle, Loader2, RotateCw, Server } from "lucide-react";
+import { Info, Loader2, RotateCw, Server } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,19 +16,15 @@ import { cn } from "@/lib/utils";
 import { useMcpStore } from "@/stores/mcp-store";
 import {
   listMcpServers,
-  listMcpToolsWithCapInfo,
   MCP_CODEMUX_SELF_ID,
-  MCP_STATUS_CHANGED_EVENT,
   primeMcpRuntime,
   restartMcpServerCmd,
   startMcpServerCmd,
   stopMcpServerCmd,
-  type CappedTools,
   type McpConfigSource,
   type McpServerConfig,
   type McpServerRuntime,
 } from "@/tauri/commands";
-import { listen } from "@tauri-apps/api/event";
 
 import { McpToolModal } from "./mcp-tool-modal";
 
@@ -36,6 +32,12 @@ import { McpToolModal } from "./mcp-tool-modal";
  *  this surface a "taking longer than usual" hint. 3 s matches
  *  Cursor's UX. */
 const SLOW_START_THRESHOLD_MS = 3000;
+
+/** Advisory-only threshold. Every tool from every enabled server is
+ *  always registered with the agent — nothing is ever dropped. Above
+ *  this total we show an informational note, because very large tool
+ *  lists cost context tokens and can degrade tool selection. */
+const MANY_TOOLS_THRESHOLD = 80;
 
 interface Props {
   /** Active workspace's project root (or null when no project is selected
@@ -70,19 +72,6 @@ export function McpSection({ projectRoot }: Props) {
   const toggleDisabled = useMcpStore((s) => s.toggleDisabled);
   const syncToBackend = useMcpStore((s) => s.syncToBackend);
 
-  // Stage 4 — cap envelope. Refreshed alongside the server list and
-  // also after every `mcp-status-changed` event so the banner stays
-  // accurate as servers come up / go down.
-  const [capInfo, setCapInfo] = useState<CappedTools | null>(null);
-  const refreshCapInfo = useCallback(async () => {
-    try {
-      const info = await listMcpToolsWithCapInfo();
-      setCapInfo(info);
-    } catch (err) {
-      console.warn("[mcp] listMcpToolsWithCapInfo failed:", err);
-    }
-  }, []);
-
   // Stage 4 — modal state. Click a row → set `pendingServer` →
   // McpToolModal renders. Closing nulls it out.
   const [pendingServer, setPendingServer] =
@@ -96,53 +85,33 @@ export function McpSection({ projectRoot }: Props) {
       setServers(result);
       await syncToBackend();
       await primeMcpRuntime(projectRoot);
-      await refreshCapInfo();
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
       setLoaded(true);
     }
-  }, [projectRoot, syncToBackend, refreshCapInfo]);
+  }, [projectRoot, syncToBackend]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  // Re-fetch cap info whenever a runtime status changes — a server
-  // coming up or going down can flip whether the cap is engaged.
-  // `listen()` throws synchronously when `window.__TAURI_INTERNALS__`
-  // is missing (jsdom tests without the Tauri shim mocked); wrap in
-  // try/catch so the section degrades gracefully under those envs.
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    try {
-      void listen(MCP_STATUS_CHANGED_EVENT, () => {
-        if (cancelled) return;
-        void refreshCapInfo();
-      })
-        .then((dispose) => {
-          if (cancelled) {
-            dispose();
-            return;
-          }
-          unlisten = dispose;
-        })
-        .catch((err) => {
-          console.warn("[mcp-section] listen failed:", err);
-        });
-    } catch (err) {
-      console.warn("[mcp-section] listen threw synchronously:", err);
-    }
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, [refreshCapInfo]);
-
   const groups = useMemo(() => groupByPrimarySource(servers), [servers]);
   const collidingNames = useMemo(() => collidingNameSet(servers), [servers]);
+
+  // Live total across running servers. The runtime hook already
+  // tracks `mcp-status-changed`, so this stays current as servers
+  // come up / go down.
+  const totalTools = useMemo(() => {
+    let sum = 0;
+    for (const runtime of runtimes.values()) {
+      if (runtime.status.kind === "running") {
+        sum += runtime.status.toolCount;
+      }
+    }
+    return sum;
+  }, [runtimes]);
 
   return (
     <div>
@@ -198,8 +167,8 @@ export function McpSection({ projectRoot }: Props) {
         </p>
       ) : (
         <TooltipProvider>
-          {capInfo && capInfo.droppedCount > 0 && (
-            <CapBanner info={capInfo} />
+          {totalTools > MANY_TOOLS_THRESHOLD && (
+            <ToolLoadNote total={totalTools} />
           )}
           <div className="space-y-6">
             {groups.map((group) => (
@@ -209,9 +178,6 @@ export function McpSection({ projectRoot }: Props) {
                 servers={group.servers}
                 collidingNames={collidingNames}
                 runtimes={runtimes}
-                cappedServerIds={
-                  new Set(capInfo?.droppedServers ?? [])
-                }
                 isDisabled={isDisabled}
                 toggleDisabled={toggleDisabled}
                 projectRoot={projectRoot}
@@ -233,27 +199,20 @@ export function McpSection({ projectRoot }: Props) {
   );
 }
 
-/** Stage 4 cap banner. Shown only when `apply_tool_cap` actually
- *  trimmed user-MCP tools to fit the 50-tool budget. Codemux's tools
- *  are protected so this banner is purely about user installs. */
-function CapBanner({ info }: { info: CappedTools }) {
+/** Informational note for heavy tool loads. Purely advisory — every
+ *  tool is still registered with the agent; nothing is dropped. */
+function ToolLoadNote({ total }: { total: number }) {
   return (
     <div
-      data-testid="mcp-cap-banner"
-      className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/10 px-3 py-2 text-xs text-status-working dark:text-status-working"
+      data-testid="mcp-tool-load-note"
+      className="mb-4 flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
     >
-      <AlertTriangle className="size-3.5 shrink-0 mt-0.5" aria-hidden />
-      <div className="flex-1">
-        <p className="font-medium">
-          {info.totalBeforeCap - info.droppedCount} of {info.totalBeforeCap}{" "}
-          tools registered with the agent
-        </p>
-        <p className="mt-0.5 text-status-working/80 dark:text-status-working/80">
-          Codemux's built-in tools are protected; {info.droppedCount} user
-          MCP tool{info.droppedCount === 1 ? " was" : "s were"} dropped to
-          fit the cap. Disable a server in this list to reclaim slots.
-        </p>
-      </div>
+      <Info className="size-3.5 shrink-0 mt-0.5" aria-hidden />
+      <p className="flex-1">
+        {total} tools are registered with the agent. Large tool lists
+        use more context and can make tool selection less reliable —
+        consider disabling servers you rarely use.
+      </p>
     </div>
   );
 }
@@ -263,7 +222,6 @@ function ServerGroup({
   servers,
   collidingNames,
   runtimes,
-  cappedServerIds,
   isDisabled,
   toggleDisabled,
   projectRoot,
@@ -273,7 +231,6 @@ function ServerGroup({
   servers: McpServerConfig[];
   collidingNames: Set<string>;
   runtimes: Map<string, McpServerRuntime>;
-  cappedServerIds: Set<string>;
   isDisabled: (id: string) => boolean;
   toggleDisabled: (id: string) => void;
   projectRoot: string | null;
@@ -296,7 +253,6 @@ function ServerGroup({
               server={server}
               runtime={runtimes.get(server.id) ?? null}
               showSourceDisambiguator={collidingNames.has(server.name)}
-              capped={cappedServerIds.has(server.id)}
               disabled={isDisabled(server.id)}
               onToggle={() => toggleDisabled(server.id)}
               onView={() => onView(server)}
@@ -313,7 +269,6 @@ function ServerRow({
   server,
   runtime,
   showSourceDisambiguator,
-  capped,
   disabled,
   onToggle,
   onView,
@@ -322,7 +277,6 @@ function ServerRow({
   server: McpServerConfig;
   runtime: McpServerRuntime | null;
   showSourceDisambiguator: boolean;
-  capped: boolean;
   disabled: boolean;
   onToggle: () => void;
   onView: () => void;
@@ -396,23 +350,6 @@ function ServerRow({
             </Badge>
           )}
           <McpStatusBadge runtime={runtime} disabled={disabled} server={server} />
-          {capped && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Badge
-                  variant="outline"
-                  className="text-[10px] cursor-help border-status-working/50 text-status-working dark:text-status-working"
-                  data-testid={`mcp-row-${server.id}-capped`}
-                >
-                  capped
-                </Badge>
-              </TooltipTrigger>
-              <TooltipContent className="max-w-xs text-xs">
-                Some tools from this server were dropped to fit the
-                50-tool cap. Disable other servers to reclaim slots.
-              </TooltipContent>
-            </Tooltip>
-          )}
           {additionalSources.length > 0 && (
             <span
               className="text-[10px] text-muted-foreground/80"

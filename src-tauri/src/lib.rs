@@ -1968,7 +1968,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::stop_mcp_server_cmd,
             commands::restart_mcp_server_cmd,
             commands::list_mcp_tools,
-            commands::list_mcp_tools_with_cap_info,
             commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,
             commands::activate_workspace,

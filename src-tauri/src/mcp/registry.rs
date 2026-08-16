@@ -34,8 +34,7 @@ use super::parser::{
 };
 use super::paths::{enumerate_mcp_paths, is_claude_wrapped_path};
 use super::runtime::{
-    aggregate_tools, apply_tool_cap, start_mcp_server, CappedTools, McpServerHandle,
-    McpServerStatus, McpTool,
+    aggregate_tools, start_mcp_server, McpServerHandle, McpServerStatus, McpTool,
 };
 use super::{McpConfigSource, McpServerConfig};
 
@@ -402,13 +401,12 @@ impl McpRegistry {
         out
     }
 
-    /// All currently-running tools across all servers, with the 50-tool
-    /// cap applied. Codemux's tools always survive the cap. Returns
-    /// the trimmed `Vec<McpTool>` for the common path; use
-    /// [`Self::list_all_tools_with_cap_info`] when the caller (e.g.
-    /// the Settings UI) needs to know whether the cap was triggered.
+    /// All currently-running tools across all servers. No cap is
+    /// applied — every tool from every enabled server is exposed; the
+    /// per-server toggle in Settings is the user's control surface.
     pub async fn list_all_tools(&self) -> Vec<McpTool> {
-        self.list_all_tools_with_cap_info().await.tools
+        let inner = self.inner.lock().await;
+        aggregate_tools(&inner.handles)
     }
 
     /// Running tools except servers already native to `source`. This lets a
@@ -441,7 +439,7 @@ impl McpRegistry {
                 tools.extend(handle.tools.iter().cloned());
             }
         }
-        super::runtime::apply_tool_cap(tools).tools
+        tools
     }
 
     /// Stage a running server with a single tool, for tests in sibling
@@ -476,18 +474,8 @@ impl McpRegistry {
         self.inner.lock().await.handles.insert(id.into(), handle);
     }
 
-    /// Like [`Self::list_all_tools`] but returns the full
-    /// [`CappedTools`] envelope so the Settings UI can render a
-    /// "23 tools dropped to fit cap" banner.
-    pub async fn list_all_tools_with_cap_info(&self) -> CappedTools {
-        let inner = self.inner.lock().await;
-        apply_tool_cap(aggregate_tools(&inner.handles))
-    }
-
-    /// Every tool registered by `server_id`, regardless of whether
-    /// the cap kicked in. Used by the Settings tool-list modal so the
-    /// user sees a server's full surface even when some tools were
-    /// dropped from the agent's view to fit `TOOL_CAP`.
+    /// Every tool registered by `server_id`. Used by the Settings
+    /// tool-list modal to show a server's full surface.
     pub async fn list_tools_for_server(&self, server_id: &str) -> Vec<McpTool> {
         let inner = self.inner.lock().await;
         inner
@@ -855,6 +843,59 @@ mod tests {
             ])
             .await;
         assert!(tools.is_empty());
+    }
+
+    /// Regression guard: a large built-in tool surface must never
+    /// crowd out user MCP tools. An earlier hard cap silently dropped
+    /// every user tool once Codemux's own tools outgrew the budget,
+    /// which made shared servers unreachable from providers that rely
+    /// on injection.
+    #[tokio::test]
+    async fn large_builtin_surface_never_drops_user_tools() {
+        let reg = McpRegistry::new();
+        {
+            let mut inner = reg.inner.lock().await;
+            let mut config = make_config("codemux-self", "codemux", "/bin/true");
+            config.sources = vec![McpConfigSource::Codemux];
+            let mut builtin = McpServerHandle::discovered(config);
+            builtin.status = McpServerStatus::Running { tool_count: 100 };
+            for i in 0..100 {
+                builtin.tools.push(McpTool {
+                    name: format!("t{i}"),
+                    prefixed_name: format!("mcp__codemux__t{i}"),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    server_id: "codemux-self".into(),
+                });
+            }
+            inner.handles.insert("codemux-self".into(), builtin);
+
+            let mut config = make_config("user-server", "user-server", "/bin/true");
+            config.sources = vec![McpConfigSource::ClaudeUser];
+            let mut user = McpServerHandle::discovered(config);
+            user.status = McpServerStatus::Running { tool_count: 4 };
+            for i in 0..4 {
+                user.tools.push(McpTool {
+                    name: format!("u{i}"),
+                    prefixed_name: format!("mcp__user-server__u{i}"),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                    server_id: "user-server".into(),
+                });
+            }
+            inner.handles.insert("user-server".into(), user);
+        }
+
+        // The Codex injection path: excludes Codex-native servers only.
+        let tools = reg
+            .list_all_tools_excluding_source(McpConfigSource::CodexUser)
+            .await;
+        assert_eq!(tools.len(), 104, "no tool may be dropped");
+        let user_tools = tools
+            .iter()
+            .filter(|t| t.server_id == "user-server")
+            .count();
+        assert_eq!(user_tools, 4, "all user MCP tools must be registered");
     }
 
     #[tokio::test]
