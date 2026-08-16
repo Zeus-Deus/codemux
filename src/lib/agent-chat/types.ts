@@ -350,6 +350,11 @@ export interface RuntimeNoticeItem {
   id: ChatItemId;
   seq: number;
   message: string;
+  /** Visual temperature. `"error"` (red) marks a terminal failure —
+   *  the session died and the message is the cause; the default
+   *  (absent / `"warning"`, amber) covers advisories the run may
+   *  recover from (rate-limit rejection, resume fallback). */
+  severity?: "warning" | "error";
 }
 
 export type ChatViewItem =

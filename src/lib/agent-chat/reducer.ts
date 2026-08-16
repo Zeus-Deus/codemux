@@ -1282,6 +1282,45 @@ function applyEventInner(
         // never sets it.
         const interrupted =
           status.status === "error" && state.streaming ? true : state.interrupted;
+        // A session ERROR carries the cause of death ("claude-agent
+        // sidecar exited unexpectedly", "opencode server unreachable").
+        // That message used to be discarded here, leaving the user with
+        // a bare "Run interrupted" and no explanation — surface it as an
+        // inline error notice instead. The backend persists this event
+        // (see `should_persist_event`), so hydrate replays the cause
+        // after a restart too. Skip only when the immediately preceding
+        // notice is the identical message (a session that errors twice
+        // in a row without intervening activity adds nothing new).
+        if (status.status === "error" && status.message) {
+          const message = `Session error: ${status.message}`;
+          const last = settled[settled.length - 1];
+          if (
+            !(
+              last &&
+              last.kind === "runtime_notice" &&
+              last.message === message
+            )
+          ) {
+            const sealed = sealTrailingReasoning(
+              { ...state, messages: settled },
+              now,
+            );
+            const { seq, next } = takeSeq(sealed);
+            const item: RuntimeNoticeItem = {
+              kind: "runtime_notice",
+              id: nextId("notice"),
+              seq,
+              message,
+              severity: "error",
+            };
+            return {
+              ...next,
+              streaming: false,
+              interrupted,
+              messages: [...next.messages, item],
+            };
+          }
+        }
         if (
           settled === state.messages &&
           !state.streaming &&

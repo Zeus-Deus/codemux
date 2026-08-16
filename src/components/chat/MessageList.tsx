@@ -1661,10 +1661,16 @@ function renderAssistantBody(
         </div>
       );
     case "runtime_notice":
-      // Compact muted-amber inline notice (provider rate-limit rejection,
-      // enumerated assistant error) — a left-bordered line in the
-      // assistant gutter. Tokens only (design-system no-hardcoded-color).
-      return (
+      // Compact inline notice — a left-bordered line in the assistant
+      // gutter. Amber for advisories the run may recover from (provider
+      // rate-limit rejection, enumerated assistant error); red for
+      // terminal failures (the session died and this is the cause).
+      // Tokens only (design-system no-hardcoded-color).
+      return item.severity === "error" ? (
+        <div className="select-text border-l-2 border-destructive/40 bg-destructive/10 px-3 py-1.5 text-[12px] text-destructive">
+          {item.message}
+        </div>
+      ) : (
         <div className="select-text border-l-2 border-status-working/40 bg-status-working/10 px-3 py-1.5 text-[12px] text-status-working">
           {item.message}
         </div>

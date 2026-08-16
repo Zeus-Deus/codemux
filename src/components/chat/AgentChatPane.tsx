@@ -123,6 +123,9 @@ import type {
 
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { ProviderStatusNotice } from "./ProviderStatusNotice";
+import { formatProviderError } from "@/lib/agent-chat/provider-error";
+import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { MonitoringBar } from "./MonitoringBar";
 import { SubagentActivityBar } from "./SubagentActivityBar";
@@ -1245,7 +1248,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           setTimeout(() => clearDraft(draftIdToClear), 5000);
         })
         .catch((err) => {
-          toast.error(`Failed to recover chat session: ${err}`);
+          toast.error(
+            `Failed to recover chat session: ${formatProviderError(err)}`,
+          );
+          // A start failure is a strong provider-health signal — re-probe
+          // now (bypassing the TTL) so the status banner explains why.
+          void useProviderHealth.getState().refresh(provider, { force: true });
           // Leave the draft in SendFailed state. The user can re-open
           // the workspace to retry, or close it and start over.
         })
@@ -1284,7 +1292,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setSessionLaunchMode(id, startMode);
       })
       .catch((err) => {
-        toast.error(`Failed to start chat session: ${err}`);
+        toast.error(
+          `Failed to start chat session: ${formatProviderError(err)}`,
+        );
+        // Re-probe provider health now (bypassing the TTL) so the
+        // status banner explains why the session couldn't start.
+        void useProviderHealth.getState().refresh(provider, { force: true });
         startAttempted.current = false;
       })
       .finally(() => setStarting(false));
@@ -1605,7 +1618,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!isContinue) {
           setInputDraft(threadId, rawText);
         }
-        toast.error(`Failed to send turn: ${err}`);
+        toast.error(`Failed to send turn: ${formatProviderError(err)}`);
+        // A failed send may mean the provider runtime itself is broken —
+        // re-probe (bypassing the TTL) so the status banner explains it.
+        void useProviderHealth.getState().refresh(provider, { force: true });
         sendInFlightRef.current = false;
         setIsSending(false);
       }
@@ -2271,7 +2287,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           }
           setSessionLaunchMode(newId, nextMode);
         } catch (err) {
-          toast.error(`Failed to restart session: ${err}`);
+          toast.error(
+            `Failed to restart session: ${formatProviderError(err)}`,
+          );
+          void useProviderHealth
+            .getState()
+            .refresh(provider, { force: true });
         } finally {
           setRestarting(false);
         }
@@ -3137,7 +3158,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ) : null;
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div className="relative flex h-full w-full flex-col bg-background">
+      {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
+          used to fail silently into a perpetual "Working…" spinner.
+          Renders as a floating top overlay; needs `relative` above. */}
+      <ProviderStatusNotice provider={provider} />
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (

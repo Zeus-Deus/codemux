@@ -11,6 +11,7 @@ import type {
   OpenCodeAvailability,
   OpenCodeProviderEntry,
   ProviderChatCapabilities,
+  ProviderHealthReport,
 } from "./types";
 import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
@@ -330,6 +331,14 @@ export const listChatProviderCapabilities = (
   invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
     provider,
   });
+
+/** Probe the health of a chat provider's local runtime (installed /
+ *  runnable / authenticated). Infallible on the backend — a failed
+ *  probe is folded into the report. May take a few seconds for Claude
+ *  (spawns the sidecar), so callers cache via the provider-health
+ *  store rather than invoking per render. */
+export const agentChatProviderHealth = (provider: AgentChatProviderKind) =>
+  invoke<ProviderHealthReport>("agent_chat_provider_health", { provider });
 
 /** Gemini launch-time model list. Backend serves a live harvest when
  *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either

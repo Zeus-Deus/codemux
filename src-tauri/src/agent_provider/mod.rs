@@ -9,6 +9,7 @@ pub mod codex;
 pub mod context_usage;
 pub mod errors;
 pub mod events;
+pub mod health;
 pub mod instance;
 pub mod opencode;
 pub mod pricing;
@@ -17,6 +18,7 @@ pub mod types;
 
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
+pub use health::{ProviderHealthReport, ProviderHealthStatus};
 pub use events::{
     child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
     PlanAuthMode, PlanUsageWindow, PlanWindowKind, ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,

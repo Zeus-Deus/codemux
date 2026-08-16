@@ -601,6 +601,48 @@ describe("agent-chat reducer", () => {
     expect(afterError.streaming).toBe(false);
   });
 
+  it("session error surfaces its message as an inline error notice", () => {
+    const base: ChatThreadState = { ...createEmptyThreadState(), streaming: true };
+    const after = applyEvent(base, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "error", message: "claude-agent sidecar exited unexpectedly" },
+    });
+    const notice = after.messages.find((m) => m.kind === "runtime_notice");
+    expect(notice).toMatchObject({
+      kind: "runtime_notice",
+      severity: "error",
+      message: "Session error: claude-agent sidecar exited unexpectedly",
+    });
+    expect(after.streaming).toBe(false);
+    // Errored mid-stream → the Continue affordance must appear.
+    expect(after.interrupted).toBe(true);
+  });
+
+  it("back-to-back identical session errors append only one notice", () => {
+    const base: ChatThreadState = { ...createEmptyThreadState(), streaming: true };
+    const errorEvent: ProviderRuntimeEvent = {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "error", message: "opencode server unreachable" },
+    };
+    const once = applyEvent(base, errorEvent);
+    const twice = applyEvent(once, errorEvent);
+    expect(
+      twice.messages.filter((m) => m.kind === "runtime_notice"),
+    ).toHaveLength(1);
+  });
+
+  it("session closed does not fabricate an error notice", () => {
+    const base: ChatThreadState = { ...createEmptyThreadState(), streaming: true };
+    const after = applyEvent(base, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "closed" },
+    });
+    expect(after.messages.some((m) => m.kind === "runtime_notice")).toBe(false);
+  });
+
   it("turn_completed seals the streaming assistant message and clears streaming", () => {
     let state = runEvents([
       {

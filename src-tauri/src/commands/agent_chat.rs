@@ -3323,6 +3323,27 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
     }
 }
 
+/// Probe the health of a chat provider's local runtime (binary present,
+/// runnable, authenticated) so the chat UI can surface a status banner
+/// BEFORE the user burns minutes on a session that can never work.
+///
+/// Deliberately infallible at the command layer: a failed probe IS the
+/// answer, folded into the report by `check_provider_health`. Not gated
+/// on the agent-chat feature flag for the same reason
+/// `list_chat_provider_capabilities` isn't — read-only diagnostics that
+/// settings surfaces may also consume.
+///
+/// Cost note: the Claude probe spawns the bundled sidecar (bounded by
+/// its 10s probe deadline), Codex/OpenCode shell `--version`-class
+/// commands. Callers should cache — the frontend store applies a TTL
+/// rather than probing per render.
+#[tauri::command]
+pub async fn agent_chat_provider_health(
+    provider: ProviderKind,
+) -> crate::agent_provider::ProviderHealthReport {
+    crate::agent_provider::health::check_provider_health(provider).await
+}
+
 /// List the provider-native slash commands available to a chat thread
 /// anchored at `cwd`. Claude is the only provider that reports a
 /// command vocabulary today (via the Agent SDK's `supportedCommands()`
@@ -6020,6 +6041,15 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // Task plans are durable conversation state. Persist the full
             // replacement event so hydrate uses the same reducer path.
             | ProviderRuntimeEvent::TasksUpdated { .. }
+            // A session ERROR is the durable record of WHY a run died
+            // (sidecar exit, server unreachable). Hydrate replays it into
+            // the inline error notice, so the cause survives a restart —
+            // without it the user only sees a bare "Run interrupted".
+            // Ready/Running/Closed stay live-only lifecycle chatter.
+            | ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Error { .. },
+                ..
+            }
     )
     // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
     // MINTED from a row `persist_user_message` has already written, and
@@ -7386,6 +7416,19 @@ mod tests {
             status: SessionStatus::Ready,
         };
         assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_persist_session_error() {
+        // The error message is the durable record of why a run died;
+        // hydrate replays it into the inline error notice.
+        let e = ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: tid(),
+            status: SessionStatus::Error {
+                message: "claude-agent sidecar exited unexpectedly".into(),
+            },
+        };
+        assert!(should_persist_event(&e));
     }
 
     #[test]
