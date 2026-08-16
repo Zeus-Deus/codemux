@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::detect::ProviderKind;
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 /// What a provider can actually do, declared statically so the UI can
@@ -66,6 +66,8 @@ pub enum Operation {
     DraftReadyCloseReopen,
     ChecksStatus,
     Timeline,
+    ThreadReply,
+    ThreadResolve,
 }
 
 impl Operation {
@@ -81,11 +83,13 @@ impl Operation {
             Operation::DraftReadyCloseReopen => "change a pull request's draft or open state",
             Operation::ChecksStatus => "read check or pipeline status",
             Operation::Timeline => "read a pull request's timeline",
+            Operation::ThreadReply => "reply to a review thread",
+            Operation::ThreadResolve => "resolve or unresolve a review thread",
         }
     }
 
     /// Every operation, for exhaustive tests and for [`OperationCapabilities::all`].
-    pub const ALL: [Operation; 9] = [
+    pub const ALL: [Operation; 11] = [
         Operation::ListRead,
         Operation::Comment,
         Operation::Approve,
@@ -95,6 +99,8 @@ impl Operation {
         Operation::DraftReadyCloseReopen,
         Operation::ChecksStatus,
         Operation::Timeline,
+        Operation::ThreadReply,
+        Operation::ThreadResolve,
     ];
 }
 
@@ -121,6 +127,10 @@ pub struct OperationCapabilities {
     pub draft_ready_close_reopen: bool,
     pub checks_status: bool,
     pub timeline: bool,
+    /// Post a reply into an existing review thread.
+    pub thread_reply: bool,
+    /// Flip a review thread's resolved state, both ways.
+    pub thread_resolve: bool,
 }
 
 impl OperationCapabilities {
@@ -136,6 +146,8 @@ impl OperationCapabilities {
             draft_ready_close_reopen: true,
             checks_status: true,
             timeline: true,
+            thread_reply: true,
+            thread_resolve: true,
         }
     }
 
@@ -150,6 +162,8 @@ impl OperationCapabilities {
             Operation::DraftReadyCloseReopen => self.draft_ready_close_reopen,
             Operation::ChecksStatus => self.checks_status,
             Operation::Timeline => self.timeline,
+            Operation::ThreadReply => self.thread_reply,
+            Operation::ThreadResolve => self.thread_resolve,
         }
     }
 }
@@ -354,6 +368,44 @@ pub trait SourceControlProvider: Send + Sync {
         repo_path: &Path,
         number: u32,
     ) -> Result<Vec<InlineReviewComment>, String>;
+
+    /// Conversation threads on the diff, with their resolution state.
+    ///
+    /// Distinct from [`pull_request_inline_comments`](Self::pull_request_inline_comments),
+    /// which is a flat list of comments and cannot answer "is this still
+    /// open?" — the two coexist because the flat list is what the review
+    /// *summaries* are grouped from.
+    fn pull_request_review_threads(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrReviewThread>, String>;
+
+    /// Reply into a thread.
+    ///
+    /// Both ids because the two hosts address the same act differently:
+    /// GitLab replies to the discussion (`thread_id`), GitHub to the
+    /// thread's first comment (`root_comment_id`, which the thread
+    /// payload carries as `database_id`). An implementation uses the one
+    /// it needs and errors clearly if that one is absent, rather than
+    /// silently posting a top-level comment instead.
+    fn reply_to_review_thread(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        thread_id: &str,
+        root_comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<(), String>;
+
+    /// Resolve (`true`) or unresolve (`false`) a thread.
+    fn set_review_thread_resolved(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<(), String>;
 
     fn submit_pull_request_review(
         &self,

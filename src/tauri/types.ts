@@ -137,6 +137,43 @@ export interface ProviderOperations {
   draft_ready_close_reopen: boolean;
   checks_status: boolean;
   timeline: boolean;
+  /** Post a reply into an existing review thread. */
+  thread_reply: boolean;
+  /** Flip a review thread's resolved state, both ways. */
+  thread_resolve: boolean;
+}
+
+/** Mirrors src-tauri/src/github.rs:PrThreadComment. */
+export interface PrThreadComment {
+  /** Host-stable id — GitHub's node id, GitLab's note number as text. */
+  id: string;
+  /** The same comment's REST id, when the host has one. The join key the
+   *  flat inline-comment list is deduped against, and the resource
+   *  GitHub's reply endpoint addresses. */
+  database_id: number | null;
+  author: string;
+  body: string;
+  created_at: string;
+}
+
+/** Mirrors src-tauri/src/github.rs:PrReviewThread.
+ *
+ *  The unit a reviewer actually works in: a conversation with a place in
+ *  the diff and a state. The flat `InlineReviewComment` list cannot say
+ *  whether anything is still open, which is why this exists alongside it
+ *  rather than instead of it. */
+export interface PrReviewThread {
+  id: string;
+  is_resolved: boolean;
+  /** The lines this was written against left the diff. Labelled, never
+   *  hidden — an outdated objection is still an objection. */
+  is_outdated: boolean;
+  /** Whether this host can resolve *this* thread. Per-thread because on
+   *  GitLab it genuinely is: a plain comment has no resolution state. */
+  is_resolvable: boolean;
+  path: string | null;
+  line: number | null;
+  comments: PrThreadComment[];
 }
 
 // ── PR timeline ──

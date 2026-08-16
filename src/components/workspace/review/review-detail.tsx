@@ -7,17 +7,21 @@ import {
   checkoutDefaultBranchInWorkspace,
   closePullRequest,
   getPrReviewDiff,
+  getPrReviewThreads,
   getPrTimeline,
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
+  replyToPrThread,
   setPrReady,
+  setPrThreadResolved,
   submitPrReview,
   submitPrReviewWithComments,
 } from "@/tauri/commands";
 import type {
   CheckInfo,
   InlineReviewComment,
+  PrReviewThread,
   ProviderOperations,
   PullRequestInfo,
   ReviewComment,
@@ -259,6 +263,53 @@ export function ReviewDetail(props: ReviewDetailProps) {
     staleTime: 30_000,
     refetchInterval: timelineEnabled ? 30_000 : false,
   });
+
+  // ── Review threads ──
+  //
+  // 30s, like the other conversation queries — a reply is not something
+  // you sit and watch arrive. Gated on `list_read` rather than on the
+  // two thread *write* operations, because reading who said what is
+  // reading: a host that serves threads but declares neither write shows
+  // them, without a composer or a Resolve button. A host that declares
+  // nothing never reaches this component at all.
+  const threadsQuery = useQuery({
+    queryKey: ["pr", "review-threads", cwd, pr.number] as const,
+    queryFn: () => getPrReviewThreads(cwd, pr.number),
+    enabled: operations.list_read,
+    staleTime: 30_000,
+    refetchInterval: operations.list_read ? 30_000 : false,
+  });
+
+  // Stale and labelled beats blank: a failed refetch keeps the threads
+  // that are on screen (react-query holds the last good data), and the
+  // notice slot already says how old the surface's data is.
+  const threads: PrReviewThread[] = threadsQuery.data ?? [];
+
+  const replyToThread = useCallback(
+    async (thread: PrReviewThread, body: string) => {
+      await replyToPrThread(
+        cwd,
+        pr.number,
+        thread.id,
+        // GitHub addresses the reply to the thread's first comment;
+        // GitLab addresses the discussion and ignores this.
+        thread.comments[0]?.database_id ?? null,
+        body,
+      );
+      // Only after the host has taken it: the composer clears on this
+      // promise resolving and on nothing else (binding rule 4).
+      await threadsQuery.refetch();
+    },
+    [cwd, pr.number, threadsQuery],
+  );
+
+  const setThreadResolved = useCallback(
+    async (thread: PrReviewThread, resolved: boolean) => {
+      await setPrThreadResolved(cwd, pr.number, thread.id, resolved);
+      await threadsQuery.refetch();
+    },
+    [cwd, pr.number, threadsQuery],
+  );
 
   // Local agent runs for this PR. Subscribed to the store rather than
   // read once, so a handoff started from the Summary tab shows up on the
@@ -1003,8 +1054,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
         <ReviewThreads
           reviews={reviews}
           inlineComments={inlineComments}
-          isLoading={commentsLoading}
+          threads={threads}
+          isLoading={commentsLoading || (threadsQuery.isFetching && !threadsQuery.data)}
           onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
+          // Undeclared ⇒ absent ⇒ never drawn. There is no disabled
+          // reply box and no Resolve button that answers with an
+          // apology; the thread list is simply something you read.
+          onReply={operations.thread_reply && !readOnly ? replyToThread : undefined}
+          onSetResolved={
+            operations.thread_resolve && !readOnly ? setThreadResolved : undefined
+          }
         />
       </div>
       )}

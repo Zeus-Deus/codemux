@@ -101,6 +101,17 @@ const BASE_XS =
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
 
+/**
+ * Neutral at the same small geometry — the reply's own send button.
+ *
+ * Ember on this surface means "an agent will do something". A thread
+ * that offered `Send to agent` and `Reply` in the same tint would say
+ * they were the same kind of act, and there would be two ember chips per
+ * thread in a list of threads. Replying is ordinary work, so it looks
+ * ordinary.
+ */
+export const btnCardXs = `${BASE_XS} bg-card font-medium text-foreground/90 hover:bg-accent/50`;
+
 /** Relative age in the panel's voice: "38m ago", "3d ago", "just now". */
 export function relativeAge(iso: string | null | undefined): string | null {
   if (!iso) return null;

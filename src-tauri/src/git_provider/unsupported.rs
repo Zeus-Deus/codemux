@@ -14,7 +14,7 @@ use super::detect::{DetectedProvider, ProviderKind};
 use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 pub struct UnsupportedProvider {
@@ -260,6 +260,35 @@ impl SourceControlProvider for UnsupportedProvider {
         _number: u32,
     ) -> Result<Vec<InlineReviewComment>, String> {
         self.err("read inline review comments")
+    }
+
+    fn pull_request_review_threads(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<Vec<PrReviewThread>, String> {
+        self.err("read review threads")
+    }
+
+    fn reply_to_review_thread(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _thread_id: &str,
+        _root_comment_id: Option<u64>,
+        _body: &str,
+    ) -> Result<(), String> {
+        self.err("reply to a review thread")
+    }
+
+    fn set_review_thread_resolved(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _thread_id: &str,
+        _resolved: bool,
+    ) -> Result<(), String> {
+        self.err("resolve a review thread")
     }
 
     fn submit_pull_request_review(

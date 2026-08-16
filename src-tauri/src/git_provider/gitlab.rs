@@ -40,7 +40,8 @@ use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    IssueComment, IssueState, PrOverviewItem, PrOverviewStats, PrTimelineEvent,
+    IssueComment, IssueState, PrOverviewItem, PrOverviewStats, PrReviewThread, PrThreadComment,
+    PrTimelineEvent,
     PrTimelineEventKind, PrsOverview,
     PullRequestInfo, ReviewComment,
     MAX_ISSUE_BODY_BYTES,
@@ -768,6 +769,93 @@ pub(crate) fn split_discussions(v: &Value) -> (Vec<ReviewComment>, Vec<InlineRev
     }
 
     (threads, inline)
+}
+
+/// Map the same `discussions` payload into review threads.
+///
+/// GitLab needs no second request for this — a discussion *is* a thread,
+/// and every note carries `resolvable`/`resolved` — which is the one
+/// place this adapter has an easier job than the GitHub one, where
+/// resolution exists only in GraphQL.
+///
+/// Two deliberate gaps:
+/// - `is_outdated` is always false. GitLab does not mark it on the notes
+///   endpoint; deciding it would mean pulling the MR's diff versions and
+///   comparing SHAs per thread, which is a request per thread for a
+///   label. An absent label costs a reader nothing; a wrong one does.
+/// - `is_resolvable` is per thread, because on GitLab it genuinely is:
+///   only diff discussions can be resolved, and a plain comment cannot.
+pub(crate) fn map_discussion_threads(v: &Value) -> Vec<PrReviewThread> {
+    let Some(discussions) = v.as_array() else {
+        return Vec::new();
+    };
+
+    let mut threads = Vec::new();
+    for discussion in discussions {
+        let Some(id) = discussion["id"].as_str() else {
+            continue;
+        };
+        let Some(notes) = discussion["notes"].as_array() else {
+            continue;
+        };
+
+        let mut comments = Vec::new();
+        let mut resolvable = false;
+        let mut all_resolved = true;
+        let mut path = None;
+        let mut line = None;
+
+        for note in notes {
+            if note["system"].as_bool() == Some(true) {
+                continue;
+            }
+            let body = note["body"].as_str().unwrap_or("").to_string();
+            if body.is_empty() {
+                continue;
+            }
+            if note["resolvable"].as_bool() == Some(true) {
+                resolvable = true;
+                if note["resolved"].as_bool() != Some(true) {
+                    all_resolved = false;
+                }
+            }
+            let position = &note["position"];
+            if path.is_none() && !position.is_null() {
+                path = position["new_path"]
+                    .as_str()
+                    .or_else(|| position["old_path"].as_str())
+                    .map(|s| s.to_string());
+                line = position["new_line"]
+                    .as_u64()
+                    .or_else(|| position["old_line"].as_u64())
+                    .map(|n| n as u32);
+            }
+            let note_id = note["id"].as_u64();
+            comments.push(PrThreadComment {
+                id: note_id.map(|n| n.to_string()).unwrap_or_default(),
+                database_id: note_id,
+                author: note["author"]["username"].as_str().unwrap_or("").to_string(),
+                body,
+                created_at: note["created_at"].as_str().unwrap_or("").to_string(),
+            });
+        }
+
+        if comments.is_empty() {
+            continue;
+        }
+
+        threads.push(PrReviewThread {
+            id: id.to_string(),
+            is_resolved: resolvable && all_resolved,
+            is_outdated: false,
+            is_resolvable: resolvable,
+            path,
+            line,
+            comments,
+        });
+    }
+
+    threads
 }
 
 /// Merge three GitLab payloads into the timeline model.
@@ -1569,6 +1657,76 @@ impl SourceControlProvider for GitLabProvider {
         Ok(split_discussions(&discussions).1)
     }
 
+    fn pull_request_review_threads(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrReviewThread>, String> {
+        let discussions = self.discussions(repo_path, number)?;
+        Ok(map_discussion_threads(&discussions))
+    }
+
+    /// GitLab replies to the discussion itself, so the root note id is
+    /// unused — the discussion id is the address.
+    fn reply_to_review_thread(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        thread_id: &str,
+        _root_comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<(), String> {
+        if body.trim().is_empty() {
+            return Err("A reply cannot be empty.".to_string());
+        }
+        self.require_ready()?;
+        run_glab_timed(
+            repo_path,
+            &[
+                "api",
+                "--method",
+                "POST",
+                &format!(
+                    "projects/:id/merge_requests/{number}/discussions/{thread_id}/notes"
+                ),
+                "-f",
+                &format!("body={body}"),
+            ],
+            CALL_TIMEOUT,
+        )?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
+    /// `PUT …/discussions/:id?resolved=…` — the same call both ways.
+    ///
+    /// Sent as a string field rather than a typed one: GitLab parses
+    /// `"true"`/`"false"` on this parameter, and this way the call does
+    /// not depend on how glab's field flags coerce booleans.
+    fn set_review_thread_resolved(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<(), String> {
+        self.require_ready()?;
+        run_glab_timed(
+            repo_path,
+            &[
+                "api",
+                "--method",
+                "PUT",
+                &format!("projects/:id/merge_requests/{number}/discussions/{thread_id}"),
+                "-f",
+                &format!("resolved={resolved}"),
+            ],
+            CALL_TIMEOUT,
+        )?;
+        invalidate_cache(Some(repo_path));
+        Ok(())
+    }
+
     fn pull_request_review_diff(
         &self,
         repo_path: &Path,
@@ -2290,6 +2448,81 @@ gitlab.com
                 ]
             }
         ])
+    }
+
+    /// The same payload read as threads: resolvability and resolution
+    /// come from the notes, which is the whole reason GitLab needs no
+    /// second request where GitHub needs GraphQL.
+    fn resolvable_discussions_fixture() -> Value {
+        serde_json::json!([
+            {
+                "id": "sha-open",
+                "notes": [
+                    {"id": 11, "body": "This leaks a descriptor", "system": false,
+                     "resolvable": true, "resolved": false,
+                     "author": {"username": "root"}, "created_at": "2026-08-07T11:24:05Z",
+                     "position": {"new_path": "src/watch.rs", "old_path": "src/watch.rs",
+                                  "new_line": 61}},
+                    {"id": 12, "body": "on it", "system": false,
+                     "resolvable": true, "resolved": false,
+                     "author": {"username": "dev"}, "created_at": "2026-08-07T11:25:00Z",
+                     "position": {"new_path": "src/watch.rs", "old_path": "src/watch.rs",
+                                  "new_line": 61}}
+                ]
+            },
+            {
+                "id": "sha-done",
+                "notes": [
+                    {"id": 13, "body": "Nit: naming", "system": false,
+                     "resolvable": true, "resolved": true,
+                     "author": {"username": "root"}, "created_at": "2026-08-07T11:26:00Z",
+                     "position": {"new_path": "src/a.rs", "old_path": "src/a.rs", "new_line": 4}}
+                ]
+            },
+            {
+                "id": "sha-plain",
+                "notes": [
+                    {"id": 14, "body": "Overall looks good", "system": false,
+                     "author": {"username": "root"}, "created_at": "2026-08-07T11:27:00Z"}
+                ]
+            }
+        ])
+    }
+
+    #[test]
+    fn discussions_become_threads_carrying_their_resolution_state() {
+        let threads = map_discussion_threads(&resolvable_discussions_fixture());
+        assert_eq!(threads.len(), 3);
+
+        assert_eq!(threads[0].id, "sha-open");
+        assert!(!threads[0].is_resolved);
+        assert!(threads[0].is_resolvable);
+        assert_eq!(threads[0].path.as_deref(), Some("src/watch.rs"));
+        assert_eq!(threads[0].line, Some(61));
+        assert_eq!(threads[0].comments.len(), 2);
+        assert_eq!(threads[0].comments[0].database_id, Some(11));
+
+        assert!(threads[1].is_resolved);
+    }
+
+    /// A plain merge-request comment has no resolution state on GitLab,
+    /// so it must not offer a Resolve button that would 400.
+    #[test]
+    fn a_non_diff_discussion_is_a_thread_but_not_a_resolvable_one() {
+        let threads = map_discussion_threads(&resolvable_discussions_fixture());
+        let plain = threads.iter().find(|t| t.id == "sha-plain").unwrap();
+        assert!(!plain.is_resolvable);
+        assert!(!plain.is_resolved);
+        assert_eq!(plain.path, None);
+    }
+
+    /// System notes and empty bodies are not conversation; a discussion
+    /// made only of them is not a thread.
+    #[test]
+    fn discussions_with_nothing_readable_are_not_threads() {
+        let threads = map_discussion_threads(&discussions_fixture());
+        assert!(threads.iter().all(|t| t.id != "ccc"));
+        assert!(map_discussion_threads(&Value::Null).is_empty());
     }
 
     #[test]

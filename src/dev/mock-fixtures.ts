@@ -33,6 +33,7 @@ import type {
   FileEntry,
   GitFileStatus,
   InlineReviewComment,
+  PrReviewThread,
   LinkedIssue,
   PrTimelineEvent,
   PullRequestInfo,
@@ -3147,6 +3148,170 @@ export const MOCK_PR_INLINE_COMMENTS: Record<number, InlineReviewComment[]> = {
       created_at: minutesAgo(30),
       in_reply_to_id: null,
       pull_request_review_id: 9001,
+    },
+  ],
+};
+
+/**
+ * Review threads — the shape the GraphQL/discussions path returns.
+ *
+ * Deliberately overlapping with `MOCK_PR_INLINE_COMMENTS` by
+ * `database_id`: 8001 and 8002 appear in both, so the dedupe (a comment
+ * that lives in a thread is drawn by the thread, once) is exercised by
+ * simply opening the panel rather than by a test alone. The review
+ * *summary* for #172 (id 9004) is a different resource and survives,
+ * which is the other half of the same rule.
+ */
+export const MOCK_PR_REVIEW_THREADS: Record<number, PrReviewThread[]> = {
+  172: [
+    {
+      id: "PRRT_draft-store",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/stores/draft-store.ts",
+      line: 84,
+      comments: [
+        {
+          id: "PRRC_8001",
+          database_id: 8001,
+          author: OTHER_AUTHOR,
+          body: "Worth a comment on why this survives a reload but not a quit.",
+          created_at: minutesAgo(20),
+        },
+      ],
+    },
+    {
+      id: "PRRT_draft-rail",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/components/sidebar/draft-rail.tsx",
+      line: 132,
+      comments: [
+        {
+          id: "PRRC_8002",
+          database_id: 8002,
+          author: OTHER_AUTHOR,
+          body: "Nit: this map never shrinks.",
+          created_at: minutesAgo(19),
+        },
+        {
+          id: "PRRC_8102",
+          database_id: 8102,
+          author: "mock-dev",
+          body: "It is bounded by the number of open workspaces — but I will add the eviction anyway.",
+          created_at: minutesAgo(12),
+        },
+      ],
+    },
+    {
+      id: "PRRT_outdated",
+      is_resolved: false,
+      is_outdated: true,
+      is_resolvable: true,
+      // Outdated threads keep their path and lose their line: the lines
+      // they were written against are no longer in the diff.
+      path: "src/lib/sessions.ts",
+      line: null,
+      comments: [
+        {
+          id: "PRRC_8201",
+          database_id: 8201,
+          author: OTHER_AUTHOR,
+          body: "This early return skips the flush on the quit path.",
+          created_at: minutesAgo(95),
+        },
+      ],
+    },
+    {
+      id: "PRRT_resolved",
+      is_resolved: true,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src-tauri/src/pty/mod.rs",
+      line: 214,
+      comments: [
+        {
+          id: "PRRC_8301",
+          database_id: 8301,
+          author: OTHER_AUTHOR,
+          body: "Is the handle closed if the spawn fails here?",
+          created_at: minutesAgo(140),
+        },
+        {
+          id: "PRRC_8302",
+          database_id: 8302,
+          author: "mock-dev",
+          body: "It is — the guard drops on the error path. Added a test.",
+          created_at: minutesAgo(130),
+        },
+        {
+          id: "PRRC_8303",
+          database_id: 8303,
+          author: OTHER_AUTHOR,
+          body: "Good, thanks.",
+          created_at: minutesAgo(128),
+        },
+      ],
+    },
+  ],
+  142: [
+    {
+      id: "PRRT_watch",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src-tauri/src/ports/watch.rs",
+      line: 61,
+      comments: [
+        {
+          id: "PRRC_8003",
+          database_id: 8003,
+          author: OTHER_AUTHOR,
+          body: "Descriptor leak: this needs a close on the error path.",
+          created_at: minutesAgo(30),
+        },
+      ],
+    },
+  ],
+  // GitLab: a resolvable diff discussion and a plain comment that has no
+  // resolution state at all — so one draws a Resolve button and the
+  // other does not.
+  88: [
+    {
+      id: "3f1a9c0d5b",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/runner/pipeline.rs",
+      line: 47,
+      comments: [
+        {
+          id: "5501",
+          database_id: 5501,
+          author: "mira",
+          body: "Can this retry loop hit the API more than once per second?",
+          created_at: minutesAgo(48),
+        },
+      ],
+    },
+    {
+      id: "9b2e7d4c1a",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: false,
+      path: null,
+      line: null,
+      comments: [
+        {
+          id: "5502",
+          database_id: 5502,
+          author: "mira",
+          body: "Overall this reads well. One question on the runner.",
+          created_at: minutesAgo(50),
+        },
+      ],
     },
   ],
 };

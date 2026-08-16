@@ -34,6 +34,8 @@ export const NO_OPERATIONS: ProviderOperations = {
   draft_ready_close_reopen: false,
   checks_status: false,
   timeline: false,
+  thread_reply: false,
+  thread_resolve: false,
 };
 
 /** Everything declared — what the GitHub adapter returns.
@@ -51,6 +53,8 @@ export const ALL_OPERATIONS: ProviderOperations = {
   draft_ready_close_reopen: true,
   checks_status: true,
   timeline: true,
+  thread_reply: true,
+  thread_resolve: true,
 };
 
 export const PROVIDER_AUTH_TTL_MS = 60_000;

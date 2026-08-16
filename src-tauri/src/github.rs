@@ -256,6 +256,54 @@ pub struct InlineReviewComment {
     pub pull_request_review_id: Option<u64>,
 }
 
+/// One comment inside a review thread.
+///
+/// `id` is a string because the two hosts' id spaces are not both
+/// numbers: GitHub's is an opaque GraphQL node id, GitLab's is a note
+/// number. Nothing but React keys and equality is done with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrThreadComment {
+    pub id: String,
+    /// The same comment's REST id, when the host has one.
+    ///
+    /// Two jobs, both load-bearing: it is the key the UI dedupes on (an
+    /// inline comment already shown inside a thread must not be drawn a
+    /// second time by the flat comment list), and on GitHub it is the
+    /// resource the reply endpoint addresses.
+    pub database_id: Option<u64>,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// A conversation anchored to a diff — the unit a reviewer replies to
+/// and resolves.
+///
+/// REST's `pulls/{n}/comments` carries none of this: it is a flat list of
+/// comments with no thread identity and no resolution state, which is why
+/// the GitHub implementation of this one type goes through GraphQL while
+/// everything else on the adapter stays on `gh`'s REST surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrReviewThread {
+    /// The id the reply and resolve calls address.
+    pub id: String,
+    pub is_resolved: bool,
+    /// The lines this thread was written against are no longer in the
+    /// diff. Labelled, never hidden — an outdated objection is still an
+    /// objection.
+    pub is_outdated: bool,
+    /// Whether this host can resolve *this* thread.
+    ///
+    /// Not a per-host constant: GitLab only resolves discussions anchored
+    /// to a diff, and a plain merge-request comment there has no
+    /// resolution state at all. Rendering a Resolve button on one would
+    /// be a control that answers a click with a 400.
+    pub is_resolvable: bool,
+    pub path: Option<String>,
+    pub line: Option<u32>,
+    pub comments: Vec<PrThreadComment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
     pub id: u64,
@@ -2235,6 +2283,193 @@ pub fn get_pr_inline_comments(
         .collect())
 }
 
+// ── Review threads ──
+//
+// Three calls, and the first of them is the reason the other two exist.
+//
+// `GET /pulls/{n}/comments` — what `get_pr_inline_comments` above reads —
+// returns comments, not conversations: no thread id, no resolution state,
+// no "this no longer matches a line". Grouping it by `pull_request_review_id`
+// (which is what this surface used to do) reconstructs *who said it in one
+// sitting*, not *what is still open*, and those are different questions.
+// Only GraphQL's `reviewThreads` answers the second, so that is where the
+// thread list comes from.
+
+/// The thread query, written for `gh api graphql --paginate`.
+///
+/// `--paginate` requires exactly two things of a query: an `$endCursor`
+/// variable it can fill, and a `pageInfo` on the connection it should
+/// follow. Both are here, so a pull request with more than one page of
+/// threads yields one JSON document per page rather than a truncated
+/// first page.
+const REVIEW_THREADS_QUERY: &str = "\
+query($owner:String!,$name:String!,$number:Int!,$endCursor:String){\
+repository(owner:$owner,name:$name){\
+pullRequest(number:$number){\
+reviewThreads(first:50,after:$endCursor){\
+pageInfo{hasNextPage endCursor}\
+nodes{id isResolved isOutdated path line \
+comments(first:50){nodes{id databaseId author{login} body createdAt}}}}}}}";
+
+/// Conversation threads on a pull request's diff, with their resolution
+/// state.
+pub fn get_pr_review_threads(
+    repo_path: &Path,
+    pr_number: u32,
+) -> Result<Vec<PrReviewThread>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let (owner, name) = nwo
+        .split_once('/')
+        .ok_or_else(|| format!("Unexpected repository name: {nwo}"))?;
+
+    // Deliberately `run_gh`, not `run_gh_optional`: a failed thread fetch
+    // has to reach the caller as an error so the surface keeps the
+    // threads it already has and says how old they are. An empty list
+    // means "no threads", and it may only ever mean that.
+    let json = run_gh(
+        repo_path,
+        &[
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            // Typed, so `number` arrives as the Int! the query declares.
+            "-F",
+            &format!("number={pr_number}"),
+            "-f",
+            &format!("query={REVIEW_THREADS_QUERY}"),
+        ],
+    )?;
+
+    Ok(parse_review_threads(&json))
+}
+
+/// Map the GraphQL payload, pagination and all.
+///
+/// Split from the subprocess call so the shape can be tested against a
+/// recorded two-page payload: the parsing is the part that breaks, and
+/// the part a schema change would break silently.
+pub(crate) fn parse_review_threads(json: &str) -> Vec<PrReviewThread> {
+    let mut out = Vec::new();
+
+    for page in parse_paginated_array(json) {
+        let Some(nodes) =
+            page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array()
+        else {
+            continue;
+        };
+
+        for node in nodes {
+            let id = node["id"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() {
+                continue;
+            }
+
+            let comments: Vec<PrThreadComment> = node["comments"]["nodes"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .map(|c| PrThreadComment {
+                            id: c["id"].as_str().unwrap_or_default().to_string(),
+                            database_id: c["databaseId"].as_u64(),
+                            author: c["author"]["login"].as_str().unwrap_or("").to_string(),
+                            body: c["body"].as_str().unwrap_or("").to_string(),
+                            created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+                        })
+                        .filter(|c| !c.body.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // A thread with nothing readable in it is not a thread. It
+            // would render as an empty card with a Resolve button, which
+            // is the worst of both.
+            if comments.is_empty() {
+                continue;
+            }
+
+            out.push(PrReviewThread {
+                id,
+                is_resolved: node["isResolved"].as_bool().unwrap_or(false),
+                is_outdated: node["isOutdated"].as_bool().unwrap_or(false),
+                // Every GitHub review thread can be resolved.
+                is_resolvable: true,
+                path: node["path"].as_str().map(|s| s.to_string()),
+                line: node["line"].as_u64().map(|n| n as u32),
+                comments,
+            });
+        }
+    }
+
+    out
+}
+
+/// Post a reply into an existing thread.
+///
+/// REST, not the `addPullRequestReviewThreadReply` mutation, for one
+/// reason: this endpoint's semantics are unambiguous — the reply is
+/// created, published, and attributed to the caller, full stop. The
+/// mutation's `pullRequestReviewId` input is optional in the schema but
+/// its behaviour when omitted (does the reply publish, or does it sit in
+/// a pending review only the author can see?) is not something this build
+/// can verify against a live host, and a reply that silently lands in a
+/// draft review is exactly the failure this surface is supposed to make
+/// impossible. The thread payload already carries the comment's REST id,
+/// so the certain route costs nothing.
+pub fn reply_to_pr_thread(
+    repo_path: &Path,
+    pr_number: u32,
+    root_comment_id: u64,
+    body: &str,
+) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("A reply cannot be empty.".to_string());
+    }
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/comments/{root_comment_id}/replies");
+    let payload = serde_json::json!({ "body": body });
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &json,
+    )?;
+    Ok(())
+}
+
+/// Resolve or unresolve a thread.
+///
+/// GraphQL-only: resolution has no REST representation at all, in either
+/// direction.
+pub fn set_pr_thread_resolved(
+    repo_path: &Path,
+    thread_id: &str,
+    resolved: bool,
+) -> Result<(), String> {
+    let mutation = if resolved {
+        "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
+    } else {
+        "mutation($threadId:ID!){unresolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
+    };
+
+    run_gh(
+        repo_path,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={mutation}"),
+            "-f",
+            &format!("threadId={thread_id}"),
+        ],
+    )?;
+    Ok(())
+}
+
 // NOTE: As of 2026-04-26 the Review tab UI no longer exposes review
 // submission — the composer was removed in the visual-match PR
 // (`feature/review-tab-visual-match`) in favour of a quieter resting
@@ -4108,5 +4343,98 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         assert_eq!(stats.number, 0);
         assert_eq!(stats.checks, "none");
         assert_eq!(stats.additions, None);
+    }
+
+    // ── Review threads ──
+
+    /// One page of the GraphQL payload, shaped exactly as
+    /// `gh api graphql` returns it (a `data` envelope per page).
+    fn thread_page(cursor_threads: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{cursor_threads}]}}}}}}}}}}"#
+        )
+    }
+
+    const UNRESOLVED_THREAD: &str = r#"{
+        "id":"PRRT_kwDOA","isResolved":false,"isOutdated":false,
+        "path":"src/stores/draft-store.ts","line":84,
+        "comments":{"nodes":[
+          {"id":"PRRC_1","databaseId":8001,"author":{"login":"juliusm"},
+           "body":"Worth a comment on why this survives a reload.","createdAt":"2026-08-16T09:00:00Z"},
+          {"id":"PRRC_2","databaseId":8002,"author":{"login":"mock-dev"},
+           "body":"Added one.","createdAt":"2026-08-16T09:10:00Z"}
+        ]}}"#;
+
+    const RESOLVED_OUTDATED_THREAD: &str = r#"{
+        "id":"PRRT_kwDOB","isResolved":true,"isOutdated":true,
+        "path":"src/pty/mod.rs","line":null,
+        "comments":{"nodes":[
+          {"id":"PRRC_3","databaseId":8003,"author":{"login":"juliusm"},
+           "body":"This close is on the wrong path.","createdAt":"2026-08-16T08:00:00Z"}
+        ]}}"#;
+
+    #[test]
+    fn threads_carry_resolution_state_and_their_comments() {
+        let threads = parse_review_threads(&thread_page(UNRESOLVED_THREAD));
+        assert_eq!(threads.len(), 1);
+        let thread = &threads[0];
+        assert_eq!(thread.id, "PRRT_kwDOA");
+        assert!(!thread.is_resolved);
+        assert!(!thread.is_outdated);
+        // Every GitHub thread can be resolved, so the button is never
+        // drawn against a host that would refuse it.
+        assert!(thread.is_resolvable);
+        assert_eq!(thread.path.as_deref(), Some("src/stores/draft-store.ts"));
+        assert_eq!(thread.line, Some(84));
+        assert_eq!(thread.comments.len(), 2);
+        // The REST id rides along: it is what the reply endpoint
+        // addresses and what the UI dedupes the flat list against.
+        assert_eq!(thread.comments[0].database_id, Some(8001));
+        assert_eq!(thread.comments[0].author, "juliusm");
+    }
+
+    #[test]
+    fn an_outdated_resolved_thread_keeps_both_facts() {
+        let threads = parse_review_threads(&thread_page(RESOLVED_OUTDATED_THREAD));
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].is_resolved);
+        assert!(threads[0].is_outdated);
+        // A thread whose lines left the diff has no line, and that is
+        // not an error — it is the definition of outdated.
+        assert_eq!(threads[0].line, None);
+    }
+
+    /// `--paginate` concatenates one *object* per page here (the timeline
+    /// case concatenates arrays). Reading only the first would silently
+    /// hide every thread past the fiftieth.
+    #[test]
+    fn every_page_of_threads_is_read() {
+        let joined = format!(
+            "{}\n{}",
+            thread_page(UNRESOLVED_THREAD),
+            thread_page(RESOLVED_OUTDATED_THREAD)
+        );
+        let threads = parse_review_threads(&joined);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "PRRT_kwDOA");
+        assert_eq!(threads[1].id, "PRRT_kwDOB");
+    }
+
+    /// A thread with nothing readable in it would render as an empty
+    /// card with a Resolve button — worse than not rendering.
+    #[test]
+    fn a_thread_with_no_readable_comment_is_dropped() {
+        let empty = r#"{"id":"PRRT_kwDOC","isResolved":false,"isOutdated":false,
+            "path":null,"line":null,"comments":{"nodes":[
+            {"id":"PRRC_9","databaseId":9,"author":{"login":"ghost"},"body":"","createdAt":""}]}}"#;
+        assert!(parse_review_threads(&thread_page(empty)).is_empty());
+    }
+
+    /// A payload that is not the shape we expect yields no threads
+    /// rather than a panic: the surface then keeps its last good data.
+    #[test]
+    fn an_unexpected_payload_yields_no_threads() {
+        assert!(parse_review_threads("{}").is_empty());
+        assert!(parse_review_threads("not json at all").is_empty());
     }
 }

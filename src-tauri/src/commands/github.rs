@@ -368,6 +368,68 @@ pub async fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<
     .map_err(|e| format!("get_pr_inline_comments task join failed: {e}"))?
 }
 
+/// Conversation threads with their resolution state.
+///
+/// `ListRead`, not a thread operation of its own: reading who said what
+/// is reading. The two thread *operations* gate the reply box and the
+/// resolve button, so a host that serves threads but cannot be written to
+/// still shows them — read-only, which is exactly right.
+#[tauri::command]
+pub async fn get_pr_review_threads(
+    path: String,
+    pr_number: u32,
+) -> Result<Vec<crate::github::PrReviewThread>, String> {
+    tokio::task::spawn_blocking(move || {
+        provider_for(&path, Operation::ListRead)?.pull_request_review_threads(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_pr_review_threads task join failed: {e}"))?
+}
+
+/// Reply into a thread. Both ids travel because the two hosts address
+/// the same act differently — see `SourceControlProvider::reply_to_review_thread`.
+#[tauri::command]
+pub async fn reply_to_pr_thread(
+    path: String,
+    pr_number: u32,
+    thread_id: String,
+    root_comment_id: Option<u64>,
+    body: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_for(&path, Operation::ThreadReply)?.reply_to_review_thread(
+            Path::new(&path),
+            pr_number,
+            &thread_id,
+            root_comment_id,
+            &body,
+        )
+    })
+    .await
+    .map_err(|e| format!("reply_to_pr_thread task join failed: {e}"))?
+}
+
+/// Resolve or unresolve a thread — one command both ways, because the
+/// button is one button whose label flips.
+#[tauri::command]
+pub async fn set_pr_thread_resolved(
+    path: String,
+    pr_number: u32,
+    thread_id: String,
+    resolved: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_for(&path, Operation::ThreadResolve)?.set_review_thread_resolved(
+            Path::new(&path),
+            pr_number,
+            &thread_id,
+            resolved,
+        )
+    })
+    .await
+    .map_err(|e| format!("set_pr_thread_resolved task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
@@ -779,6 +841,29 @@ mod tests {
             .add_inline_comment(std::path::Path::new("/tmp"), 1, &comment, "abc")
             .is_err());
         assert!(!provider.operations().line_comments);
+    }
+
+    /// Replying and resolving are declarations like any other, and they
+    /// are in `ALL` — which is what makes the refusal test above cover
+    /// them without anyone remembering to add a case.
+    #[test]
+    fn the_thread_operations_are_declared_by_the_hosts_that_serve_them() {
+        assert!(Operation::ALL.contains(&Operation::ThreadReply));
+        assert!(Operation::ALL.contains(&Operation::ThreadResolve));
+
+        let gitlab = GitLabProvider::from_detection(&detected(ProviderKind::GitLab));
+        let unsupported = UnsupportedProvider::from_detection(&detected(ProviderKind::Bitbucket));
+
+        for op in [Operation::ThreadReply, Operation::ThreadResolve] {
+            // Both hosts have a real route for these; GitLab's is the
+            // discussions API it already reads threads from.
+            assert!(check_operation(&GitHubProvider, op).is_ok(), "{op:?}");
+            assert!(check_operation(&gitlab, op).is_ok(), "{op:?}");
+
+            let err = check_operation(&unsupported, op).expect_err("must be refused");
+            assert!(err.contains("Bitbucket"), "{err}");
+            assert!(err.contains(op.describe()), "{err}");
+        }
     }
 
     /// The three verdicts one command carries are three declarations.

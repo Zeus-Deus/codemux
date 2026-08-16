@@ -11,7 +11,7 @@ use super::detect::ProviderKind;
 use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 use crate::github_cache;
 
@@ -239,6 +239,42 @@ impl SourceControlProvider for GitHubProvider {
         number: u32,
     ) -> Result<Vec<InlineReviewComment>, String> {
         github::get_pr_inline_comments(repo_path, number)
+    }
+
+    fn pull_request_review_threads(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrReviewThread>, String> {
+        github::get_pr_review_threads(repo_path, number)
+    }
+
+    /// GitHub replies to the thread's first comment, so `thread_id` is
+    /// unused here — it is the GraphQL node id, which the REST replies
+    /// endpoint does not speak.
+    fn reply_to_review_thread(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        _thread_id: &str,
+        root_comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<(), String> {
+        let comment_id = root_comment_id.ok_or_else(|| {
+            "This thread has no comment to reply to — reload the pull request and try again."
+                .to_string()
+        })?;
+        github::reply_to_pr_thread(repo_path, number, comment_id, body)
+    }
+
+    fn set_review_thread_resolved(
+        &self,
+        repo_path: &Path,
+        _number: u32,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<(), String> {
+        github::set_pr_thread_resolved(repo_path, thread_id, resolved)
     }
 
     fn submit_pull_request_review(

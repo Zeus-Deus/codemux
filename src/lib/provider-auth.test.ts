@@ -7,6 +7,7 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import {
+  NO_OPERATIONS,
   PROVIDER_AUTH_TTL_MS,
   _resetProviderAuthCache,
   fetchProviderAuth,
@@ -84,6 +85,10 @@ describe("fetchProviderAuth", () => {
       installed: false,
       authenticated: false,
       username: null,
+      // A probe that failed knows nothing about what the host can do,
+      // and the backend refuses undeclared operations — so this is the
+      // safe answer, not a degraded one.
+      operations: NO_OPERATIONS,
     });
   });
 });

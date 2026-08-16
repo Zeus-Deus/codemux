@@ -17,6 +17,9 @@ const mockGetCheckLogExcerpt = vi.fn().mockResolvedValue("");
 const mockCheckoutDefaultBranch = vi.fn().mockResolvedValue("main");
 const mockGitPullChanges = vi.fn().mockResolvedValue(undefined);
 const mockGitStashPush = vi.fn().mockResolvedValue(undefined);
+const mockGetPrReviewThreads = vi.fn();
+const mockReplyToPrThread = vi.fn().mockResolvedValue(undefined);
+const mockSetPrThreadResolved = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("@/tauri/commands", () => ({
   submitPrReview: (...a: unknown[]) => mockSubmitPrReview(...a),
@@ -29,6 +32,9 @@ vi.mock("@/tauri/commands", () => ({
   checkoutDefaultBranchInWorkspace: (...a: unknown[]) => mockCheckoutDefaultBranch(...a),
   gitPullChanges: (...a: unknown[]) => mockGitPullChanges(...a),
   gitStashPush: (...a: unknown[]) => mockGitStashPush(...a),
+  getPrReviewThreads: (...a: unknown[]) => mockGetPrReviewThreads(...a),
+  replyToPrThread: (...a: unknown[]) => mockReplyToPrThread(...a),
+  setPrThreadResolved: (...a: unknown[]) => mockSetPrThreadResolved(...a),
 }));
 
 const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
@@ -176,9 +182,35 @@ function primaryGeometry(): string {
     .join(" ");
 }
 
+/** One open thread, carrying the REST id a GitHub reply is addressed to. */
+function threadFixture() {
+  return [
+    {
+      id: "PRRT_1",
+      is_resolved: false,
+      is_outdated: false,
+      is_resolvable: true,
+      path: "src/stores/draft-store.ts",
+      line: 84,
+      comments: [
+        {
+          id: "PRRC_1",
+          database_id: 8001,
+          author: "juliusm",
+          body: "Worth a comment on why this survives a reload.",
+          created_at: new Date(Date.now() - 60_000).toISOString(),
+        },
+      ],
+    },
+  ];
+}
+
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // No threads by default: a test that is not about threads should not
+  // have a second copy of the conversation on screen.
+  mockGetPrReviewThreads.mockResolvedValue([]);
   _resetPrDrafts();
   _resetHeadOidTracking();
 });
@@ -788,5 +820,119 @@ describe("without a workspace (the Pull Requests page)", () => {
     renderDetail({ workspaceId: "ws-1", checkedOutHere: true });
     expect(screen.queryByTestId("detail-checkout")).toBeNull();
     expect(screen.getByTestId("checked-out-here")).toBeInTheDocument();
+  });
+});
+
+// ── Review threads ──
+
+describe("review threads", () => {
+  beforeEach(() => {
+    mockGetPrReviewThreads.mockResolvedValue(threadFixture());
+  });
+
+  it("fetches threads and draws the writes the host declares", async () => {
+    renderDetail();
+    await waitFor(() => expect(mockGetPrReviewThreads).toHaveBeenCalledWith("/repo", 172));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Worth a comment on why this survives a reload/)).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("thread-reply-input-PRRT_1")).toBeInTheDocument();
+    expect(screen.getByTestId("thread-resolve-PRRT_1")).toBeInTheDocument();
+  });
+
+  it("addresses a reply with the thread id and its first comment's REST id", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await waitFor(() => expect(screen.getByTestId("thread-reply-input-PRRT_1")).toBeInTheDocument());
+
+    await user.click(screen.getByTestId("thread-reply-input-PRRT_1"));
+    await user.keyboard("done in the next commit");
+    await user.click(screen.getByTestId("thread-reply-send-PRRT_1"));
+
+    await waitFor(() =>
+      expect(mockReplyToPrThread).toHaveBeenCalledWith(
+        "/repo",
+        172,
+        "PRRT_1",
+        8001,
+        "done in the next commit",
+      ),
+    );
+  });
+
+  it("resolves through the command", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await waitFor(() => expect(screen.getByTestId("thread-resolve-PRRT_1")).toBeInTheDocument());
+
+    await user.click(screen.getByTestId("thread-resolve-PRRT_1"));
+    await waitFor(() =>
+      expect(mockSetPrThreadResolved).toHaveBeenCalledWith("/repo", 172, "PRRT_1", true),
+    );
+  });
+
+  /**
+   * The whole point of the declaration: a host that serves threads but
+   * has not declared the two writes gets a thread list you can read and
+   * not one control that would answer a click with an apology.
+   */
+  it("renders threads read-only when the writes are undeclared", async () => {
+    renderDetail({
+      operations: { ...ALL_OPERATIONS, thread_reply: false, thread_resolve: false },
+    });
+    await waitFor(() =>
+      expect(screen.getByText(/Worth a comment on why this survives a reload/)).toBeInTheDocument(),
+    );
+
+    expect(screen.queryByTestId("thread-reply-input-PRRT_1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("thread-resolve-PRRT_1")).not.toBeInTheDocument();
+  });
+
+  /** A merged pull request is a record; there is nothing to answer. */
+  it("draws no thread writes on a merged pull request", async () => {
+    renderDetail({ pr: makePr({ state: "MERGED", merged_by: "juliusm" }) });
+    await waitFor(() =>
+      expect(screen.getByText(/Worth a comment on why this survives a reload/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("thread-reply-input-PRRT_1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("thread-resolve-PRRT_1")).not.toBeInTheDocument();
+  });
+
+  /** The flat list and the thread must not both draw the same comment. */
+  it("renders a comment carried by a thread exactly once", async () => {
+    renderDetail({
+      inlineComments: [
+        {
+          id: 8001,
+          author: "juliusm",
+          body: "Worth a comment on why this survives a reload.",
+          path: "src/stores/draft-store.ts",
+          line: 84,
+          created_at: new Date(Date.now() - 60_000).toISOString(),
+          in_reply_to_id: null,
+          pull_request_review_id: 9004,
+        },
+      ],
+      reviews: [
+        {
+          id: 9004,
+          author: "juliusm",
+          body: "Left two notes on the draft store; nothing blocking.",
+          state: "COMMENTED",
+          created_at: new Date(Date.now() - 120_000).toISOString(),
+        },
+      ],
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/Worth a comment on why this survives a reload/),
+      ).toHaveLength(1),
+    );
+    // The verdict summary is a different resource and stays.
+    expect(
+      screen.getByText(/Left two notes on the draft store/),
+    ).toBeInTheDocument();
   });
 });

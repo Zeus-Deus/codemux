@@ -51,6 +51,7 @@ import type {
   PrsOverview,
   ReviewComment,
   InlineReviewComment,
+  PrReviewThread,
   PrTimelineEvent,
   PrDraftComment,
   MergeState,
@@ -720,6 +721,37 @@ export const getPrReviewComments = (path: string, prNumber?: number) =>
 
 export const getPrInlineComments = (path: string, prNumber: number) =>
   invoke<InlineReviewComment[]>("get_pr_inline_comments", { path, prNumber });
+
+/** Conversation threads with their resolution state.
+ *
+ *  Not the same call as `getPrInlineComments`: that one is a flat list of
+ *  comments with no thread identity and no resolution state, which is why
+ *  both exist — the flat list is what the review *summaries* are grouped
+ *  from, and this is what "still open" is read from. */
+export const getPrReviewThreads = (path: string, prNumber: number) =>
+  invoke<PrReviewThread[]>("get_pr_review_threads", { path, prNumber });
+
+/** Reply into a thread.
+ *
+ *  Both ids travel because the two hosts address the same act
+ *  differently: GitLab replies to the discussion, GitHub to the thread's
+ *  first comment (`database_id` on that comment). */
+export const replyToPrThread = (
+  path: string,
+  prNumber: number,
+  threadId: string,
+  rootCommentId: number | null,
+  body: string,
+) => invoke("reply_to_pr_thread", { path, prNumber, threadId, rootCommentId, body });
+
+/** Resolve (`true`) or unresolve (`false`) — one command both ways,
+ *  because the button is one button whose label flips. */
+export const setPrThreadResolved = (
+  path: string,
+  prNumber: number,
+  threadId: string,
+  resolved: boolean,
+) => invoke("set_pr_thread_resolved", { path, prNumber, threadId, resolved });
 
 export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
   invoke("submit_pr_review", { path, prNumber, event, body });

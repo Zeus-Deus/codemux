@@ -61,6 +61,7 @@ import {
   MOCK_PR_VIEWER,
   MOCK_PR_REVIEW_REQUESTS,
   MOCK_PR_INLINE_COMMENTS,
+  MOCK_PR_REVIEW_THREADS,
   MOCK_PR_PATH_TO_NUMBER,
   MOCK_PR_REVIEWS,
   MOCK_TEMPLATE_PATH_PATTERN,
@@ -101,6 +102,7 @@ import type {
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
+  PrReviewThread,
   ProviderOperations,
   PullRequestInfo,
   ReviewComment,
@@ -148,6 +150,27 @@ const forcePushedPrs = new Set<number>();
 
 function mutablePr(number: number): PullRequestInfo | undefined {
   return mutablePrs[number];
+}
+
+/** Threads mutate here (reply, resolve) the way they would host-side. */
+const mutablePrThreads: Record<number, PrReviewThread[]> = {};
+
+function threadsFor(number: number): PrReviewThread[] {
+  return (mutablePrThreads[number] ??= structuredClone(
+    MOCK_PR_REVIEW_THREADS[number] ?? [],
+  ));
+}
+
+/** Whether the seeded reply always fails — see `__codemuxMockThreadReplyFail`. */
+let mockThreadReplyFails = false;
+
+/** How long a reply takes. Long enough to see the in-flight state by
+ *  default; `__codemuxMockThreadReplyDelay` stretches it further. */
+let mockThreadReplyDelayMs = 400;
+
+function withThreadOps(operations: ProviderOperations): ProviderOperations {
+  if (mockThreadOpsDeclared) return operations;
+  return { ...operations, thread_reply: false, thread_resolve: false };
 }
 
 function inlineCommentsFor(number: number): InlineReviewComment[] {
@@ -2442,6 +2465,8 @@ const NO_MOCK_OPERATIONS: ProviderOperations = {
   draft_ready_close_reopen: false,
   checks_status: false,
   timeline: false,
+  thread_reply: false,
+  thread_resolve: false,
 };
 
 const ALL_MOCK_OPERATIONS: ProviderOperations = {
@@ -2454,7 +2479,19 @@ const ALL_MOCK_OPERATIONS: ProviderOperations = {
   draft_ready_close_reopen: true,
   checks_status: true,
   timeline: true,
+  thread_reply: true,
+  thread_resolve: true,
 };
+
+/** Flipped by `__codemuxMockThreadOpsOff` so the read-only thread list
+ *  (a host that serves threads but declares neither write) can be looked
+ *  at without inventing a fifth seeded host.
+ *
+ *  Kept in localStorage because the declaration is read once per minute
+ *  and cached: a reload is the quickest way to make the new answer take
+ *  effect, and a switch that a reload undid would be unusable. */
+const THREAD_OPS_OFF_KEY = "codemux-mock-thread-ops-off";
+let mockThreadOpsDeclared = localStorage.getItem(THREAD_OPS_OFF_KEY) !== "1";
 
 const MOCK_PROVIDER_OPERATIONS: Record<string, ProviderOperations> = {
   github: ALL_MOCK_OPERATIONS,
@@ -3401,7 +3438,7 @@ const handlers: Record<string, Handler> = {
       // `git_provider/provider.rs`. GitLab is missing exactly one
       // operation, and Bitbucket declares nothing at all, so both the
       // partial and the empty case are reachable in the running app.
-      operations: MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS,
+      operations: withThreadOps(MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS),
     };
   },
   // Settings → Source Control. Deliberately mixed so both diagnostic
@@ -3674,6 +3711,56 @@ const handlers: Record<string, Handler> = {
   get_pr_inline_comments: (a) => {
     const num = Number(a.prNumber);
     return inlineCommentsFor(num);
+  },
+
+  get_pr_review_threads: (a) => threadsFor(Number(a.prNumber)),
+
+  /**
+   * A reply, with a delay you can see.
+   *
+   * ~400ms on purpose: the promise is what clears the composer, so the
+   * gap between pressing ⌘↵ and the text disappearing is the whole
+   * behaviour being demonstrated — the words are still there while the
+   * request is in flight, and a failure leaves them there for good.
+   */
+  reply_to_pr_thread: (a) => {
+    const num = Number(a.prNumber);
+    const threadId = String(a.threadId ?? "");
+    const body = String(a.body ?? "");
+    return new Promise((resolve, reject) => {
+      setTimeout(() => {
+        if (mockThreadReplyFails) {
+          reject("host unreachable: dial tcp: lookup api.github.com: no such host");
+          return;
+        }
+        const thread = threadsFor(num).find((t) => t.id === threadId);
+        if (!thread) {
+          reject(`No thread ${threadId} on #${num}`);
+          return;
+        }
+        const id = Date.now();
+        thread.comments.push({
+          id: `PRRC_${id}`,
+          database_id: id,
+          author: "mock-dev",
+          body,
+          created_at: new Date().toISOString(),
+        });
+        resolve(undefined);
+      }, mockThreadReplyDelayMs);
+    });
+  },
+
+  set_pr_thread_resolved: (a) => {
+    const num = Number(a.prNumber);
+    const threadId = String(a.threadId ?? "");
+    const thread = threadsFor(num).find((t) => t.id === threadId);
+    if (!thread) return Promise.reject(`No thread ${threadId} on #${num}`);
+    if (!thread.is_resolvable) {
+      return Promise.reject("This discussion cannot be resolved.");
+    }
+    thread.is_resolved = Boolean(a.resolved);
+    return undefined;
   },
 
   get_github_pr_diff_by_path: (a) => prDiffFor(Number(a.prNumber), Boolean(a.full)),
@@ -5063,6 +5150,56 @@ function kickPrOverview(): void {
   return failing
     ? `#${prNumber} is now failing on rust (ubuntu-latest)`
     : `#${prNumber} is green again`;
+};
+
+// Dev affordance: the two thread switches.
+//
+//   __codemuxMockThreadReplyFail(true)   // every reply is refused
+//   __codemuxMockThreadReplyFail(false)  // back to normal
+//
+// The first one is how you see binding rule 4 hold: type a reply, send
+// it, and the words are still in the box with the reason beside them and
+// Retry sending exactly what failed.
+(
+  window as unknown as {
+    __codemuxMockThreadReplyFail: (failing?: boolean) => string;
+  }
+).__codemuxMockThreadReplyFail = (failing = true) => {
+  mockThreadReplyFails = failing;
+  return failing
+    ? "thread replies will now be refused by the host"
+    : "thread replies succeed again";
+};
+
+// How long a reply takes, for looking at the in-flight state.
+//
+//   __codemuxMockThreadReplyDelay(5000)
+(
+  window as unknown as {
+    __codemuxMockThreadReplyDelay: (ms?: number) => string;
+  }
+).__codemuxMockThreadReplyDelay = (ms = 400) => {
+  mockThreadReplyDelayMs = ms;
+  return `thread replies now take ${ms}ms`;
+};
+
+// Withdraw the two thread operations from every host's declaration, so
+// the read-only thread list can be looked at. Switch workspaces (or wait
+// out the 60s provider-auth cache) for the declaration to be re-read.
+//
+//   __codemuxMockThreadOpsOff()       // no composer, no Resolve button
+//   __codemuxMockThreadOpsOff(false)  // declared again
+(
+  window as unknown as {
+    __codemuxMockThreadOpsOff: (off?: boolean) => string;
+  }
+).__codemuxMockThreadOpsOff = (off = true) => {
+  mockThreadOpsDeclared = !off;
+  if (off) localStorage.setItem(THREAD_OPS_OFF_KEY, "1");
+  else localStorage.removeItem(THREAD_OPS_OFF_KEY);
+  return off
+    ? "thread reply/resolve undeclared — reload to see the read-only list"
+    : "thread reply/resolve declared again — reload to pick it up";
 };
 
 // Dev affordance: read back what the agent-handoff buttons actually sent.
