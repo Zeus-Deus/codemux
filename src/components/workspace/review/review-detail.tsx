@@ -939,17 +939,11 @@ export function ReviewDetail(props: ReviewDetailProps) {
         data-testid="review-scroll"
       >
       {activeTab === "timeline" ? (
-        /* Reading surfaces share one measure: every row ends at the
-           same right edge instead of individual elements capping
-           themselves while their controls drift to the window edge.
-           The Code tab opts out — a diff earns the full width. */
-        <div className="mx-auto w-full max-w-[920px]">
-          <ReviewTimeline
-            entries={timelineEntries}
-            loading={timelineQuery.isFetching && !timelineQuery.data}
-            staleAgeMs={timelineStaleAgeMs}
-          />
-        </div>
+        <ReviewTimeline
+          entries={timelineEntries}
+          loading={timelineQuery.isFetching && !timelineQuery.data}
+          staleAgeMs={timelineStaleAgeMs}
+        />
       ) : activeTab === "code" ? (
         <ReviewCodeTab
           draftKey={key}
@@ -972,7 +966,10 @@ export function ReviewDetail(props: ReviewDetailProps) {
       /* Status before description, deliberately: what you need to know
          about this PR right now is whether it's healthy, not what its
          author wrote about it a day ago. */
-      <div className="mx-auto flex w-full max-w-[920px] flex-1 flex-col gap-3 px-3.5 py-3">
+      /* Full width, like the rest of the app's surfaces: the detail is
+         a working pane, not a document page. Only the border gutters
+         hold it off the edges. */
+      <div className="flex flex-1 flex-col gap-3 px-4 py-3">
         <ReviewChecks
           checks={checks}
           isLoading={checksLoading}
