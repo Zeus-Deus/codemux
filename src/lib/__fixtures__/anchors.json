@@ -1,0 +1,17 @@
+[
+  {"path": "app.py", "side": "RIGHT", "line": 47,
+   "text": "def func_45(): return cached('value_45')  # region C modified",
+   "context_before": "def func_44(): return 'value_44'  # region C",
+   "context_after": "def func_46(): return cached('value_46')  # region C modified"},
+  {"path": "app.py", "side": "RIGHT", "line": 5,
+   "text": "def func_05(): return compute('value_05')  # region A modified",
+   "context_before": "def func_04(): return 'value_04'  # region A",
+   "context_after": "def func_06(): return compute('value_06')  # region A modified"},
+  {"path": "app.py", "side": "RIGHT", "line": 21,
+   "text": "def helper_b1(): return 'b1'  # new helper",
+   "context_before": "def func_20(): return 'value_20'  # region A",
+   "context_after": "def helper_b2(): return 'b2'  # new helper"},
+  {"path": "app.py", "side": "LEFT", "line": 5,
+   "text": "def func_05(): return 'value_05'  # region A",
+   "context_before": "def func_04(): return 'value_04'  # region A"}
+]

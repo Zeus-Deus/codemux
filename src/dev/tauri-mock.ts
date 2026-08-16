@@ -48,6 +48,7 @@ import {
   MOCK_CHECK_LOG_EXCERPT,
   MOCK_LOCAL_ONLY_PATH,
   MOCK_PR_CHECKS,
+  MOCK_PR_DIFFS,
   MOCK_PR_HISTORY,
   MOCK_PR_OVERVIEW,
   MOCK_PR_REVIEW_REQUESTS,
@@ -92,6 +93,7 @@ import type {
   PresetStoreSnapshot,
   PullRequestInfo,
   ReviewComment,
+  InlineReviewComment,
   SurfaceSnapshot,
   TabSnapshot,
   TerminalPreset,
@@ -128,9 +130,26 @@ function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
 // without the fixture module ever being touched.
 const mutablePrs: Record<number, PullRequestInfo> = structuredClone(MOCK_PULL_REQUESTS);
 const mutablePrReviews: Record<number, ReviewComment[]> = {};
+/** Inline comments posted during the session, on top of the fixture. */
+const mutablePrInline: Record<number, InlineReviewComment[]> = {};
+/** PRs whose branch has been rewritten by `__codemuxMockForcePush`. */
+const forcePushedPrs = new Set<number>();
 
 function mutablePr(number: number): PullRequestInfo | undefined {
   return mutablePrs[number];
+}
+
+function inlineCommentsFor(number: number): InlineReviewComment[] {
+  return (mutablePrInline[number] ??= [...(MOCK_PR_INLINE_COMMENTS[number] ?? [])]);
+}
+
+/** The diff the Code tab gets: the rewritten one once a force-push has
+ *  been simulated for this PR. */
+function prDiffFor(number: number, full: boolean): string {
+  const entry = MOCK_PR_DIFFS[number];
+  if (!entry) return "";
+  if (!full) return entry.nameOnly;
+  return forcePushedPrs.has(number) ? (entry.afterForcePush ?? entry.full) : entry.full;
 }
 
 /** The PR for a checkout path, via the seeded path→number map. */
@@ -3367,7 +3386,92 @@ const handlers: Record<string, Handler> = {
 
   get_pr_inline_comments: (a) => {
     const num = Number(a.prNumber);
-    return MOCK_PR_INLINE_COMMENTS[num] ?? [];
+    return inlineCommentsFor(num);
+  },
+
+  get_github_pr_diff_by_path: (a) => prDiffFor(Number(a.prNumber), Boolean(a.full)),
+
+  get_pr_review_diff: (a) => prDiffFor(Number(a.prNumber), true),
+
+  add_pr_inline_comment: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const comment = (a.comment ?? {}) as {
+      file?: string;
+      body?: string;
+      line?: number;
+    };
+    inlineCommentsFor(num).push({
+      id: Date.now(),
+      author: "mock-dev",
+      body: String(comment.body ?? ""),
+      path: String(comment.file ?? ""),
+      line: comment.line ?? null,
+      created_at: new Date().toISOString(),
+      in_reply_to_id: null,
+      pull_request_review_id: null,
+    });
+    return undefined;
+  },
+
+  /**
+   * The whole pending review in one call.
+   *
+   * All-or-nothing on purpose, matching the host: the rejection happens
+   * before anything is written, so a failed submit leaves neither a
+   * review nor a stray comment behind — which is what makes "your notes
+   * are still here" true rather than hopeful.
+   */
+  submit_pr_review_with_comments: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const event = String(a.event ?? "comment");
+    const reviewId = Date.now();
+    const reviews = (mutablePrReviews[num] ??= [...(MOCK_PR_REVIEWS[num] ?? [])]);
+    reviews.push({
+      id: reviewId,
+      author: "mock-dev",
+      body: String(a.body ?? ""),
+      state:
+        event === "approve"
+          ? "APPROVED"
+          : event === "request-changes"
+            ? "CHANGES_REQUESTED"
+            : "COMMENTED",
+      created_at: new Date().toISOString(),
+    });
+
+    const comments = Array.isArray(a.comments) ? a.comments : [];
+    const inline = inlineCommentsFor(num);
+    comments.forEach((raw, i) => {
+      const c = raw as { file?: string; body?: string; line?: number };
+      inline.push({
+        id: reviewId + i + 1,
+        author: "mock-dev",
+        body: String(c.body ?? ""),
+        path: String(c.file ?? ""),
+        line: c.line ?? null,
+        created_at: new Date().toISOString(),
+        in_reply_to_id: null,
+        // Grouped under the review that carried them, so they surface
+        // as one thread on Summary rather than N loose remarks.
+        pull_request_review_id: reviewId,
+      });
+    });
+
+    const pr = mutablePr(num);
+    if (pr && event === "approve") pr.review_decision = "APPROVED";
+    if (pr && event === "request-changes") pr.review_decision = "CHANGES_REQUESTED";
+    emitAppState();
+    return undefined;
   },
 
   get_check_log_excerpt: (a) => {
@@ -4571,6 +4675,34 @@ const internals: TauriInternals = {
   workspaceTitle = "Demo",
 ) => {
   emitEvent("notification", { title, body, workspace_title: workspaceTitle });
+};
+
+// Dev affordance: rewrite a PR's branch under you.
+//
+// Flips the head sha and swaps in that PR's `afterForcePush` diff, which
+// is the whole force-push story the Code tab has to survive: the 2.5s
+// detail poll notices the new sha, refetches the diff, and re-anchors
+// every pending note against it. Deterministic — the same call always
+// produces the same rewritten diff — and reversible, so the flow can be
+// walked more than once without a reload.
+//
+//   __codemuxMockForcePush()      // PR 172, the seeded review PR
+//   __codemuxMockForcePush(172, false)   // put it back
+(
+  window as unknown as {
+    __codemuxMockForcePush: (prNumber?: number, rewritten?: boolean) => string;
+  }
+).__codemuxMockForcePush = (prNumber = 172, rewritten = true) => {
+  const pr = mutablePr(prNumber);
+  if (!pr) return `no mock PR #${prNumber}`;
+  if (rewritten) forcePushedPrs.add(prNumber);
+  else forcePushedPrs.delete(prNumber);
+  pr.head_ref_oid = rewritten
+    ? `forcepush${prNumber}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.slice(0, 40)
+    : `mock${prNumber}headsha0000000000000000000`.slice(0, 40);
+  pr.updated_at = new Date().toISOString();
+  emitAppState();
+  return `#${prNumber} head is now ${pr.head_ref_oid}`;
 };
 
 // Dev affordance: read back what the agent-handoff buttons actually sent.

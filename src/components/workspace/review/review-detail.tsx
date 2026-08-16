@@ -1,14 +1,17 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import {
   checkoutDefaultBranchInWorkspace,
   closePullRequest,
+  getPrReviewDiff,
   gitPullChanges,
   gitStashPush,
   mergePullRequest,
   setPrReady,
   submitPrReview,
+  submitPrReviewWithComments,
 } from "@/tauri/commands";
 import type {
   CheckInfo,
@@ -43,13 +46,21 @@ import {
   relativeAge,
   shortAge,
 } from "./review-ui";
+import { ReviewCodeTab, type CodeTabIntent } from "./review-code-tab";
+import { ReviewDraftFooter } from "./review-draft-footer";
+import { ReviewSubmitSheet } from "./review-submit-sheet";
 import {
+  clearLineDrafts,
   clearReviewDraft,
   draftKey as makeDraftKey,
   getLastVerdict,
   getMergeStrategy,
   getReviewDraft,
+  putDiffSnapshot,
+  reanchorLineDrafts,
   setMergeStrategy,
+  submitBlockedReason,
+  useLineDrafts,
 } from "./pr-drafts";
 
 /**
@@ -171,6 +182,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [strategy, setStrategy] = useState(() => getMergeStrategy());
+  const [submitSheetOpen, setSubmitSheetOpen] = useState(false);
+  const [codeIntent, setCodeIntent] = useState<CodeTabIntent | null>(null);
+  const lineDrafts = useLineDrafts(key);
 
   const merged = pr.state.toUpperCase() === "MERGED";
   const closed = pr.state.toUpperCase() === "CLOSED";
@@ -182,6 +196,38 @@ export function ReviewDetail(props: ReviewDetailProps) {
     viewerLogin.toLowerCase() === pr.author.toLowerCase();
 
   const forcePushedAt = noteHeadOid(key, pr.head_ref_oid, merged);
+
+  // ── The diff ──
+  //
+  // Fetched for the Code tab, and also whenever notes are pending even
+  // if you're reading Summary: a force-push has to be able to tell you
+  // how many of your notes stopped matching without you going looking.
+  // Keyed on the head sha, so a rewrite refetches by itself.
+  const needsDiff = activeTab === "code" || lineDrafts.length > 0;
+  const diffQuery = useQuery({
+    queryKey: ["pr", "review-diff", cwd, pr.number, pr.head_ref_oid],
+    queryFn: () => getPrReviewDiff(cwd, pr.number),
+    enabled: needsDiff,
+    staleTime: 60_000,
+  });
+  const diffText = diffQuery.data ?? "";
+
+  useEffect(() => {
+    if (!diffText || !pr.head_ref_oid) return;
+    // Snapshot first: once the notes are re-anchored, the diff they were
+    // written against is the only record of what the author saw, and a
+    // force-pushed commit is not guaranteed to be fetchable later.
+    putDiffSnapshot(key, pr.head_ref_oid, diffText);
+    reanchorLineDrafts(key, diffText, pr.head_ref_oid);
+  }, [diffText, pr.head_ref_oid, key]);
+
+  const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
+  const blockedSubmitReason = submitBlockedReason(lineDrafts, pr.head_ref_oid);
+
+  const openCodeTab = useCallback((kind: CodeTabIntent["kind"]) => {
+    setActiveTab("code");
+    setCodeIntent({ kind, nonce: Date.now() });
+  }, []);
 
   // ── Check arithmetic, shared by the bar sentence and the rail ──
   const { passedCount, failedCount, runningCount } = useMemo(() => {
@@ -270,6 +316,60 @@ export function ReviewDetail(props: ReviewDetailProps) {
       }
     },
     [cwd, pr.number, key, onRefresh],
+  );
+
+  /** What the last submit tried to send, so Retry sends the same thing. */
+  const lastSubmit = useRef<{ verdict: string; body: string } | null>(null);
+
+  /**
+   * The pending review, sent whole.
+   *
+   * One request carrying the verdict, the overall body and every line
+   * note — GitHub creates all of them or none of them, so there is no
+   * state where the author sees half a review. The anchors were checked
+   * against the current diff before this ran; if one still fails, the
+   * drafts survive and the notice offers Retry.
+   */
+  const submitWithNotes = useCallback(
+    async (verdict: string, body: string) => {
+      lastSubmit.current = { verdict, body };
+      setSubmitting(true);
+      setSubmitError(null);
+      try {
+        await submitPrReviewWithComments(
+          cwd,
+          pr.number,
+          verdict,
+          body,
+          lineDrafts.map((d) => ({
+            file: d.path,
+            body: d.body,
+            side: d.side,
+            line: d.line,
+            start_line: d.startLine,
+          })),
+          pr.head_ref_oid ?? "",
+        );
+        clearLineDrafts(key);
+        clearReviewDraft(key);
+        setSubmitSheetOpen(false);
+        onRefresh();
+        toast.success(
+          verdict === "approve"
+            ? "Approved"
+            : verdict === "request-changes"
+              ? "Changes requested"
+              : "Review sent",
+        );
+      } catch (err) {
+        // Nothing was created host-side, and nothing is dropped here.
+        setSubmitSheetOpen(false);
+        setSubmitError(String(err));
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [cwd, pr.number, pr.head_ref_oid, lineDrafts, key, onRefresh],
   );
 
   const confirmMerge = useCallback(
@@ -457,7 +557,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // ── Drift ──
 
   const notice = useMemo((): DriftNotice | null => {
-    const pending = getReviewDraft(key);
+    const pending = getReviewDraft(key) || lineDrafts.length > 0;
     const candidates: DriftNotice[] = [];
 
     if (merged) {
@@ -517,13 +617,32 @@ export function ReviewDetail(props: ReviewDetailProps) {
     }
 
     if (forcePushedAt) {
+      const age = relativeAge(new Date(forcePushedAt).toISOString());
       candidates.push({
         kind: "force-pushed",
         tone: "warn",
-        // Re-anchoring notes onto the new diff is ship 4's problem; for
-        // now this is informational and offers a fresh read.
-        message: <>Force-pushed {relativeAge(new Date(forcePushedAt).toISOString())}</>,
-        actions: [{ label: "Refresh", onClick: onRefresh, emphasis: "strong" }],
+        message: (
+          <>
+            Force-pushed {age}
+            {lineDrafts.length > 0 &&
+              ` · ${unanchoredCount} of your ${plural(lineDrafts.length, "note")} no longer ${
+                unanchoredCount === 1 ? "matches" : "match"
+              } a line`}
+          </>
+        ),
+        actions:
+          lineDrafts.length > 0
+            ? [
+                // The diff they were written against — not refetched,
+                // because a force-pushed commit may already be gone.
+                { label: "Show on old diff", onClick: () => openCodeTab("old-diff") },
+                {
+                  label: "Re-anchor",
+                  onClick: () => openCodeTab("repin"),
+                  emphasis: "strong" as const,
+                },
+              ]
+            : [{ label: "Refresh", onClick: onRefresh, emphasis: "strong" as const }],
       });
     }
 
@@ -588,14 +707,29 @@ export function ReviewDetail(props: ReviewDetailProps) {
         message: (
           <>
             Review didn't send — {submitError}
-            {pending ? " · your notes are still here" : ""}
+            {lineDrafts.length > 0
+              ? ` · your ${plural(lineDrafts.length, "note")} are still here`
+              : pending
+                ? " · your notes are still here"
+                : ""}
           </>
         ),
         actions: [
           { label: "Copy as markdown", onClick: () => copyDraft("Copied as markdown") },
           {
             label: "Retry",
-            onClick: () => void runSubmit(getLastVerdict(key), getReviewDraft(key)),
+            onClick: () => {
+              // Retry sends exactly what failed — the notes included.
+              const last = lastSubmit.current;
+              if (lineDrafts.length > 0) {
+                void submitWithNotes(
+                  last?.verdict ?? getLastVerdict(key),
+                  last?.body ?? getReviewDraft(key),
+                );
+              } else {
+                void runSubmit(getLastVerdict(key), getReviewDraft(key));
+              }
+            },
             emphasis: "primary",
           },
         ],
@@ -639,6 +773,10 @@ export function ReviewDetail(props: ReviewDetailProps) {
     pull,
     stashAndPull,
     runSubmit,
+    lineDrafts,
+    unanchoredCount,
+    openCodeTab,
+    submitWithNotes,
   ]);
 
   // ── Branch controls (page only) ──
@@ -666,9 +804,12 @@ export function ReviewDetail(props: ReviewDetailProps) {
       .catch(() => toast.error("Couldn't copy the branch name"));
   }, [pr.head_branch]);
 
-  // Only Summary has content in this ship. The strip takes a list so
-  // Code and Timeline arrive without the layout below it moving.
-  const tabs: ReviewTab[] = [{ id: "summary", label: "Summary" }];
+  // The strip takes a list, so Timeline can still arrive without the
+  // layout below it moving.
+  const tabs: ReviewTab[] = [
+    { id: "summary", label: "Summary" },
+    { id: "code", label: "Code", count: pr.changed_files ?? null },
+  ];
 
   return (
     <div className="flex min-h-full flex-col" data-testid="review-detail">
@@ -692,9 +833,28 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
       <ReviewTabStrip tabs={tabs} activeId={activeTab} onSelect={setActiveTab} />
 
-      {/* Status before description, deliberately: what you need to know
-          about this PR right now is whether it's healthy, not what its
-          author wrote about it a day ago. */}
+      {activeTab === "code" ? (
+        <ReviewCodeTab
+          draftKey={key}
+          cwd={cwd}
+          prNumber={pr.number}
+          headOid={pr.head_ref_oid}
+          diffText={diffText}
+          // `isFetching`, not `isPending`: a query that isn't running
+          // reports "pending" forever, and a spinner that never resolves
+          // is a worse lie than an empty state.
+          loading={diffQuery.isFetching}
+          error={diffQuery.error ? String(diffQuery.error) : null}
+          // GitLab wants a version triple we don't build yet, so the
+          // control that would need it is not drawn there.
+          canCommentNow={provider.kind === "github" && !readOnly}
+          onPosted={onRefresh}
+          intent={codeIntent}
+        />
+      ) : (
+      /* Status before description, deliberately: what you need to know
+         about this PR right now is whether it's healthy, not what its
+         author wrote about it a day ago. */
       <div className="flex flex-1 flex-col gap-3 px-3.5 py-3">
         <ReviewChecks
           checks={checks}
@@ -731,6 +891,17 @@ export function ReviewDetail(props: ReviewDetailProps) {
           onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
         />
       </div>
+      )}
+
+      {/* Pending notes are named on every tab, not just the one they
+          were written on — a review nobody can see is easy to forget. */}
+      {lineDrafts.length > 0 && !readOnly && (
+        <ReviewDraftFooter
+          drafts={lineDrafts}
+          onDiscard={() => clearLineDrafts(key)}
+          onSubmit={() => setSubmitSheetOpen(true)}
+        />
+      )}
 
       {/* One notice slot, directly above the bar. */}
       {notice && <ReviewDriftNotice notice={notice} />}
@@ -755,6 +926,27 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRebase={() => openPrPath("/conflicts")}
         onResolveConflicts={canHandOff ? resolveConflictsWithAgent : undefined}
       />
+
+      {submitSheetOpen && (
+        <ReviewSubmitSheet
+          open
+          prNumber={pr.number}
+          drafts={lineDrafts}
+          // One draft pool: whatever is half-written in the action bar
+          // is the same text this review's body starts from.
+          initialBody={getReviewDraft(key)}
+          initialVerdict={getLastVerdict(key)}
+          canRequestChanges={provider.kind !== "gitlab"}
+          submitting={submitting}
+          blockedReason={blockedSubmitReason}
+          onReanchor={() => {
+            setSubmitSheetOpen(false);
+            openCodeTab("repin");
+          }}
+          onCancel={() => setSubmitSheetOpen(false)}
+          onSubmit={(verdict, body) => void submitWithNotes(verdict, body)}
+        />
+      )}
 
       {mergeSheetOpen && (
         <MergeSheet

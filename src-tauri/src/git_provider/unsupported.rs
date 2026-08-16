@@ -189,6 +189,36 @@ impl SourceControlProvider for UnsupportedProvider {
         self.err("read a pull request diff")
     }
 
+    fn pull_request_review_diff(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<String, String> {
+        self.err("read a pull request diff")
+    }
+
+    fn add_inline_comment(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _comment: &crate::github::PrDraftComment,
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        self.err("comment on a line")
+    }
+
+    fn submit_review_with_comments(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _event: &str,
+        _body: &str,
+        _comments: &[crate::github::PrDraftComment],
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        self.err("submit a review")
+    }
+
     fn pull_request_checks(
         &self,
         _repo_path: &Path,

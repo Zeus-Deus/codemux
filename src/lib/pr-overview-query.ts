@@ -26,8 +26,10 @@ export const prOverviewKey = (projectRoot: string) =>
 
 export interface ProjectRoot {
   path: string;
-  /** Wire `provider_kind` off any workspace in this root. */
-  providerKind: string;
+  /** Wire `provider_kind` off any workspace in this root. `null` means
+   *  no workspace here has named a host yet — which is not the same as
+   *  "an unrecognised host", and must not be flattened into one. */
+  providerKind: string | null;
   /** Last path segment — what the row prints when the host can't name
    *  the repository. */
   name: string;
@@ -45,14 +47,14 @@ export function useProjectRoots(): ProjectRoot[] {
       if (existing) {
         // A root only needs one workspace to name its product; prefer
         // whichever one actually has an answer.
-        if (existing.providerKind === "unknown" && ws.provider_kind) {
+        if (existing.providerKind == null && ws.provider_kind) {
           existing.providerKind = ws.provider_kind;
         }
         continue;
       }
       roots.set(path, {
         path,
-        providerKind: ws.provider_kind ?? "unknown",
+        providerKind: ws.provider_kind ?? null,
         name: path.split(/[/\\]/).filter(Boolean).pop() ?? path,
       });
     }
@@ -100,7 +102,7 @@ function historyRow(pr: PullRequestInfo, root: ProjectRoot): PrRow {
     state: pr.state,
     projectRoot: root.path,
     repo: repoSlugFromUrl(pr.url) ?? root.name,
-    providerKind: root.providerKind,
+    providerKind: root.providerKind ?? "github",
   };
 }
 
@@ -176,7 +178,11 @@ export function usePrOverview(
           ...item,
           projectRoot: root.path,
           repo: repoSlugFromUrl(item.url) ?? root.name,
-          providerKind: root.providerKind,
+          // An unnamed host is GitHub, per the wire's back-compat rule
+          // (`resolveProvider(null)`). Flattening it to "unknown" instead
+          // made every GitHub pull request on this page render as an
+          // unsupported host — no verdicts, no diff, no merge.
+          providerKind: root.providerKind ?? "github",
         });
       }
     }

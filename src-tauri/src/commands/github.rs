@@ -311,6 +311,59 @@ pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body:
     .map_err(|e| format!("submit_pr_review task join failed: {e}"))?
 }
 
+/// The complete diff for the Code tab. Uncapped where the prompt-facing
+/// `get_github_pr_diff_by_path` is capped, because a reviewer writing
+/// notes has to be looking at all of it.
+#[tauri::command]
+pub async fn get_pr_review_diff(path: String, pr_number: u32) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).pull_request_review_diff(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_pr_review_diff task join failed: {e}"))?
+}
+
+/// Post one line comment immediately. `commit_id` must be the head the
+/// diff on screen came from — see `github::add_pr_inline_comment`.
+#[tauri::command]
+pub async fn add_pr_inline_comment(
+    path: String,
+    pr_number: u32,
+    comment: crate::github::PrDraftComment,
+    commit_id: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).add_inline_comment(Path::new(&path), pr_number, &comment, &commit_id)
+    })
+    .await
+    .map_err(|e| format!("add_pr_inline_comment task join failed: {e}"))?
+}
+
+/// The whole pending review — verdict, body and every line note — as one
+/// request. Empty `comments` falls through to the plain review path.
+#[tauri::command]
+pub async fn submit_pr_review_with_comments(
+    path: String,
+    pr_number: u32,
+    event: String,
+    body: String,
+    comments: Vec<crate::github::PrDraftComment>,
+    commit_id: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).submit_review_with_comments(
+            Path::new(&path),
+            pr_number,
+            &event,
+            &body,
+            &comments,
+            &commit_id,
+        )
+    })
+    .await
+    .map_err(|e| format!("submit_pr_review_with_comments task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
     tokio::task::spawn_blocking(move || {

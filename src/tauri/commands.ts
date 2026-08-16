@@ -49,6 +49,7 @@ import type {
   PrsOverview,
   ReviewComment,
   InlineReviewComment,
+  PrDraftComment,
   MergeState,
   MergeIntoBaseResult,
   ConflictCheckResult,
@@ -710,6 +711,40 @@ export const getPrInlineComments = (path: string, prNumber: number) =>
 
 export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
   invoke("submit_pr_review", { path, prNumber, event, body });
+
+/** The whole unified diff, for the Code tab. Uncapped where
+ *  `getGithubPrDiffByPath` is capped at 100 KB, and uncached on the
+ *  backend so a force-push shows the new patch immediately. */
+export const getPrReviewDiff = (path: string, prNumber: number) =>
+  invoke<string>("get_pr_review_diff", { path, prNumber });
+
+/** Post one line comment now. `commitId` must be the head the rendered
+ *  diff came from — a stale one pins the comment to a superseded commit
+ *  without erroring. */
+export const addPrInlineComment = (
+  path: string,
+  prNumber: number,
+  comment: PrDraftComment,
+  commitId: string,
+) => invoke("add_pr_inline_comment", { path, prNumber, comment, commitId });
+
+/** Verdict, body and every pending line note in a single request. */
+export const submitPrReviewWithComments = (
+  path: string,
+  prNumber: number,
+  event: string,
+  body: string,
+  comments: PrDraftComment[],
+  commitId: string,
+) =>
+  invoke("submit_pr_review_with_comments", {
+    path,
+    prNumber,
+    event,
+    body,
+    comments,
+    commitId,
+  });
 
 // ── GitHub Issues ──
 

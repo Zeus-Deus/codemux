@@ -2637,7 +2637,9 @@ export const MOCK_PULL_REQUESTS: Record<number, PullRequestInfo> = {
     head_branch: "agent/investigate-draft-mode",
     additions: 1180,
     deletions: 33,
-    changed_files: 8,
+    // Agrees with MOCK_PR_DIFFS[172] — the Code tab's count comes from
+    // here and its file list from there, so a mismatch reads as a bug.
+    changed_files: 5,
     body: PR_172_BODY,
     updated_at: minutesAgo(38),
     merge_state_status: "UNSTABLE",
@@ -2653,7 +2655,7 @@ export const MOCK_PULL_REQUESTS: Record<number, PullRequestInfo> = {
     author: OTHER_AUTHOR,
     additions: 58,
     deletions: 4,
-    changed_files: 2,
+    changed_files: 1,
     mergeable: "CONFLICTING",
     merge_state_status: "DIRTY",
     review_decision: "CHANGES_REQUESTED",
@@ -2957,6 +2959,198 @@ export const MOCK_PR_INLINE_COMMENTS: Record<number, InlineReviewComment[]> = {
       pull_request_review_id: 9001,
     },
   ],
+};
+
+// ── PR diffs ────────────────────────────────────────────────────────
+//
+// The Code tab parses these, so they have to be real unified diffs with
+// line numbers that add up — a hunk header that lies about its counts
+// puts every note below it on the wrong line, which is exactly the bug
+// the surface exists to avoid. The anchored inline comments above
+// (draft-store.ts:84, draft-rail.tsx:132, watch.rs:61) are addressable
+// in these.
+
+/** A file big enough to trip the 2,000-changed-line threshold. */
+function hugeFileDiff(): string {
+  const path = "src/generated/api-types.ts";
+  const dels: string[] = [];
+  const adds: string[] = [];
+  for (let i = 1; i <= 1_100; i++) {
+    dels.push(`-export type Op${i} = { kind: "op${i}"; payload: unknown };`);
+    adds.push(`+export type Op${i} = { kind: "op${i}"; payload: Payload${i} };`);
+  }
+  return [
+    `diff --git a/${path} b/${path}`,
+    "index 3f1a0c2..9b7e441 100644",
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    "@@ -1,1100 +1,1100 @@",
+    ...dels,
+    ...adds,
+  ].join("\n");
+}
+
+/**
+ * Diffs are written as line arrays, not template literals.
+ *
+ * A blank context line in a unified diff is a single space, and a
+ * formatter that strips trailing whitespace would silently turn it into
+ * an empty line — which ends the hunk as far as a parser is concerned,
+ * and quietly renumbers everything below it. `BLANK` makes that
+ * un-strippable.
+ */
+const BLANK = " ";
+
+const DRAFT_STORE_DIFF = [
+  "diff --git a/src/stores/draft-store.ts b/src/stores/draft-store.ts",
+  "index 1a2b3c4..5d6e7f8 100644",
+  "--- a/src/stores/draft-store.ts",
+  "+++ b/src/stores/draft-store.ts",
+  "@@ -81,8 +81,12 @@ export const useDraftStore = create<DraftStore>((set, get) => ({",
+  "   /** Drafts are keyed by workspace, not by tab. */",
+  "   drafts: {},",
+  BLANK,
+  "+  /** Restores what you typed after a reload — but not after a quit. */",
+  "+  hydrate: (saved) => set({ drafts: saved }),",
+  "+",
+  "-  setDraft: (workspaceId, text) => {",
+  "-    set((state) => ({ drafts: { ...state.drafts, [workspaceId]: text } }));",
+  "-  },",
+  "+  setDraft: (workspaceId, text) => {",
+  "+    const trimmed = text.trimEnd();",
+  "+    set((state) => ({ drafts: { ...state.drafts, [workspaceId]: trimmed } }));",
+  "+  },",
+  BLANK,
+  "   clearDraft: (workspaceId) => {",
+].join("\n");
+
+/**
+ * The same file after a force-push.
+ *
+ * Two lines carry the demonstration: `hydrate` survives untouched but
+ * slides three rows down (a note on it must move, quietly), and `const
+ * trimmed` is rewritten (a note on it must be reported lost, never
+ * guessed onto the line that replaced it). That is the shape of the live
+ * experiment the matcher was validated against.
+ */
+const DRAFT_STORE_DIFF_AFTER = [
+  "diff --git a/src/stores/draft-store.ts b/src/stores/draft-store.ts",
+  "index 1a2b3c4..77c0e19 100644",
+  "--- a/src/stores/draft-store.ts",
+  "+++ b/src/stores/draft-store.ts",
+  "@@ -81,8 +81,15 @@ export const useDraftStore = create<DraftStore>((set, get) => ({",
+  "   /** Drafts are keyed by workspace, not by tab. */",
+  "   drafts: {},",
+  BLANK,
+  "+  /** Bumped whenever the shape below changes. */",
+  "+  version: 2,",
+  "+",
+  "+  /** Restores what you typed after a reload — but not after a quit. */",
+  "+  hydrate: (saved) => set({ drafts: saved }),",
+  "+",
+  "-  setDraft: (workspaceId, text) => {",
+  "-    set((state) => ({ drafts: { ...state.drafts, [workspaceId]: text } }));",
+  "-  },",
+  "+  setDraft: (workspaceId, text) => {",
+  '+    const cleaned = text.replace(/\\s+$/, "");',
+  "+    set((state) => ({ drafts: { ...state.drafts, [workspaceId]: cleaned } }));",
+  "+  },",
+  BLANK,
+  "   clearDraft: (workspaceId) => {",
+].join("\n");
+
+const DRAFT_RAIL_DIFF = [
+  "diff --git a/src/components/sidebar/draft-rail.tsx b/src/components/sidebar/draft-rail.tsx",
+  "index 7c1da03..2e4f9a1 100644",
+  "--- a/src/components/sidebar/draft-rail.tsx",
+  "+++ b/src/components/sidebar/draft-rail.tsx",
+  "@@ -128,6 +128,8 @@ export function DraftRail({ workspaceId }: Props) {",
+  "   const drafts = useDraftStore((s) => s.drafts);",
+  "   const entries = Object.entries(drafts);",
+  BLANK,
+  "-  const recent = entries.slice(0, 8);",
+  "+  // Cap the rail before it becomes a second sidebar.",
+  "+  const recent = entries.slice(0, MAX_RAIL_ENTRIES);",
+  "+  const overflow = Math.max(0, entries.length - MAX_RAIL_ENTRIES);",
+  BLANK,
+  "   if (!entries.length) return null;",
+].join("\n");
+
+const ICON_BINARY_DIFF = [
+  "diff --git a/src-tauri/icons/128x128.png b/src-tauri/icons/128x128.png",
+  "index 4a1f9c3..b02e7d5 100644",
+  "Binary files a/src-tauri/icons/128x128.png and b/src-tauri/icons/128x128.png differ",
+].join("\n");
+
+const LOCKFILE_DIFF = [
+  "diff --git a/package-lock.json b/package-lock.json",
+  "index aa11bb2..cc33dd4 100644",
+  "--- a/package-lock.json",
+  "+++ b/package-lock.json",
+  "@@ -1204,6 +1204,7 @@",
+  '       "dev": true',
+  "     },",
+  '     "node_modules/zustand": {',
+  '+      "version": "5.0.3",',
+  '       "resolved": "https://registry.npmjs.org/zustand/-/zustand-5.0.2.tgz",',
+  '       "integrity": "sha512-fake"',
+  "     },",
+].join("\n");
+
+const WATCH_RS_DIFF = [
+  "diff --git a/src-tauri/src/ports/watch.rs b/src-tauri/src/ports/watch.rs",
+  "index 9f0e1a2..3c5b8d7 100644",
+  "--- a/src-tauri/src/ports/watch.rs",
+  "+++ b/src-tauri/src/ports/watch.rs",
+  "@@ -57,6 +57,8 @@ impl PortWatcher {",
+  "     pub fn poll_once(&mut self) -> Result<Vec<PortEvent>, String> {",
+  "         let listeners = self.scan()?;",
+  BLANK,
+  '-        let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;',
+  '+        let socket = UdpSocket::bind("127.0.0.1:0")',
+  '+            .map_err(|e| format!("port probe: {e}"))?;',
+  "+        socket.set_nonblocking(true).map_err(|e| e.to_string())?;",
+  BLANK,
+  "         Ok(self.diff(listeners))",
+].join("\n");
+
+/**
+ * Per-PR diffs, in the two forms the backend serves: `nameOnly` mirrors
+ * `gh pr diff --name-only`, `full` is the patch the Code tab renders.
+ * `afterForcePush` is the same PR rewritten — see the mock's
+ * `__codemuxMockForcePush` trigger.
+ */
+export const MOCK_PR_DIFFS: Record<
+  number,
+  { nameOnly: string; full: string; afterForcePush?: string }
+> = {
+  172: {
+    nameOnly: [
+      "src/stores/draft-store.ts",
+      "src/components/sidebar/draft-rail.tsx",
+      "src/generated/api-types.ts",
+      "package-lock.json",
+      "src-tauri/icons/128x128.png",
+    ].join("\n"),
+    full: [
+      DRAFT_STORE_DIFF,
+      DRAFT_RAIL_DIFF,
+      hugeFileDiff(),
+      LOCKFILE_DIFF,
+      ICON_BINARY_DIFF,
+    ].join("\n"),
+    afterForcePush: [
+      DRAFT_STORE_DIFF_AFTER,
+      DRAFT_RAIL_DIFF,
+      hugeFileDiff(),
+      LOCKFILE_DIFF,
+      ICON_BINARY_DIFF,
+    ].join("\n"),
+  },
+  142: {
+    nameOnly: "src-tauri/src/ports/watch.rs",
+    full: WATCH_RS_DIFF,
+  },
 };
 
 /**

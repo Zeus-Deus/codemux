@@ -614,6 +614,27 @@ export interface InlineReviewComment {
   pull_request_review_id: number | null;
 }
 
+/**
+ * One line note on its way to the host.
+ *
+ * `line` + `side` rather than the legacy `position` offset: position is
+ * an index into one exact patch, so a note written a moment before a
+ * push lands on an unrelated line. These are content coordinates and the
+ * host re-resolves them itself.
+ */
+export interface PrDraftComment {
+  /** The file the note is on. Named `file` so it can't be confused with
+   *  the repo `path` every command takes. */
+  file: string;
+  body: string;
+  /** `LEFT` is a deleted line; `RIGHT` is added or context. */
+  side: "LEFT" | "RIGHT";
+  /** Last line of the selection. */
+  line: number;
+  /** First line of a multi-line selection; omitted for a single line. */
+  start_line?: number | null;
+}
+
 export type IssueState = "Open" | "Closed";
 
 export interface IssueComment {

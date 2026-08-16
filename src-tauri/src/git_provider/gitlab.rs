@@ -1366,6 +1366,59 @@ impl SourceControlProvider for GitLabProvider {
         Ok(split_discussions(&discussions).1)
     }
 
+    fn pull_request_review_diff(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<String, String> {
+        // The full-diff path is already the whole patch here; GitLab
+        // returns per-file diffs from the API rather than a capped blob.
+        self.pull_request_diff(repo_path, number, true)
+    }
+
+    /// Not wired yet, and refused rather than approximated.
+    ///
+    /// GitLab does not take a line and a side. It takes a position
+    /// object carrying `base_sha`, `start_sha`, `head_sha`, `old_path`,
+    /// `new_path`, `old_line` and `new_line` together, fetched from
+    /// `merge_requests/:iid/versions`. Getting one of those wrong fails
+    /// with a `line_code` error whose exact shape has not been verified
+    /// against a live instance — and unlike GitHub, a stale position
+    /// here does not silently pin, it 400s. Guessing at an error path
+    /// nobody has seen is how you ship a button that eats a review.
+    ///
+    /// The UI capability-gates on this: "Comment now" is not drawn for
+    /// GitLab at all, so this error is a backstop, not a user-facing
+    /// message.
+    fn add_inline_comment(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _comment: &crate::github::PrDraftComment,
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        Err("Line comments on GitLab aren't wired up yet — they need the \
+             merge request's version shas, not a commit and a line."
+            .to_string())
+    }
+
+    fn submit_review_with_comments(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        event: &str,
+        body: &str,
+        comments: &[crate::github::PrDraftComment],
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        if !comments.is_empty() {
+            return Err("Line notes on GitLab aren't wired up yet — submit the \
+                        review on its own, or copy the notes into its body."
+                .to_string());
+        }
+        self.submit_pull_request_review(repo_path, number, event, body)
+    }
+
     fn submit_pull_request_review(
         &self,
         repo_path: &Path,

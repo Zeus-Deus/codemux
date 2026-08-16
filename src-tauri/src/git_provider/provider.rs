@@ -170,6 +170,37 @@ pub trait SourceControlProvider: Send + Sync {
         full: bool,
     ) -> Result<String, String>;
 
+    /// The complete unified diff, for the surface that renders it.
+    ///
+    /// Separate from `pull_request_diff` because that one is capped for
+    /// prompts: a review has to see every hunk, or notes get written
+    /// against a file the reviewer was never shown.
+    fn pull_request_review_diff(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<String, String>;
+
+    /// Post one line comment now, outside any pending review.
+    fn add_inline_comment(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        comment: &crate::github::PrDraftComment,
+        commit_id: &str,
+    ) -> Result<(), String>;
+
+    /// Submit a verdict and its line notes as a single request.
+    fn submit_review_with_comments(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        event: &str,
+        body: &str,
+        comments: &[crate::github::PrDraftComment],
+        commit_id: &str,
+    ) -> Result<(), String>;
+
     /// CI checks for a pull request. `number = None` means the current
     /// branch's PR — the panel's case; the Pull Requests page passes the
     /// number of whichever PR is selected, which is usually not this

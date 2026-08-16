@@ -714,6 +714,31 @@ pub const MAX_PR_DIFF_BYTES: usize = 100 * 1024;
 /// Truncates the full-diff variant at `MAX_PR_DIFF_BYTES` on a char
 /// boundary so the prompt stays bounded.
 pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, String> {
+    get_pr_diff_capped(repo_path, number, full, MAX_PR_DIFF_BYTES)
+}
+
+/// Cap for the diff the Code tab renders.
+///
+/// A prompt has to stay small; a review surface has to be *complete*.
+/// Truncating here would mean a reviewer scrolls to the end of what
+/// looks like the diff and never learns there was more — and every note
+/// they write below the cut would anchor against lines the host doesn't
+/// agree exist. 4MB clears any pull request a person is going to read
+/// line by line, and the per-file size threshold in the UI is what keeps
+/// the rendering cheap.
+pub const MAX_PR_REVIEW_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
+/// The whole patch, for reviewing rather than summarising.
+pub fn get_pr_review_diff(repo_path: &Path, number: u32) -> Result<String, String> {
+    get_pr_diff_capped(repo_path, number, true, MAX_PR_REVIEW_DIFF_BYTES)
+}
+
+fn get_pr_diff_capped(
+    repo_path: &Path,
+    number: u32,
+    full: bool,
+    max_bytes: usize,
+) -> Result<String, String> {
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
@@ -732,7 +757,7 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     }
     let output = run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?;
 
-    if !full || output.len() <= MAX_PR_DIFF_BYTES {
+    if !full || output.len() <= max_bytes {
         return Ok(output);
     }
 
@@ -740,14 +765,14 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     // signpost what was cut so the agent doesn't silently miss
     // hunks. The trailing pointer mirrors `get_github_issue`'s
     // truncation marker.
-    let mut end = MAX_PR_DIFF_BYTES;
+    let mut end = max_bytes;
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
     Ok(format!(
         "{}\n\n[Diff truncated at {}KB — use `gh pr diff {}` for the full patch]",
         &output[..end],
-        MAX_PR_DIFF_BYTES / 1024,
+        max_bytes / 1024,
         number,
     ))
 }
@@ -1913,6 +1938,166 @@ pub fn submit_pr_review(
         args.push(body);
     }
     run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+/// One pending line note, in the coordinates GitHub's modern review API
+/// speaks: a file, a side, and a line number on that side.
+///
+/// Not the legacy `position` (an offset into the patch text): position
+/// is only meaningful against one exact diff, so a comment written a
+/// second before a push lands somewhere arbitrary. `line` + `side` are
+/// content coordinates and the host re-resolves them itself.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PrDraftComment {
+    /// Path of the file the note is on.
+    pub file: String,
+    pub body: String,
+    /// `LEFT` (a deleted line) or `RIGHT` (added or context).
+    pub side: String,
+    /// Last line of the selection.
+    pub line: u32,
+    /// First line of a multi-line selection; absent for one line.
+    #[serde(default)]
+    pub start_line: Option<u32>,
+}
+
+impl PrDraftComment {
+    fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "path": self.file,
+            "body": self.body,
+            "side": self.side,
+            "line": self.line,
+        });
+        if let Some(start) = self.start_line {
+            v["start_line"] = serde_json::json!(start);
+            // A range can't straddle sides, so the start side is always
+            // the end side; sending it makes that explicit to the API.
+            v["start_side"] = serde_json::json!(self.side);
+        }
+        v
+    }
+}
+
+/// Run `gh` with a JSON body on stdin.
+///
+/// `gh api -f k=v` can only build flat string fields, and a review
+/// carries an array of comment objects. `--input -` is the only way to
+/// post a real JSON document in one command.
+fn run_gh_stdin(repo_path: &Path, args: &[&str], stdin: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = crate::execution::host_command("gh");
+    cmd.args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Keep DBus available — see `check_gh_status` rationale.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run gh: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("gh stdin unavailable")?
+        .write_all(stdin.as_bytes())
+        .map_err(|e| format!("Failed to write to gh: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for gh: {e}"))?;
+
+    gh_exit_result(
+        args.first().unwrap_or(&""),
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Post one inline comment immediately, outside any review.
+///
+/// `commit_id` must be the head the diff on screen was rendered from. A
+/// stale one does not fail: GitHub accepts it and pins the comment to
+/// the superseded commit, where it shows as outdated and nobody reads
+/// it. The caller re-anchors before calling this, and that is the only
+/// reason it is safe.
+pub fn add_pr_inline_comment(
+    repo_path: &Path,
+    pr_number: u32,
+    comment: &PrDraftComment,
+    commit_id: &str,
+) -> Result<(), String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/comments");
+    let mut payload = comment.to_json();
+    payload["commit_id"] = serde_json::json!(commit_id);
+    let body = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &body,
+    )?;
+    Ok(())
+}
+
+fn review_event(event: &str) -> &'static str {
+    match event {
+        "approve" => "APPROVE",
+        "request-changes" => "REQUEST_CHANGES",
+        _ => "COMMENT",
+    }
+}
+
+/// Submit a review and all of its line notes as one request.
+///
+/// One request because the alternative — a review plus N comment posts
+/// — can half-succeed, and a half-sent review is visible to the author
+/// while the reviewer still thinks it's a draft. GitHub makes this
+/// all-or-nothing: a single unresolvable line 422s the whole call and
+/// nothing is created. The caller validates every anchor locally first
+/// so that 422 is a bug, not a workflow.
+pub fn submit_pr_review_with_comments(
+    repo_path: &Path,
+    pr_number: u32,
+    event: &str,
+    body: &str,
+    comments: &[PrDraftComment],
+    commit_id: &str,
+) -> Result<(), String> {
+    if comments.is_empty() {
+        // No line notes: the plain `gh pr review` path stays exactly as
+        // it was, including its handling of an empty body.
+        return submit_pr_review(repo_path, pr_number, event, body);
+    }
+
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/reviews");
+    let payload = serde_json::json!({
+        "commit_id": commit_id,
+        "body": body,
+        "event": review_event(event),
+        "comments": comments.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
+    });
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &json,
+    )
+    .map_err(|e| {
+        // The one error worth translating: it means an anchor went
+        // stale between the local check and the send.
+        if e.contains("Line could not be resolved") {
+            "One of your notes no longer matches a line on this branch — re-anchor and try again.".to_string()
+        } else {
+            e
+        }
+    })?;
     Ok(())
 }
 

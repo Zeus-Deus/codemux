@@ -167,6 +167,43 @@ impl SourceControlProvider for GitHubProvider {
         github_cache::cached_get_pr_diff(repo_path, number, full)
     }
 
+    /// Deliberately uncached.
+    ///
+    /// The diff cache holds entries for five minutes, and the one moment
+    /// this diff must be fresh is the moment a force-push lands — the
+    /// caller re-anchors pending notes against whatever comes back, so a
+    /// stale body here would move notes onto lines that no longer exist.
+    /// React Query holds it client-side keyed by head sha instead.
+    fn pull_request_review_diff(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<String, String> {
+        github::get_pr_review_diff(repo_path, number)
+    }
+
+    fn add_inline_comment(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        comment: &github::PrDraftComment,
+        commit_id: &str,
+    ) -> Result<(), String> {
+        github::add_pr_inline_comment(repo_path, number, comment, commit_id)
+    }
+
+    fn submit_review_with_comments(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        event: &str,
+        body: &str,
+        comments: &[github::PrDraftComment],
+        commit_id: &str,
+    ) -> Result<(), String> {
+        github::submit_pr_review_with_comments(repo_path, number, event, body, comments, commit_id)
+    }
+
     fn pull_request_checks(
         &self,
         repo_path: &Path,

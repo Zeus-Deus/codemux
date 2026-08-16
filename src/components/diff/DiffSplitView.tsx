@@ -1,22 +1,38 @@
-import { useRef, useCallback, useImperativeHandle, forwardRef } from "react";
+import { useRef, useCallback, useImperativeHandle, forwardRef, Fragment } from "react";
 import type { DiffLine } from "@/lib/diff-parser";
 import { buildSplitPairs } from "@/lib/diff-parser";
+import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
+import type { DiffViewHandle } from "./DiffUnifiedView";
+import {
+  diffRowStyle,
+  SELECTED_NUMBER_CLASS,
+  SELECTED_ROW_CLASS,
+  type DiffRowSide,
+  type DiffSelection,
+} from "./diff-row";
 
 interface Props {
   lines: DiffLine[];
+  /** Line review. Absent on the Changes pane, which only reads. */
+  selection?: DiffSelection;
+  /** Natural height inside someone else's scroll container. In flow
+   *  mode the two columns scroll together with the page, which is what
+   *  a per-file section wants — there is nothing left to synchronise. */
+  flow?: boolean;
 }
 
-export interface DiffViewHandle {
-  scrollToHunk: (direction: 1 | -1) => void;
-}
+/** One handle for both views — it was declared twice, identically. */
+export type { DiffViewHandle };
 
 function SplitSideLine({
   line,
   side,
+  selection,
 }: {
   line: DiffLine | null;
   side: "left" | "right";
+  selection?: DiffSelection;
 }) {
   if (!line) {
     return (
@@ -39,57 +55,60 @@ function SplitSideLine({
   }
 
   const lineNum = side === "left" ? line.oldLine : line.newLine;
-
-  // Conflict marker detection
-  const isOursMarker = line.content.startsWith("<<<<<<<");
-  const isSeparator = line.content.startsWith("=======") && !line.content.startsWith("========");
-  const isTheirsMarker = line.content.startsWith(">>>>>>>");
-  const isConflictMarker = isOursMarker || isSeparator || isTheirsMarker;
-
-  const bgClass = isOursMarker
-    ? "bg-primary/15 border-l-2 border-primary"
-    : isTheirsMarker
-      ? "bg-accent-violet/15 border-l-2 border-accent-violet"
-      : isSeparator
-        ? "bg-muted/40 border-l-2 border-muted-foreground"
-        : line.type === "add"
-          ? "bg-success/10"
-          : line.type === "del"
-            ? "bg-danger/10"
-            : "";
-
-  const prefixChar =
-    line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
-
-  const prefixColor = isConflictMarker
-    ? "text-muted-foreground"
-    : line.type === "add"
-      ? "text-success"
-      : line.type === "del"
-        ? "text-danger"
-        : "text-muted-foreground";
+  // The column is the side. A context line appears in both columns and
+  // is addressable from either — the one you clicked is the one you meant.
+  const anchorSide: DiffRowSide = side === "left" ? "LEFT" : "RIGHT";
+  const style = diffRowStyle(line);
+  const selectable = !!selection && lineNum != null;
+  const selected = selectable && selection.isSelected(line, anchorSide);
+  const under = selection?.renderUnder?.(line, anchorSide);
 
   return (
-    <div className={`flex min-h-[18px] whitespace-pre ${bgClass}`}>
-      <span className="inline-block w-10 shrink-0 text-right pr-2 text-[11px] text-muted-foreground tabular-nums select-none">
-        {lineNum ?? ""}
-      </span>
-      <span
-        className={`inline-block w-4 shrink-0 text-center select-none ${prefixColor}`}
+    <Fragment>
+      <div
+        data-diff-row={selectable ? `${anchorSide}:${lineNum}` : undefined}
+        data-selected={selected ? "true" : undefined}
+        className={cn(
+          "flex min-h-[18px] whitespace-pre",
+          selected ? SELECTED_ROW_CLASS : style.bgClass,
+        )}
       >
-        {prefixChar}
-      </span>
-      <span className="flex-1 min-w-0 pr-4">
-        {isOursMarker && <span className="text-[9px] font-bold text-primary mr-2">OURS</span>}
-        {isTheirsMarker && <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>}
-        {line.content}
-      </span>
-    </div>
+        <span
+          data-diff-line={selectable ? `${anchorSide}:${lineNum}` : undefined}
+          className={cn(
+            "inline-block w-10 shrink-0 text-right pr-2 text-[11px] tabular-nums select-none",
+            selected ? SELECTED_NUMBER_CLASS : "text-muted-foreground",
+            selectable && "cursor-pointer hover:bg-accent-ember/10",
+          )}
+          onMouseDown={selectable ? (e) => { if (e.shiftKey) e.preventDefault(); } : undefined}
+          onClick={
+            selectable ? (e) => selection.onSelect(line, anchorSide, e.shiftKey) : undefined
+          }
+        >
+          {lineNum ?? ""}
+        </span>
+        <span
+          className={`inline-block w-4 shrink-0 text-center select-none ${style.prefixColor}`}
+        >
+          {style.prefixChar}
+        </span>
+        <span className="flex-1 min-w-0 pr-4">
+          {style.isOursMarker && (
+            <span className="text-[9px] font-bold text-primary mr-2">OURS</span>
+          )}
+          {style.isTheirsMarker && (
+            <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>
+          )}
+          {line.content}
+        </span>
+      </div>
+      {under}
+    </Fragment>
   );
 }
 
 export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
-  function DiffSplitView({ lines }, ref) {
+  function DiffSplitView({ lines, selection, flow = false }, ref) {
     const leftRef = useRef<HTMLDivElement>(null);
     const rightRef = useRef<HTMLDivElement>(null);
     const isSyncing = useRef(false);
@@ -132,19 +151,27 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         });
       };
 
+    const columnClass = flow ? "bg-card" : "relative overflow-auto bg-card";
+
     return (
-      <div className="code-surface select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden">
-        {/* Left — deletions / old. `relative` is load-bearing: it makes this
-            the offsetParent, so each hunk's offsetTop is a scroll position
-            rather than a page coordinate measured from the app shell. */}
+      <div
+        className={cn(
+          "code-surface select-text grid grid-cols-[1fr_1px_1fr]",
+          flow ? "bg-card" : "flex-1 min-h-0 overflow-hidden",
+        )}
+      >
+        {/* Left — deletions / old. `relative` is load-bearing outside flow
+            mode: it makes this the offsetParent, so each hunk's offsetTop is
+            a scroll position rather than a page coordinate measured from the
+            app shell. */}
         <div
           ref={leftRef}
-          className="relative overflow-auto bg-card"
-          onScroll={handleScroll("left")}
+          className={columnClass}
+          onScroll={flow ? undefined : handleScroll("left")}
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.left} side="left" />
+              <SplitSideLine key={i} line={pair.left} side="left" selection={selection} />
             ))}
           </div>
         </div>
@@ -155,12 +182,12 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         {/* Right — additions / new */}
         <div
           ref={rightRef}
-          className="relative overflow-auto bg-card"
-          onScroll={handleScroll("right")}
+          className={columnClass}
+          onScroll={flow ? undefined : handleScroll("right")}
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.right} side="right" />
+              <SplitSideLine key={i} line={pair.right} side="right" selection={selection} />
             ))}
           </div>
         </div>
