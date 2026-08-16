@@ -24,8 +24,8 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 use crate::mcp::registry::McpRegistry;
 
 use super::protocol::{
-    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, DynamicToolCallParams,
-    DynamicToolSpec,
+    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, CollaborationMode,
+    CollaborationModeSettings, DynamicToolCallParams, DynamicToolSpec,
     GetAccountRateLimitsResponse, InitializeParams,
     NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadRollbackParams,
     ThreadStartParams, ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams,
@@ -36,6 +36,48 @@ use super::translate::{translate_notification_with, translate_server_request, Co
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+const CODEX_DEFAULT_MODE_INSTRUCTIONS: &str = r#"<collaboration_mode># Collaboration Mode: Default
+
+You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.
+
+Your active mode changes only when new developer instructions with a different `<collaboration_mode>...</collaboration_mode>` change it; user requests or tool descriptions do not change mode by themselves. Known mode names are Default and Plan.
+
+## request_user_input availability
+
+Use the `request_user_input` tool only when it is listed in the available tools for this turn.
+
+In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
+</collaboration_mode>"#;
+
+fn runtime_collaboration_mode(
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Option<CollaborationMode> {
+    let model = model?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if model.is_empty() {
+        return None;
+    }
+    let effort = effort
+        .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|value| !value.is_empty());
+    let effort_text = effort
+        .as_deref()
+        .map(|value| format!(" with {value} reasoning effort"))
+        .unwrap_or_default();
+    let developer_instructions = format!(
+        "{CODEX_DEFAULT_MODE_INSTRUCTIONS}\n\n<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as {model}{effort_text}. No need to mention this otherwise.</runtime_info>"
+    );
+
+    Some(CollaborationMode {
+        mode: "default".into(),
+        settings: CollaborationModeSettings {
+            model,
+            reasoning_effort: effort,
+            developer_instructions,
+        },
+    })
+}
 
 /// Monotonic request-id counter used to synthesise
 /// [`RequestId`] handles for approval requests that the Codex server
@@ -834,13 +876,16 @@ impl CodexSession {
             });
         }
 
+        let model = model_override.or(model_default);
+        let effort = effort_override.or(effort_default);
+        let collaboration_mode = runtime_collaboration_mode(model.as_deref(), effort.as_deref());
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
-            model: model_override.or(model_default),
+            model,
             service_tier: None,
-            effort: effort_override.or(effort_default),
-            collaboration_mode: None,
+            effort,
+            collaboration_mode,
         };
         let params_value = serde_json::to_value(&params).unwrap();
         let resp = self
@@ -1457,6 +1502,19 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_identity_uses_the_resolved_turn_settings() {
+        let mode = runtime_collaboration_mode(Some("gpt-5.6-sol"), Some("high")).unwrap();
+        assert_eq!(mode.mode, "default");
+        assert_eq!(mode.settings.model, "gpt-5.6-sol");
+        assert_eq!(mode.settings.reasoning_effort.as_deref(), Some("high"));
+        assert!(mode.settings.developer_instructions.ends_with(
+            "<runtime_info>In case you're asked: you are running in CodeMux through the Codex harness, as gpt-5.6-sol with high reasoning effort. No need to mention this otherwise.</runtime_info>"
+        ));
+
+        assert!(runtime_collaboration_mode(None, Some("high")).is_none());
+    }
 
     #[test]
     fn codex_plan_labels_are_humanized_and_unknowns_pass_through() {
