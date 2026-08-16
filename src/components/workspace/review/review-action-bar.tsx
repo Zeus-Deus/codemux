@@ -6,9 +6,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
 import {
   btnCard,
   btnCardStrong,
+  btnEmber,
   btnGreenMuted,
   btnGreenSolid,
   btnGreenTint,
@@ -53,6 +55,8 @@ export interface ActionBarProps {
   onReadyForReview: () => void;
   onClose: () => void;
   onRebase?: () => void;
+  /** Conflicts only: hands the merge to an agent in a worktree thread. */
+  onResolveConflicts?: () => Promise<unknown>;
 }
 
 /**
@@ -116,16 +120,26 @@ export function ReviewActionBar(props: ActionBarProps) {
               {sentence}
             </span>
           </span>
+          {props.blockedByConflicts && props.onResolveConflicts && (
+            <ResolveWithAgentButton onResolve={props.onResolveConflicts} />
+          )}
           {props.blockedByConflicts && props.onRebase && (
             <button type="button" className={btnCard} onClick={props.onRebase}>
               Rebase
             </button>
           )}
-          <StrategyPicker
-            value={props.mergeStrategy}
-            onPick={props.onPickStrategy}
-            disabled={merging}
-          />
+          {/* No strategy while the branch conflicts: picking how to
+              merge is a decision about a merge that can't run, and the
+              room it takes is room the blocking reason needs to stay in
+              words rather than an ellipsis (binding rule 5). It returns
+              the moment the conflict does — Merge itself never moves. */}
+          {!props.blockedByConflicts && (
+            <StrategyPicker
+              value={props.mergeStrategy}
+              onPick={props.onPickStrategy}
+              disabled={merging}
+            />
+          )}
           <button
             type="button"
             data-testid="review-primary-action"
@@ -151,6 +165,47 @@ export function ReviewActionBar(props: ActionBarProps) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Ember, and sitting to the left of Rebase and Merge.
+ *
+ * It never takes the primary slot: resolving conflicts with an agent
+ * starts work, it doesn't complete the merge, and the button that
+ * completes the merge must stay where it was (binding rule 1).
+ */
+function ResolveWithAgentButton({ onResolve }: { onResolve: () => Promise<unknown> }) {
+  const [starting, setStarting] = useState(false);
+  return (
+    <button
+      type="button"
+      className={btnEmber}
+      data-testid="resolve-conflicts-with-agent"
+      disabled={starting}
+      onClick={() => {
+        if (starting) return;
+        setStarting(true);
+        onResolve()
+          .catch((err) => toast.error(String(err)))
+          .finally(() => setStarting(false));
+      }}
+    >
+      {starting ? (
+        <>
+          <span
+            aria-hidden
+            className="size-1.5 animate-spin rounded-full border-[1.5px] border-current border-r-transparent"
+          />
+          Starting agent
+        </>
+      ) : (
+        <>
+          <span aria-hidden className="size-1.5 rounded-full bg-current" />
+          Resolve with agent
+        </>
+      )}
+    </button>
   );
 }
 

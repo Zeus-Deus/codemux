@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { getCheckLogExcerpt } from "@/tauri/commands";
 import type { CheckInfo } from "@/tauri/types";
-import { btnCard, checkState, type CheckState } from "./review-ui";
+import { btnCard, btnEmber, checkState, type CheckState } from "./review-ui";
 
 /**
  * The spinner is its own memoized component on purpose: the checks query
@@ -53,9 +53,24 @@ interface Props {
   /** Repo path + PR number, for the failing check's log excerpt. */
   cwd: string;
   prNumber: number;
+  /**
+   * Hands the failing check to an agent, with whatever excerpt this card
+   * has already loaded. Absent ⇒ the button is not drawn: a control that
+   * has nowhere to send the work is worse than no control.
+   */
+  onFixWithAgent?: (check: CheckInfo, logExcerpt: string) => Promise<unknown>;
+  /** What the button will actually do, in this context. */
+  handoffCaption?: string;
 }
 
-export function ReviewChecks({ checks, isLoading = false, cwd, prNumber }: Props) {
+export function ReviewChecks({
+  checks,
+  isLoading = false,
+  cwd,
+  prNumber,
+  onFixWithAgent,
+  handoffCaption,
+}: Props) {
   const { passed, states, notGreen } = useMemo(() => {
     const states = checks.map((c) => checkState(c.conclusion, c.status));
     return {
@@ -109,6 +124,8 @@ export function ReviewChecks({ checks, isLoading = false, cwd, prNumber }: Props
           state={state}
           cwd={cwd}
           prNumber={prNumber}
+          onFixWithAgent={onFixWithAgent}
+          handoffCaption={handoffCaption}
         />
       ))}
     </div>
@@ -120,11 +137,15 @@ function CheckRow({
   state,
   cwd,
   prNumber,
+  onFixWithAgent,
+  handoffCaption,
 }: {
   check: CheckInfo;
   state: CheckState;
   cwd: string;
   prNumber: number;
+  onFixWithAgent?: (check: CheckInfo, logExcerpt: string) => Promise<unknown>;
+  handoffCaption?: string;
 }) {
   // A failing check is the thing you came to read, so it opens itself.
   const [expanded, setExpanded] = useState(state === "fail");
@@ -142,6 +163,18 @@ function CheckRow({
     retry: false,
   });
   const excerpt = excerptQuery.data?.trim() ?? "";
+  const [handingOff, setHandingOff] = useState(false);
+
+  const fixWithAgent = () => {
+    if (!onFixWithAgent || handingOff) return;
+    setHandingOff(true);
+    // The excerpt may still be in flight; the handoff fetches its own
+    // copy when this one is empty, so the button never has to wait for
+    // a query it didn't start.
+    onFixWithAgent(check, excerpt)
+      .catch((err) => toast.error(String(err)))
+      .finally(() => setHandingOff(false));
+  };
 
   const openLog = () => {
     if (!check.detail_url) return;
@@ -188,13 +221,48 @@ function CheckRow({
           )}
           {/* No Re-run button: `gh` has no per-check re-run, and a
               control that silently re-runs the whole workflow is not the
-              one the label promises. No Fix-with-agent yet either — it
-              arrives wired, or not at all. */}
-          {check.detail_url && (
+              one the label promises. */}
+          {(onFixWithAgent || check.detail_url) && (
             <div className="flex items-center gap-1.5">
-              <button type="button" className={btnCard} onClick={openLog}>
-                Full log
-              </button>
+              {onFixWithAgent && (
+                <button
+                  type="button"
+                  // Same class string in both states: the label and the
+                  // dot change, the box does not (binding rule 1).
+                  className={btnEmber}
+                  data-testid={`fix-with-agent-${check.name}`}
+                  onClick={fixWithAgent}
+                  disabled={handingOff}
+                >
+                  {handingOff ? (
+                    <>
+                      <span
+                        aria-hidden
+                        className="size-1.5 animate-spin rounded-full border-[1.5px] border-current border-r-transparent"
+                      />
+                      Starting agent
+                    </>
+                  ) : (
+                    <>
+                      <span
+                        aria-hidden
+                        className="size-1.5 rounded-full bg-current"
+                      />
+                      Fix with agent
+                    </>
+                  )}
+                </button>
+              )}
+              {check.detail_url && (
+                <button type="button" className={btnCard} onClick={openLog}>
+                  Full log
+                </button>
+              )}
+              {onFixWithAgent && handoffCaption && (
+                <span className="ml-auto truncate text-[9.5px] text-muted-foreground">
+                  {handoffCaption}
+                </span>
+              )}
             </div>
           )}
         </div>

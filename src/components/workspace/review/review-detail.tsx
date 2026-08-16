@@ -16,7 +16,13 @@ import type {
   PullRequestInfo,
   ReviewComment,
 } from "@/tauri/types";
-import type { ProviderPresentation } from "@/lib/source-control";
+import { providerRef, type ProviderPresentation } from "@/lib/source-control";
+import {
+  findWorkspaceForBranch,
+  handOffToAgent,
+  type HandoffRequest,
+  type ReviewThreadTask,
+} from "@/lib/pr-agent-handoff";
 import { ReviewHeader } from "./review-header";
 import { ReviewTabStrip, type ReviewTab } from "./review-tab-strip";
 import { ReviewChecks } from "./review-checks";
@@ -84,6 +90,8 @@ export interface ReviewDetailProps {
   commentsLoading: boolean;
   cwd: string;
   workspaceId: string;
+  /** Repository root — where an agent handoff would cut a worktree. */
+  projectRoot: string;
   provider: ProviderPresentation;
   repoSlug: string | null;
   /** Authenticated account, for author-vs-reviewer. Null ⇒ reviewer. */
@@ -118,6 +126,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     commentsLoading,
     cwd,
     workspaceId,
+    projectRoot,
     provider,
     repoSlug,
     viewerLogin,
@@ -333,6 +342,91 @@ export function ReviewDetail(props: ReviewDetailProps) {
     [pr.url],
   );
 
+  // ── Agent handoffs ──
+  //
+  // A failing check, a review comment and a conflict are three ways of
+  // saying "someone has to go and do something on this branch". All
+  // three go through one helper, which decides whether that means a
+  // thread here, a thread in the workspace that already has the branch,
+  // or a fresh worktree.
+
+  /** Everything but the task itself — the same for all three buttons. */
+  const handoffBase = useMemo(
+    (): Omit<HandoffRequest, "task"> => ({
+      pr: {
+        number: pr.number,
+        title: pr.title,
+        url: pr.url,
+        head_branch: pr.head_branch,
+        base_branch: pr.base_branch,
+      },
+      prRef: `${repoSlug ?? ""}${providerRef(provider, pr.number)}`,
+      projectRoot,
+      cwd,
+      // Standing in the branch is the panel's normal case, and it is
+      // the one that needs no worktree at all.
+      currentWorkspaceId: checkedOutHere ? workspaceId : null,
+      cli: provider.cli,
+      providerKind: provider.kind,
+    }),
+    [
+      pr.number,
+      pr.title,
+      pr.url,
+      pr.head_branch,
+      pr.base_branch,
+      repoSlug,
+      provider,
+      projectRoot,
+      cwd,
+      checkedOutHere,
+      workspaceId,
+    ],
+  );
+
+  // A merged or closed PR is a record. Sending an agent to fix its
+  // checks would be work with nowhere to land.
+  const canHandOff = !readOnly && provider.supported;
+
+  /**
+   * What the button will do *here*, said in the panel's own terms.
+   *
+   * The canvas caption ("checks out the branch into a worktree, opens a
+   * thread") is only true from the pull-requests page. In this panel you
+   * are usually already standing in the branch, and promising a worktree
+   * that won't be created is the kind of small lie that costs trust in
+   * everything else the surface says.
+   */
+  const handoffCaption = checkedOutHere
+    ? "opens a thread in this workspace"
+    : pr.head_branch && findWorkspaceForBranch(projectRoot, pr.head_branch)
+      ? "opens a thread in the workspace on this branch"
+      : "checks out the branch into a worktree, opens a thread";
+
+  const fixCheckWithAgent = useCallback(
+    (check: CheckInfo, logExcerpt: string) =>
+      handOffToAgent({
+        ...handoffBase,
+        task: {
+          kind: "failing-check",
+          checkName: check.name,
+          logExcerpt: logExcerpt || null,
+          detailUrl: check.detail_url,
+        },
+      }),
+    [handoffBase],
+  );
+
+  const sendThreadToAgent = useCallback(
+    (task: ReviewThreadTask) => handOffToAgent({ ...handoffBase, task }),
+    [handoffBase],
+  );
+
+  const resolveConflictsWithAgent = useCallback(
+    () => handOffToAgent({ ...handoffBase, task: { kind: "conflicts" } }),
+    [handoffBase],
+  );
+
   // ── Drift ──
 
   const notice = useMemo((): DriftNotice | null => {
@@ -526,6 +620,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
           isLoading={checksLoading}
           cwd={cwd}
           prNumber={pr.number}
+          onFixWithAgent={canHandOff ? fixCheckWithAgent : undefined}
+          handoffCaption={handoffCaption}
         />
 
         {!readOnly && (
@@ -551,6 +647,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
           reviews={reviews}
           inlineComments={inlineComments}
           isLoading={commentsLoading}
+          onSendToAgent={canHandOff ? sendThreadToAgent : undefined}
         />
       </div>
 
@@ -575,6 +672,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onReadyForReview={() => void markReady()}
         onClose={() => void closePr()}
         onRebase={() => openPrPath("/conflicts")}
+        onResolveConflicts={canHandOff ? resolveConflictsWithAgent : undefined}
       />
 
       {mergeSheetOpen && (

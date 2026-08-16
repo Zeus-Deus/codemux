@@ -3108,7 +3108,28 @@ const handlers: Record<string, Handler> = {
     }
     return undefined;
   },
-  apply_preset: () => undefined,
+  /**
+   * Records the launch instead of spawning anything.
+   *
+   * The prompt is the whole point of the agent-handoff surfaces, and in
+   * dev there is no PTY to type it into — so it is echoed to the console
+   * and kept on `window.__codemuxAgentHandoffs`, which makes "did the
+   * prompt survive the route?" answerable from the browser console.
+   */
+  apply_preset: (a) => {
+    const record = {
+      workspaceId: String(a.workspaceId ?? ""),
+      presetId: String(a.presetId ?? ""),
+      overrideMode: (a.overrideMode as string) ?? null,
+      prompt: (a.initialPrompt as string) ?? null,
+    };
+    agentHandoffs.push(record);
+    console.info(
+      `[mock] apply_preset → ${record.presetId} in ${record.workspaceId} (${record.overrideMode})`,
+      record.prompt ?? "(no prompt)",
+    );
+    return undefined;
+  },
 
   // ── Editors / tooling ──
   detect_editors: () => [],
@@ -3885,6 +3906,56 @@ const handlers: Record<string, Handler> = {
     }, 0);
     return ws.workspace_id;
   },
+  /**
+   * A real extra terminal tab, so an agent handoff is visible in dev.
+   *
+   * The handoff opens a fresh tab and then applies the preset to it
+   * (the only `apply_preset` path that carries a prompt), so a mock that
+   * returned a bare id would make the most important half of the
+   * interaction invisible in the browser.
+   */
+  create_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws || a.kind !== "terminal") return `tab-mock-${Date.now()}`;
+    const n = ++mockTabSeq;
+    const paneId = `pane-mock-tab-${n}`;
+    const surfaceId = `surface-mock-tab-${n}`;
+    const tabId = `tab-mock-tab-${n}`;
+    const sessionId = `sess-mock-tab-${n}`;
+    const label = `Terminal ${ws.tabs.filter((t) => t.kind === "terminal").length + 1}`;
+
+    ws.surfaces.push({
+      surface_id: surfaceId,
+      title: label,
+      root: { kind: "terminal", pane_id: paneId, session_id: sessionId, title: label },
+      active_pane_id: paneId,
+    });
+    ws.tabs.push({
+      tab_id: tabId,
+      kind: "terminal",
+      title: label,
+      surface_id: surfaceId,
+      browser_id: null,
+      icon: null,
+    });
+    ws.active_tab_id = tabId;
+    ws.active_surface_id = surfaceId;
+    appState.terminal_sessions.push({
+      session_id: sessionId,
+      title: label,
+      shell: "/bin/bash",
+      cwd: ws.cwd,
+      cols: 120,
+      rows: 32,
+      state: "ready",
+      last_message: null,
+      exit_code: null,
+      original_command: null,
+      adapter_captures: {},
+    });
+    emitAppState();
+    return tabId;
+  },
   agent_chat_create_pane: (a) => {
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
@@ -4140,6 +4211,21 @@ function buildRestoredWorkspace(
  *  deferred-worktree first-send path is exercisable end-to-end in
  *  `npm run dev`. */
 let deferredWorktreeSeq = 0;
+let mockTabSeq = 0;
+
+/**
+ * Every preset launch the dev session has performed, newest last.
+ *
+ * Exposed on `window` so the agent-handoff surfaces can be checked in a
+ * plain browser: the question those buttons have to answer is "did the
+ * composed prompt reach the thread", and this is where the answer is.
+ */
+const agentHandoffs: {
+  workspaceId: string;
+  presetId: string;
+  overrideMode: string | null;
+  prompt: string | null;
+}[] = [];
 function buildWorktreeWorkspace(
   repoPath: string,
   branch: string,
@@ -4416,5 +4502,11 @@ const internals: TauriInternals = {
 ) => {
   emitEvent("notification", { title, body, workspace_title: workspaceTitle });
 };
+
+// Dev affordance: read back what the agent-handoff buttons actually sent.
+//   window.__codemuxAgentHandoffs.at(-1).prompt
+(
+  window as unknown as { __codemuxAgentHandoffs: typeof agentHandoffs }
+).__codemuxAgentHandoffs = agentHandoffs;
 
 export {};

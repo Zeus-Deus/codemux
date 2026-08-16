@@ -550,6 +550,7 @@ export function ReviewPanel({ workspace }: Props) {
           commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
           cwd={cwd}
           workspaceId={workspace.workspace_id}
+          projectRoot={workspace.project_root ?? workspace.cwd}
           provider={provider}
           repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
           viewerLogin={

@@ -41,6 +41,21 @@ export const btnGreenMuted = `${BASE} bg-card text-muted-foreground`;
 /** Bare text action (the strategy dropdown trigger). */
 export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text-foreground`;
 
+/**
+ * Comment-sized ember tint, for actions that sit inside a quoted thread.
+ *
+ * A second, smaller geometry rather than a shrunk {@link btnEmber}: at
+ * 11px on a 7px-indented quote the full-size button outweighs the
+ * comment it belongs to. Same tint, same borderlessness, same rule that
+ * its box never changes between states.
+ */
+const BASE_XS =
+  "inline-flex h-5 shrink-0 items-center justify-center gap-1 rounded border-0 " +
+  "px-1.5 text-[10px] font-medium transition-colors outline-none " +
+  "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+
+export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
+
 /** Relative age in the panel's voice: "38m ago", "3d ago", "just now". */
 export function relativeAge(iso: string | null | undefined): string | null {
   if (!iso) return null;

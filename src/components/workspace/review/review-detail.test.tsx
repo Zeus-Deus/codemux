@@ -45,6 +45,13 @@ vi.mock("@/lib/toast", () => ({
   },
 }));
 
+const mockHandOff = vi.fn().mockResolvedValue({ route: "current", workspaceId: "ws-1" });
+const mockFindWorkspaceForBranch = vi.fn().mockReturnValue(null);
+vi.mock("@/lib/pr-agent-handoff", () => ({
+  handOffToAgent: (...a: unknown[]) => mockHandOff(...a),
+  findWorkspaceForBranch: (...a: unknown[]) => mockFindWorkspaceForBranch(...a),
+}));
+
 import { ReviewDetail, _resetHeadOidTracking } from "./review-detail";
 import { _resetPrDrafts } from "./pr-drafts";
 import { resolveProvider } from "@/lib/source-control";
@@ -110,6 +117,7 @@ function renderDetail(over: Partial<Parameters<typeof ReviewDetail>[0]> = {}) {
     commentsLoading: false,
     cwd: "/repo",
     workspaceId: "ws-1",
+    projectRoot: "/repo",
     provider: resolveProvider("github"),
     repoSlug: "example/codemux",
     viewerLogin: VIEWER,
@@ -580,6 +588,122 @@ describe("gitlab", () => {
 
     expect(screen.getByTestId("verdict-approve")).toBeInTheDocument();
     expect(screen.queryByTestId("verdict-request-changes")).not.toBeInTheDocument();
+  });
+});
+
+// ── Agent handoffs ──
+
+describe("agent handoffs", () => {
+  const FAILING = check("web-checks (windows-latest)", "fail");
+
+  it("sends the failing check with its PR context and log excerpt", async () => {
+    mockGetCheckLogExcerpt.mockResolvedValue("AssertionError: expected 2 calls");
+    renderDetail({ checks: [FAILING] });
+    await waitFor(() =>
+      expect(screen.getByText(/AssertionError/)).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId(`fix-with-agent-${FAILING.name}`));
+    await flush();
+
+    expect(mockHandOff).toHaveBeenCalledTimes(1);
+    const arg = mockHandOff.mock.calls[0][0];
+    expect(arg.task).toEqual({
+      kind: "failing-check",
+      checkName: FAILING.name,
+      logExcerpt: "AssertionError: expected 2 calls",
+      detailUrl: FAILING.detail_url,
+    });
+    expect(arg.prRef).toBe("example/codemux#172");
+    expect(arg.pr.head_branch).toBe("agent/investigate-draft-mode");
+    expect(arg.projectRoot).toBe("/repo");
+    expect(arg.cli).toBe("gh");
+    // Checked out here ⇒ the thread opens in this workspace, no worktree.
+    expect(arg.currentWorkspaceId).toBe("ws-1");
+  });
+
+  it("says what the button does *here*, not what the mock says elsewhere", async () => {
+    renderDetail({ checks: [FAILING] });
+    await flush();
+    expect(screen.getByText("opens a thread in this workspace")).toBeInTheDocument();
+
+    cleanup();
+    renderDetail({ checks: [FAILING], checkedOutHere: false });
+    await flush();
+    expect(
+      screen.getByText("checks out the branch into a worktree, opens a thread"),
+    ).toBeInTheDocument();
+  });
+
+  it("sends a review comment with its anchor, reviewer and body", async () => {
+    renderDetail({
+      inlineComments: [
+        {
+          id: 9,
+          author: "juliusm",
+          body: "This needs a line about the follow-up.",
+          path: "AGENTS.md",
+          line: 12,
+          created_at: new Date().toISOString(),
+          in_reply_to_id: null,
+          pull_request_review_id: null,
+        },
+      ],
+    });
+    await flush();
+
+    await userEvent.click(screen.getByTestId("send-thread-to-agent"));
+    await flush();
+
+    const arg = mockHandOff.mock.calls[0][0];
+    expect(arg.task.kind).toBe("review-thread");
+    expect(arg.task.reviewer).toBe("juliusm");
+    expect(arg.task.path).toBe("AGENTS.md");
+    expect(arg.task.line).toBe(12);
+    expect(arg.task.body).toBe("This needs a line about the follow-up.");
+  });
+
+  it("offers Resolve with agent on the conflicted bar, left of Merge", async () => {
+    renderDetail({
+      pr: makePr({ mergeable: "CONFLICTING", merge_state_status: "DIRTY" }),
+    });
+    await flush();
+
+    const button = screen.getByTestId("resolve-conflicts-with-agent");
+    expect(button).toBeInTheDocument();
+    // Rule 1: the primary slot still belongs to Merge.
+    expect(screen.getByTestId("review-primary-action")).toHaveTextContent("Merge");
+    expect(
+      button.compareDocumentPosition(screen.getByTestId("review-primary-action")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await userEvent.click(button);
+    await flush();
+    expect(mockHandOff.mock.calls[0][0].task).toEqual({ kind: "conflicts" });
+  });
+
+  it("offers no handoff on a merged pull request", async () => {
+    renderDetail({
+      pr: makePr({ state: "MERGED", merged_by: "juliusm" }),
+      checks: [FAILING],
+      inlineComments: [
+        {
+          id: 9,
+          author: "juliusm",
+          body: "nit",
+          path: "a.ts",
+          line: 1,
+          created_at: new Date().toISOString(),
+          in_reply_to_id: null,
+          pull_request_review_id: null,
+        },
+      ],
+    });
+    await flush();
+
+    expect(screen.queryByText("Fix with agent")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("send-thread-to-agent")).not.toBeInTheDocument();
   });
 });
 

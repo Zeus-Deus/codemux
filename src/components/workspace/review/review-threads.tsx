@@ -9,7 +9,10 @@ import {
   Clock,
 } from "lucide-react";
 import type { ReviewComment, InlineReviewComment } from "@/tauri/types";
+import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
+import { toast } from "@/lib/toast";
 import { CollapsibleSection } from "./collapsible-section";
+import { btnEmberXs } from "./review-ui";
 
 function ReviewStateIcon({ state }: { state: string }) {
   if (state === "APPROVED")
@@ -71,10 +74,53 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+/**
+ * The one action a thread can actually offer today.
+ *
+ * Reply and Resolve are in the mock, and neither exists at any layer of
+ * this app — no reply-to-thread command, no resolve-thread command. They
+ * are therefore not drawn: a button that answers a click with an apology
+ * is worse than the reviewer's own comment sitting there unanswered.
+ * Handing the comment to an agent is the leg that works, so it is the
+ * leg that ships.
+ */
+function SendToAgentButton({ onSend }: { onSend: () => Promise<unknown> }) {
+  const [sending, setSending] = useState(false);
+  return (
+    <button
+      type="button"
+      className={btnEmberXs}
+      data-testid="send-thread-to-agent"
+      disabled={sending}
+      onClick={() => {
+        if (sending) return;
+        setSending(true);
+        onSend()
+          .catch((err) => toast.error(String(err)))
+          .finally(() => setSending(false));
+      }}
+    >
+      {sending ? (
+        <>
+          <span
+            aria-hidden
+            className="size-1.5 animate-spin rounded-full border-[1.5px] border-current border-r-transparent"
+          />
+          Sending
+        </>
+      ) : (
+        "Send to agent"
+      )}
+    </button>
+  );
+}
+
 interface Props {
   reviews: ReviewComment[];
   inlineComments: InlineReviewComment[];
   isLoading?: boolean;
+  /** Hands one comment to an agent. Absent ⇒ no thread actions drawn. */
+  onSendToAgent?: (task: ReviewThreadTask) => Promise<unknown>;
 }
 
 interface GroupedReview {
@@ -82,7 +128,12 @@ interface GroupedReview {
   inlineComments: InlineReviewComment[];
 }
 
-export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Props) {
+export function ReviewThreads({
+  reviews,
+  inlineComments,
+  isLoading = false,
+  onSendToAgent,
+}: Props) {
   const grouped = useMemo(() => {
     // Group inline comments by pull_request_review_id
     const inlineByReview = new Map<number, InlineReviewComment[]>();
@@ -167,11 +218,28 @@ export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Pr
 
             {/* Review body */}
             {g.review.body && (
-              <div className="group/comment flex items-start gap-1 pl-7 pr-1">
-                <p className="select-text text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
-                  {g.review.body}
-                </p>
-                <CopyButton text={g.review.body} />
+              <div className="space-y-1 pl-7 pr-1">
+                <div className="group/comment flex items-start gap-1">
+                  <p className="select-text text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
+                    {g.review.body}
+                  </p>
+                  <CopyButton text={g.review.body} />
+                </div>
+                {/* An inline comment carries its own, better-anchored
+                    action; the review body only earns one when it is the
+                    whole of what the reviewer said. */}
+                {onSendToAgent && g.inlineComments.length === 0 && (
+                  <SendToAgentButton
+                    onSend={() =>
+                      onSendToAgent({
+                        kind: "review-thread",
+                        reviewer: g.review.author,
+                        body: g.review.body,
+                        verdict: g.review.state,
+                      })
+                    }
+                  />
+                )}
               </div>
             )}
 
@@ -196,6 +264,26 @@ export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Pr
                 <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words">
                   {ic.body}
                 </p>
+                {onSendToAgent && (
+                  <SendToAgentButton
+                    onSend={() =>
+                      onSendToAgent({
+                        kind: "review-thread",
+                        reviewer: ic.author,
+                        body: ic.body,
+                        path: ic.path,
+                        line: ic.line,
+                        verdict: g.review.state,
+                        // The review's own body is the context this
+                        // comment was written under, when there is one.
+                        parent:
+                          g.review.body && g.review.id !== 0
+                            ? { author: g.review.author, body: g.review.body }
+                            : null,
+                      })
+                    }
+                  />
+                )}
               </div>
             ))}
           </div>
