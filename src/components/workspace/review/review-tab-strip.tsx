@@ -34,11 +34,10 @@ interface Props {
  */
 export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
   return (
-    <div
-      role="tablist"
-      className="flex items-center gap-4 border-b border-border/40 px-3.5"
-      data-testid="review-tab-strip"
-    >
+    // Full-bleed border, centered content — same axis as the header
+    // and the reading column below.
+    <div className="border-b border-border/40" data-testid="review-tab-strip">
+    <div role="tablist" className="mx-auto flex w-full max-w-[920px] items-center gap-4 px-3.5">
       {tabs.map((tab) => {
         const active = tab.id === activeId;
         return (
@@ -70,6 +69,7 @@ export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
           {trailing}
         </>
       )}
+    </div>
     </div>
   );
 }

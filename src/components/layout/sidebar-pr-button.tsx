@@ -49,7 +49,7 @@ export function SidebarPullRequestsButton({
           {count > 0 && (
             <span
               data-testid="sidebar-pull-requests-badge"
-              className="absolute -right-0.5 -top-0.5 flex h-[15px] min-w-[15px] items-center justify-center rounded-full bg-accent-ember px-1 font-mono text-[9px] font-bold tabular-nums text-[#1a1512]"
+              className="absolute -right-0.5 -top-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-center text-[9px] leading-[15px] text-primary-foreground font-semibold tabular-nums"
             >
               {badgeLabel(count)}
             </span>

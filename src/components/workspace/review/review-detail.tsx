@@ -943,7 +943,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
            same right edge instead of individual elements capping
            themselves while their controls drift to the window edge.
            The Code tab opts out — a diff earns the full width. */
-        <div className="max-w-[920px]">
+        <div className="mx-auto w-full max-w-[920px]">
           <ReviewTimeline
             entries={timelineEntries}
             loading={timelineQuery.isFetching && !timelineQuery.data}
@@ -972,7 +972,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
       /* Status before description, deliberately: what you need to know
          about this PR right now is whether it's healthy, not what its
          author wrote about it a day ago. */
-      <div className="flex max-w-[920px] flex-1 flex-col gap-3 px-3.5 py-3">
+      <div className="mx-auto flex w-full max-w-[920px] flex-1 flex-col gap-3 px-3.5 py-3">
         <ReviewChecks
           checks={checks}
           isLoading={checksLoading}

@@ -85,10 +85,10 @@ export function ReviewHeader({
   };
 
   return (
-    <div
-      className="flex flex-col gap-2 border-b border-border/40 px-3.5 pb-2.5 pt-3"
-      data-testid="review-header"
-    >
+    // Border runs full-bleed; the content shares the body's centered
+    // reading column so title, prose and controls sit on one axis.
+    <div className="border-b border-border/40" data-testid="review-header">
+    <div className="mx-auto flex w-full max-w-[920px] flex-col gap-2 px-3.5 pb-2.5 pt-3">
       <div className="flex items-center gap-1.5">
         {repoSlug && (
           <span className={cn("truncate text-muted-foreground", tzMetaNum)}>{repoSlug}</span>
@@ -245,6 +245,7 @@ export function ReviewHeader({
           </span>
         )}
       </div>
+    </div>
     </div>
   );
 }
