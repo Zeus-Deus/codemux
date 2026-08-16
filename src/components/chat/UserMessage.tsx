@@ -6,6 +6,11 @@ import {
   IMAGE_LIGHTBOX_FALLBACK_CLASS,
   IMAGE_LIGHTBOX_MEDIA_CLASS,
 } from "@/components/chat/ImageLightbox";
+import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
+import {
+  MESSAGE_ACTION_CLASS,
+  MESSAGE_ACTION_ROW_CLASS,
+} from "@/components/chat/message-action";
 import { isAbsoluteFsPath, resolveAssetSrc } from "@/lib/asset-url";
 import { readChatImage } from "@/tauri/commands";
 import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
@@ -93,6 +98,13 @@ function useImageWithFallback(rawSrc: string): {
  * active turn and dispatches this message immediately (keeping all progress),
  * while X cancels and restores the text into the composer. Both are handled
  * by the parent. All colors are theme tokens.
+ *
+ * Settled turns get a footer strip under the bubble that fades in on hover or
+ * keyboard focus, holding Copy (the original prompt back on the clipboard
+ * verbatim, for re-running it elsewhere) and, where the turn has a checkpoint,
+ * Revert. A queued turn keeps its own footer instead — its Cancel action
+ * already returns the text to the composer, so a copy there would be
+ * redundant.
  */
 export const UserMessage = memo(function UserMessage({
   item,
@@ -173,19 +185,36 @@ export const UserMessage = memo(function UserMessage({
               Queued
             </span>
           </div>
-        ) : onRevert ? (
-          <button
-            type="button"
-            aria-label="Revert to before this turn"
-            title="Revert this turn and everything after it"
-            disabled={reverting}
-            onClick={onRevert}
-            className="flex items-center gap-0.5 rounded text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 disabled:cursor-wait disabled:opacity-60 group-hover:opacity-100"
-            data-testid="revert-turn-button"
-          >
-            <Undo2 className="h-3 w-3" aria-hidden />
-            {reverting ? "Reverting…" : "Revert"}
-          </button>
+        ) : item.text || onRevert ? (
+          // Shared footer strip. Revert stays anchored to the bubble's right
+          // edge where it has always been, and Copy takes the slot to its
+          // left, so gaining the second action doesn't move the first. Both
+          // reveal off the same rule, so they fade in together.
+          <div className={MESSAGE_ACTION_ROW_CLASS}>
+            {item.text ? (
+              <MessageCopyButton text={item.text} label="Copy prompt" />
+            ) : null}
+            {onRevert ? (
+              <button
+                type="button"
+                aria-label="Revert to before this turn"
+                title="Revert this turn and everything after it"
+                disabled={reverting}
+                onClick={onRevert}
+                className={cn(
+                  MESSAGE_ACTION_CLASS,
+                  // An in-flight revert pins itself visible: the pointer has
+                  // usually moved on by the time it lands, and a turn quietly
+                  // rewinding with no visible cause is alarming.
+                  reverting && "pointer-events-auto cursor-wait opacity-60",
+                )}
+                data-testid="revert-turn-button"
+              >
+                <Undo2 className="h-3 w-3" aria-hidden />
+                {reverting ? "Reverting…" : "Revert"}
+              </button>
+            ) : null}
+          </div>
         ) : null}
       </div>
 

@@ -1,5 +1,6 @@
 import { memo } from "react";
 
+import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
 import type { AssistantMessageItem } from "@/lib/agent-chat/types";
 
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -11,6 +12,12 @@ import { ChatMarkdown } from "./ChatMarkdown";
  * `ChatMarkdown` so the plan renderer and reasoning body share one prose
  * treatment. Live progress is communicated by the transcript's dedicated
  * streaming marker rather than extra chrome appended to the prose.
+ *
+ * A settled message gets a footer strip under the prose that fades in on hover
+ * or keyboard focus, holding a copy action aligned to the start of the text.
+ * It copies `item.text` — the markdown source, not the rendered DOM — so
+ * pasting into another editor keeps the formatting. It stays hidden while the
+ * message streams, where only half the answer exists yet.
  */
 export const AssistantMessage = memo(function AssistantMessage({
   item,
@@ -22,7 +29,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   cwd?: string | null;
 }) {
   return (
-    <div className="conversation-text leading-relaxed text-foreground break-words">
+    <div className="group conversation-text leading-relaxed text-foreground break-words">
       <ChatMarkdown
         streaming={item.streaming}
         workspaceId={workspaceId}
@@ -30,6 +37,13 @@ export const AssistantMessage = memo(function AssistantMessage({
       >
         {item.text}
       </ChatMarkdown>
+      {!item.streaming && item.text ? (
+        <MessageCopyButton
+          text={item.text}
+          label="Copy response"
+          className="mt-1"
+        />
+      ) : null}
     </div>
   );
 });

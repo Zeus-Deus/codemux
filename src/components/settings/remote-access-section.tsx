@@ -32,6 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
@@ -81,38 +82,6 @@ import {
   type EndpointGroupView,
 } from "./remote-access-utils";
 
-// ── Clipboard (secure-context aware) ─────────────────────────────────
-//
-// This panel renders on the desktop (always a secure context) AND on the
-// remote web client, which may be a plain-HTTP origin where
-// `navigator.clipboard` is undefined. Fall back to the legacy execCommand
-// path there so "Copy" still works.
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (window.isSecureContext && navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    /* fall through to the execCommand path */
-  }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.style.position = "fixed";
-    ta.style.top = "-1000px";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
 // ── Small presentational bits ────────────────────────────────────────
 
 function CopyButton({ text, label }: { text: string; label: string }) {
@@ -126,7 +95,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       title={label}
       className="shrink-0 text-muted-foreground hover:text-foreground"
       onClick={async () => {
-        const ok = await copyText(text);
+        const ok = await copyToClipboard(text);
         if (ok) {
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1400);
