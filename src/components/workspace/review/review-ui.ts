@@ -95,8 +95,8 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
  * its box never changes between states.
  */
 const BASE_XS =
-  "inline-flex h-[22px] shrink-0 items-center justify-center gap-1 rounded border-0 " +
-  "px-2 text-[11px] font-medium transition-colors outline-none " +
+  "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded border-0 " +
+  "px-2 text-[12px] font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
