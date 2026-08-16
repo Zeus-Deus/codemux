@@ -2129,3 +2129,42 @@ describe("MessageList jump-to-latest pill", () => {
     expect(pill()).toBeNull();
   });
 });
+
+describe("MessageList viewport edge fade", () => {
+  // A mask composites the element's whole rendering, and a scroll container
+  // renders its own scrollbar — so a single full-width fade dissolved the
+  // scrollbar's end stop along with the content, and a fully-scrolled
+  // transcript still looked like it had somewhere left to go. The fade must
+  // stop short of the bar's column and leave that strip opaque.
+  it("holds the edge fade off the scrollbar's own column", () => {
+    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+    const style = lastListProps.current?.style as Record<string, string>;
+    expect(style).toBeDefined();
+
+    for (const key of ["maskImage", "WebkitMaskImage"] as const) {
+      // Two layers: the vertical fade, then an opaque strip.
+      expect(style[key]).toContain("linear-gradient(#000, #000)");
+    }
+    for (const key of ["maskSize", "WebkitMaskSize"] as const) {
+      // The fade is inset by the measured bar width; the strip covers it.
+      expect(style[key]).toBe(
+        "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%",
+      );
+    }
+    for (const key of ["maskPosition", "WebkitMaskPosition"] as const) {
+      expect(style[key]).toBe("left top, right top");
+    }
+  });
+
+  it("publishes the measured scrollbar width the mask reads", () => {
+    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    )!;
+    // CSS cannot ask how wide a scrollbar is, so the mask depends on this
+    // variable existing. jsdom reports zero-size boxes, so the value is
+    // "0px" here — the assertion is that it is published at all, which is
+    // what keeps the mask from falling back to spanning the full width.
+    expect(viewport.style.getPropertyValue("--transcript-sbw")).toBe("0px");
+  });
+});
