@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider } from "@/components/ui/sidebar";
@@ -71,12 +72,19 @@ import {
 afterEach(cleanup);
 
 function renderFooter(open: boolean) {
+  // The Pull Requests entry carries a live count, so the footer now sits
+  // inside the app's query client the same way it does in the shell.
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
   return render(
-    <TooltipProvider>
-      <SidebarProvider defaultOpen={open}>
-        <SidebarFooterBar />
-      </SidebarProvider>
-    </TooltipProvider>,
+    <QueryClientProvider client={client}>
+      <TooltipProvider>
+        <SidebarProvider defaultOpen={open}>
+          <SidebarFooterBar />
+        </SidebarProvider>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -223,13 +231,19 @@ describe("AppMenuFooter — update strip", () => {
 });
 
 describe("SidebarFooterBar — collapsed", () => {
-  it("renders the four icon buttons in order", () => {
+  it("renders the five icon buttons in order", () => {
     const { container } = renderFooter(false);
 
     const labels = Array.from(
       container.querySelectorAll("button[aria-label]"),
     ).map((el) => el.getAttribute("aria-label"));
 
-    expect(labels).toEqual(["Automations", "Workspaces", "Ports", "Menu"]);
+    expect(labels).toEqual([
+      "Automations",
+      "Workspaces",
+      "Pull requests",
+      "Ports",
+      "Menu",
+    ]);
   });
 });

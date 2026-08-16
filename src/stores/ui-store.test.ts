@@ -179,6 +179,7 @@ describe("ui-store — onboarding state", () => {
         showCloneDialog: true,
         showNewProjectScreen: true,
         showNewWorkspaceDialog: true,
+        showPullRequests: true,
       });
       // Force a persist write.
       useUIStore.getState().setOnboardingProjectDir(null);
@@ -191,6 +192,41 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.showCloneDialog).toBeUndefined();
       expect(persisted.state.showNewProjectScreen).toBeUndefined();
       expect(persisted.state.showNewWorkspaceDialog).toBeUndefined();
+      expect(persisted.state.showPullRequests).toBeUndefined();
+      // A badge that stays cleared across restarts is a badge that stops
+      // telling you what is waiting.
+      expect(persisted.state.prBadgeSeen).toBeUndefined();
+    });
+
+    it("opens the Pull Requests page, optionally on one pull request", () => {
+      useUIStore.getState().setShowPullRequests(true, {
+        projectRoot: "/repo",
+        number: 285,
+      });
+      expect(useUIStore.getState().showPullRequests).toBe(true);
+      expect(useUIStore.getState().pendingPrSelection).toEqual({
+        projectRoot: "/repo",
+        number: 285,
+      });
+
+      useUIStore.getState().clearPendingPrSelection();
+      expect(useUIStore.getState().pendingPrSelection).toBeNull();
+
+      // Closing drops any selection request with it.
+      useUIStore.getState().setShowPullRequests(false);
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+      expect(useUIStore.getState().pendingPrSelection).toBeNull();
+    });
+
+    it("accumulates the badge keys the page has shown", () => {
+      useUIStore.setState({ prBadgeSeen: [] });
+      useUIStore.getState().markPrBadgeSeen(["/repo 1", "/repo 2"]);
+      useUIStore.getState().markPrBadgeSeen(["/repo 2", "/repo 3"]);
+      expect(useUIStore.getState().prBadgeSeen).toEqual([
+        "/repo 1",
+        "/repo 2",
+        "/repo 3",
+      ]);
     });
 
     it("does NOT persist the transient expand-project request", () => {

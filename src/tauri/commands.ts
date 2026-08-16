@@ -46,6 +46,7 @@ import type {
   ProjectMemoryUpdate,
   PullRequestInfo,
   IncomingPrItem,
+  PrsOverview,
   ReviewComment,
   InlineReviewComment,
   MergeState,
@@ -641,6 +642,13 @@ export const getGithubPrDiffByPath = (
 export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
+/** Every open pull request in one repository, with the viewer relation
+ *  and a one-word CI rollup — the Pull Requests page's row data. One
+ *  call per project root; the page fans out across the roots the user
+ *  has open and merges the answers. */
+export const listPrsOverview = (path: string) =>
+  invoke<PrsOverview>("list_prs_overview", { path });
+
 /** Merge a PR. `deleteBranch` defaults to true on the backend, matching
  *  the behaviour before the merge sheet made it a question. */
 export const mergePullRequest = (
@@ -686,11 +694,16 @@ export const requestPrReview = (path: string, prNumber: number, reviewer: string
 export const getCheckLogExcerpt = (path: string, prNumber: number, checkName: string) =>
   invoke<string>("get_check_log_excerpt", { path, prNumber, checkName });
 
-export const getPullRequestChecks = (path: string) =>
-  invoke<CheckInfo[]>("get_pull_request_checks", { path });
+/** Checks for a pull request. Omit `prNumber` for "whatever PR this
+ *  checkout's branch has" — the panel's case; the page passes the
+ *  selected PR, which is usually not the checked-out one. */
+export const getPullRequestChecks = (path: string, prNumber?: number) =>
+  invoke<CheckInfo[]>("get_pull_request_checks", { path, prNumber });
 
-export const getPrReviewComments = (path: string) =>
-  invoke<ReviewComment[]>("get_pr_review_comments", { path });
+/** Conversation-level reviews. Omit `prNumber` for the current
+ *  branch's PR. */
+export const getPrReviewComments = (path: string, prNumber?: number) =>
+  invoke<ReviewComment[]>("get_pr_review_comments", { path, prNumber });
 
 export const getPrInlineComments = (path: string, prNumber: number) =>
   invoke<InlineReviewComment[]>("get_pr_inline_comments", { path, prNumber });

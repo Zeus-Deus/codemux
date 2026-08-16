@@ -2185,6 +2185,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_github_pr_by_path,
             commands::get_github_pr_diff_by_path,
             commands::list_incoming_prs,
+            commands::list_prs_overview,
             commands::merge_pull_request,
             commands::close_pull_request,
             commands::reopen_pull_request,

@@ -37,6 +37,7 @@ import {
   MenuKeycap,
 } from "@/components/ui/menu-chrome";
 import { SidebarPortsPopover } from "./sidebar-ports-popover";
+import { SidebarPullRequestsButton } from "./sidebar-pr-button";
 
 /**
  * The menu's bottom strip: which build is running, and whether it is the
@@ -265,6 +266,7 @@ export function SidebarFooterBar() {
               Workspaces
             </TooltipContent>
           </Tooltip>
+          <SidebarPullRequestsButton tooltipSide="right" />
           <SidebarPortsPopover />
           <AppMenu tooltipSide="right" />
         </div>
@@ -295,6 +297,9 @@ export function SidebarFooterBar() {
         <LayoutGrid className="size-[13px]" />
         <span className="text-[12px] font-medium">Workspaces</span>
       </button>
+      {/* Icon-only, like Ports: three labelled destinations would not
+          fit this row, and the badge is what makes this one findable. */}
+      <SidebarPullRequestsButton />
       <SidebarPortsPopover />
       <AppMenu />
     </div>

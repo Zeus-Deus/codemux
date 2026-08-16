@@ -14,7 +14,7 @@ use super::detect::{DetectedProvider, ProviderKind};
 use super::provider::{Capabilities, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PullRequestInfo, ReviewComment,
+    PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 pub struct UnsupportedProvider {
@@ -98,6 +98,10 @@ impl SourceControlProvider for UnsupportedProvider {
         _base_branch: &str,
     ) -> Result<Vec<IncomingPrItem>, String> {
         self.err("list incoming pull requests")
+    }
+
+    fn pull_requests_overview(&self, _repo_path: &Path) -> Result<PrsOverview, String> {
+        self.err("list pull requests")
     }
 
     fn get_pull_request(
@@ -185,13 +189,18 @@ impl SourceControlProvider for UnsupportedProvider {
         self.err("read a pull request diff")
     }
 
-    fn pull_request_checks(&self, _repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
+    fn pull_request_checks(
+        &self,
+        _repo_path: &Path,
+        _number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String> {
         self.err("read pull request checks")
     }
 
     fn pull_request_review_comments(
         &self,
         _repo_path: &Path,
+        _number: Option<u32>,
     ) -> Result<Vec<ReviewComment>, String> {
         self.err("read review comments")
     }
@@ -316,7 +325,9 @@ mod tests {
                 .merge_pull_request(Path::new("/tmp"), 1, "squash", true, None, None)
                 .unwrap_err(),
             provider.list_issues(Path::new("/tmp"), None).unwrap_err(),
-            provider.pull_request_checks(Path::new("/tmp")).unwrap_err(),
+            provider
+                .pull_request_checks(Path::new("/tmp"), None)
+                .unwrap_err(),
         ] {
             assert!(!message.contains("secret-token-value"), "{message}");
             assert!(!message.contains("oauth2"), "{message}");

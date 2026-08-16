@@ -45,6 +45,11 @@ vi.mock("@/lib/toast", () => ({
   },
 }));
 
+const mockCheckOutPr = vi.fn().mockResolvedValue(undefined);
+vi.mock("@/lib/pr-checkout", () => ({
+  checkOutPr: (...a: unknown[]) => mockCheckOutPr(...a),
+}));
+
 const mockHandOff = vi.fn().mockResolvedValue({ route: "current", workspaceId: "ws-1" });
 const mockFindWorkspaceForBranch = vi.fn().mockReturnValue(null);
 vi.mock("@/lib/pr-agent-handoff", () => ({
@@ -711,3 +716,70 @@ export {};
 
 // Keeps `ReactNode` referenced for the JSX pragma-free config.
 export type _Node = ReactNode;
+
+/**
+ * The same component, given a project path and a number instead of a
+ * workspace — which is all the Pull Requests page has.
+ */
+describe("without a workspace (the Pull Requests page)", () => {
+  const pageProps = {
+    workspaceId: null,
+    checkedOutHere: false,
+    showCheckout: true,
+    onOpenChanges: undefined,
+  };
+
+  it("renders from (projectPath, prNumber) with a Check out button", () => {
+    renderDetail({ ...pageProps, pr: makePr({ number: 285 }) });
+
+    expect(screen.getByTestId("review-detail")).toBeInTheDocument();
+    expect(screen.getByTestId("review-header")).toHaveTextContent("#285");
+    expect(screen.getByTestId("detail-checkout")).toHaveTextContent("Check out");
+    // Nothing here is standing in the branch, so the panel's tag is gone.
+    expect(screen.queryByTestId("checked-out-here")).toBeNull();
+  });
+
+  it("offers Switch, and says so, when a workspace already has the branch", () => {
+    renderDetail({ ...pageProps, existingWorkspaceId: "ws-7" });
+
+    expect(screen.getByTestId("detail-checkout")).toHaveTextContent("Switch");
+    expect(screen.getByTestId("checked-out-elsewhere")).toHaveTextContent("checked out");
+  });
+
+  it("checks the branch out into a worktree when there is nowhere to go", async () => {
+    renderDetail({ ...pageProps });
+    await userEvent.click(screen.getByTestId("detail-checkout"));
+
+    expect(mockCheckOutPr).toHaveBeenCalledWith({
+      projectRoot: "/repo",
+      headBranch: "agent/investigate-draft-mode",
+      prNumber: 172,
+      existingWorkspaceId: undefined,
+    });
+  });
+
+  it("switches to the workspace that has the branch instead of cutting a second one", async () => {
+    renderDetail({ ...pageProps, existingWorkspaceId: "ws-7" });
+    await userEvent.click(screen.getByTestId("detail-checkout"));
+
+    expect(mockCheckOutPr).toHaveBeenCalledWith(
+      expect.objectContaining({ existingWorkspaceId: "ws-7" }),
+    );
+  });
+
+  it("keeps the action bar and its handoffs working", () => {
+    renderDetail({
+      ...pageProps,
+      pr: makePr({ author: "juliusm" }),
+      viewerLogin: VIEWER,
+    });
+    // Reviewer state: the verdict bar, not the merge bar.
+    expect(screen.getByTestId("review-primary-action")).toBeInTheDocument();
+  });
+
+  it("does not offer the panel's branch controls back in the panel", () => {
+    renderDetail({ workspaceId: "ws-1", checkedOutHere: true });
+    expect(screen.queryByTestId("detail-checkout")).toBeNull();
+    expect(screen.getByTestId("checked-out-here")).toBeInTheDocument();
+  });
+});

@@ -48,9 +48,13 @@ import {
   MOCK_CHECK_LOG_EXCERPT,
   MOCK_LOCAL_ONLY_PATH,
   MOCK_PR_CHECKS,
+  MOCK_PR_HISTORY,
+  MOCK_PR_OVERVIEW,
+  MOCK_PR_REVIEW_REQUESTS,
   MOCK_PR_INLINE_COMMENTS,
   MOCK_PR_PATH_TO_NUMBER,
   MOCK_PR_REVIEWS,
+  MOCK_UNREACHABLE_ROOT,
   MOCK_PULL_REQUESTS,
   MOCK_SUBMIT_FAILURE_PR,
   createSeedAppState,
@@ -133,6 +137,36 @@ function mutablePr(number: number): PullRequestInfo | undefined {
 function prForPath(path: unknown): PullRequestInfo | undefined {
   const number = MOCK_PR_PATH_TO_NUMBER[String(path ?? "")];
   return number == null ? undefined : mutablePrs[number];
+}
+
+/** The CI rollup the backend reduces host-side, reproduced here from
+ *  the same seeded checks the detail column renders. */
+function rollupOf(number: number): string {
+  const checks = MOCK_PR_CHECKS[number] ?? [];
+  if (checks.length === 0) return "none";
+  if (checks.some((c) => c.conclusion === "fail")) return "failing";
+  if (checks.some((c) => c.conclusion === "pending")) return "pending";
+  return "passing";
+}
+
+/** One overview row, derived from the PR the detail column will open. */
+function overviewItem(number: number) {
+  const pr = mutablePrs[number];
+  if (!pr) return null;
+  return {
+    number: pr.number,
+    title: pr.title,
+    author: pr.author ?? "",
+    head_branch: pr.head_branch,
+    is_draft: pr.is_draft,
+    additions: pr.additions,
+    deletions: pr.deletions,
+    review_decision: pr.review_decision,
+    checks: rollupOf(number),
+    review_requested_from: MOCK_PR_REVIEW_REQUESTS[number] ?? [],
+    updated_at: pr.updated_at,
+    url: pr.url,
+  };
 }
 
 /** Mirror a PR state change onto every workspace carrying that PR, so
@@ -3262,6 +3296,41 @@ const handlers: Record<string, Handler> = {
   },
   list_incoming_prs: () => [],
 
+  // ── Pull Requests page ──
+  //
+  // One root always rejects, so the footer's unreachable line (and the
+  // promise that the other repositories keep their rows) is reachable
+  // without unplugging anything.
+  list_prs_overview: (a) => {
+    const path = String(a.path ?? "");
+    if (path === MOCK_UNREACHABLE_ROOT) {
+      return Promise.reject(
+        "could not resolve host: git.scratchpad.example.com",
+      );
+    }
+    const seed = MOCK_PR_OVERVIEW[path];
+    if (!seed) return { viewer: null, items: [] };
+    return {
+      viewer: seed.viewer,
+      items: seed.numbers.map(overviewItem).filter(Boolean),
+    };
+  },
+
+  // Closed and merged rows, for the list's state dropdown.
+  list_pull_requests: (a) => {
+    const path = String(a.path ?? "");
+    const state = String(a.state ?? "open");
+    const open = MOCK_PR_OVERVIEW[path]?.numbers ?? [];
+    const history = MOCK_PR_HISTORY[path] ?? [];
+    const numbers =
+      state === "closed" ? history : state === "all" ? [...open, ...history] : open;
+    return numbers.map((n) => mutablePrs[n]).filter(Boolean);
+  },
+
+  // The page opens a PR by number, not by whatever branch a checkout
+  // happens to be standing on.
+  get_github_pr_by_path: (a) => mutablePrs[Number(a.prNumber)] ?? null,
+
   // ── Review panel ──
   //
   // Without `check_github_repo` the panel's gate resolves `repoSupported`
@@ -3286,13 +3355,14 @@ const handlers: Record<string, Handler> = {
   },
 
   get_pull_request_checks: (a) => {
-    const pr = prForPath(a.path);
-    return pr ? (MOCK_PR_CHECKS[pr.number] ?? []) : [];
+    const number = a.prNumber != null ? Number(a.prNumber) : prForPath(a.path)?.number;
+    return number == null ? [] : (MOCK_PR_CHECKS[number] ?? []);
   },
 
   get_pr_review_comments: (a) => {
-    const pr = prForPath(a.path);
-    return pr ? (MOCK_PR_REVIEWS[pr.number] ?? []) : [];
+    const number = a.prNumber != null ? Number(a.prNumber) : prForPath(a.path)?.number;
+    if (number == null) return [];
+    return mutablePrReviews[number] ?? MOCK_PR_REVIEWS[number] ?? [];
   },
 
   get_pr_inline_comments: (a) => {

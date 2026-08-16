@@ -23,6 +23,7 @@ import {
   type HandoffRequest,
   type ReviewThreadTask,
 } from "@/lib/pr-agent-handoff";
+import { checkOutPr } from "@/lib/pr-checkout";
 import { ReviewHeader } from "./review-header";
 import { ReviewTabStrip, type ReviewTab } from "./review-tab-strip";
 import { ReviewChecks } from "./review-checks";
@@ -89,7 +90,16 @@ export interface ReviewDetailProps {
   checksLoading: boolean;
   commentsLoading: boolean;
   cwd: string;
-  workspaceId: string;
+  /**
+   * The workspace this detail is being read *in*, when there is one.
+   *
+   * Null on the Pull Requests page: a pull request there belongs to a
+   * project, not to a workspace, and everything workspace-shaped below
+   * (draft scope, "switch to main", the handoff's you-are-already-here
+   * route) reads that null as "no workspace to act in" rather than
+   * pretending one exists.
+   */
+  workspaceId: string | null;
   /** Repository root — where an agent handoff would cut a worktree. */
   projectRoot: string;
   provider: ProviderPresentation;
@@ -97,6 +107,15 @@ export interface ReviewDetailProps {
   /** Authenticated account, for author-vs-reviewer. Null ⇒ reviewer. */
   viewerLogin: string | null;
   checkedOutHere: boolean;
+  /**
+   * A *different* workspace standing on this PR's head branch, if any.
+   * Resolved by the parent, which already subscribes to the workspace
+   * list, so this component never scans it per render.
+   */
+  existingWorkspaceId?: string | null;
+  /** Offer the branch controls in the header. The panel leaves this
+   *  off: it is already standing in the branch. */
+  showCheckout?: boolean;
   /** Commits on the remote this worktree doesn't have. */
   gitBehind: number;
   /** Uncommitted files here — decides whether Pull may be offered. */
@@ -105,7 +124,8 @@ export interface ReviewDetailProps {
    *  polls are healthy. Content is never blanked either way. */
   staleAgeMs: number | null;
   onRefresh: () => void;
-  onOpenChanges: () => void;
+  /** Absent on surfaces with no Changes pane to open. */
+  onOpenChanges?: () => void;
 }
 
 /**
@@ -131,6 +151,8 @@ export function ReviewDetail(props: ReviewDetailProps) {
     repoSlug,
     viewerLogin,
     checkedOutHere,
+    existingWorkspaceId,
+    showCheckout = false,
     gitBehind,
     gitDirtyFiles,
     staleAgeMs,
@@ -138,7 +160,11 @@ export function ReviewDetail(props: ReviewDetailProps) {
     onOpenChanges,
   } = props;
 
-  const key = makeDraftKey(workspaceId, pr.number);
+  // Drafts are scoped to the surface writing them. Without a workspace
+  // the project root is that scope, which keeps the page's half-written
+  // review separate from the panel's on the same PR — two places to
+  // type, two drafts, neither overwriting the other (binding rule 4).
+  const key = makeDraftKey(workspaceId ?? `page:${projectRoot}`, pr.number);
   const [activeTab, setActiveTab] = useState("summary");
   const [mergeSheetOpen, setMergeSheetOpen] = useState(false);
   const [merging, setMerging] = useState(false);
@@ -291,6 +317,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
   }, [cwd, pr.number, onRefresh]);
 
   const switchToDefaultBranch = useCallback(async () => {
+    if (!workspaceId) return;
     try {
       const branch = await checkoutDefaultBranchInWorkspace(workspaceId);
       toast.success(`Switched to ${branch}`);
@@ -448,11 +475,15 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ...(pending
             ? [{ label: "Copy notes", onClick: () => copyDraft("Notes copied") }]
             : []),
-          {
-            label: `Switch to ${baseBranch}`,
-            onClick: () => void switchToDefaultBranch(),
-            emphasis: "strong" as const,
-          },
+          ...(workspaceId
+            ? [
+                {
+                  label: `Switch to ${baseBranch}`,
+                  onClick: () => void switchToDefaultBranch(),
+                  emphasis: "strong" as const,
+                },
+              ]
+            : []),
         ],
       });
     }
@@ -472,11 +503,15 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ...(pending
             ? [{ label: "Copy notes", onClick: () => copyDraft("Notes copied") }]
             : []),
-          {
-            label: `Switch to ${baseBranch}`,
-            onClick: () => void switchToDefaultBranch(),
-            emphasis: "strong" as const,
-          },
+          ...(workspaceId
+            ? [
+                {
+                  label: `Switch to ${baseBranch}`,
+                  onClick: () => void switchToDefaultBranch(),
+                  emphasis: "strong" as const,
+                },
+              ]
+            : []),
         ],
       });
     }
@@ -513,9 +548,19 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ),
           // Pull is never offered blind over uncommitted work.
           actions: [
-            { label: "Review changes", onClick: onOpenChanges },
+            ...(onOpenChanges
+              ? [{ label: "Review changes", onClick: onOpenChanges }]
+              : []),
             { label: "Stash and pull", onClick: () => void stashAndPull() },
-            { label: "Commit first", onClick: onOpenChanges, emphasis: "strong" },
+            ...(onOpenChanges
+              ? [
+                  {
+                    label: "Commit first",
+                    onClick: onOpenChanges,
+                    emphasis: "strong" as const,
+                  },
+                ]
+              : []),
           ],
         });
       } else {
@@ -570,6 +615,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     return mostSevere(candidates);
   }, [
     key,
+    workspaceId,
     merged,
     closed,
     readOnly,
@@ -595,6 +641,31 @@ export function ReviewDetail(props: ReviewDetailProps) {
     runSubmit,
   ]);
 
+  // ── Branch controls (page only) ──
+
+  const [checkingOut, setCheckingOut] = useState(false);
+
+  const checkOut = useCallback(() => {
+    if (checkingOut) return;
+    setCheckingOut(true);
+    checkOutPr({
+      projectRoot,
+      headBranch: pr.head_branch,
+      prNumber: pr.number,
+      existingWorkspaceId,
+    })
+      .catch((err) => toast.error(String(err)))
+      .finally(() => setCheckingOut(false));
+  }, [checkingOut, projectRoot, pr.head_branch, pr.number, existingWorkspaceId]);
+
+  const copyBranch = useCallback(() => {
+    if (!pr.head_branch) return;
+    navigator.clipboard
+      .writeText(pr.head_branch)
+      .then(() => toast.success("Branch name copied"))
+      .catch(() => toast.error("Couldn't copy the branch name"));
+  }, [pr.head_branch]);
+
   // Only Summary has content in this ship. The strip takes a list so
   // Code and Timeline arrive without the layout below it moving.
   const tabs: ReviewTab[] = [{ id: "summary", label: "Summary" }];
@@ -606,6 +677,16 @@ export function ReviewDetail(props: ReviewDetailProps) {
         provider={provider}
         repoSlug={repoSlug}
         checkedOutHere={checkedOutHere}
+        checkout={
+          showCheckout
+            ? {
+                hasWorkspace: !!existingWorkspaceId,
+                busy: checkingOut,
+                onCheckOut: checkOut,
+                onCopyBranch: copyBranch,
+              }
+            : undefined
+        }
         onRefresh={onRefresh}
       />
 

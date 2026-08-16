@@ -10,9 +10,10 @@ import {
   GitPullRequest,
   X,
 } from "lucide-react";
-import { listIncomingPrs, createWorktreeWorkspace } from "@/tauri/commands";
-import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import { listIncomingPrs } from "@/tauri/commands";
+import { checkOutPr } from "@/lib/pr-checkout";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import type { IncomingPrItem, WorkspaceSnapshot } from "@/tauri/types";
@@ -101,15 +102,34 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
   const handleCheckout = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      if (existingWs) {
-        await activateWorkspaceInteraction(existingWs.workspace_id);
-      } else if (pr.head_branch) {
-        await createWorktreeWorkspace(projectRoot, pr.head_branch, false, "single", null, null, null, pr.number);
-      }
+      // Same helper the Pull Requests page's rows use, so "Switch"
+      // means the same thing on both surfaces.
+      await checkOutPr({
+        projectRoot,
+        headBranch: pr.head_branch,
+        prNumber: pr.number,
+        existingWorkspaceId: existingWs?.workspace_id ?? null,
+      });
     } catch (err) {
       console.warn("[incoming-prs] checkout failed:", err);
       toast.error(String(err));
     }
+  };
+
+  /**
+   * Clicking a row opens it on the Pull Requests page.
+   *
+   * It used to switch workspaces when one happened to exist and do
+   * nothing at all when one didn't — so the same gesture meant two
+   * different things depending on state the user can't see. Reading is
+   * what a click means on the page, and now it means that here too;
+   * checking out stays an explicit button.
+   */
+  const openOnPage = () => {
+    useUIStore.getState().setShowPullRequests(true, {
+      projectRoot,
+      number: pr.number,
+    });
   };
 
   const review = pr.review_decision ? REVIEW_LABELS[pr.review_decision] : null;
@@ -117,7 +137,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
   return (
     <div
       className="group px-2.5 py-1.5 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
-      onClick={() => { if (existingWs) activateWorkspaceInteraction(existingWs.workspace_id).catch(console.error); }}
+      onClick={openOnPage}
     >
       <div className="flex items-center gap-1.5 min-w-0 h-5">
         <ChecksIndicator status={pr.checks_status} />

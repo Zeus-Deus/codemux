@@ -40,7 +40,8 @@ use super::provider::{Capabilities, SourceControlProvider};
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    IssueComment, IssueState, PullRequestInfo, ReviewComment, MAX_ISSUE_BODY_BYTES,
+    IssueComment, IssueState, PrOverviewItem, PrsOverview, PullRequestInfo, ReviewComment,
+    MAX_ISSUE_BODY_BYTES,
     MAX_ISSUE_COMMENTS, MAX_PR_DIFF_BYTES,
 };
 
@@ -517,6 +518,82 @@ fn parse_incoming_mr_json(v: &Value) -> IncomingPrItem {
     }
 }
 
+/// A merge request's pipeline reduced to the page's four-word CI
+/// vocabulary.
+///
+/// Only what the list endpoint already carries is read. A per-MR
+/// pipeline lookup would be a request per row, which is exactly the cost
+/// the reduced rollup exists to avoid.
+fn mr_rollup_state(v: &Value) -> String {
+    let status = v["head_pipeline"]["status"]
+        .as_str()
+        .or_else(|| v["pipeline"]["status"].as_str())
+        .unwrap_or("");
+    match status {
+        "success" | "manual" => "passing".to_string(),
+        "failed" => "failing".to_string(),
+        "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | "scheduled" => {
+            "pending".to_string()
+        }
+        // canceled / skipped / absent: there is nothing to report, and a
+        // grey dot that means "cancelled" and a grey dot that means "no
+        // pipeline" are the same dot.
+        _ => "none".to_string(),
+    }
+}
+
+/// Approval state in the vocabulary the row labels read.
+///
+/// GitLab has no request-changes verdict (see the capability table), so
+/// this is a two-state answer at most. `approved` is only present on
+/// some instances/tiers, so it is read defensively and the merge-status
+/// hint is the fallback — neither is invented when GitLab is silent.
+fn mr_review_decision(v: &Value) -> Option<String> {
+    if v["approved"].as_bool() == Some(true) {
+        return Some("APPROVED".to_string());
+    }
+    match v["detailed_merge_status"].as_str() {
+        Some("not_approved") => Some("REVIEW_REQUIRED".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_overview_mr_json(v: &Value) -> PrOverviewItem {
+    let reviewers = v["reviewers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    r["username"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    PrOverviewItem {
+        number: v["iid"].as_u64().unwrap_or(0) as u32,
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        author: v["author"]["username"].as_str().unwrap_or("").to_string(),
+        head_branch: v["source_branch"].as_str().map(|s| s.to_string()),
+        is_draft: v["draft"]
+            .as_bool()
+            .or_else(|| v["work_in_progress"].as_bool())
+            .unwrap_or(false),
+        // Line counts are a diff-stat call per merge request on GitLab;
+        // the row simply omits them rather than paying 50 round trips.
+        additions: None,
+        deletions: None,
+        review_decision: mr_review_decision(v),
+        checks: mr_rollup_state(v),
+        review_requested_from: reviewers,
+        updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
+        url: v["web_url"].as_str().unwrap_or("").to_string(),
+    }
+}
+
 fn parse_issue_json(v: &Value) -> GitHubIssue {
     let labels = v["labels"]
         .as_array()
@@ -900,6 +977,24 @@ impl SourceControlProvider for GitLabProvider {
         Ok(rows.iter().map(parse_incoming_mr_json).collect())
     }
 
+    fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String> {
+        let endpoint = format!(
+            "projects/:id/merge_requests?state=opened&per_page={LIST_PAGE_SIZE}&order_by=updated_at&sort=desc"
+        );
+        let value = self.api(repo_path, &endpoint, LIST_TIMEOUT)?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| "Expected JSON array from merge request list".to_string())?;
+        let viewer = match self.auth_status() {
+            GhStatus::Authenticated { username } if !username.is_empty() => Some(username),
+            _ => None,
+        };
+        Ok(PrsOverview {
+            viewer,
+            items: rows.iter().map(parse_overview_mr_json).collect(),
+        })
+    }
+
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {
         let key = cache_key(repo_path, &["mr", &number.to_string()]);
         MR_DETAIL_CACHE.get_or_fetch(&key, DETAIL_TTL, || {
@@ -1194,16 +1289,23 @@ impl SourceControlProvider for GitLabProvider {
         })
     }
 
-    fn pull_request_checks(&self, repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-        let Some(mr) = self.branch_pull_request(repo_path)? else {
-            return Ok(Vec::new());
+    fn pull_request_checks(
+        &self,
+        repo_path: &Path,
+        number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String> {
+        let number = match number {
+            Some(number) => number,
+            None => match self.branch_pull_request(repo_path)? {
+                Some(mr) => mr.number,
+                None => return Ok(Vec::new()),
+            },
         };
 
         let pipelines = self.api(
             repo_path,
             &format!(
-                "projects/:id/merge_requests/{}/pipelines?per_page=1&order_by=id&sort=desc",
-                mr.number
+                "projects/:id/merge_requests/{number}/pipelines?per_page=1&order_by=id&sort=desc"
             ),
             CALL_TIMEOUT,
         )?;
@@ -1242,11 +1344,16 @@ impl SourceControlProvider for GitLabProvider {
     fn pull_request_review_comments(
         &self,
         repo_path: &Path,
+        number: Option<u32>,
     ) -> Result<Vec<ReviewComment>, String> {
-        let Some(mr) = self.branch_pull_request(repo_path)? else {
-            return Ok(Vec::new());
+        let number = match number {
+            Some(number) => number,
+            None => match self.branch_pull_request(repo_path)? {
+                Some(mr) => mr.number,
+                None => return Ok(Vec::new()),
+            },
         };
-        let discussions = self.discussions(repo_path, mr.number)?;
+        let discussions = self.discussions(repo_path, number)?;
         Ok(split_discussions(&discussions).0)
     }
 

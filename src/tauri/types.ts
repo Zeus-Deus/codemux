@@ -559,6 +559,32 @@ export interface IncomingPrItem {
   url: string;
 }
 
+/** One row of the Pull Requests page. `checks` is the CI rollup already
+ *  reduced host-side to one of `passing` / `failing` / `pending` /
+ *  `none` — the raw per-check array never crosses the boundary. */
+export interface PrOverviewItem {
+  number: number;
+  title: string;
+  author: string;
+  head_branch: string | null;
+  is_draft: boolean;
+  additions: number | null;
+  deletions: number | null;
+  review_decision: string | null;
+  checks: string;
+  /** Logins this pull request is waiting on. */
+  review_requested_from: string[];
+  updated_at: string | null;
+  url: string;
+}
+
+/** One repository root's open pull requests, plus who is asking — the
+ *  grouping is meaningless without the viewer. */
+export interface PrsOverview {
+  viewer: string | null;
+  items: PrOverviewItem[];
+}
+
 export interface CheckInfo {
   name: string;
   status: string;

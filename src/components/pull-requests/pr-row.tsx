@@ -1,0 +1,284 @@
+import { memo, useState } from "react";
+
+import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
+import { checkOutPr } from "@/lib/pr-checkout";
+import { providerRef, type ProviderPresentation } from "@/lib/source-control";
+import type { PrRow as PrRowData } from "@/lib/pr-overview";
+import { groupDigits, shortAge } from "@/components/workspace/review/review-ui";
+
+/** "5m" — the list has room for a magnitude, not a sentence. */
+function compactAge(iso: string | null): string | null {
+  if (!iso) return null;
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return null;
+  return shortAge(Date.now() - then);
+}
+
+/**
+ * The CI colour that leads the row.
+ *
+ * A draft's dot is dashed and grey whatever CI says: a draft is not
+ * asking for a verdict yet, and a green dot on one reads as "ready".
+ */
+function StateDot({ checks, draft }: { checks: string; draft: boolean }) {
+  if (draft) {
+    return (
+      <span
+        aria-hidden
+        data-state="draft"
+        className="size-2.5 shrink-0 rounded-full border-[1.5px] border-dashed border-muted-foreground/70"
+      />
+    );
+  }
+  if (checks === "pending") {
+    return (
+      <span
+        aria-hidden
+        data-state="pending"
+        className="size-2.5 shrink-0 animate-spin rounded-full border-[1.6px] border-status-working border-r-transparent"
+      />
+    );
+  }
+  if (checks === "failing") {
+    return (
+      <span
+        aria-hidden
+        data-state="failing"
+        className="size-2.5 shrink-0 rounded-full bg-destructive"
+      />
+    );
+  }
+  if (checks === "passing") {
+    return (
+      <span
+        aria-hidden
+        data-state="passing"
+        className="size-2.5 shrink-0 rounded-full border-[1.6px] border-status-open bg-status-open/25"
+      />
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      data-state="none"
+      className="size-2.5 shrink-0 rounded-full border-[1.5px] border-border"
+    />
+  );
+}
+
+/** The 11px host mark. Ember for GitLab, neutral for GitHub — the
+ *  colour is the only thing that has to survive at this size. */
+function HostMark({ kind }: { kind: string }) {
+  return (
+    <span
+      aria-hidden
+      data-testid={`host-mark-${kind}`}
+      className={cn(
+        "size-[11px] shrink-0 rounded-[3px]",
+        kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/40",
+      )}
+    />
+  );
+}
+
+/**
+ * The state label on the right of the title.
+ *
+ * One label, in the order that decides what to do next: something is
+ * blocking, it is ready, or it is not asking yet.
+ */
+function stateLabel(row: PrRowData): { text: string; className: string } | null {
+  const state = row.state?.toUpperCase();
+  if (state === "MERGED") return { text: "merged", className: "text-accent-violet" };
+  if (state === "CLOSED") return { text: "closed", className: "text-muted-foreground" };
+  if (row.is_draft) return null; // the Draft chip says it instead
+  if (row.review_decision === "CHANGES_REQUESTED") {
+    return { text: "changes requested", className: "text-status-working" };
+  }
+  if (row.review_decision === "APPROVED" && row.checks !== "failing") {
+    return { text: "ready to merge", className: "font-semibold text-status-open" };
+  }
+  return null;
+}
+
+export interface PrRowProps {
+  row: PrRowData;
+  provider: ProviderPresentation;
+  selected: boolean;
+  /** The row the keyboard is on — it shows its action like a hover. */
+  focused: boolean;
+  /** Rule 03: the poll wanted to move this row and was held off. */
+  moved: boolean;
+  /** Workspace already standing on this branch, when there is one. */
+  existingWorkspaceId: string | null;
+  /** One-line density, for the folded Watching group. */
+  dense?: boolean;
+  onSelect: () => void;
+}
+
+function PrRowImpl({
+  row,
+  provider,
+  selected,
+  focused,
+  moved,
+  existingWorkspaceId,
+  dense = false,
+  onSelect,
+}: PrRowProps) {
+  const [busy, setBusy] = useState(false);
+  const age = compactAge(row.updated_at);
+  const label = stateLabel(row);
+
+  const checkOut = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    if (busy) return;
+    setBusy(true);
+    checkOutPr({
+      projectRoot: row.projectRoot,
+      headBranch: row.head_branch,
+      prNumber: row.number,
+      existingWorkspaceId,
+    })
+      .catch((err) => toast.error(String(err)))
+      .finally(() => setBusy(false));
+  };
+
+  if (dense) {
+    return (
+      <div
+        role="option"
+        aria-selected={selected}
+        data-testid={`pr-row-${row.projectRoot}-${row.number}`}
+        data-focused={focused}
+        onClick={onSelect}
+        className={cn(
+          "group flex cursor-default items-center gap-2 py-1 pr-2.5",
+          selected
+            ? "border-l-2 border-accent-ember bg-card pl-[9px]"
+            : "pl-2.5 hover:bg-muted/30",
+        )}
+      >
+        <StateDot checks={row.checks} draft={row.is_draft} />
+        <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+          {providerRef(provider, row.number)}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">
+          {row.title}
+        </span>
+        {moved && <MovedMark />}
+        <span className="shrink-0 text-[10.5px] text-muted-foreground">{row.author}</span>
+        {age && (
+          <span className="shrink-0 text-[10.5px] text-muted-foreground">{age}</span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      role="option"
+      aria-selected={selected}
+      data-testid={`pr-row-${row.projectRoot}-${row.number}`}
+      data-focused={focused}
+      onClick={onSelect}
+      className={cn(
+        "group flex cursor-default flex-col gap-1 py-1.5 pr-2.5",
+        selected
+          ? "border-l-2 border-accent-ember bg-card pl-[9px]"
+          : "pl-2.5 hover:bg-muted/30",
+        row.is_draft && "opacity-70",
+      )}
+    >
+      <div className="flex items-center gap-1.5">
+        <StateDot checks={row.checks} draft={row.is_draft} />
+        {/* Titles never wrap: a two-line title pushes the row below it
+            off the fold and makes every row a different height. */}
+        <span
+          className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground"
+          title={row.title}
+        >
+          {row.title}
+        </span>
+
+        {row.is_draft && (
+          <span className="shrink-0 rounded border border-border px-1 py-px text-[9.5px] text-muted-foreground">
+            Draft
+          </span>
+        )}
+        {label && (
+          <span
+            data-testid="pr-row-state-label"
+            className={cn("shrink-0 text-[10px]", label.className)}
+          >
+            {label.text}
+          </span>
+        )}
+
+        {/* Hover and keyboard focus only — a button on every row at rest
+            is 40 buttons competing with the thing you came to read. */}
+        {row.head_branch && (
+          <button
+            type="button"
+            data-testid="pr-row-checkout"
+            disabled={busy}
+            onClick={checkOut}
+            className={cn(
+              "hidden shrink-0 rounded-[5px] bg-card px-1.5 py-0.5 text-[10px] text-foreground/90",
+              "transition-colors hover:bg-accent/60 disabled:opacity-60",
+              "group-hover:block group-data-[focused=true]:block",
+            )}
+          >
+            {existingWorkspaceId ? "Switch" : "Check out"}
+          </button>
+        )}
+      </div>
+
+      <div className="flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-foreground">
+        <HostMark kind={row.providerKind} />
+        <span className="shrink-0 font-mono">{providerRef(provider, row.number)}</span>
+        <span className="shrink-0 opacity-40">·</span>
+        <span className="min-w-0 max-w-[40%] truncate">{row.repo}</span>
+        {row.author && (
+          <>
+            <span className="shrink-0 opacity-40">·</span>
+            <span className="shrink-0 truncate">{row.author}</span>
+          </>
+        )}
+        {existingWorkspaceId && (
+          <>
+            <span className="shrink-0 opacity-40">·</span>
+            <span className="shrink-0 text-status-open">checked out</span>
+          </>
+        )}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {moved && <MovedMark />}
+          {row.additions != null && row.additions > 0 && (
+            <span className="font-mono text-status-open">+{groupDigits(row.additions)}</span>
+          )}
+          {row.deletions != null && row.deletions > 0 && (
+            <span className="font-mono text-destructive">−{groupDigits(row.deletions)}</span>
+          )}
+          {age && <span>{age}</span>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** The quiet mark rule 03 asks for: this row changed while you were
+ *  reading, and its new position is waiting. */
+function MovedMark() {
+  return (
+    <span
+      data-testid="pr-row-moved"
+      title="Updated — the list will re-sort when you're done"
+      className="size-1.5 shrink-0 rounded-full bg-accent-ember"
+    />
+  );
+}
+
+// The list re-renders on every 30s poll and on every keyboard move;
+// without this each of those walks all 50 rows.
+export const PrRow = memo(PrRowImpl);

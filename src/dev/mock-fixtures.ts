@@ -2675,6 +2675,22 @@ export const MOCK_PULL_REQUESTS: Record<number, PullRequestInfo> = {
     body: PR_482_BODY,
     latest_reviews: [{ author: OTHER_AUTHOR, state: "APPROVED" }],
   }),
+  // Yours, with changes requested on it, on a branch a workspace here
+  // is already standing in — the row that has to say three things at
+  // once on the Pull Requests page.
+  285: makePr({
+    number: 285,
+    title: "docs: drop the ports section from AGENTS.md",
+    head_branch: "demo/workflow-approval",
+    additions: 3,
+    deletions: 41,
+    changed_files: 1,
+    review_decision: "CHANGES_REQUESTED",
+    merge_state_status: "BLOCKED",
+    updated_at: minutesAgo(184),
+    body: "The ports guidance moved into the workspace docs; this drops the duplicate.",
+    latest_reviews: [{ author: OTHER_AUTHOR, state: "CHANGES_REQUESTED" }],
+  }),
   // Author + draft: Close / Ready for review.
   140: makePr({
     number: 140,
@@ -2772,6 +2788,42 @@ export const MOCK_PR_PATH_TO_NUMBER: Record<string, number> = {
 };
 
 /**
+ * What the Pull Requests page lists, per repository root.
+ *
+ * Numbers rather than rows: every field the page shows is derived from
+ * the same `MOCK_PULL_REQUESTS` entry the detail column opens, so the
+ * list and the detail can never disagree in the mock the way they could
+ * if the rows were typed out twice.
+ */
+export const MOCK_PR_OVERVIEW: Record<string, { viewer: string; numbers: number[] }> = {
+  [codemuxRoot]: { viewer: MOCK_PR_AUTHOR, numbers: [142, 172, 285, 482, 140] },
+  [siteRoot]: { viewer: MOCK_PR_AUTHOR, numbers: [12] },
+  // A different account on a different product — which is why the page
+  // resolves the viewer per root rather than once.
+  [vexisRoot]: { viewer: "mock-glab", numbers: [88, 90] },
+};
+
+/** Who each pull request is waiting on. */
+export const MOCK_PR_REVIEW_REQUESTS: Record<number, string[]> = {
+  142: [MOCK_PR_AUTHOR],
+  12: [MOCK_PR_AUTHOR],
+};
+
+/**
+ * The root whose overview always fails.
+ *
+ * One unreachable repository is the case the footer line exists for:
+ * the other roots keep their rows, and the page says how many it
+ * couldn't read rather than blanking (binding rule 2).
+ */
+export const MOCK_UNREACHABLE_ROOT = scratchRoot;
+
+/** Closed and merged pull requests per root, for the state dropdown. */
+export const MOCK_PR_HISTORY: Record<string, number[]> = {
+  [codemuxRoot]: [128, 131],
+};
+
+/**
  * The PR whose review submissions always fail.
  *
  * Deliberately a fixed PR rather than a call counter: the submit-failed
@@ -2806,7 +2858,9 @@ export const MOCK_PR_CHECKS: Record<number, CheckInfo[]> = {
   140: [checkOf("lint", "pass", "20s"), checkOf("typecheck", "pending", "11s")],
   128: [checkOf("build (ubuntu-latest)", "pass", "1m 04s")],
   131: [],
-  12: [checkOf("build", "pass", "33s"), checkOf("visual-diff", "pass", "1m 12s")],
+  285: [checkOf("lint", "pass", "18s"), checkOf("typecheck", "pass", "34s")],
+  // Running, so the page's "needs your review" group has one of each.
+  12: [checkOf("build", "pass", "33s"), checkOf("visual-diff", "pending", "1m 12s")],
   88: [checkOf("cargo build", "pass", "4m 02s"), checkOf("cargo test", "pending", "1m 30s")],
   90: [checkOf("cargo build", "pass", "3m 48s")],
 };

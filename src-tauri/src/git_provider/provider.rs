@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::detect::ProviderKind;
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PullRequestInfo, ReviewComment,
+    PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 /// What a provider can actually do, declared statically so the UI can
@@ -94,6 +94,12 @@ pub trait SourceControlProvider: Send + Sync {
         base_branch: &str,
     ) -> Result<Vec<IncomingPrItem>, String>;
 
+    /// Every open pull request in this repository, with the viewer
+    /// relation (who is asking, who is asked) and a CI rollup reduced to
+    /// one word. This is what the Pull Requests page lists, and the only
+    /// call it makes per repository root.
+    fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String>;
+
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String>;
 
     fn create_pull_request(
@@ -164,12 +170,23 @@ pub trait SourceControlProvider: Send + Sync {
         full: bool,
     ) -> Result<String, String>;
 
-    /// CI checks for the current branch's PR.
-    fn pull_request_checks(&self, repo_path: &Path) -> Result<Vec<CheckInfo>, String>;
+    /// CI checks for a pull request. `number = None` means the current
+    /// branch's PR — the panel's case; the Pull Requests page passes the
+    /// number of whichever PR is selected, which is usually not this
+    /// checkout's.
+    fn pull_request_checks(
+        &self,
+        repo_path: &Path,
+        number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String>;
 
-    /// Conversation-level review threads for the current branch's PR.
-    fn pull_request_review_comments(&self, repo_path: &Path)
-        -> Result<Vec<ReviewComment>, String>;
+    /// Conversation-level review threads. `number = None` means the
+    /// current branch's PR; the page passes the selected one.
+    fn pull_request_review_comments(
+        &self,
+        repo_path: &Path,
+        number: Option<u32>,
+    ) -> Result<Vec<ReviewComment>, String>;
 
     fn pull_request_inline_comments(
         &self,

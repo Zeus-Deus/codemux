@@ -13,7 +13,17 @@ import type { ActivePaneStatus } from "@/tauri/types";
 /** Typing this as the first character narrows the palette to commands only. */
 export const COMMAND_MODE_PREFIX = ">";
 
-export type PaletteMode = "all" | "commands";
+/**
+ * Typing this narrows the palette to loaded pull requests.
+ *
+ * A word rather than a symbol because it is what you would type anyway:
+ * `pr 6318` and `pr windows shutdown` are both things people already
+ * write in chat. The trailing space is part of the prefix so a workspace
+ * called `prototype` is still reachable by name.
+ */
+export const PR_MODE_PREFIX = "pr ";
+
+export type PaletteMode = "all" | "commands" | "prs";
 
 export interface PaletteQuery {
   /** Exactly what the user typed, prefix included. */
@@ -32,14 +42,66 @@ export interface PaletteQuery {
 export function parsePaletteQuery(raw: string): PaletteQuery {
   const leading = raw.trimStart();
   const commandMode = leading.startsWith(COMMAND_MODE_PREFIX);
-  const body = commandMode ? leading.slice(COMMAND_MODE_PREFIX.length) : raw;
+  const prMode =
+    !commandMode && leading.toLowerCase().startsWith(PR_MODE_PREFIX);
+  const body = commandMode
+    ? leading.slice(COMMAND_MODE_PREFIX.length)
+    : prMode
+      ? leading.slice(PR_MODE_PREFIX.length)
+      : raw;
   const needle = body.trim();
   return {
     raw,
-    mode: commandMode ? "commands" : "all",
+    mode: commandMode ? "commands" : prMode ? "prs" : "all",
     needle,
-    pathMode: needle.includes("/"),
+    // A pull-request query is never a path query: `owner/repo` is a
+    // perfectly ordinary thing to type at it.
+    pathMode: !prMode && needle.includes("/"),
   };
+}
+
+/** The shape `pr ` mode ranks. Structural, so the palette can hand it
+ *  overview rows without the model importing them. */
+export interface PalettePr {
+  number: number;
+  title: string;
+  repo?: string | null;
+  author?: string | null;
+}
+
+export function prSearchText(pr: PalettePr): string {
+  return [`#${pr.number}`, `!${pr.number}`, pr.title, pr.repo ?? "", pr.author ?? ""]
+    .join(" ")
+    .trim();
+}
+
+/**
+ * Rank pull requests for `pr <query>`.
+ *
+ * A number is treated as a number: `pr 285` puts #285 first even though
+ * "285" also appears inside #12850 and inside three titles. Anything
+ * else is ordinary fuzzy matching over the number, title, repository and
+ * author.
+ */
+export function rankPalettePrs<T extends PalettePr>(
+  items: readonly T[],
+  needle: string,
+): T[] {
+  if (needle === "") return [...items];
+  const digitsOnly = /^\d+$/.test(needle);
+  const scored: { item: T; score: number }[] = [];
+  for (const item of items) {
+    let score: number | null = null;
+    if (digitsOnly) {
+      const number = String(item.number);
+      if (number === needle) score = 1_000_000;
+      else if (number.startsWith(needle)) score = 500_000;
+      else if (number.includes(needle)) score = 250_000;
+    }
+    if (score === null) score = fuzzyScore(prSearchText(item), needle);
+    if (score !== null) scored.push({ item, score });
+  }
+  return scored.sort((a, b) => b.score - a.score).map((entry) => entry.item);
 }
 
 /**

@@ -32,6 +32,17 @@ vi.mock("@/tauri/commands", () => ({
   createWorktreeWorkspace: (...args: unknown[]) => mockCreateWorktreeWorkspace(...args),
 }));
 
+// A row click now opens the Pull Requests page on that PR, so the store
+// setter is what this suite watches for it.
+const mockSetShowPullRequests = vi.fn();
+vi.mock("@/stores/ui-store", () => ({
+  useUIStore: Object.assign(
+    (selector: (s: Record<string, unknown>) => unknown) =>
+      selector({ setShowPullRequests: mockSetShowPullRequests }),
+    { getState: () => ({ setShowPullRequests: mockSetShowPullRequests }) },
+  ),
+}));
+
 // ── Mock app store ──
 
 const mockWorkspaces: { workspace_id: string; git_branch: string | null; project_root: string | null }[] = [];
@@ -279,7 +290,7 @@ describe("IncomingPrsView", () => {
     expect(mockListIncomingPrs).toHaveBeenCalledWith("/home/user/project", "main");
   });
 
-  it("clicking row switches to existing worktree workspace", async () => {
+  it("clicking a row opens it on the Pull Requests page", async () => {
     const user = userEvent.setup();
     mockWorkspaces.push({
       workspace_id: "ws-existing",
@@ -291,9 +302,15 @@ describe("IncomingPrsView", () => {
     render(<IncomingPrsView {...defaultProps} />);
     await flushPromises();
 
-    // Click the row itself (title text), not a button
+    // Click the row itself (title text), not a button. Reading is what a
+    // click means on the page, so it means that here too — switching
+    // workspaces stays on the explicit button.
     await user.click(screen.getByText("Add user settings page"));
-    expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-existing");
+    expect(mockSetShowPullRequests).toHaveBeenCalledWith(true, {
+      projectRoot: "/home/user/project",
+      number: 27,
+    });
+    expect(mockActivateWorkspace).not.toHaveBeenCalled();
   });
 
   it("View button opens PR URL via openUrl", async () => {
@@ -306,7 +323,7 @@ describe("IncomingPrsView", () => {
     expect(mockOpenUrl).toHaveBeenCalledWith("https://github.com/test/repo/pull/27");
   });
 
-  it("clicking row does nothing when no matching worktree", async () => {
+  it("clicking a row never checks anything out on its own", async () => {
     const user = userEvent.setup();
     mockListIncomingPrs.mockResolvedValue([samplePrs[0]]);
     render(<IncomingPrsView {...defaultProps} />);

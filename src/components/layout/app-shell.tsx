@@ -21,6 +21,7 @@ import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { WorkspacesOverviewView } from "@/components/workspaces-overview/workspaces-overview-view";
+import { PullRequestsView } from "@/components/pull-requests/pull-requests-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { NewProjectScreen } from "@/components/overlays/new-project-screen";
 import { FileSearchDialog } from "@/components/search/file-search-dialog";
@@ -44,6 +45,7 @@ export function AppShell() {
   const showSettings = useUIStore((s) => s.showSettings);
   const showAutomations = useUIStore((s) => s.showAutomations);
   const showWorkspacesOverview = useUIStore((s) => s.showWorkspacesOverview);
+  const showPullRequests = useUIStore((s) => s.showPullRequests);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
@@ -154,6 +156,12 @@ export function AppShell() {
   // overlay shape as Settings / Automations.
   if (showWorkspacesOverview) {
     return <WorkspacesOverviewView />;
+  }
+
+  // Full-screen Pull requests — the review surface for work that isn't
+  // in a workspace yet. Same overlay shape as the pages above it.
+  if (showPullRequests) {
+    return <PullRequestsView />;
   }
 
   // Full-screen new project — replaces entire app including sidebar

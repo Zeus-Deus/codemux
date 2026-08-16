@@ -6,6 +6,7 @@ import {
   parsePaletteQuery,
   previewedThemeId,
   rankByQuery,
+  rankPalettePrs,
   rankThemeGroup,
   resultCountLabel,
   themeRowValue,
@@ -259,5 +260,62 @@ describe("theme rows", () => {
     expect(previewedThemeId("cmd:settings")).toBeNull();
     expect(previewedThemeId("theme-studio:generate")).toBeNull();
     expect(previewedThemeId("")).toBeNull();
+  });
+});
+
+describe("pr mode", () => {
+  const prs = [
+    { number: 285, title: "docs: drop the ports section", repo: "example/codemux", author: "mock-dev" },
+    { number: 2853, title: "chore: bump deps", repo: "example/codemux", author: "juliusm" },
+    { number: 6318, title: "fix(web): stabilize terminal selection copy", repo: "acme/site", author: "Defmon3" },
+  ];
+
+  it("switches mode on the `pr ` prefix and strips it", () => {
+    const query = parsePaletteQuery("pr 285");
+    expect(query.mode).toBe("prs");
+    expect(query.needle).toBe("285");
+  });
+
+  it("leaves an ordinary query alone", () => {
+    expect(parsePaletteQuery("pull").mode).toBe("all");
+    expect(parsePaletteQuery("prototype").mode).toBe("all");
+    expect(parsePaletteQuery(">settings").mode).toBe("commands");
+  });
+
+  it("does not treat a repository path in pr mode as a path query", () => {
+    expect(parsePaletteQuery("pr example/codemux").pathMode).toBe(false);
+    expect(parsePaletteQuery("example/codemux").pathMode).toBe(true);
+  });
+
+  it("ranks an exact number first, ahead of one that merely contains it", () => {
+    const ranked = rankPalettePrs(prs, "285");
+    expect(ranked[0].number).toBe(285);
+    expect(ranked.map((pr) => pr.number)).toContain(2853);
+  });
+
+  it("matches on title words", () => {
+    const ranked = rankPalettePrs(prs, "terminal");
+    expect(ranked[0].number).toBe(6318);
+  });
+
+  it("matches on repository and author", () => {
+    expect(rankPalettePrs(prs, "defmon3")[0].number).toBe(6318);
+    // Subsequence matching is deliberately generous; what matters is
+    // that the repository the user named comes first.
+    expect(rankPalettePrs(prs, "acme")[0].number).toBe(6318);
+  });
+
+  it("returns everything for an empty needle, in the caller's order", () => {
+    expect(rankPalettePrs(prs, "").map((pr) => pr.number)).toEqual([285, 2853, 6318]);
+  });
+
+  it("surfaces the page command for a plain word, not pr mode", () => {
+    const query = parsePaletteQuery("pull");
+    const commands = [
+      { label: "Pull requests", keywords: "pr prs review merge request incoming" },
+      { label: "Settings", keywords: "preferences config" },
+    ];
+    const ranked = rankByQuery(commands, query, commandSearchText, commandSearchText);
+    expect(ranked[0].label).toBe("Pull requests");
   });
 });

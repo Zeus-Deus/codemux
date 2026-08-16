@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
@@ -97,8 +98,17 @@ const liveThemeId = () => document.documentElement.dataset.themeId;
 const liveAccent = () =>
   document.documentElement.style.getPropertyValue("--cm-theme-brand-accent");
 
+/** The palette's `pr ` mode reads the shared pull-request query, so the
+ *  dialog mounts inside a client here as it does in the shell. */
+function withClient(node: React.ReactNode) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
+  return <QueryClientProvider client={client}>{node}</QueryClientProvider>;
+}
+
 function renderPalette() {
-  return render(<CommandPalette open onOpenChange={vi.fn()} />);
+  return render(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
 }
 
 // jsdom implements neither, and cmdk + the list's scroll-to-top effect both
@@ -197,7 +207,7 @@ describe("command palette — theme picker", () => {
   it("persists to the synced appearance.theme field on Enter", async () => {
     const user = userEvent.setup();
     const onOpenChange = vi.fn();
-    render(<CommandPalette open onOpenChange={onOpenChange} />);
+    render(withClient(<CommandPalette open onOpenChange={onOpenChange} />));
     await user.type(screen.getByRole("combobox"), "ember");
     await waitFor(() => expect(liveThemeId()).toBe("ember"));
 
@@ -364,7 +374,7 @@ describe("command palette — conversation search", () => {
     expect(mocks.backend.agentChatSearch).toHaveBeenCalledTimes(1);
 
     mocks.app.appState = stateWith(["ws-1"]);
-    rerender(<CommandPalette open onOpenChange={vi.fn()} />);
+    rerender(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
 
     // Rows stay put, and nothing re-queries once the debounce window passes.
     expect(screen.getByText("Anchor preserved")).toBeInTheDocument();
@@ -374,7 +384,7 @@ describe("command palette — conversation search", () => {
 
     // A real change to the open set is still worth a fresh query.
     mocks.app.appState = stateWith(["ws-1", "ws-2"]);
-    rerender(<CommandPalette open onOpenChange={vi.fn()} />);
+    rerender(withClient(<CommandPalette open onOpenChange={vi.fn()} />));
     await waitFor(() =>
       expect(mocks.backend.agentChatSearch).toHaveBeenLastCalledWith(
         "anchor",

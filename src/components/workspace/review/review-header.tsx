@@ -23,6 +23,23 @@ const STATE_PILL: Record<string, { label: string; className: string }> = {
   closed: { label: "Closed", className: "bg-destructive/12 text-destructive" },
 };
 
+/**
+ * The header's branch control, for surfaces that are not standing in
+ * the branch — i.e. the Pull Requests page.
+ *
+ * The panel doesn't pass one: it is nearly always already in the branch,
+ * and a Check out button there would offer to do something that is
+ * already done.
+ */
+export interface CheckoutControl {
+  /** A workspace already has this branch: Switch to it rather than
+   *  cutting a second worktree for the same branch. */
+  hasWorkspace: boolean;
+  onCheckOut: () => void;
+  onCopyBranch: () => void;
+  busy?: boolean;
+}
+
 interface Props {
   pr: PullRequestInfo;
   provider: ProviderPresentation;
@@ -31,6 +48,7 @@ interface Props {
   /** True when the workspace is standing in the PR's head branch — the
    *  panel says so instead of offering a Check out button. */
   checkedOutHere: boolean;
+  checkout?: CheckoutControl;
   onRefresh: () => void;
 }
 
@@ -39,6 +57,7 @@ export function ReviewHeader({
   provider,
   repoSlug,
   checkedOutHere,
+  checkout,
   onRefresh,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -80,6 +99,57 @@ export function ReviewHeader({
           {pill.label}
         </span>
         <span className="flex-1" />
+        {!checkedOutHere && checkout?.hasWorkspace && (
+          <span
+            className="shrink-0 text-[10px] text-status-open"
+            data-testid="checked-out-elsewhere"
+          >
+            checked out
+          </span>
+        )}
+        {!checkedOutHere && checkout && (
+          <span className="flex shrink-0 items-center overflow-hidden rounded-md bg-card">
+            {/* One click still checks out. The caret is a second target
+                rather than a wrapper around the first, so the common
+                action never costs two clicks. */}
+            <button
+              type="button"
+              className="h-6 border-0 pl-2 pr-1.5 text-[11px] text-foreground/90 transition-colors hover:bg-accent/50 disabled:opacity-60"
+              data-testid="detail-checkout"
+              disabled={checkout.busy}
+              onClick={checkout.onCheckOut}
+            >
+              {checkout.hasWorkspace ? "Switch" : "Check out"}
+            </button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Check out options"
+                  className="h-6 border-0 pl-0.5 pr-1.5 text-[9px] text-muted-foreground transition-colors hover:bg-accent/50"
+                >
+                  ▾
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-44">
+                <DropdownMenuItem onSelect={checkout.onCheckOut}>
+                  {checkout.hasWorkspace
+                    ? "Switch to its workspace"
+                    : "Check out in a worktree"}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={openInBrowser}>
+                  Open in browser
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={checkout.onCopyBranch}
+                  disabled={!pr.head_branch}
+                >
+                  Copy branch name
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </span>
+        )}
         <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
           <DropdownMenuTrigger asChild>
             <button

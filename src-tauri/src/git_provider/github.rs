@@ -11,7 +11,7 @@ use super::detect::ProviderKind;
 use super::provider::{Capabilities, SourceControlProvider};
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PullRequestInfo, ReviewComment,
+    PrsOverview, PullRequestInfo, ReviewComment,
 };
 use crate::github_cache;
 
@@ -65,6 +65,18 @@ impl SourceControlProvider for GitHubProvider {
         base_branch: &str,
     ) -> Result<Vec<IncomingPrItem>, String> {
         github::list_incoming_prs(repo_path, base_branch)
+    }
+
+    fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String> {
+        let items = github::list_prs_overview(repo_path)?;
+        // Who is asking decides how the page groups, but not whether it
+        // can list: a login that won't resolve costs the grouping, not
+        // the rows, so it never fails the call.
+        let viewer = match self.auth_status() {
+            GhStatus::Authenticated { username } if !username.is_empty() => Some(username),
+            _ => None,
+        };
+        Ok(PrsOverview { viewer, items })
     }
 
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {
@@ -155,15 +167,20 @@ impl SourceControlProvider for GitHubProvider {
         github_cache::cached_get_pr_diff(repo_path, number, full)
     }
 
-    fn pull_request_checks(&self, repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-        github::get_pr_checks(repo_path)
+    fn pull_request_checks(
+        &self,
+        repo_path: &Path,
+        number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String> {
+        github::get_pr_checks(repo_path, number)
     }
 
     fn pull_request_review_comments(
         &self,
         repo_path: &Path,
+        number: Option<u32>,
     ) -> Result<Vec<ReviewComment>, String> {
-        github::get_pr_review_comments(repo_path)
+        github::get_pr_review_comments(repo_path, number)
     }
 
     fn pull_request_inline_comments(

@@ -150,6 +150,19 @@ pub async fn list_incoming_prs(
     .map_err(|e| format!("list_incoming_prs task join failed: {e}"))?
 }
 
+/// Every open pull request in one repository, for the Pull Requests
+/// page. One call per project root; the page fans out and merges.
+///
+/// Same blocking-pool discipline as `list_incoming_prs`, and for the
+/// same reason: this one asks for the CI rollup too, which is the
+/// slowest field `gh pr list` serves.
+#[tauri::command]
+pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOverview, String> {
+    tokio::task::spawn_blocking(move || provider_at(&path).pull_requests_overview(Path::new(&path)))
+        .await
+        .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn merge_pull_request(
     path: String,
@@ -254,16 +267,27 @@ pub async fn get_check_log_excerpt(
 }
 
 #[tauri::command]
-pub async fn get_pull_request_checks(path: String) -> Result<Vec<CheckInfo>, String> {
-    tokio::task::spawn_blocking(move || provider_at(&path).pull_request_checks(Path::new(&path)))
-        .await
-        .map_err(|e| format!("get_pull_request_checks task join failed: {e}"))?
+pub async fn get_pull_request_checks(
+    path: String,
+    pr_number: Option<u32>,
+) -> Result<Vec<CheckInfo>, String> {
+    // Optional so the panel keeps its "checks for the branch I'm on"
+    // call unchanged; the page passes the selected PR's number because
+    // the checkout it reads from is usually standing somewhere else.
+    tokio::task::spawn_blocking(move || {
+        provider_at(&path).pull_request_checks(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_pull_request_checks task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub async fn get_pr_review_comments(path: String) -> Result<Vec<crate::github::ReviewComment>, String> {
+pub async fn get_pr_review_comments(
+    path: String,
+    pr_number: Option<u32>,
+) -> Result<Vec<crate::github::ReviewComment>, String> {
     tokio::task::spawn_blocking(move || {
-        provider_at(&path).pull_request_review_comments(Path::new(&path))
+        provider_at(&path).pull_request_review_comments(Path::new(&path), pr_number)
     })
     .await
     .map_err(|e| format!("get_pr_review_comments task join failed: {e}"))?

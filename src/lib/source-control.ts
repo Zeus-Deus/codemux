@@ -269,3 +269,26 @@ export function providerHostLabel(
   }
   return `${provider.name} · ${bare}`;
 }
+
+/**
+ * `owner/name` from a change-request URL.
+ *
+ * Both products put the repository path directly after the host, and
+ * GitLab inserts a `/-/` separator before the merge-request segment, so
+ * taking everything before `/pull/`, `/merge_requests/` or `/-/` works
+ * for both without a per-product branch.
+ */
+export function repoSlugFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    const path = new URL(url).pathname.replace(/^\/+/, "");
+    const stopped = path.split(/\/(?:-|pull|merge_requests|pulls)\//)[0];
+    const parts = stopped.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    // Subgroups are real on GitLab; the last two segments are the ones
+    // that identify the project.
+    return parts.slice(-2).join("/");
+  } catch {
+    return null;
+  }
+}

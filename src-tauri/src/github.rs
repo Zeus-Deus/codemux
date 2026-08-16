@@ -135,6 +135,50 @@ pub struct IncomingPrItem {
     pub url: String,
 }
 
+/// One row of the Pull Requests page.
+///
+/// Deliberately not `IncomingPrItem` with fields bolted on: the incoming
+/// list answers "what is aimed at my branch", this answers "what wants
+/// something from me", and the two differ in exactly the fields that
+/// cost money to fetch. Keeping them apart means the cheap call stays
+/// cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrOverviewItem {
+    pub number: u32,
+    pub title: String,
+    pub author: String,
+    pub head_branch: Option<String>,
+    pub is_draft: bool,
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+    /// APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED, when the product
+    /// has such a verdict. GitLab has no request-changes concept.
+    pub review_decision: Option<String>,
+    /// The rollup reduced host-side to one of `passing` / `failing` /
+    /// `pending` / `none`. The raw per-check array is 50 rows × N checks
+    /// of JSON the page would only ever collapse to a colour anyway.
+    pub checks: String,
+    /// Logins this pull request is waiting on, so the page can group by
+    /// "needs your review" without a second search query.
+    pub review_requested_from: Vec<String>,
+    pub updated_at: Option<String>,
+    pub url: String,
+}
+
+/// The overview for one repository root, plus who is asking.
+///
+/// `viewer` rides along with the rows rather than being resolved
+/// separately by the caller because the grouping is meaningless without
+/// it: a page that can't tell your PRs from everyone else's is just an
+/// unsorted list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrsOverview {
+    /// Signed-in account for this checkout's host, when the CLI names
+    /// one. `None` ⇒ the page can still list, but cannot group.
+    pub viewer: Option<String>,
+    pub items: Vec<PrOverviewItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckInfo {
     pub name: String,
@@ -1407,6 +1451,66 @@ pub fn list_incoming_prs(
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
 
+/// Every open pull request in this repository, with the two fields the
+/// Pull Requests page groups and colours by.
+///
+/// This is the one place the expensive `statusCheckRollup` is worth
+/// paying for. The incoming list drops it because its rows are a glance
+/// on the way to somewhere else; the page *is* the destination, and a
+/// row without a CI colour there is a row you have to open to read. One
+/// call per repository root every 30s is the whole cost, and the rollup
+/// is reduced to a single word here so the array never crosses the IPC
+/// boundary.
+pub fn list_prs_overview(repo_path: &Path) -> Result<Vec<PrOverviewItem>, String> {
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr", "list",
+            "--state", "open",
+            "--limit", "50",
+            "--json", "number,title,author,headRefName,isDraft,updatedAt,additions,deletions,reviewDecision,url,reviewRequests,statusCheckRollup",
+        ],
+        INCOMING_PRS_TIMEOUT,
+    )?;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
+    let arr = v.as_array().ok_or("Expected JSON array from gh pr list")?;
+    Ok(arr.iter().map(parse_overview_pr_json).collect())
+}
+
+/// `passing` / `failing` / `pending` / `none` — the four states a row
+/// can be drawn in, decided here so both products answer in the same
+/// vocabulary and the frontend never sees a raw check array.
+pub fn rollup_state(v: &serde_json::Value) -> String {
+    match summarize_checks_status(v).as_deref() {
+        Some("failure") => "failing".to_string(),
+        Some("pending") => "pending".to_string(),
+        Some("success") => "passing".to_string(),
+        _ => "none".to_string(),
+    }
+}
+
+fn parse_overview_pr_json(v: &serde_json::Value) -> PrOverviewItem {
+    PrOverviewItem {
+        number: v["number"].as_u64().unwrap_or(0) as u32,
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        author: v["author"]["login"].as_str().unwrap_or("").to_string(),
+        head_branch: v["headRefName"].as_str().map(|s| s.to_string()),
+        is_draft: v["isDraft"].as_bool().unwrap_or(false),
+        additions: v["additions"].as_u64().map(|n| n as u32),
+        deletions: v["deletions"].as_u64().map(|n| n as u32),
+        review_decision: v["reviewDecision"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        checks: rollup_state(&v["statusCheckRollup"]),
+        review_requested_from: parse_review_requests(&v["reviewRequests"]),
+        updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+        url: v["url"].as_str().unwrap_or("").to_string(),
+    }
+}
+
 /// Merge a PR. Both the Review panel's merge sheet and the Changes
 /// panel toolbar go through here.
 ///
@@ -1634,7 +1738,11 @@ fn strip_log_prefix(line: &str) -> &str {
     }
 }
 
-pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
+/// Checks for a pull request. `number = None` means "whatever PR the
+/// checked-out branch has", which is the panel's case; the Pull Requests
+/// page passes a number because the PR being read is very often not the
+/// one this checkout is standing on.
+pub fn get_pr_checks(repo_path: &Path, number: Option<u32>) -> Result<Vec<CheckInfo>, String> {
     // `gh pr checks --json` only accepts a specific field set:
     // bucket / completedAt / description / event / link / name /
     // startedAt / state / workflow. The previous version asked for
@@ -1659,13 +1767,15 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
     // (exit 1) or any have failed (exit 8) but still writes valid
     // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
     // on non-zero exit) and capture stdout regardless.
+    let number_str = number.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["pr", "checks"];
+    if let Some(number) = &number_str {
+        args.push(number);
+    }
+    args.extend_from_slice(&["--json", "name,state,bucket,link,startedAt,completedAt"]);
+
     let output = crate::execution::host_command("gh")
-        .args([
-            "pr",
-            "checks",
-            "--json",
-            "name,state,bucket,link,startedAt,completedAt",
-        ])
+        .args(&args)
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
@@ -1693,8 +1803,19 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
         .collect())
 }
 
-pub fn get_pr_review_comments(repo_path: &Path) -> Result<Vec<ReviewComment>, String> {
-    let output = run_gh_optional(repo_path, &["pr", "view", "--json", "reviews"]);
+/// Conversation-level reviews. `number = None` reads the current
+/// branch's PR; the Pull Requests page passes the selected one.
+pub fn get_pr_review_comments(
+    repo_path: &Path,
+    number: Option<u32>,
+) -> Result<Vec<ReviewComment>, String> {
+    let number_str = number.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["pr", "view"];
+    if let Some(number) = &number_str {
+        args.push(number);
+    }
+    args.extend_from_slice(&["--json", "reviews"]);
+    let output = run_gh_optional(repo_path, &args);
     let Some(json_str) = output else {
         return Ok(Vec::new());
     };

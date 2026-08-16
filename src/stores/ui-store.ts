@@ -118,6 +118,15 @@ interface UIStore {
   pendingPresetCreate: boolean;
   showAutomations: boolean;
   showWorkspacesOverview: boolean;
+  showPullRequests: boolean;
+  /** A pull request the page should select as it opens — set by the
+   *  palette, consumed and cleared by the page. Not persisted. */
+  pendingPrSelection: { projectRoot: string; number: number } | null;
+  /** Rows the badge has already shown the user. Keys, not a count, so a
+   *  poll that re-reports the same review request doesn't re-raise a
+   *  badge that was just cleared. Transient by design: a fresh session
+   *  should tell you what is waiting. */
+  prBadgeSeen: string[];
   /** Workspace targeted by the app-level rename dialog. Transient: menus
    *  unmount as soon as their item is chosen, so the request lives here and
    *  the dialog can stay mounted above every workspace surface. */
@@ -198,6 +207,15 @@ interface UIStore {
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
   setShowWorkspacesOverview: (show: boolean) => void;
+  /** Open the Pull Requests page, optionally on a given pull request. */
+  setShowPullRequests: (
+    show: boolean,
+    select?: { projectRoot: string; number: number } | null,
+  ) => void;
+  clearPendingPrSelection: () => void;
+  /** Mark what the badge was counting as seen — called when the page
+   *  opens, with the keys that were on it. */
+  markPrBadgeSeen: (keys: string[]) => void;
   requestRenameWorkspace: (workspaceId: string) => void;
   closeRenameWorkspace: () => void;
   setShowFileSearch: (show: boolean, target?: "editor" | "right-panel") => void;
@@ -247,6 +265,9 @@ export const useUIStore = create<UIStore>()(
       pendingPresetCreate: false,
       showAutomations: false,
       showWorkspacesOverview: false,
+      showPullRequests: false,
+      pendingPrSelection: null,
+      prBadgeSeen: [],
       renameWorkspaceId: null,
       showFileSearch: false,
       showContentSearch: false,
@@ -408,6 +429,13 @@ export const useUIStore = create<UIStore>()(
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
       setShowAutomations: (show) => set({ showAutomations: show }),
       setShowWorkspacesOverview: (show) => set({ showWorkspacesOverview: show }),
+      setShowPullRequests: (show, select = null) =>
+        set({ showPullRequests: show, pendingPrSelection: show ? select : null }),
+      clearPendingPrSelection: () => set({ pendingPrSelection: null }),
+      markPrBadgeSeen: (keys) =>
+        set((state) => ({
+          prBadgeSeen: [...new Set([...state.prBadgeSeen, ...keys])],
+        })),
       requestRenameWorkspace: (workspaceId) =>
         set({ renameWorkspaceId: workspaceId }),
       closeRenameWorkspace: () => set({ renameWorkspaceId: null }),

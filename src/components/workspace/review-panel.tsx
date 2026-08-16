@@ -36,6 +36,7 @@ import type {
 } from "@/tauri/types";
 import {
   providerForWorkspace,
+  repoSlugFromUrl,
   type ProviderPresentation,
 } from "@/lib/source-control";
 import {
@@ -150,29 +151,6 @@ function branchToTitle(branch: string | null): string {
     .replace(/^(feature|fix|chore|docs|refactor|test)[/-]/, "")
     .replace(/[-_]/g, " ")
     .replace(/^\w/, (c) => c.toUpperCase());
-}
-
-/**
- * `owner/name` from a PR URL.
- *
- * Both products put the repository path directly after the host, and
- * GitLab inserts a `/-/` separator before the merge-request segment, so
- * taking everything before `/pull/`, `/merge_requests/` or `/-/` works
- * for both without a per-product branch.
- */
-export function repoSlugFromUrl(url: string | null | undefined): string | null {
-  if (!url) return null;
-  try {
-    const path = new URL(url).pathname.replace(/^\/+/, "");
-    const stopped = path.split(/\/(?:-|pull|merge_requests|pulls)\//)[0];
-    const parts = stopped.split("/").filter(Boolean);
-    if (parts.length < 2) return null;
-    // Subgroups are real on GitLab; the last two segments are the ones
-    // that identify the project.
-    return parts.slice(-2).join("/");
-  } catch {
-    return null;
-  }
 }
 
 function ReviewSkeleton() {
@@ -641,4 +619,6 @@ export function ReviewPanel({ workspace }: Props) {
 
 // Re-exported so the pane keeps a single import surface for the review
 // subtree even though the threads list now renders inside ReviewDetail.
-export { ReviewThreads };
+// `repoSlugFromUrl` moved to `@/lib/source-control` when the Pull
+// Requests page needed it without pulling the panel in.
+export { ReviewThreads, repoSlugFromUrl };
