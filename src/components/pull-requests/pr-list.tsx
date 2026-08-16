@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { resolveProvider } from "@/lib/source-control";
 import {
+  btnCard,
   shortAge,
   tzBody,
   tzEyebrow,
@@ -59,6 +60,16 @@ export interface PrListProps {
   failures: RootFailure[];
   hostCount: number;
   updatedAt: number | null;
+  /** Rows on screen came from the last session's snapshot. */
+  carried?: boolean;
+  /** When those rows were fetched — the age the header and the strip
+   *  both print, because it is the age of what you are looking at. */
+  carriedAt?: number | null;
+  /** Every root's refresh failed. Partial failure stays in the footer;
+   *  this is what raises the strip. */
+  allRootsFailed?: boolean;
+  /** The refresh cycle settled with nothing to show for itself. */
+  refreshFailed?: boolean;
   isLoading: boolean;
   selectedKey: string | null;
   stateFilter: PrStateFilter;
@@ -76,6 +87,10 @@ export function PrList({
   failures,
   hostCount,
   updatedAt,
+  carried = false,
+  carriedAt = null,
+  allRootsFailed = false,
+  refreshFailed = false,
   isLoading,
   selectedKey,
   stateFilter,
@@ -201,7 +216,18 @@ export function PrList({
     );
   };
 
-  const age = updatedAt ? shortAge(Date.now() - updatedAt) : null;
+  // What the header claims, and it claims only what is true. Carried
+  // rows are hours old however recently the app started, so they say
+  // "as of 2h" rather than the "0s" a naive mount timestamp would print
+  // — the difference between stale-and-labelled and simply wrong.
+  const dataAt = carried ? carriedAt : updatedAt;
+  const age = dataAt ? shortAge(Date.now() - dataAt) : null;
+
+  // The strip, not the footer, when the whole cycle failed or when what
+  // you are reading is carried and the refresh behind it didn't land.
+  // Partial failure keeps the quieter footer treatment: the other
+  // repositories are current, and one line saying so is proportionate.
+  const showStaleStrip = total > 0 && (allRootsFailed || (carried && refreshFailed));
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col" data-testid="pr-list">
@@ -209,8 +235,12 @@ export function PrList({
         <span className={cn("font-semibold text-foreground", tzPanelHeader)}>Pull requests</span>
         <span className="flex-1" />
         {age && (
-          <span className={cn("text-muted-foreground", tzMetaNum)} data-testid="pr-list-age">
-            {age} ago
+          <span
+            className={cn("text-muted-foreground", tzMetaNum)}
+            data-testid="pr-list-age"
+            data-carried={carried}
+          >
+            {carried ? `as of ${age} ago` : `${age} ago`}
           </span>
         )}
         <button
@@ -265,6 +295,8 @@ export function PrList({
         </DropdownMenu>
       </div>
 
+      {showStaleStrip && <StaleStrip age={age} onRetry={onRefresh} />}
+
       <div
         role="listbox"
         aria-label="Pull requests"
@@ -282,6 +314,7 @@ export function PrList({
           <EmptyList
             hasRows={rows.length > 0}
             hasHosts={hostCount > 0}
+            isLoading={isLoading}
             query={query}
             onClearQuery={() => setQuery("")}
           />
@@ -370,6 +403,42 @@ export function PrList({
   );
 }
 
+/**
+ * The refresh failed and you are reading what was there before.
+ *
+ * Binding rule 2, given a shape: the rows stay, and one line above them
+ * says what happened and how old what you can see is. It follows the
+ * drift notice's anatomy — warn dot, sentence, action — because it is
+ * the same idea one surface up: the world moved, here is what that means
+ * for what you are reading, and here is the one thing to do about it.
+ *
+ * It is a strip and not a dialog, and it appears above the list rather
+ * than over it, so nothing that was readable a moment ago stops being
+ * readable.
+ */
+function StaleStrip({ age, onRetry }: { age: string | null; onRetry: () => void }) {
+  return (
+    <div
+      role="status"
+      data-testid="pr-stale-strip"
+      className="flex shrink-0 flex-wrap items-center gap-2 border-b border-status-working/25 bg-status-working/10 px-3 py-2"
+    >
+      <span aria-hidden className="size-2 shrink-0 rounded-full bg-status-working" />
+      <span className={cn("min-w-[11rem] flex-1 leading-snug text-foreground/80", tzBody)}>
+        The latest refresh failed{age ? ` · showing the list from ${age} ago` : " · showing the last list loaded"}
+      </span>
+      <button
+        type="button"
+        data-testid="pr-stale-retry"
+        onClick={onRetry}
+        className={btnCard}
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
   return (
     <div
@@ -400,11 +469,13 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
 function EmptyList({
   hasRows,
   hasHosts,
+  isLoading,
   query,
   onClearQuery,
 }: {
   hasRows: boolean;
   hasHosts: boolean;
+  isLoading: boolean;
   query: string;
   onClearQuery: () => void;
 }) {
@@ -438,6 +509,21 @@ function EmptyList({
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           This page lists pull requests across the projects you have open. Open one and
           its repository shows up here.
+        </p>
+      </div>
+    );
+  }
+
+  // The one place a loading state is still correct: nothing has ever
+  // been on this page, so there is nothing to keep instead (rule 02).
+  // Saying "no open pull requests" here would be answering a question
+  // the host has not been asked yet.
+  if (isLoading) {
+    return (
+      <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-first-load">
+        <p className="text-xs text-foreground">Looking for pull requests…</p>
+        <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
+          Asking each repository you have open. Rows appear as they answer.
         </p>
       </div>
     );

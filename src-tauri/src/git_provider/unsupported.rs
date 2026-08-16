@@ -14,7 +14,7 @@ use super::detect::{DetectedProvider, ProviderKind};
 use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 pub struct UnsupportedProvider {
@@ -114,6 +114,13 @@ impl SourceControlProvider for UnsupportedProvider {
 
     fn pull_requests_overview(&self, _repo_path: &Path) -> Result<PrsOverview, String> {
         self.err("list pull requests")
+    }
+
+    fn pull_requests_overview_stats(
+        &self,
+        _repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String> {
+        self.err("read check status")
     }
 
     fn get_pull_request(

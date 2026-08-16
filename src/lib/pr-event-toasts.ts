@@ -108,13 +108,24 @@ async function checksFailedToast(row: PrRow): Promise<void> {
  * Call once, from the app shell.
  */
 export function usePrEventToasts(): void {
-  const { rows, viewerByRoot } = usePrOverview(true);
+  const { rows, viewerByRoot, carried } = usePrOverview(true);
   const previous = useRef<PrSnapshot | null>(null);
   const fired = useRef<ReadonlySet<string>>(new Set<string>());
 
   useEffect(() => {
-    // Pull-request links resolve against whatever the last poll saw.
+    // Pull-request links resolve against whatever the last poll saw —
+    // including a carried one, so a link pasted two seconds after launch
+    // opens the panel instead of the browser.
     publishPrLinkIndex(rows);
+
+    // A carried paint is last session's list, and nothing in it *just
+    // happened*. It is not a baseline either: comparing the first real
+    // poll against rows from yesterday would announce every review
+    // requested and every build broken while the app was closed, which
+    // is the "six toasts from last Tuesday" this file opens by ruling
+    // out. So the detector simply doesn't run until the host answers,
+    // and the first real answer becomes the baseline.
+    if (carried) return;
 
     const next = snapshotRows(rows, viewerByRoot);
     const result = detectPrEvents(previous.current, next, fired.current);
@@ -125,5 +136,5 @@ export function usePrEventToasts(): void {
       if (event.kind === "review-requested") reviewRequestedToast(event.row);
       else void checksFailedToast(event.row);
     }
-  }, [rows, viewerByRoot]);
+  }, [rows, viewerByRoot, carried]);
 }

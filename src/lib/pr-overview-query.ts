@@ -5,17 +5,34 @@
  * same rows. They share a query key rather than a fetch each, so opening
  * the page costs nothing the badge hasn't already paid for, and the
  * badge exists before the page has ever been opened.
+ *
+ * Two things make the first paint fast rather than merely correct:
+ *
+ * - **The list is fetched in two halves.** The cheap half (who, what,
+ *   which branch, who it is waiting on) paints; the expensive half (CI
+ *   rollup, line counts) arrives behind it and is *merged* into the rows
+ *   already on screen. Merging only ever fills blanks — a slow or failed
+ *   stats call can never take a value off the page.
+ * - **The last list survives the process.** On mount, before any query
+ *   has resolved, rows come from `localStorage`. They are marked
+ *   `carried`, labelled with their age, and replaced wholesale per root
+ *   the moment that root's real answer lands.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 
-import { listPrsOverview, listPullRequests } from "@/tauri/commands";
+import { listPrsOverview, listPrsOverviewStats, listPullRequests } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { repoSlugFromUrl } from "@/lib/source-control";
 import type { PrRow } from "@/lib/pr-overview";
 import { rowKey } from "@/lib/pr-overview";
-import type { PullRequestInfo } from "@/tauri/types";
+import {
+  prSnapshotKey,
+  readPrOverviewSnapshot,
+  writePrOverviewSnapshot,
+} from "@/lib/pr-overview-snapshot";
+import type { PrOverviewStats, PullRequestInfo } from "@/tauri/types";
 
 /** 30s: PRs across every open project change on a human cadence, and
  *  each root is a CLI shell-out. The detail column polls far faster. */
@@ -23,6 +40,11 @@ export const PR_OVERVIEW_REFETCH_MS = 30_000;
 
 export const prOverviewKey = (projectRoot: string) =>
   ["prs", "overview", projectRoot] as const;
+
+/** The expensive half. A separate key so it can fail, retry and land on
+ *  its own schedule without the listing waiting on it. */
+export const prOverviewStatsKey = (projectRoot: string) =>
+  ["prs", "overview-stats", projectRoot] as const;
 
 export interface ProjectRoot {
   path: string;
@@ -106,6 +128,32 @@ function historyRow(pr: PullRequestInfo, root: ProjectRoot): PrRow {
   };
 }
 
+/**
+ * Fold the expensive half into a row.
+ *
+ * Every field uses `??` against the value the row already has, in that
+ * order, and that is the whole contract: stats can turn a blank into a
+ * value and can update a value it previously supplied, but a `null`
+ * coming back from a partial or failed stats call can never blank
+ * something the user is looking at. A row with no matching stats entry
+ * is returned untouched — identity preserved, so React doesn't re-render
+ * a list that didn't change.
+ */
+export function mergeStats(
+  row: PrRow,
+  stats: ReadonlyMap<number, PrOverviewStats> | null,
+): PrRow {
+  const stat = stats?.get(row.number);
+  if (!stat) return row;
+  const checks = stat.checks ?? row.checks;
+  const additions = stat.additions ?? row.additions;
+  const deletions = stat.deletions ?? row.deletions;
+  if (checks === row.checks && additions === row.additions && deletions === row.deletions) {
+    return row;
+  }
+  return { ...row, checks, additions, deletions };
+}
+
 export interface PrOverviewResult {
   rows: PrRow[];
   viewerByRoot: Map<string, string | null>;
@@ -115,8 +163,41 @@ export interface PrOverviewResult {
   roots: ProjectRoot[];
   /** Newest successful fetch across all roots, for "20s ago". */
   updatedAt: number | null;
+  /** True while any row on screen came from the snapshot rather than the
+   *  host. The header labels the age differently, and the toasts stay
+   *  quiet — see `pr-event-toasts`. */
+  carried: boolean;
+  /** When the carried rows were fetched, for "as of 2h ago". */
+  carriedAt: number | null;
+  /** Every root failed. Distinct from "some root failed", which is a
+   *  footer line; this is the case the stale strip exists for. */
+  allRootsFailed: boolean;
+  /** The refresh cycle settled and produced nothing new: something
+   *  failed, nothing succeeded, and nothing is still in flight.
+   *
+   *  The "nothing in flight" half is what keeps the strip from flashing
+   *  on every launch — with one permanently unreachable repository among
+   *  five, the failure lands first and the successes arrive a moment
+   *  later, and announcing a failed refresh in that gap would be both
+   *  alarming and wrong. */
+  refreshFailed: boolean;
   isLoading: boolean;
   refresh: () => void;
+}
+
+/**
+ * The last write, so the three surfaces sharing this hook write once
+ * between them rather than three times per poll.
+ *
+ * Module scope on purpose: they are three components with one query
+ * cache, and the thing being deduplicated is a side effect on storage
+ * that is global too.
+ */
+let lastSnapshotWrite = "";
+
+/** Test seam — a fresh module state without reloading the module. */
+export function _resetSnapshotWriteGuard(): void {
+  lastSnapshotWrite = "";
 }
 
 /**
@@ -146,10 +227,33 @@ export function usePrOverview(
     })),
   });
 
+  // The expensive half, fired per root only once that root's listing has
+  // landed *and* has said it doesn't know the answer. A host that fills
+  // `checks` in its first call (GitLab reads the pipeline straight off
+  // the merge request list) never makes this request at all — the gate
+  // is the data, not a hardcoded list of product names.
+  const needsStats = results.map(
+    (result) => result.data?.items.some((item) => item.checks == null) ?? false,
+  );
+
+  const statsResults = useQueries({
+    queries: roots.map((root, i) => ({
+      queryKey: prOverviewStatsKey(root.path),
+      queryFn: () => listPrsOverviewStats(root.path),
+      enabled: enabled && needsStats[i],
+      staleTime: PR_OVERVIEW_REFETCH_MS,
+      refetchInterval: PR_OVERVIEW_REFETCH_MS,
+      // No retry. The row keeps whatever it has and the next poll tries
+      // again in thirty seconds; a second attempt at a slow call is the
+      // one thing that would make the slow half slower.
+      retry: false,
+    })),
+  });
+
   // Closed and merged rows are a second, cheaper list, fetched only
   // when the dropdown asks for them. The open rows keep coming from the
-  // overview so they keep the CI rollup and the review requests that
-  // the historical list has no reason to carry.
+  // overview so they keep the review requests that the historical list
+  // has no reason to carry.
   const wantsHistory = stateFilter !== "open";
   const historyResults = useQueries({
     queries: roots.map((root) => ({
@@ -161,31 +265,76 @@ export function usePrOverview(
     })),
   });
 
+  // ── The carried paint ──
+  //
+  // Read once per distinct set of roots. Re-reading on every render
+  // would be both wasteful and wrong: the write below happens on the
+  // same roots, and a re-read would resurrect rows a fresh fetch had
+  // just replaced.
+  const rootPaths = useMemo(() => roots.map((root) => root.path), [roots]);
+  const storageKey = rootPaths.length > 0 ? prSnapshotKey(rootPaths) : "";
+  const snapshot = useMemo(
+    () => (storageKey ? readPrOverviewSnapshot(rootPaths) : null),
+    // The key *is* the identity of the root set, which is exactly the
+    // condition under which a re-read is correct.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [storageKey],
+  );
+
   const rows: PrRow[] = [];
   const viewerByRoot = new Map<string, string | null>();
   const failures: RootFailure[] = [];
   let updatedAt: number | null = null;
+  let statsUpdatedAt = 0;
   let isLoading = false;
+  let carried = false;
+  let statsPending = false;
+  let anyRootFresh = false;
 
   results.forEach((result, i) => {
     const root = roots[i];
     if (!root) return;
     if (result.isLoading) isLoading = true;
+
     if (result.data) {
+      anyRootFresh = true;
       viewerByRoot.set(root.path, result.data.viewer);
+
+      const stats = statsResults[i]?.data ?? null;
+      const byNumber = stats ? new Map(stats.map((stat) => [stat.number, stat])) : null;
+      if (needsStats[i] && statsResults[i]?.isLoading) statsPending = true;
+      const statsAt = statsResults[i]?.dataUpdatedAt ?? 0;
+      if (statsAt > statsUpdatedAt) statsUpdatedAt = statsAt;
+
       for (const item of result.data.items) {
-        rows.push({
-          ...item,
-          projectRoot: root.path,
-          repo: repoSlugFromUrl(item.url) ?? root.name,
-          // An unnamed host is GitHub, per the wire's back-compat rule
-          // (`resolveProvider(null)`). Flattening it to "unknown" instead
-          // made every GitHub pull request on this page render as an
-          // unsupported host — no verdicts, no diff, no merge.
-          providerKind: root.providerKind ?? "github",
-        });
+        rows.push(
+          mergeStats(
+            {
+              ...item,
+              projectRoot: root.path,
+              repo: repoSlugFromUrl(item.url) ?? root.name,
+              // An unnamed host is GitHub, per the wire's back-compat rule
+              // (`resolveProvider(null)`). Flattening it to "unknown" instead
+              // made every GitHub pull request on this page render as an
+              // unsupported host — no verdicts, no diff, no merge.
+              providerKind: root.providerKind ?? "github",
+            },
+            byNumber,
+          ),
+        );
+      }
+    } else if (snapshot) {
+      // Nothing from the host for this root yet. Rather than a hole in
+      // the list, last session's rows for *this* root — dropped whole
+      // the instant the real answer arrives above.
+      const carriedRows = snapshot.rows.filter((row) => row.projectRoot === root.path);
+      if (carriedRows.length > 0 || root.path in snapshot.viewerByRoot) {
+        carried = true;
+        rows.push(...carriedRows);
+        viewerByRoot.set(root.path, snapshot.viewerByRoot[root.path] ?? null);
       }
     }
+
     if (result.dataUpdatedAt > 0) {
       updatedAt = Math.max(updatedAt ?? 0, result.dataUpdatedAt);
     }
@@ -218,6 +367,43 @@ export function usePrOverview(
       ? rows.filter((row) => row.state && row.state.toUpperCase() !== "OPEN")
       : rows;
 
+  // ── Recording the refresh ──
+  //
+  // Only the default view, never while anything on screen is itself
+  // carried, and only once the stats that were asked for have settled —
+  // a snapshot written mid-flight would persist blanks that were about
+  // to be filled, and hand the next cold start a list with no colour in
+  // it.
+  //
+  // A failing root deliberately does *not* block the write. One
+  // permanently unreachable repository would otherwise mean the user
+  // never gets a carried paint for the repositories that do work, which
+  // is the same page-is-blank-on-launch problem with extra steps. The
+  // failure itself is never written: it isn't in the rows, and the roots
+  // are all refetched next launch regardless.
+  //
+  // What keeps that honest is `savedAt` — the listing's own fetch time,
+  // not the write time. A refresh that fails outright doesn't move it,
+  // so it cannot re-date rows nobody re-fetched, and the age the header
+  // prints is always the age of the data.
+  const canWrite =
+    stateFilter === "open" &&
+    anyRootFresh &&
+    !carried &&
+    !statsPending &&
+    updatedAt != null &&
+    storageKey !== "";
+  const writeToken = canWrite ? `${storageKey}|${updatedAt}|${statsUpdatedAt}` : "";
+
+  useEffect(() => {
+    if (!writeToken || writeToken === lastSnapshotWrite) return;
+    lastSnapshotWrite = writeToken;
+    writePrOverviewSnapshot(rootPaths, rows, viewerByRoot, updatedAt ?? Date.now());
+    // `rows` is rebuilt every render by design; the token is what says
+    // whether its contents actually changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [writeToken]);
+
   const refresh = () => {
     queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] === "prs" });
   };
@@ -228,6 +414,10 @@ export function usePrOverview(
     failures,
     roots,
     updatedAt,
+    carried,
+    carriedAt: carried ? (snapshot?.savedAt ?? null) : null,
+    allRootsFailed: roots.length > 0 && failures.length === roots.length,
+    refreshFailed: failures.length > 0 && !anyRootFresh && !isLoading,
     isLoading,
     refresh,
   };

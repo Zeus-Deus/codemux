@@ -639,23 +639,37 @@ export interface IncomingPrItem {
   url: string;
 }
 
-/** One row of the Pull Requests page. `checks` is the CI rollup already
- *  reduced host-side to one of `passing` / `failing` / `pending` /
- *  `none` — the raw per-check array never crosses the boundary. */
+/** One row of the Pull Requests page — the half the host serves fast. */
 export interface PrOverviewItem {
   number: number;
   title: string;
   author: string;
   head_branch: string | null;
   is_draft: boolean;
+  /** Filled by the stats call on hosts that charge for a diff stat. */
   additions: number | null;
   deletions: number | null;
   review_decision: string | null;
-  checks: string;
+  /** The CI rollup reduced host-side to one of `passing` / `failing` /
+   *  `pending` / `none` — the raw per-check array never crosses the
+   *  boundary. `null` is the fourth answer and the load-bearing one:
+   *  *nobody has asked yet*. It is not `"none"`, which is a host that
+   *  has answered "this pull request runs no checks", and no surface may
+   *  colour a row, count a badge or raise a toast from it. */
+  checks: string | null;
   /** Logins this pull request is waiting on. */
   review_requested_from: string[];
   updated_at: string | null;
   url: string;
+}
+
+/** The expensive half of a row, keyed by number so the page can merge it
+ *  into a list it has already painted. */
+export interface PrOverviewStats {
+  number: number;
+  checks: string;
+  additions: number | null;
+  deletions: number | null;
 }
 
 /** One repository root's open pull requests, plus who is asking — the

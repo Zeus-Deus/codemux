@@ -86,7 +86,7 @@ export function PrTabStrip({
               aria-hidden
               className={cn(
                 "size-[7px] shrink-0 rounded-full",
-                DOT_TONE[row.checks] ?? DOT_TONE.none,
+                DOT_TONE[row.checks ?? "none"] ?? DOT_TONE.none,
               )}
             />
             <span
@@ -158,7 +158,7 @@ export function PrTabStrip({
                     aria-hidden
                     className={cn(
                       "size-[7px] shrink-0 rounded-full",
-                      DOT_TONE[row.checks] ?? DOT_TONE.none,
+                      DOT_TONE[row.checks ?? "none"] ?? DOT_TONE.none,
                     )}
                   />
                   <span className={cn("shrink-0 font-mono text-muted-foreground", tzMeta)}>

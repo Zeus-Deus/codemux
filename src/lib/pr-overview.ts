@@ -21,6 +21,11 @@ export interface PrRow extends PrOverviewItem {
   /** Host state, for the rows the state dropdown pulls in. Absent means
    *  open — the overview only ever returns open pull requests. */
   state?: string;
+  /** This row came off the last session's snapshot, not off the host.
+   *  It is real enough to read, open and search; it is not evidence that
+   *  anything has *changed*, so the toasts decline to fire from it and
+   *  the header labels its age rather than claiming it is current. */
+  carried?: boolean;
 }
 
 export type PrGroupId = "review" | "yours" | "watching";

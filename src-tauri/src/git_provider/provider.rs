@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::detect::ProviderKind;
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 /// What a provider can actually do, declared statically so the UI can
@@ -211,10 +211,24 @@ pub trait SourceControlProvider: Send + Sync {
     ) -> Result<Vec<IncomingPrItem>, String>;
 
     /// Every open pull request in this repository, with the viewer
-    /// relation (who is asking, who is asked) and a CI rollup reduced to
-    /// one word. This is what the Pull Requests page lists, and the only
-    /// call it makes per repository root.
+    /// relation (who is asking, who is asked). This is what the Pull
+    /// Requests page lists, and it is the call whose latency the user
+    /// watches — so it carries only what the host serves cheaply.
+    ///
+    /// A provider that can answer the CI rollup for free (GitLab's merge
+    /// request list already carries `head_pipeline`) fills `checks` here
+    /// and the page never makes the second call. A provider that cannot
+    /// leaves it `None`, meaning "not measured yet".
     fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String>;
+
+    /// The expensive half of the same rows: CI rollup and line counts,
+    /// keyed by number so the page can merge them into a list it has
+    /// already painted. Only called when `pull_requests_overview` left
+    /// `checks` unanswered.
+    fn pull_requests_overview_stats(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String>;
 
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String>;
 

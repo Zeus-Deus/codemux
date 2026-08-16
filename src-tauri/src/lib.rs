@@ -2190,6 +2190,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::submit_pr_review_with_comments,
             commands::list_incoming_prs,
             commands::list_prs_overview,
+            commands::list_prs_overview_stats,
             commands::merge_pull_request,
             commands::close_pull_request,
             commands::reopen_pull_request,

@@ -40,8 +40,19 @@ export function PullRequestsView() {
   const [tabKeys, setTabKeys] = useState<string[]>([]);
   const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH);
 
-  const { rows, viewerByRoot, failures, roots, updatedAt, isLoading, refresh } =
-    usePrOverview(true, stateFilter);
+  const {
+    rows,
+    viewerByRoot,
+    failures,
+    roots,
+    updatedAt,
+    carried,
+    carriedAt,
+    allRootsFailed,
+    refreshFailed,
+    isLoading,
+    refresh,
+  } = usePrOverview(true, stateFilter);
 
   // Escape closes, matching the other full-screen destinations.
   useEffect(() => {
@@ -174,6 +185,10 @@ export function PullRequestsView() {
             failures={failures}
             hostCount={roots.length}
             updatedAt={updatedAt}
+            carried={carried}
+            carriedAt={carriedAt}
+            allRootsFailed={allRootsFailed}
+            refreshFailed={refreshFailed}
             isLoading={isLoading}
             selectedKey={selectedKey}
             stateFilter={stateFilter}

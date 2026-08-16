@@ -11,7 +11,7 @@ use super::detect::ProviderKind;
 use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 use crate::github_cache;
 
@@ -83,6 +83,13 @@ impl SourceControlProvider for GitHubProvider {
             _ => None,
         };
         Ok(PrsOverview { viewer, items })
+    }
+
+    fn pull_requests_overview_stats(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String> {
+        github::list_prs_overview_stats(repo_path)
     }
 
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {

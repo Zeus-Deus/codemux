@@ -28,8 +28,14 @@ function compactAge(iso: string | null): string | null {
  *
  * A draft's dot is dashed and grey whatever CI says: a draft is not
  * asking for a verdict yet, and a green dot on one reads as "ready".
+ *
+ * `checks === null` is the row painting before its rollup has arrived.
+ * It gets a placeholder — dimmer than "no checks", not a colour and not
+ * a spinner, because a spinner would claim CI is running and a colour
+ * would claim a verdict. It is the shape the answer will take, holding
+ * the space the answer will fill.
  */
-function StateDot({ checks, draft }: { checks: string; draft: boolean }) {
+function StateDot({ checks, draft }: { checks: string | null; draft: boolean }) {
   if (draft) {
     return (
       <span
@@ -63,6 +69,16 @@ function StateDot({ checks, draft }: { checks: string; draft: boolean }) {
         aria-hidden
         data-state="passing"
         className="size-2.5 shrink-0 rounded-full border-[1.6px] border-status-open bg-status-open/25"
+      />
+    );
+  }
+  if (checks == null) {
+    return (
+      <span
+        aria-hidden
+        data-state="unknown"
+        title="Checks are still loading"
+        className="size-2.5 shrink-0 rounded-full bg-muted-foreground/20"
       />
     );
   }
@@ -104,7 +120,11 @@ function stateLabel(row: PrRowData): { text: string; className: string } | null 
   if (row.review_decision === "CHANGES_REQUESTED") {
     return { text: "changes requested", className: "text-status-working" };
   }
-  if (row.review_decision === "APPROVED" && row.checks !== "failing") {
+  // "Ready to merge" is a claim about CI as well as about approval, so
+  // it waits for CI to have said something. Before the stats land the
+  // row simply shows no label — an approved pull request whose build is
+  // about to come back red must not be called ready in the meantime.
+  if (row.review_decision === "APPROVED" && row.checks != null && row.checks !== "failing") {
     return { text: "ready to merge", className: "font-semibold text-status-open" };
   }
   return null;

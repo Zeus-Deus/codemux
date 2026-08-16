@@ -33,6 +33,7 @@
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
   MOCK_CHAT_THREAD_ID,
@@ -200,8 +201,15 @@ const checksRollupOverrides: Record<number, string> = {};
  *  check that failed and [Fix] can hand an agent something specific. */
 const checksDetailOverrides: Record<number, CheckInfo[]> = {};
 
-/** One overview row, derived from the PR the detail column will open. */
-function overviewItem(number: number) {
+/**
+ * One overview row, derived from the PR the detail column will open.
+ *
+ * `carriesChecks` mirrors the real split: the gh path answers `null` and
+ * pays for a second call, while the glab path reads the pipeline off the
+ * merge request list it already fetched and answers in one. Both are
+ * exercised in dev because the mock's roots include both products.
+ */
+function overviewItem(number: number, carriesChecks = false) {
   const pr = mutablePrs[number];
   if (!pr) return null;
   return {
@@ -210,14 +218,73 @@ function overviewItem(number: number) {
     author: pr.author ?? "",
     head_branch: pr.head_branch,
     is_draft: pr.is_draft,
-    additions: pr.additions,
-    deletions: pr.deletions,
+    // Neither product serves line counts on a list call: gh is asked for
+    // them by the stats half, and GitLab would charge a diff-stat
+    // request per row, so its rows never get them at all.
+    additions: null,
+    deletions: null,
     review_decision: pr.review_decision,
-    checks: checksRollupOverrides[number] ?? rollupOf(number),
+    checks: carriesChecks ? overviewRollup(number) : null,
     review_requested_from:
       reviewRequestOverrides[number] ?? MOCK_PR_REVIEW_REQUESTS[number] ?? [],
     updated_at: pr.updated_at,
     url: pr.url,
+  };
+}
+
+/** The rollup the stats call would report, session overrides included. */
+function overviewRollup(number: number): string {
+  return checksRollupOverrides[number] ?? rollupOf(number);
+}
+
+/**
+ * How long each half of the overview takes.
+ *
+ * Both are shell-outs to a CLI in the real app, and a mock that answers
+ * in zero milliseconds hides the two things this page was rebuilt for:
+ * that the listing arrives before the checks do, and that the carried
+ * paint is what stands in for the listing until it lands. 600 + 800 is
+ * a plausible healthy repository and slow enough to watch.
+ *
+ * `window.__codemuxMockPrListDelay(ms)` / `__codemuxMockPrStatsDelay(ms)`
+ * move them.
+ */
+/** Both knobs survive a reload, because the thing they exist to make
+ *  visible — what the very first paint looks like — only happens on
+ *  one. */
+function storedDelay(key: string, fallback: number): number {
+  const raw = Number(localStorage.getItem(`codemux:dev:${key}`));
+  return Number.isFinite(raw) && raw >= 0 && raw > 0 ? raw : fallback;
+}
+
+let PR_LIST_DELAY_MS = storedDelay("pr-list-delay", 600);
+let PR_STATS_DELAY_MS = storedDelay("pr-stats-delay", 800);
+
+/** Session switches for the strip: the whole world unreachable, or just
+ *  the slow half of it. Flipped from the console, not seeded. */
+let prOverviewOutage = false;
+let prStatsOutage = false;
+
+/**
+ * Does this root's product answer the rollup on the list call?
+ *
+ * Decided from the merge request URLs rather than a root allowlist, so
+ * the mock keeps agreeing with itself when fixtures move.
+ */
+function rootCarriesChecks(numbers: number[]): boolean {
+  const first = numbers.map((n) => mutablePrs[n]).find(Boolean);
+  return !!first && first.url.includes("gitlab");
+}
+
+/** The expensive half of one row. */
+function overviewStats(number: number) {
+  const pr = mutablePrs[number];
+  if (!pr) return null;
+  return {
+    number,
+    checks: overviewRollup(number),
+    additions: pr.additions ?? null,
+    deletions: pr.deletions ?? null,
   };
 }
 
@@ -3450,19 +3517,46 @@ const handlers: Record<string, Handler> = {
   // One root always rejects, so the footer's unreachable line (and the
   // promise that the other repositories keep their rows) is reachable
   // without unplugging anything.
-  list_prs_overview: (a) => {
+  list_prs_overview: async (a) => {
     const path = String(a.path ?? "");
     if (path === MOCK_UNREACHABLE_ROOT) {
       return Promise.reject(
         "could not resolve host: git.scratchpad.example.com",
       );
     }
+    await new Promise((resolve) => setTimeout(resolve, PR_LIST_DELAY_MS));
+    if (prOverviewOutage) {
+      return Promise.reject("could not resolve host: api.github.com");
+    }
     const seed = MOCK_PR_OVERVIEW[path];
     if (!seed) return { viewer: null, items: [] };
+    const carriesChecks = rootCarriesChecks(seed.numbers);
     return {
       viewer: seed.viewer,
-      items: seed.numbers.map(overviewItem).filter(Boolean),
+      items: seed.numbers.map((n) => overviewItem(n, carriesChecks)).filter(Boolean),
     };
+  },
+
+  /**
+   * The slow half, deliberately slow.
+   *
+   * 800ms is not a guess at gh's latency — it is long enough that the
+   * two-phase paint is something you can watch happen in dev rather than
+   * something you have to trust the code about. If the dots ever stop
+   * arriving after the rows, this handler is where you'll see it.
+   */
+  list_prs_overview_stats: async (a) => {
+    const path = String(a.path ?? "");
+    if (path === MOCK_UNREACHABLE_ROOT || prOverviewOutage) {
+      return Promise.reject("could not resolve host: api.github.com");
+    }
+    await new Promise((resolve) => setTimeout(resolve, PR_STATS_DELAY_MS));
+    if (prStatsOutage) {
+      return Promise.reject("gh: could not compute status checks");
+    }
+    const seed = MOCK_PR_OVERVIEW[path];
+    if (!seed) return [];
+    return seed.numbers.map(overviewStats).filter(Boolean);
   },
 
   // Closed and merged rows, for the list's state dropdown.
@@ -4976,5 +5070,58 @@ function kickPrOverview(): void {
 (
   window as unknown as { __codemuxAgentHandoffs: typeof agentHandoffs }
 ).__codemuxAgentHandoffs = agentHandoffs;
+
+// ── The performance pack's three switches ─────────────────────────────
+
+// Dev affordance: throw away the carried paint.
+//
+// The snapshot's whole point is that it makes the *second* launch fast,
+// which makes the first one hard to see. Clear it and reload to watch
+// the cold path; reload again to watch the carried one.
+//
+//   __codemuxClearPrSnapshot()
+(
+  window as unknown as { __codemuxClearPrSnapshot: () => string }
+).__codemuxClearPrSnapshot = () => {
+  clearPrOverviewSnapshot();
+  return "pull-request snapshot cleared — reload for a cold paint";
+};
+
+// Dev affordance: take the host away, and watch the rows stay.
+//
+//   __codemuxMockPrOutage()             // everything fails
+//   __codemuxMockPrOutage(true, "stats") // only the slow half fails
+//   __codemuxMockPrOutage(false)        // back to normal
+(
+  window as unknown as {
+    __codemuxMockPrOutage: (down?: boolean, which?: "all" | "stats") => string;
+  }
+).__codemuxMockPrOutage = (down = true, which = "all") => {
+  prStatsOutage = down;
+  prOverviewOutage = down && which === "all";
+  kickPrOverview();
+  if (!down) return "pull-request host reachable again";
+  return which === "stats"
+    ? "the stats half now fails — rows keep the checks they had"
+    : "every root now fails — the list keeps its rows and says how old they are";
+};
+
+// Dev affordances: change how slow each half is.
+//   __codemuxMockPrStatsDelay(3000)
+//   __codemuxMockPrListDelay(3000)
+(
+  window as unknown as { __codemuxMockPrStatsDelay: (ms: number) => string }
+).__codemuxMockPrStatsDelay = (ms) => {
+  PR_STATS_DELAY_MS = Math.max(0, ms);
+  localStorage.setItem("codemux:dev:pr-stats-delay", String(PR_STATS_DELAY_MS));
+  return `stats now take ${PR_STATS_DELAY_MS}ms (across reloads)`;
+};
+(
+  window as unknown as { __codemuxMockPrListDelay: (ms: number) => string }
+).__codemuxMockPrListDelay = (ms) => {
+  PR_LIST_DELAY_MS = Math.max(0, ms);
+  localStorage.setItem("codemux:dev:pr-list-delay", String(PR_LIST_DELAY_MS));
+  return `the listing now takes ${PR_LIST_DELAY_MS}ms (across reloads)`;
+};
 
 export {};

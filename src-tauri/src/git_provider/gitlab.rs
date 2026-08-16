@@ -40,7 +40,8 @@ use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    IssueComment, IssueState, PrOverviewItem, PrTimelineEvent, PrTimelineEventKind, PrsOverview,
+    IssueComment, IssueState, PrOverviewItem, PrOverviewStats, PrTimelineEvent,
+    PrTimelineEventKind, PrsOverview,
     PullRequestInfo, ReviewComment,
     MAX_ISSUE_BODY_BYTES,
     MAX_ISSUE_COMMENTS, MAX_PR_DIFF_BYTES,
@@ -126,6 +127,18 @@ impl GitLabProvider {
     fn api(&self, repo_path: &Path, endpoint: &str, timeout: Duration) -> Result<Value, String> {
         self.require_ready()?;
         run_glab_json(repo_path, &["api", endpoint], timeout)
+    }
+
+    /// The open merge request list, newest first — the one request both
+    /// halves of the overview are served from.
+    fn open_merge_requests(&self, repo_path: &Path) -> Result<Value, String> {
+        self.api(
+            repo_path,
+            &format!(
+                "projects/:id/merge_requests?state=opened&per_page={LIST_PAGE_SIZE}&order_by=updated_at&sort=desc"
+            ),
+            LIST_TIMEOUT,
+        )
     }
 }
 
@@ -589,7 +602,12 @@ fn parse_overview_mr_json(v: &Value) -> PrOverviewItem {
         additions: None,
         deletions: None,
         review_decision: mr_review_decision(v),
-        checks: mr_rollup_state(v),
+        // Unlike the gh path, this one *can* answer in the first call:
+        // the merge request list endpoint already carries
+        // `head_pipeline`, so the row's colour costs nothing extra and
+        // the page never makes the second request. `Some` rather than
+        // `None` is what tells it so.
+        checks: Some(mr_rollup_state(v)),
         review_requested_from: reviewers,
         updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
         url: v["web_url"].as_str().unwrap_or("").to_string(),
@@ -1135,10 +1153,7 @@ impl SourceControlProvider for GitLabProvider {
     }
 
     fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String> {
-        let endpoint = format!(
-            "projects/:id/merge_requests?state=opened&per_page={LIST_PAGE_SIZE}&order_by=updated_at&sort=desc"
-        );
-        let value = self.api(repo_path, &endpoint, LIST_TIMEOUT)?;
+        let value = self.open_merge_requests(repo_path)?;
         let rows = value
             .as_array()
             .ok_or_else(|| "Expected JSON array from merge request list".to_string())?;
@@ -1150,6 +1165,37 @@ impl SourceControlProvider for GitLabProvider {
             viewer,
             items: rows.iter().map(parse_overview_mr_json).collect(),
         })
+    }
+
+    /// GitLab's overview is already complete, so this is a fallback the
+    /// page is not expected to call: it only fires the stats request for
+    /// rows whose `checks` came back unanswered, and none of GitLab's do.
+    ///
+    /// It is implemented honestly anyway rather than returning an error,
+    /// because "the page asked, so answer" is cheaper to reason about
+    /// than a command that works on one host and throws on another — and
+    /// the answer costs exactly the one list request the overview
+    /// already makes, not a pipeline lookup per row.
+    fn pull_requests_overview_stats(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String> {
+        let value = self.open_merge_requests(repo_path)?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| "Expected JSON array from merge request list".to_string())?;
+        Ok(rows
+            .iter()
+            .map(|v| PrOverviewStats {
+                number: v["iid"].as_u64().unwrap_or(0) as u32,
+                checks: mr_rollup_state(v),
+                // Line counts are a diff-stat request per merge request
+                // here; the row keeps whatever it already had rather
+                // than paying 50 round trips to fill two numbers.
+                additions: None,
+                deletions: None,
+            })
+            .collect())
     }
 
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {

@@ -6,13 +6,18 @@ import type { PrRow } from "./pr-overview";
 
 const overviewRows = vi.hoisted(() => ({ current: [] as PrRow[] }));
 const viewers = vi.hoisted(() => ({ current: new Map<string, string | null>() }));
+const carriedFlag = vi.hoisted(() => ({ current: false }));
 const getPullRequestChecks = vi.hoisted(() => vi.fn());
 const handOffToAgent = vi.hoisted(() => vi.fn(() => Promise.resolve({} as never)));
 const toastInfo = vi.hoisted(() => vi.fn());
 const toastError = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/pr-overview-query", () => ({
-  usePrOverview: () => ({ rows: overviewRows.current, viewerByRoot: viewers.current }),
+  usePrOverview: () => ({
+    rows: overviewRows.current,
+    viewerByRoot: viewers.current,
+    carried: carriedFlag.current,
+  }),
 }));
 vi.mock("@/tauri/commands", () => ({ getPullRequestChecks }));
 vi.mock("@/lib/pr-agent-handoff", () => ({ handOffToAgent }));
@@ -118,6 +123,7 @@ describe("usePrEventToasts", () => {
     overviewRows.current = [];
     viewers.current = VIEWERS;
     getPullRequestChecks.mockResolvedValue([]);
+    carriedFlag.current = false;
     useUIStore.setState({ showPullRequests: false, pendingPrSelection: null });
   });
 
@@ -188,5 +194,90 @@ describe("usePrEventToasts", () => {
     await waitFor(() => expect(getPullRequestChecks).not.toHaveBeenCalled());
     expect(toastInfo).not.toHaveBeenCalled();
     expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
+// ── The two-phase fetch and the carried paint ────────────────────────
+//
+// Both of these introduce a state the detector never used to see: a row
+// on screen whose CI is not "green" or "red" but *not yet asked*. Toasts
+// are transitions, and neither an unmeasured row nor a row restored from
+// storage is evidence that anything transitioned.
+
+describe("detectPrEvents — rows whose checks have not landed", () => {
+  it("does not fire when a row's checks go from unknown to failing", () => {
+    // Every failing pull request passes through this on the way onto the
+    // page: the listing paints, then the rollup arrives. If that fired,
+    // the split fetch would announce the whole backlog once a session.
+    const before = snap([row({ checks: null })]);
+    const after = snap([row({ checks: "failing" })]);
+    expect(detectPrEvents(before, after, new Set()).events).toEqual([]);
+  });
+
+  it("still fires on a real pass → fail once the rollup is known", () => {
+    const before = snap([row({ checks: "passing" })]);
+    const after = snap([row({ checks: "failing" })]);
+    const result = detectPrEvents(before, after, new Set());
+    expect(result.events).toEqual([{ kind: "checks-failed", row: expect.objectContaining({ number: 285 }) }]);
+  });
+
+  it("fires exactly once while the failure persists", () => {
+    const before = snap([row({ checks: "passing" })]);
+    const after = snap([row({ checks: "failing" })]);
+    const first = detectPrEvents(before, after, new Set());
+    const second = detectPrEvents(after, after, first.fired);
+    expect(first.events).toHaveLength(1);
+    expect(second.events).toEqual([]);
+  });
+
+  it("does not count an unmeasured row as failing", () => {
+    const before = snap([row({ checks: "failing" })]);
+    const after = snap([row({ checks: null })]);
+    // Going the other way is not a recovery either — it is a row that
+    // stopped saying anything, and it must not re-arm a second toast.
+    const result = detectPrEvents(before, after, new Set());
+    expect(result.events).toEqual([]);
+  });
+});
+
+describe("usePrEventToasts — carried data", () => {
+  it("raises nothing from a carried paint", async () => {
+    carriedFlag.current = true;
+    overviewRows.current = [
+      row({ review_requested_from: ["mock-dev"] }),
+      row({ number: 9, checks: "failing" }),
+    ];
+    renderHook(() => usePrEventToasts());
+
+    await waitFor(() => expect(getPullRequestChecks).not.toHaveBeenCalled());
+    expect(toastInfo).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("treats the first real poll after a carried paint as the baseline", async () => {
+    carriedFlag.current = true;
+    overviewRows.current = [row({ checks: "passing" })];
+    const { rerender } = renderHook(() => usePrEventToasts());
+
+    // The host answers, and disagrees with what was carried. That is not
+    // a transition this session watched happen.
+    carriedFlag.current = false;
+    overviewRows.current = [
+      row({ checks: "failing" }),
+      row({ number: 9, review_requested_from: ["mock-dev"] }),
+    ];
+    rerender();
+
+    await waitFor(() => expect(toastInfo).not.toHaveBeenCalled());
+    expect(toastError).not.toHaveBeenCalled();
+
+    // …and the poll after that is measured against it normally.
+    overviewRows.current = [
+      row({ checks: "failing" }),
+      row({ number: 9, review_requested_from: ["mock-dev"] }),
+      row({ number: 12, review_requested_from: ["mock-dev"] }),
+    ];
+    rerender();
+    await waitFor(() => expect(toastInfo).toHaveBeenCalledTimes(1));
   });
 });

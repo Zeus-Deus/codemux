@@ -47,6 +47,7 @@ import type {
   ProjectMemoryUpdate,
   PullRequestInfo,
   IncomingPrItem,
+  PrOverviewStats,
   PrsOverview,
   ReviewComment,
   InlineReviewComment,
@@ -646,11 +647,20 @@ export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
 /** Every open pull request in one repository, with the viewer relation
- *  and a one-word CI rollup — the Pull Requests page's row data. One
- *  call per project root; the page fans out across the roots the user
- *  has open and merges the answers. */
+ *  and the grouping fields — the Pull Requests page's row data, and the
+ *  call whose latency the user watches. One per project root; the page
+ *  fans out across the roots the user has open and merges the answers.
+ *
+ *  Deliberately without the CI rollup and the line counts: see
+ *  `listPrsOverviewStats`. */
 export const listPrsOverview = (path: string) =>
   invoke<PrsOverview>("list_prs_overview", { path });
+
+/** The expensive half: CI rollup and line counts by pull request number.
+ *  Fired behind the listing, and only for roots whose rows came back
+ *  with `checks: null`. */
+export const listPrsOverviewStats = (path: string) =>
+  invoke<PrOverviewStats[]>("list_prs_overview_stats", { path });
 
 /** Merge a PR. `deleteBranch` defaults to true on the backend, matching
  *  the behaviour before the merge sheet made it a question. */

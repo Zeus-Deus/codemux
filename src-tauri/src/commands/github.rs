@@ -201,14 +201,32 @@ pub async fn list_incoming_prs(
 /// Every open pull request in one repository, for the Pull Requests
 /// page. One call per project root; the page fans out and merges.
 ///
-/// Same blocking-pool discipline as `list_incoming_prs`, and for the
-/// same reason: this one asks for the CI rollup too, which is the
-/// slowest field `gh pr list` serves.
+/// Same blocking-pool discipline as `list_incoming_prs`. This one is
+/// deliberately the *cheap* half — the CI rollup and the line counts
+/// come from `list_prs_overview_stats` behind it, so the list can be on
+/// screen before the host has finished computing them.
 #[tauri::command]
 pub async fn list_prs_overview(path: String) -> Result<crate::github::PrsOverview, String> {
     tokio::task::spawn_blocking(move || provider_for(&path, Operation::ListRead)?.pull_requests_overview(Path::new(&path)))
         .await
         .map_err(|e| format!("list_prs_overview task join failed: {e}"))?
+}
+
+/// The slow half of the same rows: CI rollup and line counts by number.
+///
+/// Gated on `ChecksStatus` rather than `ListRead`: a host that can list
+/// pull requests but has not declared check status has nothing to say
+/// here, and should say so instead of shelling out.
+#[tauri::command]
+pub async fn list_prs_overview_stats(
+    path: String,
+) -> Result<Vec<crate::github::PrOverviewStats>, String> {
+    tokio::task::spawn_blocking(move || {
+        provider_for(&path, Operation::ChecksStatus)?
+            .pull_requests_overview_stats(Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("list_prs_overview_stats task join failed: {e}"))?
 }
 
 #[tauri::command]

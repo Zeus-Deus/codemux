@@ -435,3 +435,143 @@ describe("row hover does not reflow the row", () => {
     expect(action.className.split(/\s+/)).not.toContain("hidden");
   });
 });
+
+// ── Stale and labelled beats blank (binding rule 2) ──────────────────
+
+describe("PrList — carried rows and the stale strip", () => {
+  const carriedRows = [
+    row({ number: 41, carried: true }),
+    row({ number: 42, carried: true }),
+  ];
+  const TWO_HOURS = 2 * 60 * 60 * 1000;
+
+  it("labels a carried list with the age of the data, not of the app", () => {
+    renderList({
+      rows: carriedRows,
+      carried: true,
+      carriedAt: Date.now() - TWO_HOURS,
+      // A fresh mount would otherwise print "0s ago" over rows that are
+      // two hours old, which is the specific lie this label prevents.
+      updatedAt: Date.now(),
+    });
+
+    expect(screen.getByTestId("pr-list-age")).toHaveTextContent("as of 2h ago");
+  });
+
+  it("prints a plain age once the data is live", () => {
+    renderList({ rows: [row({ number: 41 })], updatedAt: Date.now() - 60_000 });
+    const age = screen.getByTestId("pr-list-age");
+    expect(age).toHaveTextContent("1m ago");
+    expect(age.textContent).not.toContain("as of");
+  });
+
+  it("raises one strip when every root failed, and keeps the rows", async () => {
+    const onRefresh = vi.fn();
+    renderList({
+      rows: carriedRows,
+      carried: true,
+      carriedAt: Date.now() - TWO_HOURS,
+      allRootsFailed: true,
+      refreshFailed: true,
+      failures: [
+        { root: { path: ROOT, providerKind: "github", name: "codemux" }, message: "boom" },
+      ],
+      onRefresh,
+    });
+
+    const strip = screen.getByTestId("pr-stale-strip");
+    expect(strip).toHaveTextContent("The latest refresh failed");
+    expect(strip).toHaveTextContent("showing the list from 2h ago");
+
+    // The whole point: the rows are still there to read.
+    expect(screen.getByTestId(`pr-row-${ROOT}-41`)).toBeInTheDocument();
+    expect(screen.getByTestId(`pr-row-${ROOT}-42`)).toBeInTheDocument();
+    expect(screen.queryByText("No open pull requests.")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("pr-stale-retry"));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a partial failure to the footer", () => {
+    renderList({
+      rows: [row({ number: 41 })],
+      failures: [
+        { root: { path: ROOT, providerKind: "github", name: "codemux" }, message: "boom" },
+      ],
+      allRootsFailed: false,
+    });
+
+    expect(screen.queryByTestId("pr-stale-strip")).not.toBeInTheDocument();
+    expect(screen.getByTestId("pr-list-failures")).toHaveTextContent("1 unreachable");
+  });
+
+  it("does not raise a strip over an empty list", () => {
+    // There is nothing stale to show, so the empty state's own sentence
+    // is the honest one.
+    renderList({ rows: [], allRootsFailed: true, refreshFailed: true });
+    expect(screen.queryByTestId("pr-stale-strip")).not.toBeInTheDocument();
+  });
+
+  it("stays quiet while the cycle is still in flight", () => {
+    // One repository of five is permanently unreachable and answers
+    // first. Announcing a failed refresh in the gap before the other
+    // four land would be alarming and wrong, and it would happen on
+    // every single launch.
+    renderList({
+      rows: carriedRows,
+      carried: true,
+      carriedAt: Date.now() - TWO_HOURS,
+      isLoading: true,
+      refreshFailed: false,
+      failures: [
+        { root: { path: ROOT, providerKind: "github", name: "codemux" }, message: "boom" },
+      ],
+    });
+
+    expect(screen.queryByTestId("pr-stale-strip")).not.toBeInTheDocument();
+    expect(screen.getByTestId(`pr-row-${ROOT}-41`)).toBeInTheDocument();
+  });
+
+  it("raises the strip once the cycle settles with nothing new", () => {
+    renderList({
+      rows: carriedRows,
+      carried: true,
+      carriedAt: Date.now() - TWO_HOURS,
+      refreshFailed: true,
+      failures: [
+        { root: { path: ROOT, providerKind: "github", name: "codemux" }, message: "boom" },
+      ],
+    });
+
+    expect(screen.getByTestId("pr-stale-strip")).toBeInTheDocument();
+  });
+});
+
+describe("PrList — rows whose checks have not landed", () => {
+  it("draws a placeholder rather than a colour or a spinner", () => {
+    const { container } = renderList({
+      rows: [row({ number: 41, checks: null, author: VIEWER })],
+    });
+    const dot = container.querySelector('[data-state="unknown"]');
+    expect(dot).toBeInTheDocument();
+    // Not "no checks", which is a host that has answered.
+    expect(container.querySelector('[data-state="none"]')).toBeNull();
+  });
+
+  it("withholds the ready-to-merge label until CI has spoken", () => {
+    renderList({
+      rows: [row({ number: 41, checks: null, review_decision: "APPROVED", author: VIEWER })],
+    });
+    expect(screen.queryByTestId("pr-row-state-label")).not.toBeInTheDocument();
+  });
+
+  it("shows it once the stats land green", () => {
+    renderList({
+      rows: [
+        row({ number: 41, checks: "passing", review_decision: "APPROVED", author: VIEWER }),
+      ],
+    });
+    expect(screen.getByTestId("pr-row-state-label")).toHaveTextContent("ready to merge");
+  });
+});
+
