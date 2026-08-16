@@ -1,10 +1,11 @@
-import { memo, useMemo } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 
 import { resolveAssetSrc } from "@/lib/asset-url";
 import { openExternalUrl } from "@/lib/open-url";
+import { ImageLightbox } from "./image-lightbox";
 
 /**
  * react-markdown's default `urlTransform` would strip the `data:` and
@@ -56,6 +57,19 @@ interface Props {
  * `<ReactMarkdown>` call entirely.
  */
 function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
+  /**
+   * The image being read full size, if any.
+   *
+   * Held here rather than per-`img` so only one overlay can ever be
+   * open, and so the state survives the memoized `components` object.
+   */
+  const [zoomed, setZoomed] = useState<{
+    src: string;
+    alt: string;
+    href: string | null;
+  } | null>(null);
+  const closeZoom = useCallback(() => setZoomed(null), []);
+
   const remarkPlugins = useMemo(() => [remarkGfm], []);
   // `rehypeRaw` re-parses the raw HTML that GFM leaves as opaque nodes
   // (e.g. a README's `<div align="center">` wrapper and `<img>` logo) so
@@ -66,10 +80,38 @@ function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
 
   const components = useMemo<Components>(
     () => ({
-      img: ({ src, alt, ...rest }) => (
-        // eslint-disable-next-line jsx-a11y/alt-text
-        <img src={resolveAssetSrc(src, filePath)} alt={alt ?? ""} {...rest} />
-      ),
+      /**
+       * An embedded image, constrained and inspectable.
+       *
+       * A bare `<img>` renders a 2000px-wide screenshot at 2000px and
+       * pushes everything below it off the surface, so the inline
+       * rendering is capped — but a capped screenshot is unreadable,
+       * which is why clicking one opens it full size rather than being
+       * the end of the story. Nothing is re-encoded on the way, so an
+       * animated GIF keeps animating in both places.
+       */
+      img: ({ src, alt, ...rest }) => {
+        const resolved = resolveAssetSrc(src, filePath);
+        const label = alt ?? "";
+        return (
+          <img
+            {...rest}
+            src={resolved}
+            alt={label}
+            loading="lazy"
+            data-testid="markdown-image"
+            className="my-2 max-h-[360px] w-auto max-w-full cursor-zoom-in rounded-md border border-border/60 object-contain"
+            onClick={() => {
+              if (!resolved) return;
+              setZoomed({
+                src: resolved,
+                alt: label,
+                href: typeof src === "string" ? src : null,
+              });
+            }}
+          />
+        );
+      },
       /**
        * Links go somewhere deliberate rather than nowhere.
        *
@@ -123,10 +165,29 @@ function MarkdownRenderedImpl({ content, filePath, inline = false }: Props) {
     </div>
   );
 
-  if (inline) return body;
+  const overlay = zoomed ? (
+    <ImageLightbox
+      src={zoomed.src}
+      alt={zoomed.alt}
+      href={zoomed.href}
+      onClose={closeZoom}
+    />
+  ) : null;
+
+  if (inline) {
+    return (
+      <>
+        {body}
+        {overlay}
+      </>
+    );
+  }
 
   return (
-    <div className="flex-1 min-h-0 overflow-auto bg-[var(--background)]">{body}</div>
+    <div className="flex-1 min-h-0 overflow-auto bg-[var(--background)]">
+      {body}
+      {overlay}
+    </div>
   );
 }
 

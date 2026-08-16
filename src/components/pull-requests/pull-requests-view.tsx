@@ -3,11 +3,12 @@ import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { WindowChrome } from "@/components/layout/window-chrome";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { toast } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { tzBodyLg, tzPageTitle } from "@/components/workspace/review/review-ui";
 import { badgeKeys, rowKey, type PrRow } from "@/lib/pr-overview";
 import { usePrOverview, type PrStateFilter } from "@/lib/pr-overview-query";
 import { PrList } from "./pr-list";
@@ -156,7 +157,7 @@ export function PullRequestsView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <span className="text-[14px] font-semibold tracking-tight text-foreground">
+        <span className={cn("font-semibold tracking-tight text-foreground", tzPageTitle)}>
           Pull requests
         </span>
       </div>
@@ -209,7 +210,9 @@ export function PullRequestsView() {
                   openUrl(selected.url).catch((err) => toast.error(String(err)));
                 }}
               />
-              <ScrollArea className="min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:!block">
+              {/* No scroll here: the detail column scrolls its own tab
+                  body and keeps its action bar on the bottom edge. */}
+              <div className="flex min-h-0 flex-1 flex-col">
                 <PrDetailColumn
                   key={selectedKey}
                   row={selected}
@@ -222,11 +225,11 @@ export function PullRequestsView() {
                   }
                   viewerLogin={viewerByRoot.get(selected.projectRoot) ?? null}
                 />
-              </ScrollArea>
+              </div>
             </>
           ) : (
             <div className="flex flex-1 items-center justify-center px-6">
-              <p className="max-w-sm text-center text-[11.5px] leading-relaxed text-muted-foreground">
+              <p className={cn("max-w-sm text-center leading-relaxed text-muted-foreground", tzBodyLg)}>
                 Pick a pull request on the left to read it here. ↑↓ moves through the
                 list, ↵ opens the one you're on.
               </p>

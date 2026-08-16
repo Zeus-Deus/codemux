@@ -57,7 +57,17 @@ import {
 } from "@/lib/pr-draft";
 import type { ProviderPresentation } from "@/lib/source-control";
 import { toast } from "@/lib/toast";
-import { btnCard, btnEmberSolid, plural } from "./review-ui";
+import {
+  btnCard,
+  btnEmberSolid,
+  plural,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+  tzPanelHeader,
+  tzRowTitle,
+} from "./review-ui";
 
 /** Enough to describe any branch a person would open a pull request from;
  *  past this the description would be unreadable anyway. */
@@ -93,23 +103,23 @@ async function loadRepoTemplate(
 }
 
 const LABEL =
-  "font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-muted-foreground";
+  `font-mono ${tzEyebrow} font-semibold uppercase tracking-[0.07em] text-muted-foreground`;
 
 const FIELD =
-  "w-full rounded-md border-0 bg-muted/60 px-2.5 py-1.5 text-[12px] text-foreground " +
+  `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +
   "outline-none transition-colors placeholder:text-muted-foreground/70 " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 /** A chip on the card background — the description's helpers. */
 const CHIP =
-  "inline-flex h-[22px] shrink-0 items-center gap-1 rounded-[5px] border-0 bg-card px-2 " +
-  "text-[10px] text-foreground/90 transition-colors hover:bg-accent/50 " +
+  "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-[5px] border-0 bg-card px-2.5 " +
+  `${tzMeta} text-foreground/90 transition-colors hover:bg-accent/50 ` +
   "disabled:opacity-50 outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 /** A chip that is an invitation rather than an action. */
 const DASHED_CHIP =
-  "inline-flex h-[22px] shrink-0 items-center gap-1 rounded-full border border-dashed " +
-  "border-border px-2.5 text-[11px] text-muted-foreground transition-colors " +
+  "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-full border border-dashed " +
+  `border-border px-2.5 ${tzBody} text-muted-foreground transition-colors ` +
   "hover:border-foreground/40 hover:text-foreground outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
@@ -278,16 +288,18 @@ export function CreatePrForm({
           >
             <ChevronLeft className="size-3.5" />
           </button>
-          <span className="flex-1 text-[12.5px] font-semibold text-foreground">
+          <span className={`flex-1 ${tzPanelHeader} font-semibold text-foreground`}>
             New {provider.noun}
           </span>
           {commitCount > 0 && (
-            <span className="shrink-0 text-[10.5px] text-muted-foreground">
+            <span className={`shrink-0 ${tzMetaNum} text-muted-foreground`}>
               {plural(commitCount, "commit")}
             </span>
           )}
         </div>
-        <div className="flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
+        <div
+          className={`flex min-w-0 items-center gap-1.5 font-mono ${tzMetaNum} text-muted-foreground`}
+        >
           {/* Branch names truncate from the left: the end is the part
               that identifies them. */}
           <span
@@ -302,7 +314,7 @@ export function CreatePrForm({
             <SelectTrigger
               aria-label="Base branch"
               data-testid="create-pr-base"
-              className="h-auto shrink-0 gap-1 border-0 bg-transparent p-0 font-mono text-[10.5px] text-muted-foreground shadow-none data-[size=default]:h-auto hover:text-foreground dark:bg-transparent dark:hover:bg-transparent [&_svg]:size-3"
+              className={`h-auto shrink-0 gap-1 border-0 bg-transparent p-0 font-mono ${tzMetaNum} text-muted-foreground shadow-none data-[size=default]:h-auto hover:text-foreground dark:bg-transparent dark:hover:bg-transparent [&_svg]:size-3`}
             >
               <SelectValue />
             </SelectTrigger>
@@ -329,7 +341,7 @@ export function CreatePrForm({
             {showDraftedNote && (
               <span
                 data-testid="create-pr-drafted-note"
-                className="flex items-center gap-1.5 text-[10px] text-accent-ember"
+                className={`flex items-center gap-1.5 ${tzMeta} text-accent-ember`}
               >
                 <span className="size-[5px] rounded-full bg-accent-ember" />
                 drafted from your commits
@@ -357,7 +369,7 @@ export function CreatePrForm({
           </label>
           <textarea
             id="create-pr-body"
-            className={`${FIELD} min-h-[118px] resize-y leading-relaxed`}
+            className={`${FIELD} min-h-[126px] resize-y leading-relaxed`}
             value={body}
             placeholder="What this changes, and how you checked."
             onChange={(event) => {
@@ -391,7 +403,7 @@ export function CreatePrForm({
           {reviewers.map((reviewer) => (
             <span
               key={reviewer}
-              className="inline-flex h-[22px] items-center gap-1 rounded-full bg-card px-2.5 text-[11px] text-foreground/90"
+              className={`inline-flex h-[24px] items-center gap-1 rounded-full bg-card px-2.5 ${tzBody} text-foreground/90`}
             >
               {reviewer}
               <button
@@ -420,7 +432,7 @@ export function CreatePrForm({
             <input
               ref={reviewerInputRef}
               aria-label="Reviewer handle"
-              className="h-[22px] w-28 rounded-full border-0 bg-muted/60 px-2.5 text-[11px] outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+              className={`h-[24px] w-28 rounded-full border-0 bg-muted/60 px-2.5 ${tzBody} outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60`}
               value={reviewerDraft}
               placeholder="handle"
               onChange={(event) => setReviewerDraft(event.target.value)}
@@ -439,7 +451,7 @@ export function CreatePrForm({
             className="flex items-center gap-2 rounded-md bg-status-working/[0.08] px-2.5 py-2"
           >
             <span className="size-2 shrink-0 rounded-full bg-status-working" />
-            <span className="flex-1 text-[11px] text-foreground/85">
+            <span className={`flex-1 ${tzBody} text-foreground/85`}>
               {plural(dirtyFiles, "file")} {dirtyFiles === 1 ? "has" : "have"} uncommitted
               changes
             </span>
@@ -455,7 +467,7 @@ export function CreatePrForm({
             className="flex items-start gap-2 rounded-md bg-status-attention/[0.08] px-2.5 py-2"
           >
             <span className="mt-1 size-2 shrink-0 rounded-full bg-status-attention" />
-            <span className="flex-1 break-words text-[11px] text-foreground/85">
+            <span className={`flex-1 break-words ${tzBody} text-foreground/85`}>
               {error} — your title and description are still here.
             </span>
           </div>
@@ -464,7 +476,7 @@ export function CreatePrForm({
 
       {/* ── Footer: the promise, and the two ways to keep it ── */}
       <div className="flex items-center gap-1.5 border-t border-border/40 bg-muted/40 px-3 py-2.5">
-        <span className="flex-1 text-[10.5px] text-muted-foreground">
+        <span className={`flex-1 ${tzMetaNum} text-muted-foreground`}>
           Pushes the branch first
         </span>
         {/* Both buttons keep their box in flight (binding rule 1): the

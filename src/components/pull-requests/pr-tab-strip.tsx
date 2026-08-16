@@ -5,6 +5,11 @@ import { cn } from "@/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { providerRef, resolveProvider } from "@/lib/source-control";
 import { matchesPrSearch, parsePrSearch, rowKey, type PrRow } from "@/lib/pr-overview";
+import {
+  tzBody,
+  tzMeta,
+  tzMetaNum,
+} from "@/components/workspace/review/review-ui";
 
 const DOT_TONE: Record<string, string> = {
   failing: "bg-destructive",
@@ -52,7 +57,7 @@ export function PrTabStrip({
 
   return (
     <div
-      className="flex h-[31px] shrink-0 items-center gap-0.5 border-b border-border/40 px-2"
+      className="flex h-[33px] shrink-0 items-center gap-0.5 border-b border-border/40 px-2"
       data-testid="pr-tab-strip"
     >
       {tabs.map((row) => {
@@ -72,7 +77,7 @@ export function PrTabStrip({
               }
             }}
             className={cn(
-              "group flex h-[23px] shrink-0 cursor-default items-center gap-1.5 rounded-[5px] px-2",
+              "group flex h-[25px] shrink-0 cursor-default items-center gap-1.5 rounded-[5px] px-2.5",
               active ? "bg-card" : "hover:bg-muted/40",
             )}
             onClick={() => onSelect(row)}
@@ -86,7 +91,8 @@ export function PrTabStrip({
             />
             <span
               className={cn(
-                "font-mono text-[10.5px]",
+                "font-mono",
+                tzMetaNum,
                 active ? "text-foreground" : "text-muted-foreground",
               )}
             >
@@ -126,11 +132,14 @@ export function PrTabStrip({
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Open a pull request…"
             data-testid="pr-tab-picker-search"
-            className="w-full border-b border-border/40 bg-transparent px-2.5 py-2 text-[11px] outline-none placeholder:text-muted-foreground"
+            className={cn(
+              "w-full border-b border-border/40 bg-transparent px-2.5 py-2.5 outline-none placeholder:text-muted-foreground",
+              tzBody,
+            )}
           />
           <div className="max-h-64 overflow-y-auto py-1">
             {picks.length === 0 ? (
-              <p className="px-2.5 py-2 text-[11px] text-muted-foreground">
+              <p className={cn("px-2.5 py-2 text-muted-foreground", tzBody)}>
                 Everything loaded is already open here.
               </p>
             ) : (
@@ -143,7 +152,7 @@ export function PrTabStrip({
                     setPickerOpen(false);
                     setQuery("");
                   }}
-                  className="flex w-full items-center gap-1.5 px-2.5 py-1 text-left hover:bg-accent/50"
+                  className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-accent/50"
                 >
                   <span
                     aria-hidden
@@ -152,10 +161,10 @@ export function PrTabStrip({
                       DOT_TONE[row.checks] ?? DOT_TONE.none,
                     )}
                   />
-                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                  <span className={cn("shrink-0 font-mono text-muted-foreground", tzMeta)}>
                     {providerRef(resolveProvider(row.providerKind), row.number)}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-[11px] text-foreground">
+                  <span className={cn("min-w-0 flex-1 truncate text-foreground", tzBody)}>
                     {row.title}
                   </span>
                 </button>

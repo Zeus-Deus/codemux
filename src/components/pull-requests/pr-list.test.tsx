@@ -351,3 +351,71 @@ describe("footer and empty states", () => {
     expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
   });
 });
+
+/**
+ * Task: the hover action must not move anything.
+ *
+ * jsdom applies no stylesheets, so a pixel measurement here would read
+ * zero either way and prove nothing. What it *can* prove is the stronger
+ * property the fix actually relies on: hovering changes no DOM at all.
+ * The action's slot is present and identically sized at rest, and the
+ * button inside it is revealed by `visibility`, which by definition
+ * cannot reflow its siblings — as opposed to the old `display` toggle,
+ * which inserted a box into the title row and pushed the state label.
+ */
+describe("row hover does not reflow the row", () => {
+  const hoverRow = row({
+    number: 41,
+    author: VIEWER,
+    review_decision: "APPROVED",
+    review_requested_from: [VIEWER],
+  });
+
+  /** The tag/testid shape of the title row, as a comparable snapshot. */
+  function titleRowShape() {
+    const label = screen.getByTestId("pr-row-state-label");
+    const titleRow = label.parentElement!;
+    return Array.from(titleRow.children).map(
+      (child) =>
+        `${child.tagName}:${child.getAttribute("data-testid") ?? ""}:${child.className}`,
+    );
+  }
+
+  it("holds the action's slot open at rest, so the state label never moves", async () => {
+    const user = userEvent.setup();
+    renderList({ rows: [hoverRow] });
+
+    // The slot is in the tree before anything is hovered.
+    const slot = screen.getByTestId("pr-row-action-slot");
+    expect(slot).toBeInTheDocument();
+    expect(slot.className).toContain("w-[78px]");
+
+    const atRest = titleRowShape();
+    const labelIndexAtRest = Array.from(
+      screen.getByTestId("pr-row-state-label").parentElement!.children,
+    ).indexOf(screen.getByTestId("pr-row-state-label"));
+
+    await user.hover(screen.getByTestId(`pr-row-${ROOT}-41`));
+
+    // Same children, same order, same classes: there is no geometry
+    // change for the label to be pushed by.
+    expect(titleRowShape()).toEqual(atRest);
+    expect(
+      Array.from(
+        screen.getByTestId("pr-row-state-label").parentElement!.children,
+      ).indexOf(screen.getByTestId("pr-row-state-label")),
+    ).toBe(labelIndexAtRest);
+  });
+
+  it("reveals the action with visibility rather than display", () => {
+    renderList({ rows: [hoverRow] });
+    const action = screen.getByTestId("pr-row-checkout");
+
+    expect(action.className).toContain("invisible");
+    expect(action.className).toContain("group-hover:visible");
+    // The old behaviour, explicitly ruled out: `hidden` + `group-hover:block`
+    // took the button out of flow and put it back on hover.
+    expect(action.className).not.toContain("group-hover:block");
+    expect(action.className.split(/\s+/)).not.toContain("hidden");
+  });
+});

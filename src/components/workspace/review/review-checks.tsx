@@ -7,7 +7,17 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { getCheckLogExcerpt } from "@/tauri/commands";
 import type { CheckInfo } from "@/tauri/types";
-import { btnCard, btnEmber, checkState, type CheckState } from "./review-ui";
+import {
+  btnCard,
+  btnEmber,
+  checkState,
+  tzBody,
+  tzBodyLg,
+  tzLog,
+  tzMeta,
+  tzMetaNum,
+  type CheckState,
+} from "./review-ui";
 
 /**
  * The spinner is its own memoized component on purpose: the checks query
@@ -88,13 +98,13 @@ export function ReviewChecks({
     if (isLoading) {
       return (
         <div className="flex flex-col gap-1.5" data-testid="review-checks">
-          <Skeleton className="h-1 w-full" />
+          <Skeleton className="h-[3px] w-40" />
           <Skeleton className="h-6 w-2/3" />
         </div>
       );
     }
     return (
-      <p className="text-[11px] text-muted-foreground" data-testid="review-checks">
+      <p className={cn("text-muted-foreground", tzBody)} data-testid="review-checks">
         No checks reported.
       </p>
     );
@@ -102,17 +112,28 @@ export function ReviewChecks({
 
   return (
     <div className="flex flex-col gap-1.5" data-testid="review-checks">
+      {/* The rail is a proportion, not a progress bar. One check
+          stretched across the whole column read as "something is 100%
+          done"; capping each segment keeps a two-check repo looking like
+          a two-check repo, while a busy one still fills the width. */}
       <div className="flex items-center gap-2">
-        <span className="flex flex-1 gap-0.5">
+        {/* Capped as a whole as well as per segment, so the count stays
+            beside the rail it counts instead of being flung to the far
+            edge of a full-width detail column. */}
+        <span className="flex max-w-[320px] flex-1 gap-0.5" data-testid="checks-rail">
           {states.map((state, i) => (
             <span
               key={checks[i].name}
               title={checks[i].name}
-              className={cn("h-1 flex-1 rounded-sm", SEGMENT_TONE[state])}
+              data-testid="checks-rail-segment"
+              className={cn(
+                "h-[3px] max-w-[64px] flex-1 rounded-sm",
+                SEGMENT_TONE[state],
+              )}
             />
           ))}
         </span>
-        <span className="shrink-0 font-mono text-[10.5px] text-foreground/70">
+        <span className={cn("shrink-0 font-mono text-foreground/70", tzMetaNum)}>
           {passed} passed
         </span>
       </div>
@@ -184,7 +205,7 @@ function CheckRow({
   return (
     <div
       className={cn(
-        "flex flex-col gap-1.5 rounded-md px-2 py-1.5",
+        "flex flex-col gap-1.5 rounded-md px-2.5 py-2",
         failing ? "bg-destructive/8" : "bg-muted/40",
       )}
       data-testid={`check-row-${check.name}`}
@@ -196,17 +217,17 @@ function CheckRow({
         className="flex items-center gap-1.5 text-left"
       >
         <StateDot state={state} />
-        <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">
+        <span className={cn("min-w-0 flex-1 truncate text-foreground", tzBodyLg)}>
           {check.name}
         </span>
         {check.elapsed_time && (
-          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+          <span className={cn("shrink-0 font-mono text-muted-foreground", tzMeta)}>
             {check.elapsed_time}
           </span>
         )}
         <ChevronDown
           className={cn(
-            "size-3 shrink-0 text-muted-foreground transition-transform",
+            "size-3.5 shrink-0 text-muted-foreground transition-transform",
             expanded && "rotate-180",
           )}
         />
@@ -215,7 +236,12 @@ function CheckRow({
       {expanded && failing && (
         <div className="flex flex-col gap-1.5">
           {excerpt && (
-            <pre className="overflow-hidden whitespace-pre-wrap break-all rounded bg-background/60 px-2 py-1.5 font-mono text-[9.5px] leading-relaxed text-destructive">
+            <pre
+              className={cn(
+                "overflow-hidden whitespace-pre-wrap break-all rounded bg-background/60 px-2.5 py-2 font-mono leading-[1.7] text-destructive",
+                tzLog,
+              )}
+            >
               {excerpt}
             </pre>
           )}
@@ -259,7 +285,7 @@ function CheckRow({
                 </button>
               )}
               {onFixWithAgent && handoffCaption && (
-                <span className="ml-auto truncate text-[9.5px] text-muted-foreground">
+                <span className={cn("ml-auto truncate text-muted-foreground", tzMeta)}>
                   {handoffCaption}
                 </span>
               )}

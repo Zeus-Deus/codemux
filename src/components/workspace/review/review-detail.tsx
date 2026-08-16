@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   checkoutDefaultBranchInWorkspace,
   closePullRequest,
@@ -889,7 +890,18 @@ export function ReviewDetail(props: ReviewDetailProps) {
   }
 
   return (
-    <div className="flex min-h-full flex-col" data-testid="review-detail">
+    /**
+     * The column owns the viewport height, not its content.
+     *
+     * Sized to content, the action bar landed wherever the description
+     * happened to end — halfway up a tall window, with the rest of the
+     * column empty below it. The bar is the thing you come back to; it
+     * belongs at the bottom edge of what you can see. So: the column is
+     * `h-full`, the tab body is the only part that scrolls, and the
+     * notice slot and bar are pinned under it at any window height.
+     */
+    <div className="flex h-full min-h-0 flex-col" data-testid="review-detail">
+      <div className="shrink-0">
       <ReviewHeader
         pr={pr}
         provider={provider}
@@ -918,7 +930,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
           ) : undefined
         }
       />
+      </div>
 
+      {/* The one scroll on this surface: header and tab strip stay put
+          above it, the notice slot and the bar stay put below it. */}
+      <ScrollArea
+        className="min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:!block"
+        data-testid="review-scroll"
+      >
       {activeTab === "timeline" ? (
         <ReviewTimeline
           entries={timelineEntries}
@@ -986,7 +1005,9 @@ export function ReviewDetail(props: ReviewDetailProps) {
         />
       </div>
       )}
+      </ScrollArea>
 
+      <div className="shrink-0">
       {/* Pending notes are named on every tab, not just the one they
           were written on — a review nobody can see is easy to forget. */}
       {lineDrafts.length > 0 && !readOnly && (
@@ -1024,6 +1045,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
         onRebase={() => openPrPath("/conflicts")}
         onResolveConflicts={canHandOff ? resolveConflictsWithAgent : undefined}
       />
+      </div>
 
       {submitSheetOpen && (
         <ReviewSubmitSheet

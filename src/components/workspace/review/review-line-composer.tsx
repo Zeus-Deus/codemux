@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { btnCard, btnCardStrong } from "./review-ui";
+import { cn } from "@/lib/utils";
+import { btnCard, btnCardStrong, tzBodyLg, tzMeta } from "./review-ui";
 
 interface Props {
   /** "line 43" or "lines 43–44". */
@@ -53,10 +54,10 @@ export function ReviewLineComposer({
       data-testid="line-composer"
       className="my-1 ml-[72px] mr-3 overflow-hidden rounded-lg bg-muted/40 ring-1 ring-accent-ember/30"
     >
-      <div className="flex items-center gap-2 border-b border-border/40 px-2.5 py-1.5">
-        <span className="font-mono text-[10px] text-accent-ember">{label}</span>
+      <div className="flex items-center gap-2 border-b border-border/40 px-2.5 py-2">
+        <span className={cn("font-mono text-accent-ember", tzMeta)}>{label}</span>
         <span className="flex-1" />
-        <span className="text-[10px] text-muted-foreground">esc to cancel</span>
+        <span className={cn("text-muted-foreground", tzMeta)}>esc to cancel</span>
       </div>
       <div className="flex flex-col gap-2 px-2.5 py-2">
         <textarea
@@ -77,7 +78,10 @@ export function ReviewLineComposer({
             }
           }}
           data-testid="line-composer-body"
-          className="w-full resize-y rounded-md border-0 bg-background px-2 py-1.5 font-sans text-[11.5px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+          className={cn(
+            "w-full resize-y rounded-md border-0 bg-background px-2 py-2 font-sans leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+            tzBodyLg,
+          )}
         />
         <div className="flex items-center gap-1.5">
           <button
@@ -101,7 +105,7 @@ export function ReviewLineComposer({
             </button>
           )}
           <span className="flex-1" />
-          <span className="font-mono text-[10px] text-muted-foreground">⌘↵</span>
+          <span className={cn("font-mono text-muted-foreground", tzMeta)}>⌘↵</span>
         </div>
       </div>
     </div>

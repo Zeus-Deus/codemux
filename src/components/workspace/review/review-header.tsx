@@ -12,7 +12,15 @@ import { toast } from "@/lib/toast";
 import { normalizePrState } from "@/components/github/pr-status-icon";
 import type { PullRequestInfo } from "@/tauri/types";
 import type { ProviderPresentation } from "@/lib/source-control";
-import { groupDigits, relativeAge } from "./review-ui";
+import {
+  groupDigits,
+  relativeAge,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+  tzPanelTitle,
+} from "./review-ui";
 
 /** State pill tones, matching the sidebar PR icon so one PR reads the
  *  same colour everywhere it appears. */
@@ -83,15 +91,16 @@ export function ReviewHeader({
     >
       <div className="flex items-center gap-1.5">
         {repoSlug && (
-          <span className="truncate text-[10.5px] text-muted-foreground">{repoSlug}</span>
+          <span className={cn("truncate text-muted-foreground", tzMetaNum)}>{repoSlug}</span>
         )}
-        <span className="shrink-0 font-mono text-[10.5px] text-foreground/70">
+        <span className={cn("shrink-0 font-mono text-foreground/70", tzMetaNum)}>
           {provider.sigil}
           {pr.number}
         </span>
         <span
           className={cn(
-            "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold",
+            "shrink-0 rounded px-1.5 py-[3px] font-semibold",
+            tzMeta,
             pill.className,
           )}
           data-testid="pr-state-pill"
@@ -101,7 +110,7 @@ export function ReviewHeader({
         <span className="flex-1" />
         {!checkedOutHere && checkout?.hasWorkspace && (
           <span
-            className="shrink-0 text-[10px] text-status-open"
+            className={cn("shrink-0 text-status-open", tzMeta)}
             data-testid="checked-out-elsewhere"
           >
             checked out
@@ -114,7 +123,10 @@ export function ReviewHeader({
                 action never costs two clicks. */}
             <button
               type="button"
-              className="h-6 border-0 pl-2 pr-1.5 text-[11px] text-foreground/90 transition-colors hover:bg-accent/50 disabled:opacity-60"
+              className={cn(
+                "h-[30px] border-0 pl-2.5 pr-1.5 text-foreground/90 transition-colors hover:bg-accent/50 disabled:opacity-60",
+                tzBody,
+              )}
               data-testid="detail-checkout"
               disabled={checkout.busy}
               onClick={checkout.onCheckOut}
@@ -126,7 +138,10 @@ export function ReviewHeader({
                 <button
                   type="button"
                   aria-label="Check out options"
-                  className="h-6 border-0 pl-0.5 pr-1.5 text-[9px] text-muted-foreground transition-colors hover:bg-accent/50"
+                  className={cn(
+                    "h-[30px] border-0 pl-0.5 pr-2 text-muted-foreground transition-colors hover:bg-accent/50",
+                    tzEyebrow,
+                  )}
                 >
                   ▾
                 </button>
@@ -155,7 +170,7 @@ export function ReviewHeader({
             <button
               type="button"
               aria-label="Pull request actions"
-              className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+              className="flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
             >
               <MoreHorizontal className="size-3.5" />
             </button>
@@ -171,13 +186,21 @@ export function ReviewHeader({
       {/* Two lines maximum: past that a title stops being a title and
           starts pushing the checks below the fold. */}
       <h2
-        className="line-clamp-2 text-[13.5px] font-semibold leading-snug text-foreground"
+        className={cn(
+          "line-clamp-2 font-semibold leading-snug text-foreground",
+          tzPanelTitle,
+        )}
         title={pr.title}
       >
         {pr.title}
       </h2>
 
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+      <div
+        className={cn(
+          "flex flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground",
+          tzMetaNum,
+        )}
+      >
         {pr.author && <span className="text-foreground/70">{pr.author}</span>}
         {age && <span>{age}</span>}
         {pr.changed_files != null && (
@@ -196,7 +219,12 @@ export function ReviewHeader({
         )}
       </div>
 
-      <div className="flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-1.5 font-mono text-muted-foreground",
+          tzMetaNum,
+        )}
+      >
         <span className="shrink-0">{pr.base_branch ?? "main"}</span>
         <span className="shrink-0 opacity-60">←</span>
         {/* Truncated from the LEFT: the tail of a branch name is what
@@ -210,7 +238,7 @@ export function ReviewHeader({
         </span>
         {checkedOutHere && (
           <span
-            className="shrink-0 font-sans text-[10px] text-status-open"
+            className={cn("shrink-0 font-sans text-status-open", tzMeta)}
             data-testid="checked-out-here"
           >
             checked out here

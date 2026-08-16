@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { btnCard, btnEmberSolid } from "./review-ui";
+import { cn } from "@/lib/utils";
+import { btnCard, btnEmberSolid, tzBody, tzEyebrow } from "./review-ui";
 import { draftCounts, type LineDraft } from "./pr-drafts";
 
 interface Props {
@@ -27,7 +28,7 @@ export function ReviewDraftFooter({ drafts, onDiscard, onSubmit }: Props) {
       className="flex items-center gap-2 border-t border-border/40 bg-card px-3 py-2"
     >
       <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-accent-ember" />
-      <span className="min-w-0 flex-1 text-[11px]">
+      <span className={cn("min-w-0 flex-1", tzBody)}>
         <span className="font-semibold text-foreground" data-testid="draft-count">
           {notes === 1 ? "1 pending" : `${notes} pending`}
         </span>{" "}
@@ -38,7 +39,7 @@ export function ReviewDraftFooter({ drafts, onDiscard, onSubmit }: Props) {
       </span>
       {confirming ? (
         <>
-          <span className="shrink-0 text-[11px] text-muted-foreground">
+          <span className={cn("shrink-0 text-muted-foreground", tzBody)}>
             Discard {notes === 1 ? "it" : "them"}?
           </span>
           <button type="button" className={btnCard} onClick={() => setConfirming(false)}>
@@ -72,7 +73,7 @@ export function ReviewDraftFooter({ drafts, onDiscard, onSubmit }: Props) {
         data-testid="open-submit-sheet"
         onClick={onSubmit}
       >
-        Submit review <span className="text-[9px] opacity-70">▾</span>
+        Submit review <span className={cn("opacity-70", tzEyebrow)}>▾</span>
       </button>
     </div>
   );

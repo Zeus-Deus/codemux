@@ -29,14 +29,21 @@ function SplitSideLine({
   line,
   side,
   selection,
+  flow = false,
 }: {
   line: DiffLine | null;
   side: "left" | "right";
   selection?: DiffSelection;
+  /** Review's taller leading. Applied to every row shape here — the
+   *  placeholder included — or the two columns stop lining up. */
+  flow?: boolean;
 }) {
+  const rowHeight = flow ? "min-h-[22px]" : "min-h-[18px]";
+  const gutterSize = flow ? "text-[12px]" : "text-[11px]";
+
   if (!line) {
     return (
-      <div className="flex min-h-[18px] whitespace-pre bg-muted/5">
+      <div className={cn("flex whitespace-pre bg-muted/5", rowHeight)}>
         <span className="w-10 shrink-0 select-none" />
         <span className="flex-1" />
       </div>
@@ -45,9 +52,12 @@ function SplitSideLine({
 
   if (line.type === "hunk-header") {
     return (
-      <div data-diff-hunk className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0">
+      <div
+        data-diff-hunk
+        className={cn("flex bg-muted/30 whitespace-pre mt-1 first:mt-0", rowHeight)}
+      >
         <span className="w-10 shrink-0 select-none" />
-        <span className="text-muted-foreground/60 text-[11px] px-2 truncate">
+        <span className={cn("text-muted-foreground/60 px-2 truncate", gutterSize)}>
           {line.content}
         </span>
       </div>
@@ -69,14 +79,16 @@ function SplitSideLine({
         data-diff-row={selectable ? `${anchorSide}:${lineNum}` : undefined}
         data-selected={selected ? "true" : undefined}
         className={cn(
-          "flex min-h-[18px] whitespace-pre",
+          "flex whitespace-pre",
+          rowHeight,
           selected ? SELECTED_ROW_CLASS : style.bgClass,
         )}
       >
         <span
           data-diff-line={selectable ? `${anchorSide}:${lineNum}` : undefined}
           className={cn(
-            "inline-block w-10 shrink-0 text-right pr-2 text-[11px] tabular-nums select-none",
+            "inline-block w-10 shrink-0 text-right pr-2 tabular-nums select-none",
+            gutterSize,
             selected ? SELECTED_NUMBER_CLASS : "text-muted-foreground",
             selectable && "cursor-pointer hover:bg-accent-ember/10",
           )}
@@ -171,7 +183,13 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.left} side="left" selection={selection} />
+              <SplitSideLine
+                key={i}
+                line={pair.left}
+                side="left"
+                selection={selection}
+                flow={flow}
+              />
             ))}
           </div>
         </div>
@@ -187,7 +205,13 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.right} side="right" selection={selection} />
+              <SplitSideLine
+                key={i}
+                line={pair.right}
+                side="right"
+                selection={selection}
+                flow={flow}
+              />
             ))}
           </div>
         </div>

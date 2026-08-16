@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
-import { btnCard, btnEmberSolid, plural } from "./review-ui";
+import { cn } from "@/lib/utils";
+import { btnCard, btnEmberSolid, plural, tzBody, tzMetaNum, tzRowTitle } from "./review-ui";
 import type { ProviderPresentation } from "@/lib/source-control";
 
 /**
@@ -25,15 +26,15 @@ interface EmptyStateProps {
 function EmptyState({ title, body, actions, testId }: EmptyStateProps) {
   return (
     <div className="flex flex-col gap-2.5 px-3.5 py-4" data-testid={testId}>
-      <span className="text-[12px] font-semibold text-foreground">{title}</span>
-      <p className="text-[11px] leading-relaxed text-foreground/75">{body}</p>
+      <span className={cn("font-semibold text-foreground", tzRowTitle)}>{title}</span>
+      <p className={cn("leading-relaxed text-foreground/75", tzBody)}>{body}</p>
       <div className="flex flex-wrap items-center gap-1.5">{actions}</div>
     </div>
   );
 }
 
 const Mono = ({ children }: { children: ReactNode }) => (
-  <span className="font-mono text-[10.5px]">{children}</span>
+  <span className={cn("font-mono", tzMetaNum)}>{children}</span>
 );
 
 /** No PR for a branch that is already pushed. */

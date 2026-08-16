@@ -8,9 +8,54 @@
  * deliberately not used on this surface.
  */
 
+/**
+ * The type scale for the review surfaces — one ladder, one place.
+ *
+ * The design canvas was drawn compact, and read literally it lands a
+ * whole step below the rest of the app: the sidebar, automations and the
+ * composer all sit on 11–13px with 12–12.5px doing the primary work.
+ * These tokens raise the floor to that ladder while keeping the canvas's
+ * *relative* order intact — eyebrow < meta < body < title, everywhere.
+ *
+ * Callers keep their own weight, colour and tracking; only the size (and
+ * for code, the line-height it can't be read without) lives here.
+ */
+
+/** Uppercase eyebrows and mono micro-labels. The floor — nothing below. */
+export const tzEyebrow = "text-[10px]";
+/** Meta, captions, hints — the quiet line under a title. */
+export const tzMeta = "text-[11px]";
+/** Secondary meta and mono numbers, a hair up from {@link tzMeta}. */
+export const tzMetaNum = "text-[11.5px]";
+/** Buttons, body-small, bar sentences. */
+export const tzBody = "text-[12px]";
+/** Body copy and row meta that has to be read, not scanned. */
+export const tzBodyLg = "text-[12.5px]";
+/** List/row titles. */
+export const tzRowTitle = "text-[13px]";
+/** Section and panel headers. */
+export const tzPanelHeader = "text-[13.5px]";
+/** The PR title in a panel. */
+export const tzPanelTitle = "text-[15px]";
+/** The PR title on the full-screen page, where there is room for it. */
+export const tzPageTitle = "text-[17px]";
+/** Check-log excerpts — mono, quieter than the diff it explains. */
+export const tzLog = "text-[11.5px]";
+
+/*
+ * Deliberately no token for the diff body.
+ *
+ * Code in this app is sized by the user, not by us: `.code-surface`
+ * reads `--font-size-code` from settings, and a review that overrode it
+ * would be the one place in Codemux where the diff didn't match the
+ * editor. What review *does* change is the leading and the gutter, and
+ * those live in the diff views behind their `flow` prop so the Changes
+ * pane keeps its tighter density.
+ */
+
 const BASE =
-  "inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md border-0 " +
-  "px-2.5 text-[11px] font-medium transition-colors outline-none " +
+  "inline-flex h-[30px] shrink-0 items-center justify-center gap-1.5 rounded-md border-0 " +
+  "px-3 text-[12px] font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 /** Neutral secondary — sits on the bar's card background. */
@@ -44,14 +89,14 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
 /**
  * Comment-sized ember tint, for actions that sit inside a quoted thread.
  *
- * A second, smaller geometry rather than a shrunk {@link btnEmber}: at
- * 11px on a 7px-indented quote the full-size button outweighs the
+ * A second, smaller geometry rather than a shrunk {@link btnEmber}: on a
+ * quote that is already indented, the full-size button outweighs the
  * comment it belongs to. Same tint, same borderlessness, same rule that
  * its box never changes between states.
  */
 const BASE_XS =
-  "inline-flex h-5 shrink-0 items-center justify-center gap-1 rounded border-0 " +
-  "px-1.5 text-[10px] font-medium transition-colors outline-none " +
+  "inline-flex h-[22px] shrink-0 items-center justify-center gap-1 rounded border-0 " +
+  "px-2 text-[11px] font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;

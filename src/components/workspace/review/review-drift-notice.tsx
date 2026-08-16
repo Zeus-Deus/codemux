@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import { btnCard, btnCardStrong, btnEmberSolid } from "./review-ui";
+import { btnCard, btnCardStrong, btnEmberSolid, tzBody } from "./review-ui";
 
 /**
  * Severity order. Exactly one notice shows at a time, and it is always
@@ -81,7 +81,7 @@ export function ReviewDriftNotice({ notice }: { notice: DriftNotice }) {
         aria-hidden
         className={cn("size-2 shrink-0 rounded-full", TONE_DOT[notice.tone])}
       />
-      <span className="min-w-[11rem] flex-1 text-[11px] leading-snug text-foreground/80">
+      <span className={cn("min-w-[11rem] flex-1 leading-snug text-foreground/80", tzBody)}>
         {notice.message}
       </span>
       {notice.actions.map((action) => (

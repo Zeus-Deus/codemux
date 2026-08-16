@@ -11,8 +11,16 @@ import {
 import type { ReviewComment, InlineReviewComment } from "@/tauri/types";
 import type { ReviewThreadTask } from "@/lib/pr-agent-handoff";
 import { toast } from "@/lib/toast";
+import { cn } from "@/lib/utils";
 import { CollapsibleSection } from "./collapsible-section";
-import { btnEmberXs } from "./review-ui";
+import {
+  btnEmberXs,
+  tzBody,
+  tzBodyLg,
+  tzEyebrow,
+  tzMeta,
+  tzRowTitle,
+} from "./review-ui";
 
 function ReviewStateIcon({ state }: { state: string }) {
   if (state === "APPROVED")
@@ -28,7 +36,7 @@ function AuthorAvatar({ name }: { name: string }) {
   const initial = name ? name[0].toUpperCase() : "?";
   return (
     <div className="h-5 w-5 rounded-full bg-muted flex items-center justify-center shrink-0">
-      <span className="text-[10px] font-medium text-muted-foreground">
+      <span className={cn("font-medium text-muted-foreground", tzMeta)}>
         {initial}
       </span>
     </div>
@@ -61,14 +69,14 @@ function CopyButton({ text }: { text: string }) {
     <Button
       size="icon-xs"
       variant="ghost"
-      className="h-4 w-4 opacity-0 group-hover/comment:opacity-100 transition-opacity"
+      className="h-[18px] w-[18px] opacity-0 group-hover/comment:opacity-100 transition-opacity"
       onClick={handleCopy}
       title="Copy comment"
     >
       {copied ? (
-        <span className="text-[8px] text-success">ok</span>
+        <span className={cn("text-success", tzEyebrow)}>ok</span>
       ) : (
-        <Copy className="h-2.5 w-2.5" />
+        <Copy className="h-3 w-3" />
       )}
     </Button>
   );
@@ -185,7 +193,7 @@ export function ReviewThreads({
               <Skeleton className="h-4 w-1/2 mx-1 my-0.5" />
             </>
           ) : (
-            <p className="text-xs text-muted-foreground px-1 py-0.5">
+            <p className={cn("text-muted-foreground px-1 py-1", tzBody)}>
               No comments yet.
             </p>
           )
@@ -203,14 +211,14 @@ export function ReviewThreads({
             className="space-y-1"
           >
             {/* Review header */}
-            <div className="flex items-center gap-1.5 px-1">
+            <div className="flex items-center gap-1.5 px-1 py-0.5">
               <AuthorAvatar name={g.review.author} />
-              <span className="text-xs font-medium text-foreground truncate">
+              <span className={cn("font-medium text-foreground truncate", tzRowTitle)}>
                 {g.review.author}
               </span>
               <ReviewStateIcon state={g.review.state} />
               {g.review.created_at && (
-                <span className="text-[10px] text-muted-foreground">
+                <span className={cn("text-muted-foreground", tzMeta)}>
                   {formatDate(g.review.created_at)}
                 </span>
               )}
@@ -219,8 +227,13 @@ export function ReviewThreads({
             {/* Review body */}
             {g.review.body && (
               <div className="space-y-1 pl-7 pr-1">
-                <div className="group/comment flex items-start gap-1">
-                  <p className="select-text text-xs text-muted-foreground flex-1 whitespace-pre-wrap break-words">
+                <div className="group/comment flex items-start gap-1.5">
+                  <p
+                    className={cn(
+                      "select-text text-muted-foreground flex-1 whitespace-pre-wrap break-words",
+                      tzBodyLg,
+                    )}
+                  >
                     {g.review.body}
                   </p>
                   <CopyButton text={g.review.body} />
@@ -252,16 +265,26 @@ export function ReviewThreads({
               // that's still unique relative to keyed reviews.
               <div
                 key={`${g.review.id}-${ic.id}`}
-                className="group/comment ml-7 mr-1 border-l-2 border-border/50 pl-2 space-y-0.5"
+                className="group/comment ml-7 mr-1 border-l-2 border-border/50 pl-2 space-y-1"
               >
-                <div className="flex items-center gap-1">
-                  <span className="text-[10px] font-mono bg-muted px-1 rounded text-muted-foreground truncate">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={cn(
+                      "font-mono bg-muted px-1.5 py-px rounded text-muted-foreground truncate",
+                      tzMeta,
+                    )}
+                  >
                     {ic.path}
                     {ic.line != null && `:${ic.line}`}
                   </span>
                   <CopyButton text={ic.body} />
                 </div>
-                <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                <p
+                  className={cn(
+                    "select-text text-muted-foreground whitespace-pre-wrap break-words",
+                    tzBodyLg,
+                  )}
+                >
                   {ic.body}
                 </p>
                 {onSendToAgent && (

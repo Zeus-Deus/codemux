@@ -47,6 +47,11 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
 
     useImperativeHandle(ref, () => ({ scrollToHunk }), [scrollToHunk]);
 
+    // Review's taller row and slightly larger gutter, or the Changes
+    // pane's original density.
+    const rowHeight = flow ? "min-h-[22px]" : "min-h-[18px]";
+    const gutterSize = flow ? "text-[12px]" : "text-[11px]";
+
     return (
       <div
         ref={containerRef}
@@ -59,6 +64,10 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
             : "code-surface select-text relative flex-1 overflow-auto bg-card"
         }
       >
+        {/* Review reads a diff the way you read prose — top to bottom,
+            many files, deciding as you go — so its rows get the taller
+            leading. The Changes pane is a working surface you scrub, and
+            keeps the tighter one. */}
         <div className="py-0.5">
           {lines.map((line, i) => {
             if (line.type === "hunk-header") {
@@ -66,10 +75,13 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                 <div
                   key={i}
                   data-diff-hunk
-                  className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0"
+                  className={cn(
+                    "flex bg-muted/30 whitespace-pre mt-1 first:mt-0",
+                    rowHeight,
+                  )}
                 >
                   <span className="w-[72px] shrink-0" />
-                  <span className="text-muted-foreground/60 text-[11px] px-3">
+                  <span className={cn("text-muted-foreground/60 px-3", gutterSize)}>
                     {line.content}
                   </span>
                 </div>
@@ -84,7 +96,8 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
             const under = selection?.renderUnder?.(line, side);
 
             const numberClass = cn(
-              "inline-block w-[36px] text-right pr-2 text-[11px] tabular-nums",
+              "inline-block w-[36px] text-right pr-2 tabular-nums",
+              gutterSize,
               selected ? SELECTED_NUMBER_CLASS : "text-muted-foreground",
             );
 
@@ -94,7 +107,8 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                   data-diff-row={selectable ? `${side}:${lineNo}` : undefined}
                   data-selected={selected ? "true" : undefined}
                   className={cn(
-                    "flex min-h-[18px] whitespace-pre",
+                    "flex whitespace-pre",
+                    rowHeight,
                     selected ? SELECTED_ROW_CLASS : style.bgClass,
                   )}
                 >

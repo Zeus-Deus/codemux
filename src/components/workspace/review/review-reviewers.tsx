@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { requestPrReview } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
-import { btnEmber } from "./review-ui";
+import { btnEmber, tzBody, tzEyebrow, tzMeta, tzMetaNum } from "./review-ui";
 
 /** Verdict → label + tone. GitLab never produces CHANGES_REQUESTED. */
 const VERDICT: Record<string, { label: string; className: string }> = {
@@ -62,22 +62,22 @@ export function ReviewReviewers({ pr, cwd, canRequestReview, onRequested }: Prop
           return (
             <span
               key={review.author}
-              className="flex items-center gap-1.5 rounded-md bg-muted/50 py-0.5 pl-0.5 pr-2"
+              className="flex items-center gap-1.5 rounded-md bg-muted/50 py-1 pl-1 pr-2.5"
             >
               <Avatar name={review.author} />
-              <span className="text-[10.5px] text-foreground/80">{review.author}</span>
-              <span className={cn("text-[10px]", verdict.className)}>{verdict.label}</span>
+              <span className={cn("text-foreground/80", tzMetaNum)}>{review.author}</span>
+              <span className={cn(tzMeta, verdict.className)}>{verdict.label}</span>
             </span>
           );
         })}
         {pending.map((login) => (
           <span
             key={login}
-            className="flex items-center gap-1.5 rounded-md bg-muted/50 py-0.5 pl-0.5 pr-2"
+            className="flex items-center gap-1.5 rounded-md bg-muted/50 py-1 pl-1 pr-2.5"
           >
             <Avatar name={login} />
-            <span className="text-[10.5px] text-foreground/80">{login}</span>
-            <span className="text-[10px] text-muted-foreground">pending</span>
+            <span className={cn("text-foreground/80", tzMetaNum)}>{login}</span>
+            <span className={cn("text-muted-foreground", tzMeta)}>pending</span>
           </span>
         ))}
       </div>
@@ -92,8 +92,8 @@ export function ReviewReviewers({ pr, cwd, canRequestReview, onRequested }: Prop
       data-testid="review-reviewers"
     >
       <div className="flex items-center gap-2">
-        <span className="size-[15px] shrink-0 rounded-full bg-card" aria-hidden />
-        <span className="flex-1 text-[11px] text-foreground/80">
+        <span className="size-[18px] shrink-0 rounded-full bg-card" aria-hidden />
+        <span className={cn("flex-1 text-foreground/80", tzBody)}>
           Nobody is reviewing this yet
         </span>
         {canRequestReview && !showInput && (
@@ -118,7 +118,10 @@ export function ReviewReviewers({ pr, cwd, canRequestReview, onRequested }: Prop
               if (e.key === "Enter") void submit();
               if (e.key === "Escape") setShowInput(false);
             }}
-            className="h-7 min-w-0 flex-1 rounded-md border-0 bg-background px-2 text-[11px] text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+            className={cn(
+              "h-[30px] min-w-0 flex-1 rounded-md border-0 bg-background px-2.5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              tzBody,
+            )}
             data-testid="request-review-input"
           />
           <button
@@ -139,7 +142,10 @@ function Avatar({ name }: { name: string }) {
   return (
     <span
       aria-hidden
-      className="flex size-[15px] shrink-0 items-center justify-center rounded-full bg-card text-[8px] font-semibold uppercase text-muted-foreground"
+      className={cn(
+        "flex size-[18px] shrink-0 items-center justify-center rounded-full bg-card font-semibold uppercase text-muted-foreground",
+        tzEyebrow,
+      )}
     >
       {name.slice(0, 1)}
     </span>

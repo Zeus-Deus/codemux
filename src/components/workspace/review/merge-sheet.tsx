@@ -2,7 +2,15 @@ import { useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { btnCard, btnGreenSolid } from "./review-ui";
+import {
+  btnCard,
+  btnGreenSolid,
+  tzBody,
+  tzBodyLg,
+  tzEyebrow,
+  tzMetaNum,
+  tzPanelHeader,
+} from "./review-ui";
 import { getMergeStrategy, setMergeStrategy } from "./pr-drafts";
 
 export const MERGE_STRATEGIES = [
@@ -68,7 +76,7 @@ export function MergeSheet({
     >
       <DialogContent showCloseButton={false} className="gap-0 p-0 sm:max-w-md">
         <div className="flex items-center gap-2 border-b border-border/40 px-3.5 pb-2.5 pt-3">
-          <DialogTitle className="flex-1 text-[12.5px] font-semibold">
+          <DialogTitle className={cn("flex-1 font-semibold", tzPanelHeader)}>
             Merge #{prNumber}
           </DialogTitle>
           <div
@@ -85,7 +93,8 @@ export function MergeSheet({
                 onClick={() => pickMethod(strategy.id)}
                 data-testid={`merge-strategy-${strategy.id}`}
                 className={cn(
-                  "rounded-md px-2.5 py-1 text-[10.5px] transition-colors",
+                  "rounded-md px-2.5 py-1.5 transition-colors",
+                  tzMetaNum,
                   method === strategy.id
                     ? "bg-card font-semibold text-foreground"
                     : "text-muted-foreground hover:text-foreground",
@@ -97,21 +106,34 @@ export function MergeSheet({
           </div>
         </div>
 
-        <div className="flex flex-col gap-2.5 px-3.5 py-3">
-          <label className="flex flex-col gap-1">
-            <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+        <div className="flex flex-col gap-3 px-3.5 py-3">
+          <label className="flex flex-col gap-1.5">
+            <span
+              className={cn(
+                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                tzEyebrow,
+              )}
+            >
               Commit title
             </span>
             <input
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               data-testid="merge-commit-title"
-              className="h-8 rounded-md border-0 bg-muted/50 px-2 text-[11.5px] text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+              className={cn(
+                "h-[34px] rounded-md border-0 bg-muted/50 px-2.5 text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                tzBodyLg,
+              )}
             />
           </label>
 
-          <label className="flex flex-col gap-1">
-            <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+          <label className="flex flex-col gap-1.5">
+            <span
+              className={cn(
+                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                tzEyebrow,
+              )}
+            >
               Body
             </span>
             <textarea
@@ -119,7 +141,10 @@ export function MergeSheet({
               onChange={(e) => setBody(e.target.value)}
               rows={4}
               data-testid="merge-commit-body"
-              className="resize-y rounded-md border-0 bg-muted/50 px-2 py-1.5 text-[11px] leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+              className={cn(
+                "resize-y rounded-md border-0 bg-muted/50 px-2.5 py-2 leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                tzBody,
+              )}
             />
           </label>
 
@@ -133,21 +158,21 @@ export function MergeSheet({
           >
             <span
               className={cn(
-                "flex size-3 shrink-0 items-center justify-center rounded-[3px]",
+                "flex size-3.5 shrink-0 items-center justify-center rounded-[3px]",
                 deleteBranch
                   ? "bg-status-open/20 text-status-open ring-1 ring-status-open"
                   : "bg-muted ring-1 ring-border",
               )}
             >
-              {deleteBranch && <Check className="size-2" strokeWidth={3.5} />}
+              {deleteBranch && <Check className="size-2.5" strokeWidth={3.5} />}
             </span>
-            <span className="flex-1 text-[11.5px] text-foreground/80">
-              Delete <span className="font-mono text-[11px]">{headBranch ?? "the branch"}</span>{" "}
+            <span className={cn("flex-1 text-foreground/80", tzBodyLg)}>
+              Delete <span className={cn("font-mono", tzBody)}>{headBranch ?? "the branch"}</span>{" "}
               after merging
             </span>
           </button>
 
-          <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+          <p className={cn("leading-relaxed text-muted-foreground", tzMetaNum)}>
             The worktree stays until you close it — Codemux won't remove a directory an
             agent might be running in.
           </p>

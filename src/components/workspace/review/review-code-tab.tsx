@@ -8,7 +8,7 @@ import type { DiffLine } from "@/lib/diff-parser";
 import type { DiffRowSide, DiffSelection } from "@/components/diff/diff-row";
 import { ReviewCodeFile } from "./review-code-file";
 import { ReviewLineComposer } from "./review-line-composer";
-import { btnCard } from "./review-ui";
+import { btnCard, tzBody, tzBodyLg, tzEyebrow, tzMeta, tzMetaNum } from "./review-ui";
 import {
   addLineDraft,
   getDiffSnapshot,
@@ -381,7 +381,7 @@ export function ReviewCodeTab({
 
   if (loading && !diffText) {
     return (
-      <p className="px-3.5 py-6 text-center text-[11px] text-muted-foreground">
+      <p className={cn("px-3.5 py-6 text-center text-muted-foreground", tzBody)}>
         Loading the diff…
       </p>
     );
@@ -389,7 +389,7 @@ export function ReviewCodeTab({
 
   if (error && !diffText) {
     return (
-      <p className="px-3.5 py-6 text-center text-[11px] text-muted-foreground">
+      <p className={cn("px-3.5 py-6 text-center text-muted-foreground", tzBody)}>
         Couldn't read the diff — {error}
       </p>
     );
@@ -402,7 +402,7 @@ export function ReviewCodeTab({
     // scrollbar first".
     <div ref={rootRef} className="flex flex-1 flex-col">
       <div className="flex items-center gap-1.5 border-b border-border/40 px-3 py-1.5">
-        <span className="flex-1 text-[10.5px] text-muted-foreground">
+        <span className={cn("flex-1 text-muted-foreground", tzMetaNum)}>
           {files.length === 1 ? "1 file" : `${files.length} files`} changed
         </span>
         <div className="flex gap-px rounded-md bg-muted/60 p-0.5" role="radiogroup" aria-label="Diff layout">
@@ -415,7 +415,8 @@ export function ReviewCodeTab({
               data-testid={`diff-layout-${id}`}
               onClick={() => pickLayout(id)}
               className={cn(
-                "rounded px-2 py-0.5 text-[10.5px] capitalize transition-colors",
+                "rounded px-2.5 py-1 capitalize transition-colors",
+                tzMetaNum,
                 layout === id
                   ? "bg-background font-semibold text-foreground"
                   : "text-muted-foreground hover:text-foreground",
@@ -431,7 +432,8 @@ export function ReviewCodeTab({
           data-testid="whitespace-toggle"
           onClick={() => pickWhitespace(!hideWhitespace)}
           className={cn(
-            "rounded border-0 px-2 py-0.5 text-[10.5px] transition-colors",
+            "rounded border-0 px-2.5 py-1 transition-colors",
+            tzMetaNum,
             hideWhitespace
               ? "bg-accent-ember/15 font-semibold text-accent-ember"
               : "text-muted-foreground hover:text-foreground",
@@ -446,7 +448,7 @@ export function ReviewCodeTab({
           data-testid="old-diff-banner"
           className="flex items-center gap-2 border-b border-border/40 bg-muted/40 px-3 py-1.5"
         >
-          <span className="flex-1 text-[11px] text-foreground/80">
+          <span className={cn("flex-1 text-foreground/80", tzBody)}>
             The diff as it was when you wrote these notes — the branch has moved since.
           </span>
           <button type="button" className={btnCard} onClick={() => setOldDiffOid(null)}>
@@ -460,7 +462,7 @@ export function ReviewCodeTab({
           data-testid="repin-banner"
           className="flex items-center gap-2 border-b border-border/40 bg-accent-ember/10 px-3 py-1.5"
         >
-          <span className="flex-1 text-[11px] text-foreground/80">
+          <span className={cn("flex-1 text-foreground/80", tzBody)}>
             Click the line this note belongs to now.
             {unanchored.length > 1 && ` ${unanchored.length - 1} more after this one.`}
           </span>
@@ -479,17 +481,17 @@ export function ReviewCodeTab({
           data-testid="unanchored-notes"
           className="border-b border-border/40 bg-muted/20 px-3 py-2"
         >
-          <p className="mb-1 text-[10.5px] font-semibold text-status-working">
+          <p className={cn("mb-1.5 font-semibold text-status-working", tzMetaNum)}>
             {unanchored.length === 1
               ? "1 note no longer matches a line"
               : `${unanchored.length} notes no longer match a line`}
           </p>
           {unanchored.map((note) => (
             <div key={note.id} className="flex items-start gap-2 py-0.5">
-              <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+              <span className={cn("shrink-0 font-mono text-muted-foreground", tzMeta)}>
                 {note.path}:{note.line}
               </span>
-              <span className="min-w-0 flex-1 text-[11px] leading-snug text-foreground/80">
+              <span className={cn("min-w-0 flex-1 leading-snug text-foreground/80", tzBody)}>
                 {note.body}
               </span>
               <button
@@ -499,14 +501,17 @@ export function ReviewCodeTab({
                   setRepinId(note.id);
                   scrollToFile(note.path);
                 }}
-                className="shrink-0 text-[10px] font-semibold text-accent-ember hover:underline"
+                className={cn(
+                  "shrink-0 font-semibold text-accent-ember hover:underline",
+                  tzMeta,
+                )}
               >
                 pick a line
               </button>
               <button
                 type="button"
                 onClick={() => removeLineDraft(draftKey, note.id)}
-                className="shrink-0 text-[10px] text-muted-foreground hover:text-foreground"
+                className={cn("shrink-0 text-muted-foreground hover:text-foreground", tzMeta)}
               >
                 delete
               </button>
@@ -517,7 +522,7 @@ export function ReviewCodeTab({
 
       <div>
         {files.length === 0 ? (
-          <p className="px-3.5 py-6 text-center text-[11px] text-muted-foreground">
+          <p className={cn("px-3.5 py-6 text-center text-muted-foreground", tzBody)}>
             No file changes in this pull request.
           </p>
         ) : (
@@ -566,16 +571,19 @@ function PendingNote({
     <div
       data-testid="pending-note"
       data-note-status={note.status}
-      className="my-1 ml-[72px] mr-3 rounded-lg bg-accent-ember/10 px-2.5 py-1.5"
+      className="my-1 ml-[72px] mr-3 rounded-lg bg-accent-ember/10 px-3 py-2"
     >
       <div className="flex items-center gap-2">
-        <span className="font-mono text-[10px] text-accent-ember">
+        <span className={cn("font-mono text-accent-ember", tzMeta)}>
           {rangeLabel(note.startLine, note.line)}
         </span>
         {note.status === "moved" && note.movedFrom != null && (
           <span
             data-testid="note-moved-badge"
-            className="rounded bg-muted/60 px-1.5 py-px font-mono text-[9.5px] text-muted-foreground"
+            className={cn(
+              "rounded bg-muted/60 px-1.5 py-0.5 font-mono text-muted-foreground",
+              tzEyebrow,
+            )}
           >
             moved {note.movedFrom} → {note.line}
           </span>
@@ -583,7 +591,10 @@ function PendingNote({
         {note.status === "unanchored" && (
           <span
             data-testid="note-unanchored-label"
-            className="rounded bg-status-working/15 px-1.5 py-px text-[9.5px] font-semibold text-status-working"
+            className={cn(
+              "rounded bg-status-working/15 px-1.5 py-0.5 font-semibold text-status-working",
+              tzEyebrow,
+            )}
           >
             no longer matches a line
           </span>
@@ -592,19 +603,19 @@ function PendingNote({
         <button
           type="button"
           onClick={onEdit}
-          className="text-[10px] text-muted-foreground hover:text-foreground"
+          className={cn("text-muted-foreground hover:text-foreground", tzMeta)}
         >
           edit
         </button>
         <button
           type="button"
           onClick={onDelete}
-          className="text-[10px] text-muted-foreground hover:text-foreground"
+          className={cn("text-muted-foreground hover:text-foreground", tzMeta)}
         >
           delete
         </button>
       </div>
-      <p className="mt-0.5 whitespace-pre-wrap font-sans text-[11.5px] leading-snug text-foreground">
+      <p className={cn("mt-1 whitespace-pre-wrap font-sans leading-snug text-foreground", tzBodyLg)}>
         {note.body}
       </p>
     </div>

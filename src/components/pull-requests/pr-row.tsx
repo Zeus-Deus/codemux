@@ -5,7 +5,15 @@ import { toast } from "@/lib/toast";
 import { checkOutPr } from "@/lib/pr-checkout";
 import { providerRef, type ProviderPresentation } from "@/lib/source-control";
 import type { PrRow as PrRowData } from "@/lib/pr-overview";
-import { groupDigits, shortAge } from "@/components/workspace/review/review-ui";
+import {
+  groupDigits,
+  shortAge,
+  tzBodyLg,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+  tzRowTitle,
+} from "@/components/workspace/review/review-ui";
 
 /** "5m" — the list has room for a magnitude, not a sentence. */
 function compactAge(iso: string | null): string | null {
@@ -67,15 +75,15 @@ function StateDot({ checks, draft }: { checks: string; draft: boolean }) {
   );
 }
 
-/** The 11px host mark. Ember for GitLab, neutral for GitHub — the
- *  colour is the only thing that has to survive at this size. */
+/** The host mark. Ember for GitLab, neutral for GitHub — the colour is
+ *  the only thing that has to survive at this size. */
 function HostMark({ kind }: { kind: string }) {
   return (
     <span
       aria-hidden
       data-testid={`host-mark-${kind}`}
       className={cn(
-        "size-[11px] shrink-0 rounded-[3px]",
+        "size-[12px] shrink-0 rounded-[3px]",
         kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/40",
       )}
     />
@@ -154,24 +162,22 @@ function PrRowImpl({
         data-focused={focused}
         onClick={onSelect}
         className={cn(
-          "group flex cursor-default items-center gap-2 py-1 pr-2.5",
+          "group flex cursor-default items-center gap-2 py-1.5 pr-2.5",
           selected
             ? "border-l-2 border-accent-ember bg-card pl-[9px]"
             : "pl-2.5 hover:bg-muted/30",
         )}
       >
         <StateDot checks={row.checks} draft={row.is_draft} />
-        <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+        <span className={cn("shrink-0 font-mono text-muted-foreground", tzMetaNum)}>
           {providerRef(provider, row.number)}
         </span>
-        <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">
+        <span className={cn("min-w-0 flex-1 truncate text-foreground", tzBodyLg)}>
           {row.title}
         </span>
         {moved && <MovedMark />}
-        <span className="shrink-0 text-[10.5px] text-muted-foreground">{row.author}</span>
-        {age && (
-          <span className="shrink-0 text-[10.5px] text-muted-foreground">{age}</span>
-        )}
+        <span className={cn("shrink-0 text-muted-foreground", tzMetaNum)}>{row.author}</span>
+        {age && <span className={cn("shrink-0 text-muted-foreground", tzMetaNum)}>{age}</span>}
       </div>
     );
   }
@@ -184,7 +190,7 @@ function PrRowImpl({
       data-focused={focused}
       onClick={onSelect}
       className={cn(
-        "group flex cursor-default flex-col gap-1 py-1.5 pr-2.5",
+        "group flex cursor-default flex-col gap-1.5 py-2 pr-2.5",
         selected
           ? "border-l-2 border-accent-ember bg-card pl-[9px]"
           : "pl-2.5 hover:bg-muted/30",
@@ -196,46 +202,68 @@ function PrRowImpl({
         {/* Titles never wrap: a two-line title pushes the row below it
             off the fold and makes every row a different height. */}
         <span
-          className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground"
+          className={cn("min-w-0 flex-1 truncate font-semibold text-foreground", tzRowTitle)}
           title={row.title}
         >
           {row.title}
         </span>
 
         {row.is_draft && (
-          <span className="shrink-0 rounded border border-border px-1 py-px text-[9.5px] text-muted-foreground">
+          <span
+            className={cn(
+              "shrink-0 rounded border border-border px-1.5 py-px text-muted-foreground",
+              tzEyebrow,
+            )}
+          >
             Draft
           </span>
         )}
         {label && (
           <span
             data-testid="pr-row-state-label"
-            className={cn("shrink-0 text-[10px]", label.className)}
+            className={cn("shrink-0", tzMeta, label.className)}
           >
             {label.text}
           </span>
         )}
 
-        {/* Hover and keyboard focus only — a button on every row at rest
-            is 40 buttons competing with the thing you came to read. */}
-        {row.head_branch && (
-          <button
-            type="button"
-            data-testid="pr-row-checkout"
-            disabled={busy}
-            onClick={checkOut}
-            className={cn(
-              "hidden shrink-0 rounded-[5px] bg-card px-1.5 py-0.5 text-[10px] text-foreground/90",
-              "transition-colors hover:bg-accent/60 disabled:opacity-60",
-              "group-hover:block group-data-[focused=true]:block",
-            )}
-          >
-            {existingWorkspaceId ? "Switch" : "Check out"}
-          </button>
-        )}
+        {/* The action's slot is held open whether or not the action is
+            showing. It used to be inserted on hover, which pushed the
+            title and slid the state label sideways — so running the
+            pointer down the list made every row twitch as you passed it.
+            The button is hidden by visibility, not by display: the row's
+            geometry is now identical at rest and on hover. */}
+        <span
+          data-testid="pr-row-action-slot"
+          className="flex w-[78px] shrink-0 justify-end"
+        >
+          {row.head_branch && (
+            <button
+              type="button"
+              data-testid="pr-row-checkout"
+              disabled={busy}
+              // Nothing to tab to while it is invisible.
+              tabIndex={-1}
+              onClick={checkOut}
+              className={cn(
+                "invisible max-w-full shrink-0 truncate rounded-[5px] bg-card px-2 py-0.5 text-foreground/90",
+                tzMeta,
+                "transition-colors hover:bg-accent/60 disabled:opacity-60",
+                "group-hover:visible group-data-[focused=true]:visible",
+              )}
+            >
+              {existingWorkspaceId ? "Switch" : "Check out"}
+            </button>
+          )}
+        </span>
       </div>
 
-      <div className="flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-foreground">
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-1.5 text-muted-foreground",
+          tzMetaNum,
+        )}
+      >
         <HostMark kind={row.providerKind} />
         <span className="shrink-0 font-mono">{providerRef(provider, row.number)}</span>
         <span className="shrink-0 opacity-40">·</span>

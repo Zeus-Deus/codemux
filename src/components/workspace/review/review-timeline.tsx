@@ -12,7 +12,17 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import type { AgentRunRecord } from "@/stores/pr-agent-runs-store";
 import type { PrTimelineEvent } from "@/tauri/types";
 import type { ChecksSummary, TimelineEntry, TimelineFilter } from "@/lib/pr-timeline";
-import { groupDigits, plural, relativeAge, shortAge } from "./review-ui";
+import {
+  groupDigits,
+  plural,
+  relativeAge,
+  shortAge,
+  tzBody,
+  tzBodyLg,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+} from "./review-ui";
 
 /**
  * The Timeline rail.
@@ -36,7 +46,7 @@ function Dot({ tone, spinning }: { tone: DotTone; spinning?: boolean }) {
       <span
         aria-hidden
         data-testid="timeline-dot-spinner"
-        className="size-[9px] flex-none animate-spin rounded-full border-[1.6px] border-status-working border-r-transparent"
+        className="size-[10px] flex-none animate-spin rounded-full border-[1.6px] border-status-working border-r-transparent"
       />
     );
   }
@@ -45,7 +55,7 @@ function Dot({ tone, spinning }: { tone: DotTone; spinning?: boolean }) {
       aria-hidden
       data-tone={tone}
       className={cn(
-        "size-[9px] flex-none rounded-full",
+        "size-[10px] flex-none rounded-full",
         tone === "neutral" && "border-[1.5px] border-border bg-card",
         tone === "warn" && "bg-status-working",
         tone === "green" && "bg-status-open",
@@ -75,14 +85,21 @@ function Row({
 }) {
   return (
     <div className="flex gap-2.5" data-testid={testId}>
-      <div className="flex w-[17px] flex-none flex-col items-center">
+      <div className="flex w-[18px] flex-none flex-col items-center">
         <Dot tone={tone} spinning={spinning} />
+        {/* The rail is what makes these one history rather than a stack
+            of unrelated cards, so it is drawn at the border's own weight
+            — at 40% it washed out and the entries read as floating. It
+            stops at the last entry: a line running into empty space
+            reads as "still loading". */}
         {!last && (
           <span
             aria-hidden
+            data-testid="timeline-rail"
+            data-rail-tone={emberRail ? "ember" : "neutral"}
             className={cn(
-              "w-[1.5px] flex-1",
-              emberRail ? "bg-accent-ember/35" : "bg-border/40",
+              "mt-1 w-[1.5px] flex-1 rounded-full",
+              emberRail ? "bg-accent-ember/60" : "bg-border",
             )}
           />
         )}
@@ -99,23 +116,25 @@ const Actor = ({ name }: { name: string | null }) => (
 );
 
 const Line = ({ children }: { children: React.ReactNode }) => (
-  <span className="text-[11.5px] text-foreground/80">{children}</span>
+  <span className={cn("text-foreground/80", tzBodyLg)}>{children}</span>
 );
 
 const Meta = ({ children }: { children: React.ReactNode }) => (
-  <span className="text-[10px] text-muted-foreground">{children}</span>
+  <span className={cn("text-muted-foreground", tzMeta)}>{children}</span>
 );
 
 /** A review comment, quoted the way the thread list quotes it. */
 function QuotedCard({ anchor, body }: { anchor?: string | null; body: string }) {
   if (!anchor && !body) return null;
   return (
-    <div className="flex flex-col gap-1 rounded-md bg-muted/40 px-2.5 py-[7px]">
+    // Capped: on the full-width page a quote stretched to 1,400px, and
+    // a line of prose that long stops being readable as a quote.
+    <div className="flex max-w-[760px] flex-col gap-1 rounded-md bg-muted/40 px-3 py-2">
       {anchor && (
-        <span className="font-mono text-[9.5px] text-muted-foreground">{anchor}</span>
+        <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>{anchor}</span>
       )}
       {body && (
-        <span className="whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/80">
+        <span className={cn("whitespace-pre-wrap leading-relaxed text-foreground/80", tzBody)}>
           {body}
         </span>
       )}
@@ -202,7 +221,7 @@ function HostEntry({
         <Row tone="neutral" last={last} testId={testId}>
           <Line>
             Pushed{" "}
-            <span className="font-mono text-[10.5px] text-foreground">
+            <span className={cn("font-mono text-foreground", tzMetaNum)}>
               {event.sha.slice(0, 7)}
             </span>
             {event.message && <span className="text-muted-foreground"> {event.message}</span>}
@@ -219,7 +238,7 @@ function HostEntry({
             {event.sha && (
               <>
                 {" to "}
-                <span className="font-mono text-[10.5px] text-foreground">
+                <span className={cn("font-mono text-foreground", tzMetaNum)}>
                   {event.sha.slice(0, 7)}
                 </span>
               </>
@@ -313,19 +332,24 @@ function AgentEntry({
         <span className="font-semibold text-accent-ember">Agent run</span> ·{" "}
         {runVerb(run.kind)}
       </Line>
-      <div className="flex flex-col gap-[5px] rounded-md bg-accent-ember/[0.07] px-2.5 py-[7px]">
-        <span className="text-[11px] leading-relaxed text-foreground/80">{run.summary}</span>
+      <div className="flex max-w-[760px] flex-col gap-1.5 rounded-md bg-accent-ember/[0.07] px-3 py-2">
+        <span className={cn("leading-relaxed text-foreground/80", tzBody)}>
+          {run.summary}
+        </span>
         <div className="flex items-center gap-1.5">
           {/* Omitted rather than guessed — see `AgentRunRecord`. */}
           {stats && (
-            <span className="font-mono text-[9.5px] text-muted-foreground">{stats}</span>
+            <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>{stats}</span>
           )}
           <span className="flex-1" />
           <button
             type="button"
             data-testid="timeline-open-thread"
             onClick={() => onOpenThread(run)}
-            className="rounded border-0 bg-card px-2 py-0.5 text-[10px] text-foreground/90 outline-none transition-colors hover:bg-accent/50 focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+            className={cn(
+              "rounded border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors hover:bg-accent/50 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              tzMeta,
+            )}
           >
             Open thread
           </button>
@@ -374,9 +398,13 @@ export function TimelineFilterPicker({
         <button
           type="button"
           data-testid="timeline-filter"
-          className="border-0 bg-transparent py-2 text-[10.5px] text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+          className={cn(
+            "border-0 bg-transparent py-2 text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+            tzMetaNum,
+          )}
         >
-          {value === "host" ? "Host only" : "Everything"} <span className="text-[9px]">▾</span>
+          {value === "host" ? "Host only" : "Everything"}{" "}
+          <span className={tzEyebrow}>▾</span>
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-32">
@@ -438,7 +466,10 @@ export function ReviewTimeline({ entries, loading, staleAgeMs }: ReviewTimelineP
 
   if (loading && entries.length === 0) {
     return (
-      <div className="px-3.5 py-3 text-[11px] text-muted-foreground" data-testid="timeline-loading">
+      <div
+        className={cn("px-3.5 py-3 text-muted-foreground", tzBody)}
+        data-testid="timeline-loading"
+      >
         Loading history…
       </div>
     );
@@ -447,7 +478,7 @@ export function ReviewTimeline({ entries, loading, staleAgeMs }: ReviewTimelineP
   return (
     <div className="flex flex-col px-3.5 py-3" data-testid="review-timeline">
       {staleAgeMs != null && (
-        <p className="pb-2 text-[10px] text-muted-foreground" data-testid="timeline-stale">
+        <p className={cn("pb-2 text-muted-foreground", tzMeta)} data-testid="timeline-stale">
           Showing history from {shortAge(staleAgeMs)} ago
         </p>
       )}

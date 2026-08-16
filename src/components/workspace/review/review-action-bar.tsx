@@ -15,6 +15,10 @@ import {
   btnGreenSolid,
   btnGreenTint,
   btnQuiet,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
 } from "./review-ui";
 import { MERGE_STRATEGIES } from "./merge-sheet";
 import {
@@ -90,11 +94,16 @@ export function ReviewActionBar(props: ActionBarProps) {
         <ReviewerBar {...props} />
       ) : state === "record" ? (
         <div className="flex items-center gap-2">
-          <span className="flex-1 text-[11px] text-muted-foreground">{sentence}</span>
+          <span className={cn("flex-1 text-muted-foreground", tzBody)}>{sentence}</span>
         </div>
       ) : state === "author-draft" ? (
         <div className="flex items-center gap-2">
-          <span className="flex flex-1 items-center gap-1.5 text-[10.5px] text-muted-foreground">
+          <span
+            className={cn(
+              "flex flex-1 items-center gap-1.5 text-muted-foreground",
+              tzMetaNum,
+            )}
+          >
             <span
               aria-hidden
               className="size-2 shrink-0 rounded-full border-[1.5px] border-dashed border-muted-foreground"
@@ -119,7 +128,12 @@ export function ReviewActionBar(props: ActionBarProps) {
         </div>
       ) : (
         <div className="flex items-center gap-2">
-          <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[10.5px] text-foreground/80">
+          <span
+            className={cn(
+              "flex min-w-0 flex-1 items-center gap-1.5 text-foreground/80",
+              tzMetaNum,
+            )}
+          >
             <span
               aria-hidden
               className={cn(
@@ -236,7 +250,7 @@ function StrategyPicker({
     <DropdownMenu>
       <DropdownMenuTrigger asChild disabled={disabled}>
         <button type="button" className={btnQuiet} data-testid="merge-strategy-picker">
-          {label} <span className="text-[9px]">▾</span>
+          {label} <span className={tzEyebrow}>▾</span>
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-28">
@@ -311,16 +325,22 @@ function ReviewerBar({
           onChange={(e) => update(e.target.value)}
           onKeyDown={onKeyDown}
           data-testid="review-composer"
-          className="w-full resize-y rounded-md border-0 bg-background px-2 py-1.5 text-[11px] leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+          className={cn(
+            "w-full resize-y rounded-md border-0 bg-background px-2.5 py-2 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+            tzBody,
+          )}
         />
       ) : (
         <button
           type="button"
           onClick={() => setExpanded(true)}
           data-testid="review-composer-collapsed"
-          className="rounded-md bg-background px-2 py-1.5 text-left text-[11px] text-muted-foreground"
+          className={cn(
+            "rounded-md bg-background px-2.5 py-2 text-left text-muted-foreground",
+            tzBody,
+          )}
         >
-          Leave a review… <span className="font-mono text-[10px]">⌘↵</span>
+          Leave a review… <span className={cn("font-mono", tzMeta)}>⌘↵</span>
         </button>
       )}
       <div className="flex items-center gap-2">

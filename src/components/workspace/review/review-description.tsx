@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { MarkdownRendered } from "@/components/editor/MarkdownRendered";
 import { updatePullRequest } from "@/tauri/commands";
-import { btnCard, btnEmberSolid } from "./review-ui";
+import { btnCard, btnEmberSolid, tzBody, tzEyebrow, tzMeta } from "./review-ui";
 import {
   clearDescriptionDraft,
   getDescriptionDraft,
@@ -115,7 +115,12 @@ export function ReviewDescription({
   return (
     <div className="flex flex-col gap-1.5" data-testid="review-description">
       <div className="flex items-center gap-1.5">
-        <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+        <span
+          className={cn(
+            "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+            tzEyebrow,
+          )}
+        >
           Description
         </span>
         {foldable && !editing && (
@@ -136,7 +141,10 @@ export function ReviewDescription({
           <button
             type="button"
             onClick={startEdit}
-            className="text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+            className={cn(
+              "text-muted-foreground transition-colors hover:text-foreground",
+              tzMeta,
+            )}
             data-testid="edit-description"
           >
             edit
@@ -152,7 +160,10 @@ export function ReviewDescription({
             value={draft}
             onChange={(e) => onChange(e.target.value)}
             rows={10}
-            className="w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60"
+            className={cn(
+              "w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-2 font-mono leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              tzBody,
+            )}
             data-testid="description-editor"
           />
           <div className="flex items-center gap-1.5">
@@ -176,14 +187,17 @@ export function ReviewDescription({
             <button
               type="button"
               onClick={toggleFold}
-              className="absolute inset-x-0 bottom-0 flex h-10 items-end justify-center bg-gradient-to-t from-background to-transparent text-[10px] text-muted-foreground hover:text-foreground"
+              className={cn(
+                "absolute inset-x-0 bottom-0 flex h-10 items-end justify-center bg-gradient-to-t from-background to-transparent text-muted-foreground hover:text-foreground",
+                tzMeta,
+              )}
             >
               Show all {lineCount} lines
             </button>
           )}
         </div>
       ) : (
-        <p className="text-[11px] text-muted-foreground">No description.</p>
+        <p className={cn("text-muted-foreground", tzBody)}>No description.</p>
       )}
     </div>
   );

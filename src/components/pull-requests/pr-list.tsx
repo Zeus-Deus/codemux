@@ -9,7 +9,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { resolveProvider } from "@/lib/source-control";
-import { shortAge } from "@/components/workspace/review/review-ui";
+import {
+  shortAge,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+  tzMetaNum,
+  tzPanelHeader,
+} from "@/components/workspace/review/review-ui";
 import {
   applyPlan,
   freezePlan,
@@ -193,10 +200,10 @@ export function PrList({
   return (
     <div className="flex h-full min-h-0 w-full flex-col" data-testid="pr-list">
       <div className="flex shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2">
-        <span className="text-[12.5px] font-semibold text-foreground">Pull requests</span>
+        <span className={cn("font-semibold text-foreground", tzPanelHeader)}>Pull requests</span>
         <span className="flex-1" />
         {age && (
-          <span className="text-[10.5px] text-muted-foreground" data-testid="pr-list-age">
+          <span className={cn("text-muted-foreground", tzMetaNum)} data-testid="pr-list-age">
             {age} ago
           </span>
         )}
@@ -208,21 +215,24 @@ export function PrList({
             applyPendingOrder();
             onRefresh();
           }}
-          className="flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+          className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
         >
-          <RefreshCw className={cn("size-3", isLoading && "animate-spin")} />
+          <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
         </button>
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5 border-b border-border/40 px-3 py-2">
         <span className="flex flex-1 items-center gap-1.5 rounded-[7px] bg-muted/40 px-2 py-1">
-          <Search className="size-3 shrink-0 text-muted-foreground" />
+          <Search className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search, or is:draft ci:failing"
             data-testid="pr-search"
-            className="min-w-0 flex-1 bg-transparent text-[11px] text-foreground outline-none placeholder:text-muted-foreground"
+            className={cn(
+              "min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-muted-foreground",
+              tzBody,
+            )}
           />
         </span>
         <DropdownMenu>
@@ -230,10 +240,13 @@ export function PrList({
             <button
               type="button"
               data-testid="pr-state-filter"
-              className="flex shrink-0 items-center gap-1 rounded-[7px] bg-muted/40 px-2 py-1 text-[11px] text-foreground/90 transition-colors hover:bg-accent/50"
+              className={cn(
+                "flex shrink-0 items-center gap-1 rounded-[7px] bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors hover:bg-accent/50",
+                tzBody,
+              )}
             >
               {STATE_LABEL[stateFilter]}
-              <span className="text-[9px] text-muted-foreground">▾</span>
+              <span className={cn("text-muted-foreground", tzEyebrow)}>▾</span>
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-28">
@@ -291,21 +304,26 @@ export function PrList({
                   onClick={() => setWatchingOpen((open) => !open)}
                   className="mt-2 flex w-full items-center gap-1.5 border-t border-border/40 px-3 py-1.5 text-left"
                 >
-                  <span className="text-[10px] text-muted-foreground">
+                  <span className={cn("text-muted-foreground", tzMeta)}>
                     {watchingOpen ? "▾" : "▸"}
                   </span>
-                  <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-muted-foreground">
+                  <span
+                    className={cn(
+                      "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                      tzEyebrow,
+                    )}
+                  >
                     {GROUP_LABEL.watching}
                   </span>
                   <span className="flex-1" />
-                  <span className="font-mono text-[9.5px] text-muted-foreground">
+                  <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>
                     {watching.length}
                   </span>
                 </button>
                 {watchingOpen ? (
                   watching.map((row) => renderRow(row, true))
                 ) : (
-                  <p className="px-3 pb-1 text-[10.5px] leading-relaxed text-muted-foreground">
+                  <p className={cn("px-3 pb-1.5 leading-relaxed text-muted-foreground", tzMetaNum)}>
                     Repositories you have open but aren't involved in.
                   </p>
                 )}
@@ -313,7 +331,7 @@ export function PrList({
             )}
 
             {hidden > 0 && (
-              <p className="px-3 py-2 text-[10.5px] text-muted-foreground">
+              <p className={cn("px-3 py-2.5 text-muted-foreground", tzMetaNum)}>
                 Showing the first {MAX_RENDERED} of {review.length + yours.length + watching.length}.
                 Narrow it with the search field above.
               </p>
@@ -323,7 +341,7 @@ export function PrList({
       </div>
 
       <div className="flex shrink-0 items-center gap-2 border-t border-border/40 px-3 py-1.5">
-        <span className="min-w-0 flex-1 truncate text-[10.5px] text-muted-foreground">
+        <span className={cn("min-w-0 flex-1 truncate text-muted-foreground", tzMetaNum)}>
           {hostCount} {hostCount === 1 ? "repository" : "repositories"}
           {failures.length > 0 && (
             <>
@@ -338,7 +356,7 @@ export function PrList({
             </>
           )}
         </span>
-        <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">
+        <span className={cn("shrink-0 font-mono text-muted-foreground", tzEyebrow)}>
           ↑↓ move · ↵ open
         </span>
       </div>
@@ -355,11 +373,16 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
       {id === "review" && (
         <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-accent-ember" />
       )}
-      <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.07em] text-foreground/80">
+      <span
+        className={cn(
+          "font-mono font-semibold uppercase tracking-[0.07em] text-foreground/80",
+          tzEyebrow,
+        )}
+      >
         {GROUP_LABEL[id]}
       </span>
       <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-[9.5px] text-muted-foreground">{count}</span>
+      <span className={cn("font-mono text-muted-foreground", tzEyebrow)}>{count}</span>
     </div>
   );
 }
@@ -383,7 +406,7 @@ function EmptyList({
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8">
         <p className="text-xs text-foreground">Nothing matches that search.</p>
-        <p className="text-[11px] text-muted-foreground">
+        <p className={cn("text-muted-foreground", tzBody)}>
           Tokens are <span className="font-mono">is:draft</span>,{" "}
           <span className="font-mono">ci:failing</span> and{" "}
           <span className="font-mono">author:name</span>; everything else is title text.
@@ -391,7 +414,10 @@ function EmptyList({
         <button
           type="button"
           onClick={onClearQuery}
-          className="rounded-md bg-card px-2.5 py-1 text-[11px] text-foreground/90 hover:bg-accent/50"
+          className={cn(
+            "rounded-md bg-card px-3 py-1.5 text-foreground/90 hover:bg-accent/50",
+            tzBody,
+          )}
         >
           Clear the search
         </button>
@@ -403,7 +429,7 @@ function EmptyList({
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8">
         <p className="text-xs text-foreground">No projects open.</p>
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
+        <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           This page lists pull requests across the projects you have open. Open one and
           its repository shows up here.
         </p>
@@ -414,7 +440,7 @@ function EmptyList({
   return (
     <div className="flex flex-col items-start gap-2 px-3 py-8">
       <p className="text-xs text-foreground">No open pull requests.</p>
-      <p className="text-[11px] leading-relaxed text-muted-foreground">
+      <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
         Nothing is open on the projects you have here. If you expected some, check that
         the host CLI is signed in under Settings ▸ Source Control.
       </p>

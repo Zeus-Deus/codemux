@@ -11,7 +11,7 @@ import {
   isRenderable,
   type PrDiffFile,
 } from "@/lib/pr-diff";
-import { groupDigits } from "./review-ui";
+import { groupDigits, tzBody, tzMeta, tzMetaNum } from "./review-ui";
 import type { DiffLayout } from "./pr-drafts";
 
 interface Props {
@@ -64,7 +64,14 @@ export function ReviewCodeFile({
       data-viewed={viewed ? "true" : undefined}
       className="border-b border-border/40 last:border-b-0"
     >
-      <div className="flex items-center gap-2 bg-muted/30 px-3 py-1.5">
+      {/* Chevron, then the path immediately beside it — the two things
+          you scan a file list by sit together on the left, and the
+          numbers and the Viewed toggle collect on the right. The path
+          used to take the whole free width, and because it truncates
+          from the left (`dir="rtl"`) that pushed the text itself to the
+          far right, where it read as part of the stats cluster. It now
+          shrinks to its content and an empty span holds the gap. */}
+      <div className="flex items-center gap-2 bg-muted/30 px-3 py-2">
         <button
           type="button"
           aria-label={collapsed ? `Expand ${file.path}` : `Collapse ${file.path}`}
@@ -72,30 +79,39 @@ export function ReviewCodeFile({
           onClick={() => setManuallyCollapsed((c) => !c)}
           className="shrink-0 text-muted-foreground hover:text-foreground"
         >
-          {collapsed ? <ChevronRight className="size-3" /> : <ChevronDown className="size-3" />}
+          {collapsed ? (
+            <ChevronRight className="size-3.5" />
+          ) : (
+            <ChevronDown className="size-3.5" />
+          )}
         </button>
         <span
-          className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground"
+          data-testid="code-file-path"
+          className={cn("min-w-0 shrink truncate text-left font-mono text-foreground", tzBody)}
           title={file.path}
           dir="rtl"
         >
           {file.path}
         </span>
         {file.status !== "modified" && (
-          <span className="shrink-0 text-[10px] text-muted-foreground">{file.status}</span>
+          <span className={cn("shrink-0 text-muted-foreground", tzMeta)}>{file.status}</span>
         )}
         {pendingNotes > 0 && (
           <span
             data-testid="file-pending-count"
-            className="flex shrink-0 items-center gap-1 rounded bg-accent-ember/15 px-1.5 py-px text-[10px] font-semibold text-accent-ember"
+            className={cn(
+              "flex shrink-0 items-center gap-1 rounded bg-accent-ember/15 px-1.5 py-0.5 font-semibold text-accent-ember",
+              tzMeta,
+            )}
           >
             {pendingNotes} pending
           </span>
         )}
-        <span className="shrink-0 font-mono text-[10.5px] text-success">
+        <span className="flex-1" />
+        <span className={cn("shrink-0 font-mono text-success", tzMetaNum)}>
           +{groupDigits(file.additions)}
         </span>
-        <span className="shrink-0 font-mono text-[10.5px] text-danger">
+        <span className={cn("shrink-0 font-mono text-danger", tzMetaNum)}>
           −{groupDigits(file.deletions)}
         </span>
         <button
@@ -104,7 +120,8 @@ export function ReviewCodeFile({
           aria-pressed={viewed}
           onClick={onToggleViewed}
           className={cn(
-            "shrink-0 rounded border-0 px-1.5 py-px text-[10.5px] transition-colors",
+            "shrink-0 rounded border-0 px-2 py-0.5 transition-colors",
+            tzMetaNum,
             viewed
               ? "bg-status-open/15 font-semibold text-status-open"
               : "bg-card text-muted-foreground hover:text-foreground",
@@ -118,7 +135,7 @@ export function ReviewCodeFile({
         (!renderable ? (
           <p
             data-testid="file-not-rendered"
-            className="px-3 py-2 text-[11px] text-muted-foreground"
+            className={cn("px-3 py-2.5 text-muted-foreground", tzBody)}
           >
             {file.binary ? "Binary file" : "Generated file"} — not shown. Nothing here
             reads line by line.
@@ -126,7 +143,10 @@ export function ReviewCodeFile({
         ) : large && !loadedAnyway ? (
           <div
             data-testid="file-too-large"
-            className="flex items-center gap-2 px-3 py-2 text-[11px] text-muted-foreground"
+            className={cn(
+              "flex items-center gap-2 px-3 py-2.5 text-muted-foreground",
+              tzBody,
+            )}
           >
             <span className="flex-1">
               {groupDigits(changed)} changed lines — large enough to bury the rest of
@@ -136,7 +156,10 @@ export function ReviewCodeFile({
               type="button"
               data-testid="load-anyway"
               onClick={() => setLoadedAnyway(true)}
-              className="shrink-0 rounded bg-card px-2 py-0.5 text-[10.5px] font-medium text-foreground hover:bg-accent/50"
+              className={cn(
+                "shrink-0 rounded bg-card px-2.5 py-1 font-medium text-foreground hover:bg-accent/50",
+                tzMetaNum,
+              )}
             >
               Load anyway
             </button>

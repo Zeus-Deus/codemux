@@ -403,31 +403,33 @@ export function ReviewPanel({ workspace }: Props) {
 
   if (hasPr && pr) {
     return (
-      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
-        <ReviewDetail
-          pr={pr}
-          checks={checks}
-          reviews={reviews}
-          inlineComments={inlineComments}
-          checksLoading={checksQuery.isFetching}
-          commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
-          cwd={cwd}
-          workspaceId={workspace.workspace_id}
-          projectRoot={workspace.project_root ?? workspace.cwd}
-          provider={provider}
-          operations={operations}
-          repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
-          viewerLogin={
-            ghStatus?.status === "Authenticated" ? ghStatus.username || null : null
-          }
-          checkedOutHere={isPrOnCurrentBranch(pr.head_branch, workspace.git_branch)}
-          gitBehind={workspace.git_behind ?? 0}
-          gitDirtyFiles={workspace.git_changed_files ?? 0}
-          staleAgeMs={staleAgeMs}
-          onRefresh={invalidatePrQueries}
-          onOpenChanges={openChangesPane}
-        />
-      </ScrollArea>
+      // No scroll wrapper: the detail lays itself out to the pane's full
+      // height and scrolls only its tab body, so the action bar sits on
+      // the bottom edge of the pane rather than wherever the description
+      // happened to end.
+      <ReviewDetail
+        pr={pr}
+        checks={checks}
+        reviews={reviews}
+        inlineComments={inlineComments}
+        checksLoading={checksQuery.isFetching}
+        commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
+        cwd={cwd}
+        workspaceId={workspace.workspace_id}
+        projectRoot={workspace.project_root ?? workspace.cwd}
+        provider={provider}
+        operations={operations}
+        repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
+        viewerLogin={
+          ghStatus?.status === "Authenticated" ? ghStatus.username || null : null
+        }
+        checkedOutHere={isPrOnCurrentBranch(pr.head_branch, workspace.git_branch)}
+        gitBehind={workspace.git_behind ?? 0}
+        gitDirtyFiles={workspace.git_changed_files ?? 0}
+        staleAgeMs={staleAgeMs}
+        onRefresh={invalidatePrQueries}
+        onOpenChanges={openChangesPane}
+      />
     );
   }
 

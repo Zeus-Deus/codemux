@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { tzBodyLg, tzEyebrow } from "./review-ui";
 
 export interface ReviewTab {
   id: string;
@@ -49,7 +50,8 @@ export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
             data-testid={`review-tab-${tab.id}`}
             onClick={() => onSelect(tab.id)}
             className={cn(
-              "-mb-px border-b-[1.5px] py-2 text-[11.5px] transition-colors",
+              "-mb-px border-b-[1.5px] py-2.5 transition-colors",
+              tzBodyLg,
               active
                 ? "border-accent-ember font-semibold text-foreground"
                 : "border-transparent text-muted-foreground hover:text-foreground",
@@ -57,7 +59,7 @@ export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
           >
             {tab.label}
             {tab.count != null && (
-              <span className="ml-1 font-mono text-[9.5px]">{tab.count}</span>
+              <span className={cn("ml-1.5 font-mono", tzEyebrow)}>{tab.count}</span>
             )}
           </button>
         );
