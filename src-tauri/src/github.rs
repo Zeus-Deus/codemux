@@ -479,19 +479,36 @@ pub fn check_gh_status() -> GhStatus {
         return GhStatus::NotAuthenticated;
     }
 
-    // gh auth status prints to stderr: "Logged in to github.com account USERNAME (...)"
+    // "Logged in to github.com account USERNAME (...)" — modern gh
+    // (≥2.4x, incl. 2.97) prints auth status to stdout; older releases
+    // used stderr. Parsing only stderr made every modern install look
+    // like an anonymous viewer: rows still listed (the token was fine)
+    // but nothing could be attributed to "you", so the Pull Requests
+    // page filed the user's own PRs under Watching and the panel never
+    // showed the author's action bar. Check stdout first, then stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let username = stderr
+    let username = parse_auth_status_username(&stdout)
+        .or_else(|| parse_auth_status_username(&stderr))
+        .unwrap_or_default();
+
+    GhStatus::Authenticated { username }
+}
+
+/// Extract USERNAME from a `gh auth status` stream, wherever gh chose
+/// to print it. Only lines that describe a login are considered, so a
+/// hypothetical "account" in an error message can't produce a viewer.
+fn parse_auth_status_username(stream: &str) -> Option<String> {
+    stream
         .lines()
+        .filter(|line| line.contains("Logged in to"))
         .find_map(|line| {
             line.find("account ").map(|pos| {
                 let after = &line[pos + 8..];
                 after.split_whitespace().next().unwrap_or("").to_string()
             })
         })
-        .unwrap_or_default();
-
-    GhStatus::Authenticated { username }
+        .filter(|name| !name.is_empty())
 }
 
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
@@ -3859,5 +3876,33 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
     fn paginated_pages_are_flattened_rather_than_truncated() {
         let joined = r#"[{"event":"closed","id":1}][{"event":"reopened","id":2}]"#;
         assert_eq!(parse_paginated_array(joined).len(), 2);
+    }
+
+    // gh moved `auth status` output from stderr to stdout across major
+    // versions; the viewer login must parse from either stream, and a
+    // missing login must yield None rather than an empty-string viewer
+    // (an empty viewer silently files every PR under Watching).
+    #[test]
+    fn auth_status_username_parses_modern_stdout_shape() {
+        let out = "github.com\n  \u{2713} Logged in to github.com account Zeus-Deus (keyring)\n  - Active account: true\n";
+        assert_eq!(
+            parse_auth_status_username(out).as_deref(),
+            Some("Zeus-Deus")
+        );
+    }
+
+    #[test]
+    fn auth_status_username_parses_legacy_stderr_shape() {
+        let err = "Logged in to github.com account octocat (oauth_token)\n";
+        assert_eq!(parse_auth_status_username(err).as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn auth_status_username_ignores_unrelated_account_mentions() {
+        assert_eq!(
+            parse_auth_status_username("error: account suspended, contact support\n"),
+            None
+        );
+        assert_eq!(parse_auth_status_username(""), None);
     }
 }

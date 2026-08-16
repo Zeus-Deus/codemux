@@ -85,7 +85,11 @@ export function PrList({
   onRefresh,
 }: PrListProps) {
   const [query, setQuery] = useState("");
-  const [watchingOpen, setWatchingOpen] = useState(false);
+  // null = the user hasn't chosen; the fold then follows the content:
+  // Watching stays folded while Needs-your-review / Yours have rows,
+  // but when it is the only populated group a folded header would be
+  // the entire page — so it opens itself. An explicit toggle wins.
+  const [watchingChoice, setWatchingChoice] = useState<boolean | null>(null);
   const [listFocused, setListFocused] = useState(false);
   const [pointerInside, setPointerInside] = useState(false);
 
@@ -134,6 +138,8 @@ export function PrList({
   const review = byId("review");
   const yours = byId("yours");
   const watching = byId("watching");
+  const watchingOpen =
+    watchingChoice ?? (review.length === 0 && yours.length === 0 && watching.length > 0);
 
   // What the keyboard walks: exactly what is on screen, folded groups
   // excluded — an arrow key that lands on a row you can't see is a
@@ -301,7 +307,7 @@ export function PrList({
                   type="button"
                   data-testid="pr-group-watching-toggle"
                   aria-expanded={watchingOpen}
-                  onClick={() => setWatchingOpen((open) => !open)}
+                  onClick={() => setWatchingChoice(!watchingOpen)}
                   className="mt-2 flex w-full items-center gap-1.5 border-t border-border/40 px-3 py-1.5 text-left"
                 >
                   <span className={cn("text-muted-foreground", tzMeta)}>

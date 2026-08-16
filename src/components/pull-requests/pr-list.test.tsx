@@ -107,6 +107,22 @@ describe("groups", () => {
     await userEvent.click(screen.getByTestId("pr-group-watching-toggle"));
     expect(domOrder()).toEqual([10, 20, 30]);
   });
+
+  it("opens Watching by itself when it is the only populated group", async () => {
+    // Nothing is attributed to the viewer — a folded header would be
+    // the entire page, so the fold follows the content instead.
+    renderList({ rows: [row({ number: 30 }), row({ number: 40 })] });
+
+    expect(screen.getByTestId("pr-group-watching-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(domOrder()).toEqual([30, 40]);
+
+    // An explicit collapse still wins over the default.
+    await userEvent.click(screen.getByTestId("pr-group-watching-toggle"));
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+  });
 });
 
 describe("rule 03 — order freezes while you are in the list", () => {

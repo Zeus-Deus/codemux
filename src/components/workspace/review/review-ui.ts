@@ -22,15 +22,15 @@
  */
 
 /** Uppercase eyebrows and mono micro-labels. The floor — nothing below. */
-export const tzEyebrow = "text-[10px]";
+export const tzEyebrow = "text-[11px]";
 /** Meta, captions, hints — the quiet line under a title. */
-export const tzMeta = "text-[11px]";
+export const tzMeta = "text-[12px]";
 /** Secondary meta and mono numbers, a hair up from {@link tzMeta}. */
-export const tzMetaNum = "text-[11.5px]";
+export const tzMetaNum = "text-[12px]";
 /** Buttons, body-small, bar sentences. */
-export const tzBody = "text-[12px]";
+export const tzBody = "text-[12.5px]";
 /** Body copy and row meta that has to be read, not scanned. */
-export const tzBodyLg = "text-[12.5px]";
+export const tzBodyLg = "text-[13px]";
 /** List/row titles. */
 export const tzRowTitle = "text-[13px]";
 /** Section and panel headers. */
@@ -40,7 +40,7 @@ export const tzPanelTitle = "text-[15px]";
 /** The PR title on the full-screen page, where there is room for it. */
 export const tzPageTitle = "text-[17px]";
 /** Check-log excerpts — mono, quieter than the diff it explains. */
-export const tzLog = "text-[11.5px]";
+export const tzLog = "text-[12px]";
 
 /*
  * Deliberately no token for the diff body.
