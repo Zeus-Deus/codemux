@@ -62,6 +62,18 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const LIST_PAGE_SIZE: u32 = 50;
 const BRANCH_LOOKUP_PAGE_SIZE: u32 = 100;
 
+/// How many merge requests the REST pipeline fallback will pay a request
+/// for. Only reached when an instance refuses the one GraphQL batch, and
+/// there each row is its own round trip, so it stops well short of the
+/// list rather than firing 50 subprocesses at a background refresh.
+const STATS_PIPELINE_FALLBACK_ROWS: usize = 20;
+
+/// How many pages a timeline leg will follow before giving up. Ten pages
+/// of 100 is far past any merge request a human reads to the end of; the
+/// cap exists so a pathological thread cannot pin the blocking pool.
+const TIMELINE_MAX_PAGES: u32 = 10;
+const TIMELINE_PAGE_SIZE: usize = 100;
+
 // ── Provider ────────────────────────────────────────────────────
 
 /// Stateless handle; the detection fields are the only per-repository
@@ -534,18 +546,12 @@ fn parse_incoming_mr_json(v: &Value) -> IncomingPrItem {
     }
 }
 
-/// A merge request's pipeline reduced to the page's four-word CI
-/// vocabulary.
+/// A pipeline status reduced to the page's four-word CI vocabulary.
 ///
-/// Only what the list endpoint already carries is read. A per-MR
-/// pipeline lookup would be a request per row, which is exactly the cost
-/// the reduced rollup exists to avoid.
-fn mr_rollup_state(v: &Value) -> String {
-    let status = v["head_pipeline"]["status"]
-        .as_str()
-        .or_else(|| v["pipeline"]["status"].as_str())
-        .unwrap_or("");
-    match status {
+/// Takes the raw status because the three places that have one spell it
+/// differently: REST is `success`, GraphQL is `SUCCESS`.
+fn pipeline_rollup_state(status: &str) -> String {
+    match status.to_ascii_lowercase().as_str() {
         "success" | "manual" => "passing".to_string(),
         "failed" => "failing".to_string(),
         "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | "scheduled" => {
@@ -558,16 +564,136 @@ fn mr_rollup_state(v: &Value) -> String {
     }
 }
 
+/// The newest pipeline in a `merge_requests/:iid/pipelines` response,
+/// which answers newest first.
+fn latest_pipeline_state(pipelines: &Value) -> String {
+    let status = pipelines
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|p| p["status"].as_str())
+        .unwrap_or("");
+    pipeline_rollup_state(status)
+}
+
+/// `glab mr merge` arguments, assembled away from the subprocess so the
+/// flag rules can be tested: glab spells the squash-commit subject
+/// `--squash-message` and the merge-commit subject `--message`, and
+/// neither applies to a rebase, which produces no commit of its own.
+fn glab_merge_args(
+    number: u32,
+    method: &str,
+    delete_branch: bool,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "mr".into(),
+        "merge".into(),
+        number.to_string(),
+        "--yes".into(),
+        // `glab mr merge` defaults `--auto-merge` to true, which queues
+        // the merge behind the pipeline instead of performing it. The
+        // GitHub path merges now, so this must be turned off explicitly
+        // or the button would appear to do nothing on any project with
+        // CI.
+        "--auto-merge=false".into(),
+    ];
+    if delete_branch {
+        // Mirrors `gh pr merge --delete-branch`.
+        args.push("--remove-source-branch".into());
+    }
+    match method {
+        "squash" => args.push("--squash".into()),
+        "rebase" => args.push("--rebase".into()),
+        _ => {}
+    }
+
+    let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
+    let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
+    // GitLab takes one message where gh takes a subject and a body, so
+    // the two are joined the way git itself separates them. A body with
+    // no title has nothing to be the subject of, so it is dropped.
+    let combined = match (title, body) {
+        (Some(t), Some(b)) => Some(format!("{t}\n\n{b}")),
+        (Some(t), None) => Some(t.to_string()),
+        _ => None,
+    };
+    if let Some(message) = combined {
+        match method {
+            "squash" => {
+                args.push("--squash-message".into());
+                args.push(message);
+            }
+            "rebase" => {}
+            _ => {
+                args.push("--message".into());
+                args.push(message);
+            }
+        }
+    }
+    args
+}
+
+/// The project a merge request payload belongs to, which GraphQL needs
+/// and REST never states outright: it is the left half of
+/// `references.full` (`group/project!12`).
+fn project_full_path(mr: &Value) -> Option<String> {
+    let reference = mr["references"]["full"].as_str()?;
+    let full_path = reference.split('!').next()?;
+    (!full_path.is_empty()).then(|| full_path.to_string())
+}
+
+/// The batched head-pipeline query. `iids` arrive pre-quoted because
+/// GraphQL types a merge request's `iid` as a String.
+fn overview_stats_query(full_path: &str, iids: &[String]) -> String {
+    let list = iids.join(",");
+    format!(
+        "{{project(fullPath:\"{full_path}\"){{mergeRequests(iids:[{list}]){{nodes{{iid headPipeline{{status}}}}}}}}}}"
+    )
+}
+
+/// One request's worth of head-pipeline states, keyed by merge request.
+///
+/// `mergeRequests(iids:)` is the only way to ask GitLab about a whole
+/// page of merge requests' CI at once; the REST list endpoint does not
+/// carry `head_pipeline` at all, and the per-MR REST route is a request
+/// per row.
+fn parse_overview_stats_graphql(value: &Value) -> Vec<PrOverviewStats> {
+    let Some(nodes) = value["data"]["project"]["mergeRequests"]["nodes"].as_array() else {
+        return Vec::new();
+    };
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let iid = node["iid"].as_u64().or_else(|| {
+                // GraphQL types `iid` as a String.
+                node["iid"].as_str().and_then(|s| s.parse::<u64>().ok())
+            })?;
+            Some(PrOverviewStats {
+                number: iid as u32,
+                // A merge request with no head pipeline answers `null`
+                // here, and that *is* an answer: no pipeline ran.
+                checks: pipeline_rollup_state(node["headPipeline"]["status"].as_str().unwrap_or("")),
+                // Line counts are a diff-stat request per merge request;
+                // the row keeps whatever it already had rather than
+                // paying 50 round trips to fill two numbers.
+                additions: None,
+                deletions: None,
+            })
+        })
+        .collect()
+}
+
 /// Approval state in the vocabulary the row labels read.
 ///
 /// GitLab has no request-changes verdict (see the capability table), so
-/// this is a two-state answer at most. `approved` is only present on
-/// some instances/tiers, so it is read defensively and the merge-status
-/// hint is the fallback — neither is invented when GitLab is silent.
+/// this is a two-state answer at most — and from a merge request payload
+/// it is a one-state answer: no merge request response carries an
+/// approval verdict, only the separate `/approvals` endpoint does (see
+/// [`GitLabProvider::review_decision`], which the detail view calls).
+/// `detailed_merge_status` is the one approval hint the payload has, and
+/// it only ever says "still waiting".
 fn mr_review_decision(v: &Value) -> Option<String> {
-    if v["approved"].as_bool() == Some(true) {
-        return Some("APPROVED".to_string());
-    }
     match v["detailed_merge_status"].as_str() {
         Some("not_approved") => Some("REVIEW_REQUIRED".to_string()),
         _ => None,
@@ -603,12 +729,11 @@ fn parse_overview_mr_json(v: &Value) -> PrOverviewItem {
         additions: None,
         deletions: None,
         review_decision: mr_review_decision(v),
-        // Unlike the gh path, this one *can* answer in the first call:
-        // the merge request list endpoint already carries
-        // `head_pipeline`, so the row's colour costs nothing extra and
-        // the page never makes the second request. `Some` rather than
-        // `None` is what tells it so.
-        checks: Some(mr_rollup_state(v)),
+        // Same as the gh path: the merge request *list* endpoint carries
+        // no pipeline at all — `head_pipeline` is a single-merge-request
+        // field — so this call cannot answer, and `None` is the only
+        // honest way to say so. The stats call fills it in.
+        checks: None,
         review_requested_from: reviewers,
         updated_at: v["updated_at"].as_str().map(|s| s.to_string()),
         url: v["web_url"].as_str().unwrap_or("").to_string(),
@@ -1255,15 +1380,19 @@ impl SourceControlProvider for GitLabProvider {
         })
     }
 
-    /// GitLab's overview is already complete, so this is a fallback the
-    /// page is not expected to call: it only fires the stats request for
-    /// rows whose `checks` came back unanswered, and none of GitLab's do.
+    /// The CI half of the overview, which on GitLab is genuinely a
+    /// second trip: the merge request list endpoint carries no pipeline.
     ///
-    /// It is implemented honestly anyway rather than returning an error,
-    /// because "the page asked, so answer" is cheaper to reason about
-    /// than a command that works on one host and throws on another — and
-    /// the answer costs exactly the one list request the overview
-    /// already makes, not a pipeline lookup per row.
+    /// GraphQL first, because `mergeRequests(iids:)` answers the whole
+    /// visible page's head pipelines in one request. An instance that
+    /// refuses GraphQL falls back to REST, and there the cost really is
+    /// a request per row, so the fallback is capped well below the list
+    /// and rows past the cap simply go unanswered — which is what `None`
+    /// on the row already means.
+    ///
+    /// A row this cannot answer for is *omitted*, never reported as
+    /// `none`: "no pipeline configured" and "nobody asked" are different
+    /// answers and the page colours them differently.
     fn pull_requests_overview_stats(
         &self,
         repo_path: &Path,
@@ -1272,16 +1401,29 @@ impl SourceControlProvider for GitLabProvider {
         let rows = value
             .as_array()
             .ok_or_else(|| "Expected JSON array from merge request list".to_string())?;
+
+        if let Some(stats) = self.overview_stats_graphql(repo_path, rows) {
+            return Ok(stats);
+        }
+
         Ok(rows
             .iter()
-            .map(|v| PrOverviewStats {
-                number: v["iid"].as_u64().unwrap_or(0) as u32,
-                checks: mr_rollup_state(v),
-                // Line counts are a diff-stat request per merge request
-                // here; the row keeps whatever it already had rather
-                // than paying 50 round trips to fill two numbers.
-                additions: None,
-                deletions: None,
+            .filter_map(|v| v["iid"].as_u64())
+            .take(STATS_PIPELINE_FALLBACK_ROWS)
+            .filter_map(|iid| {
+                let pipelines = self
+                    .api(
+                        repo_path,
+                        &format!("projects/:id/merge_requests/{iid}/pipelines?per_page=1"),
+                        CALL_TIMEOUT,
+                    )
+                    .ok()?;
+                Some(PrOverviewStats {
+                    number: iid as u32,
+                    checks: latest_pipeline_state(&pipelines),
+                    additions: None,
+                    deletions: None,
+                })
             })
             .collect())
     }
@@ -1380,51 +1522,8 @@ impl SourceControlProvider for GitLabProvider {
         commit_body: Option<&str>,
     ) -> Result<(), String> {
         self.require_ready()?;
-        let number_str = number.to_string();
-        let mut args: Vec<&str> = vec![
-            "mr",
-            "merge",
-            &number_str,
-            "--yes",
-            // `glab mr merge` defaults `--auto-merge` to true, which
-            // queues the merge behind the pipeline instead of
-            // performing it. The GitHub path merges now, so this must
-            // be turned off explicitly or the button would appear to do
-            // nothing on any project with CI.
-            "--auto-merge=false",
-        ];
-        if delete_branch {
-            // Mirrors `gh pr merge --delete-branch`.
-            args.push("--remove-source-branch");
-        }
-        match method {
-            "squash" => args.push("--squash"),
-            "rebase" => args.push("--rebase"),
-            _ => {}
-        }
-        // glab spells the squash-commit subject `--squash-message` and
-        // the merge-commit subject `--message`; neither applies to a
-        // rebase, which produces no commit of its own.
-        let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
-        let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
-        let combined = match (title, body) {
-            (Some(t), Some(b)) => Some(format!("{t}\n\n{b}")),
-            (Some(t), None) => Some(t.to_string()),
-            _ => None,
-        };
-        if let Some(message) = combined.as_deref() {
-            match method {
-                "squash" => {
-                    args.push("--squash-message");
-                    args.push(message);
-                }
-                "rebase" => {}
-                _ => {
-                    args.push("--message");
-                    args.push(message);
-                }
-            }
-        }
+        let owned = glab_merge_args(number, method, delete_branch, commit_title, commit_body);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         run_glab_timed(repo_path, &args, LIST_TIMEOUT)?;
         invalidate_cache(Some(repo_path));
         Ok(())
@@ -1863,27 +1962,16 @@ impl SourceControlProvider for GitLabProvider {
 
         // Each leg is independently optional: a self-managed instance
         // with one endpoint disabled should cost that leg, not the tab.
-        let states = self
-            .api(
-                repo_path,
-                &format!("{base}/resource_state_events?per_page=100"),
-                CALL_TIMEOUT,
-            )
-            .unwrap_or(Value::Null);
-        let versions = self
-            .api(
-                repo_path,
-                &format!("{base}/versions?per_page=100"),
-                CALL_TIMEOUT,
-            )
-            .unwrap_or(Value::Null);
-        let notes = self
-            .api(
-                repo_path,
-                &format!("{base}/notes?per_page=100&sort=asc"),
-                CALL_TIMEOUT,
-            )
-            .unwrap_or(Value::Null);
+        // Each is also paged: a merge request that has been open for a
+        // month has more than 100 notes, and the tail is the half a
+        // reviewer is actually reading.
+        let states = self.api_all_pages(
+            repo_path,
+            &format!("{base}/resource_state_events"),
+            CALL_TIMEOUT,
+        );
+        let versions = self.api_all_pages(repo_path, &format!("{base}/versions"), CALL_TIMEOUT);
+        let notes = self.api_all_pages(repo_path, &format!("{base}/notes?sort=asc"), CALL_TIMEOUT);
 
         Ok(map_gitlab_timeline(&states, &versions, &notes))
     }
@@ -1993,6 +2081,64 @@ impl GitLabProvider {
         }
     }
 
+    /// Head-pipeline states for a whole page of merge requests in one
+    /// request. `None` means "GraphQL did not answer", which is the
+    /// caller's signal to fall back — not "no pipelines".
+    fn overview_stats_graphql(&self, repo_path: &Path, rows: &[Value]) -> Option<Vec<PrOverviewStats>> {
+        let full_path = rows.iter().find_map(project_full_path)?;
+        let iids: Vec<String> = rows
+            .iter()
+            .filter_map(|v| v["iid"].as_u64())
+            .map(|iid| format!("\"{iid}\""))
+            .collect();
+        if iids.is_empty() {
+            return Some(Vec::new());
+        }
+        let query = overview_stats_query(&full_path, &iids);
+        let value = run_glab_json(
+            repo_path,
+            &["api", "graphql", "-f", &format!("query={query}")],
+            LIST_TIMEOUT,
+        )
+        .ok()?;
+        // An error document parses fine but has no `nodes`; treat that
+        // as "did not answer" so the REST fallback still runs.
+        value["data"]["project"]["mergeRequests"]["nodes"].as_array()?;
+        Some(parse_overview_stats_graphql(&value))
+    }
+
+    /// Follow a list endpoint's pages until a short one.
+    ///
+    /// `per_page=100` alone silently truncates, and a long-running merge
+    /// request's notes go past 100 routinely. Failure of any page keeps
+    /// what earlier pages returned rather than losing the leg entirely.
+    fn api_all_pages(&self, repo_path: &Path, endpoint: &str, timeout: Duration) -> Value {
+        let separator = if endpoint.contains('?') { '&' } else { '?' };
+        let mut all: Vec<Value> = Vec::new();
+        for page in 1..=TIMELINE_MAX_PAGES {
+            let url =
+                format!("{endpoint}{separator}per_page={TIMELINE_PAGE_SIZE}&page={page}");
+            let Ok(value) = self.api(repo_path, &url, timeout) else {
+                break;
+            };
+            let Some(rows) = value.as_array() else {
+                break;
+            };
+            let count = rows.len();
+            all.extend(rows.iter().cloned());
+            if count < TIMELINE_PAGE_SIZE {
+                return Value::Array(all);
+            }
+            if page == TIMELINE_MAX_PAGES {
+                log::warn!(
+                    "gitlab: {endpoint} still had pages at the {TIMELINE_MAX_PAGES}-page cap; \
+                     the timeline is truncated"
+                );
+            }
+        }
+        Value::Array(all)
+    }
+
     /// Additions/deletions for a merge request.
     ///
     /// The REST payload has no diff stats — only GraphQL exposes them —
@@ -2000,11 +2146,7 @@ impl GitLabProvider {
     /// request carries in `references.full` (`group/project!12`). Best
     /// effort: any failure just leaves the counts empty.
     fn diff_stats(&self, repo_path: &Path, mr: &Value) -> Option<(u32, u32)> {
-        let reference = mr["references"]["full"].as_str()?;
-        let full_path = reference.split('!').next()?;
-        if full_path.is_empty() {
-            return None;
-        }
+        let full_path = project_full_path(mr)?;
         let iid = mr["iid"].as_u64()?;
         let query = format!(
             "{{project(fullPath:\"{full_path}\"){{mergeRequest(iid:\"{iid}\"){{diffStatsSummary{{additions deletions}}}}}}}}"
@@ -2412,6 +2554,192 @@ gitlab.com
     fn a_non_array_checks_payload_is_empty_not_an_error() {
         assert!(parse_checks(&Value::Null).is_empty());
         assert!(parse_checks(&serde_json::json!({"message": "403 Forbidden"})).is_empty());
+    }
+
+    // ── Overview rows and their CI rollup ──
+
+    /// The list endpoint carries no pipeline of any kind — `head_pipeline`
+    /// is a single-merge-request field — so the fast path cannot answer
+    /// the CI question. `None` says "nobody asked yet", which is what
+    /// makes the page fire the stats call; `Some("none")` would be a
+    /// definitive "this merge request runs no CI" and would paint a grey
+    /// dot over a red pipeline.
+    #[test]
+    fn the_list_row_never_claims_to_know_the_ci_state() {
+        let row = serde_json::json!({
+            "iid": 12,
+            "title": "Add auth",
+            "source_branch": "feature/auth",
+            "updated_at": "2026-08-07T11:22:41.756Z",
+            "web_url": "http://localhost:8929/root/app/-/merge_requests/12",
+            "author": {"username": "root"},
+            "reviewers": [{"username": "juliusm"}, {"username": ""}],
+        });
+        let item = parse_overview_mr_json(&row);
+        assert_eq!(item.number, 12);
+        assert_eq!(item.checks, None);
+        // The rest of the row is what the list *can* answer.
+        assert_eq!(item.head_branch.as_deref(), Some("feature/auth"));
+        assert_eq!(item.review_requested_from, vec!["juliusm".to_string()]);
+        assert_eq!(item.additions, None);
+    }
+
+    /// GitLab's merge request payloads carry no approval verdict at all
+    /// — only the separate `/approvals` endpoint does — so the row label
+    /// may only ever say "still waiting", never "approved".
+    #[test]
+    fn the_row_label_reads_the_one_approval_hint_a_merge_request_has() {
+        assert_eq!(
+            mr_review_decision(&serde_json::json!({"detailed_merge_status": "not_approved"})),
+            Some("REVIEW_REQUIRED".to_string())
+        );
+        assert_eq!(
+            mr_review_decision(&serde_json::json!({"detailed_merge_status": "mergeable"})),
+            None
+        );
+        assert_eq!(mr_review_decision(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn pipeline_states_reduce_to_the_pages_four_words() {
+        for status in ["success", "manual", "SUCCESS"] {
+            assert_eq!(pipeline_rollup_state(status), "passing", "{status}");
+        }
+        for status in ["failed", "FAILED"] {
+            assert_eq!(pipeline_rollup_state(status), "failing", "{status}");
+        }
+        for status in ["running", "pending", "created", "PREPARING", "scheduled"] {
+            assert_eq!(pipeline_rollup_state(status), "pending", "{status}");
+        }
+        // A cancelled pipeline and no pipeline are the same grey dot.
+        for status in ["canceled", "skipped", ""] {
+            assert_eq!(pipeline_rollup_state(status), "none", "{status}");
+        }
+    }
+
+    /// `merge_requests/:iid/pipelines` answers newest first, and the
+    /// newest is the one the row is about.
+    #[test]
+    fn the_rest_fallback_reads_the_newest_pipeline() {
+        let pipelines = serde_json::json!([
+            {"id": 9, "status": "failed"},
+            {"id": 8, "status": "success"},
+        ]);
+        assert_eq!(latest_pipeline_state(&pipelines), "failing");
+        // No pipelines is an answer: nothing ran.
+        assert_eq!(latest_pipeline_state(&serde_json::json!([])), "none");
+        // A refusal is not an array, and must not read as "passing".
+        assert_eq!(
+            latest_pipeline_state(&serde_json::json!({"message": "403 Forbidden"})),
+            "none"
+        );
+    }
+
+    /// One request answers the whole visible page, which is the only
+    /// reason the stats call is affordable at all.
+    #[test]
+    fn the_graphql_batch_answers_every_row_it_was_asked_about() {
+        let value = serde_json::json!({
+            "data": {"project": {"mergeRequests": {"nodes": [
+                {"iid": "12", "headPipeline": {"status": "FAILED"}},
+                {"iid": "13", "headPipeline": {"status": "RUNNING"}},
+                {"iid": "14", "headPipeline": null},
+            ]}}}
+        });
+        let stats = parse_overview_stats_graphql(&value);
+        assert_eq!(stats.len(), 3);
+        assert_eq!((stats[0].number, stats[0].checks.as_str()), (12, "failing"));
+        assert_eq!((stats[1].number, stats[1].checks.as_str()), (13, "pending"));
+        // GraphQL answered "there is no head pipeline", which is a fact
+        // the row may be painted from.
+        assert_eq!((stats[2].number, stats[2].checks.as_str()), (14, "none"));
+        // Line counts stay a diff-stat call the row does not pay for.
+        assert_eq!(stats[0].additions, None);
+
+        // An error document has no nodes, and claims nothing.
+        assert!(parse_overview_stats_graphql(&serde_json::json!({
+            "errors": [{"message": "Field 'mergeRequests' doesn't exist"}]
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn the_batch_query_names_the_project_and_every_iid() {
+        let query = overview_stats_query("group/app", &["\"12\"".to_string(), "\"13\"".to_string()]);
+        assert!(query.contains("project(fullPath:\"group/app\")"), "{query}");
+        assert!(query.contains("mergeRequests(iids:[\"12\",\"13\"])"), "{query}");
+        assert!(query.contains("headPipeline{status}"), "{query}");
+    }
+
+    /// GraphQL needs the project path REST never states outright.
+    #[test]
+    fn the_project_path_comes_out_of_the_merge_request_reference() {
+        assert_eq!(
+            project_full_path(&serde_json::json!({"references": {"full": "group/sub/app!12"}})),
+            Some("group/sub/app".to_string())
+        );
+        assert_eq!(project_full_path(&serde_json::json!({})), None);
+        assert_eq!(
+            project_full_path(&serde_json::json!({"references": {"full": "!12"}})),
+            None
+        );
+    }
+
+    // ── Merge arguments ──
+
+    /// glab defaults `--auto-merge` to true, which queues the merge
+    /// behind the pipeline instead of performing it — the button would
+    /// appear to do nothing on any project with CI.
+    #[test]
+    fn a_merge_is_immediate_unattended_and_optionally_tidies_up() {
+        let args = glab_merge_args(12, "merge", true, None, None);
+        assert_eq!(
+            args,
+            vec![
+                "mr",
+                "merge",
+                "12",
+                "--yes",
+                "--auto-merge=false",
+                "--remove-source-branch",
+            ]
+        );
+        assert!(!glab_merge_args(12, "merge", false, None, None)
+            .contains(&"--remove-source-branch".to_string()));
+    }
+
+    /// GitLab takes one message where gh takes a subject and a body, and
+    /// spells it differently per strategy.
+    #[test]
+    fn the_commit_message_is_combined_and_named_per_strategy() {
+        let squash = glab_merge_args(12, "squash", false, Some("Add auth"), Some("Closes #4."));
+        assert_eq!(squash[5], "--squash");
+        assert_eq!(squash[6], "--squash-message");
+        assert_eq!(squash[7], "Add auth\n\nCloses #4.");
+
+        let merge = glab_merge_args(12, "merge", false, Some("Add auth"), Some("Closes #4."));
+        assert_eq!(merge[5], "--message");
+        assert_eq!(merge[6], "Add auth\n\nCloses #4.");
+
+        // A title on its own is the whole message.
+        let title_only = glab_merge_args(12, "merge", false, Some("Add auth"), None);
+        assert_eq!(title_only[6], "Add auth");
+    }
+
+    /// A rebase produces no commit of its own, so there is nothing for a
+    /// message to title — and a body with no title has nothing to be the
+    /// body of.
+    #[test]
+    fn a_rebase_and_a_bodiless_title_carry_no_message() {
+        let rebase = glab_merge_args(12, "rebase", false, Some("Add auth"), Some("Closes #4."));
+        assert_eq!(rebase, vec!["mr", "merge", "12", "--yes", "--auto-merge=false", "--rebase"]);
+
+        let body_only = glab_merge_args(12, "merge", false, None, Some("Closes #4."));
+        assert!(!body_only.contains(&"--message".to_string()));
+
+        // Whitespace is not a message.
+        let blank = glab_merge_args(12, "squash", false, Some("  "), Some("\n"));
+        assert!(!blank.contains(&"--squash-message".to_string()));
     }
 
     // ── Discussions ──

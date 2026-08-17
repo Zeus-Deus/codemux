@@ -75,6 +75,26 @@ fn verdict_operation(event: &str) -> Operation {
     }
 }
 
+/// GitHub requires `body` on the two verdicts that are only words: a
+/// review whose event is `COMMENT` or `REQUEST_CHANGES` and whose body is
+/// empty is a 422, and a raw 422 in a toast tells a reviewer nothing
+/// about what to do. Approving stays wordless — the approval *is* the
+/// statement.
+///
+/// Line notes do not stand in for the body. They hang off the review;
+/// they are not it, and the host rejects the call either way.
+pub(crate) fn require_review_body(event: &str, body: &str) -> Result<(), String> {
+    if !body.trim().is_empty() || event == "approve" {
+        return Ok(());
+    }
+    Err(match event {
+        "request-changes" => {
+            "Requesting changes needs a message saying what has to change.".to_string()
+        }
+        _ => "A comment review needs a message.".to_string(),
+    })
+}
+
 #[tauri::command]
 pub async fn check_gh_available() -> bool {
     tokio::task::spawn_blocking(|| git_provider::github_provider().cli_available())
@@ -432,6 +452,7 @@ pub async fn set_pr_thread_resolved(
 
 #[tauri::command]
 pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
+    require_review_body(&event, &body)?;
     tokio::task::spawn_blocking(move || {
         provider_for(&path, verdict_operation(&event))?.submit_pull_request_review(Path::new(&path), pr_number, &event, &body)
     })
@@ -478,6 +499,7 @@ pub async fn submit_pr_review_with_comments(
     comments: Vec<crate::github::PrDraftComment>,
     commit_id: String,
 ) -> Result<(), String> {
+    require_review_body(&event, &body)?;
     tokio::task::spawn_blocking(move || {
         // A pending review with line notes is two declarations: the
         // verdict, and the line comments carrying it.
@@ -864,6 +886,33 @@ mod tests {
             assert!(err.contains("Bitbucket"), "{err}");
             assert!(err.contains(op.describe()), "{err}");
         }
+    }
+
+    /// GitHub 422s a `COMMENT` or `REQUEST_CHANGES` review with no body,
+    /// and a raw 422 in a toast tells a reviewer nothing. The refusal
+    /// happens here, before the request, and says what to do about it.
+    #[test]
+    fn a_wordless_comment_or_request_for_changes_is_refused_here() {
+        for event in ["comment", "request-changes", ""] {
+            for body in ["", "   ", "\n\t"] {
+                let err = require_review_body(event, body)
+                    .expect_err("an empty body must be refused for this verdict");
+                assert!(
+                    err.contains("message"),
+                    "the refusal must name what is missing: {err}"
+                );
+            }
+            assert!(require_review_body(event, "Looks off to me.").is_ok());
+        }
+    }
+
+    /// An approval is a statement on its own; requiring words for it
+    /// would be this app inventing a rule GitHub does not have.
+    #[test]
+    fn approving_stays_wordless() {
+        assert!(require_review_body("approve", "").is_ok());
+        assert!(require_review_body("approve", "   ").is_ok());
+        assert!(require_review_body("approve", "Nice.").is_ok());
     }
 
     /// The three verdicts one command carries are three declarations.

@@ -1924,31 +1924,49 @@ pub fn merge_pull_request(
     commit_title: Option<&str>,
     commit_body: Option<&str>,
 ) -> Result<(), String> {
-    let number_str = pr_number.to_string();
+    let owned = merge_args(pr_number, method, delete_branch, commit_title, commit_body);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+/// The flag assembly on its own, so the rebase rule can be tested
+/// without a repository or a `gh` on PATH.
+fn merge_args(
+    pr_number: u32,
+    method: &str,
+    delete_branch: bool,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
+) -> Vec<String> {
     let method_flag = match method {
         "squash" => "--squash",
         "rebase" => "--rebase",
         _ => "--merge",
     };
-    let mut args: Vec<&str> = vec!["pr", "merge", &number_str, method_flag];
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        pr_number.to_string(),
+        method_flag.into(),
+    ];
     if delete_branch {
-        args.push("--delete-branch");
+        args.push("--delete-branch".into());
     }
     let is_rebase = method == "rebase";
     let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
     let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
     if !is_rebase {
         if let Some(title) = title {
-            args.push("--subject");
-            args.push(title);
+            args.push("--subject".into());
+            args.push(title.into());
         }
         if let Some(body) = body {
-            args.push("--body");
-            args.push(body);
+            args.push("--body".into());
+            args.push(body.into());
         }
     }
-    run_gh(repo_path, &args)?;
-    Ok(())
+    args
 }
 
 pub fn close_pull_request(repo_path: &Path, pr_number: u32) -> Result<(), String> {
@@ -2058,7 +2076,7 @@ pub fn get_check_log_excerpt(
         return Ok(String::new());
     }
 
-    let Some(run_id) = run_gh_optional(
+    let Some(runs) = run_gh_optional(
         repo_path,
         &[
             "run",
@@ -2070,22 +2088,55 @@ pub fn get_check_log_excerpt(
             "--json",
             "databaseId,conclusion,name",
             "--jq",
-            ".[] | select(.conclusion == \"failure\") | .databaseId",
+            ".[] | select(.conclusion == \"failure\") | \"\\(.databaseId)\\t\\(.name)\"",
         ],
     ) else {
         return Ok(String::new());
     };
-    // The jq filter can yield several ids, one per line; the first is
-    // the most recent run.
-    let Some(run_id) = run_id.lines().next().map(str::trim).filter(|s| !s.is_empty()) else {
+
+    // A commit can fail several workflows at once, and the excerpt is
+    // shown under *one* named check. Handing back the first failing run
+    // regardless of name puts one workflow's log under another's card,
+    // which reads as a fact and is not one.
+    let Some(run_id) = pick_failing_run(&runs, check_name) else {
         return Ok(String::new());
     };
 
-    let Some(log) = run_gh_optional(repo_path, &["run", "view", run_id, "--log-failed"]) else {
+    let Some(log) = run_gh_optional(repo_path, &["run", "view", &run_id, "--log-failed"]) else {
         return Ok(String::new());
     };
 
     Ok(tail_check_log(&log, check_name))
+}
+
+/// Pick the failing run whose workflow name goes with `check_name`.
+///
+/// Rows arrive newest first as `databaseId\tname`. The names are related
+/// but not equal — a check is a job inside a workflow, so GitHub renders
+/// them as `CI / test (ubuntu)` against a workflow called `CI` — so the
+/// same prefix convention [`tail_check_log`] uses decides it, in either
+/// direction. No match is `None`: an unrelated run's log is worse than
+/// no log.
+fn pick_failing_run(rows: &str, check_name: &str) -> Option<String> {
+    let needle = check_name.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    rows.lines().find_map(|line| {
+        let (id, name) = line.split_once('\t')?;
+        let (id, name) = (id.trim(), name.trim());
+        if id.is_empty() || name.is_empty() {
+            return None;
+        }
+        names_match(name, needle).then(|| id.to_string())
+    })
+}
+
+/// Whether a workflow name and a check name name the same thing.
+fn names_match(run_name: &str, check_name: &str) -> bool {
+    let run = run_name.to_ascii_lowercase();
+    let check = check_name.to_ascii_lowercase();
+    check.starts_with(&run) || run.starts_with(&check)
 }
 
 /// Trim a `gh run view --log-failed` dump to the interesting tail.
@@ -2295,6 +2346,16 @@ pub fn get_pr_inline_comments(
 // Only GraphQL's `reviewThreads` answers the second, so that is where the
 // thread list comes from.
 
+/// The comment selection both thread queries read, named once so the
+/// follow-up page and the first page cannot drift apart.
+const THREAD_COMMENT_NODES: &str = "nodes{id databaseId author{login} body createdAt}";
+
+/// How many long threads will be re-fetched in full. A pull request with
+/// more than this many hundred-comment threads is not a review surface
+/// any more, and the cap keeps a pathological one from firing a request
+/// storm at the host.
+const MAX_THREAD_COMMENT_REFETCHES: usize = 20;
+
 /// The thread query, written for `gh api graphql --paginate`.
 ///
 /// `--paginate` requires exactly two things of a query: an `$endCursor`
@@ -2302,14 +2363,36 @@ pub fn get_pr_inline_comments(
 /// follow. Both are here, so a pull request with more than one page of
 /// threads yields one JSON document per page rather than a truncated
 /// first page.
-const REVIEW_THREADS_QUERY: &str = "\
-query($owner:String!,$name:String!,$number:Int!,$endCursor:String){\
-repository(owner:$owner,name:$name){\
-pullRequest(number:$number){\
-reviewThreads(first:50,after:$endCursor){\
-pageInfo{hasNextPage endCursor}\
-nodes{id isResolved isOutdated path line \
-comments(first:50){nodes{id databaseId author{login} body createdAt}}}}}}}";
+///
+/// `--paginate` can only follow *one* connection, and it follows the
+/// thread list. A thread's own comments therefore come back capped, and
+/// the `pageInfo` on them is how [`get_pr_review_threads`] learns which
+/// threads it has to ask about again.
+fn review_threads_query() -> String {
+    format!(
+        "\
+query($owner:String!,$name:String!,$number:Int!,$endCursor:String){{\
+repository(owner:$owner,name:$name){{\
+pullRequest(number:$number){{\
+reviewThreads(first:50,after:$endCursor){{\
+pageInfo{{hasNextPage endCursor}}\
+nodes{{id isResolved isOutdated path line \
+comments(first:100){{pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}}}}}"
+    )
+}
+
+/// Every comment on one thread, for the threads the first query could
+/// not finish. `--paginate` follows this connection because it is the
+/// only one in the document.
+fn thread_comments_query() -> String {
+    format!(
+        "\
+query($threadId:ID!,$endCursor:String){{\
+node(id:$threadId){{... on PullRequestReviewThread{{\
+comments(first:100,after:$endCursor){{\
+pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}"
+    )
+}
 
 /// Conversation threads on a pull request's diff, with their resolution
 /// state.
@@ -2340,11 +2423,98 @@ pub fn get_pr_review_threads(
             "-F",
             &format!("number={pr_number}"),
             "-f",
-            &format!("query={REVIEW_THREADS_QUERY}"),
+            &format!("query={}", review_threads_query()),
         ],
     )?;
 
-    Ok(parse_review_threads(&json))
+    let mut threads = parse_review_threads(&json);
+
+    // A thread longer than one page came back cut off. Best effort from
+    // here: a thread that keeps only its first page is still readable,
+    // so a failed follow-up costs that thread's tail, not the tab.
+    for thread_id in truncated_thread_ids(&json)
+        .into_iter()
+        .take(MAX_THREAD_COMMENT_REFETCHES)
+    {
+        let Some(thread) = threads.iter_mut().find(|t| t.id == thread_id) else {
+            continue;
+        };
+        let Ok(page) = run_gh(
+            repo_path,
+            &[
+                "api",
+                "graphql",
+                "--paginate",
+                "-f",
+                &format!("threadId={thread_id}"),
+                "-f",
+                &format!("query={}", thread_comments_query()),
+            ],
+        ) else {
+            continue;
+        };
+        let comments = parse_thread_comments(&page);
+        // Only ever a superset. A follow-up that came back shorter than
+        // what is already on screen is a bad answer, not a shorter
+        // thread.
+        if comments.len() > thread.comments.len() {
+            thread.comments = comments;
+        }
+    }
+
+    Ok(threads)
+}
+
+/// Ids of the threads whose comment connection reported another page.
+pub(crate) fn truncated_thread_ids(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for page in parse_paginated_array(json) {
+        let Some(nodes) =
+            page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array()
+        else {
+            continue;
+        };
+        for node in nodes {
+            if node["comments"]["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+                continue;
+            }
+            let id = node["id"].as_str().unwrap_or_default();
+            if !id.is_empty() {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// One comment node, mapped. Shared so the first page and the follow-up
+/// pages cannot disagree about what a comment is.
+fn parse_thread_comment(c: &serde_json::Value) -> PrThreadComment {
+    PrThreadComment {
+        id: c["id"].as_str().unwrap_or_default().to_string(),
+        database_id: c["databaseId"].as_u64(),
+        author: c["author"]["login"].as_str().unwrap_or("").to_string(),
+        body: c["body"].as_str().unwrap_or("").to_string(),
+        created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// Every comment in a `thread_comments_query` response, pagination and
+/// all.
+pub(crate) fn parse_thread_comments(json: &str) -> Vec<PrThreadComment> {
+    let mut out = Vec::new();
+    for page in parse_paginated_array(json) {
+        let Some(nodes) = page["data"]["node"]["comments"]["nodes"].as_array() else {
+            continue;
+        };
+        out.extend(
+            nodes
+                .iter()
+                .map(parse_thread_comment)
+                .filter(|c: &PrThreadComment| !c.body.is_empty()),
+        );
+    }
+    out
 }
 
 /// Map the GraphQL payload, pagination and all.
@@ -2372,14 +2542,8 @@ pub(crate) fn parse_review_threads(json: &str) -> Vec<PrReviewThread> {
                 .as_array()
                 .map(|list| {
                     list.iter()
-                        .map(|c| PrThreadComment {
-                            id: c["id"].as_str().unwrap_or_default().to_string(),
-                            database_id: c["databaseId"].as_u64(),
-                            author: c["author"]["login"].as_str().unwrap_or("").to_string(),
-                            body: c["body"].as_str().unwrap_or("").to_string(),
-                            created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
-                        })
-                        .filter(|c| !c.body.is_empty())
+                        .map(parse_thread_comment)
+                        .filter(|c: &PrThreadComment| !c.body.is_empty())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -2646,15 +2810,29 @@ pub fn submit_pr_review_with_comments(
         &json,
     )
     .map_err(|e| {
-        // The one error worth translating: it means an anchor went
-        // stale between the local check and the send.
-        if e.contains("Line could not be resolved") {
+        if is_stale_anchor_error(&e) {
             "One of your notes no longer matches a line on this branch — re-anchor and try again.".to_string()
         } else {
             e
         }
     })?;
     Ok(())
+}
+
+/// Whether a review 422 means "an anchor went stale between the local
+/// check and the send".
+///
+/// GitHub does not have one sentence for this. The modern
+/// `line`/`start_line` API rejects a line that has moved with
+/// `pull_request_review_thread.line must be part of the diff` and a range
+/// that no longer sits in one hunk with `… must be part of the same
+/// hunk`; the legacy `position` API said `Line could not be resolved`.
+/// All three are the same event to the reviewer, and the message they
+/// need is the same: re-anchor.
+fn is_stale_anchor_error(error: &str) -> bool {
+    error.contains("Line could not be resolved")
+        || error.contains("must be part of the diff")
+        || error.contains("must be part of the same hunk")
 }
 
 pub fn get_pr_deployments(
@@ -4436,5 +4614,234 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
     fn an_unexpected_payload_yields_no_threads() {
         assert!(parse_review_threads("{}").is_empty());
         assert!(parse_review_threads("not json at all").is_empty());
+    }
+
+    /// `--paginate` follows the thread list, not each thread's comments,
+    /// so a thread past the comment page size comes back cut off. Which
+    /// threads those are has to be readable from the payload, or the
+    /// missing comments are missing silently.
+    #[test]
+    fn a_thread_that_reports_more_comments_is_marked_for_a_follow_up() {
+        let truncated = r#"{"id":"PRRT_long","isResolved":false,"isOutdated":false,
+            "path":"src/a.rs","line":1,"comments":{
+              "pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29y"},
+              "nodes":[{"id":"PRRC_1","databaseId":1,"author":{"login":"a"},
+                        "body":"first","createdAt":"2026-08-16T09:00:00Z"}]}}"#;
+        let complete = r#"{"id":"PRRT_short","isResolved":false,"isOutdated":false,
+            "path":"src/b.rs","line":2,"comments":{
+              "pageInfo":{"hasNextPage":false,"endCursor":null},
+              "nodes":[{"id":"PRRC_2","databaseId":2,"author":{"login":"b"},
+                        "body":"only","createdAt":"2026-08-16T09:00:00Z"}]}}"#;
+
+        let json = thread_page(&format!("{truncated},{complete}"));
+        assert_eq!(truncated_thread_ids(&json), vec!["PRRT_long".to_string()]);
+
+        // A payload without the connection's pageInfo at all (an older
+        // recorded response) claims nothing rather than everything.
+        assert!(truncated_thread_ids(&thread_page(UNRESOLVED_THREAD)).is_empty());
+    }
+
+    /// The follow-up query's own pages, which is where the comments past
+    /// the first hundred actually live.
+    #[test]
+    fn the_follow_up_reads_every_page_of_one_threads_comments() {
+        let page = |id: &str, body: &str| {
+            format!(
+                r#"{{"data":{{"node":{{"comments":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},
+                "nodes":[{{"id":"{id}","databaseId":7,"author":{{"login":"juliusm"}},
+                "body":"{body}","createdAt":"2026-08-16T09:00:00Z"}}]}}}}}}}}"#
+            )
+        };
+        let joined = format!("{}\n{}", page("PRRC_100", "hundredth"), page("PRRC_101", "hundred-and-first"));
+        let comments = parse_thread_comments(&joined);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1].id, "PRRC_101");
+        assert_eq!(comments[1].author, "juliusm");
+
+        // Same forgiveness as the thread parser: an unusable payload is
+        // no comments, never a panic.
+        assert!(parse_thread_comments("{}").is_empty());
+        assert!(parse_thread_comments("not json at all").is_empty());
+    }
+
+    // ── Failing-check log excerpt ──
+
+    /// A commit can fail several workflows at once. The excerpt is shown
+    /// under one named check, so the run has to be the one that check
+    /// came from — another workflow's log reads as a fact about this
+    /// check and is not one.
+    #[test]
+    fn the_failing_run_is_matched_to_the_check_that_asked() {
+        let rows = "111\tDeploy\n222\tCI\n333\tNightly";
+        // Check names are `workflow / job`, so the workflow name is a
+        // prefix of the check name.
+        assert_eq!(
+            pick_failing_run(rows, "CI / test (ubuntu-latest)").as_deref(),
+            Some("222")
+        );
+        // And the other direction, for hosts that report the bare name.
+        assert_eq!(pick_failing_run(rows, "Deploy").as_deref(), Some("111"));
+        // Case is not a distinction anybody makes here.
+        assert_eq!(pick_failing_run(rows, "nightly").as_deref(), Some("333"));
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_not_offered_as_this_checks_log() {
+        let rows = "111\tDeploy\n222\tCI";
+        assert_eq!(pick_failing_run(rows, "Lint"), None);
+        // Nothing to match against is also no match — not "the first
+        // one".
+        assert_eq!(pick_failing_run(rows, "   "), None);
+        assert_eq!(pick_failing_run("", "CI"), None);
+        // A malformed row is skipped, not treated as an id.
+        assert_eq!(pick_failing_run("no-tab-here\n222\tCI", "CI").as_deref(), Some("222"));
+    }
+
+    #[test]
+    fn the_excerpt_keeps_the_named_jobs_tail_without_its_prefixes() {
+        let log = "\
+build\tcompile\t2026-08-16T09:00:00.000Z warming up
+test\trun\t2026-08-16T09:00:01.000Z running 3 tests
+test\trun\t2026-08-16T09:00:02.000Z assertion failed: left == right
+build\tcompile\t2026-08-16T09:00:03.000Z done";
+        let excerpt = tail_check_log(log, "test");
+        assert_eq!(excerpt, "running 3 tests\nassertion failed: left == right");
+    }
+
+    /// Job names and check names diverge on matrix builds, and an empty
+    /// card is worse than a slightly wider one.
+    #[test]
+    fn a_check_name_that_matches_no_job_falls_back_to_the_whole_log() {
+        let log = "build\tcompile\t2026-08-16T09:00:00.000Z warming up\n\
+                   build\tcompile\t2026-08-16T09:00:01.000Z boom";
+        assert_eq!(tail_check_log(log, "nothing-like-this"), "warming up\nboom");
+        assert_eq!(tail_check_log(log, ""), "warming up\nboom");
+    }
+
+    #[test]
+    fn the_excerpt_is_capped_at_its_tail() {
+        let log: String = (0..CHECK_LOG_EXCERPT_LINES + 10)
+            .map(|i| format!("job\tstep\t2026-08-16T09:00:00.000Z line {i}\n"))
+            .collect();
+        let excerpt = tail_check_log(&log, "job");
+        assert_eq!(excerpt.lines().count(), CHECK_LOG_EXCERPT_LINES);
+        assert!(excerpt.starts_with("line 10"), "{excerpt}");
+    }
+
+    #[test]
+    fn only_a_real_timestamp_prefix_is_stripped() {
+        assert_eq!(
+            strip_log_prefix("job\tstep\t2026-08-16T09:00:00.000Z hello world"),
+            "hello world"
+        );
+        // A line whose last tab-separated field is not a timestamp keeps
+        // every word of itself.
+        assert_eq!(strip_log_prefix("job\tstep\tnot a timestamp"), "not a timestamp");
+        assert_eq!(strip_log_prefix("no tabs at all"), "no tabs at all");
+    }
+
+    // ── Merge arguments ──
+
+    #[test]
+    fn a_merge_commits_subject_and_body_are_passed_through() {
+        assert_eq!(
+            merge_args(7, "merge", true, Some("Ship it"), Some("Because.")),
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--merge",
+                "--delete-branch",
+                "--subject",
+                "Ship it",
+                "--body",
+                "Because."
+            ]
+        );
+        // Squash takes the same two flags; only the strategy changes.
+        let squash = merge_args(7, "squash", false, Some("Ship it"), None);
+        assert_eq!(squash[3], "--squash");
+        assert!(!squash.contains(&"--delete-branch".to_string()));
+        assert_eq!(squash[squash.len() - 2..], ["--subject", "Ship it"]);
+    }
+
+    /// `gh pr merge --rebase` rejects `--subject` and `--body`: a rebase
+    /// produces no merge commit for them to title.
+    #[test]
+    fn a_rebase_carries_no_commit_message_flags() {
+        let args = merge_args(7, "rebase", true, Some("Ship it"), Some("Because."));
+        assert_eq!(args, vec!["pr", "merge", "7", "--rebase", "--delete-branch"]);
+    }
+
+    /// A blank field is the sheet's default, not an instruction to title
+    /// the commit with whitespace.
+    #[test]
+    fn blank_message_fields_are_left_off_entirely() {
+        assert_eq!(
+            merge_args(7, "merge", false, Some("   "), Some("")),
+            vec!["pr", "merge", "7", "--merge"]
+        );
+        assert_eq!(
+            merge_args(7, "merge", false, None, None),
+            vec!["pr", "merge", "7", "--merge"]
+        );
+        // An unrecognised strategy is a merge commit, never a rebase.
+        assert_eq!(merge_args(7, "wat", false, None, None)[3], "--merge");
+    }
+
+    // ── Draft comment payloads ──
+
+    fn draft(start_line: Option<u32>) -> PrDraftComment {
+        PrDraftComment {
+            file: "src/lib.rs".to_string(),
+            body: "This allocates twice.".to_string(),
+            side: "RIGHT".to_string(),
+            line: 42,
+            start_line,
+        }
+    }
+
+    #[test]
+    fn a_single_line_note_sends_content_coordinates_only() {
+        let payload = draft(None).to_json();
+        assert_eq!(payload["path"], "src/lib.rs");
+        assert_eq!(payload["body"], "This allocates twice.");
+        assert_eq!(payload["side"], "RIGHT");
+        assert_eq!(payload["line"], 42);
+        // No range, so no range keys — GitHub rejects a `start_line`
+        // that equals `line`.
+        assert!(payload.get("start_line").is_none());
+        assert!(payload.get("start_side").is_none());
+        // The legacy patch offset is never sent: it is only meaningful
+        // against one exact diff.
+        assert!(payload.get("position").is_none());
+    }
+
+    /// A range cannot straddle sides, so the start side is the end side
+    /// — and saying so explicitly is what keeps GitHub from guessing.
+    #[test]
+    fn a_multi_line_note_sends_both_ends_on_one_side() {
+        let payload = draft(Some(38)).to_json();
+        assert_eq!(payload["start_line"], 38);
+        assert_eq!(payload["start_side"], "RIGHT");
+        assert_eq!(payload["line"], 42);
+        assert_eq!(payload["side"], "RIGHT");
+    }
+
+    /// The 422 a reviewer can act on, in every wording GitHub has used
+    /// for it — the modern `line`/`start_line` API does not say "Line
+    /// could not be resolved" at all.
+    #[test]
+    fn a_stale_anchor_is_recognised_in_every_wording() {
+        assert!(is_stale_anchor_error(
+            "HTTP 422: pull_request_review_thread.line must be part of the diff"
+        ));
+        assert!(is_stale_anchor_error(
+            "HTTP 422: pull_request_review_thread.start_line must be part of the same hunk"
+        ));
+        assert!(is_stale_anchor_error("Line could not be resolved"));
+        // An unrelated failure keeps its own words; replacing them would
+        // send the reviewer re-anchoring notes that are fine.
+        assert!(!is_stale_anchor_error("HTTP 403: Resource not accessible"));
     }
 }
