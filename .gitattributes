@@ -3,3 +3,9 @@
 # this, `core.autocrlf=true` rewrites every line ending to CRLF and
 # bash chokes on the stray \r.
 *.sh text eol=lf
+
+# Diff fixtures are parsed byte-exact by the pr-anchor tests: line
+# prefixes, blank context lines and `@@` headers all decide row numbers.
+# A CRLF checkout leaves a stray \r on every line and the anchoring
+# verdicts stop matching the ones captured from a real force-push.
+*.patch text eol=lf

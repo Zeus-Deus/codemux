@@ -87,7 +87,11 @@ function stripPrefix(p: string): string {
 export function splitDiffFiles(text: string): PrDiffFile[] {
   if (!text) return [];
   const files: PrDiffFile[] = [];
-  const lines = text.split("\n");
+  // Either terminator: `gh pr diff` on a Windows host answers with CRLF,
+  // and a trailing \r would ride into every path, every rename and every
+  // line of content. `buildFile` re-joins with "\n", so the per-file
+  // patch handed on from here is normalised whatever arrived.
+  const lines = text.split(/\r?\n/);
 
   let start = -1;
   for (let i = 0; i <= lines.length; i++) {

@@ -145,3 +145,19 @@ describe("ignoreWhitespace", () => {
     expect(types).toEqual(["del", "del", "add"]);
   });
 });
+
+describe("a diff produced on a Windows host", () => {
+  it("splits CRLF into exactly the same files, paths and stats", () => {
+    const lf = [SMALL, BINARY, DELETED].join("\n");
+    const crlf = lf.replace(/\r?\n/g, "\r\n");
+
+    // Deep-equal, so a \r surviving into a path, a rename or a line of
+    // the per-file patch fails here rather than on a Windows desk.
+    expect(splitDiffFiles(crlf)).toEqual(splitDiffFiles(lf));
+    expect(splitDiffFiles(crlf).map((f) => f.path)).toEqual([
+      "src/a.ts",
+      "icons/app.png",
+      "src/old.ts",
+    ]);
+  });
+});

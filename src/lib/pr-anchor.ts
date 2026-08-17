@@ -84,12 +84,20 @@ export function indexDiffRows(text: string): AnchorIndex {
     else index.set(k, [row]);
   };
 
+  // Split on either terminator. A diff can arrive with CRLF — a Windows
+  // checkout of a fixture, or `gh` output on a Windows host — and every
+  // decision below is made on the exact characters of a line: the `+`/`-`
+  // prefixes, the `@@` header, a blank context line that must be `""`,
+  // and the file paths that become index keys. A stray trailing \r turns
+  // the path key into one nothing looks up and ends the hunk body at the
+  // first blank line, which silently renumbers everything after it.
+  //
   // A diff that ends in a newline splits into a final `""`. That empty
   // string is not a row — but the blank-context rule below would index it
   // as one, inventing a context line one past the end of the last hunk on
   // both sides. Drop exactly one trailing `""`; interior blanks are real
   // blank context and must stay.
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 
   for (const raw of lines) {

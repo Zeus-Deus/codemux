@@ -43,6 +43,71 @@ const asAnchor = (a: (typeof anchors)[number]): DraftAnchor => ({
   contextAfter: a.context_after ?? null,
 });
 
+/**
+ * The same diffs, as a Windows checkout hands them over.
+ *
+ * `core.autocrlf=true` rewrites these fixtures on the way to the working
+ * tree, and `gh` on a Windows host can produce the same thing at
+ * runtime. Every decision the parser makes is on the exact characters of
+ * a line — the `+`/`-` prefixes, the `@@` header, the file paths that
+ * become index keys, and a blank context line that has to be `""` — so
+ * these assert the CRLF form indexes to *precisely* the LF form rather
+ * than merely producing something.
+ *
+ * `.gitattributes` pins `*.patch` to LF so the fixtures stop being
+ * rewritten at all; this is the second layer, for diff text that was
+ * never a file here.
+ */
+describe("a diff that arrives with CRLF", () => {
+  const crlf = (text: string) => text.replace(/\r?\n/g, "\r\n");
+
+  it("indexes identically to the same diff with LF", () => {
+    const lf = indexDiffRows(before);
+    const windows = indexDiffRows(crlf(before));
+
+    expect(lf.size).toBeGreaterThan(0);
+    expect([...windows.keys()].sort()).toEqual([...lf.keys()].sort());
+    for (const key of lf.keys()) {
+      expect(windows.get(key)).toEqual(lf.get(key));
+    }
+  });
+
+  it("reaches the same re-anchoring verdicts", () => {
+    const lf = indexDiffRows(after);
+    const windows = indexDiffRows(crlf(after));
+    for (const raw of anchors) {
+      expect(reanchor(asAnchor(raw), windows)).toEqual(reanchor(asAnchor(raw), lf));
+    }
+  });
+
+  it("still reads a blank context line as blank context", () => {
+    // The mechanism that broke: a blank context line is `""` under LF and
+    // `"\r"` under CRLF, which fell through to "anything else ends the
+    // hunk" — so the hunk body stopped early and every row below it went
+    // unindexed.
+    const diff = crlf(
+      [
+        "diff --git a/a.txt b/a.txt",
+        "--- a/a.txt",
+        "+++ b/a.txt",
+        "@@ -1,3 +1,3 @@",
+        "-one",
+        "+ONE",
+        "",
+        " three",
+        "",
+      ].join("\n"),
+    );
+
+    const right = rowsFor(indexDiffRows(diff), "a.txt", "RIGHT");
+    expect(right.map((r) => ({ line: r.line, text: r.text }))).toEqual([
+      { line: 1, text: "ONE" },
+      { line: 2, text: "" },
+      { line: 3, text: "three" },
+    ]);
+  });
+});
+
 describe("indexDiffRows", () => {
   it("numbers RIGHT rows by the new file and LEFT rows by the old", () => {
     const index = indexDiffRows(before);
