@@ -934,6 +934,29 @@ export const MessageList = memo(function MessageList({
     return registerTitlebarTranscript(viewport);
   }, []);
 
+  // Publish the native scrollbar's width to CSS as `--transcript-sbw`, which
+  // is what keeps the edge-fade mask off the scrollbar's own column (see
+  // `WS_FADE_STYLE`). CSS cannot ask how wide a scrollbar is, so it gets
+  // measured here: `scrollbar-gutter: stable both-edges` reserves the gutter
+  // once per side, so the bar itself is half the offset/client difference.
+  // Zero on overlay-scrollbar platforms — nothing is reserved there, and the
+  // mask falls back to spanning the full width exactly as it used to.
+  // Observed rather than measured once: pane splits and zoom changes both
+  // resize the viewport, and a stale width would misplace the seam.
+  useEffect(() => {
+    if (!fadeEnabled) return;
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    const sync = () => {
+      const bar = Math.max(0, (viewport.offsetWidth - viewport.clientWidth) / 2);
+      viewport.style.setProperty("--transcript-sbw", `${bar}px`);
+    };
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [fadeEnabled]);
+
   // Drive the overlay from the transcript's actual scroll position. This
   // publishes only a boolean transition, not every scroll frame, and the
   // external store safely aggregates multiple chat panes in one workspace.
@@ -1321,12 +1344,30 @@ function slotClientNonce(slot: TranscriptSlot): string | null {
  *  `transcript-fade.ts`). It switches itself off when the backend reports the
  *  compatibility (CPU) renderer, where the mask forces a full-viewport
  *  re-rasterization on every scroll frame, and the `codemux:transcript-fade`
- *  localStorage override still forces it either way. */
+ *  localStorage override still forces it either way.
+ *
+ *  Two layers, because a mask composites the element's WHOLE rendering and a
+ *  scroll container renders its native scrollbar. A single full-width fade
+ *  therefore dissolved the top 26px and bottom 20px of the scrollbar too, so
+ *  the thumb never visibly landed at either end and a fully-scrolled
+ *  transcript still read as having somewhere left to go. Layer 1 is the fade,
+ *  sized to stop short of the bar; layer 2 is an opaque strip over the bar's
+ *  own column (layers composite additively, so the strip wins there). */
+const WS_FADE_MASK_IMAGE =
+  "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%), linear-gradient(#000, #000)";
+const WS_FADE_MASK_SIZE =
+  "calc(100% - var(--transcript-sbw, 0px)) 100%, var(--transcript-sbw, 0px) 100%";
+const WS_FADE_MASK_POSITION = "left top, right top";
+
 const WS_FADE_STYLE: CSSProperties = {
-  maskImage:
-    "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%)",
-  WebkitMaskImage:
-    "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%)",
+  maskImage: WS_FADE_MASK_IMAGE,
+  maskSize: WS_FADE_MASK_SIZE,
+  maskPosition: WS_FADE_MASK_POSITION,
+  maskRepeat: "no-repeat",
+  WebkitMaskImage: WS_FADE_MASK_IMAGE,
+  WebkitMaskSize: WS_FADE_MASK_SIZE,
+  WebkitMaskPosition: WS_FADE_MASK_POSITION,
+  WebkitMaskRepeat: "no-repeat",
 };
 
 /** Amber "no activity" notice shown at the tail of a silently-stalled
