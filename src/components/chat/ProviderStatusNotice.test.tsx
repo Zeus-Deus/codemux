@@ -3,16 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { ProviderHealthReport } from "@/tauri/types";
-import { useProviderHealth } from "@/stores/provider-health-store";
+import {
+  HEALTH_REPROBE_MS,
+  emptyHealthSlot,
+  useProviderHealth,
+} from "@/stores/provider-health-store";
 
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 
 // The store's refresh() invokes the Tauri command; stub it so tests
 // control the report content directly through store state.
+const mockProbe = vi.fn(
+  (_provider: string) => new Promise<ProviderHealthReport>(() => {}),
+);
 vi.mock("@/tauri/commands", () => ({
-  agentChatProviderHealth: vi.fn(
-    () => new Promise<ProviderHealthReport>(() => {}),
-  ),
+  agentChatProviderHealth: (provider: string) => mockProbe(provider),
 }));
 
 // Mirrors the store's own refresh() semantics: a ready report clears
@@ -23,6 +28,7 @@ function seedReport(report: ProviderHealthReport) {
       slots: {
         ...state.slots,
         [report.provider]: {
+          ...state.slots[report.provider],
           report,
           fetchedAt: Date.now(),
           inFlight: null,
@@ -37,15 +43,14 @@ function seedReport(report: ProviderHealthReport) {
 }
 
 function resetStore() {
-  const empty = () => ({
-    report: null,
-    fetchedAt: 0,
-    inFlight: null,
-    dismissedKey: null,
-  });
+  mockProbe.mockClear();
   act(() => {
     useProviderHealth.setState({
-      slots: { claude: empty(), codex: empty(), opencode: empty() },
+      slots: {
+        claude: emptyHealthSlot(),
+        codex: emptyHealthSlot(),
+        opencode: emptyHealthSlot(),
+      },
     });
   });
 }
@@ -127,5 +132,36 @@ describe("ProviderStatusNotice", () => {
     expect(screen.getByTestId("provider-status-notice")).toHaveTextContent(
       "Codex CLI is not authenticated.",
     );
+  });
+
+  it("re-probes an unhealthy provider on the recovery cadence", () => {
+    vi.useFakeTimers();
+    try {
+      render(<ProviderStatusNotice provider="claude" />);
+      const afterMount = mockProbe.mock.calls.length;
+
+      // Healthy/unprobed: nothing to recover from, so the poll must not
+      // spawn a CLI check every few minutes for every mounted pane.
+      act(() => {
+        vi.advanceTimersByTime(HEALTH_REPROBE_MS * 2);
+      });
+      expect(mockProbe.mock.calls.length).toBe(afterMount);
+
+      // Unhealthy: the user may have fixed it in a terminal, and nothing
+      // else in the app would notice — poll so the banner clears itself.
+      seedReport({
+        provider: "claude",
+        status: "error",
+        installed: true,
+        message: "Claude CLI is not authenticated.",
+        version: null,
+      });
+      act(() => {
+        vi.advanceTimersByTime(HEALTH_REPROBE_MS);
+      });
+      expect(mockProbe.mock.calls.length).toBe(afterMount + 1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

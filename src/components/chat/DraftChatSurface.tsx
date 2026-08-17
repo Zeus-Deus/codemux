@@ -545,6 +545,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         (phase) => setPending((p) => (p ? { ...p, phase } : p)),
       );
       if (result.success) {
+        // The provider started a session and took the turn — retire any
+        // stale failure banner (no-op when nothing is bannered).
+        void useProviderHealth
+          .getState()
+          .noteProviderSuccess(finalDraft.provider);
         // Flip to the real pane. The pending view stays mounted until
         // this surface unmounts, and the live pane renders the same
         // optimistically-appended bubble — flicker-free.

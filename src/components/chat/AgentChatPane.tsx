@@ -1220,6 +1220,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       };
       agentChatStartSession(pane.pane_id, provider, startInput)
         .then((id) => {
+          // The provider just ran — retire any stale failure banner
+          // (no-op when nothing is bannered).
+          void useProviderHealth.getState().noteProviderSuccess(provider);
           setThreadId(id);
           ensureThread(id);
           if (recoveryDraft.model !== null) {
@@ -1283,6 +1286,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
     agentChatStartSession(pane.pane_id, provider, startInput)
       .then((id) => {
+        // A session that started IS the provider working: clear any
+        // stale failure banner (no-op when nothing is bannered).
+        void useProviderHealth.getState().noteProviderSuccess(provider);
         setThreadId(id);
         ensureThread(id);
         setStoreModel(id, defaultModel);
@@ -1601,6 +1607,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // we do nothing extra here. An immediate start keeps the bubble
         // as a normal user message.
         await agentChatSendTurn(provider, input);
+        // The turn was accepted, so the provider runtime is alive and
+        // authenticated — retire a stale failure banner instead of
+        // leaving it up until the next failed send.
+        void useProviderHealth.getState().noteProviderSuccess(provider);
       } catch (err) {
         // Genuine failure — roll back the optimistic bubble so no orphan
         // is left. `restoreInterrupted` re-arms the "Run interrupted"
@@ -2286,6 +2296,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             );
           }
           setSessionLaunchMode(newId, nextMode);
+          void useProviderHealth.getState().noteProviderSuccess(provider);
         } catch (err) {
           toast.error(
             `Failed to restart session: ${formatProviderError(err)}`,

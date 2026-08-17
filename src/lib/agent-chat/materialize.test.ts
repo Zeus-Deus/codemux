@@ -688,6 +688,59 @@ describe("materializeAndSend", () => {
 
       expect(result).toEqual({ success: false, error: "backend said no" });
     });
+
+    it("renders a provider-error rejection as a sentence, not raw JSON", async () => {
+      // Provider commands reject with a JSON `SerializableProviderError`.
+      // It lands in `draft.lastSendError`, which the draft composer shows
+      // verbatim — so it must be formatted here, not dumped.
+      vi.mocked(agentChatStartSession).mockRejectedValueOnce(
+        JSON.stringify({
+          kind: "not_authenticated",
+          provider: "claude",
+          hint: "Run `claude login`.",
+        }),
+      );
+      const actions = makeActions();
+
+      const result = await materializeAndSend(
+        makeDraft(),
+        "hi",
+        "/home/user",
+        actions,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "Claude CLI is not authenticated. Run `claude login`.",
+      });
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        "Claude CLI is not authenticated. Run `claude login`.",
+      );
+    });
+
+    it("formats a provider error delivered as an Error message", async () => {
+      // Tauri's JS bridge sometimes wraps the rejection in an Error.
+      vi.mocked(agentChatSendTurn).mockRejectedValueOnce(
+        new Error(
+          JSON.stringify({ kind: "session_closed", provider: "codex" }),
+        ),
+      );
+      const actions = makeActions();
+
+      const result = await materializeAndSend(
+        makeDraft(),
+        "hi",
+        "/home/user",
+        actions,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error:
+          "The chat session has been closed. Try sending again to restart it.",
+      });
+    });
   });
 
   describe("deferred worktree creation (Thread Scope redesign)", () => {

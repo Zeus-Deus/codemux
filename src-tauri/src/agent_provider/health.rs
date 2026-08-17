@@ -182,14 +182,10 @@ async fn check_codex_health() -> ProviderHealthReport {
         }
     };
     let version = match codex::auth::probe_installed(&binary).await {
-        // On PATH but `--version` would not run: broken install.
-        Ok(None) => {
-            return ProviderHealthReport::error(
-                ProviderKind::Codex,
-                true,
-                "Codex CLI is installed but failed to run.".into(),
-            )
-        }
+        // On PATH but `--version` exited non-zero. `probe_installed`
+        // documents this as benign — some Codex builds simply do that —
+        // so it is an advisory, not a dead provider.
+        Ok(None) => return codex_version_unavailable_report(),
         Ok(Some(version)) => Some(version),
         Err(err) => {
             return ProviderHealthReport::error(
@@ -200,6 +196,23 @@ async fn check_codex_health() -> ProviderHealthReport {
         }
     };
     codex_report_from_auth(codex::auth::probe_authenticated(&binary).await, version)
+}
+
+/// `codex --version` exited non-zero on a binary that IS on PATH.
+///
+/// `codex::auth::probe_installed` deliberately returns `Ok(None)` here
+/// rather than an error because some builds behave this way and still
+/// run sessions fine. Reporting it as `Error` painted a red "cannot
+/// run" banner over a working install, so it is a `Warning`: say what
+/// the probe could not determine, and don't claim the CLI is broken.
+/// Pure; unit-tested.
+fn codex_version_unavailable_report() -> ProviderHealthReport {
+    ProviderHealthReport::warning(
+        ProviderKind::Codex,
+        None,
+        "Codex CLI did not report a version (`codex --version` failed). Sessions may still work."
+            .into(),
+    )
 }
 
 /// Map a Codex auth probe outcome onto a report. Pure; unit-tested.
@@ -337,6 +350,16 @@ mod tests {
         );
         assert_eq!(report.status, ProviderHealthStatus::Error);
         assert_eq!(report.message.as_deref(), Some("Run `codex login`."));
+    }
+
+    #[test]
+    fn codex_unreadable_version_is_only_a_warning() {
+        // `--version` exiting non-zero is documented-benign for some
+        // Codex builds; it must not paint a red "cannot run" banner.
+        let report = codex_version_unavailable_report();
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.installed);
+        assert!(report.message.as_deref().unwrap().contains("version"));
     }
 
     #[test]
