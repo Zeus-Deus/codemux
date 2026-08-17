@@ -8,10 +8,10 @@
 use std::path::Path;
 
 use super::detect::ProviderKind;
-use super::provider::{Capabilities, SourceControlProvider};
+use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 use crate::github_cache;
 
@@ -33,6 +33,12 @@ impl SourceControlProvider for GitHubProvider {
             has_reviews: true,
             has_fork_pr_fetch: true,
         }
+    }
+
+    /// Everything. GitHub is the host every one of these operations was
+    /// written against, and each is exercised by a shipped surface.
+    fn operations(&self) -> OperationCapabilities {
+        OperationCapabilities::all()
     }
 
     fn cli_available(&self) -> bool {
@@ -67,6 +73,25 @@ impl SourceControlProvider for GitHubProvider {
         github::list_incoming_prs(repo_path, base_branch)
     }
 
+    fn pull_requests_overview(&self, repo_path: &Path) -> Result<PrsOverview, String> {
+        let items = github::list_prs_overview(repo_path)?;
+        // Who is asking decides how the page groups, but not whether it
+        // can list: a login that won't resolve costs the grouping, not
+        // the rows, so it never fails the call.
+        let viewer = match self.auth_status() {
+            GhStatus::Authenticated { username } if !username.is_empty() => Some(username),
+            _ => None,
+        };
+        Ok(PrsOverview { viewer, items })
+    }
+
+    fn pull_requests_overview_stats(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String> {
+        github::list_prs_overview_stats(repo_path)
+    }
+
     fn get_pull_request(&self, repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {
         github_cache::cached_get_pull_request(repo_path, number)
     }
@@ -87,8 +112,63 @@ impl SourceControlProvider for GitHubProvider {
         repo_path: &Path,
         number: u32,
         method: &str,
+        delete_branch: bool,
+        commit_title: Option<&str>,
+        commit_body: Option<&str>,
     ) -> Result<(), String> {
-        github::merge_pull_request(repo_path, number, method)
+        github::merge_pull_request(
+            repo_path,
+            number,
+            method,
+            delete_branch,
+            commit_title,
+            commit_body,
+        )
+    }
+
+    fn close_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        github::close_pull_request(repo_path, number)
+    }
+
+    fn reopen_pull_request(&self, repo_path: &Path, number: u32) -> Result<(), String> {
+        github::reopen_pull_request(repo_path, number)
+    }
+
+    fn set_pull_request_ready(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        ready: bool,
+    ) -> Result<(), String> {
+        github::set_pull_request_ready(repo_path, number, ready)
+    }
+
+    fn update_pull_request(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), String> {
+        github::update_pull_request(repo_path, number, title, body)
+    }
+
+    fn request_pull_request_review(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        reviewer: &str,
+    ) -> Result<(), String> {
+        github::request_pull_request_review(repo_path, number, reviewer)
+    }
+
+    fn check_log_excerpt(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        check_name: &str,
+    ) -> Result<String, String> {
+        github::get_check_log_excerpt(repo_path, number, check_name)
     }
 
     fn pull_request_diff(
@@ -100,15 +180,57 @@ impl SourceControlProvider for GitHubProvider {
         github_cache::cached_get_pr_diff(repo_path, number, full)
     }
 
-    fn pull_request_checks(&self, repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-        github::get_pr_checks(repo_path)
+    /// Deliberately uncached.
+    ///
+    /// The diff cache holds entries for five minutes, and the one moment
+    /// this diff must be fresh is the moment a force-push lands — the
+    /// caller re-anchors pending notes against whatever comes back, so a
+    /// stale body here would move notes onto lines that no longer exist.
+    /// React Query holds it client-side keyed by head sha instead.
+    fn pull_request_review_diff(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<String, String> {
+        github::get_pr_review_diff(repo_path, number)
+    }
+
+    fn add_inline_comment(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        comment: &github::PrDraftComment,
+        commit_id: &str,
+    ) -> Result<(), String> {
+        github::add_pr_inline_comment(repo_path, number, comment, commit_id)
+    }
+
+    fn submit_review_with_comments(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        event: &str,
+        body: &str,
+        comments: &[github::PrDraftComment],
+        commit_id: &str,
+    ) -> Result<(), String> {
+        github::submit_pr_review_with_comments(repo_path, number, event, body, comments, commit_id)
+    }
+
+    fn pull_request_checks(
+        &self,
+        repo_path: &Path,
+        number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String> {
+        github::get_pr_checks(repo_path, number)
     }
 
     fn pull_request_review_comments(
         &self,
         repo_path: &Path,
+        number: Option<u32>,
     ) -> Result<Vec<ReviewComment>, String> {
-        github::get_pr_review_comments(repo_path)
+        github::get_pr_review_comments(repo_path, number)
     }
 
     fn pull_request_inline_comments(
@@ -117,6 +239,42 @@ impl SourceControlProvider for GitHubProvider {
         number: u32,
     ) -> Result<Vec<InlineReviewComment>, String> {
         github::get_pr_inline_comments(repo_path, number)
+    }
+
+    fn pull_request_review_threads(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrReviewThread>, String> {
+        github::get_pr_review_threads(repo_path, number)
+    }
+
+    /// GitHub replies to the thread's first comment, so `thread_id` is
+    /// unused here — it is the GraphQL node id, which the REST replies
+    /// endpoint does not speak.
+    fn reply_to_review_thread(
+        &self,
+        repo_path: &Path,
+        number: u32,
+        _thread_id: &str,
+        root_comment_id: Option<u64>,
+        body: &str,
+    ) -> Result<(), String> {
+        let comment_id = root_comment_id.ok_or_else(|| {
+            "This thread has no comment to reply to — reload the pull request and try again."
+                .to_string()
+        })?;
+        github::reply_to_pr_thread(repo_path, number, comment_id, body)
+    }
+
+    fn set_review_thread_resolved(
+        &self,
+        repo_path: &Path,
+        _number: u32,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<(), String> {
+        github::set_pr_thread_resolved(repo_path, thread_id, resolved)
     }
 
     fn submit_pull_request_review(
@@ -135,6 +293,14 @@ impl SourceControlProvider for GitHubProvider {
         number: u32,
     ) -> Result<Vec<DeploymentInfo>, String> {
         github::get_pr_deployments(repo_path, number)
+    }
+
+    fn pull_request_timeline(
+        &self,
+        repo_path: &Path,
+        number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String> {
+        github::get_pr_timeline(repo_path, number)
     }
 
     fn list_issues(

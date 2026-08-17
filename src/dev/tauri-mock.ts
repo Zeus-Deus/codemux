@@ -33,6 +33,7 @@
  * falls through to a logged, shape-safe default.
  */
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+import { clearPrOverviewSnapshot } from "@/lib/pr-overview-snapshot";
 
 import {
   MOCK_CHAT_THREAD_ID,
@@ -45,6 +46,28 @@ import {
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
+  MOCK_CHECK_LOG_EXCERPT,
+  MOCK_COMMITS_AHEAD,
+  MOCK_CREATE_PR_DIRTY,
+  MOCK_CREATE_PR_PATH,
+  MOCK_LOCAL_ONLY_PATH,
+  MOCK_PR_CHECKS,
+  MOCK_PR_TIMELINES,
+  MOCK_PR_DIFFS,
+  MOCK_PR_HISTORY,
+  MOCK_PR_OVERVIEW,
+  MOCK_PR_TEMPLATE,
+  MOCK_PR_TEMPLATE_ROOT,
+  MOCK_PR_VIEWER,
+  MOCK_PR_REVIEW_REQUESTS,
+  MOCK_PR_INLINE_COMMENTS,
+  MOCK_PR_REVIEW_THREADS,
+  MOCK_PR_PATH_TO_NUMBER,
+  MOCK_PR_REVIEWS,
+  MOCK_TEMPLATE_PATH_PATTERN,
+  MOCK_UNREACHABLE_ROOT,
+  MOCK_PULL_REQUESTS,
+  MOCK_SUBMIT_FAILURE_PR,
   createSeedAppState,
   mockListDirectory,
   mockReadFile,
@@ -74,10 +97,16 @@ import type {
   AgentBrowserSession,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
+  CheckInfo,
   ChatModelInfo,
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
+  PrReviewThread,
+  ProviderOperations,
+  PullRequestInfo,
+  ReviewComment,
+  InlineReviewComment,
   SurfaceSnapshot,
   TabSnapshot,
   TerminalPreset,
@@ -105,6 +134,239 @@ let appState: AppStateSnapshot = createSeedAppState();
 
 function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
   return appState.workspaces.find((w) => w.workspace_id === id);
+}
+
+// ── Pull request mock state ──
+//
+// The fixture map is the seed; this is the copy the mutators write to,
+// so merging or editing a PR in the browser sticks for the session
+// without the fixture module ever being touched.
+const mutablePrs: Record<number, PullRequestInfo> = structuredClone(MOCK_PULL_REQUESTS);
+const mutablePrReviews: Record<number, ReviewComment[]> = {};
+/** Inline comments posted during the session, on top of the fixture. */
+const mutablePrInline: Record<number, InlineReviewComment[]> = {};
+/** PRs whose branch has been rewritten by `__codemuxMockForcePush`. */
+const forcePushedPrs = new Set<number>();
+
+function mutablePr(number: number): PullRequestInfo | undefined {
+  return mutablePrs[number];
+}
+
+/** Threads mutate here (reply, resolve) the way they would host-side. */
+const mutablePrThreads: Record<number, PrReviewThread[]> = {};
+
+function threadsFor(number: number): PrReviewThread[] {
+  return (mutablePrThreads[number] ??= structuredClone(
+    MOCK_PR_REVIEW_THREADS[number] ?? [],
+  ));
+}
+
+/** Whether the seeded reply always fails — see `__codemuxMockThreadReplyFail`. */
+let mockThreadReplyFails = false;
+
+/** How long a reply takes. Long enough to see the in-flight state by
+ *  default; `__codemuxMockThreadReplyDelay` stretches it further. */
+let mockThreadReplyDelayMs = 400;
+
+function withThreadOps(operations: ProviderOperations): ProviderOperations {
+  if (mockThreadOpsDeclared) return operations;
+  return { ...operations, thread_reply: false, thread_resolve: false };
+}
+
+/** The seeded host for a checkout or project root, resolved the way
+ *  `check_provider_auth` resolves it. */
+function providerKindAt(path: string): string {
+  const workspace = appState.workspaces.find(
+    (w) => w.cwd === path || w.project_root === path,
+  );
+  return workspace?.provider_kind ?? "github";
+}
+
+/**
+ * The refusal the real command layer raises for an operation the host's
+ * adapter never declared — `check_operation` in `commands/github.rs`,
+ * word for word.
+ *
+ * The mock has to raise it too. A host whose rows appear here but are
+ * refused in production is not a fixture of the app; it is a demo of a
+ * different product, and the divergence only ever surfaces as a bug
+ * report about a page that "worked in dev". Returned rather than thrown
+ * so a handler can gate on it in one line.
+ */
+function undeclaredRefusal(
+  path: string,
+  op: keyof ProviderOperations,
+  describe: string,
+): string | null {
+  const kind = providerKindAt(path);
+  const operations = withThreadOps(MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS);
+  if (operations[op]) return null;
+  const name = PROVIDER_DISPLAY_NAMES[kind] ?? "an unrecognised host";
+  return (
+    `${name} does not declare this operation — Codemux cannot ${describe} here. ` +
+    "Open it in the browser instead."
+  );
+}
+
+/** `ProviderKind::display_name` in `git_provider/detect.rs`. */
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  github: "GitHub",
+  gitlab: "GitLab",
+  bitbucket: "Bitbucket",
+  azure_devops: "Azure DevOps",
+};
+
+function inlineCommentsFor(number: number): InlineReviewComment[] {
+  return (mutablePrInline[number] ??= [...(MOCK_PR_INLINE_COMMENTS[number] ?? [])]);
+}
+
+/** The diff the Code tab gets: the rewritten one once a force-push has
+ *  been simulated for this PR. */
+function prDiffFor(number: number, full: boolean): string {
+  const entry = MOCK_PR_DIFFS[number];
+  if (!entry) return "";
+  if (!full) return entry.nameOnly;
+  return forcePushedPrs.has(number) ? (entry.afterForcePush ?? entry.full) : entry.full;
+}
+
+/** Pull requests opened through the form this session, by checkout path. */
+const createdPrPaths: Record<string, number> = {};
+
+/** Numbers for pull requests created during the session. Deliberately
+ *  above every seeded number so nothing can collide. */
+let nextMockPrNumber = 900;
+
+/** The PR for a checkout path, via the seeded path→number map. */
+function prForPath(path: unknown): PullRequestInfo | undefined {
+  const key = String(path ?? "");
+  const number = createdPrPaths[key] ?? MOCK_PR_PATH_TO_NUMBER[key];
+  return number == null ? undefined : mutablePrs[number];
+}
+
+/** The CI rollup the backend reduces host-side, reproduced here from
+ *  the same seeded checks the detail column renders. */
+function rollupOf(number: number): string {
+  const checks = MOCK_PR_CHECKS[number] ?? [];
+  if (checks.length === 0) return "none";
+  if (checks.some((c) => c.conclusion === "fail")) return "failing";
+  if (checks.some((c) => c.conclusion === "pending")) return "pending";
+  return "passing";
+}
+
+/**
+ * Session overrides for the two things a pull-request toast watches.
+ *
+ * Written by `__codemuxMockReviewRequest` / `__codemuxMockCiFail` so the
+ * two toasts can be fired on demand rather than waited for: both are
+ * *transitions*, so nothing seeded as already-failing could ever raise
+ * one.
+ */
+const reviewRequestOverrides: Record<number, string[]> = {};
+const checksRollupOverrides: Record<number, string> = {};
+/** The per-check list behind a forced rollup, so the toast can name the
+ *  check that failed and [Fix] can hand an agent something specific. */
+const checksDetailOverrides: Record<number, CheckInfo[]> = {};
+
+/**
+ * One overview row, derived from the PR the detail column will open.
+ *
+ * `carriesChecks` mirrors the real split: the gh path answers `null` and
+ * pays for a second call, while the glab path reads the pipeline off the
+ * merge request list it already fetched and answers in one. Both are
+ * exercised in dev because the mock's roots include both products.
+ */
+function overviewItem(number: number) {
+  const pr = mutablePrs[number];
+  if (!pr) return null;
+  return {
+    number: pr.number,
+    title: pr.title,
+    author: pr.author ?? "",
+    head_branch: pr.head_branch,
+    is_draft: pr.is_draft,
+    // Neither product serves line counts on a list call: gh is asked for
+    // them by the stats half, and GitLab would charge a diff-stat
+    // request per row, so its rows never get them at all.
+    additions: null,
+    deletions: null,
+    review_decision: pr.review_decision,
+    // Never measured on the list call, by either product.
+    checks: null,
+    review_requested_from:
+      reviewRequestOverrides[number] ?? MOCK_PR_REVIEW_REQUESTS[number] ?? [],
+    updated_at: pr.updated_at,
+    url: pr.url,
+  };
+}
+
+/** The rollup the stats call would report, session overrides included. */
+function overviewRollup(number: number): string {
+  return checksRollupOverrides[number] ?? rollupOf(number);
+}
+
+/**
+ * How long each half of the overview takes.
+ *
+ * Both are shell-outs to a CLI in the real app, and a mock that answers
+ * in zero milliseconds hides the two things this page was rebuilt for:
+ * that the listing arrives before the checks do, and that the carried
+ * paint is what stands in for the listing until it lands. 600 + 800 is
+ * a plausible healthy repository and slow enough to watch.
+ *
+ * `window.__codemuxMockPrListDelay(ms)` / `__codemuxMockPrStatsDelay(ms)`
+ * move them.
+ */
+/** Both knobs survive a reload, because the thing they exist to make
+ *  visible — what the very first paint looks like — only happens on
+ *  one. */
+function storedDelay(key: string, fallback: number): number {
+  const raw = Number(localStorage.getItem(`codemux:dev:${key}`));
+  return Number.isFinite(raw) && raw >= 0 && raw > 0 ? raw : fallback;
+}
+
+let PR_LIST_DELAY_MS = storedDelay("pr-list-delay", 600);
+let PR_STATS_DELAY_MS = storedDelay("pr-stats-delay", 800);
+
+/** Session switches for the strip: the whole world unreachable, or just
+ *  the slow half of it. Flipped from the console, not seeded. */
+let prOverviewOutage = false;
+let prStatsOutage = false;
+
+/**
+ * The expensive half of one row.
+ *
+ * A row nothing can answer for is *omitted* rather than reported as
+ * "none": the two mean different things, and only a host that actually
+ * looked may say a pull request has no checks. The listing half never
+ * fills `checks` at all — neither product does, which is the whole
+ * reason this second call exists.
+ */
+function overviewStats(number: number) {
+  const pr = mutablePrs[number];
+  if (!pr) return null;
+  if (checksRollupOverrides[number] == null && MOCK_PR_CHECKS[number] == null) {
+    return null;
+  }
+  return {
+    number,
+    checks: overviewRollup(number),
+    additions: pr.additions ?? null,
+    deletions: pr.deletions ?? null,
+  };
+}
+
+/** Mirror a PR state change onto every workspace carrying that PR, so
+ *  the sidebar icon and the panel agree — the real backend does this
+ *  through its 60s poll. */
+function syncWorkspacePrState(number: number, state: string): void {
+  let mutated = false;
+  for (const ws of appState.workspaces) {
+    if (ws.pr_number === number) {
+      ws.pr_state = state;
+      mutated = true;
+    }
+  }
+  if (mutated) emitAppState();
 }
 
 /** Re-emit the current snapshot so subscribers (`useAppStateInit`) pick
@@ -681,7 +943,13 @@ const SYNCED_SETTINGS: UserSettings = {
   // One seeded self-hosted mapping so the custom-hosts editor renders a
   // populated row (and its remove affordance) rather than only the empty
   // state under `npm run dev`.
-  source_control: { custom_hosts: { "git.acme.internal": "gitlab" } },
+  source_control: {
+    // `gitlab.example.com` is where the seeded merge requests live, and
+    // declaring it is what lets one of their URLs route to the page —
+    // the same path a user takes for a self-hosted instance.
+    custom_hosts: { "git.acme.internal": "gitlab", "gitlab.example.com": "gitlab" },
+    open_pr_links_in_browser: false,
+  },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
@@ -1173,6 +1441,34 @@ function mockChatTranscript(): string[] {
       usage: null,
     });
   }
+  // A pull-request URL in the transcript, so in-app link routing (5c) is
+  // exercisable in browser dev: this one names a seeded pull request in
+  // an open project, so clicking it opens the Pull Requests page on that
+  // pull request, and shift-clicking still goes to the browser.
+  const linkTurnId = "seed-pr-link";
+  push({
+    type: "user_message",
+    thread_id: T,
+    client_nonce: "seed-nonce-pr-link",
+    text: "Where did the monitoring work land?",
+  });
+  push({
+    type: "item_completed",
+    thread_id: T,
+    turn_id: linkTurnId,
+    item: {
+      kind: "assistant_text",
+      text: "It shipped as https://github.com/example/codemux/pull/482 — the checks are green there.",
+    },
+  });
+  push({
+    type: "turn_completed",
+    thread_id: T,
+    turn_id: linkTurnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+
   // Final showcase turn: the subagent work-log fixture — one completed
   // subagent, one still running — so the compact transcript row, panel
   // watch surface, and drill-in all render on open. Landing last keeps it
@@ -2195,6 +2491,59 @@ const stagedImages = new Map<
 >();
 let stagedImageSeq = 0;
 
+/**
+ * What each host declares, mirroring the Rust adapters.
+ *
+ * GitHub: everything. GitLab: everything but the verdict it does not
+ * have. Anything else: nothing — an unverified declaration is worse than
+ * none, because the backend refuses undeclared operations, so the honest
+ * blank renders read-only rather than drawing controls that would fail.
+ */
+const NO_MOCK_OPERATIONS: ProviderOperations = {
+  list_read: false,
+  comment: false,
+  approve: false,
+  request_changes: false,
+  line_comments: false,
+  merge_with_strategies: false,
+  draft_ready_close_reopen: false,
+  checks_status: false,
+  timeline: false,
+  thread_reply: false,
+  thread_resolve: false,
+};
+
+const ALL_MOCK_OPERATIONS: ProviderOperations = {
+  list_read: true,
+  comment: true,
+  approve: true,
+  request_changes: true,
+  line_comments: true,
+  merge_with_strategies: true,
+  draft_ready_close_reopen: true,
+  checks_status: true,
+  timeline: true,
+  thread_reply: true,
+  thread_resolve: true,
+};
+
+/** Flipped by `__codemuxMockThreadOpsOff` so the read-only thread list
+ *  (a host that serves threads but declares neither write) can be looked
+ *  at without inventing a fifth seeded host.
+ *
+ *  Kept in localStorage because the declaration is read once per minute
+ *  and cached: a reload is the quickest way to make the new answer take
+ *  effect, and a switch that a reload undid would be unusable. */
+const THREAD_OPS_OFF_KEY = "codemux-mock-thread-ops-off";
+let mockThreadOpsDeclared = localStorage.getItem(THREAD_OPS_OFF_KEY) !== "1";
+
+const MOCK_PROVIDER_OPERATIONS: Record<string, ProviderOperations> = {
+  github: ALL_MOCK_OPERATIONS,
+  // No request-changes verdict on the host, and no line-comment route
+  // in this build — see `GitLabProvider::operations`.
+  gitlab: { ...ALL_MOCK_OPERATIONS, request_changes: false, line_comments: false },
+};
+
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -2348,8 +2697,14 @@ const handlers: Record<string, Handler> = {
   // Backs the web-remote path browser (Stage 3b). Serves a small static
   // tree (see `mockListDirectory`) and rejects unknown paths like the real
   // `list_directory` so manual-path validation is exercisable in dev.
-  list_directory: (a) =>
-    mockListDirectory(String(a.path ?? "/"), Boolean(a.showHidden)),
+  list_directory: (a) => {
+    const path = String(a.path ?? "/");
+    // No seeded repository keeps GitLab-style templates in a directory,
+    // and the generic listing would hand the form a stack of unrelated
+    // `.md` files to mistake for one.
+    if (path.includes("merge_request_templates")) return [];
+    return mockListDirectory(path, Boolean(a.showHidden));
+  },
 
   // Without a handler the mock returned its `undefined` default and the
   // file-search dialog crashed on `results.map`. Serve a small repo-shaped
@@ -2380,7 +2735,20 @@ const handlers: Record<string, Handler> = {
   // Browser dev has no filesystem; every path "exists" so chat file links
   // stay clickable against the synthetic contents `read_file` fabricates.
   file_exists: () => true,
-  read_file: (a) => mockReadFile(String(a.path ?? "")),
+  read_file: (a) => {
+    const path = String(a.path ?? "");
+    // Template lookup is a series of speculative reads, and the answer
+    // that matters most is "no". `mockReadFile` returns prose for any
+    // `.md`, which would make every repository look like it had a
+    // template — so the template paths are answered explicitly, and only
+    // the seeded root has one.
+    if (MOCK_TEMPLATE_PATH_PATTERN.test(path)) {
+      return path.startsWith(MOCK_PR_TEMPLATE_ROOT)
+        ? MOCK_PR_TEMPLATE
+        : Promise.reject(`No such file or directory: ${path}`);
+    }
+    return mockReadFile(path);
+  },
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
@@ -3066,7 +3434,28 @@ const handlers: Record<string, Handler> = {
     }
     return undefined;
   },
-  apply_preset: () => undefined,
+  /**
+   * Records the launch instead of spawning anything.
+   *
+   * The prompt is the whole point of the agent-handoff surfaces, and in
+   * dev there is no PTY to type it into — so it is echoed to the console
+   * and kept on `window.__codemuxAgentHandoffs`, which makes "did the
+   * prompt survive the route?" answerable from the browser console.
+   */
+  apply_preset: (a) => {
+    const record = {
+      workspaceId: String(a.workspaceId ?? ""),
+      presetId: String(a.presetId ?? ""),
+      overrideMode: (a.overrideMode as string) ?? null,
+      prompt: (a.initialPrompt as string) ?? null,
+    };
+    agentHandoffs.push(record);
+    console.info(
+      `[mock] apply_preset → ${record.presetId} in ${record.workspaceId} (${record.overrideMode})`,
+      record.prompt ?? "(no prompt)",
+    );
+    return undefined;
+  },
 
   // ── Editors / tooling ──
   detect_editors: () => [],
@@ -3089,6 +3478,11 @@ const handlers: Record<string, Handler> = {
       installed: true,
       authenticated: true,
       username: kind === "gitlab" ? "mock-glab" : "mock-dev",
+      // Standing in for the adapters' own declarations — see
+      // `git_provider/provider.rs`. GitLab is missing exactly one
+      // operation, and Bitbucket declares nothing at all, so both the
+      // partial and the empty case are reachable in the running app.
+      operations: withThreadOps(MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS),
     };
   },
   // Settings → Source Control. Deliberately mixed so both diagnostic
@@ -3198,6 +3592,410 @@ const handlers: Record<string, Handler> = {
     };
   },
   list_incoming_prs: () => [],
+
+  // ── Pull Requests page ──
+  //
+  // Two roots always reject, for the two different reasons the footer
+  // has to be able to say: one is unreachable, and one is on a host with
+  // no adapter — so the footer line (and the promise that the other
+  // repositories keep their rows) is reachable without unplugging
+  // anything.
+  list_prs_overview: async (a) => {
+    const path = String(a.path ?? "");
+    if (path === MOCK_UNREACHABLE_ROOT) {
+      return Promise.reject(
+        "could not resolve host: git.scratchpad.example.com",
+      );
+    }
+    const refused = undeclaredRefusal(path, "list_read", "list or read pull requests");
+    if (refused) return Promise.reject(refused);
+    await new Promise((resolve) => setTimeout(resolve, PR_LIST_DELAY_MS));
+    if (prOverviewOutage) {
+      return Promise.reject("could not resolve host: api.github.com");
+    }
+    const seed = MOCK_PR_OVERVIEW[path];
+    if (!seed) return { viewer: null, items: [] };
+    return {
+      viewer: seed.viewer,
+      // No host answers the rollup on the list call: `null` here means
+      // "not measured", and the stats half is what measures it.
+      items: seed.numbers.map((n) => overviewItem(n)).filter(Boolean),
+    };
+  },
+
+  /**
+   * The slow half, deliberately slow.
+   *
+   * 800ms is not a guess at gh's latency — it is long enough that the
+   * two-phase paint is something you can watch happen in dev rather than
+   * something you have to trust the code about. If the dots ever stop
+   * arriving after the rows, this handler is where you'll see it.
+   */
+  list_prs_overview_stats: async (a) => {
+    const path = String(a.path ?? "");
+    if (path === MOCK_UNREACHABLE_ROOT || prOverviewOutage) {
+      return Promise.reject("could not resolve host: api.github.com");
+    }
+    // Gated on `checks_status` in the backend, not `list_read`.
+    const refused = undeclaredRefusal(path, "checks_status", "read check or pipeline status");
+    if (refused) return Promise.reject(refused);
+    await new Promise((resolve) => setTimeout(resolve, PR_STATS_DELAY_MS));
+    if (prStatsOutage) {
+      return Promise.reject("gh: could not compute status checks");
+    }
+    const seed = MOCK_PR_OVERVIEW[path];
+    if (!seed) return [];
+    return seed.numbers.map(overviewStats).filter(Boolean);
+  },
+
+  // Closed and merged rows, for the list's state dropdown.
+  list_pull_requests: (a) => {
+    const path = String(a.path ?? "");
+    const refused = undeclaredRefusal(path, "list_read", "list or read pull requests");
+    if (refused) return Promise.reject(refused);
+    const state = String(a.state ?? "open");
+    const open = MOCK_PR_OVERVIEW[path]?.numbers ?? [];
+    const history = MOCK_PR_HISTORY[path] ?? [];
+    const numbers =
+      state === "closed" ? history : state === "all" ? [...open, ...history] : open;
+    return numbers.map((n) => mutablePrs[n]).filter(Boolean);
+  },
+
+  // The page opens a PR by number, not by whatever branch a checkout
+  // happens to be standing on.
+  get_github_pr_by_path: (a) => mutablePrs[Number(a.prNumber)] ?? null,
+  // Host events only. An agent run reaches the rail by being recorded
+  // locally during a real handoff, never from here.
+  get_pr_timeline: (a) => MOCK_PR_TIMELINES[Number(a.prNumber)] ?? [],
+
+  // ── Review panel ──
+  //
+  // Without `check_github_repo` the panel's gate resolves `repoSupported`
+  // to null, every PR query stays disabled and the pane sits on a
+  // skeleton forever — so this is load-bearing, not decoration.
+  check_github_repo: () => true,
+
+  get_branch_pull_request: (a) => prForPath(a.path) ?? null,
+
+  // ── Opening a pull request (5a) ──
+
+  /** The commits the form drafts a title and a description from. */
+  git_commits_ahead: (a) => MOCK_COMMITS_AHEAD[String(a.path ?? "")] ?? [],
+
+  /**
+   * Create, for real as far as the rest of the mock is concerned.
+   *
+   * The new pull request is registered under the checkout's path and
+   * written onto the workspace snapshot, so everything downstream — the
+   * panel flipping to the review view, the sidebar's PR pill, the
+   * overview row — behaves the way it would after a real create rather
+   * than needing its own special case.
+   */
+  create_pull_request: (a) => {
+    const path = String(a.path ?? "");
+    const workspace = appState.workspaces.find(
+      (w) => (w.worktree_path ?? w.cwd) === path,
+    );
+    const number = nextMockPrNumber++;
+    const pr: PullRequestInfo = {
+      ...structuredClone(MOCK_PULL_REQUESTS[142]),
+      number,
+      title: String(a.title ?? ""),
+      body: String(a.body ?? "") || null,
+      base_branch: String(a.base ?? "main"),
+      head_branch: workspace?.git_branch ?? null,
+      is_draft: Boolean(a.draft),
+      state: "OPEN",
+      url: `https://github.com/example/codemux/pull/${number}`,
+      // A pull request you just opened is yours, has no verdict on it
+      // and nobody has been asked to look at it yet — none of which is
+      // true of the fixture whose shape is being borrowed.
+      author: MOCK_PR_VIEWER,
+      review_decision: null,
+      review_requests: [],
+      latest_reviews: [],
+      mergeable: "MERGEABLE",
+      merge_state_status: "CLEAN",
+      merged_by: null,
+      merged_at: null,
+      checks_passing: null,
+      comments: [],
+      totalComments: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    mutablePrs[number] = pr;
+    createdPrPaths[path] = number;
+    if (workspace) {
+      workspace.pr_number = number;
+      workspace.pr_state = a.draft ? "draft" : "open";
+      workspace.pr_url = pr.url;
+      workspace.pr_head_branch = workspace.git_branch;
+      emitAppState();
+    }
+    return pr;
+  },
+
+  // Which of the two no-PR empty states applies turns on whether the
+  // branch is on the remote at all, so one seeded checkout is
+  // deliberately local-only and everything else is pushed.
+  get_git_branch_info: (a) => {
+    const path = String(a.path ?? "");
+    const ws = appState.workspaces.find((w) => (w.worktree_path ?? w.cwd) === path);
+    return {
+      branch: ws?.git_branch ?? null,
+      ahead: ws?.git_ahead ?? 0,
+      behind: ws?.git_behind ?? 0,
+      has_upstream: path !== MOCK_LOCAL_ONLY_PATH,
+    };
+  },
+
+  get_pull_request_checks: (a) => {
+    const number = a.prNumber != null ? Number(a.prNumber) : prForPath(a.path)?.number;
+    if (number == null) return [];
+    return checksDetailOverrides[number] ?? MOCK_PR_CHECKS[number] ?? [];
+  },
+
+  get_pr_review_comments: (a) => {
+    const number = a.prNumber != null ? Number(a.prNumber) : prForPath(a.path)?.number;
+    if (number == null) return [];
+    return mutablePrReviews[number] ?? MOCK_PR_REVIEWS[number] ?? [];
+  },
+
+  get_pr_inline_comments: (a) => {
+    const num = Number(a.prNumber);
+    return inlineCommentsFor(num);
+  },
+
+  get_pr_review_threads: (a) => threadsFor(Number(a.prNumber)),
+
+  /**
+   * A reply, with a delay you can see.
+   *
+   * ~400ms on purpose: the promise is what clears the composer, so the
+   * gap between pressing ⌘↵ and the text disappearing is the whole
+   * behaviour being demonstrated — the words are still there while the
+   * request is in flight, and a failure leaves them there for good.
+   */
+  reply_to_pr_thread: (a) => {
+    const num = Number(a.prNumber);
+    const threadId = String(a.threadId ?? "");
+    const body = String(a.body ?? "");
+    return new Promise((resolve, reject) => {
+      setTimeout(() => {
+        if (mockThreadReplyFails) {
+          reject("host unreachable: dial tcp: lookup api.github.com: no such host");
+          return;
+        }
+        const thread = threadsFor(num).find((t) => t.id === threadId);
+        if (!thread) {
+          reject(`No thread ${threadId} on #${num}`);
+          return;
+        }
+        const id = Date.now();
+        thread.comments.push({
+          id: `PRRC_${id}`,
+          database_id: id,
+          author: "mock-dev",
+          body,
+          created_at: new Date().toISOString(),
+        });
+        resolve(undefined);
+      }, mockThreadReplyDelayMs);
+    });
+  },
+
+  set_pr_thread_resolved: (a) => {
+    const num = Number(a.prNumber);
+    const threadId = String(a.threadId ?? "");
+    const thread = threadsFor(num).find((t) => t.id === threadId);
+    if (!thread) return Promise.reject(`No thread ${threadId} on #${num}`);
+    if (!thread.is_resolvable) {
+      return Promise.reject("This discussion cannot be resolved.");
+    }
+    thread.is_resolved = Boolean(a.resolved);
+    return undefined;
+  },
+
+  get_github_pr_diff_by_path: (a) => prDiffFor(Number(a.prNumber), Boolean(a.full)),
+
+  get_pr_review_diff: (a) => prDiffFor(Number(a.prNumber), true),
+
+  add_pr_inline_comment: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const comment = (a.comment ?? {}) as {
+      file?: string;
+      body?: string;
+      line?: number;
+    };
+    inlineCommentsFor(num).push({
+      id: Date.now(),
+      author: "mock-dev",
+      body: String(comment.body ?? ""),
+      path: String(comment.file ?? ""),
+      line: comment.line ?? null,
+      created_at: new Date().toISOString(),
+      in_reply_to_id: null,
+      pull_request_review_id: null,
+    });
+    return undefined;
+  },
+
+  /**
+   * The whole pending review in one call.
+   *
+   * All-or-nothing on purpose, matching the host: the rejection happens
+   * before anything is written, so a failed submit leaves neither a
+   * review nor a stray comment behind — which is what makes "your notes
+   * are still here" true rather than hopeful.
+   */
+  submit_pr_review_with_comments: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const event = String(a.event ?? "comment");
+    const reviewId = Date.now();
+    const reviews = (mutablePrReviews[num] ??= [...(MOCK_PR_REVIEWS[num] ?? [])]);
+    reviews.push({
+      id: reviewId,
+      author: "mock-dev",
+      body: String(a.body ?? ""),
+      state:
+        event === "approve"
+          ? "APPROVED"
+          : event === "request-changes"
+            ? "CHANGES_REQUESTED"
+            : "COMMENTED",
+      created_at: new Date().toISOString(),
+    });
+
+    const comments = Array.isArray(a.comments) ? a.comments : [];
+    const inline = inlineCommentsFor(num);
+    comments.forEach((raw, i) => {
+      const c = raw as { file?: string; body?: string; line?: number };
+      inline.push({
+        id: reviewId + i + 1,
+        author: "mock-dev",
+        body: String(c.body ?? ""),
+        path: String(c.file ?? ""),
+        line: c.line ?? null,
+        created_at: new Date().toISOString(),
+        in_reply_to_id: null,
+        // Grouped under the review that carried them, so they surface
+        // as one thread on Summary rather than N loose remarks.
+        pull_request_review_id: reviewId,
+      });
+    });
+
+    const pr = mutablePr(num);
+    if (pr && event === "approve") pr.review_decision = "APPROVED";
+    if (pr && event === "request-changes") pr.review_decision = "CHANGES_REQUESTED";
+    emitAppState();
+    return undefined;
+  },
+
+  get_check_log_excerpt: (a) => {
+    const checks = MOCK_PR_CHECKS[Number(a.prNumber)] ?? [];
+    const check = checks.find((c) => c.name === a.checkName);
+    // Only failing checks carry an excerpt, mirroring
+    // `gh run view --log-failed`.
+    return check?.conclusion === "fail" ? MOCK_CHECK_LOG_EXCERPT : "";
+  },
+
+  submit_pr_review: (a) => {
+    const num = Number(a.prNumber);
+    if (num === MOCK_SUBMIT_FAILURE_PR) {
+      // The one PR that always refuses, so the submit-failed drift
+      // notice (and the "your text survived" promise behind it) can be
+      // re-triggered on demand instead of once per session.
+      return Promise.reject(
+        "host unreachable: dial tcp: lookup api.github.com: no such host",
+      );
+    }
+    const reviews = (mutablePrReviews[num] ??= [
+      ...(MOCK_PR_REVIEWS[num] ?? []),
+    ]);
+    const event = String(a.event ?? "comment");
+    reviews.push({
+      id: Date.now(),
+      author: "mock-dev",
+      body: String(a.body ?? ""),
+      state:
+        event === "approve"
+          ? "APPROVED"
+          : event === "request-changes"
+            ? "CHANGES_REQUESTED"
+            : "COMMENTED",
+      created_at: new Date().toISOString(),
+    });
+    const pr = mutablePr(num);
+    if (pr && event === "approve") pr.review_decision = "APPROVED";
+    if (pr && event === "request-changes") pr.review_decision = "CHANGES_REQUESTED";
+    emitAppState();
+    return undefined;
+  },
+
+  merge_pull_request: (a) => {
+    const num = Number(a.prNumber);
+    const pr = mutablePr(num);
+    if (!pr) return Promise.reject(`No merge target for #${num}`);
+    pr.state = "MERGED";
+    pr.is_draft = false;
+    pr.merged_by = "mock-dev";
+    pr.merged_at = new Date().toISOString();
+    syncWorkspacePrState(num, "merged");
+    return undefined;
+  },
+
+  close_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.state = "CLOSED";
+    syncWorkspacePrState(pr.number, "closed");
+    return undefined;
+  },
+
+  reopen_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.state = "OPEN";
+    syncWorkspacePrState(pr.number, "open");
+    return undefined;
+  },
+
+  set_pr_ready: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    pr.is_draft = !a.ready;
+    syncWorkspacePrState(pr.number, a.ready ? "open" : "draft");
+    return undefined;
+  },
+
+  update_pull_request: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    if (typeof a.title === "string") pr.title = a.title;
+    if (typeof a.body === "string") pr.body = a.body;
+    pr.updated_at = new Date().toISOString();
+    return undefined;
+  },
+
+  request_pr_review: (a) => {
+    const pr = mutablePr(Number(a.prNumber));
+    if (!pr) return Promise.reject(`No pull request #${a.prNumber}`);
+    const reviewer = String(a.reviewer ?? "").trim();
+    if (!reviewer) return Promise.reject("A reviewer name is required.");
+    if (!pr.review_requests.includes(reviewer)) pr.review_requests.push(reviewer);
+    return undefined;
+  },
 
   // ── Hosts (remote devices) ──
   //
@@ -3602,8 +4400,11 @@ const handlers: Record<string, Handler> = {
   // Empty status = "Working tree clean" for git workspaces, and lets
   // the non-git `scratchpad` seed exercise the "Not a git repository"
   // empty state (`is_git: false` → showNoGitState).
-  get_git_status: () => [],
-  get_git_branch_info: () => null,
+  // …with one exception: the checkout the create-pull-request form opens
+  // from has uncommitted work, because the form's warning row is only
+  // reachable when something is actually uncommitted.
+  get_git_status: (a) =>
+    String(a.path ?? "") === MOCK_CREATE_PR_PATH ? MOCK_CREATE_PR_DIRTY : [],
   get_merge_state: () => null,
   check_claude_available: () => false,
 
@@ -3710,6 +4511,56 @@ const handlers: Record<string, Handler> = {
       emitAppState();
     }, 0);
     return ws.workspace_id;
+  },
+  /**
+   * A real extra terminal tab, so an agent handoff is visible in dev.
+   *
+   * The handoff opens a fresh tab and then applies the preset to it
+   * (the only `apply_preset` path that carries a prompt), so a mock that
+   * returned a bare id would make the most important half of the
+   * interaction invisible in the browser.
+   */
+  create_tab: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws || a.kind !== "terminal") return `tab-mock-${Date.now()}`;
+    const n = ++mockTabSeq;
+    const paneId = `pane-mock-tab-${n}`;
+    const surfaceId = `surface-mock-tab-${n}`;
+    const tabId = `tab-mock-tab-${n}`;
+    const sessionId = `sess-mock-tab-${n}`;
+    const label = `Terminal ${ws.tabs.filter((t) => t.kind === "terminal").length + 1}`;
+
+    ws.surfaces.push({
+      surface_id: surfaceId,
+      title: label,
+      root: { kind: "terminal", pane_id: paneId, session_id: sessionId, title: label },
+      active_pane_id: paneId,
+    });
+    ws.tabs.push({
+      tab_id: tabId,
+      kind: "terminal",
+      title: label,
+      surface_id: surfaceId,
+      browser_id: null,
+      icon: null,
+    });
+    ws.active_tab_id = tabId;
+    ws.active_surface_id = surfaceId;
+    appState.terminal_sessions.push({
+      session_id: sessionId,
+      title: label,
+      shell: "/bin/bash",
+      cwd: ws.cwd,
+      cols: 120,
+      rows: 32,
+      state: "ready",
+      last_message: null,
+      exit_code: null,
+      original_command: null,
+      adapter_captures: {},
+    });
+    emitAppState();
+    return tabId;
   },
   agent_chat_create_pane: (a) => {
     // The deferred worktree workspace already carries a fresh
@@ -3966,6 +4817,21 @@ function buildRestoredWorkspace(
  *  deferred-worktree first-send path is exercisable end-to-end in
  *  `npm run dev`. */
 let deferredWorktreeSeq = 0;
+let mockTabSeq = 0;
+
+/**
+ * Every preset launch the dev session has performed, newest last.
+ *
+ * Exposed on `window` so the agent-handoff surfaces can be checked in a
+ * plain browser: the question those buttons have to answer is "did the
+ * composed prompt reach the thread", and this is where the answer is.
+ */
+const agentHandoffs: {
+  workspaceId: string;
+  presetId: string;
+  overrideMode: string | null;
+  prompt: string | null;
+}[] = [];
 function buildWorktreeWorkspace(
   repoPath: string,
   branch: string,
@@ -4241,6 +5107,212 @@ const internals: TauriInternals = {
   workspaceTitle = "Demo",
 ) => {
   emitEvent("notification", { title, body, workspace_title: workspaceTitle });
+};
+
+// Dev affordance: rewrite a PR's branch under you.
+//
+// Flips the head sha and swaps in that PR's `afterForcePush` diff, which
+// is the whole force-push story the Code tab has to survive: the 2.5s
+// detail poll notices the new sha, refetches the diff, and re-anchors
+// every pending note against it. Deterministic — the same call always
+// produces the same rewritten diff — and reversible, so the flow can be
+// walked more than once without a reload.
+//
+//   __codemuxMockForcePush()      // PR 172, the seeded review PR
+//   __codemuxMockForcePush(172, false)   // put it back
+(
+  window as unknown as {
+    __codemuxMockForcePush: (prNumber?: number, rewritten?: boolean) => string;
+  }
+).__codemuxMockForcePush = (prNumber = 172, rewritten = true) => {
+  const pr = mutablePr(prNumber);
+  if (!pr) return `no mock PR #${prNumber}`;
+  if (rewritten) forcePushedPrs.add(prNumber);
+  else forcePushedPrs.delete(prNumber);
+  pr.head_ref_oid = rewritten
+    ? `forcepush${prNumber}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.slice(0, 40)
+    : `mock${prNumber}headsha0000000000000000000`.slice(0, 40);
+  pr.updated_at = new Date().toISOString();
+  emitAppState();
+  return `#${prNumber} head is now ${pr.head_ref_oid}`;
+};
+
+// Dev affordances: fire each of the two pull-request toasts on demand.
+//
+// Both toasts are raised by a *transition* between consecutive polls, so
+// neither can be reached by seeding a state — a pull request that is
+// already red at load has not just turned red, and correctly says
+// nothing. These flip the overview fixture and kick the shared query, so
+// the very next poll sees a change that did not exist a moment ago.
+//
+//   __codemuxMockReviewRequest()   // #482 starts waiting on you
+//   __codemuxMockCiFail()          // #285 goes red on rust (ubuntu-latest)
+//   __codemuxMockCiFail(285, false)  // back to green, so it can fire again
+function kickPrOverview(): void {
+  (
+    window as unknown as {
+      __codemuxQueryClient?: {
+        invalidateQueries: (filters: { predicate: (q: { queryKey: unknown[] }) => boolean }) => void;
+      };
+    }
+  ).__codemuxQueryClient?.invalidateQueries({
+    predicate: (q) => q.queryKey[0] === "prs",
+  });
+}
+
+(
+  window as unknown as {
+    __codemuxMockReviewRequest: (prNumber?: number, requested?: boolean) => string;
+  }
+).__codemuxMockReviewRequest = (prNumber = 482, requested = true) => {
+  if (!mutablePrs[prNumber]) return `no mock PR #${prNumber}`;
+  reviewRequestOverrides[prNumber] = requested ? [MOCK_PR_VIEWER] : [];
+  kickPrOverview();
+  return requested
+    ? `#${prNumber} is now waiting on ${MOCK_PR_VIEWER}`
+    : `#${prNumber} no longer needs your review`;
+};
+
+(
+  window as unknown as {
+    __codemuxMockCiFail: (prNumber?: number, failing?: boolean) => string;
+  }
+).__codemuxMockCiFail = (prNumber = 285, failing = true) => {
+  const pr = mutablePrs[prNumber];
+  if (!pr) return `no mock PR #${prNumber}`;
+  if (failing) {
+    checksRollupOverrides[prNumber] = "failing";
+    // The toast's second line and the [Fix] handoff both name a check,
+    // so the per-check list has to agree with the rollup.
+    checksDetailOverrides[prNumber] = [
+      ...(MOCK_PR_CHECKS[prNumber] ?? []),
+      {
+        name: "rust (ubuntu-latest)",
+        status: "COMPLETED",
+        conclusion: "fail",
+        elapsed_time: "2m 14s",
+        detail_url: `https://github.com/example/codemux/actions/runs/9${prNumber}`,
+        started_at: new Date(Date.now() - 134_000).toISOString(),
+        completed_at: new Date().toISOString(),
+      },
+    ];
+  } else {
+    delete checksRollupOverrides[prNumber];
+    delete checksDetailOverrides[prNumber];
+  }
+  kickPrOverview();
+  return failing
+    ? `#${prNumber} is now failing on rust (ubuntu-latest)`
+    : `#${prNumber} is green again`;
+};
+
+// Dev affordance: the two thread switches.
+//
+//   __codemuxMockThreadReplyFail(true)   // every reply is refused
+//   __codemuxMockThreadReplyFail(false)  // back to normal
+//
+// The first one is how you see binding rule 4 hold: type a reply, send
+// it, and the words are still in the box with the reason beside them and
+// Retry sending exactly what failed.
+(
+  window as unknown as {
+    __codemuxMockThreadReplyFail: (failing?: boolean) => string;
+  }
+).__codemuxMockThreadReplyFail = (failing = true) => {
+  mockThreadReplyFails = failing;
+  return failing
+    ? "thread replies will now be refused by the host"
+    : "thread replies succeed again";
+};
+
+// How long a reply takes, for looking at the in-flight state.
+//
+//   __codemuxMockThreadReplyDelay(5000)
+(
+  window as unknown as {
+    __codemuxMockThreadReplyDelay: (ms?: number) => string;
+  }
+).__codemuxMockThreadReplyDelay = (ms = 400) => {
+  mockThreadReplyDelayMs = ms;
+  return `thread replies now take ${ms}ms`;
+};
+
+// Withdraw the two thread operations from every host's declaration, so
+// the read-only thread list can be looked at. Switch workspaces (or wait
+// out the 60s provider-auth cache) for the declaration to be re-read.
+//
+//   __codemuxMockThreadOpsOff()       // no composer, no Resolve button
+//   __codemuxMockThreadOpsOff(false)  // declared again
+(
+  window as unknown as {
+    __codemuxMockThreadOpsOff: (off?: boolean) => string;
+  }
+).__codemuxMockThreadOpsOff = (off = true) => {
+  mockThreadOpsDeclared = !off;
+  if (off) localStorage.setItem(THREAD_OPS_OFF_KEY, "1");
+  else localStorage.removeItem(THREAD_OPS_OFF_KEY);
+  return off
+    ? "thread reply/resolve undeclared — reload to see the read-only list"
+    : "thread reply/resolve declared again — reload to pick it up";
+};
+
+// Dev affordance: read back what the agent-handoff buttons actually sent.
+//   window.__codemuxAgentHandoffs.at(-1).prompt
+(
+  window as unknown as { __codemuxAgentHandoffs: typeof agentHandoffs }
+).__codemuxAgentHandoffs = agentHandoffs;
+
+// ── The performance pack's three switches ─────────────────────────────
+
+// Dev affordance: throw away the carried paint.
+//
+// The snapshot's whole point is that it makes the *second* launch fast,
+// which makes the first one hard to see. Clear it and reload to watch
+// the cold path; reload again to watch the carried one.
+//
+//   __codemuxClearPrSnapshot()
+(
+  window as unknown as { __codemuxClearPrSnapshot: () => string }
+).__codemuxClearPrSnapshot = () => {
+  clearPrOverviewSnapshot();
+  return "pull-request snapshot cleared — reload for a cold paint";
+};
+
+// Dev affordance: take the host away, and watch the rows stay.
+//
+//   __codemuxMockPrOutage()             // everything fails
+//   __codemuxMockPrOutage(true, "stats") // only the slow half fails
+//   __codemuxMockPrOutage(false)        // back to normal
+(
+  window as unknown as {
+    __codemuxMockPrOutage: (down?: boolean, which?: "all" | "stats") => string;
+  }
+).__codemuxMockPrOutage = (down = true, which = "all") => {
+  prStatsOutage = down;
+  prOverviewOutage = down && which === "all";
+  kickPrOverview();
+  if (!down) return "pull-request host reachable again";
+  return which === "stats"
+    ? "the stats half now fails — rows keep the checks they had"
+    : "every root now fails — the list keeps its rows and says how old they are";
+};
+
+// Dev affordances: change how slow each half is.
+//   __codemuxMockPrStatsDelay(3000)
+//   __codemuxMockPrListDelay(3000)
+(
+  window as unknown as { __codemuxMockPrStatsDelay: (ms: number) => string }
+).__codemuxMockPrStatsDelay = (ms) => {
+  PR_STATS_DELAY_MS = Math.max(0, ms);
+  localStorage.setItem("codemux:dev:pr-stats-delay", String(PR_STATS_DELAY_MS));
+  return `stats now take ${PR_STATS_DELAY_MS}ms (across reloads)`;
+};
+(
+  window as unknown as { __codemuxMockPrListDelay: (ms: number) => string }
+).__codemuxMockPrListDelay = (ms) => {
+  PR_LIST_DELAY_MS = Math.max(0, ms);
+  localStorage.setItem("codemux:dev:pr-list-delay", String(PR_LIST_DELAY_MS));
+  return `the listing now takes ${PR_LIST_DELAY_MS}ms (across reloads)`;
 };
 
 export {};

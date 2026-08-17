@@ -45,7 +45,9 @@ export function parseDiff(text: string): DiffLine[] {
   let newLine = 0;
   let inHunk = false;
 
-  for (const raw of text.split("\n")) {
+  // Either terminator — a diff produced on a Windows host carries CRLF,
+  // and the \r would otherwise survive into the rendered line content.
+  for (const raw of text.split(/\r?\n/)) {
     // A new file's metadata block resets hunk context. In git output the
     // `diff ` line always precedes that file's `--- `/`+++ ` headers.
     if (raw.startsWith("diff ")) {

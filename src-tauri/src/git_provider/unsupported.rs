@@ -11,10 +11,10 @@
 use std::path::Path;
 
 use super::detect::{DetectedProvider, ProviderKind};
-use super::provider::{Capabilities, SourceControlProvider};
+use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider};
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
 };
 
 pub struct UnsupportedProvider {
@@ -64,6 +64,18 @@ impl SourceControlProvider for UnsupportedProvider {
         Capabilities::default()
     }
 
+    /// Nothing, and deliberately so.
+    ///
+    /// Bitbucket and Azure DevOps have not been verified against their
+    /// real CLI surfaces. Declaring an operation we have not tested would
+    /// draw a control that fails at the server; declaring none renders
+    /// the read-only sentence and an offer of the browser, which is true.
+    /// Fill this in from the CLI — not from documentation — if either
+    /// host ever ships.
+    fn operations(&self) -> OperationCapabilities {
+        OperationCapabilities::default()
+    }
+
     fn is_implemented(&self) -> bool {
         false
     }
@@ -100,6 +112,17 @@ impl SourceControlProvider for UnsupportedProvider {
         self.err("list incoming pull requests")
     }
 
+    fn pull_requests_overview(&self, _repo_path: &Path) -> Result<PrsOverview, String> {
+        self.err("list pull requests")
+    }
+
+    fn pull_requests_overview_stats(
+        &self,
+        _repo_path: &Path,
+    ) -> Result<Vec<PrOverviewStats>, String> {
+        self.err("read check status")
+    }
+
     fn get_pull_request(
         &self,
         _repo_path: &Path,
@@ -124,8 +147,56 @@ impl SourceControlProvider for UnsupportedProvider {
         _repo_path: &Path,
         _number: u32,
         _method: &str,
+        _delete_branch: bool,
+        _commit_title: Option<&str>,
+        _commit_body: Option<&str>,
     ) -> Result<(), String> {
         self.err("merge a pull request")
+    }
+
+    fn close_pull_request(&self, _repo_path: &Path, _number: u32) -> Result<(), String> {
+        self.err("close a pull request")
+    }
+
+    fn reopen_pull_request(&self, _repo_path: &Path, _number: u32) -> Result<(), String> {
+        self.err("reopen a pull request")
+    }
+
+    fn set_pull_request_ready(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _ready: bool,
+    ) -> Result<(), String> {
+        self.err("change a pull request's draft state")
+    }
+
+    fn update_pull_request(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _title: Option<&str>,
+        _body: Option<&str>,
+    ) -> Result<(), String> {
+        self.err("edit a pull request")
+    }
+
+    fn request_pull_request_review(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _reviewer: &str,
+    ) -> Result<(), String> {
+        self.err("request a review")
+    }
+
+    fn check_log_excerpt(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _check_name: &str,
+    ) -> Result<String, String> {
+        self.err("read a check log")
     }
 
     fn pull_request_diff(
@@ -137,13 +208,48 @@ impl SourceControlProvider for UnsupportedProvider {
         self.err("read a pull request diff")
     }
 
-    fn pull_request_checks(&self, _repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
+    fn pull_request_review_diff(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<String, String> {
+        self.err("read a pull request diff")
+    }
+
+    fn add_inline_comment(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _comment: &crate::github::PrDraftComment,
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        self.err("comment on a line")
+    }
+
+    fn submit_review_with_comments(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _event: &str,
+        _body: &str,
+        _comments: &[crate::github::PrDraftComment],
+        _commit_id: &str,
+    ) -> Result<(), String> {
+        self.err("submit a review")
+    }
+
+    fn pull_request_checks(
+        &self,
+        _repo_path: &Path,
+        _number: Option<u32>,
+    ) -> Result<Vec<CheckInfo>, String> {
         self.err("read pull request checks")
     }
 
     fn pull_request_review_comments(
         &self,
         _repo_path: &Path,
+        _number: Option<u32>,
     ) -> Result<Vec<ReviewComment>, String> {
         self.err("read review comments")
     }
@@ -154,6 +260,35 @@ impl SourceControlProvider for UnsupportedProvider {
         _number: u32,
     ) -> Result<Vec<InlineReviewComment>, String> {
         self.err("read inline review comments")
+    }
+
+    fn pull_request_review_threads(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<Vec<PrReviewThread>, String> {
+        self.err("read review threads")
+    }
+
+    fn reply_to_review_thread(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _thread_id: &str,
+        _root_comment_id: Option<u64>,
+        _body: &str,
+    ) -> Result<(), String> {
+        self.err("reply to a review thread")
+    }
+
+    fn set_review_thread_resolved(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+        _thread_id: &str,
+        _resolved: bool,
+    ) -> Result<(), String> {
+        self.err("resolve a review thread")
     }
 
     fn submit_pull_request_review(
@@ -172,6 +307,14 @@ impl SourceControlProvider for UnsupportedProvider {
         _number: u32,
     ) -> Result<Vec<DeploymentInfo>, String> {
         self.err("read deployments")
+    }
+
+    fn pull_request_timeline(
+        &self,
+        _repo_path: &Path,
+        _number: u32,
+    ) -> Result<Vec<PrTimelineEvent>, String> {
+        self.err("read this pull request's timeline")
     }
 
     fn list_issues(
@@ -264,9 +407,13 @@ mod tests {
         );
         let provider = UnsupportedProvider::from_detection(&detected);
         for message in [
-            provider.merge_pull_request(Path::new("/tmp"), 1, "squash").unwrap_err(),
+            provider
+                .merge_pull_request(Path::new("/tmp"), 1, "squash", true, None, None)
+                .unwrap_err(),
             provider.list_issues(Path::new("/tmp"), None).unwrap_err(),
-            provider.pull_request_checks(Path::new("/tmp")).unwrap_err(),
+            provider
+                .pull_request_checks(Path::new("/tmp"), None)
+                .unwrap_err(),
         ] {
             assert!(!message.contains("secret-token-value"), "{message}");
             assert!(!message.contains("oauth2"), "{message}");

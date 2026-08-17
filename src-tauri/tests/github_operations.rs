@@ -335,7 +335,7 @@ fn get_branch_pr_returns_option() {
 #[ignore]
 fn get_pr_checks_returns_vec() {
     let repo_root = std::env::current_dir().expect("cwd");
-    let result = get_pr_checks(&repo_root);
+    let result = get_pr_checks(&repo_root, None);
     match result {
         Ok(checks) => {
             println!("{} checks found", checks.len());
@@ -351,7 +351,7 @@ fn get_pr_checks_returns_vec() {
 #[ignore]
 fn get_pr_review_comments_returns_vec() {
     let repo_root = std::env::current_dir().expect("cwd");
-    let result = get_pr_review_comments(&repo_root);
+    let result = get_pr_review_comments(&repo_root, None);
     match result {
         Ok(reviews) => {
             println!("{} reviews found", reviews.len());

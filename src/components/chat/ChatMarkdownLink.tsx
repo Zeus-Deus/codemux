@@ -14,6 +14,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { externalWebLinkHost } from "@/lib/agent-chat/rich-links";
+import { openExternalUrl, routeForUrl } from "@/lib/open-url";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -85,6 +86,14 @@ export function ChatMarkdownLink({
         const handledByCaller = event.defaultPrevented;
         event.preventDefault();
         if (handledByCaller || !externalHref) return;
+        // A pull request in a project you have open is not an external
+        // destination — it is a page of this app, so it opens without a
+        // dialog asking whether you meant to leave. Shift-click is a
+        // request for the browser and therefore still confirms.
+        if (routeForUrl(externalHref, { event }).kind === "in-app") {
+          void openExternalUrl(externalHref, { event });
+          return;
+        }
         setConfirmationOpen(true);
       }}
       onAuxClick={(event) => {

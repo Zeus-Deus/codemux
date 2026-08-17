@@ -89,3 +89,19 @@ describe("parseDiff", () => {
     expect(adds).toEqual(["-- a comment changed", "bar"]);
   });
 });
+
+describe("a diff produced on a Windows host", () => {
+  it("parses CRLF exactly as it parses LF, without a stray \\r in the content", () => {
+    const rows = [
+      "@@ -1,3 +1,3 @@",
+      " const a = 1;",
+      "-const b = 2;",
+      "+const b = 3;",
+    ];
+    const lf = parseDiff(rows.join("\n"));
+    const crlf = parseDiff(rows.join("\r\n"));
+
+    expect(crlf).toEqual(lf);
+    expect(crlf.map((l) => l.content)).not.toContain("const b = 3;\r");
+  });
+});

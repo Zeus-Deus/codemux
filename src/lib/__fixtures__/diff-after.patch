@@ -1,0 +1,48 @@
+mise ~/.config/mise/config.toml tools: gh@2.97.0
+diff --git a/app.py b/app.py
+index 79fd59c..0c4c836 100644
+--- a/app.py
++++ b/app.py
+@@ -1,11 +1,14 @@
++"""anchor-lab module."""
++import functools
++
+ def func_01(): return 'value_01'  # region A
+ def func_02(): return 'value_02'  # region A
+ def func_03(): return 'value_03'  # region A
+ def func_04(): return 'value_04'  # region A
+-def func_05(): return 'value_05'  # region A
+-def func_06(): return 'value_06'  # region A
+-def func_07(): return 'value_07'  # region A
+-def func_08(): return 'value_08'  # region A
++def func_05(): return compute_v2('value_05', retries=3)  # region A rewritten
++def func_06(): return compute_v2('value_06', retries=3)  # region A rewritten
++def func_07(): return compute_v2('value_07', retries=3)  # region A rewritten
++def func_08(): return compute_v2('value_08', retries=3)  # region A rewritten
+ def func_09(): return 'value_09'  # region A
+ def func_10(): return 'value_10'  # region A
+ def func_11(): return 'value_11'  # region A
+@@ -18,6 +21,8 @@ def func_17(): return 'value_17'  # region A
+ def func_18(): return 'value_18'  # region A
+ def func_19(): return 'value_19'  # region A
+ def func_20(): return 'value_20'  # region A
++def helper_b1(): return 'b1'  # new helper
++def helper_b2(): return 'b2'  # new helper
+ def func_21(): return 'value_21'  # region B
+ def func_22(): return 'value_22'  # region B
+ def func_23(): return 'value_23'  # region B
+@@ -42,10 +47,10 @@ def func_41(): return 'value_41'  # region C
+ def func_42(): return 'value_42'  # region C
+ def func_43(): return 'value_43'  # region C
+ def func_44(): return 'value_44'  # region C
+-def func_45(): return 'value_45'  # region C
+-def func_46(): return 'value_46'  # region C
+-def func_47(): return 'value_47'  # region C
+-def func_48(): return 'value_48'  # region C
++def func_45(): return cached('value_45')  # region C modified
++def func_46(): return cached('value_46')  # region C modified
++def func_47(): return cached('value_47')  # region C modified
++def func_48(): return cached('value_48')  # region C modified
+ def func_49(): return 'value_49'  # region C
+ def func_50(): return 'value_50'  # region C
+ def func_51(): return 'value_51'  # region C

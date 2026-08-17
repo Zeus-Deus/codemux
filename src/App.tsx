@@ -18,6 +18,7 @@ import { RemotePathPicker } from "@/components/remote/remote-path-picker";
 import { RemoteConnectionBanner } from "@/components/remote/remote-connection-indicator";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
+import { PrEventWatcher } from "@/components/pull-requests/pr-event-watcher";
 import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAppStore } from "@/stores/app-store";
@@ -115,6 +116,10 @@ function App() {
           quiet connected state lives as a chip in the title bar. Never
           mounted on desktop. */}
       {isRemoteClient() && <RemoteConnectionBanner />}
+      {/* Two toasts and one link index — see `pr-events.ts`. Renders
+          nothing, and sits above the full-screen destinations so it keeps
+          watching from every screen. */}
+      <PrEventWatcher />
       <Toaster />
     </>
   );

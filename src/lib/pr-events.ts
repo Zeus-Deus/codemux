@@ -1,0 +1,154 @@
+/**
+ * The only two pull-request events that earn an interruption.
+ *
+ * A review someone is waiting on you for, and one of your own pull
+ * requests going red. Everything else a pull request can do is something
+ * you will find when you look, and it lives in the sidebar badge.
+ *
+ * Everything here is a *transition* between two consecutive polls, never
+ * a state. The distinction is the whole design: "this pull request needs
+ * your review" is true for as long as it is true, and a toast for a
+ * state would fire every thirty seconds forever. "This pull request has
+ * just started needing your review" happens once.
+ *
+ * Three guards make that hold in practice:
+ *
+ * - **No baseline toast.** The first poll of a session establishes what
+ *   is already true; it never announces it. Opening Codemux to six
+ *   toasts about pull requests from last Tuesday is noise, not news.
+ * - **No first-sight-of-a-repository toast.** A project opened mid-
+ *   session brings its whole backlog with it, and none of that backlog
+ *   just happened. Roots get their own baseline.
+ * - **Armed once per transition.** A row that flickers out of the list
+ *   and back — a failed poll, a filter change — must not re-announce.
+ *   The fired set holds until the condition actually goes away.
+ *
+ * Pure functions over plain data; the hook that raises the toasts lives
+ * in `pr-event-toasts.ts`.
+ */
+
+import { groupForRow, rowKey, type PrGroupId, type PrRow } from "@/lib/pr-overview";
+
+/** What one poll knew about one pull request. */
+export interface PrSnapshotEntry {
+  key: string;
+  row: PrRow;
+  group: PrGroupId;
+  /** `passing` / `failing` / `pending` / `none`, or `null` for a row
+   *  whose stats have not landed yet. `null` is never evidence: it is
+   *  the absence of a measurement, not a measurement of absence. */
+  checks: string | null;
+}
+
+export interface PrSnapshot {
+  entries: Map<string, PrSnapshotEntry>;
+  /** Roots this poll covered, so a newly-opened project can be given its
+   *  own baseline instead of an inbox. */
+  roots: Set<string>;
+}
+
+export type PrEventKind = "review-requested" | "checks-failed";
+
+export interface PrEvent {
+  kind: PrEventKind;
+  row: PrRow;
+}
+
+/** One poll, in the shape the detector compares. */
+export function snapshotRows(
+  rows: PrRow[],
+  viewerByRoot: Map<string, string | null>,
+): PrSnapshot {
+  const entries = new Map<string, PrSnapshotEntry>();
+  const roots = new Set<string>();
+  for (const row of rows) {
+    roots.add(row.projectRoot);
+    const key = rowKey(row);
+    entries.set(key, {
+      key,
+      row,
+      group: groupForRow(row, viewerByRoot.get(row.projectRoot) ?? null),
+      checks: row.checks,
+    });
+  }
+  // A root with zero open pull requests still counts as covered — its
+  // baseline is "nothing", and the first one to arrive is news.
+  for (const root of viewerByRoot.keys()) roots.add(root);
+  return { entries, roots };
+}
+
+/** Arming keys, so a condition that persists can't re-fire. */
+const armKey = (key: string, kind: PrEventKind) => `${key}\u0000${kind}`;
+
+export interface DetectResult {
+  events: PrEvent[];
+  /** The next fired set — conditions that have gone away are released so
+   *  the same pull request can announce a *second* failure later. */
+  fired: Set<string>;
+}
+
+/**
+ * What changed between two polls.
+ *
+ * `previous` is null on the very first poll of a session: it produces no
+ * events, only the baseline the next poll is measured against.
+ */
+export function detectPrEvents(
+  previous: PrSnapshot | null,
+  next: PrSnapshot,
+  fired: ReadonlySet<string>,
+): DetectResult {
+  const stillTrue = new Set<string>();
+  const events: PrEvent[] = [];
+
+  for (const entry of next.entries.values()) {
+    const needsReview = entry.group === "review";
+    const isYoursAndRed = entry.group === "yours" && entry.checks === "failing";
+
+    const reviewArm = armKey(entry.key, "review-requested");
+    const ciArm = armKey(entry.key, "checks-failed");
+    if (needsReview) stillTrue.add(reviewArm);
+    if (isYoursAndRed) stillTrue.add(ciArm);
+
+    // No previous poll at all, or none that covered this repository:
+    // this row's state is a baseline, not an event.
+    if (!previous || !previous.roots.has(entry.row.projectRoot)) continue;
+
+    const before = previous.entries.get(entry.key) ?? null;
+
+    if (needsReview && before?.group !== "review" && !fired.has(reviewArm)) {
+      events.push({ kind: "review-requested", row: entry.row });
+    }
+
+    // Only a pull request that *was* green, running or unreported and is
+    // now red. A row arriving already-failing is not a transition this
+    // session watched happen — it is the same backlog the badge counts.
+    //
+    // `before.checks == null` is excluded for the same reason and it is
+    // the one the two-phase fetch introduced: a row paints before its
+    // rollup lands, so *every* red pull request passes through
+    // unknown→failing on its way onto the page. Firing on that would
+    // turn the split fetch into a toast for every failing pull request,
+    // once per session, which is precisely the backlog announcement the
+    // baseline rules above exist to prevent.
+    if (
+      isYoursAndRed &&
+      before != null &&
+      before.checks != null &&
+      before.checks !== "failing" &&
+      !fired.has(ciArm)
+    ) {
+      events.push({ kind: "checks-failed", row: entry.row });
+    }
+  }
+
+  // Keep only the arms whose condition still holds. A pull request whose
+  // checks went green is free to announce its next failure.
+  const nextFired = new Set<string>();
+  for (const arm of stillTrue) nextFired.add(arm);
+  for (const event of events) {
+    nextFired.add(armKey(rowKey(event.row), event.kind));
+  }
+
+  return { events, fired: nextFired };
+}

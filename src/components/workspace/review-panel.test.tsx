@@ -29,6 +29,13 @@ const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
 const mockCreatePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockGetDefaultBranch = vi.fn().mockResolvedValue("main");
+// The two no-PR empty states differ by whether the branch is on the
+// remote at all, so the panel asks. Default to "pushed" — a branch with
+// commits and no PR is the ordinary case.
+const mockGetGitBranchInfo = vi
+  .fn()
+  .mockResolvedValue({ branch: "feat/my-feature", ahead: 2, behind: 0, has_upstream: true });
+const mockGitPushChanges = vi.fn().mockResolvedValue(undefined);
 vi.mock("@/tauri/commands", () => ({
   checkProviderAuth: (...args: unknown[]) => mockCheckProviderAuth(...args),
   checkGithubRepo: (...args: unknown[]) => mockCheckGithubRepo(...args),
@@ -40,11 +47,15 @@ vi.mock("@/tauri/commands", () => ({
   listBranches: (...args: unknown[]) => mockListBranches(...args),
   createPullRequest: (...args: unknown[]) => mockCreatePullRequest(...args),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
+  getGitBranchInfo: (...args: unknown[]) => mockGetGitBranchInfo(...args),
+  gitPushChanges: (...args: unknown[]) => mockGitPushChanges(...args),
 }));
 
-// Mock sub-components to keep tests focused on ReviewPanel logic
-vi.mock("./review/review-header", () => ({ ReviewHeader: () => <div data-testid="pr-header" /> }));
-vi.mock("./review/review-checks", () => ({ ReviewChecks: () => <div data-testid="pr-checks" /> }));
+// Mock sub-components to keep these tests about ReviewPanel's gate.
+// The detail surface has its own test file.
+vi.mock("./review/review-detail", () => ({
+  ReviewDetail: () => <div data-testid="pr-header" />,
+}));
 vi.mock("./review/review-threads", () => ({ ReviewThreads: () => <div data-testid="pr-reviews" /> }));
 vi.mock("./review/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
 
@@ -117,10 +128,19 @@ const mockPr: PullRequestInfo = {
   review_decision: null,
   checks_passing: null,
   updated_at: "2026-04-09T00:00:00Z",
+  created_at: null,
   body: null,
   comments: [],
   totalComments: 0,
   author: null,
+  head_ref_oid: null,
+  head_repository_owner: null,
+  merge_state_status: null,
+  changed_files: null,
+  merged_by: null,
+  merged_at: null,
+  review_requests: [],
+  latest_reviews: [],
 };
 
 beforeEach(() => {
@@ -141,6 +161,12 @@ beforeEach(() => {
   mockGetPrReviewComments.mockResolvedValue([]);
   mockGetPrInlineComments.mockResolvedValue([]);
   mockGetDefaultBranch.mockResolvedValue("main");
+  mockGetGitBranchInfo.mockResolvedValue({
+    branch: "feat/my-feature",
+    ahead: 2,
+    behind: 0,
+    has_upstream: true,
+  });
 });
 
 afterEach(() => {
@@ -233,7 +259,7 @@ describe("cache TTL", () => {
     const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
+    expect(screen.getByTestId("empty-unsupported")).toBeInTheDocument();
     expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
 
     unmount();
@@ -244,7 +270,7 @@ describe("cache TTL", () => {
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    expect(screen.queryByText("Not a GitHub repository")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("empty-unsupported")).not.toBeInTheDocument();
   });
 
   it("setCachedRepoCheck drops false values", () => {
@@ -265,8 +291,10 @@ describe("error state", () => {
     renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
     await flushPromises();
 
+    // Never a blank panel: a PR that has never loaded and whose fetch
+    // fails is a reachability state with a way out, not an error dump.
     await waitFor(() => {
-      expect(screen.getByText(/gh CLI error/)).toBeInTheDocument();
+      expect(screen.getByTestId("empty-unreachable")).toBeInTheDocument();
     });
   });
 
@@ -274,7 +302,9 @@ describe("error state", () => {
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("empty-no-pr")).toBeInTheDocument();
+    });
     // No error banner should be present
     expect(screen.queryByText(/Failed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
@@ -292,7 +322,7 @@ describe("incoming PRs on base branch", () => {
     await waitFor(() => {
       expect(screen.getByTestId("incoming-prs-view")).toBeInTheDocument();
     });
-    expect(screen.queryByText("No pull request for this branch")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("empty-no-pr")).not.toBeInTheDocument();
   });
 
   it("renders NoPrView when on feature branch (not default)", async () => {
@@ -301,7 +331,7 @@ describe("incoming PRs on base branch", () => {
     await flushPromises();
 
     await waitFor(() => {
-      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+      expect(screen.getByTestId("empty-no-pr")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
   });
@@ -312,7 +342,7 @@ describe("incoming PRs on base branch", () => {
     await flushPromises();
 
     await waitFor(() => {
-      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+      expect(screen.getByTestId("empty-no-pr")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
   });
@@ -323,7 +353,7 @@ describe("incoming PRs on base branch", () => {
     await flushPromises();
 
     await waitFor(() => {
-      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+      expect(screen.getByTestId("empty-no-pr")).toBeInTheDocument();
     });
   });
 
@@ -400,9 +430,8 @@ describe("provider-aware copy", () => {
       <ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />,
     );
     await flushPromises();
-    expect(
-      screen.getByText("GitLab CLI (glab) is not installed. Install it from gitlab.com/gitlab-org/cli"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("GitLab CLI (glab) isn't installed")).toBeInTheDocument();
+    expect(screen.getByText("glab", { selector: "span" })).toBeInTheDocument();
     unmount();
     _resetCaches();
 
@@ -411,7 +440,8 @@ describe("provider-aware copy", () => {
     );
     renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
     await flushPromises();
-    expect(screen.getByText("Not authenticated. Run: glab auth login")).toBeInTheDocument();
+    expect(screen.getByText("Sign in to GitLab")).toBeInTheDocument();
+    expect(screen.getByText("glab auth login")).toBeInTheDocument();
   });
 
   it("keeps the exact GitHub wording it had before detection existed", async () => {
@@ -420,9 +450,7 @@ describe("provider-aware copy", () => {
     );
     const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
-    expect(
-      screen.getByText("GitHub CLI (gh) is not installed. Install it from cli.github.com"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("GitHub CLI (gh) isn't installed")).toBeInTheDocument();
     unmount();
     _resetCaches();
 
@@ -431,16 +459,19 @@ describe("provider-aware copy", () => {
     );
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
-    expect(screen.getByText("Not authenticated. Run: gh auth login")).toBeInTheDocument();
+    expect(screen.getByText("Sign in to GitHub")).toBeInTheDocument();
+    expect(screen.getByText("gh auth login")).toBeInTheDocument();
   });
 
   it("says merge request, not pull request, on the GitLab create affordance", async () => {
     mockCheckGithubRepo.mockResolvedValue(true);
     renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
     await flushPromises();
-    expect(screen.getByText("No merge request for this branch")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("No merge request yet")).toBeInTheDocument();
+    });
     expect(
-      screen.getByRole("button", { name: "Create Merge Request" }),
+      screen.getByRole("button", { name: "Open a merge request" }),
     ).toBeInTheDocument();
   });
 
@@ -448,9 +479,11 @@ describe("provider-aware copy", () => {
     mockCheckGithubRepo.mockResolvedValue(true);
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
-    expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("No pull request yet")).toBeInTheDocument();
+    });
     expect(
-      screen.getByRole("button", { name: "Create Pull Request" }),
+      screen.getByRole("button", { name: "Open a pull request" }),
     ).toBeInTheDocument();
   });
 
@@ -465,8 +498,10 @@ describe("provider-aware copy", () => {
     );
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
-    expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
-    expect(screen.queryByText(/is not installed/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("No supported source control host for this repository"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/isn't installed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/cli\.github\.com/)).not.toBeInTheDocument();
   });
 
@@ -490,8 +525,7 @@ describe("provider-aware copy", () => {
     );
     renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "bitbucket" })} />);
     await flushPromises();
-    expect(
-      screen.getByText("Codemux has no Bitbucket integration yet."),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Bitbucket, read-only")).toBeInTheDocument();
+    expect(screen.queryByText(/isn't installed/)).not.toBeInTheDocument();
   });
 });

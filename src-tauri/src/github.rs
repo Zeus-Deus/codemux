@@ -29,6 +29,12 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
+    /// When the pull request was opened. One string field, added for the
+    /// timeline's synthesized "opened" row — the commit *count* that row
+    /// also shows is deliberately not fetched here, because `commits` is
+    /// an array and this struct is refreshed every 2.5s.
+    #[serde(alias = "createdAt", default)]
+    pub created_at: Option<String>,
     /// Head commit SHA reported by GitHub. Kept as useful PR metadata, but
     /// association is branch/repository based: a local worktree may
     /// legitimately be behind the final remote PR head after review commits
@@ -61,6 +67,37 @@ pub struct PullRequestInfo {
     /// Author login. Useful for chip tooltips + injection header.
     #[serde(default)]
     pub author: Option<String>,
+    /// gh's `mergeStateStatus`: CLEAN / BLOCKED / DIRTY / BEHIND /
+    /// UNSTABLE / HAS_HOOKS / UNKNOWN. `mergeable` alone cannot tell
+    /// "conflicts with base" from "a required check is still running",
+    /// and the action bar has to name the blocking reason in words.
+    #[serde(alias = "mergeStateStatus", default)]
+    pub merge_state_status: Option<String>,
+    /// File count for the meta row ("8 files").
+    #[serde(alias = "changedFiles", default)]
+    pub changed_files: Option<u32>,
+    /// Login that merged it — the merged-elsewhere drift notice names
+    /// a person, not an event.
+    #[serde(alias = "mergedBy", default)]
+    pub merged_by: Option<String>,
+    #[serde(alias = "mergedAt", default)]
+    pub merged_at: Option<String>,
+    /// Logins with a review *requested* but not yet given. Drives the
+    /// "Nobody is reviewing this yet" vs. pending-chips branch.
+    #[serde(alias = "reviewRequests", default)]
+    pub review_requests: Vec<String>,
+    /// One entry per reviewer who has actually submitted a verdict.
+    #[serde(alias = "latestReviews", default)]
+    pub latest_reviews: Vec<PrReviewSummary>,
+}
+
+/// A reviewer's most recent verdict, flattened from gh's
+/// `latestReviews[].author.login` + `.state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrReviewSummary {
+    pub author: String,
+    /// APPROVED / CHANGES_REQUESTED / COMMENTED / PENDING / DISMISSED.
+    pub state: String,
 }
 
 impl PullRequestInfo {
@@ -102,6 +139,76 @@ pub struct IncomingPrItem {
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
     pub url: String,
+}
+
+/// One row of the Pull Requests page.
+///
+/// Deliberately not `IncomingPrItem` with fields bolted on: the incoming
+/// list answers "what is aimed at my branch", this answers "what wants
+/// something from me", and the two differ in exactly the fields that
+/// cost money to fetch. Keeping them apart means the cheap call stays
+/// cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrOverviewItem {
+    pub number: u32,
+    pub title: String,
+    pub author: String,
+    pub head_branch: Option<String>,
+    pub is_draft: bool,
+    /// Line counts, when the host served them cheaply. `None` means "not
+    /// measured yet", and the row draws nothing rather than a zero.
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+    /// APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED, when the product
+    /// has such a verdict. GitLab has no request-changes concept.
+    pub review_decision: Option<String>,
+    /// The rollup reduced host-side to one of `passing` / `failing` /
+    /// `pending` / `none`. The raw per-check array is 50 rows × N checks
+    /// of JSON the page would only ever collapse to a colour anyway.
+    ///
+    /// `None` is a fourth answer, and a load-bearing one: *nobody has
+    /// asked yet*. It is not `none` (this pull request has no checks) and
+    /// it is not a colour — a row carrying `None` is waiting on the stats
+    /// call, and the surfaces that judge a pull request by its CI (the
+    /// badge, the toast, the "ready to merge" label) must all decline to
+    /// judge until it becomes a word.
+    pub checks: Option<String>,
+    /// Logins this pull request is waiting on, so the page can group by
+    /// "needs your review" without a second search query.
+    pub review_requested_from: Vec<String>,
+    pub updated_at: Option<String>,
+    pub url: String,
+}
+
+/// The second half of a row, fetched separately because it is the half
+/// that costs seconds.
+///
+/// `statusCheckRollup` makes GitHub compute an aggregate CI state per
+/// pull request server-side, and `additions`/`deletions` make it compute
+/// a diff stat per pull request; both are per-row work on top of a list
+/// that is otherwise a single indexed read. Splitting them out is what
+/// lets the listing paint while they are still being computed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrOverviewStats {
+    pub number: u32,
+    /// `passing` / `failing` / `pending` / `none`.
+    pub checks: String,
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+/// The overview for one repository root, plus who is asking.
+///
+/// `viewer` rides along with the rows rather than being resolved
+/// separately by the caller because the grouping is meaningless without
+/// it: a page that can't tell your PRs from everyone else's is just an
+/// unsorted list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrsOverview {
+    /// Signed-in account for this checkout's host, when the CLI names
+    /// one. `None` ⇒ the page can still list, but cannot group.
+    pub viewer: Option<String>,
+    pub items: Vec<PrOverviewItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +256,54 @@ pub struct InlineReviewComment {
     pub pull_request_review_id: Option<u64>,
 }
 
+/// One comment inside a review thread.
+///
+/// `id` is a string because the two hosts' id spaces are not both
+/// numbers: GitHub's is an opaque GraphQL node id, GitLab's is a note
+/// number. Nothing but React keys and equality is done with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrThreadComment {
+    pub id: String,
+    /// The same comment's REST id, when the host has one.
+    ///
+    /// Two jobs, both load-bearing: it is the key the UI dedupes on (an
+    /// inline comment already shown inside a thread must not be drawn a
+    /// second time by the flat comment list), and on GitHub it is the
+    /// resource the reply endpoint addresses.
+    pub database_id: Option<u64>,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// A conversation anchored to a diff — the unit a reviewer replies to
+/// and resolves.
+///
+/// REST's `pulls/{n}/comments` carries none of this: it is a flat list of
+/// comments with no thread identity and no resolution state, which is why
+/// the GitHub implementation of this one type goes through GraphQL while
+/// everything else on the adapter stays on `gh`'s REST surface.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrReviewThread {
+    /// The id the reply and resolve calls address.
+    pub id: String,
+    pub is_resolved: bool,
+    /// The lines this thread was written against are no longer in the
+    /// diff. Labelled, never hidden — an outdated objection is still an
+    /// objection.
+    pub is_outdated: bool,
+    /// Whether this host can resolve *this* thread.
+    ///
+    /// Not a per-host constant: GitLab only resolves discussions anchored
+    /// to a diff, and a plain merge-request comment there has no
+    /// resolution state at all. Rendering a Resolve button on one would
+    /// be a control that answers a click with a 400.
+    pub is_resolvable: bool,
+    pub path: Option<String>,
+    pub line: Option<u32>,
+    pub comments: Vec<PrThreadComment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentInfo {
     pub id: u64,
@@ -156,6 +311,221 @@ pub struct DeploymentInfo {
     pub state: String,
     pub url: Option<String>,
     pub created_at: String,
+}
+
+// ── PR timeline ──
+//
+// The host's own history of a pull request, mapped to the handful of
+// shapes the timeline rail actually draws. Two rules govern this model:
+//
+// 1. Every variant here is one the UI can render *specifically* — there
+//    is no variant that exists only to be turned back into a string.
+// 2. Anything else becomes [`PrTimelineEventKind::Other`] carrying a
+//    human label, and is drawn as a plain one-liner. A host that grows a
+//    new event type must never make an entry vanish (the reviewer would
+//    be reading an incomplete history without being told) and must never
+//    make the deserializer fail (which would blank the whole tab).
+
+/// What happened, in the vocabulary the rail draws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrTimelineEventKind {
+    /// Synthesized from the PR itself: the API's stream has no "opened".
+    Opened { commits: Option<u32> },
+    Commented { body: String },
+    Reviewed {
+        /// APPROVED / CHANGES_REQUESTED / COMMENTED.
+        verdict: String,
+        body: String,
+        /// `path:line` of the review's first inline note, when the
+        /// payload already carried one. Never fetched for: one extra
+        /// request per review to decorate a card is not a trade the
+        /// 30s poll can afford.
+        anchor: Option<String>,
+    },
+    Committed { sha: String, message: String },
+    HeadRefForcePushed { sha: Option<String> },
+    Merged { sha: Option<String> },
+    Closed,
+    Reopened,
+    ReviewRequested { reviewer: Option<String> },
+    Renamed { from: String, to: String },
+    /// Anything the host has that this build does not draw specifically.
+    Other { label: String },
+}
+
+/// One row of the host's history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrTimelineEvent {
+    /// Stable within one payload — the React key, so a poll that returns
+    /// the same event twice updates a row instead of duplicating it.
+    pub id: String,
+    pub actor: Option<String>,
+    /// ISO-8601. `None` sorts to the top rather than being dropped.
+    pub created_at: Option<String>,
+    #[serde(flatten)]
+    pub kind: PrTimelineEventKind,
+}
+
+/// Turn a raw event type into the label a one-liner shows.
+///
+/// `head_ref_deleted` → "head ref deleted". Underscores become spaces
+/// because a raw API token in a sentence reads like a leaked internal.
+fn humanize_event(raw: &str) -> String {
+    raw.replace('_', " ")
+}
+
+/// `gh api --paginate` on an array endpoint emits one JSON array per
+/// page, concatenated. `serde_json::from_str` sees the first array and
+/// then trailing characters, so a two-page timeline would either error or
+/// silently lose every page but the first — read the stream instead and
+/// flatten it.
+fn parse_paginated_array(json: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(json).into_iter::<serde_json::Value>();
+    for value in stream.flatten() {
+        match value {
+            serde_json::Value::Array(items) => out.extend(items),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Map one raw GitHub timeline row.
+///
+/// Public within the crate so the mapping can be tested against recorded
+/// payloads without a `gh` on PATH — the parsing is the part that breaks,
+/// not the subprocess call around it.
+pub(crate) fn map_github_timeline_event(
+    raw: &serde_json::Value,
+    index: usize,
+) -> Option<PrTimelineEvent> {
+    let event = raw["event"].as_str().unwrap_or("");
+
+    // `commented` rows carry the author under `user`; the rest under
+    // `actor`. A commit row has neither and names its author inline.
+    let actor = raw["actor"]["login"]
+        .as_str()
+        .or_else(|| raw["user"]["login"].as_str())
+        .or_else(|| raw["author"]["name"].as_str())
+        .or_else(|| raw["committer"]["name"].as_str())
+        .map(|s| s.to_string());
+
+    let created_at = raw["created_at"]
+        .as_str()
+        .or_else(|| raw["submitted_at"].as_str())
+        .or_else(|| raw["author"]["date"].as_str())
+        .or_else(|| raw["committer"]["date"].as_str())
+        .map(|s| s.to_string());
+
+    // Ids are per-resource and a commit row has a `sha` instead, so the
+    // index is folded in: two events can share neither.
+    let id = raw["id"]
+        .as_u64()
+        .map(|n| n.to_string())
+        .or_else(|| raw["sha"].as_str().map(|s| s.to_string()))
+        .or_else(|| raw["node_id"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("{event}-{index}"));
+    let id = format!("{id}:{index}");
+
+    let kind = match event {
+        "commented" => {
+            let body = raw["body"].as_str().unwrap_or("").trim().to_string();
+            // A comment with no text is a deletion artefact, not history.
+            if body.is_empty() {
+                return None;
+            }
+            PrTimelineEventKind::Commented { body }
+        }
+        "reviewed" => PrTimelineEventKind::Reviewed {
+            verdict: raw["state"]
+                .as_str()
+                .unwrap_or("COMMENTED")
+                .to_uppercase(),
+            body: raw["body"].as_str().unwrap_or("").trim().to_string(),
+            anchor: None,
+        },
+        "committed" => PrTimelineEventKind::Committed {
+            sha: raw["sha"].as_str().unwrap_or("").to_string(),
+            message: raw["message"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        },
+        "head_ref_force_pushed" => PrTimelineEventKind::HeadRefForcePushed {
+            sha: raw["commit_id"].as_str().map(|s| s.to_string()),
+        },
+        "merged" => PrTimelineEventKind::Merged {
+            sha: raw["commit_id"].as_str().map(|s| s.to_string()),
+        },
+        "closed" => PrTimelineEventKind::Closed,
+        "reopened" => PrTimelineEventKind::Reopened,
+        "review_requested" => PrTimelineEventKind::ReviewRequested {
+            reviewer: raw["requested_reviewer"]["login"]
+                .as_str()
+                .or_else(|| raw["requested_team"]["name"].as_str())
+                .map(|s| s.to_string()),
+        },
+        "renamed" => PrTimelineEventKind::Renamed {
+            from: raw["rename"]["from"].as_str().unwrap_or("").to_string(),
+            to: raw["rename"]["to"].as_str().unwrap_or("").to_string(),
+        },
+        // Includes the empty string: a row with no `event` at all is
+        // still a row, and saying "unknown event" is more honest than
+        // dropping it.
+        other => PrTimelineEventKind::Other {
+            label: humanize_event(if other.is_empty() { "unknown event" } else { other }),
+        },
+    };
+
+    Some(PrTimelineEvent {
+        id,
+        actor,
+        created_at,
+        kind,
+    })
+}
+
+/// Map a whole raw GitHub timeline payload.
+pub(crate) fn map_github_timeline(rows: &[serde_json::Value]) -> Vec<PrTimelineEvent> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, raw)| map_github_timeline_event(raw, i))
+        .collect()
+}
+
+/// The host's history of one pull request.
+///
+/// `GET /repos/{owner}/{repo}/issues/{n}/timeline` with a plain Accept
+/// header — the preview header this endpoint once needed is long retired,
+/// and sending it now is a way to get a 415 from GitHub Enterprise.
+///
+/// The stream has no "opened" event, so the caller synthesizes one from
+/// the pull request it already holds; doing it here would cost a second
+/// request for data every caller already has.
+pub fn get_pr_timeline(repo_path: &Path, pr_number: u32) -> Result<Vec<PrTimelineEvent>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/issues/{pr_number}/timeline");
+    let Some(json) = run_gh_optional(
+        repo_path,
+        &[
+            "api",
+            &endpoint,
+            "--paginate",
+            "-H",
+            "Accept: application/vnd.github+json",
+        ],
+    ) else {
+        return Ok(Vec::new());
+    };
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(map_github_timeline(&parse_paginated_array(&json)))
 }
 
 pub fn check_gh_status() -> GhStatus {
@@ -183,19 +553,36 @@ pub fn check_gh_status() -> GhStatus {
         return GhStatus::NotAuthenticated;
     }
 
-    // gh auth status prints to stderr: "Logged in to github.com account USERNAME (...)"
+    // "Logged in to github.com account USERNAME (...)" — modern gh
+    // (≥2.4x, incl. 2.97) prints auth status to stdout; older releases
+    // used stderr. Parsing only stderr made every modern install look
+    // like an anonymous viewer: rows still listed (the token was fine)
+    // but nothing could be attributed to "you", so the Pull Requests
+    // page filed the user's own PRs under Watching and the panel never
+    // showed the author's action bar. Check stdout first, then stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let username = stderr
+    let username = parse_auth_status_username(&stdout)
+        .or_else(|| parse_auth_status_username(&stderr))
+        .unwrap_or_default();
+
+    GhStatus::Authenticated { username }
+}
+
+/// Extract USERNAME from a `gh auth status` stream, wherever gh chose
+/// to print it. Only lines that describe a login are considered, so a
+/// hypothetical "account" in an error message can't produce a viewer.
+fn parse_auth_status_username(stream: &str) -> Option<String> {
+    stream
         .lines()
+        .filter(|line| line.contains("Logged in to"))
         .find_map(|line| {
             line.find("account ").map(|pos| {
                 let after = &line[pos + 8..];
                 after.split_whitespace().next().unwrap_or("").to_string()
             })
         })
-        .unwrap_or_default();
-
-    GhStatus::Authenticated { username }
+        .filter(|name| !name.is_empty())
 }
 
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
@@ -596,7 +983,7 @@ pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo
         repo_path,
         &[
             "pr", "view", &number_str,
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,author,body,comments",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,author,body,comments,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews",
         ],
         ISSUE_FETCH_TIMEOUT,
     )?;
@@ -639,6 +1026,31 @@ pub const MAX_PR_DIFF_BYTES: usize = 100 * 1024;
 /// Truncates the full-diff variant at `MAX_PR_DIFF_BYTES` on a char
 /// boundary so the prompt stays bounded.
 pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, String> {
+    get_pr_diff_capped(repo_path, number, full, MAX_PR_DIFF_BYTES)
+}
+
+/// Cap for the diff the Code tab renders.
+///
+/// A prompt has to stay small; a review surface has to be *complete*.
+/// Truncating here would mean a reviewer scrolls to the end of what
+/// looks like the diff and never learns there was more — and every note
+/// they write below the cut would anchor against lines the host doesn't
+/// agree exist. 4MB clears any pull request a person is going to read
+/// line by line, and the per-file size threshold in the UI is what keeps
+/// the rendering cheap.
+pub const MAX_PR_REVIEW_DIFF_BYTES: usize = 4 * 1024 * 1024;
+
+/// The whole patch, for reviewing rather than summarising.
+pub fn get_pr_review_diff(repo_path: &Path, number: u32) -> Result<String, String> {
+    get_pr_diff_capped(repo_path, number, true, MAX_PR_REVIEW_DIFF_BYTES)
+}
+
+fn get_pr_diff_capped(
+    repo_path: &Path,
+    number: u32,
+    full: bool,
+    max_bytes: usize,
+) -> Result<String, String> {
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
@@ -657,7 +1069,7 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     }
     let output = run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?;
 
-    if !full || output.len() <= MAX_PR_DIFF_BYTES {
+    if !full || output.len() <= max_bytes {
         return Ok(output);
     }
 
@@ -665,14 +1077,14 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     // signpost what was cut so the agent doesn't silently miss
     // hunks. The trailing pointer mirrors `get_github_issue`'s
     // truncation marker.
-    let mut end = MAX_PR_DIFF_BYTES;
+    let mut end = max_bytes;
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
     Ok(format!(
         "{}\n\n[Diff truncated at {}KB — use `gh pr diff {}` for the full patch]",
         &output[..end],
-        MAX_PR_DIFF_BYTES / 1024,
+        max_bytes / 1024,
         number,
     ))
 }
@@ -861,7 +1273,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
 /// The `--json` field set every branch-PR query asks for. Shared by the
 /// per-branch lookup and the repo-wide fallback list so `parse_pr_json` can
 /// never be handed a row that is missing a field one caller relies on.
-const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner";
+const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,createdAt,headRefOid,headRepositoryOwner,author,body,changedFiles,mergeStateStatus,mergedBy,mergedAt,reviewRequests,latestReviews";
 
 /// The current branch's PR plus the branch context that produced it.
 ///
@@ -1376,32 +1788,430 @@ pub fn list_incoming_prs(
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
 
-// NOTE: As of 2026-04-26 the Review tab UI no longer exposes its own
-// merge controls — that section was removed in the visual-match PR
-// (`feature/review-tab-visual-match`). The Changes panel toolbar's
-// split-button merge dropdown still uses this command, so this is not
-// dead code; it's the active merge surface for Codemux. Comment kept
-// for future archeology in case someone wonders why the Review tab
-// doesn't have its own merge UI.
+/// The fields the listing asks for. Named rather than inlined so the
+/// split is one assertable string instead of a habit — a test can hold
+/// the expensive fields out of it, which is the only thing standing
+/// between this and someone adding "just one more field" back.
+pub const OVERVIEW_FAST_FIELDS: &str =
+    "number,title,author,headRefName,isDraft,updatedAt,reviewDecision,url,reviewRequests";
+
+/// The fields the stats call asks for — everything the listing refused.
+pub const OVERVIEW_STATS_FIELDS: &str = "number,statusCheckRollup,additions,deletions";
+
+/// Every open pull request in this repository — the fast half.
+///
+/// The fields here are the ones GitHub can serve straight off the pull
+/// request record: who, what, which branch, and who it is waiting on.
+/// Grouping rides along deliberately (`reviewRequests` + `author`), so
+/// "Needs your review" is correct in the first paint rather than after a
+/// second round trip — triage is the entire reason the page exists.
+///
+/// What is *not* here is `statusCheckRollup`, `additions` and
+/// `deletions`. Each of those is per-row work the host does on demand —
+/// an aggregate CI state computed across every check run, and a diff
+/// stat computed against the merge base — and together they dominate the
+/// call: measured across a dozen repositories the split listing returned
+/// in ~4.0s against ~7.1s for the combined one. The same reasoning
+/// already applied to `list_incoming_prs` above; this is that trade
+/// made for the page, with the difference that here the missing half is
+/// fetched immediately afterwards by `list_prs_overview_stats` and
+/// merged in, rather than dropped.
+pub fn list_prs_overview(repo_path: &Path) -> Result<Vec<PrOverviewItem>, String> {
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr", "list",
+            "--state", "open",
+            "--limit", "50",
+            "--json", OVERVIEW_FAST_FIELDS,
+        ],
+        INCOMING_PRS_TIMEOUT,
+    )?;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
+    let arr = v.as_array().ok_or("Expected JSON array from gh pr list")?;
+    Ok(arr.iter().map(parse_overview_pr_json).collect())
+}
+
+/// The slow half: CI rollup and line counts, keyed by pull request
+/// number so the page can merge it into rows that are already on screen.
+///
+/// Deliberately a second `gh pr list` rather than a per-pull-request
+/// call: the expensive fields are expensive per row either way, and one
+/// request that takes four seconds beats fifty that take one each.
+///
+/// Returning only what it was asked for — no titles, no authors — is
+/// also what makes the merge safe to write as "fill in the blanks": this
+/// payload has nothing in it that could overwrite something the user is
+/// already reading.
+pub fn list_prs_overview_stats(repo_path: &Path) -> Result<Vec<PrOverviewStats>, String> {
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr", "list",
+            "--state", "open",
+            "--limit", "50",
+            "--json", OVERVIEW_STATS_FIELDS,
+        ],
+        INCOMING_PRS_TIMEOUT,
+    )?;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
+    let arr = v.as_array().ok_or("Expected JSON array from gh pr list")?;
+    Ok(arr.iter().map(parse_overview_stats_json).collect())
+}
+
+/// `passing` / `failing` / `pending` / `none` — the four states a row
+/// can be drawn in, decided here so both products answer in the same
+/// vocabulary and the frontend never sees a raw check array.
+pub fn rollup_state(v: &serde_json::Value) -> String {
+    match summarize_checks_status(v).as_deref() {
+        Some("failure") => "failing".to_string(),
+        Some("pending") => "pending".to_string(),
+        Some("success") => "passing".to_string(),
+        _ => "none".to_string(),
+    }
+}
+
+fn parse_overview_pr_json(v: &serde_json::Value) -> PrOverviewItem {
+    PrOverviewItem {
+        number: v["number"].as_u64().unwrap_or(0) as u32,
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        author: v["author"]["login"].as_str().unwrap_or("").to_string(),
+        head_branch: v["headRefName"].as_str().map(|s| s.to_string()),
+        is_draft: v["isDraft"].as_bool().unwrap_or(false),
+        // The stats call fills these; the fast listing never asks.
+        additions: None,
+        deletions: None,
+        review_decision: v["reviewDecision"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        checks: None,
+        review_requested_from: parse_review_requests(&v["reviewRequests"]),
+        updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+        url: v["url"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+fn parse_overview_stats_json(v: &serde_json::Value) -> PrOverviewStats {
+    PrOverviewStats {
+        number: v["number"].as_u64().unwrap_or(0) as u32,
+        checks: rollup_state(&v["statusCheckRollup"]),
+        additions: v["additions"].as_u64().map(|n| n as u32),
+        deletions: v["deletions"].as_u64().map(|n| n as u32),
+    }
+}
+
+/// Merge a PR. Both the Review panel's merge sheet and the Changes
+/// panel toolbar go through here.
+///
+/// `delete_branch` used to be unconditional, which made the one
+/// irreversible action in the app also silently destroy the branch the
+/// user might still be standing in. The merge sheet asks now, so the
+/// answer has to be able to be "no".
+///
+/// `commit_title` / `commit_body` map to `--subject` / `--body`. gh
+/// rejects both on `--rebase` (there is no merge commit to title), so
+/// they are only passed for squash and merge commits.
 pub fn merge_pull_request(
     repo_path: &Path,
     pr_number: u32,
     method: &str,
+    delete_branch: bool,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
 ) -> Result<(), String> {
-    let number_str = pr_number.to_string();
+    let owned = merge_args(pr_number, method, delete_branch, commit_title, commit_body);
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+/// The flag assembly on its own, so the rebase rule can be tested
+/// without a repository or a `gh` on PATH.
+fn merge_args(
+    pr_number: u32,
+    method: &str,
+    delete_branch: bool,
+    commit_title: Option<&str>,
+    commit_body: Option<&str>,
+) -> Vec<String> {
     let method_flag = match method {
         "squash" => "--squash",
         "rebase" => "--rebase",
         _ => "--merge",
     };
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "merge".into(),
+        pr_number.to_string(),
+        method_flag.into(),
+    ];
+    if delete_branch {
+        args.push("--delete-branch".into());
+    }
+    let is_rebase = method == "rebase";
+    let title = commit_title.map(str::trim).filter(|s| !s.is_empty());
+    let body = commit_body.map(str::trim).filter(|s| !s.is_empty());
+    if !is_rebase {
+        if let Some(title) = title {
+            args.push("--subject".into());
+            args.push(title.into());
+        }
+        if let Some(body) = body {
+            args.push("--body".into());
+            args.push(body.into());
+        }
+    }
+    args
+}
+
+pub fn close_pull_request(repo_path: &Path, pr_number: u32) -> Result<(), String> {
+    run_gh(repo_path, &["pr", "close", &pr_number.to_string()])?;
+    Ok(())
+}
+
+pub fn reopen_pull_request(repo_path: &Path, pr_number: u32) -> Result<(), String> {
+    run_gh(repo_path, &["pr", "reopen", &pr_number.to_string()])?;
+    Ok(())
+}
+
+/// Flip draft ↔ ready. `gh pr ready --undo` is the documented way back
+/// to draft; there is no `gh pr draft`.
+pub fn set_pull_request_ready(
+    repo_path: &Path,
+    pr_number: u32,
+    ready: bool,
+) -> Result<(), String> {
+    let number_str = pr_number.to_string();
+    let mut args: Vec<&str> = vec!["pr", "ready", &number_str];
+    if !ready {
+        args.push("--undo");
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+/// Edit title and/or body. A `None` field is left untouched — passing
+/// an empty `--body` would erase a description the user never opened.
+pub fn update_pull_request(
+    repo_path: &Path,
+    pr_number: u32,
+    title: Option<&str>,
+    body: Option<&str>,
+) -> Result<(), String> {
+    let number_str = pr_number.to_string();
+    let mut args: Vec<&str> = vec!["pr", "edit", &number_str];
+    if let Some(title) = title {
+        args.push("--title");
+        args.push(title);
+    }
+    if let Some(body) = body {
+        args.push("--body");
+        args.push(body);
+    }
+    if args.len() == 3 {
+        // Nothing to change; `gh pr edit` with no field flags opens an
+        // interactive prompt, which would hang the blocking pool.
+        return Ok(());
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+pub fn request_pull_request_review(
+    repo_path: &Path,
+    pr_number: u32,
+    reviewer: &str,
+) -> Result<(), String> {
+    let reviewer = reviewer.trim();
+    if reviewer.is_empty() {
+        return Err("A reviewer name is required.".to_string());
+    }
     run_gh(
         repo_path,
-        &["pr", "merge", &number_str, method_flag, "--delete-branch"],
+        &[
+            "pr",
+            "edit",
+            &pr_number.to_string(),
+            "--add-reviewer",
+            reviewer,
+        ],
     )?;
     Ok(())
 }
 
-pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
+/// How many trailing log lines a failing check's excerpt keeps.
+const CHECK_LOG_EXCERPT_LINES: usize = 40;
+
+/// Best-effort tail of a failing check's log.
+///
+/// Deliberately forgiving: the excerpt is a nicety on the failing-check
+/// card, so every way this can come up empty (no matching run, a check
+/// that isn't a GitHub Actions job, `gh run view` refusing) returns
+/// `Ok("")` and the card renders without it. Only a hard CLI failure is
+/// an `Err`, and even that the UI treats as "no excerpt".
+pub fn get_check_log_excerpt(
+    repo_path: &Path,
+    pr_number: u32,
+    check_name: &str,
+) -> Result<String, String> {
+    let number_str = pr_number.to_string();
+    // Resolve the PR's head sha, then the failing workflow run on it.
+    // `gh run list` is branch/commit scoped, so this avoids fetching a
+    // run from an unrelated branch that happens to share a job name.
+    let Some(sha) = run_gh_optional(
+        repo_path,
+        &[
+            "pr", "view", &number_str, "--json", "headRefOid", "--jq", ".headRefOid",
+        ],
+    ) else {
+        return Ok(String::new());
+    };
+    let sha = sha.trim();
+    if sha.is_empty() {
+        return Ok(String::new());
+    }
+
+    let Some(runs) = run_gh_optional(
+        repo_path,
+        &[
+            "run",
+            "list",
+            "--commit",
+            sha,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,conclusion,name",
+            "--jq",
+            ".[] | select(.conclusion == \"failure\") | \"\\(.databaseId)\\t\\(.name)\"",
+        ],
+    ) else {
+        return Ok(String::new());
+    };
+
+    // A commit can fail several workflows at once, and the excerpt is
+    // shown under *one* named check. Handing back the first failing run
+    // regardless of name puts one workflow's log under another's card,
+    // which reads as a fact and is not one.
+    let Some(run_id) = pick_failing_run(&runs, check_name) else {
+        return Ok(String::new());
+    };
+
+    let Some(log) = run_gh_optional(repo_path, &["run", "view", &run_id, "--log-failed"]) else {
+        return Ok(String::new());
+    };
+
+    Ok(tail_check_log(&log, check_name))
+}
+
+/// Pick the failing run whose workflow name goes with `check_name`.
+///
+/// Rows arrive newest first as `databaseId\tname`. The names are related
+/// but not equal — a check is a job inside a workflow, so GitHub renders
+/// them as `CI / test (ubuntu)` against a workflow called `CI` — so the
+/// same prefix convention [`tail_check_log`] uses decides it, in either
+/// direction. No match is `None`: an unrelated run's log is worse than
+/// no log.
+///
+/// The *best* match wins, not the first one seen. Workflow names share
+/// prefixes all the time — `CI` and `CI-lint` in one repository is
+/// ordinary — and taking the first row meant a check called
+/// `CI-lint / job` was answered with `CI`'s log whenever `CI` happened to
+/// be newer. An exact name beats a prefix, and among prefixes the longest
+/// workflow name wins, because that is the most specific claim any row is
+/// making about this check.
+fn pick_failing_run(rows: &str, check_name: &str) -> Option<String> {
+    let needle = check_name.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    rows.lines()
+        .filter_map(|line| {
+            let (id, name) = line.split_once('\t')?;
+            let (id, name) = (id.trim(), name.trim());
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            let score = match_quality(name, needle)?;
+            Some((score, id.to_string()))
+        })
+        // `max_by_key` keeps the *last* maximum; rows arrive newest
+        // first, so the reversed index keeps the newest of an equally
+        // good set — the behaviour the first-match version had.
+        .enumerate()
+        .max_by_key(|(index, (score, _))| (*score, std::cmp::Reverse(*index)))
+        .map(|(_, (_, id))| id)
+}
+
+/// How well a workflow name answers for a check name, or `None` when it
+/// does not answer for it at all. Higher is better.
+fn match_quality(run_name: &str, check_name: &str) -> Option<(u8, usize)> {
+    let run = run_name.trim().to_ascii_lowercase();
+    let check = check_name.trim().to_ascii_lowercase();
+    if run == check {
+        return Some((2, run.len()));
+    }
+    if check.starts_with(&run) || run.starts_with(&check) {
+        // The longer workflow name is the more specific claim.
+        return Some((1, run.len()));
+    }
+    None
+}
+
+/// Trim a `gh run view --log-failed` dump to the interesting tail.
+///
+/// The dump prefixes every line with `job\tstep\ttimestamp `. Lines for
+/// the named job are preferred; when the name doesn't match anything
+/// (job names and check names diverge on matrix builds) the whole log's
+/// tail is used rather than returning nothing.
+fn tail_check_log(log: &str, check_name: &str) -> String {
+    let needle = check_name.trim();
+    let matching: Vec<&str> = if needle.is_empty() {
+        Vec::new()
+    } else {
+        log.lines().filter(|l| l.starts_with(needle)).collect()
+    };
+    let lines: Vec<&str> = if matching.is_empty() {
+        log.lines().collect()
+    } else {
+        matching
+    };
+    let start = lines.len().saturating_sub(CHECK_LOG_EXCERPT_LINES);
+    lines[start..]
+        .iter()
+        .map(|l| strip_log_prefix(l))
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drop the `job\tstep\t2026-01-01T00:00:00.000Z ` prefix gh puts on
+/// every log line, leaving the message the user actually wants to read.
+fn strip_log_prefix(line: &str) -> &str {
+    let rest = match line.rsplit_once('\t') {
+        Some((_, rest)) => rest,
+        None => line,
+    };
+    // The timestamp is the first whitespace-delimited token of what's
+    // left; it is only a prefix when it parses as one.
+    match rest.split_once(' ') {
+        Some((first, tail)) if first.len() >= 20 && first.contains('T') && first.ends_with('Z') => {
+            tail
+        }
+        _ => rest,
+    }
+}
+
+/// Checks for a pull request. `number = None` means "whatever PR the
+/// checked-out branch has", which is the panel's case; the Pull Requests
+/// page passes a number because the PR being read is very often not the
+/// one this checkout is standing on.
+pub fn get_pr_checks(repo_path: &Path, number: Option<u32>) -> Result<Vec<CheckInfo>, String> {
     // `gh pr checks --json` only accepts a specific field set:
     // bucket / completedAt / description / event / link / name /
     // startedAt / state / workflow. The previous version asked for
@@ -1426,13 +2236,15 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
     // (exit 1) or any have failed (exit 8) but still writes valid
     // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
     // on non-zero exit) and capture stdout regardless.
+    let number_str = number.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["pr", "checks"];
+    if let Some(number) = &number_str {
+        args.push(number);
+    }
+    args.extend_from_slice(&["--json", "name,state,bucket,link,startedAt,completedAt"]);
+
     let output = crate::execution::host_command("gh")
-        .args([
-            "pr",
-            "checks",
-            "--json",
-            "name,state,bucket,link,startedAt,completedAt",
-        ])
+        .args(&args)
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
@@ -1460,8 +2272,19 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
         .collect())
 }
 
-pub fn get_pr_review_comments(repo_path: &Path) -> Result<Vec<ReviewComment>, String> {
-    let output = run_gh_optional(repo_path, &["pr", "view", "--json", "reviews"]);
+/// Conversation-level reviews. `number = None` reads the current
+/// branch's PR; the Pull Requests page passes the selected one.
+pub fn get_pr_review_comments(
+    repo_path: &Path,
+    number: Option<u32>,
+) -> Result<Vec<ReviewComment>, String> {
+    let number_str = number.map(|n| n.to_string());
+    let mut args: Vec<&str> = vec!["pr", "view"];
+    if let Some(number) = &number_str {
+        args.push(number);
+    }
+    args.extend_from_slice(&["--json", "reviews"]);
+    let output = run_gh_optional(repo_path, &args);
     let Some(json_str) = output else {
         return Ok(Vec::new());
     };
@@ -1535,6 +2358,306 @@ pub fn get_pr_inline_comments(
         .collect())
 }
 
+// ── Review threads ──
+//
+// Three calls, and the first of them is the reason the other two exist.
+//
+// `GET /pulls/{n}/comments` — what `get_pr_inline_comments` above reads —
+// returns comments, not conversations: no thread id, no resolution state,
+// no "this no longer matches a line". Grouping it by `pull_request_review_id`
+// (which is what this surface used to do) reconstructs *who said it in one
+// sitting*, not *what is still open*, and those are different questions.
+// Only GraphQL's `reviewThreads` answers the second, so that is where the
+// thread list comes from.
+
+/// The comment selection both thread queries read, named once so the
+/// follow-up page and the first page cannot drift apart.
+const THREAD_COMMENT_NODES: &str = "nodes{id databaseId author{login} body createdAt}";
+
+/// How many long threads will be re-fetched in full. A pull request with
+/// more than this many hundred-comment threads is not a review surface
+/// any more, and the cap keeps a pathological one from firing a request
+/// storm at the host.
+const MAX_THREAD_COMMENT_REFETCHES: usize = 20;
+
+/// The thread query, written for `gh api graphql --paginate`.
+///
+/// `--paginate` requires exactly two things of a query: an `$endCursor`
+/// variable it can fill, and a `pageInfo` on the connection it should
+/// follow. Both are here, so a pull request with more than one page of
+/// threads yields one JSON document per page rather than a truncated
+/// first page.
+///
+/// `--paginate` can only follow *one* connection, and it follows the
+/// thread list. A thread's own comments therefore come back capped, and
+/// the `pageInfo` on them is how [`get_pr_review_threads`] learns which
+/// threads it has to ask about again.
+fn review_threads_query() -> String {
+    format!(
+        "\
+query($owner:String!,$name:String!,$number:Int!,$endCursor:String){{\
+repository(owner:$owner,name:$name){{\
+pullRequest(number:$number){{\
+reviewThreads(first:50,after:$endCursor){{\
+pageInfo{{hasNextPage endCursor}}\
+nodes{{id isResolved isOutdated path line \
+comments(first:100){{pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}}}}}"
+    )
+}
+
+/// Every comment on one thread, for the threads the first query could
+/// not finish. `--paginate` follows this connection because it is the
+/// only one in the document.
+fn thread_comments_query() -> String {
+    format!(
+        "\
+query($threadId:ID!,$endCursor:String){{\
+node(id:$threadId){{... on PullRequestReviewThread{{\
+comments(first:100,after:$endCursor){{\
+pageInfo{{hasNextPage endCursor}}{THREAD_COMMENT_NODES}}}}}}}}}"
+    )
+}
+
+/// Conversation threads on a pull request's diff, with their resolution
+/// state.
+pub fn get_pr_review_threads(
+    repo_path: &Path,
+    pr_number: u32,
+) -> Result<Vec<PrReviewThread>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let (owner, name) = nwo
+        .split_once('/')
+        .ok_or_else(|| format!("Unexpected repository name: {nwo}"))?;
+
+    // Deliberately `run_gh`, not `run_gh_optional`: a failed thread fetch
+    // has to reach the caller as an error so the surface keeps the
+    // threads it already has and says how old they are. An empty list
+    // means "no threads", and it may only ever mean that.
+    let json = run_gh(
+        repo_path,
+        &[
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            // Typed, so `number` arrives as the Int! the query declares.
+            "-F",
+            &format!("number={pr_number}"),
+            "-f",
+            &format!("query={}", review_threads_query()),
+        ],
+    )?;
+
+    let mut threads = parse_review_threads(&json);
+
+    // A thread longer than one page came back cut off. Best effort from
+    // here: a thread that keeps only its first page is still readable,
+    // so a failed follow-up costs that thread's tail, not the tab.
+    for thread_id in truncated_thread_ids(&json)
+        .into_iter()
+        .take(MAX_THREAD_COMMENT_REFETCHES)
+    {
+        let Some(thread) = threads.iter_mut().find(|t| t.id == thread_id) else {
+            continue;
+        };
+        let Ok(page) = run_gh(
+            repo_path,
+            &[
+                "api",
+                "graphql",
+                "--paginate",
+                "-f",
+                &format!("threadId={thread_id}"),
+                "-f",
+                &format!("query={}", thread_comments_query()),
+            ],
+        ) else {
+            continue;
+        };
+        let comments = parse_thread_comments(&page);
+        // Only ever a superset. A follow-up that came back shorter than
+        // what is already on screen is a bad answer, not a shorter
+        // thread.
+        if comments.len() > thread.comments.len() {
+            thread.comments = comments;
+        }
+    }
+
+    Ok(threads)
+}
+
+/// Ids of the threads whose comment connection reported another page.
+pub(crate) fn truncated_thread_ids(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for page in parse_paginated_array(json) {
+        let Some(nodes) =
+            page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array()
+        else {
+            continue;
+        };
+        for node in nodes {
+            if node["comments"]["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+                continue;
+            }
+            let id = node["id"].as_str().unwrap_or_default();
+            if !id.is_empty() {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// One comment node, mapped. Shared so the first page and the follow-up
+/// pages cannot disagree about what a comment is.
+fn parse_thread_comment(c: &serde_json::Value) -> PrThreadComment {
+    PrThreadComment {
+        id: c["id"].as_str().unwrap_or_default().to_string(),
+        database_id: c["databaseId"].as_u64(),
+        author: c["author"]["login"].as_str().unwrap_or("").to_string(),
+        body: c["body"].as_str().unwrap_or("").to_string(),
+        created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// Every comment in a `thread_comments_query` response, pagination and
+/// all.
+pub(crate) fn parse_thread_comments(json: &str) -> Vec<PrThreadComment> {
+    let mut out = Vec::new();
+    for page in parse_paginated_array(json) {
+        let Some(nodes) = page["data"]["node"]["comments"]["nodes"].as_array() else {
+            continue;
+        };
+        out.extend(
+            nodes
+                .iter()
+                .map(parse_thread_comment)
+                .filter(|c: &PrThreadComment| !c.body.is_empty()),
+        );
+    }
+    out
+}
+
+/// Map the GraphQL payload, pagination and all.
+///
+/// Split from the subprocess call so the shape can be tested against a
+/// recorded two-page payload: the parsing is the part that breaks, and
+/// the part a schema change would break silently.
+pub(crate) fn parse_review_threads(json: &str) -> Vec<PrReviewThread> {
+    let mut out = Vec::new();
+
+    for page in parse_paginated_array(json) {
+        let Some(nodes) =
+            page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array()
+        else {
+            continue;
+        };
+
+        for node in nodes {
+            let id = node["id"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() {
+                continue;
+            }
+
+            let comments: Vec<PrThreadComment> = node["comments"]["nodes"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .map(parse_thread_comment)
+                        .filter(|c: &PrThreadComment| !c.body.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // A thread with nothing readable in it is not a thread. It
+            // would render as an empty card with a Resolve button, which
+            // is the worst of both.
+            if comments.is_empty() {
+                continue;
+            }
+
+            out.push(PrReviewThread {
+                id,
+                is_resolved: node["isResolved"].as_bool().unwrap_or(false),
+                is_outdated: node["isOutdated"].as_bool().unwrap_or(false),
+                // Every GitHub review thread can be resolved.
+                is_resolvable: true,
+                path: node["path"].as_str().map(|s| s.to_string()),
+                line: node["line"].as_u64().map(|n| n as u32),
+                comments,
+            });
+        }
+    }
+
+    out
+}
+
+/// Post a reply into an existing thread.
+///
+/// REST, not the `addPullRequestReviewThreadReply` mutation, for one
+/// reason: this endpoint's semantics are unambiguous — the reply is
+/// created, published, and attributed to the caller, full stop. The
+/// mutation's `pullRequestReviewId` input is optional in the schema but
+/// its behaviour when omitted (does the reply publish, or does it sit in
+/// a pending review only the author can see?) is not something this build
+/// can verify against a live host, and a reply that silently lands in a
+/// draft review is exactly the failure this surface is supposed to make
+/// impossible. The thread payload already carries the comment's REST id,
+/// so the certain route costs nothing.
+pub fn reply_to_pr_thread(
+    repo_path: &Path,
+    pr_number: u32,
+    root_comment_id: u64,
+    body: &str,
+) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("A reply cannot be empty.".to_string());
+    }
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/comments/{root_comment_id}/replies");
+    let payload = serde_json::json!({ "body": body });
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &json,
+    )?;
+    Ok(())
+}
+
+/// Resolve or unresolve a thread.
+///
+/// GraphQL-only: resolution has no REST representation at all, in either
+/// direction.
+pub fn set_pr_thread_resolved(
+    repo_path: &Path,
+    thread_id: &str,
+    resolved: bool,
+) -> Result<(), String> {
+    let mutation = if resolved {
+        "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
+    } else {
+        "mutation($threadId:ID!){unresolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
+    };
+
+    run_gh(
+        repo_path,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={mutation}"),
+            "-f",
+            &format!("threadId={thread_id}"),
+        ],
+    )?;
+    Ok(())
+}
+
 // NOTE: As of 2026-04-26 the Review tab UI no longer exposes review
 // submission — the composer was removed in the visual-match PR
 // (`feature/review-tab-visual-match`) in favour of a quieter resting
@@ -1560,6 +2683,180 @@ pub fn submit_pr_review(
     }
     run_gh(repo_path, &args)?;
     Ok(())
+}
+
+/// One pending line note, in the coordinates GitHub's modern review API
+/// speaks: a file, a side, and a line number on that side.
+///
+/// Not the legacy `position` (an offset into the patch text): position
+/// is only meaningful against one exact diff, so a comment written a
+/// second before a push lands somewhere arbitrary. `line` + `side` are
+/// content coordinates and the host re-resolves them itself.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct PrDraftComment {
+    /// Path of the file the note is on.
+    pub file: String,
+    pub body: String,
+    /// `LEFT` (a deleted line) or `RIGHT` (added or context).
+    pub side: String,
+    /// Last line of the selection.
+    pub line: u32,
+    /// First line of a multi-line selection; absent for one line.
+    #[serde(default)]
+    pub start_line: Option<u32>,
+}
+
+impl PrDraftComment {
+    fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "path": self.file,
+            "body": self.body,
+            "side": self.side,
+            "line": self.line,
+        });
+        if let Some(start) = self.start_line {
+            v["start_line"] = serde_json::json!(start);
+            // A range can't straddle sides, so the start side is always
+            // the end side; sending it makes that explicit to the API.
+            v["start_side"] = serde_json::json!(self.side);
+        }
+        v
+    }
+}
+
+/// Run `gh` with a JSON body on stdin.
+///
+/// `gh api -f k=v` can only build flat string fields, and a review
+/// carries an array of comment objects. `--input -` is the only way to
+/// post a real JSON document in one command.
+fn run_gh_stdin(repo_path: &Path, args: &[&str], stdin: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = crate::execution::host_command("gh");
+    cmd.args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Keep DBus available — see `check_gh_status` rationale.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to run gh: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("gh stdin unavailable")?
+        .write_all(stdin.as_bytes())
+        .map_err(|e| format!("Failed to write to gh: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for gh: {e}"))?;
+
+    gh_exit_result(
+        args.first().unwrap_or(&""),
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Post one inline comment immediately, outside any review.
+///
+/// `commit_id` must be the head the diff on screen was rendered from. A
+/// stale one does not fail: GitHub accepts it and pins the comment to
+/// the superseded commit, where it shows as outdated and nobody reads
+/// it. The caller re-anchors before calling this, and that is the only
+/// reason it is safe.
+pub fn add_pr_inline_comment(
+    repo_path: &Path,
+    pr_number: u32,
+    comment: &PrDraftComment,
+    commit_id: &str,
+) -> Result<(), String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/comments");
+    let mut payload = comment.to_json();
+    payload["commit_id"] = serde_json::json!(commit_id);
+    let body = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &body,
+    )?;
+    Ok(())
+}
+
+fn review_event(event: &str) -> &'static str {
+    match event {
+        "approve" => "APPROVE",
+        "request-changes" => "REQUEST_CHANGES",
+        _ => "COMMENT",
+    }
+}
+
+/// Submit a review and all of its line notes as one request.
+///
+/// One request because the alternative — a review plus N comment posts
+/// — can half-succeed, and a half-sent review is visible to the author
+/// while the reviewer still thinks it's a draft. GitHub makes this
+/// all-or-nothing: a single unresolvable line 422s the whole call and
+/// nothing is created. The caller validates every anchor locally first
+/// so that 422 is a bug, not a workflow.
+pub fn submit_pr_review_with_comments(
+    repo_path: &Path,
+    pr_number: u32,
+    event: &str,
+    body: &str,
+    comments: &[PrDraftComment],
+    commit_id: &str,
+) -> Result<(), String> {
+    if comments.is_empty() {
+        // No line notes: the plain `gh pr review` path stays exactly as
+        // it was, including its handling of an empty body.
+        return submit_pr_review(repo_path, pr_number, event, body);
+    }
+
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{nwo}/pulls/{pr_number}/reviews");
+    let payload = serde_json::json!({
+        "commit_id": commit_id,
+        "body": body,
+        "event": review_event(event),
+        "comments": comments.iter().map(|c| c.to_json()).collect::<Vec<_>>(),
+    });
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+
+    run_gh_stdin(
+        repo_path,
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &json,
+    )
+    .map_err(|e| {
+        if is_stale_anchor_error(&e) {
+            "One of your notes no longer matches a line on this branch — re-anchor and try again.".to_string()
+        } else {
+            e
+        }
+    })?;
+    Ok(())
+}
+
+/// Whether a review 422 means "an anchor went stale between the local
+/// check and the send".
+///
+/// GitHub does not have one sentence for this. The modern
+/// `line`/`start_line` API rejects a line that has moved with
+/// `pull_request_review_thread.line must be part of the diff` and a range
+/// that no longer sits in one hunk with `… must be part of the same
+/// hunk`; the legacy `position` API said `Line could not be resolved`.
+/// All three are the same event to the reviewer, and the message they
+/// need is the same: re-anchor.
+fn is_stale_anchor_error(error: &str) -> bool {
+    error.contains("Line could not be resolved")
+        || error.contains("must be part of the diff")
+        || error.contains("must be part of the same hunk")
 }
 
 pub fn get_pr_deployments(
@@ -1668,11 +2965,71 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
             .filter(|s| !s.is_empty()),
         // Detail-only fields. List paths leave these None / empty so
         // the cheap query stays cheap.
-        body: None,
+        body: v["body"]
+            .as_str()
+            .map(truncate_pr_body)
+            .filter(|s| !s.is_empty()),
         comments: Vec::new(),
         total_comments: 0,
         author,
+        created_at: v["createdAt"].as_str().map(|s| s.to_string()),
+        merge_state_status: v["mergeStateStatus"].as_str().map(|s| s.to_string()),
+        changed_files: v["changedFiles"].as_u64().map(|n| n as u32),
+        merged_by: v["mergedBy"]["login"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
+        merged_at: v["mergedAt"].as_str().map(|s| s.to_string()),
+        review_requests: parse_review_requests(&v["reviewRequests"]),
+        latest_reviews: parse_latest_reviews(&v["latestReviews"]),
     }
+}
+
+/// Truncate a PR body at [`MAX_ISSUE_BODY_BYTES`] on a char boundary.
+fn truncate_pr_body(body: &str) -> String {
+    if body.len() <= MAX_ISSUE_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ISSUE_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n[Description truncated]", &body[..end])
+}
+
+/// `reviewRequests` is a list of requested reviewers; a team request has
+/// `name` where a user request has `login`. Both are worth naming.
+fn parse_review_requests(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    r["login"]
+                        .as_str()
+                        .or_else(|| r["name"].as_str())
+                        .or_else(|| r["slug"].as_str())
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_latest_reviews(v: &serde_json::Value) -> Vec<PrReviewSummary> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let author = r["author"]["login"].as_str().filter(|s| !s.is_empty())?;
+                    Some(PrReviewSummary {
+                        author: author.to_string(),
+                        state: r["state"].as_str().unwrap_or("COMMENTED").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn summarize_checks_status(v: &serde_json::Value) -> Option<String> {
@@ -1794,12 +3151,19 @@ mod tests {
             review_decision: None,
             checks_passing: None,
             updated_at: Some(updated_at.into()),
+            created_at: None,
             head_ref_oid: head_ref_oid.map(|s| s.to_string()),
             head_repository_owner: None,
             body: None,
             comments: Vec::new(),
             total_comments: 0,
             author: None,
+            merge_state_status: None,
+            changed_files: None,
+            merged_by: None,
+            merged_at: None,
+            review_requests: Vec::new(),
+            latest_reviews: Vec::new(),
         }
     }
 
@@ -2390,6 +3754,7 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
             review_decision: Some("APPROVED".into()),
             checks_passing: None,
             updated_at: Some("2026-04-27T00:00:00Z".into()),
+            created_at: Some("2026-04-26T00:00:00Z".into()),
             head_ref_oid: Some("deadbeef".into()),
             head_repository_owner: Some("zeus".into()),
             body: Some("PR body here".into()),
@@ -2400,6 +3765,15 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
             }],
             total_comments: 1,
             author: Some("zeus".into()),
+            merge_state_status: Some("CLEAN".into()),
+            changed_files: Some(3),
+            merged_by: None,
+            merged_at: None,
+            review_requests: vec!["juliusm".into()],
+            latest_reviews: vec![PrReviewSummary {
+                author: "alice".into(),
+                state: "APPROVED".into(),
+            }],
         };
         let json = serde_json::to_string(&pr).unwrap();
         assert!(json.contains("\"totalComments\":1"));
@@ -2910,5 +4284,619 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
     fn test_summarize_checks_status_null() {
         let v = serde_json::Value::Null;
         assert_eq!(summarize_checks_status(&v), None);
+    }
+
+    // ── Timeline mapping ──
+
+    /// A recorded slice of `GET /issues/{n}/timeline`, including an event
+    /// type this build has never heard of.
+    fn timeline_fixture() -> Vec<serde_json::Value> {
+        serde_json::from_str(
+            r#"[
+              {"event":"commented","id":1001,"user":{"login":"juliusm"},
+               "created_at":"2026-08-16T09:00:00Z","body":"Worth a line here saying so."},
+              {"event":"reviewed","id":1002,"user":{"login":"juliusm"},"state":"changes_requested",
+               "submitted_at":"2026-08-16T09:05:00Z","body":"The discoverability leg is a follow-up."},
+              {"event":"committed","sha":"a1f9c2e5d","author":{"name":"Zeus-Deus","date":"2026-08-16T09:30:00Z"},
+               "message":"fix: address review\n\nlonger body that must not appear"},
+              {"event":"head_ref_force_pushed","id":1004,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T09:45:00Z","commit_id":"bb31d70"},
+              {"event":"review_requested","id":1005,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T09:50:00Z","requested_reviewer":{"login":"octocat"}},
+              {"event":"renamed","id":1006,"actor":{"login":"Zeus-Deus"},"created_at":"2026-08-16T09:55:00Z",
+               "rename":{"from":"wip: thing","to":"feat: thing"}},
+              {"event":"merged","id":1007,"actor":{"login":"Zeus-Deus"},"created_at":"2026-08-16T10:00:00Z",
+               "commit_id":"ff00aa1"},
+              {"event":"automatic_base_change_succeeded","id":1008,"actor":{"login":"Zeus-Deus"},
+               "created_at":"2026-08-16T10:05:00Z"},
+              {"event":"commented","id":1009,"user":{"login":"ghost"},
+               "created_at":"2026-08-16T10:06:00Z","body":"   "}
+            ]"#,
+        )
+        .expect("fixture must parse")
+    }
+
+    #[test]
+    fn every_event_maps_to_a_renderable_variant() {
+        let events = map_github_timeline(&timeline_fixture());
+        let kinds: Vec<&PrTimelineEventKind> = events.iter().map(|e| &e.kind).collect();
+
+        assert!(matches!(kinds[0], PrTimelineEventKind::Commented { body } if body == "Worth a line here saying so."));
+        assert!(
+            matches!(kinds[1], PrTimelineEventKind::Reviewed { verdict, .. } if verdict == "CHANGES_REQUESTED"),
+            "the verdict is upper-cased so the UI has one vocabulary"
+        );
+        // Only the subject line: a commit body in a rail entry pushes
+        // everything after it off the screen.
+        assert!(
+            matches!(kinds[2], PrTimelineEventKind::Committed { sha, message }
+                if sha == "a1f9c2e5d" && message == "fix: address review"),
+        );
+        assert!(matches!(kinds[3], PrTimelineEventKind::HeadRefForcePushed { sha } if sha.as_deref() == Some("bb31d70")));
+        assert!(matches!(kinds[4], PrTimelineEventKind::ReviewRequested { reviewer } if reviewer.as_deref() == Some("octocat")));
+        assert!(matches!(kinds[5], PrTimelineEventKind::Renamed { to, .. } if to == "feat: thing"));
+        assert!(matches!(kinds[6], PrTimelineEventKind::Merged { .. }));
+    }
+
+    /// The rule that keeps the tab honest as GitHub grows event types:
+    /// never dropped, never a parse failure, always a readable label.
+    #[test]
+    fn an_unknown_event_survives_as_a_labelled_one_liner() {
+        let events = map_github_timeline(&timeline_fixture());
+        let unknown = events
+            .iter()
+            .find(|e| matches!(e.kind, PrTimelineEventKind::Other { .. }))
+            .expect("the unknown event must not be dropped");
+        let PrTimelineEventKind::Other { label } = &unknown.kind else {
+            unreachable!()
+        };
+        assert_eq!(label, "automatic base change succeeded");
+        assert_eq!(unknown.actor.as_deref(), Some("Zeus-Deus"));
+    }
+
+    /// The force-push row is what ties the timeline to re-anchoring, so
+    /// it gets its own assertion rather than riding on the sweep above.
+    #[test]
+    fn the_force_push_event_is_present_and_carries_its_sha() {
+        let events = map_github_timeline(&timeline_fixture());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, PrTimelineEventKind::HeadRefForcePushed { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_emptied_comment_is_not_history() {
+        let events = map_github_timeline(&timeline_fixture());
+        assert!(
+            !events.iter().any(|e| e.actor.as_deref() == Some("ghost")),
+            "a whitespace-only comment is a deletion artefact"
+        );
+    }
+
+    #[test]
+    fn event_ids_are_unique_even_when_the_host_reuses_one() {
+        // Two rows sharing an id would collapse into one React key and
+        // one of them would silently stop rendering.
+        let rows: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"event":"closed","id":7},{"event":"reopened","id":7}]"#,
+        )
+        .unwrap();
+        let events = map_github_timeline(&rows);
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].id, events[1].id);
+    }
+
+    /// `--paginate` concatenates one array per page; a naive parse would
+    /// keep page one and drop the rest.
+    #[test]
+    fn paginated_pages_are_flattened_rather_than_truncated() {
+        let joined = r#"[{"event":"closed","id":1}][{"event":"reopened","id":2}]"#;
+        assert_eq!(parse_paginated_array(joined).len(), 2);
+    }
+
+    // gh moved `auth status` output from stderr to stdout across major
+    // versions; the viewer login must parse from either stream, and a
+    // missing login must yield None rather than an empty-string viewer
+    // (an empty viewer silently files every PR under Watching).
+    #[test]
+    fn auth_status_username_parses_modern_stdout_shape() {
+        let out = "github.com\n  \u{2713} Logged in to github.com account Zeus-Deus (keyring)\n  - Active account: true\n";
+        assert_eq!(
+            parse_auth_status_username(out).as_deref(),
+            Some("Zeus-Deus")
+        );
+    }
+
+    #[test]
+    fn auth_status_username_parses_legacy_stderr_shape() {
+        let err = "Logged in to github.com account octocat (oauth_token)\n";
+        assert_eq!(parse_auth_status_username(err).as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn auth_status_username_ignores_unrelated_account_mentions() {
+        assert_eq!(
+            parse_auth_status_username("error: account suspended, contact support\n"),
+            None
+        );
+        assert_eq!(parse_auth_status_username(""), None);
+    }
+
+    // ── The fast/slow split ──────────────────────────────────────────
+    //
+    // The listing's whole value is what it does *not* ask for, and that
+    // is invisible at the call site — it looks like a comma-separated
+    // string either way. These tests are the thing that notices when a
+    // field quietly moves back across the line.
+
+    #[test]
+    fn overview_listing_omits_the_expensive_fields() {
+        assert!(
+            !OVERVIEW_FAST_FIELDS.contains("statusCheckRollup"),
+            "the rollup is per-row work the host does on demand; it belongs in the stats call"
+        );
+        assert!(!OVERVIEW_FAST_FIELDS.contains("additions"));
+        assert!(!OVERVIEW_FAST_FIELDS.contains("deletions"));
+    }
+
+    #[test]
+    fn overview_listing_keeps_the_fields_grouping_needs() {
+        // Triage is the reason the page exists, so "Needs your review"
+        // has to be right in the first paint — which means the author
+        // and the requested reviewers ride the fast call, not the slow
+        // one.
+        for field in ["number", "title", "author", "reviewRequests", "url"] {
+            assert!(
+                OVERVIEW_FAST_FIELDS.contains(field),
+                "the listing must carry {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_stats_asks_for_exactly_what_the_listing_refused() {
+        assert!(OVERVIEW_STATS_FIELDS.contains("statusCheckRollup"));
+        assert!(OVERVIEW_STATS_FIELDS.contains("additions"));
+        assert!(OVERVIEW_STATS_FIELDS.contains("deletions"));
+        // Keyed by number so the page can merge it into rows it has
+        // already drawn.
+        assert!(OVERVIEW_STATS_FIELDS.contains("number"));
+    }
+
+    #[test]
+    fn overview_item_leaves_the_unasked_fields_unanswered() {
+        let json = serde_json::json!({
+            "number": 285,
+            "title": "Fix the installer",
+            "author": {"login": "juliusm"},
+            "headRefName": "fix/installer",
+            "isDraft": false,
+            "updatedAt": "2026-08-16T10:00:00Z",
+            "reviewDecision": "APPROVED",
+            "url": "https://github.com/u/r/pull/285",
+            "reviewRequests": [{"login": "mock-dev"}]
+        });
+        let item = parse_overview_pr_json(&json);
+
+        assert_eq!(item.number, 285);
+        assert_eq!(item.author, "juliusm");
+        assert_eq!(item.review_requested_from, vec!["mock-dev".to_string()]);
+        // None, not "none": nobody has asked yet, which is a different
+        // claim from "this pull request runs no checks".
+        assert_eq!(item.checks, None);
+        assert_eq!(item.additions, None);
+        assert_eq!(item.deletions, None);
+    }
+
+    #[test]
+    fn overview_stats_parses_the_rollup_into_one_word() {
+        let json = serde_json::json!([
+            {
+                "number": 1,
+                "additions": 12,
+                "deletions": 3,
+                "statusCheckRollup": [
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}
+                ]
+            },
+            {
+                "number": 2,
+                "additions": 0,
+                "deletions": 0,
+                "statusCheckRollup": [
+                    {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null}
+                ]
+            },
+            {
+                "number": 3,
+                "additions": 4,
+                "deletions": 4,
+                "statusCheckRollup": [
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ]
+            },
+            {"number": 4, "additions": null, "deletions": null, "statusCheckRollup": []}
+        ]);
+        let stats: Vec<PrOverviewStats> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(parse_overview_stats_json)
+            .collect();
+
+        assert_eq!(stats[0].checks, "failing");
+        assert_eq!(stats[0].additions, Some(12));
+        assert_eq!(stats[0].deletions, Some(3));
+        assert_eq!(stats[1].checks, "pending");
+        assert_eq!(stats[2].checks, "passing");
+        // An empty rollup is a host that answered: no checks configured.
+        assert_eq!(stats[3].checks, "none");
+        assert_eq!(stats[3].additions, None);
+    }
+
+    #[test]
+    fn overview_stats_survives_a_row_with_nothing_in_it() {
+        let stats = parse_overview_stats_json(&serde_json::json!({}));
+        assert_eq!(stats.number, 0);
+        assert_eq!(stats.checks, "none");
+        assert_eq!(stats.additions, None);
+    }
+
+    // ── Review threads ──
+
+    /// One page of the GraphQL payload, shaped exactly as
+    /// `gh api graphql` returns it (a `data` envelope per page).
+    fn thread_page(cursor_threads: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{cursor_threads}]}}}}}}}}}}"#
+        )
+    }
+
+    const UNRESOLVED_THREAD: &str = r#"{
+        "id":"PRRT_kwDOA","isResolved":false,"isOutdated":false,
+        "path":"src/stores/draft-store.ts","line":84,
+        "comments":{"nodes":[
+          {"id":"PRRC_1","databaseId":8001,"author":{"login":"juliusm"},
+           "body":"Worth a comment on why this survives a reload.","createdAt":"2026-08-16T09:00:00Z"},
+          {"id":"PRRC_2","databaseId":8002,"author":{"login":"mock-dev"},
+           "body":"Added one.","createdAt":"2026-08-16T09:10:00Z"}
+        ]}}"#;
+
+    const RESOLVED_OUTDATED_THREAD: &str = r#"{
+        "id":"PRRT_kwDOB","isResolved":true,"isOutdated":true,
+        "path":"src/pty/mod.rs","line":null,
+        "comments":{"nodes":[
+          {"id":"PRRC_3","databaseId":8003,"author":{"login":"juliusm"},
+           "body":"This close is on the wrong path.","createdAt":"2026-08-16T08:00:00Z"}
+        ]}}"#;
+
+    #[test]
+    fn threads_carry_resolution_state_and_their_comments() {
+        let threads = parse_review_threads(&thread_page(UNRESOLVED_THREAD));
+        assert_eq!(threads.len(), 1);
+        let thread = &threads[0];
+        assert_eq!(thread.id, "PRRT_kwDOA");
+        assert!(!thread.is_resolved);
+        assert!(!thread.is_outdated);
+        // Every GitHub thread can be resolved, so the button is never
+        // drawn against a host that would refuse it.
+        assert!(thread.is_resolvable);
+        assert_eq!(thread.path.as_deref(), Some("src/stores/draft-store.ts"));
+        assert_eq!(thread.line, Some(84));
+        assert_eq!(thread.comments.len(), 2);
+        // The REST id rides along: it is what the reply endpoint
+        // addresses and what the UI dedupes the flat list against.
+        assert_eq!(thread.comments[0].database_id, Some(8001));
+        assert_eq!(thread.comments[0].author, "juliusm");
+    }
+
+    #[test]
+    fn an_outdated_resolved_thread_keeps_both_facts() {
+        let threads = parse_review_threads(&thread_page(RESOLVED_OUTDATED_THREAD));
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].is_resolved);
+        assert!(threads[0].is_outdated);
+        // A thread whose lines left the diff has no line, and that is
+        // not an error — it is the definition of outdated.
+        assert_eq!(threads[0].line, None);
+    }
+
+    /// `--paginate` concatenates one *object* per page here (the timeline
+    /// case concatenates arrays). Reading only the first would silently
+    /// hide every thread past the fiftieth.
+    #[test]
+    fn every_page_of_threads_is_read() {
+        let joined = format!(
+            "{}\n{}",
+            thread_page(UNRESOLVED_THREAD),
+            thread_page(RESOLVED_OUTDATED_THREAD)
+        );
+        let threads = parse_review_threads(&joined);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "PRRT_kwDOA");
+        assert_eq!(threads[1].id, "PRRT_kwDOB");
+    }
+
+    /// A thread with nothing readable in it would render as an empty
+    /// card with a Resolve button — worse than not rendering.
+    #[test]
+    fn a_thread_with_no_readable_comment_is_dropped() {
+        let empty = r#"{"id":"PRRT_kwDOC","isResolved":false,"isOutdated":false,
+            "path":null,"line":null,"comments":{"nodes":[
+            {"id":"PRRC_9","databaseId":9,"author":{"login":"ghost"},"body":"","createdAt":""}]}}"#;
+        assert!(parse_review_threads(&thread_page(empty)).is_empty());
+    }
+
+    /// A payload that is not the shape we expect yields no threads
+    /// rather than a panic: the surface then keeps its last good data.
+    #[test]
+    fn an_unexpected_payload_yields_no_threads() {
+        assert!(parse_review_threads("{}").is_empty());
+        assert!(parse_review_threads("not json at all").is_empty());
+    }
+
+    /// `--paginate` follows the thread list, not each thread's comments,
+    /// so a thread past the comment page size comes back cut off. Which
+    /// threads those are has to be readable from the payload, or the
+    /// missing comments are missing silently.
+    #[test]
+    fn a_thread_that_reports_more_comments_is_marked_for_a_follow_up() {
+        let truncated = r#"{"id":"PRRT_long","isResolved":false,"isOutdated":false,
+            "path":"src/a.rs","line":1,"comments":{
+              "pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29y"},
+              "nodes":[{"id":"PRRC_1","databaseId":1,"author":{"login":"a"},
+                        "body":"first","createdAt":"2026-08-16T09:00:00Z"}]}}"#;
+        let complete = r#"{"id":"PRRT_short","isResolved":false,"isOutdated":false,
+            "path":"src/b.rs","line":2,"comments":{
+              "pageInfo":{"hasNextPage":false,"endCursor":null},
+              "nodes":[{"id":"PRRC_2","databaseId":2,"author":{"login":"b"},
+                        "body":"only","createdAt":"2026-08-16T09:00:00Z"}]}}"#;
+
+        let json = thread_page(&format!("{truncated},{complete}"));
+        assert_eq!(truncated_thread_ids(&json), vec!["PRRT_long".to_string()]);
+
+        // A payload without the connection's pageInfo at all (an older
+        // recorded response) claims nothing rather than everything.
+        assert!(truncated_thread_ids(&thread_page(UNRESOLVED_THREAD)).is_empty());
+    }
+
+    /// The follow-up query's own pages, which is where the comments past
+    /// the first hundred actually live.
+    #[test]
+    fn the_follow_up_reads_every_page_of_one_threads_comments() {
+        let page = |id: &str, body: &str| {
+            format!(
+                r#"{{"data":{{"node":{{"comments":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},
+                "nodes":[{{"id":"{id}","databaseId":7,"author":{{"login":"juliusm"}},
+                "body":"{body}","createdAt":"2026-08-16T09:00:00Z"}}]}}}}}}}}"#
+            )
+        };
+        let joined = format!("{}\n{}", page("PRRC_100", "hundredth"), page("PRRC_101", "hundred-and-first"));
+        let comments = parse_thread_comments(&joined);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1].id, "PRRC_101");
+        assert_eq!(comments[1].author, "juliusm");
+
+        // Same forgiveness as the thread parser: an unusable payload is
+        // no comments, never a panic.
+        assert!(parse_thread_comments("{}").is_empty());
+        assert!(parse_thread_comments("not json at all").is_empty());
+    }
+
+    // ── Failing-check log excerpt ──
+
+    /// A commit can fail several workflows at once. The excerpt is shown
+    /// under one named check, so the run has to be the one that check
+    /// came from — another workflow's log reads as a fact about this
+    /// check and is not one.
+    #[test]
+    fn the_failing_run_is_matched_to_the_check_that_asked() {
+        let rows = "111\tDeploy\n222\tCI\n333\tNightly";
+        // Check names are `workflow / job`, so the workflow name is a
+        // prefix of the check name.
+        assert_eq!(
+            pick_failing_run(rows, "CI / test (ubuntu-latest)").as_deref(),
+            Some("222")
+        );
+        // And the other direction, for hosts that report the bare name.
+        assert_eq!(pick_failing_run(rows, "Deploy").as_deref(), Some("111"));
+        // Case is not a distinction anybody makes here.
+        assert_eq!(pick_failing_run(rows, "nightly").as_deref(), Some("333"));
+    }
+
+    /// Workflow names share prefixes all the time. `CI` and `CI-lint` in
+    /// one repository is ordinary, and taking the first matching row put
+    /// `CI`'s log under a `CI-lint` card whenever `CI` was newer — which
+    /// reads as a fact about the failing check and is not one.
+    #[test]
+    fn the_more_specific_workflow_name_wins_a_shared_prefix() {
+        let rows = "111\tCI\n222\tCI-lint";
+        assert_eq!(
+            pick_failing_run(rows, "CI-lint / job").as_deref(),
+            Some("222")
+        );
+        // Order of the rows is not what decides it.
+        let reversed = "222\tCI-lint\n111\tCI";
+        assert_eq!(
+            pick_failing_run(reversed, "CI-lint / job").as_deref(),
+            Some("222")
+        );
+        // The less specific check still finds its own workflow.
+        assert_eq!(pick_failing_run(rows, "CI / test").as_deref(), Some("111"));
+        // An exact name beats a longer one that merely shares a prefix.
+        assert_eq!(pick_failing_run(rows, "CI").as_deref(), Some("111"));
+    }
+
+    /// Two runs of the same workflow both match; the newest is the one
+    /// the page is showing, and `gh` lists newest first.
+    #[test]
+    fn the_newest_of_two_equally_good_rows_is_kept() {
+        let rows = "999\tCI\n111\tCI";
+        assert_eq!(pick_failing_run(rows, "CI / test").as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_not_offered_as_this_checks_log() {
+        let rows = "111\tDeploy\n222\tCI";
+        assert_eq!(pick_failing_run(rows, "Lint"), None);
+        // Nothing to match against is also no match — not "the first
+        // one".
+        assert_eq!(pick_failing_run(rows, "   "), None);
+        assert_eq!(pick_failing_run("", "CI"), None);
+        // A malformed row is skipped, not treated as an id.
+        assert_eq!(pick_failing_run("no-tab-here\n222\tCI", "CI").as_deref(), Some("222"));
+    }
+
+    #[test]
+    fn the_excerpt_keeps_the_named_jobs_tail_without_its_prefixes() {
+        let log = "\
+build\tcompile\t2026-08-16T09:00:00.000Z warming up
+test\trun\t2026-08-16T09:00:01.000Z running 3 tests
+test\trun\t2026-08-16T09:00:02.000Z assertion failed: left == right
+build\tcompile\t2026-08-16T09:00:03.000Z done";
+        let excerpt = tail_check_log(log, "test");
+        assert_eq!(excerpt, "running 3 tests\nassertion failed: left == right");
+    }
+
+    /// Job names and check names diverge on matrix builds, and an empty
+    /// card is worse than a slightly wider one.
+    #[test]
+    fn a_check_name_that_matches_no_job_falls_back_to_the_whole_log() {
+        let log = "build\tcompile\t2026-08-16T09:00:00.000Z warming up\n\
+                   build\tcompile\t2026-08-16T09:00:01.000Z boom";
+        assert_eq!(tail_check_log(log, "nothing-like-this"), "warming up\nboom");
+        assert_eq!(tail_check_log(log, ""), "warming up\nboom");
+    }
+
+    #[test]
+    fn the_excerpt_is_capped_at_its_tail() {
+        let log: String = (0..CHECK_LOG_EXCERPT_LINES + 10)
+            .map(|i| format!("job\tstep\t2026-08-16T09:00:00.000Z line {i}\n"))
+            .collect();
+        let excerpt = tail_check_log(&log, "job");
+        assert_eq!(excerpt.lines().count(), CHECK_LOG_EXCERPT_LINES);
+        assert!(excerpt.starts_with("line 10"), "{excerpt}");
+    }
+
+    #[test]
+    fn only_a_real_timestamp_prefix_is_stripped() {
+        assert_eq!(
+            strip_log_prefix("job\tstep\t2026-08-16T09:00:00.000Z hello world"),
+            "hello world"
+        );
+        // A line whose last tab-separated field is not a timestamp keeps
+        // every word of itself.
+        assert_eq!(strip_log_prefix("job\tstep\tnot a timestamp"), "not a timestamp");
+        assert_eq!(strip_log_prefix("no tabs at all"), "no tabs at all");
+    }
+
+    // ── Merge arguments ──
+
+    #[test]
+    fn a_merge_commits_subject_and_body_are_passed_through() {
+        assert_eq!(
+            merge_args(7, "merge", true, Some("Ship it"), Some("Because.")),
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--merge",
+                "--delete-branch",
+                "--subject",
+                "Ship it",
+                "--body",
+                "Because."
+            ]
+        );
+        // Squash takes the same two flags; only the strategy changes.
+        let squash = merge_args(7, "squash", false, Some("Ship it"), None);
+        assert_eq!(squash[3], "--squash");
+        assert!(!squash.contains(&"--delete-branch".to_string()));
+        assert_eq!(squash[squash.len() - 2..], ["--subject", "Ship it"]);
+    }
+
+    /// `gh pr merge --rebase` rejects `--subject` and `--body`: a rebase
+    /// produces no merge commit for them to title.
+    #[test]
+    fn a_rebase_carries_no_commit_message_flags() {
+        let args = merge_args(7, "rebase", true, Some("Ship it"), Some("Because."));
+        assert_eq!(args, vec!["pr", "merge", "7", "--rebase", "--delete-branch"]);
+    }
+
+    /// A blank field is the sheet's default, not an instruction to title
+    /// the commit with whitespace.
+    #[test]
+    fn blank_message_fields_are_left_off_entirely() {
+        assert_eq!(
+            merge_args(7, "merge", false, Some("   "), Some("")),
+            vec!["pr", "merge", "7", "--merge"]
+        );
+        assert_eq!(
+            merge_args(7, "merge", false, None, None),
+            vec!["pr", "merge", "7", "--merge"]
+        );
+        // An unrecognised strategy is a merge commit, never a rebase.
+        assert_eq!(merge_args(7, "wat", false, None, None)[3], "--merge");
+    }
+
+    // ── Draft comment payloads ──
+
+    fn draft(start_line: Option<u32>) -> PrDraftComment {
+        PrDraftComment {
+            file: "src/lib.rs".to_string(),
+            body: "This allocates twice.".to_string(),
+            side: "RIGHT".to_string(),
+            line: 42,
+            start_line,
+        }
+    }
+
+    #[test]
+    fn a_single_line_note_sends_content_coordinates_only() {
+        let payload = draft(None).to_json();
+        assert_eq!(payload["path"], "src/lib.rs");
+        assert_eq!(payload["body"], "This allocates twice.");
+        assert_eq!(payload["side"], "RIGHT");
+        assert_eq!(payload["line"], 42);
+        // No range, so no range keys — GitHub rejects a `start_line`
+        // that equals `line`.
+        assert!(payload.get("start_line").is_none());
+        assert!(payload.get("start_side").is_none());
+        // The legacy patch offset is never sent: it is only meaningful
+        // against one exact diff.
+        assert!(payload.get("position").is_none());
+    }
+
+    /// A range cannot straddle sides, so the start side is the end side
+    /// — and saying so explicitly is what keeps GitHub from guessing.
+    #[test]
+    fn a_multi_line_note_sends_both_ends_on_one_side() {
+        let payload = draft(Some(38)).to_json();
+        assert_eq!(payload["start_line"], 38);
+        assert_eq!(payload["start_side"], "RIGHT");
+        assert_eq!(payload["line"], 42);
+        assert_eq!(payload["side"], "RIGHT");
+    }
+
+    /// The 422 a reviewer can act on, in every wording GitHub has used
+    /// for it — the modern `line`/`start_line` API does not say "Line
+    /// could not be resolved" at all.
+    #[test]
+    fn a_stale_anchor_is_recognised_in_every_wording() {
+        assert!(is_stale_anchor_error(
+            "HTTP 422: pull_request_review_thread.line must be part of the diff"
+        ));
+        assert!(is_stale_anchor_error(
+            "HTTP 422: pull_request_review_thread.start_line must be part of the same hunk"
+        ));
+        assert!(is_stale_anchor_error("Line could not be resolved"));
+        // An unrelated failure keeps its own words; replacing them would
+        // send the reviewer re-anchoring notes that are fine.
+        assert!(!is_stale_anchor_error("HTTP 403: Resource not accessible"));
     }
 }

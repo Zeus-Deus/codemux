@@ -1,8 +1,23 @@
-import { useRef, useCallback, useImperativeHandle, forwardRef } from "react";
+import { useRef, useCallback, useImperativeHandle, forwardRef, Fragment } from "react";
 import type { DiffLine } from "@/lib/diff-parser";
+import { cn } from "@/lib/utils";
+import {
+  diffRowStyle,
+  lineNumberOn,
+  sideOf,
+  SELECTED_NUMBER_CLASS,
+  SELECTED_ROW_CLASS,
+  type DiffSelection,
+} from "./diff-row";
 
 interface Props {
   lines: DiffLine[];
+  /** Line review. Absent on the Changes pane, which only reads. */
+  selection?: DiffSelection;
+  /** Render at natural height inside someone else's scroll container —
+   *  what a per-file review section needs, since a PR is one scroll
+   *  through many files rather than one scrollbar per file. */
+  flow?: boolean;
 }
 
 export interface DiffViewHandle {
@@ -10,7 +25,7 @@ export interface DiffViewHandle {
 }
 
 export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
-  function DiffUnifiedView({ lines }, ref) {
+  function DiffUnifiedView({ lines, selection, flow = false }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const scrollToHunk = useCallback(
       (direction: 1 | -1) => {
@@ -32,14 +47,27 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
 
     useImperativeHandle(ref, () => ({ scrollToHunk }), [scrollToHunk]);
 
+    // Review's taller row and slightly larger gutter, or the Changes
+    // pane's original density.
+    const rowHeight = flow ? "min-h-[22px]" : "min-h-[18px]";
+    const gutterSize = flow ? "text-[12px]" : "text-[11px]";
+
     return (
       <div
         ref={containerRef}
         // `relative` is load-bearing: it makes this the offsetParent, so each
         // hunk's offsetTop is a scroll position rather than a page coordinate
         // measured from the app shell above the toolbar.
-        className="code-surface select-text relative flex-1 overflow-auto bg-card"
+        className={
+          flow
+            ? "code-surface select-text bg-card"
+            : "code-surface select-text relative flex-1 overflow-auto bg-card"
+        }
       >
+        {/* Review reads a diff the way you read prose — top to bottom,
+            many files, deciding as you go — so its rows get the taller
+            leading. The Changes pane is a working surface you scrub, and
+            keeps the tighter one. */}
         <div className="py-0.5">
           {lines.map((line, i) => {
             if (line.type === "hunk-header") {
@@ -47,69 +75,88 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                 <div
                   key={i}
                   data-diff-hunk
-                  className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0"
+                  className={cn(
+                    "flex bg-muted/30 whitespace-pre mt-1 first:mt-0",
+                    rowHeight,
+                  )}
                 >
                   <span className="w-[72px] shrink-0" />
-                  <span className="text-muted-foreground/60 text-[11px] px-3">
+                  <span className={cn("text-muted-foreground/60 px-3", gutterSize)}>
                     {line.content}
                   </span>
                 </div>
               );
             }
 
-            // Conflict marker detection
-            const isOursMarker = line.content.startsWith("<<<<<<<");
-            const isSeparator = line.content.startsWith("=======") && !line.content.startsWith("========");
-            const isTheirsMarker = line.content.startsWith(">>>>>>>");
-            const isConflictMarker = isOursMarker || isSeparator || isTheirsMarker;
+            const style = diffRowStyle(line);
+            const side = sideOf(line);
+            const lineNo = lineNumberOn(line, side);
+            const selectable = !!selection && lineNo != null;
+            const selected = selectable && selection.isSelected(line, side);
+            const under = selection?.renderUnder?.(line, side);
 
-            const bgClass = isOursMarker
-              ? "bg-primary/15 border-l-2 border-primary"
-              : isTheirsMarker
-                ? "bg-accent-violet/15 border-l-2 border-accent-violet"
-                : isSeparator
-                  ? "bg-muted/40 border-l-2 border-muted-foreground"
-                  : line.type === "add"
-                    ? "bg-success/10"
-                    : line.type === "del"
-                      ? "bg-danger/10"
-                      : "";
-
-            const prefixChar =
-              line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
-
-            const prefixColor = isConflictMarker
-              ? "text-muted-foreground"
-              : line.type === "add"
-                ? "text-success"
-                : line.type === "del"
-                  ? "text-danger"
-                  : "text-muted-foreground";
+            const numberClass = cn(
+              "inline-block w-[36px] text-right pr-2 tabular-nums",
+              gutterSize,
+              selected ? SELECTED_NUMBER_CLASS : "text-muted-foreground",
+            );
 
             return (
-              <div
-                key={i}
-                className={`flex min-h-[18px] whitespace-pre ${bgClass}`}
-              >
-                <span className="flex w-[72px] shrink-0 select-none">
-                  <span className="inline-block w-[36px] text-right pr-2 text-[11px] text-muted-foreground tabular-nums">
-                    {line.oldLine ?? ""}
-                  </span>
-                  <span className="inline-block w-[36px] text-right pr-2 text-[11px] text-muted-foreground tabular-nums">
-                    {line.newLine ?? ""}
-                  </span>
-                </span>
-                <span
-                  className={`inline-block w-4 shrink-0 text-center select-none ${prefixColor}`}
+              <Fragment key={i}>
+                <div
+                  data-diff-row={selectable ? `${side}:${lineNo}` : undefined}
+                  data-selected={selected ? "true" : undefined}
+                  className={cn(
+                    "flex whitespace-pre",
+                    rowHeight,
+                    selected ? SELECTED_ROW_CLASS : style.bgClass,
+                  )}
                 >
-                  {prefixChar}
-                </span>
-                <span className="flex-1 min-w-0 pr-4">
-                  {isOursMarker && <span className="text-[9px] font-bold text-primary mr-2">OURS</span>}
-                  {isTheirsMarker && <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>}
-                  {line.content}
-                </span>
-              </div>
+                  {/* The gutter is the click target, not the row: dragging
+                      across code to copy it must stay a text selection. */}
+                  <span
+                    data-diff-line={selectable ? `${side}:${lineNo}` : undefined}
+                    className={cn(
+                      "flex w-[72px] shrink-0 select-none",
+                      selectable && "cursor-pointer hover:bg-accent-ember/10",
+                    )}
+                    onMouseDown={
+                      selectable
+                        ? (e) => {
+                            // Shift-click extends; without this the browser
+                            // paints a text selection over the whole range.
+                            if (e.shiftKey) e.preventDefault();
+                          }
+                        : undefined
+                    }
+                    onClick={
+                      selectable
+                        ? (e) => selection.onSelect(line, side, e.shiftKey)
+                        : undefined
+                    }
+                  >
+                    <span className={numberClass}>{line.oldLine ?? ""}</span>
+                    <span className={numberClass}>{line.newLine ?? ""}</span>
+                  </span>
+                  <span
+                    className={`inline-block w-4 shrink-0 text-center select-none ${style.prefixColor}`}
+                  >
+                    {style.prefixChar}
+                  </span>
+                  <span className="flex-1 min-w-0 pr-4">
+                    {style.isOursMarker && (
+                      <span className="text-[9px] font-bold text-primary mr-2">OURS</span>
+                    )}
+                    {style.isTheirsMarker && (
+                      <span className="text-[9px] font-bold text-accent-violet mr-2">
+                        THEIRS
+                      </span>
+                    )}
+                    {line.content}
+                  </span>
+                </div>
+                {under}
+              </Fragment>
             );
           })}
         </div>

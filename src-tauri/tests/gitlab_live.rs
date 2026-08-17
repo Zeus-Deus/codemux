@@ -346,7 +346,7 @@ fn gitlab_adapter_round_trips_against_a_live_instance() {
     seed_discussions(dir, number);
 
     let threads = provider
-        .pull_request_review_comments(dir)
+        .pull_request_review_comments(dir, None)
         .expect("review threads");
     let thread = threads
         .iter()
@@ -407,7 +407,7 @@ fn gitlab_adapter_round_trips_against_a_live_instance() {
         );
     }
 
-    let checks = provider.pull_request_checks(dir).expect("checks");
+    let checks = provider.pull_request_checks(dir, None).expect("checks");
     let by_name: HashMap<&str, &codemux_lib::github::CheckInfo> =
         checks.iter().map(|c| (c.name.as_str(), c)).collect();
     assert_eq!(
@@ -509,7 +509,7 @@ fn gitlab_adapter_round_trips_against_a_live_instance() {
     // ── Merge, and the state round trip ──
 
     provider
-        .merge_pull_request(dir, number, "merge")
+        .merge_pull_request(dir, number, "merge", true, None, None)
         .expect("merge");
 
     let merged = provider.get_pull_request(dir, number).expect("get merged");

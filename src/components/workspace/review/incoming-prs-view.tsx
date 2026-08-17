@@ -10,9 +10,10 @@ import {
   GitPullRequest,
   X,
 } from "lucide-react";
-import { listIncomingPrs, createWorktreeWorkspace } from "@/tauri/commands";
-import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import { listIncomingPrs } from "@/tauri/commands";
+import { checkOutPr } from "@/lib/pr-checkout";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import type { IncomingPrItem, WorkspaceSnapshot } from "@/tauri/types";
@@ -22,6 +23,8 @@ import {
   resolveProvider,
   type ProviderPresentation,
 } from "@/lib/source-control";
+import { cn } from "@/lib/utils";
+import { tzBody, tzEyebrow, tzMeta, tzRowTitle } from "./review-ui";
 
 // ── Module-level cache ──
 //
@@ -101,84 +104,139 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
   const handleCheckout = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      if (existingWs) {
-        await activateWorkspaceInteraction(existingWs.workspace_id);
-      } else if (pr.head_branch) {
-        await createWorktreeWorkspace(projectRoot, pr.head_branch, false, "single", null, null, null, pr.number);
-      }
+      // Same helper the Pull Requests page's rows use, so "Switch"
+      // means the same thing on both surfaces.
+      await checkOutPr({
+        projectRoot,
+        headBranch: pr.head_branch,
+        prNumber: pr.number,
+        existingWorkspaceId: existingWs?.workspace_id ?? null,
+      });
     } catch (err) {
       console.warn("[incoming-prs] checkout failed:", err);
       toast.error(String(err));
     }
   };
 
+  /**
+   * Clicking a row opens it on the Pull Requests page.
+   *
+   * It used to switch workspaces when one happened to exist and do
+   * nothing at all when one didn't — so the same gesture meant two
+   * different things depending on state the user can't see. Reading is
+   * what a click means on the page, and now it means that here too;
+   * checking out stays an explicit button.
+   */
+  const openOnPage = () => {
+    useUIStore.getState().setShowPullRequests(true, {
+      projectRoot,
+      number: pr.number,
+    });
+  };
+
   const review = pr.review_decision ? REVIEW_LABELS[pr.review_decision] : null;
 
   return (
     <div
-      className="group px-2.5 py-1.5 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
-      onClick={() => { if (existingWs) activateWorkspaceInteraction(existingWs.workspace_id).catch(console.error); }}
+      className="group px-2.5 py-2 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
+      onClick={openOnPage}
     >
-      <div className="flex items-center gap-1.5 min-w-0 h-5">
+      <div className="flex items-center gap-1.5 min-w-0 h-[22px]">
         <ChecksIndicator status={pr.checks_status} />
-        <span className="text-muted-foreground/60 font-mono text-[11px] tabular-nums shrink-0">{providerRef(provider, pr.number)}</span>
-        <span className={`truncate flex-1 min-w-0 text-xs ${pr.is_draft ? "italic text-muted-foreground" : "text-foreground"}`}>
+        <span
+          className={cn(
+            "text-muted-foreground/60 font-mono tabular-nums shrink-0",
+            tzBody,
+          )}
+        >
+          {providerRef(provider, pr.number)}
+        </span>
+        <span
+          className={cn(
+            "truncate flex-1 min-w-0",
+            tzRowTitle,
+            pr.is_draft ? "italic text-muted-foreground" : "text-foreground",
+          )}
+        >
           {pr.title}
         </span>
         {pr.is_draft && (
-          <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none shrink-0">
+          <Badge
+            variant="outline"
+            className={cn("h-[17px] px-1.5 leading-none shrink-0", tzEyebrow)}
+          >
             Draft
           </Badge>
         )}
         {review && (
-          <span className={`text-[10px] shrink-0 ${review.cls}`}>{review.label}</span>
+          <span className={cn("shrink-0", tzMeta, review.cls)}>{review.label}</span>
         )}
       </div>
 
-      {/* Bottom row pins to h-5 so the hover-swap (text spans →
-          buttons) doesn't reflow the row height — both states share
-          the button height. */}
-      <div className="flex items-center gap-1.5 mt-0.5 min-w-0 h-5">
-        <span className="text-[10px] text-muted-foreground/60 shrink-0">{pr.author}</span>
+      {/* The trailing slot is a fixed box that holds both states at
+          once: the stats at rest, the buttons on hover, the buttons
+          stacked over the stats rather than replacing them in the flow.
+          Swapping them inline made the wider hover state re-truncate the
+          branch name beside it, so every row you passed over twitched. */}
+      <div className="flex items-center gap-1.5 mt-1 min-w-0 h-[22px]">
+        <span className={cn("text-muted-foreground/60 shrink-0", tzMeta)}>{pr.author}</span>
         {pr.head_branch && (
-          <span className="text-[10px] text-muted-foreground/40 font-mono truncate min-w-0">{pr.head_branch}</span>
+          <span
+            className={cn("text-muted-foreground/40 font-mono truncate min-w-0", tzMeta)}
+          >
+            {pr.head_branch}
+          </span>
         )}
 
-        <span className="flex items-center gap-1.5 shrink-0 group-hover:hidden ml-auto tabular-nums">
-          {pr.additions != null && pr.additions > 0 && (
-            <span className="text-[10px] font-mono text-success">+{pr.additions}</span>
-          )}
-          {pr.deletions != null && pr.deletions > 0 && (
-            <span className="text-[10px] font-mono text-danger">&minus;{pr.deletions}</span>
-          )}
-          {pr.updated_at && (
-            <span className="text-[10px] text-muted-foreground/60">{formatRelativeTime(pr.updated_at)}</span>
-          )}
-        </span>
+        <span
+          data-testid="incoming-pr-action-slot"
+          className="relative ml-auto flex h-[22px] w-[136px] shrink-0 items-center justify-end"
+        >
+          <span className="flex items-center gap-1.5 tabular-nums group-hover:invisible">
+            {pr.additions != null && pr.additions > 0 && (
+              <span className={cn("font-mono text-success", tzMeta)}>+{pr.additions}</span>
+            )}
+            {pr.deletions != null && pr.deletions > 0 && (
+              <span className={cn("font-mono text-danger", tzMeta)}>
+                &minus;{pr.deletions}
+              </span>
+            )}
+            {pr.updated_at && (
+              <span className={cn("text-muted-foreground/60", tzMeta)}>
+                {formatRelativeTime(pr.updated_at)}
+              </span>
+            )}
+          </span>
 
-        <span className="hidden group-hover:flex items-center gap-0.5 shrink-0 ml-auto">
-          <Button
-            size="xs"
-            variant="ghost"
-            className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
-            onClick={handleView}
-            title={`View on ${provider.name}`}
-          >
-            <ExternalLink className="h-2.5 w-2.5 mr-0.5" />
-            View
-          </Button>
-          {pr.head_branch && (
+          <span className="invisible absolute inset-y-0 right-0 flex items-center gap-0.5 group-hover:visible">
             <Button
               size="xs"
               variant="ghost"
-              className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
-              onClick={handleCheckout}
-              title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
+              tabIndex={-1}
+              className={cn("h-[22px] px-2 text-muted-foreground hover:text-foreground", tzMeta)}
+              onClick={handleView}
+              title={`View on ${provider.name}`}
             >
-              <GitBranch className="h-2.5 w-2.5 mr-0.5" />
-              {existingWs ? "Switch" : "Checkout"}
+              <ExternalLink className="h-3 w-3 mr-0.5" />
+              View
             </Button>
-          )}
+            {pr.head_branch && (
+              <Button
+                size="xs"
+                variant="ghost"
+                tabIndex={-1}
+                className={cn(
+                  "h-[22px] px-2 text-muted-foreground hover:text-foreground",
+                  tzMeta,
+                )}
+                onClick={handleCheckout}
+                title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
+              >
+                <GitBranch className="h-3 w-3 mr-0.5" />
+                {existingWs ? "Switch" : "Checkout"}
+              </Button>
+            )}
+          </span>
         </span>
       </div>
     </div>
@@ -267,11 +325,11 @@ export function IncomingPrsView({
   return (
     <div className="flex flex-col">
       <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
-        <span className="text-[11px] font-medium text-muted-foreground tracking-wide truncate">
+        <span className={cn("font-medium text-muted-foreground tracking-wide truncate", tzBody)}>
           {provider.nounTitleCase}s
         </span>
         {!loading && prs.length > 0 && (
-          <span className="ml-1.5 text-[10px] tabular-nums text-muted-foreground/60">
+          <span className={cn("ml-1.5 tabular-nums text-muted-foreground/60", tzMeta)}>
             {prs.length}
           </span>
         )}
@@ -279,7 +337,12 @@ export function IncomingPrsView({
 
       <div className="px-1.5 pt-1.5 pb-3">
         {error && (
-          <div className="mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
+          <div
+            className={cn(
+              "mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2.5 py-2 text-danger",
+              tzBody,
+            )}
+          >
             <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
             <span className="break-words">{error}</span>
           </div>
@@ -300,7 +363,7 @@ export function IncomingPrsView({
         {!loading && !error && prs.length === 0 && (
           <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
             <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
-            <p className="text-[11px]">No open {provider.nounPlural}</p>
+            <p className={tzBody}>No open {provider.nounPlural}</p>
           </div>
         )}
 
@@ -317,7 +380,10 @@ export function IncomingPrsView({
             ))}
             {prs.length >= 50 && (
               <button
-                className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2.5 py-1 mt-1 transition-colors text-left"
+                className={cn(
+                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors text-left",
+                  tzMeta,
+                )}
                 onClick={() => {
                   const repoUrl = changeRequestListUrl(provider, prs[0]?.url);
                   if (repoUrl) openUrl(repoUrl);

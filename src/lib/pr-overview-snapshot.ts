@@ -1,0 +1,272 @@
+/**
+ * The last list you saw, kept so the next cold start has something to
+ * paint while the host is still being asked.
+ *
+ * Binding rule 2 says stale and labelled beats blank. Across an app
+ * restart the alternative to stale is not "fresh" — it is an empty page
+ * for as long as `gh` takes to answer, once per repository root. So the
+ * merged rows are written to `localStorage` after every clean refresh
+ * and read back synchronously on mount; the queries revalidate behind
+ * them, and the header says how old what you are looking at is.
+ *
+ * Four rules keep that from turning into a different kind of lie:
+ *
+ * - **Only the default view is written.** A snapshot taken while the
+ *   dropdown said "Closed" would hydrate the next session's Open list
+ *   with merged pull requests.
+ * - **Only a clean refresh is written.** If any root failed, the row set
+ *   is missing a repository, and a partial list restored as if it were
+ *   whole is worse than no list.
+ * - **The key is the identity of the source set.** Close a project and
+ *   the set of roots changes, so the key changes, so yesterday's rows
+ *   for a repository you no longer have open cannot come back.
+ * - **Every field is validated on read.** This is the one input the app
+ *   takes from a place a user (or an older build, or a half-finished
+ *   write) can put arbitrary text into. Anything that doesn't match the
+ *   shape is dropped silently — a corrupt snapshot costs a cold start,
+ *   never a crash.
+ */
+
+import type { PrRow } from "@/lib/pr-overview";
+
+/** Bumped when the row shape changes in a way an old snapshot can't
+ *  satisfy. Old versions are rejected by the validator, not migrated:
+ *  the cost of being wrong is a blank first paint, and the cost of
+ *  migrating wrong is a list that says things that aren't true. */
+export const PR_SNAPSHOT_VERSION = 1;
+
+/** The key namespace. Versioned separately from the payload because the
+ *  two can change for different reasons: this moves if the *keying*
+ *  scheme changes, `PR_SNAPSHOT_VERSION` moves if the row shape does. */
+const KEY_PREFIX = "codemux:pr-overview:v1:";
+
+/**
+ * How many rows a snapshot keeps.
+ *
+ * The list renders at most 200 and the fetch caps at 50 per root, so 99
+ * is a first paint deep enough to include everything grouped above the
+ * fold on any realistic project set, and small enough that the parse is
+ * imperceptible on a path that runs before the first frame.
+ */
+export const PR_SNAPSHOT_MAX_ROWS = 99;
+
+export interface PrOverviewSnapshot {
+  version: number;
+  /** When the refresh this came from completed. The page's age label. */
+  savedAt: number;
+  rows: PrRow[];
+  viewerByRoot: Record<string, string | null>;
+}
+
+/**
+ * FNV-1a over the sorted root paths.
+ *
+ * A hash rather than the paths themselves for two reasons: a key is
+ * bounded in length whatever the project set is, and the storage of a
+ * desktop app stops enumerating the user's home directory to anything
+ * that can read it.
+ */
+function hashRoots(roots: readonly string[]): string {
+  const joined = [...roots].sort().join("\u0000");
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < joined.length; i++) {
+    hash ^= joined.charCodeAt(i);
+    // FNV prime, via shifts so this stays in 32-bit integer arithmetic.
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/** The storage key for one set of project roots. */
+export function prSnapshotKey(roots: readonly string[]): string {
+  return `${KEY_PREFIX}${hashRoots(roots)}`;
+}
+
+/** `localStorage`, or null where there isn't one (SSR, a locked-down
+ *  webview, a browser with storage disabled). Never throws. */
+function storage(): Storage | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+// ── Validation ────────────────────────────────────────────────────────
+//
+// Hand-rolled rather than a schema library: the repository has no
+// validation dependency, and the shape is nine fields. Every helper
+// answers for one field, so a drifted row is rejected at the field that
+// drifted rather than by a `try`/`catch` around the whole parse.
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+const isString = (v: unknown): v is string => typeof v === "string";
+
+const isOptionalString = (v: unknown): v is string | null => v === null || isString(v);
+
+const isFiniteNumber = (v: unknown): v is number =>
+  typeof v === "number" && Number.isFinite(v);
+
+const isOptionalNumber = (v: unknown): v is number | null => v === null || isFiniteNumber(v);
+
+const isStringArray = (v: unknown): v is string[] =>
+  Array.isArray(v) && v.every(isString);
+
+/**
+ * One row, or null.
+ *
+ * The two fields that decide a row's identity — `projectRoot` and
+ * `number` — are required and typed strictly, because a row that can't
+ * be keyed can't be replaced by fresh data later, and would sit on the
+ * page forever.
+ */
+function validateRow(value: unknown): PrRow | null {
+  if (!isRecord(value)) return null;
+  if (!isFiniteNumber(value.number)) return null;
+  if (!isString(value.projectRoot) || value.projectRoot === "") return null;
+  if (!isString(value.title)) return null;
+  if (!isString(value.author)) return null;
+  if (!isString(value.url)) return null;
+  if (!isString(value.providerKind)) return null;
+  if (!isOptionalString(value.head_branch)) return null;
+  if (!isOptionalString(value.review_decision)) return null;
+  if (!isOptionalString(value.updated_at)) return null;
+  if (!isOptionalString(value.repo)) return null;
+  if (!isOptionalString(value.checks)) return null;
+  if (typeof value.is_draft !== "boolean") return null;
+  if (!isOptionalNumber(value.additions)) return null;
+  if (!isOptionalNumber(value.deletions)) return null;
+  if (!isStringArray(value.review_requested_from)) return null;
+  if (value.state !== undefined && !isString(value.state)) return null;
+
+  return {
+    number: value.number,
+    title: value.title,
+    author: value.author,
+    head_branch: value.head_branch,
+    is_draft: value.is_draft,
+    additions: value.additions,
+    deletions: value.deletions,
+    review_decision: value.review_decision,
+    checks: value.checks,
+    review_requested_from: [...value.review_requested_from],
+    updated_at: value.updated_at,
+    url: value.url,
+    projectRoot: value.projectRoot,
+    repo: value.repo,
+    providerKind: value.providerKind,
+    ...(isString(value.state) ? { state: value.state } : {}),
+    // Set here, never trusted from storage: everything read back is
+    // carried by definition, and a snapshot claiming otherwise would
+    // let stale rows through the guards that keep them from raising
+    // toasts.
+    carried: true,
+  };
+}
+
+function validateSnapshot(value: unknown): PrOverviewSnapshot | null {
+  if (!isRecord(value)) return null;
+  if (value.version !== PR_SNAPSHOT_VERSION) return null;
+  if (!isFiniteNumber(value.savedAt) || value.savedAt <= 0) return null;
+  if (!Array.isArray(value.rows)) return null;
+  if (!isRecord(value.viewerByRoot)) return null;
+
+  const viewerByRoot: Record<string, string | null> = {};
+  for (const [root, viewer] of Object.entries(value.viewerByRoot)) {
+    if (!isOptionalString(viewer)) return null;
+    viewerByRoot[root] = viewer;
+  }
+
+  // One bad row rejects the snapshot rather than being skipped. A list
+  // that is quietly one row short is the failure mode this whole file
+  // exists to avoid, and there is a correct fallback available: fetch.
+  const rows: PrRow[] = [];
+  for (const raw of value.rows) {
+    const row = validateRow(raw);
+    if (!row) return null;
+    rows.push(row);
+  }
+
+  return { version: PR_SNAPSHOT_VERSION, savedAt: value.savedAt, rows, viewerByRoot };
+}
+
+// ── Read / write ──────────────────────────────────────────────────────
+
+/** The snapshot for this set of roots, or null if there isn't a valid
+ *  one. Never throws, never partially applies. */
+export function readPrOverviewSnapshot(
+  roots: readonly string[],
+): PrOverviewSnapshot | null {
+  const store = storage();
+  if (!store || roots.length === 0) return null;
+  let raw: string | null = null;
+  try {
+    raw = store.getItem(prSnapshotKey(roots));
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    return validateSnapshot(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record a clean refresh of the default view.
+ *
+ * Callers gate on "every root answered and none failed"; this function
+ * enforces the rest — the cap, and blanking the carried flag so a
+ * snapshot can never be written from a snapshot and pin an age that
+ * stopped being true hours ago.
+ */
+export function writePrOverviewSnapshot(
+  roots: readonly string[],
+  rows: readonly PrRow[],
+  viewerByRoot: ReadonlyMap<string, string | null>,
+  now = Date.now(),
+): void {
+  const store = storage();
+  if (!store || roots.length === 0) return;
+
+  const snapshot: PrOverviewSnapshot = {
+    version: PR_SNAPSHOT_VERSION,
+    savedAt: now,
+    rows: rows.slice(0, PR_SNAPSHOT_MAX_ROWS).map((row) => {
+      const { carried: _carried, ...rest } = row;
+      return rest;
+    }),
+    viewerByRoot: Object.fromEntries(viewerByRoot),
+  };
+
+  try {
+    store.setItem(prSnapshotKey(roots), JSON.stringify(snapshot));
+  } catch {
+    // Quota, private mode, a disabled store: the next paint is a cold
+    // one, which is exactly where we were before this file existed.
+  }
+}
+
+/** Forget the snapshot for one root set, or every snapshot when no roots
+ *  are named — what the dev trigger calls to test the cold path. */
+export function clearPrOverviewSnapshot(roots?: readonly string[]): void {
+  const store = storage();
+  if (!store) return;
+  try {
+    if (roots && roots.length > 0) {
+      store.removeItem(prSnapshotKey(roots));
+      return;
+    }
+    const keys: string[] = [];
+    for (let i = 0; i < store.length; i++) {
+      const key = store.key(i);
+      if (key?.startsWith(KEY_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) store.removeItem(key);
+  } catch {
+    // Nothing to clear if the store won't talk to us.
+  }
+}

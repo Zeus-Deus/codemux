@@ -50,6 +50,10 @@ export interface GitSyncSettings {
  *  backend provider detection. Edited in Settings → Source Control. */
 export interface SourceControlSyncSettings {
   custom_hosts: Record<string, string>;
+  /** Opt out of routing host pull-request links to the Pull Requests
+   *  page. Absent on payloads written before the setting existed, which
+   *  is why every reader defaults it to `false`. */
+  open_pr_links_in_browser?: boolean;
 }
 
 /** One hosting product's readiness, from `discover_source_control`.
@@ -106,7 +110,107 @@ export interface ProviderAuthStatus {
   authenticated: boolean;
   /** Account the CLI reports, when it names one. Never a token. */
   username: string | null;
+  /** What may be *done* here, per operation — see `ProviderOperations`. */
+  operations: ProviderOperations;
 }
+
+/** Mirrors src-tauri/src/git_provider/provider.rs:OperationCapabilities.
+ *
+ *  The gate every review control renders from. Distinct from
+ *  `ProviderCapabilities`, which describes what a host *has* (an issue
+ *  tracker, inline comments as a concept); this describes what this build
+ *  of Codemux can actually perform against it. Only the second one may
+ *  draw a button.
+ *
+ *  All-false is the correct answer for an unverified host, not a
+ *  degraded one: the backend refuses undeclared operations, so a host
+ *  that declares nothing is read-only by construction. Never widen these
+ *  from a hostname on the frontend — the declaration has one home, and it
+ *  is the adapter. */
+export interface ProviderOperations {
+  list_read: boolean;
+  comment: boolean;
+  approve: boolean;
+  request_changes: boolean;
+  line_comments: boolean;
+  merge_with_strategies: boolean;
+  draft_ready_close_reopen: boolean;
+  checks_status: boolean;
+  timeline: boolean;
+  /** Post a reply into an existing review thread. */
+  thread_reply: boolean;
+  /** Flip a review thread's resolved state, both ways. */
+  thread_resolve: boolean;
+}
+
+/** Mirrors src-tauri/src/github.rs:PrThreadComment. */
+export interface PrThreadComment {
+  /** Host-stable id — GitHub's node id, GitLab's note number as text. */
+  id: string;
+  /** The same comment's REST id, when the host has one. The join key the
+   *  flat inline-comment list is deduped against, and the resource
+   *  GitHub's reply endpoint addresses. */
+  database_id: number | null;
+  author: string;
+  body: string;
+  created_at: string;
+}
+
+/** Mirrors src-tauri/src/github.rs:PrReviewThread.
+ *
+ *  The unit a reviewer actually works in: a conversation with a place in
+ *  the diff and a state. The flat `InlineReviewComment` list cannot say
+ *  whether anything is still open, which is why this exists alongside it
+ *  rather than instead of it. */
+export interface PrReviewThread {
+  id: string;
+  is_resolved: boolean;
+  /** The lines this was written against left the diff. Labelled, never
+   *  hidden — an outdated objection is still an objection. */
+  is_outdated: boolean;
+  /** Whether this host can resolve *this* thread. Per-thread because on
+   *  GitLab it genuinely is: a plain comment has no resolution state. */
+  is_resolvable: boolean;
+  path: string | null;
+  line: number | null;
+  comments: PrThreadComment[];
+}
+
+// ── PR timeline ──
+//
+// Mirrors src-tauri/src/github.rs:PrTimelineEvent. The `kind` tag is
+// flattened onto the event, so this is a discriminated union and every
+// `switch` over it is exhaustive — except for `other`, which exists
+// precisely so a host event this build has never seen still renders as a
+// one-liner instead of vanishing or throwing.
+
+export type PrTimelineEventKind =
+  | { kind: "opened"; commits: number | null }
+  | { kind: "commented"; body: string }
+  | {
+      kind: "reviewed";
+      /** APPROVED / CHANGES_REQUESTED / COMMENTED. */
+      verdict: string;
+      body: string;
+      /** `path:line` of the review's first inline note, when known. */
+      anchor: string | null;
+    }
+  | { kind: "committed"; sha: string; message: string }
+  | { kind: "head_ref_force_pushed"; sha: string | null }
+  | { kind: "merged"; sha: string | null }
+  | { kind: "closed" }
+  | { kind: "reopened" }
+  | { kind: "review_requested"; reviewer: string | null }
+  | { kind: "renamed"; from: string; to: string }
+  | { kind: "other"; label: string };
+
+export type PrTimelineEvent = {
+  /** Stable within a payload — the React key. */
+  id: string;
+  actor: string | null;
+  /** ISO-8601, or null for an event the host dated. */
+  created_at: string | null;
+} & PrTimelineEventKind;
 
 export interface KeyboardSettings {
   shortcuts: Record<string, string>;
@@ -461,6 +565,14 @@ export interface CommitFileEntry {
   status: string;
 }
 
+/** One commit ahead of the base branch. `body` is `""` when the commit
+ *  had only a subject line. */
+export interface CommitSummary {
+  short_hash: string;
+  subject: string;
+  body: string;
+}
+
 export interface EditorInfo {
   id: string;
   name: string;
@@ -502,6 +614,11 @@ export interface PullRequestInfo {
   review_decision: string | null;
   checks_passing: boolean | null;
   updated_at: string | null;
+  /** When it was opened — for the timeline's synthesized "opened" row.
+   *  The commit count beside it is derived from the timeline's own
+   *  commit events rather than fetched, since `commits` is an array and
+   *  the detail query polls every 2.5s. */
+  created_at: string | null;
   /** Stage 5 — populated by `get_github_pr_by_path` only. List paths
    *  leave it null so list queries stay cheap. Body is truncated at
    *  50 KB on a char boundary, mirroring the issue path. */
@@ -514,6 +631,35 @@ export interface PullRequestInfo {
   /** PR author login. Null when gh JSON didn't carry the field
    *  (e.g. ghost users / list rows that didn't request author). */
   author: string | null;
+  /** Head commit SHA. Association is branch-based, not SHA-based — this
+   *  is metadata, and the panel watches it across polls to notice a
+   *  force-push. */
+  head_ref_oid: string | null;
+  /** Owner of the repository holding the head branch (the fork owner on
+   *  a cross-repository PR). */
+  head_repository_owner: string | null;
+  /** gh `mergeStateStatus` — CLEAN / BLOCKED / DIRTY / BEHIND /
+   *  UNSTABLE / HAS_HOOKS / UNKNOWN. `mergeable` alone can't tell a
+   *  conflict from a still-running required check, and the action bar
+   *  has to name the blocking reason in words. */
+  merge_state_status: string | null;
+  /** File count for the header meta row. */
+  changed_files: number | null;
+  /** Login that merged it — the merged-elsewhere notice names a
+   *  person, not an event. */
+  merged_by: string | null;
+  merged_at: string | null;
+  /** Logins with a review requested but not yet given. */
+  review_requests: string[];
+  /** One entry per reviewer who has submitted a verdict. */
+  latest_reviews: PrReviewSummary[];
+}
+
+/** A reviewer's most recent verdict. */
+export interface PrReviewSummary {
+  author: string;
+  /** APPROVED / CHANGES_REQUESTED / COMMENTED / PENDING / DISMISSED. */
+  state: string;
 }
 
 export interface IncomingPrItem {
@@ -528,6 +674,46 @@ export interface IncomingPrItem {
   checks_status: string | null;
   updated_at: string | null;
   url: string;
+}
+
+/** One row of the Pull Requests page — the half the host serves fast. */
+export interface PrOverviewItem {
+  number: number;
+  title: string;
+  author: string;
+  head_branch: string | null;
+  is_draft: boolean;
+  /** Filled by the stats call on hosts that charge for a diff stat. */
+  additions: number | null;
+  deletions: number | null;
+  review_decision: string | null;
+  /** The CI rollup reduced host-side to one of `passing` / `failing` /
+   *  `pending` / `none` — the raw per-check array never crosses the
+   *  boundary. `null` is the fourth answer and the load-bearing one:
+   *  *nobody has asked yet*. It is not `"none"`, which is a host that
+   *  has answered "this pull request runs no checks", and no surface may
+   *  colour a row, count a badge or raise a toast from it. */
+  checks: string | null;
+  /** Logins this pull request is waiting on. */
+  review_requested_from: string[];
+  updated_at: string | null;
+  url: string;
+}
+
+/** The expensive half of a row, keyed by number so the page can merge it
+ *  into a list it has already painted. */
+export interface PrOverviewStats {
+  number: number;
+  checks: string;
+  additions: number | null;
+  deletions: number | null;
+}
+
+/** One repository root's open pull requests, plus who is asking — the
+ *  grouping is meaningless without the viewer. */
+export interface PrsOverview {
+  viewer: string | null;
+  items: PrOverviewItem[];
 }
 
 export interface CheckInfo {
@@ -557,6 +743,27 @@ export interface InlineReviewComment {
   created_at: string;
   in_reply_to_id: number | null;
   pull_request_review_id: number | null;
+}
+
+/**
+ * One line note on its way to the host.
+ *
+ * `line` + `side` rather than the legacy `position` offset: position is
+ * an index into one exact patch, so a note written a moment before a
+ * push lands on an unrelated line. These are content coordinates and the
+ * host re-resolves them itself.
+ */
+export interface PrDraftComment {
+  /** The file the note is on. Named `file` so it can't be confused with
+   *  the repo `path` every command takes. */
+  file: string;
+  body: string;
+  /** `LEFT` is a deleted line; `RIGHT` is added or context. */
+  side: "LEFT" | "RIGHT";
+  /** Last line of the selection. */
+  line: number;
+  /** First line of a multi-line selection; omitted for a single line. */
+  start_line?: number | null;
 }
 
 export type IssueState = "Open" | "Closed";

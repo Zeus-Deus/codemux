@@ -8,6 +8,7 @@ import {
   Columns2,
   FolderOpen,
   Globe,
+  GitPullRequest,
   Keyboard,
   LayoutGrid,
   LoaderCircle,
@@ -50,6 +51,9 @@ import {
 } from "@/lib/pane-status";
 import { shortenPath } from "@/lib/shorten-path";
 import { cn } from "@/lib/utils";
+import { providerRef, resolveProvider } from "@/lib/source-control";
+import { rowKey, type PrRow } from "@/lib/pr-overview";
+import { usePrOverview } from "@/lib/pr-overview-query";
 import {
   createBrowserPane,
   cyclePane,
@@ -74,12 +78,14 @@ import { openConversationSearchResult } from "@/lib/agent-chat/conversation-sear
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   COMMAND_MODE_PREFIX,
+  PR_MODE_PREFIX,
   commandSearchText,
   compareWorkspaceOrder,
   groupCountLabel,
   parsePaletteQuery,
   previewedThemeId,
   rankByQuery,
+  rankPalettePrs,
   resultCountLabel,
   rankThemeGroup,
   themeRowValue,
@@ -210,6 +216,13 @@ const COMMANDS: PaletteCommand[] = [
         .catch(console.error),
   },
   { id: "shortcuts", label: "Keyboard shortcuts", icon: Keyboard, actionId: "showShortcuts", keywords: "keybinds bindings" },
+  {
+    id: "pull-requests",
+    label: "Pull requests",
+    icon: GitPullRequest,
+    keywords: "pr prs review merge request incoming",
+    run: () => useUIStore.getState().setShowPullRequests(true),
+  },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
   {
     id: "regen-mcp",
@@ -240,6 +253,12 @@ interface ProjectRow {
   key: string;
   group: ProjectGroup;
   activeCount: number;
+}
+
+interface PrPaletteRow {
+  kind: "pr";
+  key: string;
+  row: PrRow;
 }
 
 interface CommandRow {
@@ -290,6 +309,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     () => useUIStore.getState().takeCommandPaletteQuery() ?? "",
   );
   const query = useMemo(() => parsePaletteQuery(rawQuery), [rawQuery]);
+  // Shares its key with the sidebar badge's fetch, so `pr ` is answered
+  // from rows that are already loaded rather than a fresh round trip.
+  const { rows: prOverviewRows } = usePrOverview(true);
   const listRef = useRef<HTMLDivElement>(null);
   // A seeded `theme` query is a deep link from Settings ▸ Appearance, not
   // an ordinary palette search. Remember that distinction after the store's
@@ -461,10 +483,23 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   // ── Filter + rank ──────────────────────────────────────────────────────
   const commandsOnly = query.mode === "commands";
+  // `pr ` is its own mode: it ranks pull requests and nothing else, the
+  // same way `>` ranks commands and nothing else.
+  const prsOnly = query.mode === "prs";
+
+  const matchedPrs = useMemo<PrPaletteRow[]>(
+    () =>
+      prsOnly
+        ? rankPalettePrs(prOverviewRows, query.needle)
+            .slice(0, 20)
+            .map((row) => ({ kind: "pr" as const, key: `pr:${rowKey(row)}`, row }))
+        : [],
+    [prsOnly, prOverviewRows, query.needle],
+  );
 
   const matchedWorkspaces = useMemo(
     () =>
-      commandsOnly
+      commandsOnly || prsOnly
         ? []
         : rankByQuery(
             workspaceRows,
@@ -472,11 +507,11 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             (r) => workspaceSearchText(r.workspace),
             (r) => workspacePathText(r.workspace),
           ),
-    [workspaceRows, query, commandsOnly],
+    [workspaceRows, query, commandsOnly, prsOnly],
   );
   const matchedProjects = useMemo(
     () =>
-      commandsOnly
+      commandsOnly || prsOnly
         ? []
         : rankByQuery(
             projectRows,
@@ -484,14 +519,14 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             (r) => r.group.projectName,
             (r) => r.group.projectPath,
           ),
-    [projectRows, query, commandsOnly],
+    [projectRows, query, commandsOnly, prsOnly],
   );
   const matchedCommands = useMemo(
     () =>
       // A path query is asking "where", and no command has a location — so
       // outside explicit command mode, path mode drops them rather than
       // letting a long `a/b/c` subsequence-match some unrelated label.
-      query.pathMode && !commandsOnly
+      prsOnly || (query.pathMode && !commandsOnly)
         ? []
         : rankByQuery(
             commandRows,
@@ -499,11 +534,12 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             (r) => commandSearchText(r.command),
             (r) => commandSearchText(r.command),
           ),
-    [commandRows, query, commandsOnly],
+    [commandRows, query, commandsOnly, prsOnly],
   );
 
   const searching = query.needle !== "";
-  const conversationsEligible = searching && !commandsOnly && !query.pathMode;
+  const conversationsEligible =
+    searching && !commandsOnly && !prsOnly && !query.pathMode;
 
   // The search only cares about *which* workspaces are open, but `workspaces`
   // gets a fresh identity on every app-state emit (pane status, streaming, …).
@@ -580,6 +616,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     listRef.current?.scrollTo({ top: 0 });
   }, [rawQuery]);
   const totalShown =
+    matchedPrs.length +
     shownWorkspaces.length +
     shownProjects.length +
     conversationRows.length +
@@ -799,6 +836,23 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             />
           ))}
 
+          {matchedPrs.length > 0 && (
+            <GroupHeader label="Pull requests" count={`${matchedPrs.length}`} first />
+          )}
+          {matchedPrs.map((row) => (
+            <PrPaletteItem
+              key={row.key}
+              row={row.row}
+              onSelect={() => {
+                close();
+                useUIStore.getState().setShowPullRequests(true, {
+                  projectRoot: row.row.projectRoot,
+                  number: row.row.number,
+                });
+              }}
+            />
+          ))}
+
           {shownProjects.length > 0 && (
             <GroupHeader
               label="Projects"
@@ -869,6 +923,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <FooterHint keys="↑↓" label="navigate" />
             <FooterHint keys="↵" label="open" />
             <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
+            <FooterHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
             <span className="flex-1" />
             <span className="font-mono text-[10px] text-muted-foreground/70">
               {resultCountLabel(totalShown)}
@@ -1177,6 +1232,41 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
       {row.keys && (
         <span className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground group-data-selected/pal-row:hidden">
           {row.keys}
+        </span>
+      )}
+      <EnterBadge />
+    </PaletteItem>
+  );
+}
+
+/** A pull request in `pr ` mode: dot, number, title, repository. */
+function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) {
+  return (
+    <PaletteItem value={`pr:${rowKey(row)}`} onSelect={onSelect}>
+      <span className="flex size-5 flex-none items-center justify-center">
+        <span
+          aria-hidden
+          className={cn(
+            "size-2 rounded-full",
+            row.checks === "failing"
+              ? "bg-destructive"
+              : row.checks === "pending"
+                ? "bg-status-working"
+                : row.checks === "passing"
+                  ? "bg-status-open"
+                  : "bg-border",
+          )}
+        />
+      </span>
+      <span className="flex-none font-mono text-[11px] text-muted-foreground">
+        {providerRef(resolveProvider(row.providerKind), row.number)}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[13px] text-foreground/90">
+        {row.title}
+      </span>
+      {row.repo && (
+        <span className="flex-none truncate text-[11px] text-muted-foreground/70">
+          {row.repo}
         </span>
       )}
       <EnterBadge />

@@ -1,36 +1,23 @@
 import { useState, useEffect, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  GitPullRequest,
-  AlertCircle,
-  ChevronLeft,
-} from "lucide-react";
-import {
   checkGithubRepo,
   getBranchPullRequest,
-  createPullRequest,
   getPullRequestChecks,
   getPrReviewComments,
   getPrInlineComments,
-  listBranches,
+  getGitBranchInfo,
+  gitPushChanges,
   getDefaultBranch,
+  refreshWorkspacePr,
 } from "@/tauri/commands";
 import type {
   WorkspaceSnapshot,
   GhStatus,
   ProviderAuthStatus,
+  ProviderOperations,
   PullRequestInfo,
   CheckInfo,
   ReviewComment,
@@ -38,20 +25,31 @@ import type {
 } from "@/tauri/types";
 import {
   providerForWorkspace,
-  unsupportedRepoMessage,
+  repoSlugFromUrl,
   type ProviderPresentation,
 } from "@/lib/source-control";
 import {
   fetchProviderAuth,
   getCachedProviderAuth,
+  NO_OPERATIONS,
   PROVIDER_AUTH_TTL_MS,
   _resetProviderAuthCache,
 } from "@/lib/provider-auth";
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
-import { ReviewHeader } from "./review/review-header";
-import { ReviewChecks } from "./review/review-checks";
+import { toast } from "@/lib/toast";
+import { useUIStore } from "@/stores/ui-store";
+import { CreatePrForm } from "./review/create-pr-form";
+import { ReviewDetail } from "./review/review-detail";
 import { ReviewThreads } from "./review/review-threads";
 import { IncomingPrsView } from "./review/incoming-prs-view";
+import {
+  BranchLocalOnlyState,
+  CliMissingState,
+  NoPullRequestState,
+  RepoUnreachableState,
+  SignedOutState,
+  UnsupportedHostState,
+} from "./review/review-empty-states";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -87,9 +85,8 @@ type ProviderGate = GhStatus | { status: "Unsupported" };
 const repoCheckCache = new Map<string, CacheEntry<boolean>>();
 
 /** Auth status for one checkout, if a usable verdict is still warm. */
-function cachedStatus(cwd: string, kind: string): ProviderGate | null {
-  const cached = getCachedProviderAuth(cwd, kind);
-  return cached ? toProviderGate(cached) : null;
+function cachedStatus(cwd: string, kind: string): ProviderAuthStatus | null {
+  return getCachedProviderAuth(cwd, kind);
 }
 
 export function getCachedRepoCheck(key: string): boolean | undefined {
@@ -120,15 +117,12 @@ export function _resetCaches(): void {
  * One host-scoped probe for every product, including GitHub: the backend
  * resolves the checkout's provider and asks *that* adapter, which for
  * GitHub is the same `gh auth status` call this used to make directly.
- * The previous non-GitHub path ran the whole settings-pane sweep, which
- * probed every CLI and answered for no instance in particular — wrong on
- * a self-hosted deployment and wasteful everywhere.
  */
 async function fetchProviderAuthStatus(
   cwd: string,
   provider: ProviderPresentation,
-): Promise<ProviderGate> {
-  return toProviderGate(await fetchProviderAuth(cwd, provider.kind));
+): Promise<ProviderAuthStatus> {
+  return fetchProviderAuth(cwd, provider.kind);
 }
 
 /** The probe's verdict in the vocabulary this panel already renders. */
@@ -140,31 +134,6 @@ function toProviderGate(status: ProviderAuthStatus): ProviderGate {
 }
 
 // ── Helpers ──
-
-function branchToTitle(branch: string | null): string {
-  if (!branch) return "";
-  return branch
-    .replace(/^(feature|fix|chore|docs|refactor|test)[/-]/, "")
-    .replace(/[-_]/g, " ")
-    .replace(/^\w/, (c) => c.toUpperCase());
-}
-
-// ── Small sub-components ──
-
-function StatusMessage({
-  icon,
-  message,
-}: {
-  icon: React.ReactNode;
-  message: string;
-}) {
-  return (
-    <div className="flex flex-col items-center justify-center py-8 text-muted-foreground gap-2">
-      {icon}
-      <p className="text-xs text-center px-4">{message}</p>
-    </div>
-  );
-}
 
 function ReviewSkeleton() {
   return (
@@ -188,227 +157,22 @@ function ReviewSkeleton() {
   );
 }
 
-// ── CreatePrForm ──
-
-function CreatePrForm({
-  cwd,
-  branchName,
-  provider,
-  onCreated,
-  onCancel,
-}: {
-  cwd: string;
-  branchName: string | null;
-  provider: ProviderPresentation;
-  onCreated: (pr: PullRequestInfo) => void;
-  onCancel: () => void;
-}) {
-  const [title, setTitle] = useState(() => branchToTitle(branchName));
-  const [body, setBody] = useState("");
-  const [baseBranch, setBaseBranch] = useState("main");
-  const [branches, setBranches] = useState<string[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
-  const [isDraft, setIsDraft] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-
-  const loadBranches = useCallback(() => {
-    if (branchesLoaded) return;
-    listBranches(cwd, false)
-      .then((b) => {
-        setBranches(b);
-        setBranchesLoaded(true);
-        if (b.includes("main")) setBaseBranch("main");
-        else if (b.includes("master")) setBaseBranch("master");
-        else if (b.length > 0) setBaseBranch(b[0]);
-      })
-      .catch(console.error);
-  }, [cwd, branchesLoaded]);
-
-  const handleCreate = async () => {
-    if (!title.trim() || creating) return;
-    setCreating(true);
-    setError(null);
-    try {
-      const pr = await createPullRequest(
-        cwd,
-        title.trim(),
-        body.trim(),
-        baseBranch,
-        isDraft,
-      );
-      onCreated(pr);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  return (
-    <div className="space-y-2 p-3">
-      <div className="flex items-center gap-1">
-        <Button
-          size="icon-xs"
-          variant="ghost"
-          onClick={onCancel}
-          title="Back"
-        >
-          <ChevronLeft className="h-3 w-3" />
-        </Button>
-        <p className="text-xs font-medium text-muted-foreground">
-          Create {provider.nounTitleCase}
-        </p>
-      </div>
-      <Input
-        placeholder={`${provider.shortNoun} title`}
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-        className="h-7 text-xs"
-      />
-      <Textarea
-        placeholder="Description (optional)"
-        value={body}
-        onChange={(e) => setBody(e.target.value)}
-        className="text-xs resize-none h-16 min-h-16"
-      />
-      <div className="flex items-center gap-2">
-        <div className="flex-1">
-          <Select
-            value={baseBranch}
-            onValueChange={setBaseBranch}
-            onOpenChange={(open) => {
-              if (open) loadBranches();
-            }}
-          >
-            <SelectTrigger className="h-7 text-xs">
-              <SelectValue placeholder="Base branch" />
-            </SelectTrigger>
-            <SelectContent>
-              {branches.length > 0 ? (
-                branches.map((b) => (
-                  <SelectItem key={b} value={b} className="text-xs">
-                    {b}
-                  </SelectItem>
-                ))
-              ) : (
-                <SelectItem value={baseBranch} className="text-xs">
-                  {baseBranch}
-                </SelectItem>
-              )}
-            </SelectContent>
-          </Select>
-        </div>
-        <label className="flex items-center gap-1 text-xs text-muted-foreground cursor-pointer">
-          <input
-            type="checkbox"
-            checked={isDraft}
-            onChange={(e) => setIsDraft(e.target.checked)}
-            className="rounded"
-          />
-          Draft
-        </label>
-      </div>
-      <Button
-        size="xs"
-        className="w-full text-xs h-7"
-        disabled={!title.trim() || creating}
-        onClick={handleCreate}
-      >
-        {creating ? "Creating..." : `Create ${provider.shortNoun}`}
-      </Button>
-      {error && <p className="text-xs text-danger break-words">{error}</p>}
-    </div>
-  );
-}
-
-// ── NoReviewView ──
-
-function NoReviewView({
-  cwd,
-  branchName,
-  provider,
-  onCreated,
-}: {
-  cwd: string;
-  branchName: string | null;
-  provider: ProviderPresentation;
-  onCreated: (pr: PullRequestInfo) => void;
-}) {
-  const [showForm, setShowForm] = useState(false);
-
-  if (showForm) {
-    return (
-      <CreatePrForm
-        cwd={cwd}
-        branchName={branchName}
-        provider={provider}
-        onCreated={onCreated}
-        onCancel={() => setShowForm(false)}
-      />
-    );
-  }
-
-  return (
-    <div className="flex flex-col items-center justify-center py-8 gap-3">
-      <GitPullRequest className="h-8 w-8 text-muted-foreground/30" />
-      <p className="text-xs text-muted-foreground">
-        No {provider.noun} for this branch
-      </p>
-      <Button variant="secondary" size="xs" className="text-xs" onClick={() => setShowForm(true)}>
-        Create {provider.nounTitleCase}
-      </Button>
-    </div>
-  );
-}
-
-// ── ReviewView ──
-
-function ReviewView({
-  pr,
-  checks,
-  reviews,
-  inlineComments,
-  checksLoading,
-  commentsLoading,
-}: {
-  pr: PullRequestInfo;
-  checks: CheckInfo[];
-  reviews: ReviewComment[];
-  inlineComments: InlineReviewComment[];
-  checksLoading: boolean;
-  commentsLoading: boolean;
-}) {
-  // Stripped to match Superset's resting layout: title + status badge
-  // + checks + comments only. Composer (Approve / Request changes /
-  // Comment), merge controls, and deployments were intentionally
-  // removed — composer because Superset has no equivalent (verified
-  // against the reference clone), merge controls because the Changes
-  // panel toolbar already has a merge dropdown, deployments because
-  // it's not part of Superset's Review surface. Backends for the
-  // composer and merge are retained for potential future re-wire.
-  return (
-    <div className="space-y-2 p-3">
-      <ReviewHeader pr={pr} />
-
-      <div className="border-t border-border/30" />
-
-      <ReviewChecks checks={checks} isLoading={checksLoading} />
-      <ReviewThreads
-        reviews={reviews}
-        inlineComments={inlineComments}
-        isLoading={commentsLoading}
-      />
-    </div>
-  );
-}
-
 // ── Main ReviewPanel ──
 
 export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const provider = providerForWorkspace(workspace);
+  /**
+   * A pull request this pane just opened, held until the backend's
+   * workspace snapshot catches up.
+   *
+   * `pr_number` arrives on the snapshot from a poll that runs on its own
+   * schedule, so without this the panel would drop back to "No pull
+   * request yet" for a few seconds immediately after creating one — the
+   * one moment the user is certain there is one.
+   */
+  const [justCreated, setJustCreated] = useState<PullRequestInfo | null>(null);
+
   // Strictly the checked-out branch's PR. The workspace snapshot may also
   // carry a *badge-only* side-branch association (a PR the workspace opened
   // from a branch it has since left — see `isPrOnCurrentBranch`), and this
@@ -416,11 +180,25 @@ export function ReviewPanel({ workspace }: Props) {
   // a branch the user is not on while hiding the "Create PR" affordance for
   // the branch they actually are on.
   const hasPr =
-    workspace.pr_number != null &&
-    isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
+    justCreated != null ||
+    (workspace.pr_number != null &&
+      isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch));
+  const prNumber = workspace.pr_number ?? justCreated?.number ?? null;
 
-  const [ghStatus, setGhStatus] = useState<ProviderGate | null>(
-    cachedStatus(cwd, provider.kind),
+  // The snapshot has caught up; the local hold is no longer needed.
+  useEffect(() => {
+    if (workspace.pr_number != null) setJustCreated(null);
+  }, [workspace.pr_number]);
+
+  const [ghStatus, setGhStatus] = useState<ProviderGate | null>(() => {
+    const cached = cachedStatus(cwd, provider.kind);
+    return cached ? toProviderGate(cached) : null;
+  });
+  // The per-operation declarations for this checkout, from the same
+  // probe that answers the auth gate — so no surface needs a second
+  // command, and no control renders before its right to exist is known.
+  const [operations, setOperations] = useState<ProviderOperations>(
+    () => cachedStatus(cwd, provider.kind)?.operations ?? NO_OPERATIONS,
   );
   const [repoSupported, setRepoSupported] = useState<boolean | null>(
     getCachedRepoCheck(cwd) ?? null,
@@ -429,13 +207,10 @@ export function ReviewPanel({ workspace }: Props) {
     cachedStatus(cwd, provider.kind) === null ||
       getCachedRepoCheck(cwd) === undefined,
   );
+  const [showCreateForm, setShowCreateForm] = useState(false);
 
   const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
-  // The IncomingPrsView used to be re-fetched via the now-removed
-  // refresh button. Auto-poll covers regular PR data; the incoming
-  // list relies on its own internal mount cycle (and on the 60s Rust
-  // background poll updating workspace.pr_state for each row).
   const incomingRefreshKey = 0;
 
   const isBaseBranch = defaultBranch != null && workspace.git_branch === defaultBranch;
@@ -450,13 +225,13 @@ export function ReviewPanel({ workspace }: Props) {
     let cancelled = false;
     (async () => {
       try {
-        // `fetchProviderAuth` owns the TTL cache, so this is a
-        // no-op call when a usable verdict is still warm.
         const status = await fetchProviderAuthStatus(cwd, provider);
         if (cancelled) return;
-        setGhStatus(status);
+        const gate = toProviderGate(status);
+        setGhStatus(gate);
+        setOperations(status.operations ?? NO_OPERATIONS);
 
-        if (status.status !== "Authenticated") {
+        if (gate.status !== "Authenticated") {
           setInitialLoading(false);
           return;
         }
@@ -477,39 +252,23 @@ export function ReviewPanel({ workspace }: Props) {
     return () => {
       cancelled = true;
     };
-    // `provider` is a stable module-level singleton per kind, so this
-    // re-runs only when the workspace actually changes product.
   }, [cwd, provider]);
 
   // ── React Query: PR data ──
   //
   // Each query is keyed by (workspaceId, pr_number) so switching
-  // workspaces auto-cancels in-flight calls for the previous workspace
-  // — the stale-data-flashing bug the analysis (§4) called out.
-  // staleTime + refetchInterval keep the surface honest without
-  // hammering `gh`. Reviews/inline comments are slower (30s) than
-  // PR/checks/deploys (10s) since they change less often.
-  //
-  // Caveat: AbortSignal is plumbed through but the underlying Rust
-  // commands are sync `pub fn` using `std::process::Command`, so a
-  // canceled query stops the JS from caring about the result; the
-  // `gh` subprocess keeps running until natural completion (already
-  // bounded by the existing 10s timeout in `run_gh_timed`). Wasted
-  // CPU on a stale call is minimal; the fix that matters here is that
-  // the *result* never lands in the new workspace's UI.
+  // workspaces auto-cancels in-flight calls for the previous workspace.
+  // Cadence: PR detail + checks at 2.5s so a check going green shows up
+  // without a manual refresh; reviews + inline comments at 30s, since
+  // they change far less often and carry larger payloads.
   const detailsEnabled =
     !initialLoading &&
     ghStatus?.status === "Authenticated" &&
     repoSupported === true &&
     hasPr;
 
-  // Cadence per Superset (`ChangesView.tsx:105` polls at 2500ms when
-  // active). PR detail + checks update fast so the user sees their
-  // PR move from pending → success without a manual refresh.
-  // Reviews + inline comments stay at 30s — they change less often
-  // and the JSON payloads are larger.
   const prDetailQuery = useQuery({
-    queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "detail", workspace.workspace_id, prNumber] as const,
     queryFn: () => getBranchPullRequest(cwd),
     enabled: detailsEnabled,
     staleTime: 2_500,
@@ -517,7 +276,7 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const checksQuery = useQuery({
-    queryKey: ["pr", "checks", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "checks", workspace.workspace_id, prNumber] as const,
     queryFn: () => getPullRequestChecks(cwd),
     enabled: detailsEnabled,
     staleTime: 2_500,
@@ -525,7 +284,7 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const reviewsQuery = useQuery({
-    queryKey: ["pr", "reviews", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "reviews", workspace.workspace_id, prNumber] as const,
     queryFn: () => getPrReviewComments(cwd),
     enabled: detailsEnabled,
     staleTime: 30_000,
@@ -533,31 +292,47 @@ export function ReviewPanel({ workspace }: Props) {
   });
 
   const inlineQuery = useQuery({
-    queryKey: ["pr", "inline", workspace.workspace_id, workspace.pr_number] as const,
+    queryKey: ["pr", "inline", workspace.workspace_id, prNumber] as const,
     queryFn: () => {
-      const num = workspace.pr_number;
-      if (num == null) return Promise.resolve([] as InlineReviewComment[]);
-      return getPrInlineComments(cwd, num);
+      if (prNumber == null) return Promise.resolve([] as InlineReviewComment[]);
+      return getPrInlineComments(cwd, prNumber);
     },
-    enabled: detailsEnabled && workspace.pr_number != null,
+    enabled: detailsEnabled && prNumber != null,
     staleTime: 30_000,
     refetchInterval: 30_000,
   });
 
-  const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
+  // Is this branch on the remote at all? Decides which of the two
+  // no-PR empty states applies.
+  const branchInfoQuery = useQuery({
+    queryKey: ["pr", "branch-info", workspace.workspace_id, workspace.git_branch] as const,
+    queryFn: () => getGitBranchInfo(cwd),
+    enabled: !initialLoading && !hasPr,
+    staleTime: 10_000,
+  });
+
+  // The pull request this pane just opened stands in until the first
+  // poll answers for it, so the panel never flashes a skeleton over a
+  // pull request the user has just watched itself create.
+  const pr: PullRequestInfo | null = prDetailQuery.data ?? justCreated ?? null;
   const checks: CheckInfo[] = checksQuery.data ?? [];
   const reviews: ReviewComment[] = reviewsQuery.data ?? [];
   const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
-  // Only the primary detail query's error feeds the banner — the
-  // others swallow their errors via empty-array fallbacks below since
-  // their failures are usually transient and the empty sections
-  // render fine.
-  const fetchError = prDetailQuery.error
-    ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
-    : null;
 
-  // Helper to invalidate every PR query for this workspace at once —
-  // used by manual refresh and (in §3.3) by commit/push/merge events.
+  /**
+   * How old the newest good data is, when the polls are currently
+   * failing — null while they're healthy.
+   *
+   * Binding rule 2: a failed refresh never blanks what is being read.
+   * The panel keeps rendering the last good PR and says how old it is;
+   * only a PR that has *never* loaded gets a skeleton.
+   */
+  const staleAgeMs =
+    prDetailQuery.isError && prDetailQuery.dataUpdatedAt > 0
+      ? Date.now() - prDetailQuery.dataUpdatedAt
+      : null;
+
+  // Helper to invalidate every PR query for this workspace at once.
   const invalidatePrQueries = useCallback(() => {
     queryClient.invalidateQueries({
       predicate: (q) =>
@@ -566,16 +341,28 @@ export function ReviewPanel({ workspace }: Props) {
     });
   }, [queryClient, workspace.workspace_id]);
 
+  const openChangesPane = useCallback(() => {
+    useUIStore.getState().setRightPanelTab(workspace.workspace_id, "changes");
+  }, [workspace.workspace_id]);
+
+  /**
+   * The form's success path: the pane becomes the review view for the
+   * pull request that was just opened, without an intervening blank.
+   *
+   * Three things in order — hold the new pull request locally, seed the
+   * detail cache under its number so the first render has real data, and
+   * ask the backend to re-read the workspace's pull request so
+   * `pr_number` lands on the snapshot and the local hold can retire.
+   */
   const handlePrCreated = (newPr: PullRequestInfo) => {
-    // Seed the detail cache directly so the user sees the new PR
-    // immediately without waiting for the workspace state push to
-    // flip pr_number. Then invalidate the rest so checks/reviews/
-    // deploys fetch fresh.
+    setJustCreated(newPr);
     queryClient.setQueryData(
       ["pr", "detail", workspace.workspace_id, newPr.number],
       newPr,
     );
+    setShowCreateForm(false);
     invalidatePrQueries();
+    void refreshWorkspacePr(workspace.workspace_id).catch(() => {});
   };
 
   // ── Render ──
@@ -584,64 +371,92 @@ export function ReviewPanel({ workspace }: Props) {
     return <ReviewSkeleton />;
   }
 
-  // Both no-adapter-for-this-host and no-repo-behind-this-checkout land
-  // here, and both must be answered before the CLI states below: an
-  // unsupported host is not a missing-CLI problem, and telling a user
-  // with `gh` on their PATH to go install it is simply wrong.
+  // A host with no adapter is not a missing-CLI problem, and telling a
+  // user with `gh` on their PATH to install it is simply wrong — so
+  // both no-adapter cases are answered before the CLI states below.
   if (ghStatus?.status === "Unsupported" || repoSupported === false) {
     return (
-      <StatusMessage
-        icon={<GitPullRequest className="h-6 w-6 opacity-40" />}
-        message={unsupportedRepoMessage(provider)}
-      />
+      <UnsupportedHostState provider={provider} url={workspace.pr_url ?? null} />
     );
   }
 
   if (ghStatus?.status === "NotInstalled") {
-    return (
-      <StatusMessage
-        icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message={
-          provider.cliLabel
-            ? `${provider.cliLabel} is not installed. Install it from ${provider.installUrl}`
-            : unsupportedRepoMessage(provider)
-        }
-      />
-    );
+    return <CliMissingState provider={provider} />;
   }
 
   if (ghStatus?.status === "NotAuthenticated") {
+    return <SignedOutState provider={provider} />;
+  }
+
+  // Authenticated and the repo is supported, but the PR itself can't be
+  // fetched and never has been: that is a reachability problem, not an
+  // empty state.
+  if (hasPr && !pr && prDetailQuery.isError) {
     return (
-      <StatusMessage
-        icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message={`Not authenticated. Run: ${provider.loginCommand}`}
+      <RepoUnreachableState
+        repoSlug={repoSlugFromUrl(workspace.pr_url)}
+        provider={provider}
+        onRetry={invalidatePrQueries}
       />
     );
   }
 
-  return (
-    <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
-      {/* No refresh button — auto-poll handles freshness (2.5s for PR
-          detail and checks, 30s for reviews + inline comments while the
-          tab is active). Mirrors Superset's pattern. */}
-      {fetchError && (
-        <div className="mx-3 mb-1 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
-          <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
-          <span className="break-words">{fetchError}</span>
-        </div>
-      )}
-      {hasPr && pr ? (
-        <ReviewView
-          pr={pr}
-          checks={checks}
-          reviews={reviews}
-          inlineComments={inlineComments}
-          checksLoading={checksQuery.isFetching}
-          commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
+  if (hasPr && pr) {
+    return (
+      // No scroll wrapper: the detail lays itself out to the pane's full
+      // height and scrolls only its tab body, so the action bar sits on
+      // the bottom edge of the pane rather than wherever the description
+      // happened to end.
+      <ReviewDetail
+        pr={pr}
+        checks={checks}
+        reviews={reviews}
+        inlineComments={inlineComments}
+        checksLoading={checksQuery.isFetching}
+        commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
+        cwd={cwd}
+        workspaceId={workspace.workspace_id}
+        projectRoot={workspace.project_root ?? workspace.cwd}
+        provider={provider}
+        operations={operations}
+        repoSlug={repoSlugFromUrl(pr.url) ?? repoSlugFromUrl(workspace.pr_url)}
+        viewerLogin={
+          ghStatus?.status === "Authenticated" ? ghStatus.username || null : null
+        }
+        checkedOutHere={isPrOnCurrentBranch(pr.head_branch, workspace.git_branch)}
+        gitBehind={workspace.git_behind ?? 0}
+        gitDirtyFiles={workspace.git_changed_files ?? 0}
+        staleAgeMs={staleAgeMs}
+        onRefresh={invalidatePrQueries}
+        onOpenChanges={openChangesPane}
+      />
+    );
+  }
+
+  if (hasPr && !pr) {
+    return <ReviewSkeleton />;
+  }
+
+  if (showCreateForm) {
+    return (
+      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
+        <CreatePrForm
+          cwd={cwd}
+          projectRoot={workspace.project_root ?? workspace.cwd}
+          branchName={workspace.git_branch}
+          defaultBranch={defaultBranch}
+          provider={provider}
+          onCreated={handlePrCreated}
+          onCancel={() => setShowCreateForm(false)}
+          onOpenChanges={openChangesPane}
         />
-      ) : hasPr && !pr ? (
-        <ReviewSkeleton />
-      ) : isBaseBranch ? (
+      </ScrollArea>
+    );
+  }
+
+  if (isBaseBranch) {
+    return (
+      <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
         <IncomingPrsView
           cwd={cwd}
           baseBranch={defaultBranch!}
@@ -649,14 +464,52 @@ export function ReviewPanel({ workspace }: Props) {
           providerKind={workspace.provider_kind}
           refreshKey={incomingRefreshKey}
         />
-      ) : (
-        <NoReviewView
-          cwd={cwd}
-          branchName={workspace.git_branch}
+      </ScrollArea>
+    );
+  }
+
+  const pushed = branchInfoQuery.data?.has_upstream ?? false;
+  const dirtyFiles = workspace.git_changed_files ?? 0;
+
+  return (
+    <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
+      {pushed ? (
+        <NoPullRequestState
+          branch={workspace.git_branch}
+          baseBranch={defaultBranch ?? "main"}
+          commitsAhead={workspace.git_ahead ?? 0}
           provider={provider}
-          onCreated={handlePrCreated}
+          onCreate={() => setShowCreateForm(true)}
+          onViewCommits={openChangesPane}
+        />
+      ) : (
+        <BranchLocalOnlyState
+          changedFiles={dirtyFiles}
+          pushOnly={dirtyFiles === 0}
+          onOpenChanges={openChangesPane}
+          onCommitAndPush={() => {
+            if (dirtyFiles > 0) {
+              // Committing needs a message, and the Changes pane is
+              // where that conversation already happens.
+              openChangesPane();
+              return;
+            }
+            gitPushChanges(cwd, true)
+              .then(() => {
+                toast.success("Branch pushed");
+                invalidatePrQueries();
+                void branchInfoQuery.refetch();
+              })
+              .catch((err) => toast.error(String(err)));
+          }}
         />
       )}
     </ScrollArea>
   );
 }
+
+// Re-exported so the pane keeps a single import surface for the review
+// subtree even though the threads list now renders inside ReviewDetail.
+// `repoSlugFromUrl` moved to `@/lib/source-control` when the Pull
+// Requests page needed it without pulling the panel in.
+export { ReviewThreads, repoSlugFromUrl };

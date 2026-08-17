@@ -514,6 +514,16 @@ body.pane-resizing iframe {
   line-height: var(--line-height-code, 20px);
 }
 
+/* Reading text on the review surfaces — review and comment bodies.
+ * Same user-adjustable scale and full-strength ink as the chat
+ * transcript: prose someone wrote for you to read is never caption
+ * gray, no matter how dense the panel around it is. */
+.pr-reading {
+  font-size: var(--font-size-conversation, 14px);
+  line-height: 1.65;
+  color: var(--foreground);
+}
+
 /* ── Rendered markdown ── */
 .markdown-rendered {
   color: var(--foreground);
@@ -521,6 +531,43 @@ body.pane-resizing iframe {
   font-size: var(--font-size-conversation, 14px);
   line-height: 1.7;
 }
+/* Inline variant: the same markdown inside a dense panel (the PR
+ * description in the Review pane and on the Pull Requests page). It
+ * keeps the document's tightened vertical rhythm but reads at body
+ * scale — the description is the primary content of the detail
+ * surface, not a caption, so it must not sit below the meta lines
+ * around it. */
+.markdown-rendered-inline {
+  /* The description is read the way the chat transcript is read, so it
+   * uses the same user-adjustable scale and the same full-strength
+   * ink — a PR body in caption gray was the single biggest reason the
+   * detail surface read "smaller" than the rest of the app. The
+   * measure cap keeps fullscreen windows from stretching a paragraph
+   * across the whole column. */
+  font-size: var(--font-size-conversation, 14px);
+  line-height: 1.7;
+  color: var(--foreground);
+  /* No max-width here: the detail surface caps its whole reading
+   * column in one place, so prose and the rows around it share a
+   * right edge instead of each capping itself. */
+}
+.markdown-rendered-inline p { margin: 0 0 0.5em; }
+.markdown-rendered-inline > *:last-child { margin-bottom: 0; }
+.markdown-rendered-inline h1 { font-size: 1.2em; }
+.markdown-rendered-inline h2 { font-size: 1.1em; border-bottom: 0; padding-bottom: 0; }
+.markdown-rendered-inline h3, .markdown-rendered-inline h4 { font-size: 1em; }
+.markdown-rendered-inline h1, .markdown-rendered-inline h2,
+.markdown-rendered-inline h3, .markdown-rendered-inline h4 {
+  margin: 0.7em 0 0.3em;
+  color: var(--foreground);
+}
+.markdown-rendered-inline ul, .markdown-rendered-inline ol { margin: 0.35em 0; padding-left: 1.1em; }
+.markdown-rendered-inline li { margin: 0.15em 0; }
+/* Doubled class beats the document-scale `.markdown-rendered code`
+ * rules below, which otherwise win on source order. */
+.markdown-rendered.markdown-rendered-inline pre { font-size: 12.5px; padding: 0.5em 0.6em; margin: 0.5em 0; }
+.markdown-rendered.markdown-rendered-inline code { font-size: 13px; }
+
 .markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3,
 .markdown-rendered h4, .markdown-rendered h5, .markdown-rendered h6 {
   color: var(--foreground);

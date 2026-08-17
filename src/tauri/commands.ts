@@ -36,6 +36,7 @@ import type {
   GitFileStatus,
   GitLogEntry,
   CommitFileEntry,
+  CommitSummary,
   HandoffPacket,
   LaunchMode,
   ProviderDiagnostic,
@@ -46,8 +47,13 @@ import type {
   ProjectMemoryUpdate,
   PullRequestInfo,
   IncomingPrItem,
+  PrOverviewStats,
+  PrsOverview,
   ReviewComment,
   InlineReviewComment,
+  PrReviewThread,
+  PrTimelineEvent,
+  PrDraftComment,
   MergeState,
   MergeIntoBaseResult,
   ConflictCheckResult,
@@ -641,20 +647,156 @@ export const getGithubPrDiffByPath = (
 export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
-export const mergePullRequest = (path: string, prNumber: number, method: string) =>
-  invoke("merge_pull_request", { path, prNumber, method });
+/** Every open pull request in one repository, with the viewer relation
+ *  and the grouping fields — the Pull Requests page's row data, and the
+ *  call whose latency the user watches. One per project root; the page
+ *  fans out across the roots the user has open and merges the answers.
+ *
+ *  Deliberately without the CI rollup and the line counts: see
+ *  `listPrsOverviewStats`. */
+export const listPrsOverview = (path: string) =>
+  invoke<PrsOverview>("list_prs_overview", { path });
 
-export const getPullRequestChecks = (path: string) =>
-  invoke<CheckInfo[]>("get_pull_request_checks", { path });
+/** The expensive half: CI rollup and line counts by pull request number.
+ *  Fired behind the listing, and only for roots whose rows came back
+ *  with `checks: null`. */
+export const listPrsOverviewStats = (path: string) =>
+  invoke<PrOverviewStats[]>("list_prs_overview_stats", { path });
 
-export const getPrReviewComments = (path: string) =>
-  invoke<ReviewComment[]>("get_pr_review_comments", { path });
+/** Merge a PR. `deleteBranch` defaults to true on the backend, matching
+ *  the behaviour before the merge sheet made it a question. */
+export const mergePullRequest = (
+  path: string,
+  prNumber: number,
+  method: string,
+  deleteBranch?: boolean,
+  commitTitle?: string | null,
+  commitBody?: string | null,
+) =>
+  invoke("merge_pull_request", {
+    path,
+    prNumber,
+    method,
+    deleteBranch,
+    commitTitle,
+    commitBody,
+  });
+
+export const closePullRequest = (path: string, prNumber: number) =>
+  invoke("close_pull_request", { path, prNumber });
+
+export const reopenPullRequest = (path: string, prNumber: number) =>
+  invoke("reopen_pull_request", { path, prNumber });
+
+/** Flip draft ↔ ready-for-review. */
+export const setPrReady = (path: string, prNumber: number, ready: boolean) =>
+  invoke("set_pr_ready", { path, prNumber, ready });
+
+/** Edit title and/or body; an omitted field is left untouched. */
+export const updatePullRequest = (
+  path: string,
+  prNumber: number,
+  title: string | null,
+  body: string | null,
+) => invoke("update_pull_request", { path, prNumber, title, body });
+
+export const requestPrReview = (path: string, prNumber: number, reviewer: string) =>
+  invoke("request_pr_review", { path, prNumber, reviewer });
+
+/** Best-effort log tail for a failing check. Empty string means "no
+ *  excerpt available" — the failing-check card renders without one. */
+export const getCheckLogExcerpt = (path: string, prNumber: number, checkName: string) =>
+  invoke<string>("get_check_log_excerpt", { path, prNumber, checkName });
+
+/** Checks for a pull request. Omit `prNumber` for "whatever PR this
+ *  checkout's branch has" — the panel's case; the page passes the
+ *  selected PR, which is usually not the checked-out one. */
+export const getPullRequestChecks = (path: string, prNumber?: number) =>
+  invoke<CheckInfo[]>("get_pull_request_checks", { path, prNumber });
+
+/** Conversation-level reviews. Omit `prNumber` for the current
+ *  branch's PR. */
+export const getPrReviewComments = (path: string, prNumber?: number) =>
+  invoke<ReviewComment[]>("get_pr_review_comments", { path, prNumber });
 
 export const getPrInlineComments = (path: string, prNumber: number) =>
   invoke<InlineReviewComment[]>("get_pr_inline_comments", { path, prNumber });
 
+/** Conversation threads with their resolution state.
+ *
+ *  Not the same call as `getPrInlineComments`: that one is a flat list of
+ *  comments with no thread identity and no resolution state, which is why
+ *  both exist — the flat list is what the review *summaries* are grouped
+ *  from, and this is what "still open" is read from. */
+export const getPrReviewThreads = (path: string, prNumber: number) =>
+  invoke<PrReviewThread[]>("get_pr_review_threads", { path, prNumber });
+
+/** Reply into a thread.
+ *
+ *  Both ids travel because the two hosts address the same act
+ *  differently: GitLab replies to the discussion, GitHub to the thread's
+ *  first comment (`database_id` on that comment). */
+export const replyToPrThread = (
+  path: string,
+  prNumber: number,
+  threadId: string,
+  rootCommentId: number | null,
+  body: string,
+) => invoke("reply_to_pr_thread", { path, prNumber, threadId, rootCommentId, body });
+
+/** Resolve (`true`) or unresolve (`false`) — one command both ways,
+ *  because the button is one button whose label flips. */
+export const setPrThreadResolved = (
+  path: string,
+  prNumber: number,
+  threadId: string,
+  resolved: boolean,
+) => invoke("set_pr_thread_resolved", { path, prNumber, threadId, resolved });
+
 export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
   invoke("submit_pr_review", { path, prNumber, event, body });
+
+/** The whole unified diff, for the Code tab. Uncapped where
+ *  `getGithubPrDiffByPath` is capped at 100 KB, and uncached on the
+ *  backend so a force-push shows the new patch immediately. */
+export const getPrReviewDiff = (path: string, prNumber: number) =>
+  invoke<string>("get_pr_review_diff", { path, prNumber });
+
+/** The host's own history of a pull request, oldest first.
+ *
+ *  Carries neither the "opened" row nor the checks row: the first is
+ *  synthesized from the PR the caller already holds, and checks are not a
+ *  timeline event at any host — they are the live checks query. */
+export const getPrTimeline = (path: string, prNumber: number) =>
+  invoke<PrTimelineEvent[]>("get_pr_timeline", { path, prNumber });
+
+/** Post one line comment now. `commitId` must be the head the rendered
+ *  diff came from — a stale one pins the comment to a superseded commit
+ *  without erroring. */
+export const addPrInlineComment = (
+  path: string,
+  prNumber: number,
+  comment: PrDraftComment,
+  commitId: string,
+) => invoke("add_pr_inline_comment", { path, prNumber, comment, commitId });
+
+/** Verdict, body and every pending line note in a single request. */
+export const submitPrReviewWithComments = (
+  path: string,
+  prNumber: number,
+  event: string,
+  body: string,
+  comments: PrDraftComment[],
+  commitId: string,
+) =>
+  invoke("submit_pr_review_with_comments", {
+    path,
+    prNumber,
+    event,
+    body,
+    comments,
+    commitId,
+  });
 
 // ── GitHub Issues ──
 
@@ -807,6 +949,12 @@ export const gitDiscardFile = (path: string, file: string) =>
 
 export const gitLogEntries = (path: string, count: number) =>
   invoke<GitLogEntry[]>("git_log_entries", { path, count });
+
+/** Commits this branch has that `base` does not, newest first, with
+ *  bodies — what the create-pull-request form drafts its title and
+ *  description from. Capped by `limit`. */
+export const gitCommitsAhead = (path: string, base: string, limit: number) =>
+  invoke<CommitSummary[]>("git_commits_ahead", { path, base, limit });
 
 export const getCommitFiles = (path: string, hash: string) =>
   invoke<CommitFileEntry[]>("get_commit_files", { path, hash });

@@ -1,26 +1,58 @@
-import { useRef, useCallback, useImperativeHandle, forwardRef } from "react";
+import {
+  useRef,
+  useCallback,
+  useImperativeHandle,
+  useLayoutEffect,
+  useState,
+  forwardRef,
+  Fragment,
+  type ReactNode,
+} from "react";
 import type { DiffLine } from "@/lib/diff-parser";
 import { buildSplitPairs } from "@/lib/diff-parser";
+import { cn } from "@/lib/utils";
 import { Separator } from "@/components/ui/separator";
+import type { DiffViewHandle } from "./DiffUnifiedView";
+import {
+  diffRowStyle,
+  SELECTED_NUMBER_CLASS,
+  SELECTED_ROW_CLASS,
+  type DiffRowSide,
+  type DiffSelection,
+} from "./diff-row";
 
 interface Props {
   lines: DiffLine[];
+  /** Line review. Absent on the Changes pane, which only reads. */
+  selection?: DiffSelection;
+  /** Natural height inside someone else's scroll container. In flow
+   *  mode the two columns scroll together with the page, which is what
+   *  a per-file section wants — there is nothing left to synchronise. */
+  flow?: boolean;
 }
 
-export interface DiffViewHandle {
-  scrollToHunk: (direction: 1 | -1) => void;
-}
+/** One handle for both views — it was declared twice, identically. */
+export type { DiffViewHandle };
 
 function SplitSideLine({
   line,
   side,
+  selection,
+  flow = false,
 }: {
   line: DiffLine | null;
   side: "left" | "right";
+  selection?: DiffSelection;
+  /** Review's taller leading. Applied to every row shape here — the
+   *  placeholder included — or the two columns stop lining up. */
+  flow?: boolean;
 }) {
+  const rowHeight = flow ? "min-h-[22px]" : "min-h-[18px]";
+  const gutterSize = flow ? "text-[12px]" : "text-[11px]";
+
   if (!line) {
     return (
-      <div className="flex min-h-[18px] whitespace-pre bg-muted/5">
+      <div className={cn("flex whitespace-pre bg-muted/5", rowHeight)}>
         <span className="w-10 shrink-0 select-none" />
         <span className="flex-1" />
       </div>
@@ -29,9 +61,12 @@ function SplitSideLine({
 
   if (line.type === "hunk-header") {
     return (
-      <div data-diff-hunk className="flex min-h-[18px] bg-muted/30 whitespace-pre mt-1 first:mt-0">
+      <div
+        data-diff-hunk
+        className={cn("flex bg-muted/30 whitespace-pre mt-1 first:mt-0", rowHeight)}
+      >
         <span className="w-10 shrink-0 select-none" />
-        <span className="text-muted-foreground/60 text-[11px] px-2 truncate">
+        <span className={cn("text-muted-foreground/60 px-2 truncate", gutterSize)}>
           {line.content}
         </span>
       </div>
@@ -39,62 +74,164 @@ function SplitSideLine({
   }
 
   const lineNum = side === "left" ? line.oldLine : line.newLine;
-
-  // Conflict marker detection
-  const isOursMarker = line.content.startsWith("<<<<<<<");
-  const isSeparator = line.content.startsWith("=======") && !line.content.startsWith("========");
-  const isTheirsMarker = line.content.startsWith(">>>>>>>");
-  const isConflictMarker = isOursMarker || isSeparator || isTheirsMarker;
-
-  const bgClass = isOursMarker
-    ? "bg-primary/15 border-l-2 border-primary"
-    : isTheirsMarker
-      ? "bg-accent-violet/15 border-l-2 border-accent-violet"
-      : isSeparator
-        ? "bg-muted/40 border-l-2 border-muted-foreground"
-        : line.type === "add"
-          ? "bg-success/10"
-          : line.type === "del"
-            ? "bg-danger/10"
-            : "";
-
-  const prefixChar =
-    line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
-
-  const prefixColor = isConflictMarker
-    ? "text-muted-foreground"
-    : line.type === "add"
-      ? "text-success"
-      : line.type === "del"
-        ? "text-danger"
-        : "text-muted-foreground";
+  // The column is the side. A context line appears in both columns and
+  // is addressable from either — the one you clicked is the one you meant.
+  const anchorSide: DiffRowSide = side === "left" ? "LEFT" : "RIGHT";
+  const style = diffRowStyle(line);
+  const selectable = !!selection && lineNum != null;
+  const selected = selectable && selection.isSelected(line, anchorSide);
 
   return (
-    <div className={`flex min-h-[18px] whitespace-pre ${bgClass}`}>
-      <span className="inline-block w-10 shrink-0 text-right pr-2 text-[11px] text-muted-foreground tabular-nums select-none">
+    <div
+      data-diff-row={selectable ? `${anchorSide}:${lineNum}` : undefined}
+      data-selected={selected ? "true" : undefined}
+      className={cn(
+        "flex whitespace-pre",
+        rowHeight,
+        selected ? SELECTED_ROW_CLASS : style.bgClass,
+      )}
+    >
+      <span
+        data-diff-line={selectable ? `${anchorSide}:${lineNum}` : undefined}
+        className={cn(
+          "inline-block w-10 shrink-0 text-right pr-2 tabular-nums select-none",
+          gutterSize,
+          selected ? SELECTED_NUMBER_CLASS : "text-muted-foreground",
+          selectable && "cursor-pointer hover:bg-accent-ember/10",
+        )}
+        onMouseDown={selectable ? (e) => { if (e.shiftKey) e.preventDefault(); } : undefined}
+        onClick={
+          selectable ? (e) => selection.onSelect(line, anchorSide, e.shiftKey) : undefined
+        }
+      >
         {lineNum ?? ""}
       </span>
       <span
-        className={`inline-block w-4 shrink-0 text-center select-none ${prefixColor}`}
+        className={`inline-block w-4 shrink-0 text-center select-none ${style.prefixColor}`}
       >
-        {prefixChar}
+        {style.prefixChar}
       </span>
       <span className="flex-1 min-w-0 pr-4">
-        {isOursMarker && <span className="text-[9px] font-bold text-primary mr-2">OURS</span>}
-        {isTheirsMarker && <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>}
+        {style.isOursMarker && (
+          <span className="text-[9px] font-bold text-primary mr-2">OURS</span>
+        )}
+        {style.isTheirsMarker && (
+          <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>
+        )}
         {line.content}
       </span>
     </div>
   );
 }
 
+/** What a column wants to draw beneath one row — a composer, a pending
+ *  note. Hunk headers are not addressable, so they never have one. */
+function underFor(
+  selection: DiffSelection | undefined,
+  line: DiffLine | null,
+  side: DiffRowSide,
+): ReactNode {
+  if (!line || line.type === "hunk-header") return null;
+  return selection?.renderUnder?.(line, side) ?? null;
+}
+
+/**
+ * The under-row for one column, and the space it costs the other one.
+ *
+ * The two columns are separate scroll boxes, so anything rendered below
+ * a row pushes only *that* column's remaining rows down — and from there
+ * the sides no longer face each other, which is the one thing a split
+ * view is for. A composer opened on a RIGHT line used to shift every
+ * line below it out of alignment with its LEFT counterpart.
+ *
+ * Each side therefore reports the height it took, and both sides hold at
+ * least the taller of the two. One side with content and one without
+ * gives an empty box of exactly the same height; both sides with content
+ * (a context line noted from LEFT *and* RIGHT) levels them to the taller.
+ * Measured rather than assumed because the content is a live component
+ * whose height changes as you type.
+ *
+ * The measured element is *inside* the box holding the matched height,
+ * never the box itself. Measuring the outer one would fold the other
+ * column's height into this column's report, and the pair would ratchet:
+ * two sides each holding a height derived from the other, and deleting a
+ * paragraph would never bring either back down.
+ */
+function UnderRow({
+  id,
+  content,
+  matchHeight,
+  onMeasure,
+  onRelease,
+}: {
+  id: string;
+  content: ReactNode;
+  /** What the opposite column reported for this row. */
+  matchHeight: number;
+  onMeasure: (id: string, height: number) => void;
+  onRelease: (id: string) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) {
+      // A spacer costs the other column nothing.
+      onMeasure(id, 0);
+      return;
+    }
+    const report = () => onMeasure(id, el.offsetHeight);
+    report();
+    // Absent in jsdom, where every height is zero and there is nothing
+    // to keep level anyway.
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(report);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [content, id, onMeasure]);
+
+  // The row is gone; so is the space it was asking the other column for.
+  // Separate from the measuring effect above so it fires on unmount only,
+  // rather than on every change of what is being measured.
+  useLayoutEffect(() => () => onRelease(id), [id, onRelease]);
+
+  if (!content) {
+    return matchHeight > 0 ? <div aria-hidden style={{ height: matchHeight }} /> : null;
+  }
+  return (
+    <div style={matchHeight > 0 ? { minHeight: matchHeight } : undefined}>
+      <div ref={ref}>{content}</div>
+    </div>
+  );
+}
+
 export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
-  function DiffSplitView({ lines }, ref) {
+  function DiffSplitView({ lines, selection, flow = false }, ref) {
     const leftRef = useRef<HTMLDivElement>(null);
     const rightRef = useRef<HTMLDivElement>(null);
     const isSyncing = useRef(false);
 
     const pairs = buildSplitPairs(lines);
+
+    // Resolved once per pair rather than inside each column, so a column
+    // that is drawing nothing still knows the other one is.
+    const unders = pairs.map((pair) => ({
+      left: underFor(selection, pair.left, "LEFT"),
+      right: underFor(selection, pair.right, "RIGHT"),
+    }));
+
+    const [underHeights, setUnderHeights] = useState<Record<string, number>>({});
+    const measureUnder = useCallback((id: string, height: number) => {
+      setUnderHeights((prev) => (prev[id] === height ? prev : { ...prev, [id]: height }));
+    }, []);
+    const releaseUnder = useCallback((id: string) => {
+      setUnderHeights((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }, []);
 
     const scrollToHunk = useCallback(
       (direction: 1 | -1) => {
@@ -132,19 +269,43 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         });
       };
 
+    const columnClass = flow ? "bg-card" : "relative overflow-auto bg-card";
+
     return (
-      <div className="code-surface select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden">
-        {/* Left — deletions / old. `relative` is load-bearing: it makes this
-            the offsetParent, so each hunk's offsetTop is a scroll position
-            rather than a page coordinate measured from the app shell. */}
+      <div
+        className={cn(
+          "code-surface select-text grid grid-cols-[1fr_1px_1fr]",
+          flow ? "bg-card" : "flex-1 min-h-0 overflow-hidden",
+        )}
+      >
+        {/* Left — deletions / old. `relative` is load-bearing outside flow
+            mode: it makes this the offsetParent, so each hunk's offsetTop is
+            a scroll position rather than a page coordinate measured from the
+            app shell. */}
         <div
           ref={leftRef}
-          className="relative overflow-auto bg-card"
-          onScroll={handleScroll("left")}
+          className={columnClass}
+          onScroll={flow ? undefined : handleScroll("left")}
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.left} side="left" />
+              <Fragment key={i}>
+                <SplitSideLine
+                  line={pair.left}
+                  side="left"
+                  selection={selection}
+                  flow={flow}
+                />
+                {(unders[i].left || unders[i].right) && (
+                  <UnderRow
+                    id={`${i}:left`}
+                    content={unders[i].left}
+                    matchHeight={underHeights[`${i}:right`] ?? 0}
+                    onMeasure={measureUnder}
+                    onRelease={releaseUnder}
+                  />
+                )}
+              </Fragment>
             ))}
           </div>
         </div>
@@ -155,12 +316,28 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         {/* Right — additions / new */}
         <div
           ref={rightRef}
-          className="relative overflow-auto bg-card"
-          onScroll={handleScroll("right")}
+          className={columnClass}
+          onScroll={flow ? undefined : handleScroll("right")}
         >
           <div className="py-0.5">
             {pairs.map((pair, i) => (
-              <SplitSideLine key={i} line={pair.right} side="right" />
+              <Fragment key={i}>
+                <SplitSideLine
+                  line={pair.right}
+                  side="right"
+                  selection={selection}
+                  flow={flow}
+                />
+                {(unders[i].right || unders[i].left) && (
+                  <UnderRow
+                    id={`${i}:right`}
+                    content={unders[i].right}
+                    matchHeight={underHeights[`${i}:left`] ?? 0}
+                    onMeasure={measureUnder}
+                    onRelease={releaseUnder}
+                  />
+                )}
+              </Fragment>
             ))}
           </div>
         </div>
