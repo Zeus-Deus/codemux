@@ -424,8 +424,9 @@ describe("SidebarInboxCard — background recede", () => {
   });
 
   // Idle must not light up: the exemption exists so a *live* agent reads as
-  // live, and a row with nothing running has no state to shout about.
-  it("recedes an idle background card and leaves its readout grey", () => {
+  // live, and a row with nothing running has no state to shout about — so its
+  // timestamp dims with the rest of the card instead of outshining the title.
+  it("recedes an idle background card along with its readout", () => {
     useSidebarDensityStore.setState({ settledAt: { "ws-1": 0 } });
     const { card } = renderCard({ status: null, now: 26 * 60_000 });
 
@@ -435,9 +436,42 @@ describe("SidebarInboxCard — background recede", () => {
     );
 
     const idleState = screen.getByText("26m");
-    expect(idleState.className).toContain("text-muted-foreground/70");
+    expect(idleState.className).toContain("text-muted-foreground/50");
+    expect(idleState.className).toContain(
+      "group-hover/card:text-muted-foreground/70",
+    );
     expect(idleState.className).toContain("font-medium");
     expect(idleState.className).not.toContain("text-status-");
+  });
+
+  // The chip paints its own colours, so the recede has to ride a wrapper
+  // opacity — otherwise it is the brightest mark on a dim card.
+  it("dims the linked-issue chip on a receded working card", () => {
+    renderCard({
+      status: "working",
+      workspace: makeWorkspace({
+        linked_issue: { number: 42, title: "Fix it", state: "Open", labels: [] },
+      }),
+    });
+
+    const chipWrapper = screen.getByText("#42").closest("button")?.parentElement;
+    expect(chipWrapper?.className).toContain("opacity-70");
+    expect(chipWrapper?.className).toContain("group-hover/card:opacity-100");
+    expect(chipWrapper?.className).toContain(
+      "group-focus-within/card:opacity-100",
+    );
+  });
+
+  // The pin marker is eyebrow furniture, not a live readout, so it recedes
+  // with the repo name it sits beside.
+  it("dims the resting pin marker on a receded card", () => {
+    const { container } = renderCard({ pinned: true, status: "working" });
+    // An SVG node, so `className` is an SVGAnimatedString — read the attribute.
+    const marker = container.querySelector('[aria-label="Pinned workspace"]')!;
+    const classes = marker.getAttribute("class") ?? "";
+    expect(classes).toContain("text-muted-foreground/55");
+    expect(classes).toContain("group-hover/card:text-muted-foreground/75");
+    expect(classes).not.toMatch(/(^|\s)text-muted-foreground\/75\b/);
   });
 
   // A watch loop is background presence by definition, so its card recedes

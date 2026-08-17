@@ -250,13 +250,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // read, so it sits back and the ones that need you read as the bright rows.
   //
   // The recede is applied per element — repo identity, title, git facts, PR
-  // chip, trailing indicators — and never as one opacity on the card root,
-  // because a blanket multiplier also swallows the one thing a background card
-  // still has to say: what its agent is doing. So the state readout is exempt.
-  // A quietly-working card paints "Working 11m" at full strength on an
-  // otherwise dim card, monitoring keeps its own colour the same way, and idle
-  // stays grey — that is the middle step between "nothing here" and "this one
-  // needs you", and it is only legible if the readout survives the dimming.
+  // chip, linked issue, pin marker, trailing indicators — and never as one
+  // opacity on the card root, because a blanket multiplier also swallows the
+  // one thing a background card still has to say: what its agent is doing. So
+  // a *live* readout is the single exemption. A quietly-working card paints
+  // "Working 11m" at full strength on an otherwise dim card and monitoring
+  // keeps its own colour the same way, while an idle card's timestamp recedes
+  // with everything else — nothing is running, so it has nothing to shout.
+  // That is the middle step between "nothing here" and "this one needs you",
+  // and it is only legible if the live readout survives the dimming.
   // Hovering or focusing a receded card still restores everything else, so
   // nothing is ever hidden — only ranked.
   const receded =
@@ -360,7 +362,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         isNeeds && "font-semibold text-status-attention",
         isMonitoring && "font-semibold text-status-monitoring",
         isDone && "font-semibold text-status-open",
-        !status && "font-medium text-muted-foreground/70",
+        // The exemption is for *live* readouts only. An idle card's timestamp
+        // reports nothing running, so it recedes with the rest of the card
+        // rather than outshining that card's own title.
+        !status &&
+          (visuallyReceded
+            ? "font-medium text-muted-foreground/50 transition-colors group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
+            : "font-medium text-muted-foreground/70"),
       )}
     >
       {/* Workspace navigation reports lifecycle, not the agent's current
@@ -549,7 +557,14 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     role="img"
                     aria-label="Pinned workspace"
                     className={cn(
-                      "size-[11px] shrink-0 text-muted-foreground/75",
+                      "size-[11px] shrink-0 transition-colors duration-150",
+                      // Recedes with the eyebrow it sits in. The restore pair
+                      // rides along for consistency with the other converted
+                      // elements; the marker also hides outright under the
+                      // pointer, one line down.
+                      visuallyReceded
+                        ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/75 group-focus-within/card:text-muted-foreground/75"
+                        : "text-muted-foreground/75",
                       actionsPinned
                         ? "hidden"
                         : "group-hover/card:hidden group-focus-within/card:hidden",
@@ -741,11 +756,24 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {displayTitle}
                 </span>
                 {workspace.linked_issue && (
-                  <IssueDetailPopover
-                    providerKind={workspace.provider_kind}
-                    workspaceId={workspace.workspace_id}
-                    issue={workspace.linked_issue}
-                  />
+                  // The chip owns its own colours — a solid state dot and the
+                  // `#N` beside it — and takes no class from here, so its
+                  // recede is a wrapper opacity rather than a colour swap.
+                  // Without it the chip would be the brightest thing on a dim
+                  // card, louder than that card's own title.
+                  <span
+                    className={cn(
+                      "flex shrink-0 transition-opacity duration-150",
+                      visuallyReceded &&
+                        "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
+                    )}
+                  >
+                    <IssueDetailPopover
+                      providerKind={workspace.provider_kind}
+                      workspaceId={workspace.workspace_id}
+                      issue={workspace.linked_issue}
+                    />
+                  </span>
                 )}
               </div>
 
