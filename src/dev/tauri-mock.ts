@@ -82,6 +82,7 @@ import type {
   TabSnapshot,
   TerminalPreset,
   ProviderChatCapabilities,
+  ProviderHealthReport,
   ResourceMetricsSnapshot,
   ShellAppearance,
   ThemeColors,
@@ -1792,6 +1793,56 @@ function streamMockRunStalled(
   });
 }
 
+/** Provider-health QA: per-provider override served by the
+ *  `agent_chat_provider_health` mock handler. Absent → healthy. */
+type MockProviderKind = "claude" | "codex" | "opencode";
+const mockProviderHealth: Partial<
+  Record<MockProviderKind, ProviderHealthReport>
+> = {};
+
+/** Inject (or clear, with `null`) a provider health failure, then nudge
+ *  the frontend store to re-probe immediately so the chat surfaces'
+ *  status banner reflects it without waiting out the TTL. */
+function setMockProviderHealth(
+  provider: MockProviderKind,
+  health: Partial<ProviderHealthReport> | null,
+): void {
+  if (health === null) {
+    delete mockProviderHealth[provider];
+  } else {
+    mockProviderHealth[provider] = {
+      provider,
+      status: "error",
+      installed: true,
+      message: null,
+      version: null,
+      ...health,
+    };
+  }
+  void import("@/stores/provider-health-store").then((m) =>
+    m.useProviderHealth.getState().refresh(provider, { force: true }),
+  );
+}
+
+/** Session-death QA: emit the `session_state_changed { error }` the
+ *  provider watchdogs fire when a sidecar/server dies WITHOUT a
+ *  recoverable turn id. Drives the inline red "Session error" notice. */
+function sessionErrorMockRun(
+  threadId: string = MOCK_CHAT_THREAD_ID,
+  message = "claude-agent sidecar exited unexpectedly",
+): void {
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: `err-turn-${Date.now()}` },
+  });
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "error", message },
+  });
+}
+
 /** Dead-run detection QA (issue #154): settle a live turn with a synthetic
  *  `child_exited` error — exactly what the provider watchdogs emit when a
  *  sidecar/server dies mid-turn. Drives the "Run interrupted" divider and
@@ -1825,6 +1876,8 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       streamSubagents: typeof streamMockSubagents;
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
+      sessionError: typeof sessionErrorMockRun;
+      setProviderHealth: typeof setMockProviderHealth;
     };
   }
 ).__codemuxChatMock = {
@@ -1833,6 +1886,8 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   streamSubagents: streamMockSubagents,
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
+  sessionError: sessionErrorMockRun,
+  setProviderHealth: setMockProviderHealth,
 };
 
 // Expose the terminal flood + serialize triggers for browser-console /
@@ -2733,6 +2788,21 @@ const handlers: Record<string, Handler> = {
   // MCP warmup is a real background prime in the app; the mock has no MCP
   // host, so this is a no-op that returns immediately.
   agent_chat_prime_mcp: () => undefined,
+  // Provider runtime health probe. Healthy by default; QA can inject a
+  // failure via `window.__codemuxChatMock.setProviderHealth(...)` to
+  // exercise the chat surfaces' provider status banner.
+  agent_chat_provider_health: (a) => {
+    const provider = String(a.provider) as MockProviderKind;
+    return (
+      mockProviderHealth[provider] ?? {
+        provider,
+        status: "ready",
+        installed: true,
+        message: null,
+        version: "0.0.0-mock",
+      }
+    );
+  },
   agent_chat_start_session: (a) => (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) => {
     const input = a.input as {

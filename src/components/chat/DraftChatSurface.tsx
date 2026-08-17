@@ -74,6 +74,9 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { ProviderStatusNotice } from "./ProviderStatusNotice";
+import { formatProviderError } from "@/lib/agent-chat/provider-error";
+import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
 import type { ActivePillMode } from "./pickers/ModePill";
@@ -542,6 +545,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         (phase) => setPending((p) => (p ? { ...p, phase } : p)),
       );
       if (result.success) {
+        // The provider started a session and took the turn — retire any
+        // stale failure banner (no-op when nothing is bannered).
+        void useProviderHealth
+          .getState()
+          .noteProviderSuccess(finalDraft.provider);
         // Flip to the real pane. The pending view stays mounted until
         // this surface unmounts, and the live pane renders the same
         // optimistically-appended bubble — flicker-free.
@@ -560,7 +568,13 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         // `draft.lastSendError` on the composer.
         setPending(null);
         updateDraftInput(finalDraft.draftId, text);
-        toast.error(`Send failed: ${result.error}`);
+        toast.error(`Send failed: ${formatProviderError(result.error)}`);
+        // A materialize failure often means the provider runtime itself
+        // is broken — re-probe (bypassing the TTL) so the status banner
+        // explains why instead of leaving only a transient toast.
+        void useProviderHealth
+          .getState()
+          .refresh(finalDraft.provider, { force: true });
       }
       sendInFlightRef.current = false;
     })();
@@ -1142,8 +1156,13 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div className="relative flex h-full w-full flex-col bg-background">
       {!enableAgentChat && <DraftSurfaceHeader />}
+      {/* Provider runtime health (probe-backed, TTL-cached): tell the
+          user the selected provider can't run BEFORE they compose and
+          send a first message into a session that will never start.
+          Renders as a floating top overlay; needs `relative` above. */}
+      <ProviderStatusNotice provider={draft.provider} />
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />

@@ -671,6 +671,21 @@ export interface OpenCodeProviderEntry {
   models: Record<string, OpenCodeModel>;
 }
 
+/** Probe-backed health snapshot for one chat provider's local runtime,
+ *  as returned by `agent_chat_provider_health`. Mirrors the Rust
+ *  `ProviderHealthReport` in `src-tauri/src/agent_provider/health.rs`
+ *  field for field. `message` is `null` exactly when `status` is
+ *  `"ready"`. */
+export type ProviderHealthStatus = "ready" | "warning" | "error";
+
+export interface ProviderHealthReport {
+  provider: AgentChatProviderKind;
+  status: ProviderHealthStatus;
+  installed: boolean;
+  message: string | null;
+  version: string | null;
+}
+
 // ── Chat-side provider capabilities ───────────────────────────────────
 
 export type EffortGranularity = "per_session" | "per_turn";

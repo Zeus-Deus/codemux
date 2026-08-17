@@ -19,6 +19,9 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
+  // Provider-health probe (ProviderStatusNotice mount). Never resolves
+  // so no banner state churns mid-test.
+  agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
   // MCP warmup fired on the draft surface mount; no-op in tests. Image
   // staging commands are imported by the image-staging helper but only
   // invoked when a test stages an image (none here).

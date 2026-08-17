@@ -23,6 +23,7 @@ import {
 } from "./derive-title";
 import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { applyAllPrefixes } from "./mode-prefix";
+import { formatProviderError } from "./provider-error";
 import type { UserMessageImage } from "./types";
 import type { ResolvedSkillSelection } from "./skill-tokens";
 import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
@@ -918,11 +919,23 @@ async function resolveCwdForTarget(draft: ChatDraft): Promise<string> {
   }
 }
 
+/**
+ * Human-readable text for a failure on the materialize path.
+ *
+ * Everything here funnels into `markSendFailed` → `draft.lastSendError`,
+ * which the draft composer renders verbatim, so a provider command's
+ * rejection must not reach it as raw `SerializableProviderError` JSON —
+ * `{"kind":"not_installed","provider":"claude",…}` is not an error
+ * message. `formatProviderError` turns that into the same sentence the
+ * toast shows and passes anything else (plain strings, workspace-layer
+ * messages) straight through, so it is safe to apply to every failure
+ * and idempotent if applied twice.
+ */
 function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
+  if (err instanceof Error) return formatProviderError(err.message);
+  if (typeof err === "string") return formatProviderError(err);
   try {
-    return JSON.stringify(err);
+    return formatProviderError(JSON.stringify(err));
   } catch {
     return "Unknown error";
   }

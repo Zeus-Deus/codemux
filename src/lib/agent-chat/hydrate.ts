@@ -388,9 +388,12 @@ function finalizeReplay(
  *
  * Scans the ordered rows for the LAST `user_message` envelope and returns
  * true iff one exists and NO later row is a `turn_completed` event.
- * `session_state_changed` is never persisted, so `turn_completed` is the
- * sole settlement marker; queued-turn envelopes persist at dispatch time,
- * so ordering is sound. Exported for direct unit testing.
+ * `turn_completed` is the sole settlement marker. A persisted
+ * `session_state_changed{Error}` is NOT a second one: the watchdog emits
+ * a persisted `turn_completed` before it, so any turn an error settles
+ * already carries its own marker and scanning for errors here would only
+ * duplicate that. Queued-turn envelopes persist at dispatch time, so
+ * ordering is sound. Exported for direct unit testing.
  *
  * Takes ALREADY-PARSED rows: the hydrate path parses each payload once
  * and shares the array with the fold. `previous` seeds the scan with the

@@ -363,6 +363,10 @@ vi.mock("@/tauri/events", () => ({
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
+  // Provider-health probe (ProviderStatusNotice mount). Never resolves
+  // so no banner state churns mid-test; banner tests drive the store
+  // directly (see ProviderStatusNotice.test.tsx).
+  agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
   // The pane's mount-seed effect (design F) fetches the persisted
   // session row to restore picker config + resume cursor. Default to
   // `null` (no persisted row) so tests that don't seed a record fall

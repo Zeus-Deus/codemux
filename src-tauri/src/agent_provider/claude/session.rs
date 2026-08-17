@@ -206,17 +206,35 @@ impl ClaudeSession {
         // one the user is viewing. `JsonRpcChild` applies these as overlays on
         // the inherited env, so an empty map (no workspace resolved) is a
         // no-op and the sidecar inherits Codemux's env unchanged.
+        let sidecar_binary = spawn.sidecar_binary;
         let sidecar = JsonRpcChild::spawn(SpawnConfig {
-            program: spawn.sidecar_binary,
+            program: sidecar_binary.clone(),
             args: vec![],
             env: input.env.clone().unwrap_or_default(),
             cwd: Some(input.cwd.clone()),
             default_timeout: DEFAULT_RPC_TIMEOUT,
         })
         .await
-        .map_err(|e| ProviderError::ProcessError {
-            message: "failed to spawn claude-agent sidecar".into(),
-            source: Some(e.to_string()),
+        .map_err(|e| match e {
+            // A missing sidecar binary is an install problem, not a
+            // generic process failure — classify it so the UI can render
+            // the actionable "not installed" state (mirrors the probe
+            // path in `claude/auth.rs`).
+            crate::json_rpc_child::RpcChildError::SpawnFailed(ref io)
+                if io.kind() == std::io::ErrorKind::NotFound =>
+            {
+                ProviderError::NotInstalled {
+                    provider: crate::agent_provider::ProviderKind::Claude,
+                    hint: format!(
+                        "claude-agent sidecar not found at {}",
+                        sidecar_binary.display()
+                    ),
+                }
+            }
+            other => ProviderError::ProcessError {
+                message: "failed to spawn claude-agent sidecar".into(),
+                source: Some(other.to_string()),
+            },
         })?;
         let sidecar = Arc::new(sidecar);
 
