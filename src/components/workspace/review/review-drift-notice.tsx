@@ -6,15 +6,23 @@ import { btnCard, btnCardStrong, btnEmberSolid, tzBody } from "./review-ui";
  * Severity order. Exactly one notice shows at a time, and it is always
  * the most severe one that applies — a merged PR does not also need to
  * tell you the remote moved.
+ *
+ * `submit-failed` sits directly under the two terminal states, above
+ * everything describing the world moving. It is the only notice about
+ * something *you* just did that didn't work, and its Retry button is the
+ * only way back to the review you wrote. Ranked below `force-pushed`, as
+ * it originally was, a single force-push permanently hid it: the notice
+ * outranked the failure for the rest of the session, and Retry became
+ * unreachable with the text still sitting in the draft.
  */
 export const DRIFT_PRIORITY = [
   "merged",
   "closed",
+  "submit-failed",
   "force-pushed",
   "conflict",
   "remote-ahead-dirty",
   "remote-ahead-clean",
-  "submit-failed",
   "stale-data",
 ] as const;
 

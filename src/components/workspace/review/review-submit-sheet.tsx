@@ -12,7 +12,7 @@ import {
   tzPanelHeader,
 } from "./review-ui";
 import { rangeLabel } from "./review-code-tab";
-import type { LineDraft } from "./pr-drafts";
+import { setLastVerdict, setReviewDraft, type DraftKey, type LineDraft } from "./pr-drafts";
 
 export interface VerdictOption {
   id: string;
@@ -28,6 +28,8 @@ const VERDICTS: VerdictOption[] = [
 interface Props {
   open: boolean;
   prNumber: number;
+  /** Where the body and the verdict live between visits to this sheet. */
+  draftKey: DraftKey;
   drafts: LineDraft[];
   /** The action bar's half-written review — one draft pool, not two. */
   initialBody: string;
@@ -55,6 +57,7 @@ interface Props {
 export function ReviewSubmitSheet({
   open,
   prNumber,
+  draftKey,
   drafts,
   initialBody,
   initialVerdict,
@@ -68,6 +71,26 @@ export function ReviewSubmitSheet({
 }: Props) {
   const [verdict, setVerdict] = useState(initialVerdict);
   const [body, setBody] = useState(initialBody);
+
+  // ── Edits go back into the draft pool ──
+  //
+  // The sheet used to seed itself from the store and never write back,
+  // so everything typed here existed only in this component's state:
+  // clicking Re-anchor closed the sheet and lost it, reopening reseeded
+  // from the older action-bar text, and a failed submit kept it alive
+  // only in the retry buffer. There is meant to be one draft per pull
+  // request, not one per surface that can edit it, so every keystroke
+  // lands in the same place the action bar reads from and this sheet
+  // reseeds from next time.
+  const editBody = (value: string) => {
+    setBody(value);
+    setReviewDraft(draftKey, value);
+  };
+
+  const pickVerdict = (id: string) => {
+    setVerdict(id);
+    setLastVerdict(draftKey, id);
+  };
 
   // Rendered from the declarations, so the sheet and the action bar
   // cannot disagree about which verdicts this host has.
@@ -101,7 +124,7 @@ export function ReviewSubmitSheet({
                 role="radio"
                 aria-checked={verdict === option.id}
                 data-testid={`verdict-option-${option.id}`}
-                onClick={() => setVerdict(option.id)}
+                onClick={() => pickVerdict(option.id)}
                 className={cn(
                   "rounded-md px-2.5 py-1.5 transition-colors",
                   tzBody,
@@ -121,7 +144,7 @@ export function ReviewSubmitSheet({
             rows={3}
             value={body}
             placeholder="Anything to say about the review as a whole…"
-            onChange={(e) => setBody(e.target.value)}
+            onChange={(e) => editBody(e.target.value)}
             data-testid="submit-sheet-body"
             className={cn(
               "w-full resize-y rounded-md border-0 bg-background px-2.5 py-2 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",

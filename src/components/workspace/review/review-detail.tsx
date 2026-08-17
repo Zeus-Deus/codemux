@@ -93,6 +93,13 @@ export function _resetHeadOidTracking(): void {
   headOidSeen.clear();
 }
 
+/**
+ * Record the head we are looking at, and say when it last moved.
+ *
+ * Called from an effect, never during render: it writes module state and
+ * reads the clock, and doing either while rendering makes the same
+ * render produce different answers on a replay.
+ */
 function noteHeadOid(key: string, oid: string | null, merged: boolean): number | null {
   if (!oid) return null;
   const prev = headOidSeen.get(key);
@@ -106,6 +113,20 @@ function noteHeadOid(key: string, oid: string | null, merged: boolean): number |
   const changedAt = merged ? null : Date.now();
   headOidSeen.set(key, { oid, changedAt });
   return changedAt;
+}
+
+/**
+ * The force-push notice has been acted on; stop raising it.
+ *
+ * It used to be cleared only by a merge, so one force-push pinned
+ * "Force-pushed 3h ago" to the panel for the rest of the session — long
+ * after the notes had been re-anchored and there was nothing left to do
+ * about it. A notice with nothing left to say is not information, it is
+ * a permanent occupant of the one slot the surface has.
+ */
+function clearHeadOidChange(key: string): void {
+  const prev = headOidSeen.get(key);
+  if (prev?.changedAt != null) headOidSeen.set(key, { oid: prev.oid, changedAt: null });
 }
 
 export interface ReviewDetailProps {
@@ -220,7 +241,22 @@ export function ReviewDetail(props: ReviewDetailProps) {
     !!pr.author &&
     viewerLogin.toLowerCase() === pr.author.toLowerCase();
 
-  const forcePushedAt = noteHeadOid(key, pr.head_ref_oid, merged);
+  // Read from the module map on mount so a force-push noticed while you
+  // were on another pane is still there when you come back, then kept in
+  // state — the recording itself is a side effect and belongs in an
+  // effect, not in the middle of a render.
+  const [forcePushedAt, setForcePushedAt] = useState<number | null>(
+    () => headOidSeen.get(key)?.changedAt ?? null,
+  );
+
+  useEffect(() => {
+    setForcePushedAt(noteHeadOid(key, pr.head_ref_oid, merged));
+  }, [key, pr.head_ref_oid, merged]);
+
+  const acknowledgeForcePush = useCallback(() => {
+    clearHeadOidChange(key);
+    setForcePushedAt(null);
+  }, [key]);
 
   // ── The diff ──
   //
@@ -248,6 +284,20 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
   const unanchoredCount = lineDrafts.filter((d) => d.status === "unanchored").length;
   const blockedSubmitReason = submitBlockedReason(lineDrafts, pr.head_ref_oid);
+
+  // The force-push notice exists to get lost notes re-anchored. Once the
+  // last one has found a line again it has nothing left to say, so it
+  // stands down by itself rather than waiting for a merge.
+  const hadUnanchored = useRef(false);
+  useEffect(() => {
+    if (unanchoredCount > 0) {
+      hadUnanchored.current = true;
+      return;
+    }
+    if (!hadUnanchored.current) return;
+    hadUnanchored.current = false;
+    acknowledgeForcePush();
+  }, [unanchoredCount, acknowledgeForcePush]);
 
   // ── The timeline ──
   //
@@ -748,6 +798,11 @@ export function ReviewDetail(props: ReviewDetailProps) {
               } a line`}
           </>
         ),
+        // Both primary actions acknowledge the notice: the user has read
+        // it and is now dealing with it, and a notice that keeps shouting
+        // through the work it asked for is just occupying the slot the
+        // next thing needs. Re-anchoring also clears it on its own once
+        // the last note lands, above.
         actions:
           lineDrafts.length > 0
             ? [
@@ -756,21 +811,30 @@ export function ReviewDetail(props: ReviewDetailProps) {
                 { label: "Show on old diff", onClick: () => openCodeTab("old-diff") },
                 {
                   label: "Re-anchor",
-                  onClick: () => openCodeTab("repin"),
+                  onClick: () => {
+                    acknowledgeForcePush();
+                    openCodeTab("repin");
+                  },
                   emphasis: "strong" as const,
                 },
               ]
-            : [{ label: "Refresh", onClick: onRefresh, emphasis: "strong" as const }],
+            : [
+                {
+                  label: "Refresh",
+                  onClick: () => {
+                    acknowledgeForcePush();
+                    onRefresh();
+                  },
+                  emphasis: "strong" as const,
+                },
+              ],
       });
     }
 
-    // Deliberately no conflict notice. `conflict` sits above the
-    // transient notices in the severity order, so raising one here would
-    // outrank — and hide — the submit-failure notice for a review the
-    // user just tried to send. The author's bar already names the
+    // Deliberately no conflict notice. The author's bar already names the
     // conflict in words, and a reviewer can't resolve someone else's
-    // conflict from this panel anyway, so the notice would cost the one
-    // message that is actionable to buy one that isn't.
+    // conflict from this panel anyway — so a notice here would spend the
+    // one slot on a message nobody in this surface can act on.
 
     if (gitBehind > 0 && !readOnly) {
       if (gitDirtyFiles > 0) {
@@ -874,6 +938,7 @@ export function ReviewDetail(props: ReviewDetailProps) {
     isAuthor,
     conflicted,
     forcePushedAt,
+    acknowledgeForcePush,
     gitBehind,
     gitDirtyFiles,
     submitError,
@@ -1096,7 +1161,19 @@ export function ReviewDetail(props: ReviewDetailProps) {
         canComment={operations.comment}
         canMerge={operations.merge_with_strategies}
         canChangeState={operations.draft_ready_close_reopen}
-        onSubmitReview={(event, body) => void runSubmit(event, body)}
+        // A verdict from the bar sends the pending line notes with it.
+        //
+        // The bar and the submit sheet are two doors onto the same act,
+        // and the bar used to go through the plain review call — so
+        // approving from it published the verdict and left every line
+        // note sitting in the draft store, invisible to the author and
+        // still marked pending here. With no drafts this is the same
+        // request it always was.
+        onSubmitReview={(event, body) =>
+          void (lineDrafts.length > 0
+            ? submitWithNotes(event, body)
+            : runSubmit(event, body))
+        }
         onOpenMergeSheet={() => setMergeSheetOpen(true)}
         onPickStrategy={(next) => {
           setStrategy(next);
@@ -1111,8 +1188,12 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
       {submitSheetOpen && (
         <ReviewSubmitSheet
+          // Same reason as the merge sheet: body and verdict are seeded
+          // once per mount, so the mount has to end when the PR changes.
+          key={key}
           open
           prNumber={pr.number}
+          draftKey={key}
           drafts={lineDrafts}
           // One draft pool: whatever is half-written in the action bar
           // is the same text this review's body starts from.
@@ -1133,6 +1214,12 @@ export function ReviewDetail(props: ReviewDetailProps) {
 
       {mergeSheetOpen && (
         <MergeSheet
+          // The commit title is seeded from props into `useState`, which
+          // is only ever right because a fresh sheet is a fresh mount.
+          // The panel's `ReviewDetail` is not keyed by pull request, so
+          // the PR under an open sheet can change; keying it here makes
+          // the assumption true rather than lucky.
+          key={pr.number}
           open
           prNumber={pr.number}
           prTitle={pr.title}

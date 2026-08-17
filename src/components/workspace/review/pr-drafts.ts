@@ -221,8 +221,9 @@ export function putDiffSnapshot(key: DraftKey, headOid: string, diff: string): v
     diffSnapshots.set(key, snapshots);
   }
   if (snapshots.has(headOid)) return;
-  // Two is enough to answer "what did it look like before?" without
-  // holding every diff of a busy afternoon in memory.
+  // Three is enough to answer "what did it look like before?" across a
+  // couple of force-pushes without holding every diff of a busy
+  // afternoon in memory.
   if (snapshots.size >= 3) {
     const oldest = snapshots.keys().next().value;
     if (oldest) snapshots.delete(oldest);

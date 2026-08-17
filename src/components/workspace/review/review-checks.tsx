@@ -175,7 +175,11 @@ function CheckRow({
   // Only fetched once the card is actually open, and only for failures:
   // an excerpt is a nicety, not worth a subprocess per poll.
   const excerptQuery = useQuery({
-    queryKey: ["pr", "check-log", prNumber, check.name] as const,
+    // `cwd` is part of the key because it is part of the question: two
+    // repositories open at once can each have a #142 with a `lint`
+    // check, and a key that can't tell them apart feeds one repo's log
+    // to the other's card — and to its "Fix with agent" handoff.
+    queryKey: ["pr", "check-log", cwd, prNumber, check.name] as const,
     queryFn: () => getCheckLogExcerpt(cwd, prNumber, check.name),
     enabled: failing && expanded,
     staleTime: 60_000,

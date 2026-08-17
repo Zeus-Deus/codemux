@@ -7,6 +7,20 @@ interface Props {
   label: string;
   /** Editing an existing note rather than writing a new one. */
   initialBody?: string;
+  /**
+   * Reports every change, for a composer whose position can move.
+   *
+   * The new-note composer is mounted beneath the *end* of the selection,
+   * so shift-clicking to extend the range relocates it — and a relocated
+   * component is a remounted one, which took its local `body` with it.
+   * The owner keeps a copy and feeds it back as `initialBody` on the
+   * remount, so the draft survives the move.
+   *
+   * Reported rather than controlled on purpose: the owner is the parent
+   * of every file's diff view, and re-rendering that tree on each
+   * keystroke would repaint thousands of rows to update one textarea.
+   */
+  onBodyChange?: (body: string) => void;
   busy?: boolean;
   /** Absent when the host can't post a single comment outside a review
    *  — the control is then not drawn at all rather than drawn and
@@ -31,6 +45,7 @@ interface Props {
 export function ReviewLineComposer({
   label,
   initialBody = "",
+  onBodyChange,
   busy = false,
   onCommentNow,
   onAddToReview,
@@ -39,8 +54,19 @@ export function ReviewLineComposer({
   const [body, setBody] = useState(initialBody);
   const ref = useRef<HTMLTextAreaElement>(null);
 
+  const edit = (value: string) => {
+    setBody(value);
+    onBodyChange?.(value);
+  };
+
   useEffect(() => {
-    ref.current?.focus();
+    const el = ref.current;
+    if (!el) return;
+    el.focus();
+    // A relocated composer is a fresh element, so the caret goes back to
+    // the end of what was already typed rather than in front of it.
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
   }, []);
 
   const submit = () => {
@@ -65,7 +91,7 @@ export function ReviewLineComposer({
           rows={3}
           value={body}
           placeholder="Leave a note on these lines…"
-          onChange={(e) => setBody(e.target.value)}
+          onChange={(e) => edit(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Escape") {
               e.preventDefault();

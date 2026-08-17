@@ -291,6 +291,37 @@ describe("selecting lines", () => {
     });
   });
 
+  it("keeps what you typed when shift-click widens the range under it", async () => {
+    // The composer is mounted beneath the *end* of the selection, so
+    // extending the range relocates it — and React remounts a relocated
+    // component. Everything typed used to go with it, which is the one
+    // thing this surface promises never happens.
+    const user = userEvent.setup();
+    renderDetail();
+    await openCodeTab(user);
+    await user.click(gutter("RIGHT:11"));
+    await user.type(screen.getByTestId("line-composer-body"), "Half a thought");
+
+    await user.keyboard("{Shift>}");
+    await user.click(gutter("RIGHT:12"));
+    await user.keyboard("{/Shift}");
+
+    expect(screen.getByTestId("line-composer")).toHaveTextContent("lines 11–12");
+    expect(screen.getByTestId("line-composer-body")).toHaveValue("Half a thought");
+  });
+
+  it("starts empty on a different line, rather than carrying the last note over", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+    await openCodeTab(user);
+    await user.click(gutter("RIGHT:11"));
+    await user.type(screen.getByTestId("line-composer-body"), "About eleven");
+
+    // A plain click somewhere else is a different note.
+    await user.click(gutter("RIGHT:13"));
+    expect(screen.getByTestId("line-composer-body")).toHaveValue("");
+  });
+
   it("anchors a note on a deleted line to the LEFT side", async () => {
     const user = userEvent.setup();
     renderDetail();
@@ -304,6 +335,27 @@ describe("selecting lines", () => {
     await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalled());
     const [, , , , comments] = mockSubmitWithComments.mock.calls[0];
     expect(comments[0]).toMatchObject({ side: "LEFT", line: 11, start_line: null });
+  });
+
+  it("still shows a LEFT context-line note after switching to unified", async () => {
+    // Split draws a context line in both columns and anchors the left
+    // one as (LEFT, oldLine); unified draws it once and calls it
+    // (RIGHT, newLine). Matching a note on the passed side alone made a
+    // note written in split disappear entirely in unified — while still
+    // submitting against the host perfectly well.
+    const user = userEvent.setup();
+    renderDetail();
+    await openCodeTab(user);
+    await user.click(screen.getByTestId("diff-layout-split"));
+
+    // `const a = 1;` is context: old 10 on the left, new 10 on the right.
+    await user.click(gutter("LEFT:10"));
+    await user.type(screen.getByTestId("line-composer-body"), "Context note.");
+    await user.click(screen.getByTestId("add-to-review"));
+    expect(screen.getByTestId("pending-note")).toHaveTextContent("Context note.");
+
+    await user.click(screen.getByTestId("diff-layout-unified"));
+    expect(screen.getByTestId("pending-note")).toHaveTextContent("Context note.");
   });
 
   it("escape drops the selection", async () => {
@@ -484,6 +536,42 @@ describe("submitting", () => {
     await waitFor(() => expect(screen.queryByTestId("draft-footer")).toBeNull());
   });
 
+  it("sends the pending notes when the verdict comes from the action bar", async () => {
+    // The bar and the sheet are two doors onto the same act. The bar
+    // used to take the plain review route, so approving from it
+    // published the verdict and stranded every line note in the draft
+    // store — invisible to the author, still pending here.
+    const user = userEvent.setup();
+    renderDetail();
+    await withOneNote(user);
+
+    await user.click(screen.getByTestId("verdict-approve"));
+
+    await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalledTimes(1));
+    const [, , verdict, , comments] = mockSubmitWithComments.mock.calls[0];
+    expect(verdict).toBe("approve");
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ file: "src/a.ts", line: 11 });
+    await waitFor(() => expect(screen.queryByTestId("draft-footer")).toBeNull());
+  });
+
+  it("keeps the sheet's body in the draft pool across a reopen", async () => {
+    // The sheet seeded itself from the draft store and never wrote back,
+    // so its text lived only in component state and a Cancel — or a
+    // Re-anchor, or a failure — took it with it.
+    const user = userEvent.setup();
+    renderDetail();
+    await withOneNote(user);
+
+    await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.type(screen.getByTestId("submit-sheet-body"), "Nearly done.");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("submit-sheet")).toBeNull());
+
+    await user.click(screen.getByTestId("open-submit-sheet"));
+    expect(screen.getByTestId("submit-sheet-body")).toHaveValue("Nearly done.");
+  });
+
   it("does not offer Request changes on GitLab", async () => {
     const user = userEvent.setup();
     renderDetail({
@@ -598,6 +686,43 @@ describe("after a force-push", () => {
     const [, , , , comments, commitId] = mockSubmitWithComments.mock.calls[0];
     expect(commitId).toBe("head-two");
     expect(comments.map((c: { line: number }) => c.line).sort()).toEqual([13, 14]);
+  });
+
+  it("stands down once every note has found a line again", async () => {
+    // The notice exists to get lost notes re-anchored. Its `changedAt`
+    // used to be cleared only by a merge, so it sat on the panel — and
+    // on the one notice slot — for the rest of the session.
+    const user = await forcePushWithNotes();
+    await screen.findByTestId("unanchored-notes");
+    expect(await screen.findByTestId("drift-notice")).toHaveAttribute(
+      "data-drift-kind",
+      "force-pushed",
+    );
+
+    await user.click(screen.getByTestId("repin-note"));
+    await user.click(gutter("RIGHT:14"));
+
+    await waitFor(() => expect(screen.queryByTestId("drift-notice")).toBeNull());
+  });
+
+  it("lets a failed submit through instead of hiding it behind the force-push", async () => {
+    // Ranked below `force-pushed`, the submit failure was unreachable
+    // after any force-push — and Retry with it, while the review sat
+    // written and unsent.
+    const user = await forcePushWithNotes();
+    await screen.findByTestId("unanchored-notes");
+
+    await user.click(screen.getByTestId("repin-note"));
+    await user.click(gutter("RIGHT:14"));
+    await waitFor(() => expect(screen.queryByTestId("unanchored-notes")).toBeNull());
+
+    mockSubmitWithComments.mockRejectedValue("host unreachable");
+    await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.click(screen.getByTestId("submit-review-confirm"));
+
+    const notice = await screen.findByTestId("drift-notice");
+    expect(notice).toHaveAttribute("data-drift-kind", "submit-failed");
+    expect(within(notice).getByText("Retry")).toBeInTheDocument();
   });
 
   it("shows the diff the notes were written against, read-only", async () => {

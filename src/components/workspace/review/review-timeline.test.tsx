@@ -376,6 +376,7 @@ describe("per-operation capabilities", () => {
       <ReviewSubmitSheet
         open
         prNumber={172}
+        draftKey="ws-1:172"
         drafts={[]}
         initialBody=""
         initialVerdict="comment"

@@ -96,6 +96,25 @@ export function ReviewCodeTab({
   const [oldDiffOid, setOldDiffOid] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
+  /**
+   * What has been typed into the new-note composer, kept out here.
+   *
+   * The composer mounts beneath the *end* of the selection, so
+   * shift-clicking to extend a range relocates it — and React remounts a
+   * relocated component, which used to take everything typed into it
+   * along. This surface's whole rule is that anything typed survives
+   * everything, and widening a range while writing about it is the most
+   * ordinary way there is to lose a paragraph.
+   *
+   * A ref, not state: this component is the parent of every file's diff
+   * view, and re-rendering that tree on each keystroke would repaint
+   * thousands of rows to update one textarea. The composer keeps its own
+   * local state and reports changes here; this copy exists only to seed
+   * the next mount. It is emptied whenever the note being written
+   * changes — a different anchor, a submit, a cancel.
+   */
+  const composerDraft = useRef("");
+
   const unanchored = useMemo(
     () => drafts.filter((d) => d.status === "unanchored"),
     [drafts],
@@ -204,23 +223,33 @@ export function ReviewCodeTab({
       }
 
       setEditingId(null);
-      setSelection((prev) => {
-        // A range has to stay on one side and one file — the host has no
-        // way to express a note that spans both.
-        if (shiftKey && prev && prev.path === path && prev.side === side) {
-          return {
-            ...prev,
-            start: Math.min(prev.anchor, no),
-            end: Math.max(prev.anchor, no),
-          };
-        }
-        if (prev && prev.path === path && prev.side === side && prev.start === no && prev.end === no) {
-          return null; // clicking the same single line again clears it
-        }
-        return { path, side, anchor: no, start: no, end: no };
-      });
+      // A range has to stay on one side and one file — the host has no
+      // way to express a note that spans both. Extending one keeps the
+      // anchor, and with it whatever has been typed about it.
+      if (shiftKey && selection && selection.path === path && selection.side === side) {
+        setSelection({
+          ...selection,
+          start: Math.min(selection.anchor, no),
+          end: Math.max(selection.anchor, no),
+        });
+        return;
+      }
+
+      // Anything else starts a different note, or none at all.
+      composerDraft.current = "";
+      if (
+        selection &&
+        selection.path === path &&
+        selection.side === side &&
+        selection.start === no &&
+        selection.end === no
+      ) {
+        setSelection(null); // clicking the same single line again clears it
+        return;
+      }
+      setSelection({ path, side, anchor: no, start: no, end: no });
     },
-    [repinId, repin],
+    [repinId, repin, selection, canDraftLineNotes],
   );
 
   // Escape clears a selection from anywhere in the tab, not just the
@@ -230,6 +259,7 @@ export function ReviewCodeTab({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setSelection(null);
+      composerDraft.current = "";
       setRepinId(null);
     };
     window.addEventListener("keydown", onKey);
@@ -260,6 +290,7 @@ export function ReviewCodeTab({
         body,
       });
       setSelection(null);
+      composerDraft.current = "";
     },
     [selection, anchorIndex, draftKey, headOid],
   );
@@ -283,6 +314,7 @@ export function ReviewCodeTab({
       )
         .then(() => {
           setSelection(null);
+          composerDraft.current = "";
           onPosted();
           toast.success("Comment posted");
         })
@@ -292,31 +324,68 @@ export function ReviewCodeTab({
     [selection, headOid, cwd, prNumber, onPosted],
   );
 
+  /**
+   * Every coordinate a rendered row can be addressed by.
+   *
+   * Split view draws a context line in *both* columns and asks about
+   * each side separately, so the side it passes is the whole answer
+   * there — anything else would draw the same note twice, once per
+   * column. Unified draws that line once and asks about RIGHT only
+   * (`sideOf`), but a note written from the split view's LEFT column is
+   * stored as (LEFT, oldLine). Matching on the passed side alone meant
+   * such a note — and any open composer or live selection on it —
+   * rendered nowhere at all after a layout switch, while still
+   * submitting perfectly well against the host.
+   *
+   * So in unified, and only there, a context row answers to both of its
+   * coordinates.
+   */
+  const rowCoords = useCallback(
+    (line: DiffLine, side: DiffRowSide): Array<{ side: DiffRowSide; line: number }> => {
+      const coords: Array<{ side: DiffRowSide; line: number }> = [];
+      const no = side === "LEFT" ? line.oldLine : line.newLine;
+      if (no != null) coords.push({ side, line: no });
+      if (
+        layout === "unified" &&
+        line.type === "context" &&
+        side === "RIGHT" &&
+        line.oldLine != null
+      ) {
+        coords.push({ side: "LEFT", line: line.oldLine });
+      }
+      return coords;
+    },
+    [layout],
+  );
+
   /** The selection/notes behaviour handed to one file's diff view. */
   const selectionFor = useCallback(
     (file: PrDiffFile): DiffSelection => ({
       isSelected: (line, side) => {
-        if (!selection || selection.path !== file.path || selection.side !== side) {
-          return false;
-        }
-        const no = side === "LEFT" ? line.oldLine : line.newLine;
-        return no != null && no >= selection.start && no <= selection.end;
+        if (!selection || selection.path !== file.path) return false;
+        return rowCoords(line, side).some(
+          (c) =>
+            c.side === selection.side &&
+            c.line >= selection.start &&
+            c.line <= selection.end,
+        );
       },
       onSelect: (line, side, shiftKey) => selectLine(file.path, line, side, shiftKey),
       renderUnder: (line, side) => {
-        const no = side === "LEFT" ? line.oldLine : line.newLine;
-        if (no == null) return null;
+        const coords = rowCoords(line, side);
+        if (coords.length === 0) return null;
+        const at = (s: DiffRowSide, n: number) =>
+          coords.some((c) => c.side === s && c.line === n);
 
         // An unanchored note's line number points at whatever happens to
         // sit there now, which is not what it was written about. Those
         // live in the panel at the top of the tab instead.
         const notes = (draftsByFile.get(file.path) ?? []).filter(
-          (d) => d.status !== "unanchored" && d.side === side && d.line === no,
+          (d) => d.status !== "unanchored" && at(d.side, d.line),
         );
         const composerHere =
           selection?.path === file.path &&
-          selection.side === side &&
-          selection.end === no &&
+          at(selection.side, selection.end) &&
           !editingId;
 
         if (!notes.length && !composerHere) return null;
@@ -353,10 +422,17 @@ export function ReviewCodeTab({
                   selection.start === selection.end ? null : selection.start,
                   selection.end,
                 )}
+                initialBody={composerDraft.current}
+                onBodyChange={(value) => {
+                  composerDraft.current = value;
+                }}
                 busy={posting}
                 onAddToReview={addNote}
                 onCommentNow={canCommentNow ? commentNow : undefined}
-                onCancel={() => setSelection(null)}
+                onCancel={() => {
+                  setSelection(null);
+                  composerDraft.current = "";
+                }}
               />
             )}
           </>
@@ -366,6 +442,7 @@ export function ReviewCodeTab({
     [
       selection,
       selectLine,
+      rowCoords,
       draftsByFile,
       editingId,
       draftKey,

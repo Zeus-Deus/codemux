@@ -21,6 +21,26 @@ const DEFAULT_LIST_WIDTH = 452;
 const MIN_LIST_WIDTH = 340;
 const MAX_LIST_WIDTH = 720;
 
+/** Anything Escape might reasonably mean "stop editing" rather than
+ *  "leave the page" for. */
+function isEditableElement(el: Element | null | undefined): boolean {
+  if (!el || !(el instanceof HTMLElement)) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return el.isContentEditable;
+}
+
+/** Inside a Radix overlay — a dialog, sheet, popover, dropdown or the
+ *  wrapper any of them are portalled into. */
+function isInsideOverlay(el: Element | null | undefined): boolean {
+  if (!el || typeof el.closest !== "function") return false;
+  return (
+    el.closest(
+      '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]',
+    ) != null
+  );
+}
+
 /**
  * Pull requests, across every project you have open.
  *
@@ -54,10 +74,40 @@ export function PullRequestsView() {
     refresh,
   } = usePrOverview(true, stateFilter);
 
-  // Escape closes, matching the other full-screen destinations.
+  // Escape closes, matching the other full-screen destinations — but
+  // only when nothing nearer to the user wanted the key first.
+  //
+  // This page is full of things that own Escape locally: the merge and
+  // submit sheets, the thread reply box, the line composer, the image
+  // lightbox. A page-level listener that fires regardless closes the
+  // whole destination out from under them and takes the typed text with
+  // it, which is exactly the promise the review surfaces are built on
+  // ("anything typed survives everything"). So the page declines the key
+  // in four cases, and this guard is why per-component workarounds are
+  // no longer the thing standing between a reply draft and oblivion.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setShowPullRequests(false);
+      if (event.key !== "Escape") return;
+      // 1. Something closer to the event already claimed it.
+      if (event.defaultPrevented) return;
+
+      const target = event.target as HTMLElement | null;
+      const focused = document.activeElement as HTMLElement | null;
+
+      // 2. The key belongs to whatever is being typed into.
+      if (isEditableElement(target) || isEditableElement(focused)) return;
+
+      // 3. Focus is inside an overlay that dismisses itself on Escape.
+      //    Radix does not `preventDefault` when it closes a dialog, so
+      //    `defaultPrevented` alone would not catch a sheet.
+      if (isInsideOverlay(target) || isInsideOverlay(focused)) return;
+
+      // 4. A modal is open even though focus escaped it. The DOM has not
+      //    been updated with the close Radix just scheduled, so an open
+      //    dialog here means the key was for that dialog.
+      if (document.querySelector('[role="dialog"][data-state="open"]')) return;
+
+      setShowPullRequests(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -117,10 +167,39 @@ export function PullRequestsView() {
     if (first) openRow(first);
   }, [rows, viewerByRoot, selectedKey, pendingSelection, openRow]);
 
-  const selected = selectedKey ? byKey.get(selectedKey) ?? null : null;
-  const tabs = tabKeys
-    .map((key) => byKey.get(key))
-    .filter((row): row is PrRow => row != null);
+  // ── Rows that have left the list but are still open in a tab ──
+  //
+  // Merging or closing a pull request drops it out of the default "open"
+  // filter on the very next refresh. Resolving the open tabs from the
+  // filtered list alone therefore emptied the page the instant you did
+  // the thing you came here to do: the row vanished, `selected` went
+  // null, the tab strip went with it, and the built merged/closed detail
+  // — the confirmation you were waiting for — was replaced by "Pick a
+  // pull request".
+  //
+  // So every row a tab has pointed at is remembered, and a tab keeps
+  // rendering from that copy once the list stops carrying it. The fresh
+  // row always wins while it exists, and the cache is pruned to the open
+  // tabs so it can't outgrow what's on screen.
+  const lastKnown = useRef(new Map<string, PrRow>());
+  useEffect(() => {
+    const open = new Set(tabKeys);
+    for (const key of open) {
+      const row = byKey.get(key);
+      if (row) lastKnown.current.set(key, row);
+    }
+    for (const key of [...lastKnown.current.keys()]) {
+      if (!open.has(key)) lastKnown.current.delete(key);
+    }
+  }, [byKey, tabKeys]);
+
+  const rowFor = useCallback(
+    (key: string): PrRow | null => byKey.get(key) ?? lastKnown.current.get(key) ?? null,
+    [byKey],
+  );
+
+  const selected = selectedKey ? rowFor(selectedKey) : null;
+  const tabs = tabKeys.map(rowFor).filter((row): row is PrRow => row != null);
 
   const closeTab = (key: string) => {
     setTabKeys((keys) => {
