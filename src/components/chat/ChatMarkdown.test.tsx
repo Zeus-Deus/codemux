@@ -96,6 +96,24 @@ function renderMarkdown(markdown: string) {
   return render(markdownTree(markdown));
 }
 
+/**
+ * Put a working async clipboard in place. jsdom leaves `isSecureContext`
+ * undefined, which the shared copy helper reads as "insecure origin" and
+ * routes past `navigator.clipboard` into its execCommand fallback.
+ */
+function stubClipboard() {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(window, "isSecureContext", {
+    configurable: true,
+    value: true,
+  });
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText },
+  });
+  return writeText;
+}
+
 /** Per-token highlight color, in source order — `inherit` means un-highlighted. */
 function tokenColors(container: HTMLElement): string[] {
   return Array.from(
@@ -155,11 +173,7 @@ describe("ChatMarkdown code blocks", () => {
   });
 
   it("copies code without the Markdown fence", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
+    const writeText = stubClipboard();
     renderMarkdown(fenced("tsx", "const answer = 42;"));
 
     fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
@@ -170,11 +184,7 @@ describe("ChatMarkdown code blocks", () => {
   });
 
   it("keeps blank lines a snippet genuinely ends with", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
+    const writeText = stubClipboard();
     // mdast terminates the fence value with one newline; the two blank lines
     // before it are the author's and must survive render and copy.
     const { container } = renderMarkdown(fenced("txt", "one\n\n"));
@@ -183,6 +193,32 @@ describe("ChatMarkdown code blocks", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
     await vi.waitFor(() => {
       expect(writeText).toHaveBeenCalledWith("one\n\n");
+    });
+  });
+
+  it("still copies on an origin without the async clipboard", async () => {
+    // The remote web client can be plain HTTP, where `navigator.clipboard` is
+    // undefined; the code block goes through the same fallback as the
+    // message-level copy rather than silently doing nothing.
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: false,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    renderMarkdown(fenced("tsx", "const answer = 42;"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await vi.waitFor(() => {
+      expect(execCommand).toHaveBeenCalledWith("copy");
+      expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
     });
   });
 
