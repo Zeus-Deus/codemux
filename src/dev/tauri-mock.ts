@@ -275,7 +275,7 @@ const checksDetailOverrides: Record<number, CheckInfo[]> = {};
  * merge request list it already fetched and answers in one. Both are
  * exercised in dev because the mock's roots include both products.
  */
-function overviewItem(number: number, carriesChecks = false) {
+function overviewItem(number: number) {
   const pr = mutablePrs[number];
   if (!pr) return null;
   return {
@@ -290,7 +290,8 @@ function overviewItem(number: number, carriesChecks = false) {
     additions: null,
     deletions: null,
     review_decision: pr.review_decision,
-    checks: carriesChecks ? overviewRollup(number) : null,
+    // Never measured on the list call, by either product.
+    checks: null,
     review_requested_from:
       reviewRequestOverrides[number] ?? MOCK_PR_REVIEW_REQUESTS[number] ?? [],
     updated_at: pr.updated_at,
@@ -332,20 +333,20 @@ let prOverviewOutage = false;
 let prStatsOutage = false;
 
 /**
- * Does this root's product answer the rollup on the list call?
+ * The expensive half of one row.
  *
- * Decided from the merge request URLs rather than a root allowlist, so
- * the mock keeps agreeing with itself when fixtures move.
+ * A row nothing can answer for is *omitted* rather than reported as
+ * "none": the two mean different things, and only a host that actually
+ * looked may say a pull request has no checks. The listing half never
+ * fills `checks` at all — neither product does, which is the whole
+ * reason this second call exists.
  */
-function rootCarriesChecks(numbers: number[]): boolean {
-  const first = numbers.map((n) => mutablePrs[n]).find(Boolean);
-  return !!first && first.url.includes("gitlab");
-}
-
-/** The expensive half of one row. */
 function overviewStats(number: number) {
   const pr = mutablePrs[number];
   if (!pr) return null;
+  if (checksRollupOverrides[number] == null && MOCK_PR_CHECKS[number] == null) {
+    return null;
+  }
   return {
     number,
     checks: overviewRollup(number),
@@ -3614,10 +3615,11 @@ const handlers: Record<string, Handler> = {
     }
     const seed = MOCK_PR_OVERVIEW[path];
     if (!seed) return { viewer: null, items: [] };
-    const carriesChecks = rootCarriesChecks(seed.numbers);
     return {
       viewer: seed.viewer,
-      items: seed.numbers.map((n) => overviewItem(n, carriesChecks)).filter(Boolean),
+      // No host answers the rollup on the list call: `null` here means
+      // "not measured", and the stats half is what measures it.
+      items: seed.numbers.map((n) => overviewItem(n)).filter(Boolean),
     };
   },
 

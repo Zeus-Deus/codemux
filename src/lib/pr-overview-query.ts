@@ -236,10 +236,11 @@ export function usePrOverview(
   });
 
   // The expensive half, fired per root only once that root's listing has
-  // landed *and* has said it doesn't know the answer. A host that fills
-  // `checks` in its first call (GitLab reads the pipeline straight off
-  // the merge request list) never makes this request at all — the gate
-  // is the data, not a hardcoded list of product names.
+  // landed *and* has said it doesn't know the answer. The gate is the
+  // data, not a hardcoded list of product names: a host that can fill
+  // `checks` in its first call never makes this request at all, and one
+  // that answers `null` — "nobody measured this", which both GitHub and
+  // GitLab do on the fast list — is asked once more, here.
   const needsStats = results.map(
     (result) => result.data?.items.some((item) => item.checks == null) ?? false,
   );

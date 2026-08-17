@@ -158,3 +158,23 @@ export function checkState(conclusion: string | null, status: string): CheckStat
 export function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
+
+/**
+ * Why this verdict can't be sent yet, or null when it can.
+ *
+ * The host requires a body on the two verdicts that are only words, and
+ * the command layer refuses them before they get there
+ * (`require_review_body`). The wording is that refusal's, said before the
+ * click rather than after it — a control that fails on use teaches the
+ * same thing at a worse moment. Approving stays wordless: the approval
+ * *is* the statement.
+ *
+ * Line notes do not stand in for the body. They hang off the review;
+ * they are not it, and the host rejects the call either way.
+ */
+export function reviewBodyRequirement(verdict: string, body: string): string | null {
+  if (body.trim() !== "" || verdict === "approve") return null;
+  return verdict === "request-changes"
+    ? "Requesting changes needs a message saying what has to change."
+    : "A comment review needs a message.";
+}

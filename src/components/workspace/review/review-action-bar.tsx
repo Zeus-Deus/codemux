@@ -15,6 +15,7 @@ import {
   btnGreenSolid,
   btnGreenTint,
   btnQuiet,
+  reviewBodyRequirement,
   tzBody,
   tzEyebrow,
   tzMeta,
@@ -299,7 +300,17 @@ function ReviewerBar({
     setReviewDraft(draftKey, value);
   };
 
+  // Comment and Request changes need words; Approve does not. Asked here
+  // so the control is unavailable with the reason on it, rather than
+  // available, clicked, and refused by the host.
+  const needsWords = (event: string) => reviewBodyRequirement(event, text);
+
   const submit = (event: string) => {
+    if (needsWords(event)) {
+      setExpanded(true);
+      textareaRef.current?.focus();
+      return;
+    }
     setLastVerdict(draftKey, event);
     onSubmitReview(event, text);
   };
@@ -365,7 +376,8 @@ function ReviewerBar({
             className={btnCard}
             data-testid="verdict-request-changes"
             onClick={() => submit("request-changes")}
-            disabled={submitting}
+            disabled={submitting || !!needsWords("request-changes")}
+            title={needsWords("request-changes") ?? undefined}
           >
             Request changes
           </button>
@@ -376,7 +388,8 @@ function ReviewerBar({
             className={btnCard}
             data-testid="review-primary-action"
             onClick={() => submit("comment")}
-            disabled={submitting}
+            disabled={submitting || !!needsWords("comment")}
+            title={needsWords("comment") ?? undefined}
           >
             Comment
           </button>

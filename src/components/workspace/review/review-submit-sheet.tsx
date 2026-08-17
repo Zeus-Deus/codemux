@@ -5,6 +5,7 @@ import {
   btnCard,
   btnCardStrong,
   btnEmberSolid,
+  reviewBodyRequirement,
   tzBody,
   tzBodyLg,
   tzMeta,
@@ -92,6 +93,14 @@ export function ReviewSubmitSheet({
     setLastVerdict(draftKey, id);
   };
 
+  // Two reasons a send can be blocked, and they are not interchangeable:
+  // `blockedReason` is about the notes and offers Re-anchor, this one is
+  // about the body and is answered by typing. Both are said in words
+  // above the footer; the notes take precedence because re-anchoring is
+  // the bigger interruption.
+  const bodyRequirement = reviewBodyRequirement(verdict, body);
+  const blocked = blockedReason ?? bodyRequirement;
+
   // Rendered from the declarations, so the sheet and the action bar
   // cannot disagree about which verdicts this host has.
   const options = VERDICTS.filter(
@@ -177,15 +186,17 @@ export function ReviewSubmitSheet({
           </ul>
         </div>
 
-        {blockedReason && (
+        {blocked && (
           <p
-            data-testid="submit-blocked-reason"
+            data-testid={
+              blockedReason ? "submit-blocked-reason" : "submit-body-required"
+            }
             className={cn(
               "border-t border-border/40 bg-status-working/10 px-3.5 py-2.5 leading-snug text-foreground/85",
               tzBody,
             )}
           >
-            {blockedReason}
+            {blocked}
           </p>
         )}
 
@@ -210,7 +221,10 @@ export function ReviewSubmitSheet({
               type="button"
               className={btnEmberSolid}
               data-testid="submit-review-confirm"
-              disabled={submitting}
+              // A wordless comment or request-for-changes is refused by
+              // the host, so it is refused here — with the reason above,
+              // and a textarea right there to answer it.
+              disabled={submitting || bodyRequirement != null}
               onClick={() => onSubmit(verdict, body)}
             >
               {submitting ? "Sending" : "Submit review"}

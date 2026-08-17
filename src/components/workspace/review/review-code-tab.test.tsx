@@ -280,6 +280,7 @@ describe("selecting lines", () => {
     await user.click(screen.getByTestId("add-to-review"));
 
     await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.type(screen.getByTestId("submit-sheet-body"), "Summary.");
     await user.click(screen.getByTestId("submit-review-confirm"));
     await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalled());
     const [, , , , comments] = mockSubmitWithComments.mock.calls[0];
@@ -331,6 +332,7 @@ describe("selecting lines", () => {
     await user.click(screen.getByTestId("add-to-review"));
 
     await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.type(screen.getByTestId("submit-sheet-body"), "Summary.");
     await user.click(screen.getByTestId("submit-review-confirm"));
     await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalled());
     const [, , , , comments] = mockSubmitWithComments.mock.calls[0];
@@ -572,6 +574,32 @@ describe("submitting", () => {
     expect(screen.getByTestId("submit-sheet-body")).toHaveValue("Nearly done.");
   });
 
+  it("won't send a wordless comment, and says why", async () => {
+    // The host rejects a COMMENT or REQUEST_CHANGES review with no body,
+    // and the command layer refuses it before it gets there. Both doors
+    // say so before the click rather than after it. Line notes do not
+    // count as the body — they hang off the review, they are not it.
+    const user = userEvent.setup();
+    renderDetail();
+    await withOneNote(user);
+
+    expect(screen.getByTestId("review-primary-action")).toBeDisabled();
+    expect(screen.getByTestId("verdict-request-changes")).toBeDisabled();
+    // Approving is allowed to be wordless: the approval is the statement.
+    expect(screen.getByTestId("verdict-approve")).toBeEnabled();
+
+    await user.click(screen.getByTestId("open-submit-sheet"));
+    expect(screen.getByTestId("submit-body-required")).toHaveTextContent(
+      "A comment review needs a message.",
+    );
+    expect(screen.getByTestId("submit-review-confirm")).toBeDisabled();
+
+    await user.type(screen.getByTestId("submit-sheet-body"), "Two small things.");
+    expect(screen.queryByTestId("submit-body-required")).toBeNull();
+    await user.click(screen.getByTestId("submit-review-confirm"));
+    await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalledTimes(1));
+  });
+
   it("does not offer Request changes on GitLab", async () => {
     const user = userEvent.setup();
     renderDetail({
@@ -592,6 +620,7 @@ describe("submitting", () => {
     await withOneNote(user);
 
     await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.type(screen.getByTestId("submit-sheet-body"), "Summary.");
     await user.click(screen.getByTestId("submit-review-confirm"));
 
     const notice = await screen.findByTestId("drift-notice");
@@ -681,6 +710,7 @@ describe("after a force-push", () => {
 
     await user.click(screen.getByTestId("open-submit-sheet"));
     expect(screen.queryByTestId("submit-blocked-reason")).toBeNull();
+    await user.type(screen.getByTestId("submit-sheet-body"), "Summary.");
     await user.click(screen.getByTestId("submit-review-confirm"));
     await waitFor(() => expect(mockSubmitWithComments).toHaveBeenCalled());
     const [, , , , comments, commitId] = mockSubmitWithComments.mock.calls[0];
@@ -718,6 +748,7 @@ describe("after a force-push", () => {
 
     mockSubmitWithComments.mockRejectedValue("host unreachable");
     await user.click(screen.getByTestId("open-submit-sheet"));
+    await user.type(screen.getByTestId("submit-sheet-body"), "Summary.");
     await user.click(screen.getByTestId("submit-review-confirm"));
 
     const notice = await screen.findByTestId("drift-notice");
