@@ -25,6 +25,10 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import {
+  assistantReferenceCwds,
+  assistantReferencePaths,
+} from "@/lib/agent-chat/reference-cwd";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -242,6 +246,25 @@ export const MessageList = memo(function MessageList({
     copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
     return copy;
   }, [messages]);
+  // File-link resolution context, recomputed per store update but carried
+  // forward by identity (issue #129, same cache pattern as `prevSlotsRef`
+  // below): the builders return the previous map — and the previous per-row
+  // path array — whenever nothing changed, so a streaming delta does not
+  // hand every reference-bearing row a fresh prop and bust `SlotRowMemo`.
+  const prevReferenceCwdsRef = useRef<ReadonlyMap<string, string>>(new Map());
+  const referenceCwdByMessageId = useMemo(() => {
+    const next = assistantReferenceCwds(ordered, prevReferenceCwdsRef.current);
+    prevReferenceCwdsRef.current = next;
+    return next;
+  }, [ordered]);
+  const prevReferencePathsRef = useRef<ReadonlyMap<string, readonly string[]>>(
+    new Map(),
+  );
+  const referencePathsByMessageId = useMemo(() => {
+    const next = assistantReferencePaths(ordered, prevReferencePathsRef.current);
+    prevReferencePathsRef.current = next;
+    return next;
+  }, [ordered]);
 
   // Turn-fold expansion lives above the virtualized rows so recycling or
   // measurement churn never loses the user's disclosure choice.
@@ -1109,6 +1132,8 @@ export const MessageList = memo(function MessageList({
           }
           workspaceId={workspaceId}
           cwd={cwd}
+          referenceCwd={referenceCwdByMessageId.get(slot.messageId)}
+          referencePaths={referencePathsByMessageId.get(slot.messageId)}
           onRespondToRequest={onRespondToRequest}
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
@@ -1129,6 +1154,8 @@ export const MessageList = memo(function MessageList({
       onSendQueuedNow,
       onRevertTurn,
       requestsById,
+      referenceCwdByMessageId,
+      referencePathsByMessageId,
       revertingTurnIndex,
       subagentNames,
       toggleTurnFold,
@@ -1483,6 +1510,8 @@ function ItemRow({
   revertingTurnIndex,
   workspaceId,
   cwd,
+  referenceCwd,
+  referencePaths,
 }: {
   item: ChatViewItem;
   approval: PermissionRequestItem | null;
@@ -1497,6 +1526,8 @@ function ItemRow({
   revertingTurnIndex?: number | null;
   workspaceId?: string | null;
   cwd?: string | null;
+  referenceCwd?: string | null;
+  referencePaths?: readonly string[];
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -1562,6 +1593,8 @@ function ItemRow({
     subagentName,
     workspaceId,
     cwd,
+    referenceCwd,
+    referencePaths,
     handleDecide,
     handleAcceptPlan,
     handleRejectPlan,
@@ -1575,6 +1608,8 @@ function renderAssistantBody(
     subagentName: string | null;
     workspaceId?: string | null;
     cwd?: string | null;
+    referenceCwd?: string | null;
+    referencePaths?: readonly string[];
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -1587,6 +1622,8 @@ function renderAssistantBody(
           item={item}
           workspaceId={handlers.workspaceId}
           cwd={handlers.cwd}
+          referenceCwd={handlers.referenceCwd}
+          referencePaths={handlers.referencePaths}
         />
       );
     case "reasoning":
@@ -1748,6 +1785,8 @@ function SlotRow({
   subagentName,
   workspaceId,
   cwd,
+  referenceCwd,
+  referencePaths,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -1763,6 +1802,8 @@ function SlotRow({
   subagentName: string | null;
   workspaceId?: string | null;
   cwd?: string | null;
+  referenceCwd?: string | null;
+  referencePaths?: readonly string[];
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -1823,6 +1864,8 @@ function SlotRow({
           revertingTurnIndex={revertingTurnIndex}
           workspaceId={workspaceId}
           cwd={cwd}
+          referenceCwd={referenceCwd}
+          referencePaths={referencePaths}
         />
       )}
     </div>

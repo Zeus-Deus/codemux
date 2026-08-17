@@ -35,8 +35,12 @@ export function VideoViewer({ filePath }: Props) {
             />
           </div>
           <p className="text-xs font-medium text-foreground">Can’t play this video</p>
+          <p className="mt-1.5 break-all font-mono text-[11px] leading-[1.55] text-muted-foreground">
+            {filePath}
+          </p>
           <p className="mt-1.5 text-[11px] leading-[1.55] text-muted-foreground">
-            The file may use a codec that isn’t available in the system webview.
+            The file may have been moved or deleted, or it uses a codec that
+            isn’t available in the system webview.
           </p>
         </div>
       </div>

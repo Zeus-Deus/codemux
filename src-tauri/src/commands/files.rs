@@ -463,6 +463,18 @@ fn search_with_find(
         .collect())
 }
 
+// Existence probe for chat file links. Agents sometimes emit a bare
+// filename whose real location is elsewhere, and opening a tab for a
+// guessed path produces a dead viewer — so the frontend stats the resolved
+// candidate (and any turn-context fallbacks) before opening. `async fn` so
+// the stat runs on the blocking pool (see note at top of file).
+#[tauri::command]
+pub async fn file_exists(path: String) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || Path::new(&path).is_file())
+        .await
+        .map_err(|e| format!("file_exists task join failed: {e}"))
+}
+
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
 
 // `async fn` so the metadata stat + file read run on the blocking pool
@@ -817,10 +829,31 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 mod tests {
     use super::{
         build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png,
-        grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
+        file_exists, grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
         search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
+
+    #[tokio::test]
+    async fn file_exists_stats_files_not_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shot.png");
+        fs::write(&file, b"png").unwrap();
+
+        let present = file_exists(file.to_string_lossy().to_string()).await.unwrap();
+        assert!(present);
+
+        let missing = file_exists(dir.path().join("nope.png").to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert!(!missing);
+
+        // A directory is not an openable doc target.
+        let dir_hit = file_exists(dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert!(!dir_hit);
+    }
 
     #[tokio::test]
     async fn grep_count_pattern_zero_when_no_matches() {

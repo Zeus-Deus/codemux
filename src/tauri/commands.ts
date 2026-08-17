@@ -1182,6 +1182,11 @@ export const revealInFileManager = (path: string) =>
 export const listDirectory = (path: string, showHidden?: boolean) =>
   invoke<FileEntry[]>("list_directory", { path, showHidden });
 
+/** Stat probe used by chat file links before opening a doc tab, so a
+ *  path the agent merely guessed never opens a dead viewer. */
+export const fileExists = (path: string) =>
+  invoke<boolean>("file_exists", { path });
+
 export const readFile = (path: string) =>
   invoke<string>("read_file", { path });
 

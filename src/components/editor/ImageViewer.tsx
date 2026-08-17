@@ -19,11 +19,28 @@ export function ImageViewer({ filePath }: Props) {
   const src = convertFileSrc(filePath);
 
   if (errored) {
+    // Mirror VideoViewer's failure card, and always show the resolved
+    // path: "failed to load" without it is undiagnosable, and the most
+    // common cause is a chat link that resolved somewhere the file isn't.
     return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground">
-        <div className="flex flex-col items-center gap-2">
-          <ImageOff className="h-8 w-8 opacity-40" />
-          <span className="text-xs">Failed to load image</span>
+      <div className="flex flex-1 items-center justify-center bg-[var(--background)] px-6 text-center text-muted-foreground">
+        <div className="flex max-w-[320px] flex-col items-center">
+          <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
+            <ImageOff
+              className="size-[18px] text-muted-foreground/60"
+              strokeWidth={1.5}
+            />
+          </div>
+          <p className="text-xs font-medium text-foreground">
+            Failed to load image
+          </p>
+          <p className="mt-1.5 break-all font-mono text-[11px] leading-[1.55] text-muted-foreground">
+            {filePath}
+          </p>
+          <p className="mt-1.5 text-[11px] leading-[1.55] text-muted-foreground">
+            The file may have been moved or deleted, or the format isn’t
+            supported by the system webview.
+          </p>
         </div>
       </div>
     );

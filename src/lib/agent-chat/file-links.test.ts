@@ -12,12 +12,40 @@ describe("resolveChatFileLink", () => {
     ["src/components/Chat.tsx#L9C3", "/work/codemux/src/components/Chat.tsx", 9, 3],
     ["src/My%20File.ts:11", "/work/codemux/src/My File.ts", 11, undefined],
     ["/work/codemux/src/lib.ts:5", "/work/codemux/src/lib.ts", 5, undefined],
+    ["/work/another-project/AGENTS.md", "/work/another-project/AGENTS.md", undefined, undefined],
     ["WORKFLOW.md", "/work/codemux/WORKFLOW.md", undefined, undefined],
-  ])("resolves %s inside the active worktree", (input, filePath, line, column) => {
+  ])("resolves source reference %s", (input, filePath, line, column) => {
     const resolved = resolveChatFileLink(input as string, cwd);
     expect(resolved?.filePath).toBe(filePath);
     expect(resolved?.line).toBe(line);
     expect(resolved?.column).toBe(column);
+  });
+
+  describe("workspaceCwd fallback", () => {
+    it("adds the workspace-root resolution when a tool ran in a subdirectory", () => {
+      expect(
+        resolveChatFileLink("package.json", "/work/codemux/src-tauri", {
+          workspaceCwd: "/work/codemux",
+        }),
+      ).toMatchObject({
+        filePath: "/work/codemux/src-tauri/package.json",
+        workspacePath: "/work/codemux/package.json",
+      });
+    });
+
+    it("omits the fallback when both roots resolve to the same path", () => {
+      expect(
+        resolveChatFileLink("src/app.ts", cwd, { workspaceCwd: cwd }),
+      ).not.toHaveProperty("workspacePath");
+    });
+
+    it("omits the fallback for an explicit absolute reference", () => {
+      expect(
+        resolveChatFileLink("/work/other/app.ts", "/work/codemux/src-tauri", {
+          workspaceCwd: cwd,
+        }),
+      ).not.toHaveProperty("workspacePath");
+    });
   });
 
   it("supports Windows worktree references without treating the drive as a URL scheme", () => {
@@ -31,7 +59,6 @@ describe("resolveChatFileLink", () => {
     "https://example.com/file.ts",
     "mailto:dev@example.com",
     "../outside.ts",
-    "/tmp/outside.ts",
     "package@1.2.3",
     "v1.2.3",
     "not a source reference",

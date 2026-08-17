@@ -2311,6 +2311,10 @@ const handlers: Record<string, Handler> = {
       "src/components/layout/right-panel.tsx",
       "src/stores/ui-store.ts",
       "src-tauri/Cargo.toml",
+      // No real filesystem backs browser dev, so an opened image always
+      // 404s — which is exactly what makes the ImageViewer failure card
+      // reachable here.
+      "docs/screenshots/dashboard.png",
     ];
     return query ? paths.filter((p) => p.toLowerCase().includes(query)) : paths;
   },
@@ -2318,6 +2322,9 @@ const handlers: Record<string, Handler> = {
   // Enough content for the editor surfaces (main-area tab and the right
   // panel's doc panes) to exercise rendered-vs-raw markdown, soft wrap and
   // copy without a real filesystem.
+  // Browser dev has no filesystem; every path "exists" so chat file links
+  // stay clickable against the synthetic contents `read_file` fabricates.
+  file_exists: () => true,
   read_file: (a) => mockReadFile(String(a.path ?? "")),
 
   // ── Theme / appearance ──
