@@ -146,9 +146,9 @@ const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 // have to travel in one module-level object, because Streamdown keys its
 // processor cache on the identity of this map.
 function FileLinkElement({ sourceHref, ...props }: Record<string, unknown>) {
-  const { cwd } = useChatFileLinkContext();
+  const { cwd, workspaceCwd } = useChatFileLinkContext();
   const href = String(sourceHref ?? "");
-  const meta = resolveChatFileLink(href, cwd);
+  const meta = resolveChatFileLink(href, cwd, { workspaceCwd });
   // A common agent pattern is [`path/to/file.ts:42`](path/to/file.ts:42).
   // Streamdown has already rendered that label through our inline-code
   // override by the time the transformed link reaches this component. Keep
@@ -170,12 +170,15 @@ function InlineSourceReference({
   ...props
 }: ComponentProps<"code"> & ExtraProps) {
   void _node;
-  const { cwd } = useChatFileLinkContext();
+  const { cwd, workspaceCwd } = useChatFileLinkContext();
   const text = plainText(children);
   // Inline code is prose, not markup: only a whitespace-free token can be a
   // source reference, so `cat src/foo.ts` stays a code span instead of
   // becoming a chip that resolves to `<root>/cat src/foo.ts`.
-  const meta = resolveChatFileLink(text, cwd, { allowSpaces: false });
+  const meta = resolveChatFileLink(text, cwd, {
+    allowSpaces: false,
+    workspaceCwd,
+  });
   if (meta) return <MarkdownFileLink meta={meta}>{text}</MarkdownFileLink>;
   return (
     <code {...props} className={className} data-streamdown="inline-code">
@@ -220,12 +223,14 @@ export function ChatMarkdown({
   streaming = false,
   workspaceId,
   cwd,
+  workspaceCwd,
   referencePaths,
 }: {
   children: string;
   streaming?: boolean;
   workspaceId?: string | null;
   cwd?: string | null;
+  workspaceCwd?: string | null;
   referencePaths?: readonly string[];
 }) {
   const code = useChatCodePlugin();
@@ -236,14 +241,17 @@ export function ChatMarkdown({
     () => ({
       workspaceId: workspaceId ?? inheritedFileContext.workspaceId,
       cwd: cwd ?? inheritedFileContext.cwd,
+      workspaceCwd: workspaceCwd ?? inheritedFileContext.workspaceCwd,
       referencePaths: referencePaths ?? inheritedFileContext.referencePaths,
     }),
     [
       cwd,
       inheritedFileContext.cwd,
       inheritedFileContext.referencePaths,
+      inheritedFileContext.workspaceCwd,
       inheritedFileContext.workspaceId,
       referencePaths,
+      workspaceCwd,
       workspaceId,
     ],
   );

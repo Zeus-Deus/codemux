@@ -442,6 +442,34 @@ describe("ChatMarkdown source references", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
+  it("falls back to the workspace root when the tool ran in a subdirectory", async () => {
+    // The turn's last command ran in `<workspace>/src-tauri`, so the chip
+    // resolves there first, but the answer names the repo-root file.
+    const rootFile = `${cwd}/package.json`;
+    mocks.fileExists.mockImplementation(
+      async (path: unknown) => path === rootFile,
+    );
+
+    const { getByRole } = render(
+      <ChatMarkdown
+        workspaceId={workspaceId}
+        cwd={`${cwd}/src-tauri`}
+        workspaceCwd={cwd}
+      >
+        {"Bumped the version in [package.json](package.json)."}
+      </ChatMarkdown>,
+    );
+
+    fireEvent.click(getByRole("button", { name: "package.json" }));
+
+    await waitFor(() =>
+      expect(useUIStore.getState().getRightPanelTab(workspaceId)).toBe(
+        docPaneId(rootFile),
+      ),
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
   it("shows a not-found toast instead of opening a tab for a missing file", async () => {
     mocks.fileExists.mockResolvedValue(false);
 

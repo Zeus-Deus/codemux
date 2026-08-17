@@ -31,6 +31,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         streaming={item.streaming}
         workspaceId={workspaceId}
         cwd={referenceCwd ?? cwd}
+        workspaceCwd={cwd}
         referencePaths={referencePaths}
       >
         {item.text}

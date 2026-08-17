@@ -21,6 +21,33 @@ describe("resolveChatFileLink", () => {
     expect(resolved?.column).toBe(column);
   });
 
+  describe("workspaceCwd fallback", () => {
+    it("adds the workspace-root resolution when a tool ran in a subdirectory", () => {
+      expect(
+        resolveChatFileLink("package.json", "/work/codemux/src-tauri", {
+          workspaceCwd: "/work/codemux",
+        }),
+      ).toMatchObject({
+        filePath: "/work/codemux/src-tauri/package.json",
+        workspacePath: "/work/codemux/package.json",
+      });
+    });
+
+    it("omits the fallback when both roots resolve to the same path", () => {
+      expect(
+        resolveChatFileLink("src/app.ts", cwd, { workspaceCwd: cwd }),
+      ).not.toHaveProperty("workspacePath");
+    });
+
+    it("omits the fallback for an explicit absolute reference", () => {
+      expect(
+        resolveChatFileLink("/work/other/app.ts", "/work/codemux/src-tauri", {
+          workspaceCwd: cwd,
+        }),
+      ).not.toHaveProperty("workspacePath");
+    });
+  });
+
   it("supports Windows worktree references without treating the drive as a URL scheme", () => {
     expect(resolveChatFileLink("C:\\repo\\src\\main.rs:18", "C:\\repo")).toMatchObject({
       filePath: "C:/repo/src/main.rs",

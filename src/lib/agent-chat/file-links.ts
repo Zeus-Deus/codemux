@@ -6,6 +6,14 @@ export interface ChatFileLinkMeta {
   filePath: string;
   basename: string;
   displayPath: string;
+  /**
+   * The same relative reference resolved against the workspace root, when the
+   * chip resolved against a tool working directory that differs from it (the
+   * agent ran in a subdirectory, or in another project entirely). Click-time
+   * resolution tries this after `filePath`: prose that names a repo-root file
+   * while the last command ran in a subdirectory must still open.
+   */
+  workspacePath?: string;
   line?: number;
   column?: number;
 }
@@ -107,6 +115,13 @@ export interface ResolveChatFileLinkOptions {
    * to a confident chip that opens the wrong file. Defaults to `true`.
    */
   allowSpaces?: boolean;
+  /**
+   * The workspace root, when `cwd` is a tool working directory rather than
+   * the workspace itself. Produces `workspacePath`, the click-time fallback
+   * candidate that keeps repo-root references working while a tool runs in a
+   * subdirectory.
+   */
+  workspaceCwd?: string | null;
 }
 
 export function resolveChatFileLink(
@@ -148,13 +163,31 @@ export function resolveChatFileLink(
       ? basename(resolved)
       : resolved.slice(root.length + 1)
     : resolved;
+  const workspacePath = absoluteReference
+    ? undefined
+    : workspaceFallbackPath(location.path, options.workspaceCwd, resolved);
   return {
     filePath: resolved,
     basename: basename(resolved),
     displayPath: relative || basename(resolved),
+    ...(workspacePath ? { workspacePath } : {}),
     ...(location.line ? { line: location.line } : {}),
     ...(location.column ? { column: location.column } : {}),
   };
+}
+
+/** The relative reference resolved against the workspace root instead, when
+ *  that is a different, in-root path than the primary resolution. */
+function workspaceFallbackPath(
+  relativePath: string,
+  workspaceCwd: string | null | undefined,
+  resolved: string,
+): string | undefined {
+  if (!workspaceCwd) return undefined;
+  const root = normalizePath(workspaceCwd);
+  const candidate = normalizePath(`${root}/${relativePath}`);
+  if (candidate === resolved || !withinRoot(candidate, root)) return undefined;
+  return candidate;
 }
 
 interface HastNode {

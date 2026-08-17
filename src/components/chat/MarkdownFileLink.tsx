@@ -49,17 +49,15 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
         // Fallback candidates come from the turn's tool calls — the agent
         // that linked a bare filename usually wrote the real absolute path
         // into a command moments earlier.
-        let target: string | null = meta.filePath;
-        try {
-          target = await resolveExistingFileTarget(
-            meta,
-            referencePaths ?? [],
-            fileExists,
-          );
-        } catch {
-          // Stat unavailable (e.g. an older remote backend): keep the
-          // pre-existing open-directly behavior rather than a dead chip.
-        }
+        // The resolver decides what a failing probe means: an unavailable
+        // stat (e.g. an older remote backend) keeps the pre-existing
+        // open-directly behavior, while a path the probe confirmed missing
+        // is never opened.
+        const target = await resolveExistingFileTarget(
+          meta,
+          referencePaths ?? [],
+          fileExists,
+        );
         if (!target) {
           toast.error(`File not found: ${meta.filePath}`);
           return;
