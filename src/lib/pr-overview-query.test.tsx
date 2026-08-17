@@ -298,6 +298,66 @@ describe("usePrOverview — carried rows", () => {
     expect(result.current.carried).toBe(true);
   });
 
+  it("stops carrying a root once it has failed", async () => {
+    // The bug this pins: `carried` means "some root has not answered
+    // yet". A root that answers with an error *has* answered, and if it
+    // keeps counting as carried it stays carried for the whole session —
+    // which silently switches off snapshot writes and every pull-request
+    // toast, for every root, until the app is restarted.
+    setRoots(ROOT, OTHER);
+    localStorage.setItem(
+      prSnapshotKey([ROOT, OTHER]),
+      JSON.stringify({
+        version: PR_SNAPSHOT_VERSION,
+        savedAt: 1000,
+        rows: [row({ number: 1 }), row({ number: 7, projectRoot: OTHER })],
+        viewerByRoot: { [ROOT]: "mock-dev", [OTHER]: "mock-dev" },
+      }),
+    );
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT
+        ? Promise.resolve({ viewer: "mock-dev", items: [item({ number: 5 })] })
+        : Promise.reject("could not resolve host"),
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.failures).toHaveLength(1));
+    await waitFor(() => expect(result.current.carried).toBe(false));
+    // The dead root's stale rows go with it: it is a footer line now,
+    // not a repository we are waiting on.
+    expect(result.current.rows.map((r) => r.number)).toEqual([5]);
+    expect(result.current.carriedAt).toBeNull();
+  });
+
+  it("keeps carrying a root that is merely slow, not failed", async () => {
+    // The other half of the same rule — a root still in flight is
+    // exactly what the carried paint is for, and must not be dropped
+    // just because its neighbour failed.
+    setRoots(ROOT, OTHER);
+    localStorage.setItem(
+      prSnapshotKey([ROOT, OTHER]),
+      JSON.stringify({
+        version: PR_SNAPSHOT_VERSION,
+        savedAt: 1000,
+        rows: [row({ number: 7, projectRoot: OTHER })],
+        viewerByRoot: { [OTHER]: "mock-dev" },
+      }),
+    );
+    const slow = deferred<unknown>();
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT ? Promise.reject("could not resolve host") : slow.promise,
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.failures).toHaveLength(1));
+    expect(result.current.carried).toBe(true);
+    expect(result.current.rows.map((r) => r.number)).toEqual([7]);
+  });
+
   it("does not hydrate from a snapshot taken with a different root set", () => {
     localStorage.setItem(
       prSnapshotKey([ROOT, OTHER]),
@@ -397,6 +457,40 @@ describe("usePrOverview — recording a clean refresh", () => {
     // One root fresh, one still carried: the old timestamp stands until
     // everything on screen came from the host.
     expect(readPrOverviewSnapshot([ROOT, OTHER])?.savedAt).toBe(1000);
+  });
+
+  it("keeps writing the snapshot after a root has permanently failed", async () => {
+    // A previously-snapshotted root that errors used to pin `carried`
+    // true forever, which blocked every later write — so the snapshot
+    // froze at the moment the root died and the contract above ("a
+    // failing root deliberately does not block the write") quietly
+    // stopped holding.
+    setRoots(ROOT, OTHER);
+    localStorage.setItem(
+      prSnapshotKey([ROOT, OTHER]),
+      JSON.stringify({
+        version: PR_SNAPSHOT_VERSION,
+        savedAt: 1000,
+        rows: [row({ number: 1 }), row({ number: 7, projectRoot: OTHER })],
+        viewerByRoot: { [ROOT]: "mock-dev", [OTHER]: "mock-dev" },
+      }),
+    );
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT
+        ? Promise.resolve({ viewer: "mock-dev", items: [item({ number: 5 })] })
+        : Promise.reject("could not resolve host"),
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.carried).toBe(false));
+
+    await waitFor(() =>
+      expect(readPrOverviewSnapshot([ROOT, OTHER])?.savedAt).not.toBe(1000),
+    );
+    const snapshot = readPrOverviewSnapshot([ROOT, OTHER])!;
+    expect(snapshot.rows.map((r) => r.number)).toEqual([5]);
+    expect(snapshot.viewerByRoot).toEqual({ [ROOT]: "mock-dev" });
   });
 
   it("does not write the closed view over the open one", async () => {

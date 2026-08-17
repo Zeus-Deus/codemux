@@ -8,6 +8,7 @@ import {
   providerHostLabel,
   providerRef,
   providerRefLabel,
+  repoSlugFromUrl,
   resolveProvider,
   unsupportedRepoMessage,
   type ProviderKind,
@@ -248,5 +249,33 @@ describe("unsupportedRepoMessage", () => {
     expect(unsupportedRepoMessage(resolveProvider("unknown"))).toBe(
       "No supported source control host for this repository",
     );
+  });
+});
+
+describe("repoSlugFromUrl", () => {
+  it("reads the slug from every host's change-request URL", () => {
+    expect(repoSlugFromUrl("https://github.com/acme/web/pull/285")).toBe("acme/web");
+    expect(repoSlugFromUrl("https://github.com/acme/web/pulls/285")).toBe("acme/web");
+    expect(
+      repoSlugFromUrl("https://gitlab.com/acme/group/api/-/merge_requests/12"),
+    ).toBe("group/api");
+    // The one that was wrong. `pull-requests` was missing from the stop
+    // list, so the split matched nothing and the last two segments of
+    // the *whole* path came back — "pull-requests/64" as a repository
+    // name, on every row and every header the ledger fixture reaches.
+    expect(repoSlugFromUrl("https://bitbucket.org/acme/ledger-api/pull-requests/64")).toBe(
+      "acme/ledger-api",
+    );
+    expect(
+      repoSlugFromUrl("https://dev.azure.com/acme/ledger/_git/api/pullrequest/7"),
+    ).toBe("_git/api");
+  });
+
+  it("has no answer rather than a wrong one", () => {
+    expect(repoSlugFromUrl(null)).toBeNull();
+    expect(repoSlugFromUrl("")).toBeNull();
+    expect(repoSlugFromUrl("not a url")).toBeNull();
+    // One segment names no repository.
+    expect(repoSlugFromUrl("https://github.com/acme")).toBeNull();
   });
 });

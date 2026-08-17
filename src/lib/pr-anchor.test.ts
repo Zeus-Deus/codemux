@@ -69,6 +69,60 @@ describe("indexDiffRows", () => {
     expect(rowsFor(indexDiffRows(before), "app.py", "RIGHT").length).toBeGreaterThan(0);
   });
 
+  it("does not invent a row past the end of a hunk", () => {
+    // A diff that ends in a newline splits into a trailing `""`, and the
+    // blank-context rule used to index that empty string as a real row —
+    // one past the last line of the hunk, on both sides at once. The
+    // damage was two-fold: re-anchoring could land a note on a line the
+    // file does not have (the host answers 422), and the true last row
+    // reported `contextAfter: ""` instead of `null`, which disqualified
+    // the correct candidate whenever `reanchor` had to break a tie.
+    const diff = [
+      "diff --git a/a.txt b/a.txt",
+      "--- a/a.txt",
+      "+++ b/a.txt",
+      "@@ -1,2 +1,2 @@",
+      "-one",
+      "+ONE",
+      " two",
+      "",
+    ].join("\n");
+
+    const index = indexDiffRows(diff);
+    const right = rowsFor(index, "a.txt", "RIGHT");
+    const left = rowsFor(index, "a.txt", "LEFT");
+
+    expect(right.map((r) => r.line)).toEqual([1, 2]);
+    expect(left.map((r) => r.line)).toEqual([1, 2]);
+    expect(anchorContext(index, "a.txt", "RIGHT", 3)).toBeNull();
+    // The last real row is last: nothing follows it.
+    expect(anchorContext(index, "a.txt", "RIGHT", 2)?.contextAfter).toBeNull();
+  });
+
+  it("still counts a blank line inside a hunk body as context", () => {
+    // The trailing-newline fix pops exactly one empty string. An interior
+    // blank is a real row, and dropping it would renumber everything
+    // below it.
+    const diff = [
+      "diff --git a/a.txt b/a.txt",
+      "--- a/a.txt",
+      "+++ b/a.txt",
+      "@@ -1,3 +1,3 @@",
+      "-one",
+      "+ONE",
+      "",
+      " three",
+      "",
+    ].join("\n");
+
+    const right = rowsFor(indexDiffRows(diff), "a.txt", "RIGHT");
+    expect(right.map((r) => ({ line: r.line, text: r.text }))).toEqual([
+      { line: 1, text: "ONE" },
+      { line: 2, text: "" },
+      { line: 3, text: "three" },
+    ]);
+  });
+
   it("reads a line's neighbours and hunk straight off the diff", () => {
     const ctx = anchorContext(indexDiffRows(before), "app.py", "RIGHT", 47);
     expect(ctx).toEqual({

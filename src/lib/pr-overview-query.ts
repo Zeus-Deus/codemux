@@ -112,12 +112,16 @@ function historyRow(pr: PullRequestInfo, root: ProjectRoot): PrRow {
     additions: pr.additions,
     deletions: pr.deletions,
     review_decision: pr.review_decision,
+    // `null` stays `null`. "none" is the host saying this pull request has
+    // no checks; the historical list simply never asked, and flattening
+    // the two would draw a confident "no checks" dot — and make a
+    // `ci:none` search match rows nobody measured.
     checks:
       pr.checks_passing === true
         ? "passing"
         : pr.checks_passing === false
           ? "failing"
-          : "none",
+          : null,
     review_requested_from: pr.review_requests ?? [],
     updated_at: pr.updated_at,
     url: pr.url,
@@ -163,9 +167,13 @@ export interface PrOverviewResult {
   roots: ProjectRoot[];
   /** Newest successful fetch across all roots, for "20s ago". */
   updatedAt: number | null;
-  /** True while any row on screen came from the snapshot rather than the
-   *  host. The header labels the age differently, and the toasts stay
-   *  quiet — see `pr-event-toasts`. */
+  /** True while any root is *still awaiting its first answer* and is
+   *  painting snapshot rows in the meantime. The header labels the age
+   *  differently, and the toasts stay quiet — see `pr-event-toasts`.
+   *
+   *  A root that has already failed does not count: it is a footer line
+   *  in `failures`, not a root we are waiting on, so it cannot pin the
+   *  page in carried mode and silence every toast for the session. */
   carried: boolean;
   /** When the carried rows were fetched, for "as of 2h ago". */
   carriedAt: number | null;
@@ -323,10 +331,21 @@ export function usePrOverview(
           ),
         );
       }
-    } else if (snapshot) {
-      // Nothing from the host for this root yet. Rather than a hole in
+    } else if (snapshot && !result.isError) {
+      // Nothing from the host for this root *yet*. Rather than a hole in
       // the list, last session's rows for *this* root — dropped whole
       // the instant the real answer arrives above.
+      //
+      // "Yet" is load-bearing, and is why an errored root is excluded.
+      // A root that has answered — with a failure — is not waiting on
+      // anything, and one permanently unreachable repository must not
+      // keep the whole page in carried mode for the rest of the session:
+      // `carried` blocks every snapshot write and silences every toast,
+      // so a single dead root would otherwise mean no review-requested
+      // and no CI-failed toast for *any* repository, forever. It becomes
+      // a footer line via `failures` below instead, which is also what
+      // the write rule further down already assumes ("the failure itself
+      // is never written: it isn't in the rows").
       const carriedRows = snapshot.rows.filter((row) => row.projectRoot === root.path);
       if (carriedRows.length > 0 || root.path in snapshot.viewerByRoot) {
         carried = true;

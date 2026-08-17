@@ -278,16 +278,23 @@ export function providerHostLabel(
 /**
  * `owner/name` from a change-request URL.
  *
- * Both products put the repository path directly after the host, and
+ * Every host puts the repository path directly after the host name, and
  * GitLab inserts a `/-/` separator before the merge-request segment, so
- * taking everything before `/pull/`, `/merge_requests/` or `/-/` works
- * for both without a per-product branch.
+ * taking everything before the change-request segment works for all of
+ * them without a per-product branch.
+ *
+ * The stop list has to name every host's spelling of that segment. A
+ * missing one isn't a graceful degradation: the split finds nothing, and
+ * the last two segments of the *whole* path come back — `pull-requests/64`
+ * where the repository slug should be.
  */
 export function repoSlugFromUrl(url: string | null | undefined): string | null {
   if (!url) return null;
   try {
     const path = new URL(url).pathname.replace(/^\/+/, "");
-    const stopped = path.split(/\/(?:-|pull|merge_requests|pulls)\//)[0];
+    const stopped = path.split(
+      /\/(?:-|pull|pulls|merge_requests|pull-requests|pullrequest)\//,
+    )[0];
     const parts = stopped.split("/").filter(Boolean);
     if (parts.length < 2) return null;
     // Subgroups are real on GitLab; the last two segments are the ones
