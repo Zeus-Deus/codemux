@@ -13,6 +13,9 @@ vi.mock("./ChatMarkdown", () => ({
   ),
 }));
 
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/toast", () => ({ toast: { error: toastError } }));
+
 import { AssistantMessage } from "./AssistantMessage";
 import { UserMessage } from "./UserMessage";
 
@@ -36,12 +39,17 @@ function assistantItem(
 
 let writeText: ReturnType<typeof vi.fn>;
 
-beforeEach(() => {
-  writeText = vi.fn().mockResolvedValue(undefined);
+function setSecureContext(value: boolean) {
   Object.defineProperty(window, "isSecureContext", {
     configurable: true,
-    value: true,
+    value,
   });
+}
+
+beforeEach(() => {
+  toastError.mockClear();
+  writeText = vi.fn().mockResolvedValue(undefined);
+  setSecureContext(true);
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
     value: { writeText },
@@ -102,8 +110,8 @@ describe("message copy action", () => {
     for (const reveal of [
       "opacity-0",
       "pointer-events-none",
-      "group-hover:opacity-100",
-      "group-focus-within:opacity-100",
+      "group-hover/message:opacity-100",
+      "group-focus-within/message:opacity-100",
       "pointer-coarse:opacity-100",
     ]) {
       expect(copy.className).toContain(reveal);
@@ -131,13 +139,30 @@ describe("message copy action", () => {
     await vi.waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
   });
 
-  it("falls back to execCommand when the async clipboard is unavailable", async () => {
-    // The remote web client can be a plain-HTTP origin, where
-    // `navigator.clipboard` is undefined.
-    Object.defineProperty(window, "isSecureContext", {
-      configurable: true,
-      value: false,
-    });
+  // The remote web client can be served from a plain-HTTP origin. Browsers
+  // differ there: some drop `navigator.clipboard` entirely, others keep it and
+  // reject the write. Every shape has to reach the execCommand fallback.
+  it.each([
+    [
+      "the clipboard API is missing",
+      () => {
+        setSecureContext(false);
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: undefined,
+        });
+      },
+    ],
+    [
+      "the API exists but the origin is insecure",
+      () => setSecureContext(false),
+    ],
+    [
+      "the write rejects on a secure origin",
+      () => writeText.mockRejectedValue(new Error("denied")),
+    ],
+  ])("falls back to execCommand when %s", async (_name, arrange) => {
+    arrange();
     const execCommand = vi.fn().mockReturnValue(true);
     Object.defineProperty(document, "execCommand", {
       configurable: true,
@@ -149,8 +174,56 @@ describe("message copy action", () => {
 
     await vi.waitFor(() => {
       expect(execCommand).toHaveBeenCalledWith("copy");
-      expect(writeText).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
     });
+    expect(toastError).not.toHaveBeenCalled();
+    // The fallback's scratch textarea must not outlive the copy.
+    expect(document.querySelector("textarea")).toBeNull();
+  });
+
+  it("tells the user when every copy path is blocked", async () => {
+    setSecureContext(false);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    // A browser that refuses the fallback outright, the way a sandboxed or
+    // permission-denied context does.
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => {
+        throw new Error("blocked");
+      }),
+    });
+
+    render(<UserMessage item={userItem("nowhere to go")} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+
+    await vi.waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(expect.any(String)),
+    );
+    // No false confirmation, and no textarea left behind by the throw.
+    expect(screen.queryByRole("button", { name: "Copied" })).toBeNull();
+    expect(document.querySelector("textarea")).toBeNull();
+  });
+});
+
+describe("message hover scope", () => {
+  // An unnamed `group` here would also fire the unnamed `group-hover:` rules
+  // inside a message's own content — inline images zoom-scale on hover — so
+  // hovering anywhere on a message would animate every image in it.
+  it("scopes the reveal to a named group on both message roots", () => {
+    const { container: assistant } = render(
+      <AssistantMessage item={assistantItem("answer")} />,
+    );
+    const { container: user } = render(<UserMessage item={userItem("ask")} />);
+
+    for (const root of [assistant.firstElementChild, user.firstElementChild]) {
+      expect(root).not.toBeNull();
+      expect(root?.classList.contains("group/message")).toBe(true);
+    }
+    // The user root keeps its pre-existing unnamed group for the queued-turn
+    // actions; the assistant root, which wraps rendered prose, must not.
+    expect(assistant.firstElementChild?.classList.contains("group")).toBe(false);
   });
 });

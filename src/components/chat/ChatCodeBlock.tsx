@@ -33,6 +33,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { resolveChatFileLink } from "@/lib/agent-chat/file-links";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
 
 import { useChatFileLinkContext } from "./chat-file-link-context";
 import { MarkdownFileLink } from "./MarkdownFileLink";
@@ -378,18 +380,22 @@ function ChatFencedCode({
   );
 
   async function copyCode() {
-    if (!navigator.clipboard?.writeText || copied) return;
-    try {
-      await navigator.clipboard.writeText(code);
-      setCopied(true);
-      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
-      copiedTimer.current = window.setTimeout(() => {
-        setCopied(false);
-        copiedTimer.current = null;
-      }, 1200);
-    } catch (error) {
-      console.error("Failed to copy chat code block", error);
+    // Ignore repeat clicks while the check is up; restarting the timer makes
+    // the confirmation feel stuck.
+    if (copied) return;
+    // Goes through the shared helper rather than `navigator.clipboard` so the
+    // remote web client on a plain-HTTP origin — where that is undefined —
+    // still copies, and says so when even the fallback is blocked.
+    if (!(await copyToClipboard(code))) {
+      toast.error(COPY_FAILED_MESSAGE);
+      return;
     }
+    setCopied(true);
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => {
+      setCopied(false);
+      copiedTimer.current = null;
+    }, 1200);
   }
 
   const wrapLabel = wrapped ? "Disable line wrap" : "Wrap lines";

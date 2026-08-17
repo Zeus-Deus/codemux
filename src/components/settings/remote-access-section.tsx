@@ -32,7 +32,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { copyToClipboard } from "@/lib/clipboard";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/lib/toast";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
@@ -101,7 +101,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
           window.setTimeout(() => setCopied(false), 1400);
           toast.success("Copied to clipboard");
         } else {
-          toast.error("Couldn't copy — select and copy manually.");
+          toast.error(COPY_FAILED_MESSAGE);
         }
       }}
     >

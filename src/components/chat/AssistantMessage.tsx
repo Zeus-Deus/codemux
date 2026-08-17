@@ -1,7 +1,9 @@
 import { memo } from "react";
 
 import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
+import { MESSAGE_GROUP_CLASS } from "@/components/chat/message-action";
 import type { AssistantMessageItem } from "@/lib/agent-chat/types";
+import { cn } from "@/lib/utils";
 
 import { ChatMarkdown } from "./ChatMarkdown";
 
@@ -17,7 +19,9 @@ import { ChatMarkdown } from "./ChatMarkdown";
  * or keyboard focus, holding a copy action aligned to the start of the text.
  * It copies `item.text` — the markdown source, not the rendered DOM — so
  * pasting into another editor keeps the formatting. It stays hidden while the
- * message streams, where only half the answer exists yet.
+ * message streams, where only half the answer exists yet. The hover target is
+ * a *named* group: prose can contain its own unnamed `group`s (an inline image
+ * zooms on hover), which an unnamed one here would fire on every hover.
  */
 export const AssistantMessage = memo(function AssistantMessage({
   item,
@@ -29,7 +33,12 @@ export const AssistantMessage = memo(function AssistantMessage({
   cwd?: string | null;
 }) {
   return (
-    <div className="group conversation-text leading-relaxed text-foreground break-words">
+    <div
+      className={cn(
+        MESSAGE_GROUP_CLASS,
+        "conversation-text leading-relaxed text-foreground break-words",
+      )}
+    >
       <ChatMarkdown
         streaming={item.streaming}
         workspaceId={workspaceId}

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 
-import { copyToClipboard } from "@/lib/clipboard";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
 import { MESSAGE_ACTION_CLASS } from "./message-action";
@@ -45,7 +46,13 @@ export function MessageCopyButton({
     // Ignore repeat clicks while the check is up: re-copying identical text is
     // a no-op, and restarting the timer makes the confirmation feel stuck.
     if (!text || copied) return;
-    if (!(await copyToClipboard(text))) return;
+    if (!(await copyToClipboard(text))) {
+      // Every path failed (a plain-HTTP origin where execCommand is blocked
+      // too). Say so — a Copy that leaves the clipboard untouched and the
+      // glyph unchanged is indistinguishable from a missed click.
+      toast.error(COPY_FAILED_MESSAGE);
+      return;
+    }
     setCopied(true);
     if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
     resetTimer.current = window.setTimeout(() => {

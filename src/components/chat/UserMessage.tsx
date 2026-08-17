@@ -10,6 +10,7 @@ import { MessageCopyButton } from "@/components/chat/MessageCopyButton";
 import {
   MESSAGE_ACTION_CLASS,
   MESSAGE_ACTION_ROW_CLASS,
+  MESSAGE_GROUP_CLASS,
 } from "@/components/chat/message-action";
 import { isAbsoluteFsPath, resolveAssetSrc } from "@/lib/asset-url";
 import { readChatImage } from "@/tauri/commands";
@@ -129,7 +130,11 @@ export const UserMessage = memo(function UserMessage({
     lightboxIndex !== null ? images[lightboxIndex] : undefined;
 
   return (
-    <div className="group flex justify-end">
+    // Two group names on one root: the queued turn's inline actions have always
+    // revealed off the unnamed `group`, while the footer strip uses the named
+    // one shared with assistant messages, whose prose runs unnamed groups of
+    // its own.
+    <div className={cn(MESSAGE_GROUP_CLASS, "group flex justify-end")}>
       <div className="flex max-w-[82%] flex-col items-end gap-1">
         <div
           className={cn(

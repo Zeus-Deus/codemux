@@ -1,4 +1,10 @@
 /**
+ * What to tell the user when `copyToClipboard` resolves false. Shared so every
+ * copy affordance fails the same way instead of inventing its own wording.
+ */
+export const COPY_FAILED_MESSAGE = "Couldn't copy — select and copy manually.";
+
+/**
  * Write `text` to the system clipboard, resolving to whether it landed.
  *
  * The async Clipboard API is the fast path, but Codemux also renders in the
@@ -22,8 +28,8 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   }
 
   const previous = document.activeElement;
+  const ta = document.createElement("textarea");
   try {
-    const ta = document.createElement("textarea");
     ta.value = text;
     ta.setAttribute("readonly", "");
     ta.style.position = "fixed";
@@ -32,12 +38,13 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
+    return document.execCommand("copy");
   } catch {
     return false;
   } finally {
+    // Both of these have to run even when `execCommand` throws, or a failed
+    // copy leaves a stray textarea in the DOM and the caret on it.
+    ta.remove();
     if (previous instanceof HTMLElement) previous.focus();
   }
 }
