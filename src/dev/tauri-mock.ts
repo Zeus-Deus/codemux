@@ -246,6 +246,131 @@ const MOCK_TERMINAL_BANNER =
   "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
   "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n";
 
+// ── MCP fixtures (Settings → MCP Servers) ──
+
+/** Discovered server configs across provider scopes. Mirrors
+ *  `McpServerConfig` on the Rust side. */
+const MOCK_MCP_SERVERS = [
+  {
+    id: "codemux-self",
+    name: "codemux",
+    sources: ["codemux"],
+    command: "/usr/bin/codemux",
+    args: ["mcp"],
+    env: {},
+    disabled: false,
+    transport: "stdio",
+    raw: null,
+  },
+  {
+    id: "docs-kb",
+    name: "docs-kb",
+    sources: ["claudeUser", "openCodeUser"],
+    command: "docker",
+    args: ["exec", "-i", "docs-kb", "python", "/app/server.py"],
+    env: {},
+    disabled: false,
+    transport: "stdio",
+    raw: null,
+  },
+  {
+    id: "code-search",
+    name: "code-search",
+    sources: ["codexUser"],
+    command: "npx",
+    args: ["-y", "@acme/code-search-mcp"],
+    env: {},
+    disabled: false,
+    transport: "stdio",
+    raw: null,
+  },
+  {
+    id: "issue-tracker",
+    name: "issue-tracker",
+    sources: ["codexUser"],
+    command: "https://mcp.example.com/mcp",
+    args: [],
+    env: {},
+    disabled: false,
+    transport: "http",
+    raw: null,
+  },
+  {
+    id: "notes-sync",
+    name: "notes-sync",
+    sources: ["openCodeUser"],
+    command: "uvx",
+    args: ["notes-sync-mcp", "-y"],
+    env: {},
+    disabled: false,
+    transport: "stdio",
+    raw: null,
+  },
+] as const;
+
+/** Live runtime rows keyed to the configs above. Tool counts sum to
+ *  86 (> the advisory threshold) so the "many tools" note renders. */
+const MOCK_MCP_RUNTIMES = [
+  {
+    id: "codemux-self",
+    name: "codemux",
+    status: { kind: "running", toolCount: 57 },
+    toolsCount: 57,
+    errorMessage: null,
+    stderrTail: null,
+    startedAtMs: 0,
+  },
+  {
+    id: "docs-kb",
+    name: "docs-kb",
+    status: { kind: "running", toolCount: 12 },
+    toolsCount: 12,
+    errorMessage: null,
+    stderrTail: null,
+    startedAtMs: 0,
+  },
+  {
+    id: "code-search",
+    name: "code-search",
+    status: { kind: "running", toolCount: 9 },
+    toolsCount: 9,
+    errorMessage: null,
+    stderrTail: null,
+    startedAtMs: 0,
+  },
+  {
+    id: "issue-tracker",
+    name: "issue-tracker",
+    status: { kind: "running", toolCount: 8 },
+    toolsCount: 8,
+    errorMessage: null,
+    stderrTail: null,
+    startedAtMs: 0,
+  },
+  {
+    id: "notes-sync",
+    name: "notes-sync",
+    status: { kind: "errored", message: "spawn uvx ENOENT" },
+    toolsCount: 0,
+    errorMessage: "spawn uvx ENOENT",
+    stderrTail: "uvx: command not found",
+    startedAtMs: 0,
+  },
+];
+
+/** Deterministic per-server tool list for the tool modal. */
+function mockMcpToolsForServer(id: string) {
+  const runtime = MOCK_MCP_RUNTIMES.find((r) => r.id === id);
+  const count = runtime?.toolsCount ?? 0;
+  return Array.from({ length: count }, (_, i) => ({
+    name: `tool_${i + 1}`,
+    prefixedName: `mcp__${id === "codemux-self" ? "codemux" : id}__tool_${i + 1}`,
+    description: `Sample tool ${i + 1} exposed by ${id}.`,
+    inputSchema: { type: "object", properties: {} },
+    serverId: id,
+  }));
+}
+
 /** Push one ordered frame through a tracked PTY channel. Best-effort:
  *  any shape mismatch / stale callback is swallowed so a terminal that
  *  renders differently never breaks boot. Returns whether it landed. */
@@ -3168,8 +3293,27 @@ const handlers: Record<string, Handler> = {
   workspaces_sync_now: () => undefined,
 
   // ── MCP runtime ──
-  get_mcp_runtime_status: () => ({ servers: [], running: false }),
-  list_mcp_servers: () => [],
+  //
+  // Sample fleet sized so the Settings section exercises its states:
+  // the always-on Codemux row plus user servers from several provider
+  // scopes, one errored. Tool counts intentionally sum past the
+  // "many tools" advisory threshold so the informational note renders.
+  get_mcp_runtime_status: () => MOCK_MCP_RUNTIMES,
+  list_mcp_servers: () => MOCK_MCP_SERVERS,
+  prime_mcp_runtime: () => MOCK_MCP_RUNTIMES,
+  set_mcp_disabled_ids: () => undefined,
+  start_mcp_server_cmd: (args: Args) =>
+    MOCK_MCP_RUNTIMES.find((r) => r.id === args.id) ?? MOCK_MCP_RUNTIMES[0],
+  stop_mcp_server_cmd: (args: Args) => ({
+    ...(MOCK_MCP_RUNTIMES.find((r) => r.id === args.id) ?? MOCK_MCP_RUNTIMES[0]),
+    status: { kind: "stopped" },
+  }),
+  restart_mcp_server_cmd: (args: Args) =>
+    MOCK_MCP_RUNTIMES.find((r) => r.id === args.id) ?? MOCK_MCP_RUNTIMES[0],
+  list_mcp_tools: () =>
+    MOCK_MCP_RUNTIMES.flatMap((r) => mockMcpToolsForServer(r.id)),
+  list_mcp_tools_for_server: (args: Args) =>
+    mockMcpToolsForServer(String(args.id)),
 
   // ── Branch listing (Thread Scope row's "from ⑂ branch" picker) ──
   //

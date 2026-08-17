@@ -2339,22 +2339,8 @@ export const restartMcpServerCmd = (id: string) =>
 
 export const listMcpTools = () => invoke<McpTool[]>("list_mcp_tools");
 
-export interface CappedTools {
-  tools: McpTool[];
-  totalBeforeCap: number;
-  droppedCount: number;
-  droppedServers: string[];
-}
-
-/** Same as `listMcpTools` but returns the cap-info envelope so the
- *  Settings UI can show a "N tools dropped to fit cap" banner. */
-export const listMcpToolsWithCapInfo = () =>
-  invoke<CappedTools>("list_mcp_tools_with_cap_info");
-
-/** Tools registered by a single server, uncapped. Drives the
- *  Settings tool-list modal — the user sees the full surface even
- *  when some tools were dropped from the agent's view to fit the
- *  cap. */
+/** Tools registered by a single server. Drives the Settings
+ *  tool-list modal. */
 export const listMcpToolsForServer = (id: string) =>
   invoke<McpTool[]>("list_mcp_tools_for_server", { id });
 

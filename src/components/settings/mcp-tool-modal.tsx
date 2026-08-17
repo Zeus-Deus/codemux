@@ -27,10 +27,7 @@ interface Props {
 
 /**
  * Stage 4 — settings tool-list modal. Click a server row → see every
- * tool it registered with descriptions. Bypasses the 50-tool cap so
- * the user sees the full surface even when some tools were dropped
- * from the agent's view; cap-related dropping is surfaced via the
- * banner at the section level.
+ * tool it registered with descriptions.
  *
  * Mirrors `SkillViewModal` in shape: shadcn Dialog with a header
  * describing the server, an overflow-scrolled body listing each
