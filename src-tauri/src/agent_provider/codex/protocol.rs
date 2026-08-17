@@ -255,7 +255,22 @@ pub struct TurnStartParams {
     pub effort: Option<String>,
     /// Per-turn collaboration-mode override.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub collaboration_mode: Option<String>,
+    pub collaboration_mode: Option<CollaborationMode>,
+}
+
+/// Codex collaboration mode with the resolved per-turn settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborationMode {
+    pub mode: String,
+    pub settings: CollaborationModeSettings,
+}
+
+/// Settings nested under [`CollaborationMode`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborationModeSettings {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub developer_instructions: String,
 }
 
 /// A single item in [`TurnStartParams::input`].
@@ -1477,6 +1492,35 @@ mod tests {
         let arr = v["input"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["type"], "text");
+    }
+
+    #[test]
+    fn turn_start_serializes_runtime_collaboration_settings() {
+        let params = TurnStartParams {
+            thread_id: "t-codex".into(),
+            input: vec![],
+            model: Some("gpt-5.6-sol".into()),
+            service_tier: None,
+            effort: Some("high".into()),
+            collaboration_mode: Some(CollaborationMode {
+                mode: "default".into(),
+                settings: CollaborationModeSettings {
+                    model: "gpt-5.6-sol".into(),
+                    reasoning_effort: Some("high".into()),
+                    developer_instructions: "runtime identity".into(),
+                },
+            }),
+        };
+
+        let value = serde_json::to_value(params).unwrap();
+        let mode = &value["collaborationMode"];
+        assert_eq!(mode["mode"], "default");
+        assert_eq!(mode["settings"]["model"], "gpt-5.6-sol");
+        assert_eq!(mode["settings"]["reasoning_effort"], "high");
+        assert_eq!(
+            mode["settings"]["developer_instructions"],
+            "runtime identity"
+        );
     }
 
     #[test]
