@@ -679,14 +679,17 @@ fn handle_collab_agent_tool_call(
             };
             let mut snap = subagent_snapshot(&tid, status);
             snap.parent_item_id = Some(call.id.clone());
-            // An explicit child override wins. When app-server omits the
-            // field, the spawned child inherits the active session model;
-            // carrying that known value is more useful (and more accurate)
-            // than leaving the cross-provider model slot blank.
-            snap.model = call
-                .model
-                .clone()
-                .or_else(|| demux.active_model.clone());
+            // An explicit child override wins. `model` is only ever set on
+            // `spawnAgent`, so the inherit-from-parent fallback is scoped to
+            // that tool: a later `wait`/`sendInput`/`closeAgent` on the same
+            // child must leave the slot `None` (the merge keeps the last
+            // known value) instead of stamping the parent's *current* model
+            // over an explicitly-routed child.
+            snap.model = match (call.model.clone(), call.tool.as_str()) {
+                (Some(model), _) => Some(model),
+                (None, "spawnAgent") => demux.active_model.clone(),
+                (None, _) => None,
+            };
             snap.activity = activity;
             ProviderRuntimeEvent::SubagentUpdated {
                 thread_id: thread_id.clone(),
@@ -1996,6 +1999,50 @@ mod tests {
             ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
                 assert_eq!(subagent.status, SubagentStatus::Completed);
                 assert_eq!(subagent.activity.as_deref(), Some("done"));
+            }
+            other => panic!("expected SubagentUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collab_non_spawn_call_leaves_model_unset() {
+        // `model` is only ever reported on `spawnAgent`. A later `wait` (or
+        // `sendInput` / `closeAgent`) must not stamp the *parent's* current
+        // model onto the child — the consumer merges last-non-null-wins, so
+        // that would silently overwrite an explicitly-routed child model.
+        let mut demux = CodexSubagentDemux::new("c-1");
+        demux.set_active_model(Some("gpt-5.4".into()));
+        for tool in ["wait", "sendInput", "closeAgent", "resumeAgent"] {
+            let msg = collab_item(json!({
+                "type": "collabAgentToolCall", "id": "call-2", "tool": tool,
+                "status": "completed", "senderThreadId": "c-1",
+                "receiverThreadIds": ["c-child"],
+                "agentsStates": {"c-child": {"status": "running"}}
+            }));
+            let events = translate_notification_with(&mut demux, &tid(), msg);
+            match &events[0] {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                    assert_eq!(subagent.model, None, "{tool} must not restamp model");
+                }
+                other => panic!("expected SubagentUpdated, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collab_explicit_model_wins_over_active_session_model() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        demux.set_active_model(Some("gpt-5.4".into()));
+        let msg = collab_item(json!({
+            "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+            "status": "completed", "senderThreadId": "c-1",
+            "receiverThreadIds": ["c-child"], "model": "gpt-5.4-codex-mini",
+            "agentsStates": {"c-child": {"status": "running"}}
+        }));
+        let events = translate_notification_with(&mut demux, &tid(), msg);
+        match &events[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.model.as_deref(), Some("gpt-5.4-codex-mini"));
             }
             other => panic!("expected SubagentUpdated, got {other:?}"),
         }
