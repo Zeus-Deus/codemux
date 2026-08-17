@@ -199,6 +199,15 @@ pub struct OpenCodeUsageState {
     /// messages, which `seen_per_message` never sees because the context
     /// meter drops them before they reach it.
     ledger_per_message: HashMap<String, UsageSplit>,
+    /// Child session id → the model already reported for that subagent.
+    ///
+    /// OpenCode re-broadcasts one assistant message many times, so without
+    /// this the model snapshot would re-fire on every tick. Each of those
+    /// snapshots carries `Running`, and a re-broadcast that lands after the
+    /// child's terminal snapshot would re-track a finished subagent as live
+    /// work. Emitting only when the model is genuinely new keeps the
+    /// snapshot to the one tick that actually says something.
+    subagent_models: HashMap<String, String>,
 }
 
 /// A non-overlapping token split, in the shape
@@ -862,7 +871,30 @@ fn translate_message_tokens(
     // below is a context-meter hygiene rule, not an accounting one.
     let mut events = record_usage(info, ctx, subagent_id.is_some(), usage);
 
-    if subagent_id.is_some() {
+    if let Some(id) = subagent_id {
+        // Task metadata normally reports the child's model at launch, but
+        // some upstream agents omit it. Each assistant message carries the
+        // concrete federated model pair, so use that authoritative fallback
+        // to make model identity reliable across OpenCode providers.
+        //
+        // Once per (child, model): the same message is re-broadcast many
+        // times, and every repeat would be a `Running` snapshot that says
+        // nothing new — see [`OpenCodeUsageState::subagent_models`].
+        if let Some(model) = info.qualified_model_id() {
+            if usage.subagent_models.get(id) != Some(&model) {
+                usage.subagent_models.insert(id.to_string(), model.clone());
+                events.push(subagent_event(
+                    ctx,
+                    SubagentSnapshot {
+                        subagent_id: id.to_string(),
+                        model: Some(model),
+                        status: SubagentStatus::Running,
+                        provider_ref: Some(id.to_string()),
+                        ..empty_snapshot(id)
+                    },
+                ));
+            }
+        }
         return events;
     }
     let Some(tokens) = info.tokens.as_ref() else {
@@ -2183,6 +2215,13 @@ mod usage_ledger_tests {
         assert_eq!(r.len(), 1);
         assert!(r[0].4, "subagent flag must be set");
         assert_eq!(r[0].0, 200);
+        assert!(first.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+                if subagent.subagent_id == "child_session"
+                    && subagent.model.as_deref()
+                        == Some("anthropic/claude-haiku-4-5")
+        )));
         assert!(
             !first
                 .iter()
@@ -2200,6 +2239,15 @@ mod usage_ledger_tests {
         let r2 = rows(&second);
         assert_eq!(r2[0].0, 0);
         assert_eq!(r2[0].1, 70);
+        // …and the model snapshot fires once, not on every re-broadcast:
+        // a repeat carries `Running` and would re-track a child that has
+        // since finished.
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            "repeat message must not re-emit the model snapshot: {second:?}"
+        );
     }
 
     /// OpenCode re-broadcasts a growing message, so reasoning needs the

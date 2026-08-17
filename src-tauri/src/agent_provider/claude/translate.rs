@@ -840,6 +840,33 @@ fn translate_assistant(
     let turn_id = extract_turn_id(msg);
     let parent = parent_tool_use_id(msg);
     let subagent_id = parent.as_ref().map(|p| demux.root_for(p));
+    // The launch tool's `model` input is optional when a Claude subagent
+    // inherits its model. The child assistant envelope is authoritative and
+    // always describes the model that actually produced this message, so
+    // merge it into the row as soon as it arrives. This is the same in-band
+    // source the usage ledger relies on below and avoids guessing from parent
+    // session state (which can differ from an explicitly-routed child).
+    //
+    // Gated on the *direct* parent being the top-level launch: a grandchild's
+    // messages flatten into the root's transcript, but their `message.model`
+    // describes the grandchild, and the consumer's merge is
+    // last-non-`None`-wins — so emitting for them would relabel the root row
+    // with a nested agent's model.
+    if let (Some(id), Some(model)) = (
+        parent.as_deref().filter(|p| demux.is_top_level_launch(p)),
+        msg.get("message")
+            .and_then(|message| message.get("model"))
+            .and_then(|model| model.as_str())
+            .filter(|model| !model.is_empty()),
+    ) {
+        let mut snapshot = base_snapshot(id);
+        snapshot.model = Some(model.to_string());
+        stamp_task_classification(&mut snapshot, demux);
+        out.push(ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: thread_id.clone(),
+            subagent: snapshot,
+        });
+    }
     if let Some(err) = msg.get("error").and_then(|v| v.as_str()) {
         out.push(ProviderRuntimeEvent::RuntimeWarning {
             thread_id: Some(thread_id.clone()),
@@ -3183,14 +3210,23 @@ mod tests {
             "type": "assistant",
             "parent_tool_use_id": "toolu_root",
             "turn_id": "turn-1",
-            "message": { "content": [
+            "message": { "model": "claude-opus-4-8", "content": [
                 {"type": "text", "text": "working on it"},
                 {"type": "tool_use", "id": "tu-bash", "name": "Bash", "input": {"command": "ls"}}
             ]}
         });
         let events = translate_sdk_message_with(&tid(), &inner, &mut demux);
-        assert_eq!(events.len(), 2);
-        for e in &events {
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. }
+                if subagent.subagent_id == "toolu_root"
+                    && subagent.model.as_deref() == Some("claude-opus-4-8")
+        )));
+        for e in events
+            .iter()
+            .filter(|event| matches!(event, ProviderRuntimeEvent::ItemCompleted { .. }))
+        {
             match e {
                 ProviderRuntimeEvent::ItemCompleted { subagent_id, .. } => {
                     assert_eq!(subagent_id.as_deref(), Some("toolu_root"));
@@ -3198,6 +3234,110 @@ mod tests {
                 other => panic!("expected ItemCompleted, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn grandchild_assistant_message_does_not_relabel_root_model() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        // The root subagent spawns a nested Agent — registered so its own
+        // items flatten into `toolu_root`.
+        translate_sdk_message_with(
+            &tid(),
+            &json!({
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_root",
+                "turn_id": "turn-1",
+                "message": { "model": "claude-opus-4-8", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_nested",
+                    "name": "Agent",
+                    "input": {"subagent_type": "Explore"}
+                }]}
+            }),
+            &mut demux,
+        );
+        // The grandchild's own assistant envelope reports the grandchild's
+        // model. It flattens into the root transcript, but must NOT restamp
+        // the root row's badge.
+        let grandchild = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_nested",
+            "turn_id": "turn-1",
+            "message": { "model": "claude-haiku-4-5", "content": [
+                {"type": "text", "text": "nested work"}
+            ]}
+        });
+        let events = translate_sdk_message_with(&tid(), &grandchild, &mut demux);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            "grandchild model must not emit a snapshot: {events:?}"
+        );
+        // …while still routing its transcript under the root.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderRuntimeEvent::ItemCompleted { subagent_id, .. }
+                if subagent_id.as_deref() == Some("toolu_root")
+        )));
+    }
+
+    #[test]
+    fn assistant_model_snapshot_is_stamped_as_foreground_task() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        let inner = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_root",
+            "turn_id": "turn-1",
+            "message": { "model": "claude-opus-4-8", "content": [
+                {"type": "text", "text": "working on it"}
+            ]}
+        });
+        let events = translate_sdk_message_with(&tid(), &inner, &mut demux);
+        let snap = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => Some(subagent),
+                _ => None,
+            })
+            .expect("model snapshot");
+        assert_eq!(snap.model.as_deref(), Some("claude-opus-4-8"));
+        // A registered top-level launch is never background work; shipping
+        // the raw default would classify the row as unreported live work.
+        assert!(!snap.background_task);
+    }
+
+    #[test]
+    fn unseen_parent_assistant_message_does_not_emit_model_snapshot() {
+        // Mid-session attach: the launch was never seen, so the row is not a
+        // known top-level subagent. Emitting here would invent a phantom
+        // live subagent that has no terminal event.
+        let mut demux = SubagentDemux::default();
+        let inner = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_unseen",
+            "turn_id": "turn-1",
+            "message": { "model": "claude-opus-4-8", "content": [
+                {"type": "text", "text": "hi"}
+            ]}
+        });
+        let events = translate_sdk_message_with(&tid(), &inner, &mut demux);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            "unseen parent must not emit a subagent snapshot: {events:?}"
+        );
     }
 
     #[test]

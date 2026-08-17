@@ -89,7 +89,10 @@ export function SubagentsPane({
       />
 
       {active.length > 0 && (
-        <section className="mt-3" aria-label={`${active.length} live subagents`}>
+        <section
+          className="mt-3"
+          aria-label={`${active.length} live subagents`}
+        >
           <div className="space-y-1.5">
             {active.map((subagent) => (
               <LiveSubagentCard
@@ -144,27 +147,25 @@ function LiveSubagentCard({
         <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground/90">
           {subagent.name ?? subagent.agentType ?? "Subagent"}
         </span>
-        <TickingText
-          className="shrink-0 font-mono text-[9px] text-muted-foreground"
-          active={false}
-          compute={() => {
-            const tools = subagentToolCount(subagent);
-            return `${tools} ${tools === 1 ? "tool" : "tools"}`;
-          }}
-        />
+        <SubagentModelBadge model={subagent.model} />
       </div>
       <div className="mt-1.5 truncate pl-7 font-mono text-[10px] text-muted-foreground">
         {activity}
       </div>
-      <button
-        type="button"
-        disabled={!canOpen}
-        onClick={onOpen}
-        className="mt-2 ml-7 flex items-center gap-0.5 text-[10px] font-medium text-foreground/75 hover:text-foreground disabled:cursor-default"
-      >
-        Open thread
-        <ChevronRight className="size-3" aria-hidden />
-      </button>
+      <div className="mt-2 ml-7 flex items-center gap-2">
+        <button
+          type="button"
+          disabled={!canOpen}
+          onClick={onOpen}
+          className="flex items-center gap-0.5 text-[10px] font-medium text-foreground/75 hover:text-foreground disabled:cursor-default"
+        >
+          Open thread
+          <ChevronRight className="size-3" aria-hidden />
+        </button>
+        <span className="ml-auto shrink-0 font-mono text-[9px] text-muted-foreground">
+          {toolCountLabel(subagent)}
+        </span>
+      </div>
     </div>
   );
 }
@@ -190,6 +191,7 @@ function FinishedSubagentRow({
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-foreground/75">
         {subagent.name ?? subagent.agentType ?? "Subagent"}
       </span>
+      <SubagentModelBadge model={subagent.model} compact />
       <TickingText
         active={false}
         className="shrink-0 font-mono text-[9px] text-muted-foreground/80"
@@ -218,7 +220,45 @@ function FinishedGlyph({ subagent }: { subagent: SubagentView }) {
       />
     );
   }
-  return <Check {...props} className={cn(props.className, "text-status-open")} />;
+  return (
+    <Check {...props} className={cn(props.className, "text-status-open")} />
+  );
+}
+
+/**
+ * Provider-neutral model identity. Snapshot model ids are intentionally
+ * opaque cross-provider strings, so the pane presents the value exactly as
+ * reported instead of guessing at a vendor-specific display name. Long ids
+ * truncate in the row; the native title keeps the full value one hover away.
+ */
+function SubagentModelBadge({
+  model,
+  compact = false,
+}: {
+  model?: string;
+  compact?: boolean;
+}) {
+  const value = model?.trim();
+  if (!value) return null;
+
+  return (
+    <span
+      data-subagent-model={value}
+      title={`Model: ${value}`}
+      className={cn(
+        "inline-flex min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 font-mono text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.025)]",
+        compact
+          ? "h-[17px] max-w-[38%] px-1.5 text-[8px]"
+          : "h-[18px] max-w-[48%] px-1.5 text-[9px]",
+      )}
+    >
+      <span
+        className="size-1 shrink-0 rounded-full bg-accent-ember/75"
+        aria-hidden
+      />
+      <span className="truncate">{value}</span>
+    </span>
+  );
 }
 
 function elapsedLabel(subagents: readonly SubagentView[], now: number): string {
@@ -229,6 +269,11 @@ function elapsedLabel(subagents: readonly SubagentView[], now: number): string {
 function finishedTimeLabel(subagent: SubagentView, now: number): string {
   const elapsed = subagentElapsedMs(subagent, now);
   if (elapsed != null) return formatElapsed(elapsed);
+  const tools = subagentToolCount(subagent);
+  return `${tools} ${tools === 1 ? "tool" : "tools"}`;
+}
+
+function toolCountLabel(subagent: SubagentView): string {
   const tools = subagentToolCount(subagent);
   return `${tools} ${tools === 1 ? "tool" : "tools"}`;
 }
