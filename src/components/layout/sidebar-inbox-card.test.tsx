@@ -257,8 +257,10 @@ describe("SidebarInboxCard — snooze affordance", () => {
     expect(cluster.className).toContain("flex");
     // The menu portal owns pointer/focus now, but the card must stay visually
     // restored for the duration of that interaction.
-    expect(card.className).not.toContain("opacity-70");
     expect(within(card).getByText("M").className).not.toContain("grayscale");
+    expect(within(card).getByText("Ship it").className).toContain(
+      "text-foreground",
+    );
   });
 
   it("snoozes to the chosen preset's instant without activating the workspace", async () => {
@@ -348,11 +350,28 @@ describe("SidebarInboxCard — background recede", () => {
   // needs-you, done-review, unread, woke, and anything ticked for a bulk
   // action. A quietly-working agent and an idle row you have already read sit
   // back instead, and hover/focus brings them straight back to full.
-  it("dims a background card whose agent is quietly working", () => {
+  //
+  // The recede is per element, never one opacity on the card root — that is
+  // what lets the state readout stay exempt, so a background card still says
+  // out loud what its agent is doing.
+  it("recedes a quietly-working card without dimming the whole node", () => {
     const { card } = renderCard({ status: "working" });
-    expect(card.className).toContain("opacity-70");
-    expect(card.className).toContain("hover:opacity-100");
-    expect(card.className).toContain("focus-within:opacity-100");
+    expect(card.className).not.toContain("opacity-70");
+    expect(screen.getByText("M").className).toContain("grayscale");
+    expect(screen.getByText("Ship it").className).toContain(
+      "text-muted-foreground/55",
+    );
+  });
+
+  it("keeps the working readout at full strength on a receded card", () => {
+    renderCard({ status: "working" });
+
+    const workingState = screen.getByText("Working").parentElement;
+    // Amber and semibold at rest: no hover required to tell a live agent
+    // from an idle row.
+    expect(workingState?.className).toContain("text-status-working");
+    expect(workingState?.className).toContain("font-semibold");
+    expect(workingState?.className).not.toContain("text-muted-foreground");
   });
 
   it("neutralizes a background card's colors until hover or focus", () => {
@@ -369,52 +388,105 @@ describe("SidebarInboxCard — background recede", () => {
 
     const avatar = screen.getByText("M");
     expect(avatar.className).toContain("grayscale");
+    expect(avatar.className).toContain("opacity-40");
     expect(avatar.className).toContain("group-hover/card:grayscale-0");
 
     const title = screen.getByText("Ship it");
-    expect(title.className).toContain("text-muted-foreground/80");
+    expect(title.className).toContain("text-muted-foreground/55");
     expect(title.className).toContain("group-hover/card:text-foreground");
 
-    const workingState = screen.getByText("Working").parentElement;
-    expect(workingState?.className).toContain("text-muted-foreground/70");
-    expect(workingState?.className).toContain(
-      "group-hover/card:text-status-working",
+    // The meta line mutes as a block, so branch and ↑ahead inherit it.
+    expect(metaLine(card).className).toContain("text-muted-foreground/40");
+    expect(metaLine(card).className).toContain(
+      "group-hover/card:text-muted-foreground/60",
     );
 
     const additions = screen.getByText("+38");
     const deletions = screen.getByText("−12");
-    expect(additions.className).toContain("text-muted-foreground/70");
+    expect(additions.className).toContain("text-muted-foreground/50");
     expect(additions.className).toContain(
       "group-hover/card:text-status-open/80",
     );
-    expect(deletions.className).toContain("text-muted-foreground/70");
+    expect(deletions.className).toContain("text-muted-foreground/50");
     expect(deletions.className).toContain(
       "group-focus-within/card:text-status-attention/80",
     );
 
     const pr = screen.getByRole("button", { name: "Pull request #87 — open" });
-    expect(pr.className).toContain("text-muted-foreground/65");
+    expect(pr.className).toContain("text-muted-foreground/45");
     expect(pr.className).toContain("group-hover/card:text-status-open");
     expect(pr.className).not.toMatch(/(^|\s)text-status-open\b/);
     expect(pr.querySelector("svg")?.getAttribute("class")).toContain(
       "text-current",
     );
-    expect(card.className).toContain("opacity-70");
+    // None of that dimming rides a blanket opacity on the card node.
+    expect(card.className).not.toContain("opacity-70");
   });
 
-  it("dims an idle background card the same way", () => {
-    const { card } = renderCard({ status: null });
-    expect(card.className).toContain("opacity-70");
-    expect(card.className).toContain("hover:opacity-100");
+  // Idle must not light up: the exemption exists so a *live* agent reads as
+  // live, and a row with nothing running has no state to shout about — so its
+  // timestamp dims with the rest of the card instead of outshining the title.
+  it("recedes an idle background card along with its readout", () => {
+    useSidebarDensityStore.setState({ settledAt: { "ws-1": 0 } });
+    const { card } = renderCard({ status: null, now: 26 * 60_000 });
+
+    expect(card.className).not.toContain("opacity-70");
+    expect(screen.getByText("Ship it").className).toContain(
+      "text-muted-foreground/55",
+    );
+
+    const idleState = screen.getByText("26m");
+    expect(idleState.className).toContain("text-muted-foreground/50");
+    expect(idleState.className).toContain(
+      "group-hover/card:text-muted-foreground/70",
+    );
+    expect(idleState.className).toContain("font-medium");
+    expect(idleState.className).not.toContain("text-status-");
   });
 
-  // A watch loop is background presence by definition, so it recedes with
-  // the quietly-working rows rather than competing with the ones that want
-  // a human.
-  it("dims a monitoring background card", () => {
+  // The chip paints its own colours, so the recede has to ride a wrapper
+  // opacity — otherwise it is the brightest mark on a dim card.
+  it("dims the linked-issue chip on a receded working card", () => {
+    renderCard({
+      status: "working",
+      workspace: makeWorkspace({
+        linked_issue: { number: 42, title: "Fix it", state: "Open", labels: [] },
+      }),
+    });
+
+    const chipWrapper = screen.getByText("#42").closest("button")?.parentElement;
+    expect(chipWrapper?.className).toContain("opacity-70");
+    expect(chipWrapper?.className).toContain("group-hover/card:opacity-100");
+    expect(chipWrapper?.className).toContain(
+      "group-focus-within/card:opacity-100",
+    );
+  });
+
+  // The pin marker is eyebrow furniture, not a live readout, so it recedes
+  // with the repo name it sits beside.
+  it("dims the resting pin marker on a receded card", () => {
+    const { container } = renderCard({ pinned: true, status: "working" });
+    // An SVG node, so `className` is an SVGAnimatedString — read the attribute.
+    const marker = container.querySelector('[aria-label="Pinned workspace"]')!;
+    const classes = marker.getAttribute("class") ?? "";
+    expect(classes).toContain("text-muted-foreground/55");
+    expect(classes).toContain("group-hover/card:text-muted-foreground/75");
+    expect(classes).not.toMatch(/(^|\s)text-muted-foreground\/75\b/);
+  });
+
+  // A watch loop is background presence by definition, so its card recedes
+  // with the quietly-working rows — but monitoring is a live state, so its
+  // readout keeps its own colour just as Working does.
+  it("recedes a monitoring card while its readout keeps its tone", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
-    expect(card.className).toContain("opacity-70");
-    expect(card.className).toContain("hover:opacity-100");
+    expect(card.className).not.toContain("opacity-70");
+    expect(screen.getByText("Ship it").className).toContain(
+      "text-muted-foreground/55",
+    );
+
+    const label = screen.getByText("Monitoring");
+    expect(label.className).toContain("text-status-monitoring");
+    expect(label.className).toContain("font-semibold");
   });
 
   it("keeps every card that wants a human at full brightness", () => {
@@ -435,7 +507,18 @@ describe("SidebarInboxCard — background recede", () => {
 
     for (const [label, overrides] of cases) {
       const { card } = renderCard(overrides);
-      expect(card.className, label).not.toContain("opacity-70");
+      // Nothing on these cards carries the receded treatment: the title is
+      // full-strength ink and the repo avatar keeps its colour.
+      expect(screen.getByText("Ship it").className, label).toContain(
+        "text-foreground",
+      );
+      expect(screen.getByText("Ship it").className, label).not.toContain(
+        "text-muted-foreground/55",
+      );
+      expect(screen.getByText("M").className, label).not.toContain("grayscale");
+      expect(metaLine(card).className, label).not.toContain(
+        "text-muted-foreground/40",
+      );
       cleanup();
     }
   });
@@ -738,17 +821,18 @@ describe("SidebarInboxCard — working duration", () => {
 });
 
 describe("SidebarInboxCard — monitoring status", () => {
-  it("defers the Monitoring tone until the background card is engaged", () => {
+  // Monitoring is a live state, so its readout is exempt from the card's
+  // recede: colour and dot are there at rest, no hover needed.
+  it("keeps the Monitoring tone on a receded background card", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
     const label = screen.getByText("Monitoring");
-    expect(label.className).toContain("text-muted-foreground/70");
-    expect(label.className).toContain(
-      "group-hover/card:text-status-monitoring",
-    );
+    expect(label.className).toContain("text-status-monitoring");
+    expect(label.className).toContain("font-semibold");
+    expect(label.className).not.toContain("text-muted-foreground");
     const dot = [...card.querySelectorAll("span")].find((element) =>
-      element.className.includes("group-hover/card:bg-status-monitoring"),
+      element.className.includes("bg-status-monitoring"),
     );
-    expect(dot?.className).toContain("bg-muted-foreground/60");
+    expect(dot).toBeDefined();
   });
 
   // The whole point of a separate status: monitoring is calm. A pulsing dot
@@ -756,7 +840,7 @@ describe("SidebarInboxCard — monitoring status", () => {
   it("renders a steady dot with no pulse", () => {
     const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
     const dot = [...card.querySelectorAll("span")].find((element) =>
-      element.className.includes("group-hover/card:bg-status-monitoring"),
+      element.className.includes("bg-status-monitoring"),
     );
     expect(dot).toBeDefined();
     expect(dot?.className).not.toContain("animate");
