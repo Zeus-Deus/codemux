@@ -2117,26 +2117,50 @@ pub fn get_check_log_excerpt(
 /// same prefix convention [`tail_check_log`] uses decides it, in either
 /// direction. No match is `None`: an unrelated run's log is worse than
 /// no log.
+///
+/// The *best* match wins, not the first one seen. Workflow names share
+/// prefixes all the time — `CI` and `CI-lint` in one repository is
+/// ordinary — and taking the first row meant a check called
+/// `CI-lint / job` was answered with `CI`'s log whenever `CI` happened to
+/// be newer. An exact name beats a prefix, and among prefixes the longest
+/// workflow name wins, because that is the most specific claim any row is
+/// making about this check.
 fn pick_failing_run(rows: &str, check_name: &str) -> Option<String> {
     let needle = check_name.trim();
     if needle.is_empty() {
         return None;
     }
-    rows.lines().find_map(|line| {
-        let (id, name) = line.split_once('\t')?;
-        let (id, name) = (id.trim(), name.trim());
-        if id.is_empty() || name.is_empty() {
-            return None;
-        }
-        names_match(name, needle).then(|| id.to_string())
-    })
+    rows.lines()
+        .filter_map(|line| {
+            let (id, name) = line.split_once('\t')?;
+            let (id, name) = (id.trim(), name.trim());
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            let score = match_quality(name, needle)?;
+            Some((score, id.to_string()))
+        })
+        // `max_by_key` keeps the *last* maximum; rows arrive newest
+        // first, so the reversed index keeps the newest of an equally
+        // good set — the behaviour the first-match version had.
+        .enumerate()
+        .max_by_key(|(index, (score, _))| (*score, std::cmp::Reverse(*index)))
+        .map(|(_, (_, id))| id)
 }
 
-/// Whether a workflow name and a check name name the same thing.
-fn names_match(run_name: &str, check_name: &str) -> bool {
-    let run = run_name.to_ascii_lowercase();
-    let check = check_name.to_ascii_lowercase();
-    check.starts_with(&run) || run.starts_with(&check)
+/// How well a workflow name answers for a check name, or `None` when it
+/// does not answer for it at all. Higher is better.
+fn match_quality(run_name: &str, check_name: &str) -> Option<(u8, usize)> {
+    let run = run_name.trim().to_ascii_lowercase();
+    let check = check_name.trim().to_ascii_lowercase();
+    if run == check {
+        return Some((2, run.len()));
+    }
+    if check.starts_with(&run) || run.starts_with(&check) {
+        // The longer workflow name is the more specific claim.
+        return Some((1, run.len()));
+    }
+    None
 }
 
 /// Trim a `gh run view --log-failed` dump to the interesting tail.
@@ -4683,6 +4707,37 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
         assert_eq!(pick_failing_run(rows, "Deploy").as_deref(), Some("111"));
         // Case is not a distinction anybody makes here.
         assert_eq!(pick_failing_run(rows, "nightly").as_deref(), Some("333"));
+    }
+
+    /// Workflow names share prefixes all the time. `CI` and `CI-lint` in
+    /// one repository is ordinary, and taking the first matching row put
+    /// `CI`'s log under a `CI-lint` card whenever `CI` was newer — which
+    /// reads as a fact about the failing check and is not one.
+    #[test]
+    fn the_more_specific_workflow_name_wins_a_shared_prefix() {
+        let rows = "111\tCI\n222\tCI-lint";
+        assert_eq!(
+            pick_failing_run(rows, "CI-lint / job").as_deref(),
+            Some("222")
+        );
+        // Order of the rows is not what decides it.
+        let reversed = "222\tCI-lint\n111\tCI";
+        assert_eq!(
+            pick_failing_run(reversed, "CI-lint / job").as_deref(),
+            Some("222")
+        );
+        // The less specific check still finds its own workflow.
+        assert_eq!(pick_failing_run(rows, "CI / test").as_deref(), Some("111"));
+        // An exact name beats a longer one that merely shares a prefix.
+        assert_eq!(pick_failing_run(rows, "CI").as_deref(), Some("111"));
+    }
+
+    /// Two runs of the same workflow both match; the newest is the one
+    /// the page is showing, and `gh` lists newest first.
+    #[test]
+    fn the_newest_of_two_equally_good_rows_is_kept() {
+        let rows = "999\tCI\n111\tCI";
+        assert_eq!(pick_failing_run(rows, "CI / test").as_deref(), Some("999"));
     }
 
     #[test]

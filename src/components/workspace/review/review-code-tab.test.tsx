@@ -464,7 +464,12 @@ describe("the pending review", () => {
     expect(within(bigAgain).getByTestId("file-pending-count")).toHaveTextContent("1 pending");
     await user.click(within(bigAgain).getByTestId("load-anyway"));
     expect(screen.getAllByTestId("pending-note")).toHaveLength(3);
-  });
+    // Renders the 2,400-row file twice and types into it, which is the
+    // point — this is the case where a draft would be lost. It runs in
+    // well under two seconds alone but has gone over the 5s default on a
+    // loaded CI worker, so it gets a timeout that reflects the work
+    // rather than a flake that reflects the machine.
+  }, 20_000);
 
   it("asks before discarding, then clears", async () => {
     const user = userEvent.setup();
@@ -496,6 +501,27 @@ describe("the pending review", () => {
     await waitFor(() =>
       expect(screen.getByTestId("draft-footer")).toHaveTextContent("1 pending"),
     );
+  });
+
+  it("does not carry an unfinished composer over to another PR", async () => {
+    // The draft that survives relocation must not survive the pull
+    // request. The tab holds it in a ref and the detail is not keyed by
+    // PR, so without a fresh mount per draft key the paragraph typed
+    // about #172 would seed the composer on #285 the moment a row at the
+    // same coordinates existed — which, on the same fixture diff, it does.
+    const user = userEvent.setup();
+    const { rerenderWith } = renderDetail();
+    await openCodeTab(user);
+    await user.click(gutter("RIGHT:11"));
+    await user.type(screen.getByTestId("line-composer-body"), "Meant for 172.");
+
+    rerenderWith({ pr: makePr({ number: 285, head_ref_oid: "other-head" }) });
+    await openCodeTab(user);
+    // The selection is #172's too, so #285 opens with no composer at all.
+    expect(screen.queryByTestId("line-composer")).toBeNull();
+
+    await user.click(gutter("RIGHT:11"));
+    expect(screen.getByTestId("line-composer-body")).toHaveValue("");
   });
 });
 
@@ -733,6 +759,43 @@ describe("after a force-push", () => {
     await user.click(gutter("RIGHT:14"));
 
     await waitFor(() => expect(screen.queryByTestId("drift-notice")).toBeNull());
+  });
+
+  it("does not dismiss another PR's force-push notice on the way past", async () => {
+    // The auto-acknowledge asks "were there unanchored notes a moment
+    // ago, and are there none now?". `ReviewDetail` is not keyed by pull
+    // request, so arriving at a PR with no notes — from one that had
+    // unanchored ones — read as "they were all just re-anchored", and
+    // dismissed a force-push notice the user had never seen. The flag
+    // now remembers which pull request raised it.
+    const user = userEvent.setup();
+
+    // #285 is seen first, so a later head change on it reads as a
+    // force-push rather than a first sighting.
+    const { rerenderWith } = renderDetail({
+      pr: makePr({ number: 285, head_ref_oid: "285-head-one" }),
+    });
+
+    // Over to #172: two notes, then a force-push that loses one.
+    rerenderWith({ pr: makePr() });
+    await openCodeTab(user);
+    for (const [id, text] of [
+      ["RIGHT:11", "This one survives."],
+      ["RIGHT:12", "This one does not."],
+    ] as const) {
+      await user.click(gutter(id));
+      await user.type(screen.getByTestId("line-composer-body"), text);
+      await user.click(screen.getByTestId("add-to-review"));
+    }
+    mockGetPrReviewDiff.mockResolvedValue(DIFF_AFTER);
+    rerenderWith({ pr: makePr({ head_ref_oid: "head-two" }) });
+    await screen.findByTestId("unanchored-notes");
+
+    // Back to #285, which has force-pushed too and has no notes at all.
+    rerenderWith({ pr: makePr({ number: 285, head_ref_oid: "285-head-two" }) });
+
+    const notice = await screen.findByTestId("drift-notice");
+    expect(notice).toHaveAttribute("data-drift-kind", "force-pushed");
   });
 
   it("lets a failed submit through instead of hiding it behind the force-push", async () => {

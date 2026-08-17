@@ -30,13 +30,22 @@ function isEditableElement(el: Element | null | undefined): boolean {
   return el.isContentEditable;
 }
 
-/** Inside a Radix overlay — a dialog, sheet, popover, dropdown or the
- *  wrapper any of them are portalled into. */
+/**
+ * Inside a Radix overlay — a dialog, sheet, popover, dropdown or the
+ * wrapper any of them are portalled into.
+ *
+ * Deliberately not `[role="listbox"]`: a listbox is not by itself an
+ * overlay, and the page's own results list is one (`pr-list`), focusable
+ * so the arrow keys work. Naming the role here meant that clicking into
+ * the list — the most ordinary thing on this page — quietly switched
+ * Escape off. Radix's own listboxes are portalled into the popper
+ * wrapper below and are already covered by it.
+ */
 function isInsideOverlay(el: Element | null | undefined): boolean {
   if (!el || typeof el.closest !== "function") return false;
   return (
     el.closest(
-      '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]',
+      '[role="dialog"], [role="alertdialog"], [role="menu"], [data-radix-popper-content-wrapper]',
     ) != null
   );
 }

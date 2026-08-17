@@ -565,14 +565,23 @@ fn pipeline_rollup_state(status: &str) -> String {
 }
 
 /// The newest pipeline in a `merge_requests/:iid/pipelines` response,
-/// which answers newest first.
-fn latest_pipeline_state(pipelines: &Value) -> String {
-    let status = pipelines
-        .as_array()
-        .and_then(|rows| rows.first())
+/// which answers newest first. `None` when this body did not answer the
+/// question at all.
+///
+/// The two cases the `Option` keeps apart are the whole point. An empty
+/// array is an answer — GitLab looked and this merge request has no
+/// pipelines — and becomes "none". A body that is not an array is not an
+/// answer: a `{"message": "403 Forbidden"}`, or any shape a future API
+/// returns that this code does not understand. Reporting "none" for that
+/// would state, on the row, that a project nobody could read has no CI.
+/// The row is omitted instead, and the page leaves the dot unmeasured.
+fn latest_pipeline_state(pipelines: &Value) -> Option<String> {
+    let rows = pipelines.as_array()?;
+    let status = rows
+        .first()
         .and_then(|p| p["status"].as_str())
         .unwrap_or("");
-    pipeline_rollup_state(status)
+    Some(pipeline_rollup_state(status))
 }
 
 /// `glab mr merge` arguments, assembled away from the subprocess so the
@@ -1420,7 +1429,11 @@ impl SourceControlProvider for GitLabProvider {
                     .ok()?;
                 Some(PrOverviewStats {
                     number: iid as u32,
-                    checks: latest_pipeline_state(&pipelines),
+                    // A row this call could not answer for is left out
+                    // rather than reported as "none" — the caller merges
+                    // only what it is given, so an omission keeps the
+                    // dot unmeasured instead of asserting there is no CI.
+                    checks: latest_pipeline_state(&pipelines)?,
                     additions: None,
                     deletions: None,
                 })
@@ -2625,13 +2638,19 @@ gitlab.com
             {"id": 9, "status": "failed"},
             {"id": 8, "status": "success"},
         ]);
-        assert_eq!(latest_pipeline_state(&pipelines), "failing");
-        // No pipelines is an answer: nothing ran.
-        assert_eq!(latest_pipeline_state(&serde_json::json!([])), "none");
-        // A refusal is not an array, and must not read as "passing".
+        assert_eq!(latest_pipeline_state(&pipelines).as_deref(), Some("failing"));
+        // No pipelines is an answer: GitLab looked, and nothing ran.
+        assert_eq!(
+            latest_pipeline_state(&serde_json::json!([])).as_deref(),
+            Some("none")
+        );
+        // A refusal is not an answer. It must not read as "passing", and
+        // it must not read as "none" either — the row is omitted, so the
+        // page leaves the dot unmeasured rather than claiming a project
+        // nobody could read has no CI.
         assert_eq!(
             latest_pipeline_state(&serde_json::json!({"message": "403 Forbidden"})),
-            "none"
+            None
         );
     }
 

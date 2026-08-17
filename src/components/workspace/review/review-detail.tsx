@@ -288,16 +288,27 @@ export function ReviewDetail(props: ReviewDetailProps) {
   // The force-push notice exists to get lost notes re-anchored. Once the
   // last one has found a line again it has nothing left to say, so it
   // stands down by itself rather than waiting for a merge.
-  const hadUnanchored = useRef(false);
+  //
+  // "The last one" has to mean this pull request's. This component is not
+  // keyed by PR, so the flag below would otherwise survive the switch:
+  // leaving A with notes unanchored and selecting B, which has none,
+  // reads as "they were all just re-anchored" and dismisses a notice for
+  // B that nobody has seen yet. The key it was raised under is therefore
+  // part of the flag.
+  const hadUnanchored = useRef<string | null>(null);
   useEffect(() => {
     if (unanchoredCount > 0) {
-      hadUnanchored.current = true;
+      hadUnanchored.current = key;
       return;
     }
-    if (!hadUnanchored.current) return;
-    hadUnanchored.current = false;
+    if (hadUnanchored.current !== key) {
+      // A different pull request's business, or nothing to acknowledge.
+      hadUnanchored.current = null;
+      return;
+    }
+    hadUnanchored.current = null;
     acknowledgeForcePush();
-  }, [unanchoredCount, acknowledgeForcePush]);
+  }, [key, unanchoredCount, acknowledgeForcePush]);
 
   // ── The timeline ──
   //
@@ -1062,6 +1073,14 @@ export function ReviewDetail(props: ReviewDetailProps) {
         />
       ) : activeTab === "code" ? (
         <ReviewCodeTab
+          // Keyed by draft, like the two sheets, and for the same reason:
+          // everything the tab holds locally — the live selection, the
+          // composer's text, which note is being edited or re-pinned — is
+          // about *this* pull request. `ReviewDetail` is not itself keyed
+          // by PR, so switching from one to another while a composer was
+          // open would otherwise hand the new PR the old one's paragraph
+          // the moment a row at the same coordinates existed.
+          key={key}
           draftKey={key}
           cwd={cwd}
           prNumber={pr.number}

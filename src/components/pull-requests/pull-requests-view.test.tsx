@@ -120,6 +120,14 @@ describe("Escape on the Pull Requests page", () => {
     const user = userEvent.setup();
     renderView([row({ number: 1 })]);
 
+    // Focused explicitly: the list container is what holds focus once you
+    // click or tab into the results, and jsdom does not move focus on a
+    // click. Escape has to keep working from there — the container is a
+    // `role="listbox"`, and treating that role as an overlay switched the
+    // page's own Escape off for the most ordinary position on the page.
+    screen.getByTestId("pr-list-rows").focus();
+    expect(document.activeElement).toBe(screen.getByTestId("pr-list-rows"));
+
     await user.keyboard("{Escape}");
     expect(mockSetShowPullRequests).toHaveBeenCalledWith(false);
   });

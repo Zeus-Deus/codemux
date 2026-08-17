@@ -150,18 +150,26 @@ function underFor(
  * (a context line noted from LEFT *and* RIGHT) levels them to the taller.
  * Measured rather than assumed because the content is a live component
  * whose height changes as you type.
+ *
+ * The measured element is *inside* the box holding the matched height,
+ * never the box itself. Measuring the outer one would fold the other
+ * column's height into this column's report, and the pair would ratchet:
+ * two sides each holding a height derived from the other, and deleting a
+ * paragraph would never bring either back down.
  */
 function UnderRow({
   id,
   content,
   matchHeight,
   onMeasure,
+  onRelease,
 }: {
   id: string;
   content: ReactNode;
   /** What the opposite column reported for this row. */
   matchHeight: number;
   onMeasure: (id: string, height: number) => void;
+  onRelease: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -182,12 +190,17 @@ function UnderRow({
     return () => observer.disconnect();
   }, [content, id, onMeasure]);
 
+  // The row is gone; so is the space it was asking the other column for.
+  // Separate from the measuring effect above so it fires on unmount only,
+  // rather than on every change of what is being measured.
+  useLayoutEffect(() => () => onRelease(id), [id, onRelease]);
+
   if (!content) {
     return matchHeight > 0 ? <div aria-hidden style={{ height: matchHeight }} /> : null;
   }
   return (
-    <div ref={ref} style={matchHeight > 0 ? { minHeight: matchHeight } : undefined}>
-      {content}
+    <div style={matchHeight > 0 ? { minHeight: matchHeight } : undefined}>
+      <div ref={ref}>{content}</div>
     </div>
   );
 }
@@ -210,6 +223,14 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
     const [underHeights, setUnderHeights] = useState<Record<string, number>>({});
     const measureUnder = useCallback((id: string, height: number) => {
       setUnderHeights((prev) => (prev[id] === height ? prev : { ...prev, [id]: height }));
+    }, []);
+    const releaseUnder = useCallback((id: string) => {
+      setUnderHeights((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
     }, []);
 
     const scrollToHunk = useCallback(
@@ -281,6 +302,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
                     content={unders[i].left}
                     matchHeight={underHeights[`${i}:right`] ?? 0}
                     onMeasure={measureUnder}
+                    onRelease={releaseUnder}
                   />
                 )}
               </Fragment>
@@ -312,6 +334,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
                     content={unders[i].right}
                     matchHeight={underHeights[`${i}:left`] ?? 0}
                     onMeasure={measureUnder}
+                    onRelease={releaseUnder}
                   />
                 )}
               </Fragment>
