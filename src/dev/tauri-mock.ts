@@ -173,6 +173,49 @@ function withThreadOps(operations: ProviderOperations): ProviderOperations {
   return { ...operations, thread_reply: false, thread_resolve: false };
 }
 
+/** The seeded host for a checkout or project root, resolved the way
+ *  `check_provider_auth` resolves it. */
+function providerKindAt(path: string): string {
+  const workspace = appState.workspaces.find(
+    (w) => w.cwd === path || w.project_root === path,
+  );
+  return workspace?.provider_kind ?? "github";
+}
+
+/**
+ * The refusal the real command layer raises for an operation the host's
+ * adapter never declared — `check_operation` in `commands/github.rs`,
+ * word for word.
+ *
+ * The mock has to raise it too. A host whose rows appear here but are
+ * refused in production is not a fixture of the app; it is a demo of a
+ * different product, and the divergence only ever surfaces as a bug
+ * report about a page that "worked in dev". Returned rather than thrown
+ * so a handler can gate on it in one line.
+ */
+function undeclaredRefusal(
+  path: string,
+  op: keyof ProviderOperations,
+  describe: string,
+): string | null {
+  const kind = providerKindAt(path);
+  const operations = withThreadOps(MOCK_PROVIDER_OPERATIONS[kind] ?? NO_MOCK_OPERATIONS);
+  if (operations[op]) return null;
+  const name = PROVIDER_DISPLAY_NAMES[kind] ?? "an unrecognised host";
+  return (
+    `${name} does not declare this operation — Codemux cannot ${describe} here. ` +
+    "Open it in the browser instead."
+  );
+}
+
+/** `ProviderKind::display_name` in `git_provider/detect.rs`. */
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  github: "GitHub",
+  gitlab: "GitLab",
+  bitbucket: "Bitbucket",
+  azure_devops: "Azure DevOps",
+};
+
 function inlineCommentsFor(number: number): InlineReviewComment[] {
   return (mutablePrInline[number] ??= [...(MOCK_PR_INLINE_COMMENTS[number] ?? [])]);
 }
@@ -3551,9 +3594,11 @@ const handlers: Record<string, Handler> = {
 
   // ── Pull Requests page ──
   //
-  // One root always rejects, so the footer's unreachable line (and the
-  // promise that the other repositories keep their rows) is reachable
-  // without unplugging anything.
+  // Two roots always reject, for the two different reasons the footer
+  // has to be able to say: one is unreachable, and one is on a host with
+  // no adapter — so the footer line (and the promise that the other
+  // repositories keep their rows) is reachable without unplugging
+  // anything.
   list_prs_overview: async (a) => {
     const path = String(a.path ?? "");
     if (path === MOCK_UNREACHABLE_ROOT) {
@@ -3561,6 +3606,8 @@ const handlers: Record<string, Handler> = {
         "could not resolve host: git.scratchpad.example.com",
       );
     }
+    const refused = undeclaredRefusal(path, "list_read", "list or read pull requests");
+    if (refused) return Promise.reject(refused);
     await new Promise((resolve) => setTimeout(resolve, PR_LIST_DELAY_MS));
     if (prOverviewOutage) {
       return Promise.reject("could not resolve host: api.github.com");
@@ -3587,6 +3634,9 @@ const handlers: Record<string, Handler> = {
     if (path === MOCK_UNREACHABLE_ROOT || prOverviewOutage) {
       return Promise.reject("could not resolve host: api.github.com");
     }
+    // Gated on `checks_status` in the backend, not `list_read`.
+    const refused = undeclaredRefusal(path, "checks_status", "read check or pipeline status");
+    if (refused) return Promise.reject(refused);
     await new Promise((resolve) => setTimeout(resolve, PR_STATS_DELAY_MS));
     if (prStatsOutage) {
       return Promise.reject("gh: could not compute status checks");
@@ -3599,6 +3649,8 @@ const handlers: Record<string, Handler> = {
   // Closed and merged rows, for the list's state dropdown.
   list_pull_requests: (a) => {
     const path = String(a.path ?? "");
+    const refused = undeclaredRefusal(path, "list_read", "list or read pull requests");
+    if (refused) return Promise.reject(refused);
     const state = String(a.state ?? "open");
     const open = MOCK_PR_OVERVIEW[path]?.numbers ?? [];
     const history = MOCK_PR_HISTORY[path] ?? [];

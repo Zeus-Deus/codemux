@@ -2134,7 +2134,7 @@ export function monitoringEnvelopes(threadId: string): unknown[] {
 
 // ── Stress-fixture scaling ──────────────────────────────────────────
 //
-// The curated 19 workspaces above are a design fixture. Selecting a stress
+// The curated 21 workspaces above are a design fixture. Selecting a stress
 // fixture (`?fixture=large`, see `stress-fixture.ts`) scales that list to the
 // audited real profile so switch latency is measured against something honest.
 // Generated workspaces reuse the same builders, so they carry the same pane /
@@ -2991,9 +2991,15 @@ export const MOCK_PR_OVERVIEW: Record<string, { viewer: string; numbers: number[
   // A different account on a different product — which is why the page
   // resolves the viewer per root rather than once.
   [vexisRoot]: { viewer: "mock-glab", numbers: [88, 90] },
-  // A host that declares nothing still *lists* here — being unable to
-  // review is not the same as being invisible.
-  [ledgerRoot]: { viewer: MOCK_PR_AUTHOR, numbers: [64] },
+  // `ledgerRoot` is deliberately absent. Bitbucket declares no
+  // operations, so the real command layer refuses `list_prs_overview`
+  // for it outright and the page draws a failing-root footer line. The
+  // mock refuses it the same way (see `undeclaredRefusal` in
+  // `tauri-mock.ts`) rather than serving rows production can never show
+  // — a fixture that disagrees with the backend is a demo of a product
+  // that doesn't exist. The two ledger workspaces stay: the read-only
+  // workspace-panel path is still worth walking, and it never asks for
+  // this list.
 };
 
 /** Who each pull request is waiting on. */
