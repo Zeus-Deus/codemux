@@ -52,6 +52,26 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
 };
 
 /**
+ * Providers Codemux can drive as a ONE-SHOT, non-interactive CLI.
+ *
+ * Chat providers speak a long-lived session protocol; the background
+ * text-generation features (utility agent, commit messages, merge
+ * resolution) instead shell out once, pipe a prompt in, and read the
+ * answer back. Two Rust dispatchers own that shape —
+ * `utility_ai.rs::build_invocation` and `ai.rs::build_resolver_argv` —
+ * and both know exactly these three CLIs.
+ *
+ * Cursor is deliberately absent: `cursor-agent` ships no equivalent
+ * non-interactive mode, so a Cursor selection would either fail with
+ * `utility_provider_unsupported` or (in the resolver's case) silently
+ * fall through to the `claude` binary carrying a Cursor model slug.
+ * Every picker bound to one of those backends passes this list as its
+ * `allowedProviders` so the choice cannot be made in the first place.
+ */
+export const NON_INTERACTIVE_CLI_PROVIDERS: ReadonlyArray<AgentChatProviderKind> =
+  ["claude", "codex", "opencode"];
+
+/**
  * Whether a provider's outstanding approval / input requests can still be
  * answered after the live Codemux session is gone (app restart, pane
  * teardown, session adoption).

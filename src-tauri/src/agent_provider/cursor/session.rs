@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_provider::{
-    pricing, ApprovalDecision, CompletedItem, ContentDelta, ContextUsageSnapshot, CostSource,
+    pricing, ApprovalDecision, CompletedItem, ContentDelta, ContextUsageTracker, CostSource,
     ProviderError, ProviderKind, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome,
     SendTurnInput, SessionStatus, TaskSnapshotItem, TaskStatus, TasksSnapshot, ThreadId, TurnId,
     TurnStatus,
@@ -91,17 +91,66 @@ pub(crate) struct CursorSessionState {
     queued: VecDeque<QueuedTurn>,
     assistant_text: String,
     thinking_text: String,
-    /// `true` between the moment `session/prompt` is written and the
-    /// moment its response lands. Interrupts outside that window cannot
-    /// be delivered as `session/cancel` — the child has no turn to
-    /// cancel yet — so they are recorded in `pending_interrupt` instead.
-    prompt_in_flight: bool,
-    /// A Stop the user pressed while the turn was still being dispatched
-    /// (permission/model/effort config round-trips, queue promotion).
-    /// Consumed by the prompt worker, which then never sends the prompt.
-    pending_interrupt: bool,
+    /// Monotonic id of the current claim on the session's single prompt
+    /// slot, bumped every time the slot is claimed (see
+    /// [`CursorSessionState::claim_turn`]).
+    turn_generation: u64,
+    /// The generation a Stop applies to, if any.
+    ///
+    /// Stop cannot always be forwarded the instant it arrives: while a
+    /// turn is still being dispatched (config round-trips, queue
+    /// promotion) the child has no prompt to cancel, so the request has
+    /// to be parked. Parking it as a bare boolean leaked — a Stop that
+    /// landed in a window where nothing consumed it survived into the
+    /// NEXT turn and completed it as interrupted before its prompt was
+    /// ever written. Tagging it with the generation it was aimed at makes
+    /// staleness self-invalidating: the next claim bumps the counter and
+    /// the orphaned request can never match again.
+    interrupt_generation: Option<u64>,
     /// High-water mark of the cumulative usage Cursor last reported.
     usage_totals: CursorUsageTotals,
+    /// Context-window occupancy, clamped/deduplicated by the shared
+    /// tracker every other adapter uses.
+    context: ContextUsageTracker,
+}
+
+impl CursorSessionState {
+    /// Claim the prompt slot for a new turn and return its generation.
+    ///
+    /// Callers set `active_turn` themselves — some claim the
+    /// `DISPATCHING` marker first and only mint the real turn id later —
+    /// but every claim must come through here so interrupt targeting
+    /// stays accurate.
+    fn claim_turn(&mut self) -> u64 {
+        self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.turn_generation
+    }
+
+    /// Aim a Stop at whatever is claimed right now. No-op when the
+    /// session is idle: there is nothing to interrupt.
+    fn request_interrupt(&mut self) {
+        if self.active_turn.is_some() {
+            self.interrupt_generation = Some(self.turn_generation);
+        }
+    }
+
+    /// Consume a Stop aimed at `generation`. A request aimed at any other
+    /// generation is left alone — it belongs to a turn that has already
+    /// finished, and honoring it would cancel an unrelated turn.
+    fn take_interrupt(&mut self, generation: u64) -> bool {
+        if self.interrupt_generation == Some(generation) {
+            self.interrupt_generation = None;
+            return true;
+        }
+        false
+    }
+
+    /// Release the prompt slot. Drops any Stop still aimed at the
+    /// generation being released so it cannot outlive its turn.
+    fn release_turn(&mut self) {
+        self.active_turn = None;
+        self.interrupt_generation = None;
+    }
 }
 
 /// A token a message pump answers once it has drained everything the
@@ -120,6 +169,10 @@ pub(crate) struct CursorSession {
     /// See [`CursorSession::await_child_messages_drained`].
     notification_barrier_tx: mpsc::UnboundedSender<NotificationBarrier>,
     request_barrier_tx: mpsc::UnboundedSender<NotificationBarrier>,
+    /// Woken by [`CursorSession::interrupt`] so the prompt worker can
+    /// deliver `session/cancel` itself. See
+    /// [`CursorSession::send_prompt`].
+    interrupt_notify: Notify,
     stopped: AtomicBool,
 }
 
@@ -229,15 +282,17 @@ impl CursorSession {
                 queued: VecDeque::new(),
                 assistant_text: String::new(),
                 thinking_text: String::new(),
-                prompt_in_flight: false,
-                pending_interrupt: false,
+                turn_generation: 0,
+                interrupt_generation: None,
                 usage_totals: CursorUsageTotals::default(),
+                context: ContextUsageTracker::default(),
             }),
             child,
             event_tx,
             tasks: Mutex::new(Vec::new()),
             notification_barrier_tx,
             request_barrier_tx,
+            interrupt_notify: Notify::new(),
             stopped: AtomicBool::new(false),
         });
         session
@@ -389,8 +444,9 @@ impl CursorSession {
         // work begins. Two frontend sends can otherwise both observe an
         // idle session and start concurrent `session/prompt` requests.
         state.active_turn = Some(TurnId(DISPATCHING_TURN_ID.into()));
+        let generation = state.claim_turn();
         drop(state);
-        match self.dispatch_turn(input, None).await {
+        match self.dispatch_turn(input, None, generation).await {
             Ok(turn_id) => Ok(SendOutcome::Started(turn_id)),
             Err(error) => {
                 self.release_dispatch_reservation().await;
@@ -403,12 +459,15 @@ impl CursorSession {
         self: &Arc<Self>,
         input: SendTurnInput,
         queued_id: Option<String>,
+        generation: u64,
     ) -> Result<TurnId, ProviderError> {
         let (turn_id, prompt) = self.prepare_turn(input, queued_id).await?;
         let session = Arc::clone(self);
         let worker_turn_id = turn_id.clone();
         let task = tokio::spawn(async move {
-            session.run_prompt_worker(worker_turn_id, prompt).await;
+            session
+                .run_prompt_worker(worker_turn_id, prompt, generation)
+                .await;
         });
         {
             // Reap finished workers on the way in: a long session would
@@ -518,36 +577,28 @@ impl CursorSession {
         Ok((turn_id, build_prompt(&input)))
     }
 
-    async fn run_prompt_worker(self: Arc<Self>, mut turn_id: TurnId, mut prompt: Vec<Value>) {
+    async fn run_prompt_worker(
+        self: Arc<Self>,
+        mut turn_id: TurnId,
+        mut prompt: Vec<Value>,
+        mut generation: u64,
+    ) {
         loop {
-            // Claim the in-flight window under the same lock `interrupt`
-            // reads, so a Stop pressed anywhere between dispatch and this
-            // point aborts the turn instead of being swallowed by a child
-            // that has not been asked to do anything yet.
-            let interrupted_before_send = {
-                let mut state = self.state.lock().await;
-                let interrupted = std::mem::take(&mut state.pending_interrupt);
-                state.prompt_in_flight = !interrupted;
-                interrupted
-            };
+            // A Stop that landed while this turn was still being
+            // dispatched has nothing to cancel on the child yet, so the
+            // turn simply never starts. Checked under the same lock
+            // `interrupt` writes, so the request cannot slip past.
+            let interrupted_before_send = self.state.lock().await.take_interrupt(generation);
             let response = if interrupted_before_send {
                 Ok(json!({ "stopReason": "cancelled" }))
             } else {
-                self.child
-                    .request_with_timeout(
-                        "session/prompt",
-                        json!({
-                            "sessionId": self.provider_session_id.0,
-                            "prompt": prompt
-                        }),
-                        PROMPT_TIMEOUT,
-                    )
-                    .await
+                self.send_prompt(&prompt, generation).await
             };
-            let next = self.finish_turn(turn_id, response).await;
-            let Some(queued) = next else {
+            let next = self.finish_turn(turn_id, response, generation).await;
+            let Some((queued, next_generation)) = next else {
                 return;
             };
+            generation = next_generation;
             match self
                 .prepare_turn(queued.input, Some(queued.id.clone()))
                 .await
@@ -559,7 +610,10 @@ impl CursorSession {
                 Err(error) => {
                     let cancelled = {
                         let mut state = self.state.lock().await;
-                        state.active_turn = None;
+                        // `release_turn` (not a bare `active_turn = None`)
+                        // so a Stop aimed at this abandoned claim cannot
+                        // outlive it.
+                        state.release_turn();
                         state.status = SessionStatus::Ready;
                         state
                             .queued
@@ -591,19 +645,70 @@ impl CursorSession {
         }
     }
 
+    /// Run one `session/prompt`, forwarding any Stop that arrives while
+    /// it is in flight.
+    ///
+    /// The cancel is issued from HERE rather than from
+    /// [`CursorSession::interrupt`] to fix an ordering race: an interrupt
+    /// firing microseconds after the worker claimed the in-flight window
+    /// could win the stdin write race and reach the child before the
+    /// prompt it was meant to cancel, leaving the child with nothing to
+    /// cancel and the user's Stop silently dropped. `biased` polls the
+    /// prompt future first, so the request is written before the cancel
+    /// arm is ever reachable, and the transport's writer mutex is FIFO so
+    /// a contended write still keeps that order. `session/cancel` is a
+    /// notification with no reply, so repeating it is harmless.
+    async fn send_prompt(
+        &self,
+        prompt: &[Value],
+        generation: u64,
+    ) -> Result<Value, RpcChildError> {
+        let request = self.child.request_with_timeout(
+            "session/prompt",
+            json!({
+                "sessionId": self.provider_session_id.0,
+                "prompt": prompt
+            }),
+            PROMPT_TIMEOUT,
+        );
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                biased;
+                response = &mut request => return response,
+                () = self.interrupt_notify.notified() => {
+                    if !self.state.lock().await.take_interrupt(generation) {
+                        continue;
+                    }
+                    if let Err(error) = self
+                        .child
+                        .notify(
+                            "session/cancel",
+                            json!({ "sessionId": self.provider_session_id.0 }),
+                        )
+                        .await
+                    {
+                        self.warn(format!("Could not cancel the Cursor turn: {error}"), None);
+                    }
+                }
+            }
+        }
+    }
+
     async fn finish_turn(
         &self,
         turn_id: TurnId,
         response: Result<Value, RpcChildError>,
-    ) -> Option<QueuedTurn> {
+        generation: u64,
+    ) -> Option<(QueuedTurn, u64)> {
         // Ordering barrier — see `await_child_messages_drained`. Must run
         // before the buffers below are taken, and without holding the
         // state lock the notification task needs.
         self.await_child_messages_drained().await;
         let (assistant_text, thinking_text, cancelled_requests) = {
             let mut state = self.state.lock().await;
-            state.prompt_in_flight = false;
-            state.pending_interrupt = false;
+            // This turn is over, so a Stop still aimed at it is moot.
+            state.take_interrupt(generation);
             (
                 std::mem::take(&mut state.assistant_text),
                 std::mem::take(&mut state.thinking_text),
@@ -664,13 +769,27 @@ impl CursorSession {
         let next = {
             let mut state = self.state.lock().await;
             state.status = SessionStatus::Ready;
-            let next = state.queued.pop_front();
-            // Reserve the dispatch slot before releasing the lock. Without
-            // this marker a concurrent send could observe an idle session
-            // between popping the queued turn and preparing it, starting a
-            // second prompt worker for the same ACP session.
-            state.active_turn = next.as_ref().map(|_| TurnId(DISPATCHING_TURN_ID.into()));
-            next
+            // A Stop can also land in the gap between the two locked
+            // sections above, where `active_turn` still names the turn
+            // that just finished. Dropping it here — and claiming a fresh
+            // generation for any queued turn — is what stops it becoming
+            // an instant cancellation of somebody else's turn.
+            state.interrupt_generation = None;
+            match state.queued.pop_front() {
+                Some(queued) => {
+                    // Reserve the dispatch slot before releasing the lock.
+                    // Without this marker a concurrent send could observe
+                    // an idle session between popping the queued turn and
+                    // preparing it, starting a second prompt worker for
+                    // the same ACP session.
+                    state.active_turn = Some(TurnId(DISPATCHING_TURN_ID.into()));
+                    Some((queued, state.claim_turn()))
+                }
+                None => {
+                    state.release_turn();
+                    None
+                }
+            }
         };
         let _ = self
             .event_tx
@@ -681,6 +800,13 @@ impl CursorSession {
         next
     }
 
+    /// Record a Stop against the turn that is claimed right now.
+    ///
+    /// Nothing is written to the child from here. The prompt worker owns
+    /// delivery — it either abandons a turn whose prompt has not gone out
+    /// yet, or issues `session/cancel` from inside
+    /// [`CursorSession::send_prompt`], where the cancel provably follows
+    /// the prompt it cancels.
     pub async fn interrupt(&self, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
         {
             let mut state = self.state.lock().await;
@@ -688,24 +814,10 @@ impl CursorSession {
             if active.is_none() || turn_id.is_some_and(|requested| Some(requested) != active) {
                 return Ok(());
             }
-            if !state.prompt_in_flight {
-                // The turn is claimed but `session/prompt` has not been
-                // written yet — it is still going through the dispatch
-                // config round-trips, or the worker task has not been
-                // scheduled. A `session/cancel` now would hit a child with
-                // nothing to cancel and Stop would be silently lost, so
-                // record it and let the worker abort the turn instead.
-                state.pending_interrupt = true;
-                return Ok(());
-            }
+            state.request_interrupt();
         }
-        self.child
-            .notify(
-                "session/cancel",
-                json!({ "sessionId": self.provider_session_id.0 }),
-            )
-            .await
-            .map_err(map_rpc_error)
+        self.interrupt_notify.notify_one();
+        Ok(())
     }
 
     pub async fn cancel_queued(&self, queued_id: &str) -> bool {
@@ -745,14 +857,18 @@ impl CursorSession {
                 }
                 Some(queued) => {
                     state.active_turn = Some(TurnId(DISPATCHING_TURN_ID.into()));
-                    (Some(queued), false)
+                    let generation = state.claim_turn();
+                    (Some((queued, generation)), false)
                 }
                 None => (None, false),
             }
         };
-        if let Some(queued) = ready_to_dispatch {
+        if let Some((queued, generation)) = ready_to_dispatch {
             let queued_id = queued.id.clone();
-            if let Err(error) = self.dispatch_turn(queued.input, Some(queued.id)).await {
+            if let Err(error) = self
+                .dispatch_turn(queued.input, Some(queued.id), generation)
+                .await
+            {
                 self.release_dispatch_reservation().await;
                 let _ = self
                     .event_tx
@@ -773,9 +889,8 @@ impl CursorSession {
     async fn release_dispatch_reservation(&self) {
         let mut state = self.state.lock().await;
         if state.active_turn.as_ref().map(|turn| turn.0.as_str()) == Some(DISPATCHING_TURN_ID) {
-            state.active_turn = None;
+            state.release_turn();
             state.status = SessionStatus::Ready;
-            state.pending_interrupt = false;
         }
     }
 
@@ -1284,12 +1399,36 @@ impl CursorSession {
         let Some(totals) = usage_totals_from_value(update) else {
             return;
         };
-        let (delta, model) = {
+        let (delta, model, context_events) = {
             let mut state = self.state.lock().await;
             let previous = state.usage_totals;
             state.usage_totals = totals;
-            (totals.delta_since(&previous), state.model.clone())
+            let delta = totals.delta_since(&previous);
+            state
+                .context
+                .observe_max_tokens(context_window_from_value(update));
+            // Cursor's report is cumulative for the session, which is
+            // exactly what the lifetime accumulator wants.
+            state.context.observe_lifetime_total(totals.total_tokens());
+            // Occupancy is the LATEST request, never the session total:
+            // `cache_read` re-counts the whole context on every request,
+            // so summing it across the session would make the meter climb
+            // monotonically and peg at the window. The per-frame delta is
+            // one request's token count — the same quantity Codex reads
+            // off its `last` breakdown.
+            let events = state.context.events(
+                &self.thread_id,
+                delta.total_tokens(),
+                None,
+                // Cursor manages its own context window and exposes no
+                // Codemux-side toggle for it.
+                Some(true),
+            );
+            (delta, state.model.clone(), events)
         };
+        for event in context_events {
+            let _ = self.event_tx.send(event);
+        }
         if !delta.is_empty() {
             let cost_usd = pricing::cost_for(
                 model.as_deref(),
@@ -1315,25 +1454,6 @@ impl CursorSession {
                 cost_source: cost_usd.map(|_| CostSource::Table),
             });
         }
-        let max_tokens = context_window_from_value(update);
-        let used_tokens = match max_tokens {
-            Some(max) => totals.context_tokens().min(max),
-            None => totals.context_tokens(),
-        };
-        let _ = self
-            .event_tx
-            .send(ProviderRuntimeEvent::ContextUsageUpdated {
-                thread_id: self.thread_id.clone(),
-                usage: ContextUsageSnapshot {
-                    used_tokens,
-                    total_processed_tokens: None,
-                    max_tokens,
-                    last_used_tokens: None,
-                    // Cursor manages its own context window and exposes no
-                    // Codemux-side toggle for it.
-                    compacts_automatically: Some(true),
-                },
-            });
     }
 
     fn warn(&self, message: String, original_payload: Option<Value>) {
@@ -1380,9 +1500,13 @@ impl CursorSession {
 }
 
 impl CursorUsageTotals {
-    /// Tokens occupying the live window: fresh input plus everything the
-    /// provider read back from cache, plus what it produced.
-    fn context_tokens(&self) -> u64 {
+    /// Every token in the record, summed.
+    ///
+    /// On a cumulative report this is the session's lifetime total; on a
+    /// per-frame delta it is one request's token count — which, because
+    /// Cursor re-reads the whole context from cache each request, is what
+    /// currently occupies the context window.
+    fn total_tokens(&self) -> u64 {
         self.input
             .saturating_add(self.output)
             .saturating_add(self.cache_read)
@@ -2048,7 +2172,116 @@ mod tests {
             }
         );
         assert!(first.delta_since(&second).is_empty());
-        assert_eq!(second.context_tokens(), 200);
+        assert_eq!(second.total_tokens(), 200);
+    }
+
+    /// Occupancy has to come from the latest request, not the session
+    /// total. Cursor re-reads the whole context from cache on every
+    /// request, so a cumulative `cache_read` would make the composer
+    /// meter climb monotonically and peg at the window on any long
+    /// session even while the real context stayed flat.
+    #[test]
+    fn context_occupancy_tracks_the_latest_request_not_the_session_total() {
+        let mut tracker = ContextUsageTracker::default();
+        tracker.observe_max_tokens(Some(200_000));
+        let mut previous = CursorUsageTotals::default();
+        let mut occupancies = Vec::new();
+        // Three requests against a ~50k context: fresh input is small,
+        // but each request reads the whole context back from cache.
+        for request in 1..=3u64 {
+            let cumulative = CursorUsageTotals {
+                input: 100 * request,
+                output: 200 * request,
+                cache_read: 50_000 * request,
+                cache_write: 0,
+            };
+            let delta = cumulative.delta_since(&previous);
+            previous = cumulative;
+            tracker.observe_lifetime_total(cumulative.total_tokens());
+            occupancies.push(
+                tracker
+                    .snapshot(delta.total_tokens(), None, Some(true))
+                    .expect("a changed reading emits")
+                    .used_tokens,
+            );
+        }
+        assert_eq!(occupancies, vec![50_300, 50_300, 50_300]);
+        // The cumulative figure still drives the lifetime line.
+        assert_eq!(tracker.lifetime_total(), 150_900);
+    }
+
+    fn interrupt_test_state() -> CursorSessionState {
+        CursorSessionState {
+            status: SessionStatus::Ready,
+            active_turn: None,
+            model: None,
+            permission_mode: "agent".into(),
+            config_options: vec![],
+            pending: HashMap::new(),
+            queued: VecDeque::new(),
+            assistant_text: String::new(),
+            thinking_text: String::new(),
+            turn_generation: 0,
+            interrupt_generation: None,
+            usage_totals: CursorUsageTotals::default(),
+            context: ContextUsageTracker::default(),
+        }
+    }
+
+    /// A Stop that nothing consumes must die with the turn it was aimed
+    /// at. As a bare flag it did not: `finish_turn` cleared it in its
+    /// first locked section, and an interrupt landing in the gap before
+    /// the second one re-set it on a session that was already done with
+    /// that turn. The flag then survived idle and instantly "interrupted"
+    /// whatever ran next — the user's next turn hours later, or the
+    /// queued turn that had just been promoted.
+    #[test]
+    fn a_stop_never_outlives_the_turn_it_was_aimed_at() {
+        let mut state = interrupt_test_state();
+
+        // Turn A runs and its prompt goes out.
+        state.active_turn = Some(TurnId("turn-a".into()));
+        let turn_a = state.claim_turn();
+        assert!(!state.take_interrupt(turn_a));
+
+        // Stop lands in `finish_turn`'s gap: turn A is over, but
+        // `active_turn` still names it.
+        state.request_interrupt();
+        assert_eq!(state.interrupt_generation, Some(turn_a));
+
+        // finish_turn promotes a queued turn B.
+        let turn_b = state.claim_turn();
+        assert!(
+            !state.take_interrupt(turn_b),
+            "a Stop aimed at turn A must not cancel queued turn B"
+        );
+
+        // And with an empty queue the request cannot survive idle into
+        // whatever the user sends next.
+        state.request_interrupt();
+        state.release_turn();
+        state.active_turn = Some(TurnId("turn-c".into()));
+        let turn_c = state.claim_turn();
+        assert!(
+            !state.take_interrupt(turn_c),
+            "a stale Stop must not complete the next turn before it starts"
+        );
+    }
+
+    #[test]
+    fn a_stop_aimed_at_the_running_turn_is_honored_exactly_once() {
+        let mut state = interrupt_test_state();
+        state.active_turn = Some(TurnId("turn-a".into()));
+        let turn_a = state.claim_turn();
+        state.request_interrupt();
+        assert!(state.take_interrupt(turn_a));
+        // Consumed — the in-flight cancel path must not fire again for
+        // the same request.
+        assert!(!state.take_interrupt(turn_a));
+        // An idle session has nothing to interrupt.
+        state.release_turn();
+        state.request_interrupt();
+        assert_eq!(state.interrupt_generation, None);
     }
 
     #[test]

@@ -2346,19 +2346,34 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (currentSlice.mode !== "plan" && currentSlice.permissionMode !== "plan") {
           return;
         }
+        // The stashed prior mode can be foreign — a thread handed over
+        // from another provider carries that provider's vocabulary, and
+        // Cursor's adapter rejects anything outside its own table. Run it
+        // through the same compat check the capabilities effect uses so
+        // the restore target is always a mode this provider advertises.
+        const compat = planCapabilityCompatReset({
+          capabilities,
+          currentPermissionMode: currentSlice.modePriorPermissionMode,
+        });
         const restore =
-          currentSlice.modePriorPermissionMode ??
+          (compat.resetPermissionMode === undefined
+            ? currentSlice.modePriorPermissionMode
+            : compat.resetPermissionMode) ??
           providerDefaultPermissionMode ??
           DEFAULT_THREAD_PERMISSION_MODE;
+        // Apply live FIRST. Clearing the pill on a call that then fails
+        // would leave the composer unlocked while the session was still
+        // read-only — the exact desync this branch exists to prevent.
+        try {
+          await agentChatSetPermissionMode(provider, threadId, restore);
+        } catch (err) {
+          toast.error(`Failed to leave plan mode: ${err}`);
+          return;
+        }
+        setSessionLaunchMode(threadId, restore);
         setStoreMode(threadId, "default");
         setStoreModePriorPermissionMode(threadId, null);
         setStorePermissionMode(threadId, restore);
-        try {
-          await agentChatSetPermissionMode(provider, threadId, restore);
-          setSessionLaunchMode(threadId, restore);
-        } catch (err) {
-          toast.error(`Failed to leave plan mode: ${err}`);
-        }
         return;
       }
       // Collapse the plan card locally. The sidecar denied+interrupted
@@ -2392,6 +2407,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      capabilities,
       providerDefaultPermissionMode,
       handleRespond,
       markRequestResolved,

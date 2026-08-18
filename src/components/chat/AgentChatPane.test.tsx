@@ -2509,6 +2509,61 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
     expect(agentChatStopSession).not.toHaveBeenCalled();
     expect(agentChatSendTurn).not.toHaveBeenCalled();
   });
+
+  it("sanitizes a foreign stashed mode against Cursor's own table", async () => {
+    // A thread handed over from Claude carries Claude's vocabulary in
+    // `modePriorPermissionMode`. Restoring it verbatim made the adapter
+    // reject the mode and the session stayed read-only.
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "bypassPermissions",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+    const { container } = render(<AgentChatPane pane={cursorPane} />);
+    (
+      container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
+    ).click();
+
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "cursor",
+        "thread-x",
+        // Cursor's advertised default, not Claude's Full-access spelling.
+        "agent",
+      ),
+    );
+  });
+
+  it("keeps the Plan pill when the live mode change fails", async () => {
+    // Clearing the pill first would unlock the composer while the
+    // session was still read-only — the desync this branch exists to
+    // prevent, inverted.
+    vi.mocked(agentChatSetPermissionMode).mockRejectedValueOnce(
+      new Error("session gone"),
+    );
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "agent",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+    const { container } = render(<AgentChatPane pane={cursorPane} />);
+    (
+      container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
+    ).click();
+
+    await waitFor(() => expect(agentChatSetPermissionMode).toHaveBeenCalled());
+    // The pill survives: mode stays "plan" and the stash is not dropped,
+    // so the user can retry (or exit via the pill) instead of facing a
+    // composer that lies about being writable.
+    expect(setModeMock).not.toHaveBeenCalledWith("thread-x", "default");
+    expect(setModePriorMock).not.toHaveBeenCalledWith("thread-x", null);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────

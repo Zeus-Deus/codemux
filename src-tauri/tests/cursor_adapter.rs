@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use codemux_lib::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent,
-    RequestId, SendTurnInput, StartSessionInput, ThreadId,
+    RequestId, SendTurnInput, StartSessionInput, ThreadId, TurnStatus,
 };
 use futures_util::StreamExt;
 use tokio::time::{timeout, Duration};
@@ -187,6 +187,53 @@ async fn cursor_turn_cancels_an_open_permission_request() {
         .await
         .expect_err("a cancelled request is no longer pending");
     assert!(matches!(err, ProviderError::RequestNotPending { .. }));
+    provider
+        .stop_session(ThreadId(thread_id.into()))
+        .await
+        .expect("stop fixture session");
+}
+
+/// Regression: Stop must reach the child no matter where in the turn's
+/// lifecycle it lands. The fixture holds this prompt open until it
+/// receives a `session/cancel`, so the turn can only complete if the
+/// adapter actually delivered the interrupt — and delivered it after the
+/// prompt, since the fixture had to receive the prompt to hold it. A
+/// Stop that arrives before the prompt goes out is equally honored: the
+/// worker abandons the turn instead of sending it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_stop_is_never_lost_whenever_it_lands() {
+    let provider = fixture_provider();
+    let mut events = provider.event_stream();
+    let thread_id = "cursor-stop";
+
+    provider
+        .start_session(fixture_start_input(thread_id))
+        .await
+        .expect("start fixture session");
+    let started = provider
+        .send_turn(fixture_turn(thread_id, "await-cancel please"))
+        .await
+        .expect("send turn");
+    provider
+        .interrupt_turn(ThreadId(thread_id.into()), Some(started.turn_id))
+        .await
+        .expect("interrupt");
+
+    let status = timeout(Duration::from_secs(20), async {
+        while let Some(event) = events.next().await {
+            if let ProviderRuntimeEvent::TurnCompleted { status, .. } = event {
+                return status;
+            }
+        }
+        panic!("event stream closed before turn completion");
+    })
+    .await
+    .expect("the interrupted turn never completed — Stop was dropped");
+
+    assert!(
+        matches!(status, TurnStatus::Error { ref subtype, .. } if subtype == "interrupted"),
+        "expected an interrupted turn, got {status:?}"
+    );
     provider
         .stop_session(ThreadId(thread_id.into()))
         .await

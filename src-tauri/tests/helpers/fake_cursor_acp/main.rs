@@ -18,8 +18,13 @@
 //!       * `permission` sends a `session/request_permission` request and
 //!         then finishes the turn WITHOUT waiting for the answer, leaving
 //!         an outstanding request the adapter has to cancel.
+//!       * `await-cancel` holds the turn open — it responds only once a
+//!         `session/cancel` notification arrives, and then with
+//!         `stopReason: cancelled`. A client that never delivers the
+//!         cancel hangs, which is exactly what makes it a test of Stop.
 //!       * anything else answers with a single chunk and `end_turn`.
-//!   - `session/cancel` (notification) → recorded, no reply.
+//!   - `session/cancel` (notification) → completes a held turn, else
+//!     ignored.
 //!
 //! Shutdown: closing stdin triggers EOF; the program exits 0.
 
@@ -100,6 +105,9 @@ fn main() {
     let mut stdin = BufReader::new(stdin.lock());
     let mut line = String::new();
     let mut next_request_id = 1_000;
+    // Id of a `session/prompt` deliberately left unanswered until a
+    // `session/cancel` arrives.
+    let mut held_prompt: Option<Value> = None;
 
     loop {
         line.clear();
@@ -159,6 +167,14 @@ fn main() {
                     .unwrap_or("fake-cursor-session")
                     .to_string();
                 let text = prompt_text(&params);
+                if text.contains("await-cancel") {
+                    // Hold the turn open. Only a `session/cancel` ends it,
+                    // so the adapter has to actually deliver the Stop —
+                    // and deliver it AFTER this prompt, or we would never
+                    // have gotten here to hold anything.
+                    held_prompt = id;
+                    continue;
+                }
                 if text.contains("permission") {
                     next_request_id += 1;
                     write_line(&json!({
@@ -188,8 +204,15 @@ fn main() {
                     }));
                 }
             }
-            // Fire-and-forget notifications the adapter sends.
-            "session/cancel" => {}
+            "session/cancel" => {
+                if let Some(prompt_id) = held_prompt.take() {
+                    write_line(&json!({
+                        "jsonrpc": "2.0",
+                        "id": prompt_id,
+                        "result": {"stopReason": "cancelled"}
+                    }));
+                }
+            }
             other => {
                 if let Some(id) = id {
                     write_line(&json!({
