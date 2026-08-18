@@ -1128,9 +1128,11 @@ export function Composer({
               ? "text-warning"
               : sourceProvider === "codex"
                 ? "text-success"
-                : sourceProvider === "opencode"
-                  ? "text-chart-4"
-                  : "text-muted-foreground";
+                : sourceProvider === "cursor"
+                  ? "text-accent-violet"
+                  : sourceProvider === "opencode"
+                    ? "text-chart-4"
+                    : "text-muted-foreground";
           return {
             id: `session:${session.thread_id}`,
             label: sessionMentionTitle(session),

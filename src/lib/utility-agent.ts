@@ -16,6 +16,20 @@ export const UTILITY_SETTING_KEYS = {
 
 export type UtilityAgentMode = "auto" | "custom";
 
+/** Providers the utility runner can actually execute.
+ *
+ *  The backend dispatcher (`src-tauri/src/utility_ai.rs::build_invocation`)
+ *  builds a one-shot, tool-less CLI invocation per provider and rejects
+ *  anything else with `utility_provider_unsupported`. Cursor ships no such
+ *  non-interactive mode, so it stays off this list — selecting it would
+ *  break commit-message generation, handoff summaries, and session-context
+ *  passes. It remains a fully supported CHAT provider. */
+export const UTILITY_PROVIDERS: ReadonlyArray<AgentChatProviderKind> = [
+  "claude",
+  "codex",
+  "opencode",
+];
+
 /** Effort a utility pass should run at. Codex's Luna tier defaults to a
  *  reasoning level that costs more than the summarisation is worth, so the
  *  utility path pins it to `low` wherever that is offered; every other model
@@ -82,11 +96,7 @@ export function utilitySelectionFromStores(): UtilityModelSelection | null {
     UTILITY_SETTING_KEYS.provider,
   ) as AgentChatProviderKind;
   const model = settings.get(UTILITY_SETTING_KEYS.model).trim();
-  if (
-    !model ||
-    !["claude", "codex", "cursor", "opencode"].includes(provider)
-  )
-    return null;
+  if (!model || !UTILITY_PROVIDERS.includes(provider)) return null;
   const effort = settings.get(UTILITY_SETTING_KEYS.effort).trim() || null;
   return { provider, model, effort };
 }

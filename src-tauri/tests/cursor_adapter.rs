@@ -4,9 +4,12 @@
 //! authenticated Cursor Agent CLI. Run it manually when changing session
 //! lifecycle or model configuration behavior.
 
+use std::path::PathBuf;
+
 use codemux_lib::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
 use codemux_lib::agent_provider::{
-    AgentProvider, ProviderRuntimeEvent, SendTurnInput, StartSessionInput, ThreadId,
+    AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent,
+    RequestId, SendTurnInput, StartSessionInput, ThreadId,
 };
 use futures_util::StreamExt;
 use tokio::time::{timeout, Duration};
@@ -30,6 +33,164 @@ fn start_input(
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }
+}
+
+/// Provider wired to the `fake_cursor_acp` fixture instead of a real CLI.
+fn fixture_provider() -> CursorAgentProvider {
+    CursorAgentProvider::new(CursorProviderConfig {
+        binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
+        event_channel_capacity: 1024,
+    })
+}
+
+fn fixture_start_input(thread_id: &str) -> StartSessionInput {
+    StartSessionInput {
+        thread_id: ThreadId(thread_id.into()),
+        cwd: std::env::current_dir().expect("test cwd"),
+        model: None,
+        resume_cursor: None,
+        permission_mode: Some("ask".into()),
+        effort: None,
+        context_window: None,
+        fast_mode: false,
+        additional_directories: vec![],
+        env: None,
+        extra: serde_json::Value::Null,
+        recorded_usage_baseline: None,
+    }
+}
+
+fn fixture_turn(thread_id: &str, text: &str) -> SendTurnInput {
+    SendTurnInput {
+        thread_id: ThreadId(thread_id.into()),
+        text: text.into(),
+        images: vec![],
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: None,
+        display_text: None,
+        skill_invocations: vec![],
+        turn_checkpoint: None,
+    }
+}
+
+/// Regression: `session/prompt`'s response is resolved through the
+/// transport's oneshot while the trailing `agent_message_chunk`
+/// notifications ahead of it on stdout are still queued in the session's
+/// broadcast channel. Completing the turn on the response alone dropped
+/// that tail — the assistant message the transcript persisted was short by
+/// however many chunks lost the race. The adapter now waits for its
+/// notification pipeline to drain before finishing the turn, so the
+/// completed item must carry every chunk the fixture wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_turn_keeps_trailing_message_chunks() {
+    const CHUNKS: usize = 40;
+    let provider = fixture_provider();
+    let mut events = provider.event_stream();
+    let thread_id = "cursor-chunk-order";
+
+    provider
+        .start_session(fixture_start_input(thread_id))
+        .await
+        .expect("start fixture session");
+    provider
+        .send_turn(fixture_turn(thread_id, &format!("chunks:{CHUNKS}")))
+        .await
+        .expect("send turn");
+
+    let text = timeout(Duration::from_secs(20), async {
+        let mut assistant_text = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ProviderRuntimeEvent::ItemCompleted {
+                    item: CompletedItem::AssistantText { text },
+                    ..
+                } => assistant_text = Some(text),
+                ProviderRuntimeEvent::TurnCompleted { .. } => return assistant_text,
+                _ => {}
+            }
+        }
+        panic!("event stream closed before turn completion");
+    })
+    .await
+    .expect("turn timed out")
+    .expect("assistant text item");
+
+    let expected = (0..CHUNKS)
+        .map(|index| format!("[{index}]"))
+        .collect::<String>();
+    assert_eq!(text, expected);
+    provider
+        .stop_session(ThreadId(thread_id.into()))
+        .await
+        .expect("stop fixture session");
+}
+
+/// Regression: a turn that ends with a `session/request_permission` still
+/// outstanding used to clear the pending map silently. The child never got
+/// the `cancelled` outcome ACP requires, and the UI's approval surface was
+/// never resolved — clicking Allow afterwards failed with
+/// `RequestNotPending` on a card that could no longer be dismissed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_turn_cancels_an_open_permission_request() {
+    let provider = fixture_provider();
+    let mut events = provider.event_stream();
+    let thread_id = "cursor-pending-cancel";
+
+    provider
+        .start_session(fixture_start_input(thread_id))
+        .await
+        .expect("start fixture session");
+    provider
+        .send_turn(fixture_turn(thread_id, "please ask for permission"))
+        .await
+        .expect("send turn");
+
+    let (opened, resolved) = timeout(Duration::from_secs(20), async {
+        let mut opened: Option<RequestId> = None;
+        let mut resolved: Option<(RequestId, ApprovalDecision)> = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ProviderRuntimeEvent::RequestOpened { request_id, .. } => {
+                    opened = Some(request_id);
+                }
+                ProviderRuntimeEvent::RequestResolved {
+                    request_id,
+                    decision,
+                    ..
+                } => resolved = Some((request_id, decision)),
+                ProviderRuntimeEvent::TurnCompleted { .. } => return (opened, resolved),
+                _ => {}
+            }
+        }
+        panic!("event stream closed before turn completion");
+    })
+    .await
+    .expect("turn timed out");
+
+    let opened = opened.expect("permission request was opened");
+    let (resolved_id, decision) = resolved.expect("pending request resolved on turn end");
+    assert_eq!(resolved_id, opened);
+    assert!(matches!(decision, ApprovalDecision::Cancel));
+
+    // The approval is genuinely gone, not just visually resolved.
+    let err = provider
+        .respond_to_request(
+            ThreadId(thread_id.into()),
+            opened,
+            ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            },
+        )
+        .await
+        .expect_err("a cancelled request is no longer pending");
+    assert!(matches!(err, ProviderError::RequestNotPending { .. }));
+    provider
+        .stop_session(ThreadId(thread_id.into()))
+        .await
+        .expect("stop fixture session");
 }
 
 /// Run manually with:

@@ -1234,6 +1234,9 @@ const CURSOR_CAPABILITIES: ProviderChatCapabilities = {
       id: "cursor-small",
       label: "Cursor Small",
       description: "No model-specific options",
+      // The real harvest marks every Cursor row image-capable; inheriting
+      // the shared mock's `false` made attachments look unsupported.
+      supports_images: true,
     },
   ],
   effort_granularity: "per_turn",

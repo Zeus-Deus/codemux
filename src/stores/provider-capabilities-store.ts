@@ -1,13 +1,39 @@
 import { useEffect } from "react";
 import { create } from "zustand";
 
+import { useProviderHealth } from "@/stores/provider-health-store";
 import { listChatProviderCapabilities } from "@/tauri/commands";
 import type {
   AgentChatProviderKind,
   ProviderChatCapabilities,
+  ProviderHealthReport,
 } from "@/tauri/types";
 
-const CURSOR_CAPABILITY_REFRESH_MS = 5 * 60 * 1000;
+/** Server-side TTL on the Rust Cursor harvest cache, mirrored here so the
+ *  poll below can be stated relative to it. Keep in lockstep with
+ *  `CAPABILITY_CACHE_TTL` in `agent_provider/cursor/capabilities.rs`. */
+export const CURSOR_CAPABILITY_TTL_MS = 5 * 60 * 1000;
+
+/** How often the app re-harvests Cursor's catalog. Deliberately LONGER
+ *  than the Rust TTL: polling exactly at the TTL means each tick has a
+ *  coin-flip chance of landing inside the still-valid cache window, so
+ *  every other poll is a no-op and the effective refresh period silently
+ *  doubles. A margin past the TTL makes every tick a real refresh. */
+export const CURSOR_CAPABILITY_REFRESH_MS =
+  CURSOR_CAPABILITY_TTL_MS + 60 * 1000;
+
+/** Whether a scheduled Cursor re-harvest is worth issuing.
+ *
+ *  A machine without the CLI has no catalog to refresh, and the probe
+ *  would try to spawn a missing binary once per tick forever. Only a
+ *  definite "not installed" suppresses the poll — an unknown health slot
+ *  (never probed) still refreshes, because the harvest is how the picker
+ *  learns Cursor exists at all. */
+export function shouldRefreshCursorCapabilities(
+  health: ProviderHealthReport | null,
+): boolean {
+  return health?.installed !== false;
+}
 
 interface ProviderCapabilitiesStore {
   claude: ProviderChatCapabilities | null;
@@ -97,6 +123,8 @@ export function useProviderCapabilitiesInit(): void {
     void refreshAll().finally(() => {
       if (cancelled) return;
       timer = window.setInterval(() => {
+        const health = useProviderHealth.getState().slots.cursor.report;
+        if (!shouldRefreshCursorCapabilities(health)) return;
         void refresh("cursor");
       }, CURSOR_CAPABILITY_REFRESH_MS);
     });

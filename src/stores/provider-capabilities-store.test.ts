@@ -25,9 +25,12 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import {
+  CURSOR_CAPABILITY_REFRESH_MS,
+  CURSOR_CAPABILITY_TTL_MS,
   selectCapabilities,
   selectError,
   selectModel,
+  shouldRefreshCursorCapabilities,
   useProviderCapabilities,
 } from "./provider-capabilities-store";
 import type {
@@ -252,6 +255,32 @@ describe("provider-capabilities-store", () => {
     const state = useProviderCapabilities.getState();
     const caps = selectCapabilities(state, "opencode");
     expect(caps?.models[0]?.sub_provider).toBe("openai");
+  });
+});
+
+describe("cursor capability polling", () => {
+  it("polls past the Rust TTL so every tick is a real refresh", () => {
+    // Polling exactly at the TTL makes roughly every other tick land
+    // inside the still-valid server cache, silently doubling the
+    // effective refresh period the comment above the constant promises.
+    expect(CURSOR_CAPABILITY_REFRESH_MS).toBeGreaterThan(
+      CURSOR_CAPABILITY_TTL_MS,
+    );
+  });
+
+  it("skips the poll only when Cursor is known to be missing", () => {
+    const report = (installed: boolean) => ({
+      provider: "cursor" as const,
+      status: "ready" as const,
+      installed,
+      message: null,
+      version: null,
+    });
+    expect(shouldRefreshCursorCapabilities(report(false))).toBe(false);
+    expect(shouldRefreshCursorCapabilities(report(true))).toBe(true);
+    // Never probed yet — the harvest is how the picker learns Cursor
+    // exists, so an unknown slot must still refresh.
+    expect(shouldRefreshCursorCapabilities(null)).toBe(true);
   });
 });
 

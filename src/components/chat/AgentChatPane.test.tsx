@@ -207,6 +207,7 @@ vi.mock("./Composer", () => ({
     onModelChange,
     onProviderModelChange,
     onContextWindowChange,
+    onPermissionModeChange,
     provider,
     providerCliInstalled,
     providerAuthenticated,
@@ -221,9 +222,13 @@ vi.mock("./Composer", () => ({
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
-    onProviderModelChange: (provider: "claude" | "codex" | "opencode", model: string) => void;
+    onProviderModelChange: (
+      provider: "claude" | "codex" | "cursor" | "opencode",
+      model: string,
+    ) => void;
     onContextWindowChange: (contextWindow: string) => void;
-    provider: "claude" | "codex" | "opencode";
+    onPermissionModeChange: (mode: string) => void;
+    provider: "claude" | "codex" | "cursor" | "opencode";
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
@@ -274,6 +279,13 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="context-window-change"
         onClick={() => onContextWindowChange("1m")}
+      />
+      {/* Permission-mode picker selection. Per-turn providers have to
+          push the choice onto the LIVE session; per-session ones
+          restart. Both branches are asserted below. */}
+      <button
+        data-testid="permission-mode-change"
+        onClick={() => onPermissionModeChange("ask")}
       />
     </div>
   ),
@@ -639,6 +651,7 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
+import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 
 const pane = {
   kind: "agent_chat" as const,
@@ -2367,6 +2380,134 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(acceptMode).toBe("default");
     expect(agentChatStartSession).not.toHaveBeenCalled();
     expect(agentChatStopSession).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Cursor — the first provider that combines real permission modes with
+// PER-TURN granularity, and the first whose plan approval is a blocking
+// RPC rather than a synthetic follow-up turn.
+// ─────────────────────────────────────────────────────────────────────
+
+const cursorPane = { ...pane, provider: "cursor" as const };
+
+function seedCursorCapabilities() {
+  useProviderCapabilities.setState({
+    cursor: {
+      models: [],
+      effort_granularity: "per_turn",
+      effort_label_map: {},
+      permission_modes: [
+        {
+          value: "ask",
+          label: "Ask first",
+          description: "Ask before commands or edits that need approval.",
+          is_default: false,
+        },
+        {
+          value: "agent",
+          label: "Full access",
+          description: "Work without approval prompts.",
+          is_default: true,
+        },
+      ],
+      default_permission_mode: "agent",
+      permission_granularity: "per_turn",
+    },
+    cursorError: null,
+  });
+}
+
+describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    setModeMock.mockClear();
+    setModePriorMock.mockClear();
+    setPermissionModeMock.mockClear();
+    vi.mocked(agentChatSetPermissionMode).mockClear().mockResolvedValue(
+      undefined,
+    );
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStopSession).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear();
+    vi.mocked(agentChatUpdateSessionConfig).mockClear().mockResolvedValue(
+      undefined,
+    );
+    seedCursorCapabilities();
+  });
+  afterEach(() => {
+    cleanup();
+    useProviderCapabilities.setState({ cursor: null, cursorError: null });
+  });
+
+  it("pushes a per-turn permission mode onto the LIVE session instead of only persisting it", async () => {
+    // Persisting alone stranded the choice: every sendTurn call site
+    // passes `permission_mode_override: null`, so flipping Full access →
+    // Ask first never reached the adapter and the picker lied for the
+    // rest of the session.
+    currentSliceOverrides = {
+      "thread-x": { permissionMode: "agent", sessionLaunchMode: "agent" },
+    };
+    const { container } = render(<AgentChatPane pane={cursorPane} />);
+    (
+      container.querySelector(
+        '[data-testid="permission-mode-change"]',
+      ) as HTMLButtonElement
+    ).click();
+
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "cursor",
+        "thread-x",
+        "ask",
+      ),
+    );
+    expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "ask");
+    await waitFor(() =>
+      expect(agentChatUpdateSessionConfig).toHaveBeenCalledWith("thread-x", {
+        permission_mode: "ask",
+      }),
+    );
+    // Per-turn granularity means no session teardown.
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+  });
+
+  it("accepting a Cursor plan drops the read-only Plan pill and restores the prior mode", async () => {
+    // Answering the create_plan RPC is consent to IMPLEMENT the plan.
+    // Leaving `mode: "plan"` in the slice kept the composer showing the
+    // read-only Plan pill while Cursor edited files.
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "agent",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+    const { container } = render(<AgentChatPane pane={cursorPane} />);
+    (
+      container.querySelector('[data-testid="accept-plan"]') as HTMLButtonElement
+    ).click();
+
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "cursor",
+        "thread-x",
+        "agent",
+      ),
+    );
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+    expect(setModePriorMock).toHaveBeenCalledWith("thread-x", null);
+    expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "agent");
+    // Cursor applies the mode live — no restart, and no synthetic
+    // "Proceed with the plan." turn (the RPC answer is the go-ahead).
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
   });
 });
 

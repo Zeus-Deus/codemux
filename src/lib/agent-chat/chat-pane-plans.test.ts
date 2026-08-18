@@ -405,7 +405,11 @@ describe("planPermissionModeChange", () => {
       nextMode: "default",
       capabilities: CLAUDE_CAPS,
     });
-    expect(plan).toEqual({ setPermissionMode: "default", restart: true });
+    expect(plan).toEqual({
+      setPermissionMode: "default",
+      restart: true,
+      applyLive: false,
+    });
   });
 
   it("Codex PerSession (MVP wiring) → restart=true", () => {
@@ -413,10 +417,19 @@ describe("planPermissionModeChange", () => {
       nextMode: "read-only",
       capabilities: CODEX_CAPS,
     });
-    expect(plan).toEqual({ setPermissionMode: "read-only", restart: true });
+    expect(plan).toEqual({
+      setPermissionMode: "read-only",
+      restart: true,
+      applyLive: false,
+    });
   });
 
-  it("hypothetical PerTurn provider → restart=false", () => {
+  it("PerTurn provider skips the restart but must still apply the mode live", () => {
+    // Cursor is the first provider with real permission modes AND
+    // per-turn granularity. `restart: false` alone left the choice
+    // stranded in the DB — every sendTurn call site passes
+    // `permission_mode_override: null`, so nothing ever carried it to
+    // the running session and the picker lied until the next restart.
     const perTurnCaps: ProviderChatCapabilities = {
       ...CODEX_CAPS,
       permission_granularity: "per_turn",
@@ -425,7 +438,11 @@ describe("planPermissionModeChange", () => {
       nextMode: "read-only",
       capabilities: perTurnCaps,
     });
-    expect(plan).toEqual({ setPermissionMode: "read-only", restart: false });
+    expect(plan).toEqual({
+      setPermissionMode: "read-only",
+      restart: false,
+      applyLive: true,
+    });
   });
 });
 

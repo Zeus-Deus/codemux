@@ -100,14 +100,28 @@ impl AgentProvider for CursorAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
-        if let Some(existing) = self.sessions.read().await.get(&thread_id).cloned() {
-            if !existing.is_dead() {
-                return Err(ProviderError::ValidationError {
-                    message: format!("Cursor session already exists for thread {}", thread_id.0),
-                });
+        // Evict a corpse under the write lock so check→remove is atomic
+        // against a concurrent rebuild. A read-lock check followed by a
+        // separate write-lock remove lets two starts both observe the same
+        // dead session. A still-live session is a genuine double-start and
+        // stays a ValidationError.
+        let dead_evicted = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(&thread_id) {
+                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
+                Some(_) => {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "Cursor session already exists for thread {}",
+                            thread_id.0
+                        ),
+                    });
+                }
+                None => None,
             }
-            self.sessions.write().await.remove(&thread_id);
-            existing.shutdown().await;
+        };
+        if let Some(dead) = dead_evicted {
+            dead.shutdown().await;
         }
         let session = CursorSession::spawn_and_initialize(
             thread_id.clone(),
@@ -125,10 +139,24 @@ impl AgentProvider for CursorAgentProvider {
             self.event_tx.clone(),
         )
         .await?;
-        self.sessions
-            .write()
-            .await
-            .insert(thread_id.clone(), Arc::clone(&session));
+        // Spawning is async, so two starts that both got past the eviction
+        // above can arrive here with two live children. Never overwrite a
+        // live entry: the loser's `cursor-agent` process would stay running
+        // with nothing holding a handle to shut it down.
+        {
+            let mut sessions = self.sessions.write().await;
+            if sessions
+                .get(&thread_id)
+                .is_some_and(|existing| !existing.is_dead())
+            {
+                drop(sessions);
+                session.shutdown().await;
+                return Err(ProviderError::ValidationError {
+                    message: format!("Cursor session already exists for thread {}", thread_id.0),
+                });
+            }
+            sessions.insert(thread_id.clone(), Arc::clone(&session));
+        }
         Ok(ProviderSession {
             thread_id,
             provider: ProviderKind::Cursor,

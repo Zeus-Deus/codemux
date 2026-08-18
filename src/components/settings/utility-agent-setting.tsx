@@ -13,6 +13,7 @@ import {
 import {
   resolveAutoUtilitySelection,
   utilityEffortFor,
+  UTILITY_PROVIDERS,
   UTILITY_SETTING_KEYS,
   type UtilityAgentMode,
 } from "@/lib/utility-agent";
@@ -105,6 +106,10 @@ export function UtilityAgentSetting() {
       ) : (
         <>
           <MultiProviderModelPicker
+            // The utility runner has no Cursor backend, so offering a
+            // Cursor row here would only produce
+            // `utility_provider_unsupported` at generation time.
+            allowedProviders={UTILITY_PROVIDERS}
             provider={customProvider}
             model={customModel}
             onProviderModelChange={(provider, model) => {

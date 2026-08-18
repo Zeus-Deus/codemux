@@ -197,12 +197,21 @@ export function planSubmit(input: PlanSubmitInput): SubmitPlan {
  * - `setPermissionMode`: the new value to write to the thread slice.
  *   Never null — a picker selection always represents an intent.
  * - `restart`: true when the provider requires a session restart to
- *   apply the mode (PerSession granularity). false means the mode
- *   rides on the next send via `permission_mode_override`.
+ *   apply the mode (PerSession granularity).
+ * - `applyLive`: true when the adapter accepts the mode on the running
+ *   session (PerTurn granularity), so the caller must push it through
+ *   `agent_chat_set_permission_mode`. Persisting alone is NOT enough:
+ *   every `sendTurn` call site passes `permission_mode_override: null`,
+ *   so a mode that is only written to the DB never reaches the live
+ *   session and the picker silently lies until the next restart.
+ *
+ * The two are mutually exclusive — a mode change always has to land
+ * somewhere.
  */
 export interface PermissionModeChangePlan {
   setPermissionMode: string;
   restart: boolean;
+  applyLive: boolean;
 }
 
 export interface PlanPermissionModeChangeInput {
@@ -219,9 +228,11 @@ export function planPermissionModeChange(
     (m) => m.value === nextMode,
   );
   if (!supported) return null;
+  const restart = capabilities.permission_granularity === "per_session";
   return {
     setPermissionMode: nextMode,
-    restart: capabilities.permission_granularity === "per_session",
+    restart,
+    applyLive: !restart,
   };
 }
 

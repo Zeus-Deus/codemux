@@ -1600,12 +1600,21 @@ fn resolve_start_permission_mode(
         Some(mode) if provider == ProviderKind::Claude && mode == "danger-full-access" => {
             Some("bypassPermissions".to_string())
         }
-        Some(mode)
-            if provider == ProviderKind::Cursor
-                && matches!(mode.as_str(), "bypassPermissions" | "danger-full-access") =>
-        {
-            Some("agent".to_string())
-        }
+        // Cursor's adapter rejects an unknown mode outright, and that
+        // rejection aborts the whole start and tears the child down. A
+        // thread carried over from another provider (Claude's `default` /
+        // `acceptEdits`, Codex's `read-only` / `workspace-write`) must
+        // therefore be translated here: full-access strings become Cursor's
+        // `agent`, and anything else degrades to its ask-first mode rather
+        // than silently widening permissions.
+        Some(mode) if provider == ProviderKind::Cursor => Some(
+            match mode.as_str() {
+                "bypassPermissions" | "danger-full-access" => "agent",
+                "agent" | "ask" | "plan" => mode.as_str(),
+                _ => "ask",
+            }
+            .to_string(),
+        ),
         Some(mode) if provider == ProviderKind::Claude && mode == "agent" => {
             Some("bypassPermissions".to_string())
         }
@@ -6692,6 +6701,29 @@ mod tests {
             resolve_start_permission_mode(ProviderKind::Codex, Some("agent".to_string())),
             Some("danger-full-access".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_degrades_foreign_cursor_modes_to_ask() {
+        // A thread previously run under Claude/Codex carries a mode Cursor
+        // has never heard of. Passing it through made the adapter's
+        // `set_permission_mode` fail, which aborted `start_session` and
+        // killed the freshly spawned child. Degrade to ask-first instead —
+        // never to full access.
+        for foreign in ["default", "acceptEdits", "read-only", "workspace-write"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Cursor, Some(foreign.to_string())),
+                Some("ask".to_string()),
+                "{foreign} should degrade to Cursor's ask-first mode"
+            );
+        }
+        // Cursor's own modes still pass through untouched.
+        for native in ["agent", "ask", "plan"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Cursor, Some(native.to_string())),
+                Some(native.to_string())
+            );
+        }
     }
 
     #[test]

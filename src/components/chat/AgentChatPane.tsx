@@ -2334,9 +2334,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (!threadId) return;
       if (provider === "cursor") {
         // Cursor's documented create_plan extension is a blocking RPC.
-        // Resolve that request directly; no synthetic follow-up turn or
-        // Claude-specific mode transition is needed.
+        // Resolve that request directly; no synthetic follow-up turn is
+        // needed — answering it is what lets the session implement.
         await handleRespond(requestId, { decision: "allow" }, true);
+        // …but "implement it" and "read-only Plan pill" cannot both be
+        // true. Leaving the slice in plan mode kept the composer locked
+        // while Cursor edited files. Restore the mode the user had before
+        // the pill; Cursor applies it to the live session, no restart.
+        const currentSlice = useAgentChatStore.getState().threads[threadId];
+        if (!currentSlice) return;
+        if (currentSlice.mode !== "plan" && currentSlice.permissionMode !== "plan") {
+          return;
+        }
+        const restore =
+          currentSlice.modePriorPermissionMode ??
+          providerDefaultPermissionMode ??
+          DEFAULT_THREAD_PERMISSION_MODE;
+        setStoreMode(threadId, "default");
+        setStoreModePriorPermissionMode(threadId, null);
+        setStorePermissionMode(threadId, restore);
+        try {
+          await agentChatSetPermissionMode(provider, threadId, restore);
+          setSessionLaunchMode(threadId, restore);
+        } catch (err) {
+          toast.error(`Failed to leave plan mode: ${err}`);
+        }
         return;
       }
       // Collapse the plan card locally. The sidecar denied+interrupted
@@ -2370,6 +2392,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      providerDefaultPermissionMode,
       handleRespond,
       markRequestResolved,
       setStorePermissionMode,
@@ -2687,14 +2710,26 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (currentSlice.sessionLaunchMode === plan.setPermissionMode) return;
       if (plan.restart) {
         restartSessionWith({ permissionMode: plan.setPermissionMode });
+        return;
       }
-      // PerTurn providers: the mode is already persisted; the next
-      // `sendTurn` picks it up via `permission_mode_override`.
+      // PerTurn providers accept the mode on the running session. This
+      // has to happen explicitly: no send path forwards the stored mode
+      // as `permission_mode_override`, so without this call the picker
+      // would show "Ask first" while the session kept full access.
+      if (plan.applyLive) {
+        agentChatSetPermissionMode(provider, threadId, plan.setPermissionMode)
+          .then(() => setSessionLaunchMode(threadId, plan.setPermissionMode))
+          .catch((err) => {
+            toast.error(`Failed to set permission mode: ${err}`);
+          });
+      }
     },
     [
       threadId,
+      provider,
       capabilities,
       setStorePermissionMode,
+      setSessionLaunchMode,
       restartSessionWith,
       persistSessionConfig,
     ],
