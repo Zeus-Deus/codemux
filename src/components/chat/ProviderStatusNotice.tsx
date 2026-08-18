@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 

@@ -152,7 +152,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
       const q = questions[i];
       if (!q) return false;
       const p = picks[i];
-      const free = (otherText[i] ?? "").trim();
+      const free = q.allowOther ? (otherText[i] ?? "").trim() : "";
       // Typing into "Something else" counts as selecting Other even if
       // the user never explicitly clicked the row — the free-text row is
       // an answer in its own right.
@@ -184,7 +184,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
     const answers: Record<string, string> = {};
     questions.forEach((q, i) => {
       const p = picks[i] ?? new Set<string>();
-      const free = (otherText[i] ?? "").trim();
+      const free = q.allowOther ? (otherText[i] ?? "").trim() : "";
       if (q.multiSelect) {
         const labels = [...p].filter((l) => l !== OTHER_LABEL);
         if (free) labels.push(free);
@@ -395,17 +395,19 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
                   ))}
                 </QuestionnaireChoices>
 
-                {/* "Something else" free-text row — always visible.
-                    Typing into it implicitly answers the question; no
-                    explicit selection required. */}
-                <OtherRow
-                  questionIndex={i}
-                  value={otherText[i] ?? ""}
-                  onChange={(val) =>
-                    setOtherText((prev) => ({ ...prev, [i]: val }))
-                  }
-                  onEnter={advanceOrSubmit}
-                />
+                {/* Providers may restrict answers to advertised choices.
+                    When free text is allowed, typing here implicitly answers
+                    the question without an explicit selection. */}
+                {q.allowOther && (
+                  <OtherRow
+                    questionIndex={i}
+                    value={otherText[i] ?? ""}
+                    onChange={(val) =>
+                      setOtherText((prev) => ({ ...prev, [i]: val }))
+                    }
+                    onEnter={advanceOrSubmit}
+                  />
+                )}
 
                 <QuestionnaireError className="text-[11px]" />
               </QuestionnaireItem>
@@ -599,6 +601,7 @@ interface Question {
   header: string;
   question: string;
   multiSelect: boolean;
+  allowOther: boolean;
   options: { label: string; description: string; preview: string | null }[];
 }
 
@@ -614,6 +617,7 @@ function extractQuestions(payload: unknown): Question[] {
     if (!question) continue;
     const header = typeof q["header"] === "string" ? (q["header"] as string) : "";
     const multiSelect = q["multiSelect"] === true;
+    const allowOther = q["allowOther"] !== false;
     const optsRaw = q["options"];
     const options: Question["options"] = [];
     if (Array.isArray(optsRaw)) {
@@ -633,7 +637,7 @@ function extractQuestions(payload: unknown): Question[] {
         options.push({ label, description, preview });
       }
     }
-    out.push({ header, question, multiSelect, options });
+    out.push({ header, question, multiSelect, allowOther, options });
   }
   return out;
 }

@@ -243,6 +243,16 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
+# Test helper binary used by `tests/cursor_adapter.rs` — simulates
+# `cursor-agent acp`. Gated like fake_rpc_child above.
+[[bin]]
+name = "fake_cursor_acp"
+path = "tests/helpers/fake_cursor_acp/main.rs"
+test = false
+doctest = false
+bench = false
+required-features = ["test-fixtures"]
+
 # Test helper binary used by `tests/claude_adapter.rs` — simulates the
 # claude-agent sidecar without involving the real SDK. Gated like
 # fake_rpc_child above.

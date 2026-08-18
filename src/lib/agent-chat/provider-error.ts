@@ -14,6 +14,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 

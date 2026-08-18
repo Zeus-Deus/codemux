@@ -164,6 +164,7 @@ const ENABLE_PROVIDER_PICKER = true;
 const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 
@@ -2331,6 +2332,50 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAcceptPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "cursor") {
+        // Cursor's documented create_plan extension is a blocking RPC.
+        // Resolve that request directly; no synthetic follow-up turn is
+        // needed — answering it is what lets the session implement.
+        await handleRespond(requestId, { decision: "allow" }, true);
+        // …but "implement it" and "read-only Plan pill" cannot both be
+        // true. Leaving the slice in plan mode kept the composer locked
+        // while Cursor edited files. Restore the mode the user had before
+        // the pill; Cursor applies it to the live session, no restart.
+        const currentSlice = useAgentChatStore.getState().threads[threadId];
+        if (!currentSlice) return;
+        if (currentSlice.mode !== "plan" && currentSlice.permissionMode !== "plan") {
+          return;
+        }
+        // The stashed prior mode can be foreign — a thread handed over
+        // from another provider carries that provider's vocabulary, and
+        // Cursor's adapter rejects anything outside its own table. Run it
+        // through the same compat check the capabilities effect uses so
+        // the restore target is always a mode this provider advertises.
+        const compat = planCapabilityCompatReset({
+          capabilities,
+          currentPermissionMode: currentSlice.modePriorPermissionMode,
+        });
+        const restore =
+          (compat.resetPermissionMode === undefined
+            ? currentSlice.modePriorPermissionMode
+            : compat.resetPermissionMode) ??
+          providerDefaultPermissionMode ??
+          DEFAULT_THREAD_PERMISSION_MODE;
+        // Apply live FIRST. Clearing the pill on a call that then fails
+        // would leave the composer unlocked while the session was still
+        // read-only — the exact desync this branch exists to prevent.
+        try {
+          await agentChatSetPermissionMode(provider, threadId, restore);
+        } catch (err) {
+          toast.error(`Failed to leave plan mode: ${err}`);
+          return;
+        }
+        setSessionLaunchMode(threadId, restore);
+        setStoreMode(threadId, "default");
+        setStoreModePriorPermissionMode(threadId, null);
+        setStorePermissionMode(threadId, restore);
+        return;
+      }
       // Collapse the plan card locally. The sidecar denied+interrupted
       // the ExitPlanMode tool before emitting the request, so no
       // `request-resolved` event will ever arrive — without this the
@@ -2362,6 +2407,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      capabilities,
+      providerDefaultPermissionMode,
+      handleRespond,
       markRequestResolved,
       setStorePermissionMode,
       setSessionLaunchMode,
@@ -2378,6 +2426,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleRejectPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "cursor") {
+        await handleRespond(
+          requestId,
+          { decision: "deny", message: "Please revise the plan." },
+          true,
+        );
+        return;
+      }
       // Same reasoning as handleAcceptPlan: no sidecar round-trip, so
       // collapse the card locally before firing the follow-up turn.
       markRequestResolved(threadId, requestId, {
@@ -2396,7 +2452,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         toast.error(`Failed to reject plan: ${err}`);
       }
     },
-    [threadId, provider, markRequestResolved],
+    [threadId, provider, handleRespond, markRequestResolved],
   );
 
   // Composer-level mode pill activation. Plan and Ask both flip the
@@ -2670,14 +2726,26 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (currentSlice.sessionLaunchMode === plan.setPermissionMode) return;
       if (plan.restart) {
         restartSessionWith({ permissionMode: plan.setPermissionMode });
+        return;
       }
-      // PerTurn providers: the mode is already persisted; the next
-      // `sendTurn` picks it up via `permission_mode_override`.
+      // PerTurn providers accept the mode on the running session. This
+      // has to happen explicitly: no send path forwards the stored mode
+      // as `permission_mode_override`, so without this call the picker
+      // would show "Ask first" while the session kept full access.
+      if (plan.applyLive) {
+        agentChatSetPermissionMode(provider, threadId, plan.setPermissionMode)
+          .then(() => setSessionLaunchMode(threadId, plan.setPermissionMode))
+          .catch((err) => {
+            toast.error(`Failed to set permission mode: ${err}`);
+          });
+      }
     },
     [
       threadId,
+      provider,
       capabilities,
       setStorePermissionMode,
+      setSessionLaunchMode,
       restartSessionWith,
       persistSessionConfig,
     ],
@@ -2727,10 +2795,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (!threadId) return;
       setStoreContextWindow(threadId, next);
       persistSessionConfig({ context_window: next });
-      // Context window on Claude is encoded into the model id (e.g.
-      // `claude-opus-4-7[1m]`), which is a session-init parameter.
-      // Mid-session change → restart.
-      if (provider === "claude") {
+      // Claude encodes context into the model id; Cursor exposes context as
+      // an ACP session config option. Both must be applied before the next
+      // turn, so rebuild the resumable provider session with the new value.
+      if (provider === "claude" || provider === "cursor") {
         restartSessionWith({ contextWindow: next });
       }
     },

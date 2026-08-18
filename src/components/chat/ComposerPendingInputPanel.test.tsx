@@ -81,6 +81,32 @@ describe("ComposerPendingInputPanel", () => {
     expect(screen.getByText(/1 of 1/)).toBeInTheDocument();
   });
 
+  it("hides free text when a provider only accepts advertised choices", () => {
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({
+          payload: {
+            questions: [
+              {
+                header: "Cursor",
+                question: "Choose a mode",
+                multiSelect: false,
+                allowOther: false,
+                options: [
+                  { label: "Agent", description: "" },
+                  { label: "Plan", description: "" },
+                ],
+              },
+            ],
+          },
+        })}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.queryByPlaceholderText("Something else…")).toBeNull();
+    expect(screen.getByText("Agent")).toBeInTheDocument();
+  });
+
   it("Send is disabled until a pick or free-text answer exists", () => {
     render(
       <ComposerPendingInputPanel

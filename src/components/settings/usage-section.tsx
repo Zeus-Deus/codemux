@@ -52,12 +52,14 @@ const METRIC_OPTIONS: { value: Metric; label: string }[] = [
 const SERIES_FILL: Record<string, string> = {
   claude: "bg-accent-ember",
   codex: "bg-foreground/45",
+  cursor: "bg-accent-violet",
   opencode: "bg-status-open",
 };
 
 const SERIES_LABEL: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 
@@ -75,7 +77,12 @@ function seriesLabel(provider: string): string {
 }
 
 function isKnownProvider(provider: string): provider is AgentChatProviderKind {
-  return provider === "claude" || provider === "codex" || provider === "opencode";
+  return (
+    provider === "claude" ||
+    provider === "codex" ||
+    provider === "cursor" ||
+    provider === "opencode"
+  );
 }
 
 // ── formatting ──

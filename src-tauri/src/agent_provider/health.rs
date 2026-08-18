@@ -19,6 +19,7 @@ use super::types::ProviderKind;
 use crate::agent_provider::claude;
 use crate::agent_provider::codex;
 use crate::agent_provider::opencode;
+use std::time::Duration;
 
 /// Coarse severity for a provider health snapshot.
 ///
@@ -86,6 +87,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
     match provider {
         ProviderKind::Claude => check_claude_health().await,
         ProviderKind::Codex => check_codex_health().await,
+        ProviderKind::Cursor => check_cursor_health().await,
         ProviderKind::OpenCode => check_opencode_health().await,
     }
 }
@@ -238,6 +240,95 @@ fn codex_report_from_auth(
             ProviderKind::Codex,
             version,
             format!("Could not verify Codex authentication status. ({err})"),
+        ),
+    }
+}
+
+// ── Cursor ──────────────────────────────────────────────────────────
+
+async fn check_cursor_health() -> ProviderHealthReport {
+    let binary = match which::which("cursor-agent") {
+        Ok(path) => path,
+        Err(_) => {
+            return ProviderHealthReport::error(
+                ProviderKind::Cursor,
+                false,
+                "Cursor Agent CLI (`cursor-agent`) is not installed or not on PATH.".into(),
+            )
+        }
+    };
+    let version = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(&binary)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!text.is_empty()).then_some(text)
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            return ProviderHealthReport::error(
+                ProviderKind::Cursor,
+                true,
+                format!("Cursor Agent is installed but failed to run. ({error})"),
+            )
+        }
+        Err(_) => {
+            return ProviderHealthReport::warning(
+                ProviderKind::Cursor,
+                None,
+                "Cursor Agent version probe timed out. Sessions may still work.".into(),
+            )
+        }
+    };
+
+    // `models` is an official, read-only command and exercises both the
+    // installation and current login without opening an interactive flow.
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(&binary).arg("models").output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => {
+            ProviderHealthReport::ready(ProviderKind::Cursor, version)
+        }
+        Ok(Ok(output)) => {
+            let detail = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if crate::agent_provider::cursor::capabilities::looks_unauthenticated(&detail) {
+                let mut report = ProviderHealthReport::error(
+                    ProviderKind::Cursor,
+                    true,
+                    "Cursor Agent is not authenticated. Run `cursor-agent login` and try again."
+                        .into(),
+                );
+                report.version = version;
+                report
+            } else {
+                ProviderHealthReport::warning(
+                    ProviderKind::Cursor,
+                    version,
+                    "Cursor Agent model probe failed; sessions may still work.".into(),
+                )
+            }
+        }
+        Ok(Err(error)) => ProviderHealthReport::error(
+            ProviderKind::Cursor,
+            true,
+            format!("Cursor Agent is installed but failed to run. ({error})"),
+        ),
+        Err(_) => ProviderHealthReport::warning(
+            ProviderKind::Cursor,
+            version,
+            "Cursor Agent authentication probe timed out. Sessions may still work.".into(),
         ),
     }
 }

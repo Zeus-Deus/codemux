@@ -76,6 +76,7 @@ import {
 import { ThemeSettings } from "./theme-settings";
 import { UtilityAgentSetting } from "./utility-agent-setting";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
@@ -1280,6 +1281,12 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
   return (
     <div className="flex items-center gap-2">
       <MultiProviderModelPicker
+        // `generate_commit_message` dispatches through
+        // `build_resolver_argv`, whose only arms are claude / codex /
+        // opencode — an unrecognized CLI silently falls through to the
+        // claude arm and would run the claude binary with another
+        // provider's model slug.
+        allowedProviders={NON_INTERACTIVE_CLI_PROVIDERS}
         provider={provider}
         model={model}
         onProviderModelChange={(nextProvider, nextModel) => {
@@ -2011,12 +2018,13 @@ export function SettingsView() {
                   />
                 </SettingRow>
                 {/* Same `MultiProviderModelPicker` the resolver row below
-                    uses (and the agent-chat composer). All three providers
-                    are shown — the commit-message backend in
-                    `src-tauri/src/ai.rs:generate_commit_message` now
-                    dispatches via `build_resolver_argv`, the same builder
-                    the merge resolver uses, so claude / codex / opencode
-                    all work. Picking a model atomically writes both the
+                    uses (and the agent-chat composer), restricted to the
+                    providers `build_resolver_argv` can actually run — the
+                    commit-message backend in
+                    `src-tauri/src/ai.rs:generate_commit_message`
+                    dispatches through it, so claude / codex / opencode
+                    all work and nothing else does. Picking a model
+                    atomically writes both the
                     CLI and the model so they can never drift out of sync.
                     Reuse buys us favorites carry-over for free: star a
                     model anywhere (chat composer, this row, the resolver
@@ -2052,6 +2060,9 @@ export function SettingsView() {
                   description="Which AI agent (and model) resolves conflicts."
                 >
                   <MultiProviderModelPicker
+                    // Same `build_resolver_argv` constraint as the
+                    // commit-message row above.
+                    allowedProviders={NON_INTERACTIVE_CLI_PROVIDERS}
                     provider={(config?.ai_resolver_cli ?? "claude") as AgentChatProviderKind}
                     model={config?.ai_resolver_model ?? null}
                     onProviderModelChange={(provider, model) => {

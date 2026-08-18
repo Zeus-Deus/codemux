@@ -10,6 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { NON_INTERACTIVE_CLI_PROVIDERS } from "@/lib/agent-chat/capability-defaults";
 import {
   resolveAutoUtilitySelection,
   utilityEffortFor,
@@ -105,6 +106,10 @@ export function UtilityAgentSetting() {
       ) : (
         <>
           <MultiProviderModelPicker
+            // The utility runner has no Cursor backend, so offering a
+            // Cursor row here would only produce
+            // `utility_provider_unsupported` at generation time.
+            allowedProviders={NON_INTERACTIVE_CLI_PROVIDERS}
             provider={customProvider}
             model={customModel}
             onProviderModelChange={(provider, model) => {

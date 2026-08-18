@@ -61,9 +61,11 @@ afterEach(() => {
   useProviderCapabilities.setState({
     claude: null,
     codex: null,
+    cursor: null,
     opencode: null,
     claudeError: null,
     codexError: null,
+    cursorError: null,
     opencodeError: null,
   });
   useSettingsStore.setState({ settings: {} });
@@ -139,6 +141,23 @@ describe("Utility agent selection", () => {
         "ai.utility.mode": "custom",
         "ai.utility.provider": "claude",
         "ai.utility.model": "",
+      },
+    });
+    expect(utilitySelectionFromStores()).toBeNull();
+  });
+
+  it("rejects a Cursor custom selection the utility backend cannot run", () => {
+    // `utility_ai.rs::build_invocation` only knows codex/claude/opencode;
+    // a stored Cursor pick would fail every commit message, handoff
+    // summary, and session-context pass with
+    // `utility_provider_unsupported`. Reporting "no utility model" is the
+    // same answer any other unrunnable custom pick gets.
+    setProvider("claude", capabilities([model("claude-haiku-4-5")]));
+    useSettingsStore.setState({
+      settings: {
+        "ai.utility.mode": "custom",
+        "ai.utility.provider": "cursor",
+        "ai.utility.model": "auto",
       },
     });
     expect(utilitySelectionFromStores()).toBeNull();

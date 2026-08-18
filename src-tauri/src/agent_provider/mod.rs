@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod codex;
 pub mod context_usage;
+pub mod cursor;
 pub mod errors;
 pub mod events;
 pub mod health;

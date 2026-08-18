@@ -19,6 +19,9 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> = {
   claude: "claude-opus-4-8",
   codex: "gpt-5.4",
+  // Cursor resolves this provider-native alias until its live ACP model
+  // catalogue has hydrated. No concrete Cursor model is hardcoded.
+  cursor: "default",
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
   // live in Stage 2 and effectively zero out this fallback once the
   // store hydrates; the slug here follows OpenCode's own
@@ -44,8 +47,29 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
 > = {
   claude: "bypassPermissions",
   codex: "danger-full-access",
+  cursor: "agent",
   opencode: null,
 };
+
+/**
+ * Providers Codemux can drive as a ONE-SHOT, non-interactive CLI.
+ *
+ * Chat providers speak a long-lived session protocol; the background
+ * text-generation features (utility agent, commit messages, merge
+ * resolution) instead shell out once, pipe a prompt in, and read the
+ * answer back. Two Rust dispatchers own that shape —
+ * `utility_ai.rs::build_invocation` and `ai.rs::build_resolver_argv` —
+ * and both know exactly these three CLIs.
+ *
+ * Cursor is deliberately absent: `cursor-agent` ships no equivalent
+ * non-interactive mode, so a Cursor selection would either fail with
+ * `utility_provider_unsupported` or (in the resolver's case) silently
+ * fall through to the `claude` binary carrying a Cursor model slug.
+ * Every picker bound to one of those backends passes this list as its
+ * `allowedProviders` so the choice cannot be made in the first place.
+ */
+export const NON_INTERACTIVE_CLI_PROVIDERS: ReadonlyArray<AgentChatProviderKind> =
+  ["claude", "codex", "opencode"];
 
 /**
  * Whether a provider's outstanding approval / input requests can still be
@@ -69,6 +93,7 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
 > = {
   claude: false,
   codex: false,
+  cursor: false,
   opencode: true,
 };
 

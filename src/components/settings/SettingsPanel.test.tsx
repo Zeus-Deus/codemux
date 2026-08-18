@@ -144,16 +144,14 @@ vi.mock("@/tauri/events", () => ({
 
 // ── Model picker mock ──
 //
-// Both settings rows now use `MultiProviderModelPicker`; the commits
-// row passes `allowedProviders=["claude"]` to keep that backend's
-// claude-only constraint, while the resolver row leaves it open. We
-// mock the picker as a thin shell that:
-//   - surfaces `allowedProviders` as a data attribute so tests can
-//     distinguish the two instances on the page
-//   - fires a sensible change tuple on click. When restricted to a
-//     single provider, the mock fires THAT provider; otherwise it
-//     simulates a cross-provider switch (claude → opencode) so the
-//     resolver test can prove both setters are invoked atomically.
+// Both settings rows use `MultiProviderModelPicker`, each pinned to the
+// providers their Rust backend can actually run (`build_resolver_argv`:
+// claude / codex / opencode). We mock the picker as a thin shell that:
+//   - surfaces `allowedProviders` as a data attribute so tests can pin
+//     the allowlist each row passes
+//   - fires a cross-provider change tuple on click (the LAST allowed
+//     provider, which is never the seeded one) so each row's test can
+//     prove both setters are invoked atomically.
 //
 // The picker's real internals (search, rail, error states, loading
 // skeletons, favorites) are covered by chat-side tests. Reusing the
@@ -172,9 +170,11 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
     onProviderModelChange: (provider: string, model: string) => void;
     allowedProviders?: ReadonlyArray<string>;
   }) => {
-    const restricted =
-      Array.isArray(allowedProviders) && allowedProviders.length > 0;
-    const allowedKey = restricted ? allowedProviders!.join(",") : "all";
+    const allowed =
+      Array.isArray(allowedProviders) && allowedProviders.length > 0
+        ? allowedProviders
+        : null;
+    const allowedKey = allowed ? allowed.join(",") : "all";
     return (
       <button
         type="button"
@@ -183,17 +183,11 @@ vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
         data-model={model ?? ""}
         data-allowed={allowedKey}
         onClick={() => {
-          if (restricted) {
-            // Pinned-provider case (commits): pick a model in the same
-            // provider so the wiring stays type-correct. The first
-            // allowed provider wins.
-            onProviderModelChange(allowedProviders![0]!, "claude-test-model");
-          } else {
-            // Multi-provider case (resolver): simulate flipping to a
-            // different provider so the test can verify BOTH the cli
-            // setter and the model setter fire atomically.
-            onProviderModelChange("opencode", "anthropic/claude-3-5-sonnet");
-          }
+          // Simulate flipping to a DIFFERENT provider so each test can
+          // verify the cli setter and the model setter fire atomically.
+          // A restricted picker switches within its own allowlist.
+          const next = allowed ? allowed[allowed.length - 1]! : "opencode";
+          onProviderModelChange(next, "anthropic/claude-3-5-sonnet");
         }}
       >
         MultiPicker:{provider}/{model ?? "default"}/{allowedKey}
@@ -322,11 +316,10 @@ describe("SettingsPanel — Git section model pickers", () => {
     fireEvent.click(gitButtons[0]);
   }
 
-  /** Both pickers in the Git section now use the same shared
-   *  `MultiProviderModelPicker` with no `allowedProviders` allowlist —
-   *  the commits row went open after the backend was generalised to
-   *  accept any CLI (claude / codex / opencode) via `build_resolver_argv`.
-   *  Distinguish them by document order: the FIRST live picker is the
+  /** Both pickers in the Git section use the same shared
+   *  `MultiProviderModelPicker`, both pinned to the CLIs
+   *  `build_resolver_argv` actually dispatches (claude / codex /
+   *  opencode). Distinguish them by document order: the FIRST live picker is the
    *  "Used to generate commit messages" row, the SECOND is the merge
    *  resolver row. ScrollArea duplicates trees for measurement, so we
    *  filter to the unique instances by stable side-effect (the
@@ -343,21 +336,23 @@ describe("SettingsPanel — Git section model pickers", () => {
 
   it("renders MultiProviderModelPicker for both rows, both seeded with the current cli + model", () => {
     // Both rows use the same picker (same component, same favorites
-    // store, identical visual style) and now both show all providers.
-    // The commits row going open is what closes the visual-consistency
-    // bug the user reported in the screenshots.
+    // store, identical visual style) and both offer the same drivers.
     openGitSection();
 
     const pickers = getPickers();
     // Mock app-store seeds both rows with provider="claude", model=null.
     expect(pickers[0]!.getAttribute("data-provider")).toBe("claude");
     expect(pickers[1]!.getAttribute("data-provider")).toBe("claude");
-    // Neither picker passes `allowedProviders` anymore — both surfaces
-    // accept all three drivers now. (The chat composer still passes no
-    // allowlist either, so all three pickers in the app are
-    // interchangeable wiring-wise.)
-    expect(pickers[0]!.getAttribute("data-allowed")).toBe("all");
-    expect(pickers[1]!.getAttribute("data-allowed")).toBe("all");
+    // Both rows are pinned to the CLIs `build_resolver_argv` knows.
+    // Cursor is a chat-only provider: it has no non-interactive mode,
+    // and an unrecognized cli silently falls through to the claude arm,
+    // which would run `claude` with a Cursor model slug.
+    expect(pickers[0]!.getAttribute("data-allowed")).toBe(
+      "claude,codex,opencode",
+    );
+    expect(pickers[1]!.getAttribute("data-allowed")).toBe(
+      "claude,codex,opencode",
+    );
   });
 
   it("clicking the commits picker writes BOTH ai_commit_message_cli AND ai_commit_message_model atomically", () => {
