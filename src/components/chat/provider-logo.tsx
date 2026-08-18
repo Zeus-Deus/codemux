@@ -7,17 +7,20 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 // SVG is treated as a self-contained asset rather than inlined markup.
 import claudeIcon from "@/assets/preset-icons/claude.svg";
 import codexIcon from "@/assets/preset-icons/codex.svg";
+import cursorIcon from "@/assets/preset-icons/cursor-agent.svg";
 import opencodeIcon from "@/assets/preset-icons/opencode.svg";
 
 const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   claude: claudeIcon,
   codex: codexIcon,
+  cursor: cursorIcon,
   opencode: opencodeIcon,
 };
 
 const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 

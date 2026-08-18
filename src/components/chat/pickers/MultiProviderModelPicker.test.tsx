@@ -63,6 +63,11 @@ const CODEX_CAPS = makeCaps([
   makeModel({ id: "codex-mini-latest", label: "codex-mini-latest" }),
 ]);
 
+const CURSOR_CAPS = makeCaps([
+  makeModel({ id: "auto", label: "Cursor Auto" }),
+  makeModel({ id: "cursor-fast", label: "Cursor Fast" }),
+]);
+
 const OPENCODE_CAPS = makeCaps([
   makeModel({
     id: "openai/gpt-5",
@@ -84,17 +89,21 @@ const OPENCODE_CAPS = makeCaps([
 function seedStore(opts: {
   claude?: ProviderChatCapabilities | null;
   codex?: ProviderChatCapabilities | null;
+  cursor?: ProviderChatCapabilities | null;
   opencode?: ProviderChatCapabilities | null;
   claudeError?: string | null;
   codexError?: string | null;
+  cursorError?: string | null;
   opencodeError?: string | null;
 } = {}) {
   useProviderCapabilities.setState({
     claude: opts.claude ?? null,
     codex: opts.codex ?? null,
+    cursor: opts.cursor ?? null,
     opencode: opts.opencode ?? null,
     claudeError: opts.claudeError ?? null,
     codexError: opts.codexError ?? null,
+    cursorError: opts.cursorError ?? null,
     opencodeError: opts.opencodeError ?? null,
     loaded: false,
   });
@@ -104,6 +113,7 @@ beforeEach(() => {
   seedStore({
     claude: CLAUDE_CAPS,
     codex: CODEX_CAPS,
+    cursor: CURSOR_CAPS,
     opencode: OPENCODE_CAPS,
   });
   // Clear any favorites from a previous test so the search-boost
@@ -259,12 +269,13 @@ describe("MultiProviderModelPicker — model descriptions", () => {
 });
 
 describe("MultiProviderModelPicker — provider rail", () => {
-  it("renders all three providers in the rail", async () => {
+  it("renders all four providers in the rail", async () => {
     const user = userEvent.setup();
     renderPicker();
     await openPicker(user);
     expect(screen.getByTestId("provider-rail-claude")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-codex")).toBeInTheDocument();
+    expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
   });
 

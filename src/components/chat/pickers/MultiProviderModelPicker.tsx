@@ -75,6 +75,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
 }> = [
   { kind: "claude", label: "Claude" },
   { kind: "codex", label: "Codex" },
+  { kind: "cursor", label: "Cursor" },
   { kind: "opencode", label: "OpenCode" },
 ];
 
@@ -119,12 +120,15 @@ function parseProviderError(error: string | null): ParsedProviderError | null {
     colonIdx >= 0 ? error.slice(colonIdx + 1).trim() || null : null;
   switch (head) {
     case "codex_not_installed":
+    case "cursor_not_installed":
     case "opencode_not_installed":
       return { kind: "not_installed", detail };
     case "codex_not_authenticated":
+    case "cursor_not_authenticated":
     case "opencode_not_authenticated":
       return { kind: "not_authenticated", detail };
     case "codex_harvest_failed":
+    case "cursor_harvest_failed":
     case "opencode_harvest_failed":
       return { kind: "harvest_failed", detail };
     default:
@@ -235,6 +239,7 @@ export function MultiProviderModelPicker({
   const allCaps = useProviderCapabilities();
   const claudeCaps = allCaps.claude;
   const codexCaps = allCaps.codex;
+  const cursorCaps = allCaps.cursor;
   const opencodeCaps = allCaps.opencode;
 
   // Subscribe to the favorites array so toggling a star while the
@@ -272,9 +277,10 @@ export function MultiProviderModelPicker({
     return {
       claude: rowsFromCaps("claude", claudeCaps),
       codex: rowsFromCaps("codex", codexCaps),
+      cursor: rowsFromCaps("cursor", cursorCaps),
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
-  }, [claudeCaps, codexCaps, opencodeCaps]);
+  }, [claudeCaps, codexCaps, cursorCaps, opencodeCaps]);
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
@@ -371,8 +377,10 @@ export function MultiProviderModelPicker({
     provider === "claude"
       ? claudeCaps
       : provider === "codex"
-      ? codexCaps
-      : opencodeCaps;
+        ? codexCaps
+        : provider === "cursor"
+          ? cursorCaps
+          : opencodeCaps;
   const resolvedModel = useMemo(
     () => selectModel(capsForCurrentProvider, model),
     [capsForCurrentProvider, model],
@@ -477,6 +485,7 @@ export function MultiProviderModelPicker({
                       railKey,
                       claudeCaps,
                       codexCaps,
+                      cursorCaps,
                       opencodeCaps,
                     )}
                     error={errorForRail(railKey, allCaps)}
@@ -489,6 +498,7 @@ export function MultiProviderModelPicker({
                       railKey,
                       claudeCaps,
                       codexCaps,
+                      cursorCaps,
                       opencodeCaps,
                     )}
                     error={errorForRail(railKey, allCaps)}
@@ -685,6 +695,7 @@ function capsForRail(
   rail: RailKey,
   claudeCaps: ProviderChatCapabilities | null,
   codexCaps: ProviderChatCapabilities | null,
+  cursorCaps: ProviderChatCapabilities | null,
   opencodeCaps: ProviderChatCapabilities | null,
 ): ProviderChatCapabilities | null {
   switch (rail) {
@@ -692,6 +703,8 @@ function capsForRail(
       return claudeCaps;
     case "codex":
       return codexCaps;
+    case "cursor":
+      return cursorCaps;
     case "opencode":
       return opencodeCaps;
     case "favorites":
@@ -1028,6 +1041,8 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Claude";
     case "codex":
       return "Codex";
+    case "cursor":
+      return "Cursor";
     case "opencode":
       return "OpenCode";
   }

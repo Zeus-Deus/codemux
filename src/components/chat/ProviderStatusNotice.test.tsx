@@ -49,6 +49,7 @@ function resetStore() {
       slots: {
         claude: emptyHealthSlot(),
         codex: emptyHealthSlot(),
+        cursor: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });

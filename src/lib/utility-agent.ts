@@ -82,7 +82,10 @@ export function utilitySelectionFromStores(): UtilityModelSelection | null {
     UTILITY_SETTING_KEYS.provider,
   ) as AgentChatProviderKind;
   const model = settings.get(UTILITY_SETTING_KEYS.model).trim();
-  if (!model || !["claude", "codex", "opencode"].includes(provider))
+  if (
+    !model ||
+    !["claude", "codex", "cursor", "opencode"].includes(provider)
+  )
     return null;
   const effort = settings.get(UTILITY_SETTING_KEYS.effort).trim() || null;
   return { provider, model, effort };

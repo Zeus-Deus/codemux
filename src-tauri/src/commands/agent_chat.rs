@@ -110,6 +110,7 @@ pub fn feature_flag_on(store: &ObservabilityStore) -> Result<(), String> {
 pub struct ProviderRegistry {
     claude: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
@@ -133,6 +134,11 @@ impl ProviderRegistry {
         *self.codex.write().await = Some(provider);
     }
 
+    /// Inject the Cursor ACP provider.
+    pub async fn set_cursor(&self, provider: Arc<dyn AgentProvider>) {
+        *self.cursor.write().await = Some(provider);
+    }
+
     /// Inject the OpenCode provider. Reserved for a later stage; the
     /// Stage 1 scaffold never calls this so the slot stays `None`
     /// in production.
@@ -147,6 +153,7 @@ impl ProviderRegistry {
         match kind {
             ProviderKind::Claude => self.claude.read().await.clone(),
             ProviderKind::Codex => self.codex.read().await.clone(),
+            ProviderKind::Cursor => self.cursor.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
         }
     }
@@ -160,6 +167,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.codex.read().await.clone() {
             out.push((ProviderKind::Codex, p));
+        }
+        if let Some(p) = self.cursor.read().await.clone() {
+            out.push((ProviderKind::Cursor, p));
         }
         if let Some(p) = self.opencode.read().await.clone() {
             out.push((ProviderKind::OpenCode, p));
@@ -585,6 +595,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         let provider_name = match provider {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
         };
         let persisted_sdk_session_id = {
@@ -698,6 +709,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         let provider_str = match provider {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
         };
         // A CodeMux thread can keep its transcript while changing provider,
@@ -1275,6 +1287,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
     match provider {
         "claude" => Ok(ProviderKind::Claude),
         "codex" => Ok(ProviderKind::Codex),
+        "cursor" => Ok(ProviderKind::Cursor),
         "opencode" => Ok(ProviderKind::OpenCode),
         other => Err(format!("unsupported provider stored for chat: {other}")),
     }
@@ -1546,6 +1559,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
+        ProviderKind::Cursor => Some("agent"),
         ProviderKind::OpenCode => None,
     }
 }
@@ -1585,6 +1599,18 @@ fn resolve_start_permission_mode(
         }
         Some(mode) if provider == ProviderKind::Claude && mode == "danger-full-access" => {
             Some("bypassPermissions".to_string())
+        }
+        Some(mode)
+            if provider == ProviderKind::Cursor
+                && matches!(mode.as_str(), "bypassPermissions" | "danger-full-access") =>
+        {
+            Some("agent".to_string())
+        }
+        Some(mode) if provider == ProviderKind::Claude && mode == "agent" => {
+            Some("bypassPermissions".to_string())
+        }
+        Some(mode) if provider == ProviderKind::Codex && mode == "agent" => {
+            Some("danger-full-access".to_string())
         }
         Some(mode) => Some(mode),
         None => fallback_permission_mode(provider).map(str::to_string),
@@ -1837,6 +1863,10 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
     match provider {
         ProviderKind::Claude => crate::skills::SkillProvider::Claude,
         ProviderKind::Codex => crate::skills::SkillProvider::Codex,
+        // Cursor has no native SKILL.md inventory. Reuse the portable
+        // `.agents/skills` projection; selected bodies are inlined into the
+        // ACP prompt exactly as they are for the other providers.
+        ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
     }
 }
@@ -1968,21 +1998,21 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     let turn_checkpoint: Option<Arc<dyn TurnDispatchCheckpoint>> = if run_checkpoints_enabled()
         && impl_.capabilities().supports_conversation_rollback
     {
-        db.get_agent_chat_session(&thread_id_for_persist)
-            .and_then(|session| {
-                session.cwd.map(|repo_path| {
-                    Arc::new(GitTurnDispatchCheckpoint::new(
-                        app.clone(),
-                        thread_id_for_persist.clone(),
-                        session.workspace_id,
-                        repo_path,
-                        input.client_nonce.clone(),
-                    )) as Arc<dyn TurnDispatchCheckpoint>
+            db.get_agent_chat_session(&thread_id_for_persist)
+                .and_then(|session| {
+                    session.cwd.map(|repo_path| {
+                        Arc::new(GitTurnDispatchCheckpoint::new(
+                            app.clone(),
+                            thread_id_for_persist.clone(),
+                            session.workspace_id,
+                            repo_path,
+                            input.client_nonce.clone(),
+                        )) as Arc<dyn TurnDispatchCheckpoint>
+                    })
                 })
-            })
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let skill_invocations = if input.skill_ids.is_empty() {
         Vec::new()
     } else {
@@ -3266,6 +3296,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
     >,
+    cursor_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>,
+    >,
     claude_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
@@ -3313,6 +3347,18 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .get_or_harvest(&binary_path, None)
                 .await
                 .map_err(|err| err.to_command_string())
+        }
+        ProviderKind::Cursor => {
+            let binary_path = which::which("cursor-agent").map_err(|_| {
+                crate::agent_provider::cursor::capabilities::HarvestError::NotInstalled {
+                    hint: "Install Cursor Agent from https://cursor.com/docs/cli/installation and ensure `cursor-agent` is on PATH.".into(),
+                }
+                .to_command_string()
+            })?;
+            cursor_cache
+                .get_or_harvest(&binary_path)
+                .await
+                .map_err(|error| error.to_command_string())
         }
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
@@ -3370,7 +3416,7 @@ pub async fn list_chat_slash_commands(
         ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
         // No discovery surface on these providers (yet) — empty list,
         // not an error, so the popup renders without a failure footer.
-        ProviderKind::Codex | ProviderKind::OpenCode => Ok(Vec::new()),
+        ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::OpenCode => Ok(Vec::new()),
     }
 }
 
@@ -3980,6 +4026,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     let provider = match record.provider.to_ascii_lowercase().as_str() {
         "claude" => ProviderKind::Claude,
         "codex" => ProviderKind::Codex,
+        "cursor" => ProviderKind::Cursor,
         "opencode" => ProviderKind::OpenCode,
         other => return Err(format!("unsupported_provider: {other}")),
     };
@@ -6594,6 +6641,10 @@ mod tests {
             resolve_start_permission_mode(ProviderKind::Codex, None),
             Some("danger-full-access".to_string())
         );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Cursor, None),
+            Some("agent".to_string())
+        );
         // OpenCode has no permission modes, so None stays None.
         assert_eq!(
             resolve_start_permission_mode(ProviderKind::OpenCode, None),
@@ -6629,6 +6680,17 @@ mod tests {
                 Some("danger-full-access".to_string())
             ),
             Some("bypassPermissions".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Cursor,
+                Some("danger-full-access".to_string())
+            ),
+            Some("agent".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Codex, Some("agent".to_string())),
+            Some("danger-full-access".to_string())
         );
     }
 
@@ -8254,12 +8316,12 @@ mod tests {
     #[test]
     fn an_empty_subagent_id_never_publishes_or_consumes_a_review() {
         let empty = |status| ProviderRuntimeEvent::SubagentUpdated {
-                thread_id: tid(),
-                subagent: SubagentSnapshot {
-                    subagent_id: String::new(),
-                    status,
-                    ..Default::default()
-                },
+            thread_id: tid(),
+            subagent: SubagentSnapshot {
+                subagent_id: String::new(),
+                status,
+                ..Default::default()
+            },
         };
 
         // Mid-turn: no-op, exactly as before.

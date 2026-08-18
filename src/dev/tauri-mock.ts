@@ -1200,6 +1200,67 @@ const CODEX_UTILITY_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+/** Mirrors Cursor's ACP `cursor/list_available_models` extension: options
+ * are per model, not provider-wide. This keeps browser-dev useful for
+ * verifying that controls appear and disappear as the selected row changes. */
+const CURSOR_CAPABILITIES: ProviderChatCapabilities = {
+  models: [
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "cursor-auto",
+      label: "Cursor Auto",
+      description: "Dynamically selected by Cursor",
+      effort_levels: ["low", "medium", "high", "max"],
+      default_effort: "medium",
+      context_window_options: [
+        {
+          value: "200k",
+          label: "200K",
+          is_default: true,
+          context_window_tokens: 200_000,
+        },
+        {
+          value: "1m",
+          label: "1M",
+          is_default: false,
+          context_window_tokens: 1_000_000,
+        },
+      ],
+      supports_fast_mode: true,
+      supports_images: true,
+    },
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "cursor-small",
+      label: "Cursor Small",
+      description: "No model-specific options",
+    },
+  ],
+  effort_granularity: "per_turn",
+  effort_label_map: {
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    max: "Max",
+  },
+  permission_modes: [
+    {
+      value: "ask",
+      label: "Ask first",
+      description: "Ask before commands or edits that need approval.",
+      is_default: false,
+    },
+    {
+      value: "agent",
+      label: "Full access",
+      description: "Allow Cursor Agent to work without approval prompts.",
+      is_default: true,
+    },
+  ],
+  default_permission_mode: "agent",
+  permission_granularity: "per_turn",
+};
+
 /** Number of simulated turns in the seeded transcript. Every 5th turn
  * includes an 8-call tool burst (exercises run folding). At 520 turns the
  * derived transcript still has more than 1,100 independently virtualized
@@ -2091,7 +2152,7 @@ function streamMockRunStalled(
 
 /** Provider-health QA: per-provider override served by the
  *  `agent_chat_provider_health` mock handler. Absent → healthy. */
-type MockProviderKind = "claude" | "codex" | "opencode";
+type MockProviderKind = "claude" | "codex" | "cursor" | "opencode";
 const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
@@ -2765,6 +2826,8 @@ const handlers: Record<string, Handler> = {
       ? CLAUDE_CAPABILITIES
       : a.provider === "codex"
         ? CODEX_UTILITY_CAPABILITIES
+        : a.provider === "cursor"
+          ? CURSOR_CAPABILITIES
         : EMPTY_CAPABILITIES,
   // Provider slash commands — in production these are harvested live
   // from the deployed Claude Code CLI (SDK `supportedCommands()`),

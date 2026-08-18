@@ -182,7 +182,8 @@ export function planSubmit(input: PlanSubmitInput): SubmitPlan {
       : rawText;
   return {
     text,
-    effortOverride: provider === "codex" ? effort : null,
+    effortOverride:
+      provider === "codex" || provider === "cursor" ? effort : null,
   };
 }
 

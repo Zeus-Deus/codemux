@@ -57,6 +57,7 @@ impl ProviderInstanceId {
         let slug = match driver {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
+            ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
         };
         Self(slug.to_string())
@@ -82,6 +83,7 @@ mod tests {
         let cases = [
             (ProviderKind::Claude, "claude"),
             (ProviderKind::Codex, "codex"),
+            (ProviderKind::Cursor, "cursor"),
             (ProviderKind::OpenCode, "opencode"),
         ];
         for (driver, slug) in cases {

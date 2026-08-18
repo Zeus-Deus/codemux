@@ -140,10 +140,10 @@ fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
                 .ok()
                 .flatten()
                 .map_or(false, |m| {
-                    let mw = m.size().width as f64 / sf;
-                    let mh = m.size().height as f64 / sf;
-                    lw + 100.0 >= mw && lh + 100.0 >= mh
-                });
+                let mw = m.size().width as f64 / sf;
+                let mh = m.size().height as f64 / sf;
+                lw + 100.0 >= mw && lh + 100.0 >= mh
+            });
 
             if fills_monitor {
                 db.delete_ui_state("window_width").ok();
@@ -338,6 +338,12 @@ fn build_core_app<R: tauri::Runtime>(
         // call for the Codex provider.
         .manage(std::sync::Arc::new(
             crate::agent_provider::codex::capabilities::CodexCapabilityCache::new(),
+        ))
+        // Cursor models and their parameterized options are discovered from
+        // the installed ACP server. No model catalogue is compiled into
+        // Codemux, so provider releases appear after a capability refresh.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::cursor::capabilities::CursorCapabilityCache::new(),
         ))
         // Claude capability cache — populated lazily on the first
         // `list_chat_provider_capabilities` call for Claude when
@@ -968,6 +974,16 @@ fn build_core_app<R: tauri::Runtime>(
                             agent_provider::codex::CodexAgentProvider::new(codex_config);
                         registry
                             .set_codex(std::sync::Arc::new(codex) as _)
+                            .await;
+
+                        // Cursor Agent speaks the official Agent Client
+                        // Protocol over stdio. Like Codex, its subprocess is
+                        // spawned lazily per chat session.
+                        let cursor = agent_provider::cursor::CursorAgentProvider::new(
+                            agent_provider::cursor::CursorProviderConfig::default(),
+                        );
+                        registry
+                            .set_cursor(std::sync::Arc::new(cursor) as _)
                             .await;
 
                         // OpenCode provider — Step 12 Stage 8. Shares

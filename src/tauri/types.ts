@@ -816,7 +816,11 @@ export interface TabSnapshot {
   icon: string | null;
 }
 
-export type AgentChatProviderKind = "claude" | "codex" | "opencode";
+export type AgentChatProviderKind =
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "opencode";
 
 /** Launch-time model / reasoning / context choice for a CLI agent
  *  preset. Every field is optional — `null` means "use the agent's own

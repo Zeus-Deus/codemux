@@ -67,9 +67,11 @@ function resetStore() {
   useProviderCapabilities.setState({
     claude: null,
     codex: null,
+    cursor: null,
     opencode: null,
     claudeError: null,
     codexError: null,
+    cursorError: null,
     opencodeError: null,
     loaded: false,
   });
@@ -109,7 +111,7 @@ describe("provider-capabilities-store", () => {
     expect(state.codexError).toBeNull();
   });
 
-  it("refreshAll fires all three providers in parallel", async () => {
+  it("refreshAll fires all four providers in parallel", async () => {
     const calls: AgentChatProviderKind[] = [];
     mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
       calls.push(provider);
@@ -119,11 +121,12 @@ describe("provider-capabilities-store", () => {
     await useProviderCapabilities.getState().refreshAll();
     // Order is not guaranteed, but every provider must have been
     // called exactly once.
-    expect(calls.sort()).toEqual(["claude", "codex", "opencode"]);
+    expect(calls.sort()).toEqual(["claude", "codex", "cursor", "opencode"]);
     const state = useProviderCapabilities.getState();
     expect(state.loaded).toBe(true);
     expect(state.claude).not.toBeNull();
     expect(state.codex).not.toBeNull();
+    expect(state.cursor).not.toBeNull();
     expect(state.opencode).not.toBeNull();
   });
 
@@ -141,6 +144,7 @@ describe("provider-capabilities-store", () => {
     expect(state.loaded).toBe(true);
     expect(state.claude?.models[0]?.id).toBe("model-claude");
     expect(state.codex?.models[0]?.id).toBe("model-codex");
+    expect(state.cursor?.models[0]?.id).toBe("model-cursor");
     expect(state.opencode).toBeNull();
     expect(state.opencodeError).toBe("opencode_not_installed");
   });
@@ -149,16 +153,19 @@ describe("provider-capabilities-store", () => {
     const caps = useProviderCapabilities.getState();
     const claudeCaps = makeCaps("claude-opus-4-7");
     const codexCaps = makeCaps("gpt-5.4");
+    const cursorCaps = makeCaps("auto");
     const opencodeCaps = makeCaps("openai/gpt-5");
     useProviderCapabilities.setState({
       claude: claudeCaps,
       codex: codexCaps,
+      cursor: cursorCaps,
       opencode: opencodeCaps,
     });
 
     const updated = useProviderCapabilities.getState();
     expect(selectCapabilities(updated, "claude")).toBe(claudeCaps);
     expect(selectCapabilities(updated, "codex")).toBe(codexCaps);
+    expect(selectCapabilities(updated, "cursor")).toBe(cursorCaps);
     // The Stage 2 bug: a non-exhaustive ternary returned `state.codex`
     // for any non-claude provider. Pin the fix here so a regression
     // can't reintroduce it silently.
@@ -173,11 +180,13 @@ describe("provider-capabilities-store", () => {
     useProviderCapabilities.setState({
       claudeError: "claude broke",
       codexError: "codex broke",
+      cursorError: "cursor_not_authenticated",
       opencodeError: "opencode_not_installed",
     });
     const state = useProviderCapabilities.getState();
     expect(selectError(state, "claude")).toBe("claude broke");
     expect(selectError(state, "codex")).toBe("codex broke");
+    expect(selectError(state, "cursor")).toBe("cursor_not_authenticated");
     expect(selectError(state, "opencode")).toBe("opencode_not_installed");
   });
 

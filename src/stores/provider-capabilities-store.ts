@@ -7,9 +7,12 @@ import type {
   ProviderChatCapabilities,
 } from "@/tauri/types";
 
+const CURSOR_CAPABILITY_REFRESH_MS = 5 * 60 * 1000;
+
 interface ProviderCapabilitiesStore {
   claude: ProviderChatCapabilities | null;
   codex: ProviderChatCapabilities | null;
+  cursor: ProviderChatCapabilities | null;
   /** Step 12 Stage 3 — slot for OpenCode's live model harvest. Stays
    *  `null` until `refresh("opencode")` resolves. Failure surfaces in
    *  `opencodeError`; the slot itself stays `null` so the picker can
@@ -17,6 +20,7 @@ interface ProviderCapabilitiesStore {
   opencode: ProviderChatCapabilities | null;
   claudeError: string | null;
   codexError: string | null;
+  cursorError: string | null;
   opencodeError: string | null;
   loaded: boolean;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
@@ -27,9 +31,11 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
   (set) => ({
     claude: null,
     codex: null,
+    cursor: null,
     opencode: null,
     claudeError: null,
     codexError: null,
+    cursorError: null,
     opencodeError: null,
     loaded: false,
     refresh: async (provider) => {
@@ -53,6 +59,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
       await Promise.all([
         store.refresh("claude"),
         store.refresh("codex"),
+        store.refresh("cursor"),
         store.refresh("opencode"),
       ]);
       set({ loaded: true });
@@ -83,9 +90,25 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
  */
 export function useProviderCapabilitiesInit(): void {
   const refreshAll = useProviderCapabilities((s) => s.refreshAll);
+  const refresh = useProviderCapabilities((s) => s.refresh);
   useEffect(() => {
-    void refreshAll();
-  }, [refreshAll]);
+    let timer: number | null = null;
+    let cancelled = false;
+    void refreshAll().finally(() => {
+      if (cancelled) return;
+      timer = window.setInterval(() => {
+        void refresh("cursor");
+      }, CURSOR_CAPABILITY_REFRESH_MS);
+    });
+    // Cursor's installed CLI is the catalog authority. Refresh on a bounded
+    // cadence so newly released/retired models appear without a Codemux
+    // release or app restart. Start the clock after the initial harvest so
+    // the matching Rust TTL has definitely elapsed on the first tick.
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [refreshAll, refresh]);
 }
 
 /** Convenience selector: capabilities for the given provider, or null.
@@ -101,6 +124,8 @@ export function selectCapabilities(
       return state.claude;
     case "codex":
       return state.codex;
+    case "cursor":
+      return state.cursor;
     case "opencode":
       return state.opencode;
   }
@@ -116,6 +141,8 @@ export function selectError(
       return state.claudeError;
     case "codex":
       return state.codexError;
+    case "cursor":
+      return state.cursorError;
     case "opencode":
       return state.opencodeError;
   }
@@ -159,6 +186,8 @@ function storeOk(
       return { claude: caps, claudeError: null };
     case "codex":
       return { codex: caps, codexError: null };
+    case "cursor":
+      return { cursor: caps, cursorError: null };
     case "opencode":
       return { opencode: caps, opencodeError: null };
   }
@@ -177,6 +206,8 @@ function storeErr(
       return { claudeError: message };
     case "codex":
       return { codexError: message };
+    case "cursor":
+      return { cursorError: message };
     case "opencode":
       return { opencodeError: message };
   }

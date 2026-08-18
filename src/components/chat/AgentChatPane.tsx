@@ -164,6 +164,7 @@ const ENABLE_PROVIDER_PICKER = true;
 const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
+  cursor: "Cursor",
   opencode: "OpenCode",
 };
 
@@ -2331,6 +2332,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAcceptPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "cursor") {
+        // Cursor's documented create_plan extension is a blocking RPC.
+        // Resolve that request directly; no synthetic follow-up turn or
+        // Claude-specific mode transition is needed.
+        await handleRespond(requestId, { decision: "allow" }, true);
+        return;
+      }
       // Collapse the plan card locally. The sidecar denied+interrupted
       // the ExitPlanMode tool before emitting the request, so no
       // `request-resolved` event will ever arrive — without this the
@@ -2362,6 +2370,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      handleRespond,
       markRequestResolved,
       setStorePermissionMode,
       setSessionLaunchMode,
@@ -2378,6 +2387,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleRejectPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "cursor") {
+        await handleRespond(
+          requestId,
+          { decision: "deny", message: "Please revise the plan." },
+          true,
+        );
+        return;
+      }
       // Same reasoning as handleAcceptPlan: no sidecar round-trip, so
       // collapse the card locally before firing the follow-up turn.
       markRequestResolved(threadId, requestId, {
@@ -2396,7 +2413,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         toast.error(`Failed to reject plan: ${err}`);
       }
     },
-    [threadId, provider, markRequestResolved],
+    [threadId, provider, handleRespond, markRequestResolved],
   );
 
   // Composer-level mode pill activation. Plan and Ask both flip the
@@ -2727,10 +2744,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       if (!threadId) return;
       setStoreContextWindow(threadId, next);
       persistSessionConfig({ context_window: next });
-      // Context window on Claude is encoded into the model id (e.g.
-      // `claude-opus-4-7[1m]`), which is a session-init parameter.
-      // Mid-session change → restart.
-      if (provider === "claude") {
+      // Claude encodes context into the model id; Cursor exposes context as
+      // an ACP session config option. Both must be applied before the next
+      // turn, so rebuild the resumable provider session with the new value.
+      if (provider === "claude" || provider === "cursor") {
         restartSessionWith({ contextWindow: next });
       }
     },

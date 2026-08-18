@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 /// The set of CLI-backed coding agents the chat runtime can drive.
 ///
-/// Serialized as lowercase strings (`"claude"`, `"codex"`, `"opencode"`) so
+/// Serialized as lowercase strings (`"claude"`, `"codex"`, `"cursor"`,
+/// `"opencode"`) so
 /// values round-trip cleanly through JSON settings and IPC surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,6 +24,8 @@ pub enum ProviderKind {
     Claude,
     /// Codex via the `codex app-server` JSON-RPC binary.
     Codex,
+    /// Cursor Agent via its official Agent Client Protocol server.
+    Cursor,
     /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.

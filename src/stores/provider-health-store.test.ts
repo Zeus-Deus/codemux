@@ -69,6 +69,7 @@ describe("provider-health-store", () => {
       slots: {
         claude: emptyHealthSlot(),
         codex: emptyHealthSlot(),
+        cursor: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });

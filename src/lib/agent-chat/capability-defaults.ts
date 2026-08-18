@@ -19,6 +19,9 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> = {
   claude: "claude-opus-4-8",
   codex: "gpt-5.4",
+  // Cursor resolves this provider-native alias until its live ACP model
+  // catalogue has hydrated. No concrete Cursor model is hardcoded.
+  cursor: "default",
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
   // live in Stage 2 and effectively zero out this fallback once the
   // store hydrates; the slug here follows OpenCode's own
@@ -44,6 +47,7 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
 > = {
   claude: "bypassPermissions",
   codex: "danger-full-access",
+  cursor: "agent",
   opencode: null,
 };
 
@@ -69,6 +73,7 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
 > = {
   claude: false,
   codex: false,
+  cursor: false,
   opencode: true,
 };
 
