@@ -894,9 +894,15 @@ describe("Default base branch", () => {
     // Also seed the detailed list so the BranchPicker popover has options
     const { listBranchesDetailed } = await import("@/tauri/commands");
     (listBranchesDetailed as Mock).mockResolvedValue([
-      { name: "main", last_commit_unix: 1, is_local: true, is_remote: true },
-      { name: "master", last_commit_unix: 2, is_local: true, is_remote: true },
-      { name: "feature-x", last_commit_unix: 3, is_local: true, is_remote: false },
+      { name: "main", last_commit_unix: 1, is_local: true, is_remote: true, is_head: true },
+      { name: "master", last_commit_unix: 2, is_local: true, is_remote: true, is_head: false },
+      {
+        name: "feature-x",
+        last_commit_unix: 3,
+        is_local: true,
+        is_remote: false,
+        is_head: false,
+      },
     ]);
 
     renderDialog(true);

@@ -584,6 +584,9 @@ export interface BranchDetail {
   last_commit_unix: number;
   is_local: boolean;
   is_remote: boolean;
+  /** True for the local branch checked out at the project path this list
+   *  came from. Detached HEAD leaves every entry false. */
+  is_head: boolean;
 }
 
 export interface WorktreeInfo {

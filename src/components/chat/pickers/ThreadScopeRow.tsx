@@ -737,9 +737,16 @@ function BranchControl({
     return set;
   }, [groups, projectPath]);
 
+  // Switching the thread's project invalidates the list — otherwise the
+  // fetch below sees a non-null `branches` and keeps serving the previous
+  // project's branches, including its checked-out one.
+  useEffect(() => {
+    setBranches(null);
+  }, [projectPath]);
+
   // Fetch eagerly on mount (not just on open) so the current/worktree
   // mode's displayed branch corrects itself before the user opens the
-  // popover (carried over from the retired DerivativeBranchPicker).
+  // popover.
   useEffect(() => {
     if (!projectPath) return;
     if (branches !== null) return;
@@ -760,13 +767,25 @@ function BranchControl({
     };
   }, [projectPath, branches]);
 
-  // Seed / auto-correct the base branch once the branch list loads —
-  // main/master/first-branch heuristic (carried over from the retired
-  // DerivativeBranchPicker), used when the caller couldn't seed the
-  // value from the workspace snapshot's `git_branch`.
+  // The branch actually checked out in the project directory, if the
+  // backend could resolve one (detached HEAD reports none).
+  const headBranch = useMemo(
+    () => branches?.find((b) => b.is_head)?.name ?? null,
+    [branches],
+  );
+
+  // Seed / auto-correct the base branch once the branch list loads. The
+  // checked-out branch wins: in "current checkout" mode that IS the branch
+  // the agent will work in, so showing anything else would promise a base
+  // the thread never gets. Only when no branch is flagged (detached HEAD)
+  // do we fall back to the main/master/first-branch guess.
   useEffect(() => {
     if (!branches || branches.length === 0) return;
     if (baseBranch && branches.some((b) => b.name === baseBranch)) return;
+    if (headBranch) {
+      onChangeBaseBranch(headBranch);
+      return;
+    }
     const names = branches.map((b) => b.name);
     const best = names.includes("main")
       ? "main"
@@ -774,7 +793,19 @@ function BranchControl({
         ? "master"
         : names[0];
     onChangeBaseBranch(best);
-  }, [branches, baseBranch, onChangeBaseBranch]);
+  }, [branches, baseBranch, headBranch, onChangeBaseBranch]);
+
+  // In "current checkout" mode the pill can only truthfully show HEAD —
+  // submit ignores `baseBranch` there and opens the project directory
+  // as-is. Keep it pinned to the real checkout so a stale value (a draft
+  // persisted before the list loaded, a worktree draft switched back to
+  // current, or a `git checkout` run outside the app) never promises a
+  // branch the thread won't get. Picking a different branch still flips
+  // to worktree mode via `handleSelect`, so this never fights the user.
+  useEffect(() => {
+    if (checkoutMode !== "current" || !headBranch) return;
+    if (headBranch !== baseBranch) onChangeBaseBranch(headBranch);
+  }, [checkoutMode, headBranch, baseBranch, onChangeBaseBranch]);
 
   const handleSelect = (name: string) => {
     setOpen(false);

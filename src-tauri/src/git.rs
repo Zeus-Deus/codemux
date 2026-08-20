@@ -1857,6 +1857,11 @@ pub struct BranchDetail {
     pub last_commit_unix: i64,
     pub is_local: bool,
     pub is_remote: bool,
+    /// True for the local branch currently checked out at the repo path
+    /// this list was built from. Detached HEAD leaves every entry false.
+    /// The composer's base-branch pill seeds from this so "current
+    /// checkout" shows the branch the user would actually work in.
+    pub is_head: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1954,6 +1959,16 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
         ],
     )?;
 
+    // The branch HEAD points at, if any. `symbolic-ref -q` exits non-zero
+    // on a detached HEAD (and on an unborn HEAD it still reports the
+    // branch name, which is fine — that ref just has no commit yet, so it
+    // won't appear in the list below). Errors are non-fatal: worst case no
+    // row is flagged.
+    let head_branch: Option<String> = run_git(repo_path, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut map: HashMap<String, BranchDetail> = HashMap::new();
 
     for line in output.lines() {
@@ -1993,6 +2008,10 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
                     existing.is_remote = true;
                 } else {
                     existing.is_local = true;
+                    // Only a local ref can be the checked-out branch.
+                    if head_branch.as_deref() == Some(name) {
+                        existing.is_head = true;
+                    }
                 }
                 if timestamp > existing.last_commit_unix {
                     existing.last_commit_unix = timestamp;
@@ -2006,6 +2025,7 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
                         last_commit_unix: timestamp,
                         is_local: !is_remote,
                         is_remote,
+                        is_head: !is_remote && head_branch.as_deref() == Some(name),
                     },
                 );
             }
@@ -3834,6 +3854,30 @@ C  source.txt -> copy.txt";
         assert!(default.is_local);
         assert!(!default.is_remote);
         assert!(default.last_commit_unix > 0);
+    }
+
+    #[test]
+    fn test_list_branches_detailed_flags_checked_out_branch() {
+        let (_dir, repo) = setup_test_repo();
+        let head = run_git(&repo, &["symbolic-ref", "--short", "HEAD"]).expect("head");
+        let head = head.trim().to_string();
+
+        let branches = git_list_branches_detailed(&repo).expect("list detailed");
+        let flagged: Vec<&str> = branches.iter().filter(|b| b.is_head).map(|b| b.name.as_str()).collect();
+        assert_eq!(flagged, vec![head.as_str()], "only the checked-out branch is head");
+
+        // Switching branches moves the flag with the checkout.
+        run_git(&repo, &["checkout", "-b", "other"]).expect("create other");
+        let branches = git_list_branches_detailed(&repo).expect("list detailed after checkout");
+        let other = branches.iter().find(|b| b.name == "other").expect("other present");
+        assert!(other.is_head, "other should be head after checkout");
+        let previous = branches.iter().find(|b| b.name == head).expect("previous branch present");
+        assert!(!previous.is_head, "{head} should no longer be head");
+
+        // Detached HEAD flags nothing.
+        run_git(&repo, &["checkout", "--detach"]).expect("detach");
+        let branches = git_list_branches_detailed(&repo).expect("list detailed detached");
+        assert!(branches.iter().all(|b| !b.is_head), "detached HEAD flags no branch");
     }
 
     #[test]
