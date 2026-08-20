@@ -17,6 +17,12 @@ const UNAUTHENTICATED_PATTERNS = [
   "not logged in",
   "run claude login",
   "not authenticated",
+  // Must be listed (and therefore matched) BEFORE the positive
+  // heuristic below, which looks for the substring "authenticated" —
+  // that substring also sits inside "unauthenticated", so a CLI that
+  // reports `Status: unauthenticated` would otherwise be read as
+  // logged in and no banner would ever appear.
+  "unauthenticated",
   "please log in",
   "login required",
 ];
@@ -92,9 +98,82 @@ export async function probeInstalled(
   return { installed: true, version: token };
 }
 
+/** Newer CLIs print `auth status` as a JSON object with a `loggedIn`
+ *  boolean. The legacy substring matcher below never sees the phrase
+ *  "logged in" in that form (the key is `loggedIn`), so without this
+ *  step a fully logged-in user is reported as `unknown` forever and
+ *  the chat surface shows a "could not verify" banner that no amount
+ *  of re-login clears. Returns `null` when the output is not JSON or
+ *  lacks the field, so the text heuristics still apply. */
+function classifyJsonAuthOutput(
+  output: string,
+): ProbeAuthenticatedResult | null {
+  for (const candidate of jsonObjectCandidates(output)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const loggedIn = (parsed as Record<string, unknown>)["loggedIn"];
+    if (typeof loggedIn !== "boolean") continue;
+    return loggedIn
+      ? { status: "authenticated" }
+      : {
+          status: "unauthenticated",
+          message:
+            "Claude CLI is not authenticated. Run `claude login` and retry.",
+        };
+  }
+  return null;
+}
+
+/** Every balanced top-level `{...}` region in `output`, in order.
+ *
+ *  Scanning for balanced regions rather than slicing first-`{` to
+ *  last-`}` matters because the classified text is stdout AND stderr
+ *  concatenated: one brace-bearing extra line (an update notice, a
+ *  second JSON object, a runtime warning) would make the single wide
+ *  slice unparseable and silently drop the whole probe back to
+ *  `unknown` — reinstating the very "could not verify" banner this
+ *  parsing exists to prevent. Quoted strings are tracked so braces
+ *  inside values (an org name, say) do not unbalance the scan. */
+function* jsonObjectCandidates(output: string): Generator<string> {
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < output.length; i += 1) {
+    const ch = output[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === "}") {
+      // A stray closer outside any object is noise, not an underflow.
+      if (depth === 0) continue;
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        yield output.slice(start, i + 1);
+        start = -1;
+      }
+    }
+  }
+}
+
 /** Classify combined stdout+stderr into an auth status. Split out
  *  so it is pure and unit-testable. */
 export function classifyAuthOutput(output: string): ProbeAuthenticatedResult {
+  const structured = classifyJsonAuthOutput(output);
+  if (structured) return structured;
   const lower = output.toLowerCase();
   for (const pattern of UNAUTHENTICATED_PATTERNS) {
     if (lower.includes(pattern)) {

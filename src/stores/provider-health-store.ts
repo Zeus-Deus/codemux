@@ -192,6 +192,13 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     // `ready` report would break the banner's probe-backed contract, so
     // the forced re-probe below re-establishes ground truth (and puts
     // the banner back if the provider really is still degraded).
+    //
+    // The user's dismissal is deliberately KEPT. Successful turns are
+    // the common case, so wiping it here would resurrect a dismissed
+    // banner on every send whenever the re-probe returns the same
+    // inconclusive answer (a probe that can't classify the CLI's
+    // output, say). `refresh` already clears the dismissal on a
+    // genuine recovery, and a DIFFERENT failure has a different key.
     set((state) => ({
       slots: {
         ...state.slots,
@@ -199,7 +206,6 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
           ...state.slots[provider],
           report: null,
           fetchedAt: 0,
-          dismissedKey: null,
         },
       },
     }));

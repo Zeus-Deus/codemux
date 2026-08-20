@@ -185,6 +185,58 @@ describe("provider-health-store", () => {
     ).toBe("Claude CLI is not installed.");
   });
 
+  it("noteProviderSuccess keeps a dismissal when the same warning returns", async () => {
+    // A dismissed advisory must not come back on every successful send
+    // just because the re-probe is still inconclusive.
+    seed(report("warning", "Could not verify Claude authentication status."));
+    useProviderHealth.getState().dismiss("claude");
+    mockProbe.mockResolvedValue(
+      report("warning", "Could not verify Claude authentication status."),
+    );
+
+    await useProviderHealth.getState().noteProviderSuccess("claude");
+
+    expect(mockProbe).toHaveBeenCalledTimes(1);
+    expect(
+      selectVisibleHealthReport(useProviderHealth.getState(), "claude"),
+    ).toBeNull();
+  });
+
+  it("keeps a dismissal narrow: a different failure still banners", async () => {
+    // The counterweight to the test above — the dismissal survives a
+    // successful send, but it must stay scoped to the failure the user
+    // actually closed, or a real new problem goes unreported.
+    seed(report("warning", "Could not verify Claude authentication status."));
+    useProviderHealth.getState().dismiss("claude");
+    mockProbe.mockResolvedValue(report("error", "Claude CLI is not installed."));
+
+    await useProviderHealth.getState().noteProviderSuccess("claude");
+
+    expect(
+      selectVisibleHealthReport(useProviderHealth.getState(), "claude")
+        ?.message,
+    ).toBe("Claude CLI is not installed.");
+  });
+
+  it("retires a dismissal on recovery so the same failure banners again", async () => {
+    // Recovery is the ONLY thing that clears a dismissal now, so pin it:
+    // fail → dismiss → recover → fail identically → visible again.
+    const failure = report("warning", "Could not verify Claude auth.");
+    seed(failure);
+    useProviderHealth.getState().dismiss("claude");
+
+    mockProbe.mockResolvedValueOnce(report("ready"));
+    await useProviderHealth.getState().refresh("claude", { force: true });
+    expect(useProviderHealth.getState().slots.claude.dismissedKey).toBeNull();
+
+    mockProbe.mockResolvedValueOnce(failure);
+    await useProviderHealth.getState().refresh("claude", { force: true });
+    expect(
+      selectVisibleHealthReport(useProviderHealth.getState(), "claude")
+        ?.message,
+    ).toBe("Could not verify Claude auth.");
+  });
+
   it("noteProviderSuccess costs nothing on the healthy path", async () => {
     seed(report("ready"));
     await useProviderHealth.getState().noteProviderSuccess("claude");
