@@ -1,4 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -127,6 +128,7 @@ function branch(name: string, overrides: Partial<BranchDetail> = {}): BranchDeta
     last_commit_unix: NOW - 3600,
     is_local: true,
     is_remote: false,
+    is_head: false,
     ...overrides,
   };
 }
@@ -162,6 +164,47 @@ function renderRow(
     onChangeWorktreeName,
     onChangeBaseBranch,
   };
+}
+
+/** Controlled harness: the real composer stores `checkoutMode` /
+ *  `baseBranch` in the draft and feeds them back down, so the pill shows
+ *  whatever the row seeds. `renderRow` freezes those props, which is fine
+ *  for click assertions but hides the seeding effect's result. */
+function renderControlled(
+  initial: {
+    checkoutMode?: "current" | "worktree";
+    baseBranch?: string;
+  } = {},
+) {
+  const onChangeCheckoutMode = vi.fn();
+  const onChangeBaseBranch = vi.fn();
+  function Harness() {
+    const [checkoutMode, setCheckoutMode] = useState<"current" | "worktree">(
+      initial.checkoutMode ?? "current",
+    );
+    const [baseBranch, setBaseBranch] = useState(initial.baseBranch ?? "");
+    return (
+      <ThreadScopeRow
+        target={{ kind: "project", projectPath: "/projects/foo" }}
+        onChangeTarget={vi.fn()}
+        projectPath="/projects/foo"
+        checkoutMode={checkoutMode}
+        worktreeName=""
+        baseBranch={baseBranch}
+        onChangeCheckoutMode={(mode) => {
+          onChangeCheckoutMode(mode);
+          setCheckoutMode(mode);
+        }}
+        onChangeWorktreeName={vi.fn()}
+        onChangeBaseBranch={(name) => {
+          onChangeBaseBranch(name);
+          setBaseBranch(name);
+        }}
+      />
+    );
+  }
+  const utils = render(<Harness />);
+  return { ...utils, onChangeCheckoutMode, onChangeBaseBranch };
 }
 
 describe("ThreadScopeRow", () => {
@@ -716,6 +759,106 @@ describe("ThreadScopeRow", () => {
       await user.click(developRow);
       expect(onChangeCheckoutMode).not.toHaveBeenCalled();
       expect(onChangeBaseBranch).toHaveBeenCalledWith("develop");
+    });
+
+    it("seeds the pill from the checked-out branch, not main", async () => {
+      vi.mocked(listBranchesDetailed).mockResolvedValue([
+        branch("main"),
+        branch("feature-x", { is_head: true }),
+        branch("develop"),
+      ]);
+      const { onChangeBaseBranch } = renderControlled();
+      expect(await screen.findByText("feature-x")).toBeInTheDocument();
+      expect(onChangeBaseBranch).toHaveBeenCalledWith("feature-x");
+      expect(onChangeBaseBranch).not.toHaveBeenCalledWith("main");
+    });
+
+    it("falls back to main when no branch is flagged as checked out", async () => {
+      vi.mocked(listBranchesDetailed).mockResolvedValue([
+        branch("feature-x"),
+        branch("main"),
+        branch("develop"),
+      ]);
+      const { onChangeBaseBranch } = renderControlled();
+      await waitFor(() => {
+        expect(onChangeBaseBranch).toHaveBeenCalledWith("main");
+      });
+      expect(screen.getByText("main")).toBeInTheDocument();
+    });
+
+    it("picking main while the checkout is on feature-x flips to a worktree based on main", async () => {
+      vi.mocked(listBranchesDetailed).mockResolvedValue([
+        branch("feature-x", { is_head: true }),
+        branch("main"),
+      ]);
+      const user = userEvent.setup();
+      const { onChangeCheckoutMode, onChangeBaseBranch } = renderControlled();
+      await user.click(await screen.findByText("feature-x"));
+      await user.click(await screen.findByText("main"));
+      expect(onChangeCheckoutMode).toHaveBeenCalledWith("worktree");
+      expect(onChangeBaseBranch).toHaveBeenLastCalledWith("main");
+      expect(await screen.findByText("New worktree")).toBeInTheDocument();
+    });
+
+    it("switching back to the current checkout snaps the pill back to the real HEAD", async () => {
+      vi.mocked(listBranchesDetailed).mockResolvedValue([
+        branch("feature-x", { is_head: true }),
+        branch("main"),
+      ]);
+      const user = userEvent.setup();
+      const { onChangeBaseBranch } = renderControlled();
+      await user.click(await screen.findByText("feature-x"));
+      await user.click(await screen.findByText("main"));
+      await screen.findByText("New worktree");
+
+      await user.click(screen.getByText("New worktree"));
+      await screen.findByText("Where should the agent work?");
+      await user.click(screen.getByText("Current checkout"));
+
+      await waitFor(() => {
+        expect(onChangeBaseBranch).toHaveBeenLastCalledWith("feature-x");
+      });
+      expect(screen.getByText("feature-x")).toBeInTheDocument();
+    });
+
+    it("refetches on a project switch, so the pill can't keep the old project's HEAD", async () => {
+      vi.mocked(listBranchesDetailed).mockImplementation(async (path: string) =>
+        path === "/projects/bar"
+          ? [branch("bar-head", { is_head: true })]
+          : [branch("foo-head", { is_head: true })],
+      );
+      const onChangeBaseBranch = vi.fn();
+      const shared = {
+        onChangeTarget: vi.fn(),
+        checkoutMode: "current",
+        worktreeName: "",
+        baseBranch: "",
+        onChangeCheckoutMode: vi.fn(),
+        onChangeWorktreeName: vi.fn(),
+        onChangeBaseBranch,
+      } satisfies Partial<ThreadScopeRowProps>;
+
+      const { rerender } = render(
+        <ThreadScopeRow
+          {...shared}
+          target={{ kind: "project", projectPath: "/projects/foo" }}
+          projectPath="/projects/foo"
+        />,
+      );
+      await waitFor(() => {
+        expect(onChangeBaseBranch).toHaveBeenLastCalledWith("foo-head");
+      });
+
+      rerender(
+        <ThreadScopeRow
+          {...shared}
+          target={{ kind: "project", projectPath: "/projects/bar" }}
+          projectPath="/projects/bar"
+        />,
+      );
+      await waitFor(() => {
+        expect(onChangeBaseBranch).toHaveBeenLastCalledWith("bar-head");
+      });
     });
 
     it("shows a WORKTREE badge on branches that have a worktree on this device", async () => {
