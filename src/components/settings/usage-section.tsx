@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { SegmentedControl } from "./settings-primitives";
+import { UsageAreaChart, UsageSparkline } from "./usage-area-chart";
 import {
   usageExportCsv,
   usageScanProviderHistory,
@@ -55,6 +56,22 @@ const SERIES_FILL: Record<string, string> = {
   cursor: "bg-accent-violet",
   opencode: "bg-status-open",
 };
+
+/** The same series tones as CSS colors, for the SVG chart. Codex's
+ *  neutral tint is expressed as foreground at reduced opacity so it
+ *  follows the palette the way the `bg-foreground/45` swatch does. */
+const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
+  claude: { color: "var(--accent-ember)", opacity: 1 },
+  codex: { color: "var(--foreground)", opacity: 0.55 },
+  cursor: { color: "var(--accent-violet)", opacity: 1 },
+  opencode: { color: "var(--status-open)", opacity: 1 },
+};
+
+const UNKNOWN_COLOR = { color: "var(--muted-foreground)", opacity: 0.5 };
+
+function seriesColor(provider: string): { color: string; opacity: number } {
+  return SERIES_COLOR[provider] ?? UNKNOWN_COLOR;
+}
 
 const SERIES_LABEL: Record<string, string> = {
   claude: "Claude Code",
@@ -387,7 +404,7 @@ function rangeLabel(summary: UsageSummary): string {
 }
 
 /** The value one bucket contributes for one provider, under the active
- *  metric. Shared by the chart and the readout so a hovered bar and its
+ *  metric. Shared by the chart and its tooltip so a hovered point and its
  *  numbers can never disagree. */
 function bucketValue(
   bucket: UsageBucket,
@@ -407,7 +424,7 @@ function formatMetric(value: number, metric: Metric): string {
 
 /** Design canvas value. The chart flexes horizontally on its own; only
  *  the height needs stating. */
-const CHART_HEIGHT_PX = 150;
+const CHART_HEIGHT_PX = 200;
 
 function OverviewCard({
   summary,
@@ -427,37 +444,20 @@ function OverviewCard({
   // readout — so the eye can track one provider across all three.
   const order = useMemo(() => providers.map((p) => p.provider), [providers]);
 
-  const max = useMemo(() => {
-    const totalsPerBucket = buckets.map((bucket) =>
-      order.reduce((sum, p) => sum + bucketValue(bucket, p, metric), 0),
-    );
-    return Math.max(...totalsPerBucket, 0) || 1;
-  }, [buckets, order, metric]);
-
-  const hoveredBucket = hovered === null ? null : (buckets[hovered] ?? null);
-
-  const readoutValue = hoveredBucket
-    ? formatMetric(
-        order.reduce((sum, p) => sum + bucketValue(hoveredBucket, p, metric), 0),
-        metric,
-      )
-    : metric === "cost"
-      ? formatMoney(totals.estimated_cost_usd)
-      : formatTokens(totals.total_tokens);
-
-  const readoutBreakdown = hoveredBucket
-    ? order
-        .map(
-          (p) =>
-            `${seriesLabel(p).split(" ")[0]} ${formatMetric(
-              bucketValue(hoveredBucket, p, metric),
-              metric,
-            )}`,
-        )
-        .join("   ")
-    : metric === "cost"
-      ? "API/list-price equivalent"
-      : "input + output + cache read + cache write";
+  const series = useMemo(
+    () =>
+      order.map((p) => ({
+        key: p,
+        label: seriesLabel(p),
+        ...seriesColor(p),
+        values: buckets.map((bucket) => bucketValue(bucket, p, metric)),
+      })),
+    [buckets, order, metric],
+  );
+  const points = useMemo(
+    () => buckets.map((b) => ({ label: b.label, subLabel: b.sub_label })),
+    [buckets],
+  );
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
@@ -494,59 +494,20 @@ function OverviewCard({
         </div>
       </div>
 
-      <div className="mt-4 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-t border-border/40 pt-3">
-        <span className="text-[12px] text-muted-foreground">
-          {hoveredBucket
-            ? hoveredBucket.sub_label
-            : metric === "cost"
-              ? "Total for period"
-              : "Tokens for period"}
-        </span>
-        <span className="select-text font-mono text-[14px] font-semibold tabular-nums tracking-tight">
-          {readoutValue}
-        </span>
-        <span className="select-text font-mono text-[11px] tabular-nums text-muted-foreground">
-          {readoutBreakdown}
-        </span>
-      </div>
-
-      <div
-        className="mt-4 flex items-end gap-[3px]"
-        style={{ height: CHART_HEIGHT_PX }}
-        onMouseLeave={() => onHover(null)}
-      >
-        {buckets.map((bucket, index) => (
-          <div
-            key={bucket.start_ms}
-            role="presentation"
-            onMouseEnter={() => onHover(index)}
-            title={`${bucket.sub_label} — ${formatMetric(
-              order.reduce((sum, p) => sum + bucketValue(bucket, p, metric), 0),
-              metric,
-            )}`}
-            className={cn(
-              "flex h-full min-w-0 flex-1 flex-col justify-end gap-[2px] transition-opacity",
-              hovered !== null && hovered !== index && "opacity-40",
-            )}
-          >
-            {/* Reversed so the first lane (largest provider) stacks on
-                top, matching the legend's reading order. */}
-            {[...order].reverse().map((provider) => {
-              const value = bucketValue(bucket, provider, metric);
-              if (value <= 0) return null;
-              return (
-                <div
-                  key={provider}
-                  className={cn("w-full rounded-[2px]", seriesFill(provider))}
-                  style={{
-                    height: Math.max(2, (value / max) * (CHART_HEIGHT_PX - 8)),
-                  }}
-                />
-              );
-            })}
-          </div>
-        ))}
-      </div>
+      <UsageAreaChart
+        className="mt-5"
+        series={series}
+        points={points}
+        height={CHART_HEIGHT_PX}
+        hovered={hovered}
+        onHover={onHover}
+        formatValue={(v) => formatMetric(v, metric)}
+        ariaLabel={
+          metric === "cost"
+            ? "Estimated cost per bucket by provider"
+            : "Tokens per bucket by provider"
+        }
+      />
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 xl:gap-x-6">
@@ -946,12 +907,8 @@ function ProviderLane({
 }) {
   const bars = quota ? meterWindows(quota.windows) : [];
   const note = quota ? meterNote(quota) : "";
-  const laneMax = useMemo(
-    () =>
-      Math.max(
-        ...buckets.map((b) => b.providers[provider.provider]?.tokens ?? 0),
-        0,
-      ) || 1,
+  const laneValues = useMemo(
+    () => buckets.map((b) => b.providers[provider.provider]?.tokens ?? 0),
     [buckets, provider.provider],
   );
 
@@ -1010,26 +967,12 @@ function ProviderLane({
             )}
           </span>
         ) : null}
-        <span
-          className="flex min-w-0 flex-1 items-end gap-[2px]"
-          style={{ height: SPARK_HEIGHT_PX }}
-          aria-hidden
-        >
-          {buckets.map((bucket) => {
-            const tokens = bucket.providers[provider.provider]?.tokens ?? 0;
-            return (
-              <span
-                key={bucket.start_ms}
-                className={cn(
-                  "min-w-0 flex-1 rounded-[1px]",
-                  seriesFill(provider.provider),
-                )}
-                style={{
-                  height: Math.max(2, (tokens / laneMax) * SPARK_HEIGHT_PX),
-                }}
-              />
-            );
-          })}
+        <span className="min-w-0 flex-1 self-center">
+          <UsageSparkline
+            values={laneValues}
+            height={SPARK_HEIGHT_PX}
+            {...seriesColor(provider.provider)}
+          />
         </span>
 
         <span className="flex w-[76px] shrink-0 flex-col gap-0.5 text-right">

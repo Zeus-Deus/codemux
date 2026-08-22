@@ -240,16 +240,41 @@ describe("UsageSection", () => {
     });
   });
 
-  it("switches the readout between cost and tokens", async () => {
+  it("shows a tooltip with per-provider figures for the hovered bucket", async () => {
     render(<UsageSection />);
     await waitFor(() => {
-      expect(screen.getByText("Total for period")).toBeInTheDocument();
+      expect(screen.getByRole("img", { name: /Estimated cost per bucket/ })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+
+    // jsdom has no layout, so the chart measures at its fallback width and
+    // the far-left pointer lands on the first bucket.
+    const chart = screen.getByRole("img", { name: /Estimated cost per bucket/ })
+      .parentElement as HTMLElement;
+    await userEvent.pointer({ target: chart, coords: { clientX: 0, clientY: 10 } });
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Aug 1");
+    expect(tooltip).toHaveTextContent("Claude Code$9.40");
+    expect(tooltip).toHaveTextContent("OpenCode$0.92");
+    expect(tooltip).toHaveTextContent("Total$10.32");
+
+    await userEvent.unhover(chart);
+    await waitFor(() => {
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    });
+  });
+
+  it("switches the chart between cost and tokens", async () => {
+    render(<UsageSection />);
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: /Estimated cost per bucket/ })).toBeInTheDocument();
     });
     expect(screen.getAllByText("API/list-price equivalent").length).toBeGreaterThan(0);
 
     await userEvent.click(screen.getByRole("radio", { name: "Tokens" }));
     await waitFor(() => {
-      expect(screen.getByText("Tokens for period")).toBeInTheDocument();
+      expect(screen.getByRole("img", { name: /Tokens per bucket/ })).toBeInTheDocument();
     });
     expect(
       screen.getAllByText("input + output + cache read + cache write").length,
@@ -527,7 +552,8 @@ describe("composition, breakdown and cost confidence", () => {
       expect(screen.queryByText("gpt-5-codex")).not.toBeInTheDocument();
     });
     // Day rows come from the same buckets the chart uses, newest first.
-    expect(screen.getByText("Aug 7")).toBeInTheDocument();
+    // The chart's axis also labels that bucket, hence "all".
+    expect(screen.getAllByText("Aug 7").length).toBeGreaterThan(1);
 
     await userEvent.click(screen.getByRole("radio", { name: "Model" }));
     await waitFor(() => {
