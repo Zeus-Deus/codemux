@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Skeleton } from "@/components/ui/skeleton";
@@ -11,12 +11,38 @@ import {
 import { resolveProvider } from "@/lib/source-control";
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import type { PrRow } from "@/lib/pr-overview";
+import type { CheckInfo } from "@/tauri/types";
 import { ReviewDetail } from "@/components/workspace/review/review-detail";
 import { RepoUnreachableState } from "@/components/workspace/review/review-empty-states";
+import { checkState } from "@/components/workspace/review/review-ui";
+import { budgetApplies, clearRateLimitPause, useRateLimitPause } from "@/lib/pr-rate-limit";
 
-/** Same cadence as the panel: a check going green is the one thing you
- *  wait for, and 2.5s is fast enough that you never reach for refresh. */
+/**
+ * How often the open pull request re-reads itself while its checks are
+ * still running.
+ *
+ * Fast on purpose: a build going green under the cursor is most of what
+ * the column is for, and two and a half seconds is what makes that feel
+ * like watching rather than refreshing.
+ */
 const DETAIL_POLL_MS = 2_500;
+
+/**
+ * And how often once every check has reported.
+ *
+ * A settled pull request has nothing left to watch at the fast cadence,
+ * and the cost of pretending otherwise is not theoretical: two calls
+ * every 2.5s is roughly three thousand requests an hour, spent re-asking
+ * a question whose answer has stopped changing, against an hourly budget
+ * of five thousand for the whole account. A pull request left open on a
+ * second monitor was quietly the most expensive thing in the app.
+ *
+ * Twenty seconds is still well inside "I looked away and it updated",
+ * and it is already the cadence the conversation below it polls at — so
+ * a settled column now refreshes as one surface rather than in two
+ * tiers.
+ */
+const SETTLED_POLL_MS = 20_000;
 const CONVERSATION_POLL_MS = 30_000;
 
 export interface PrDetailColumnProps {
@@ -24,6 +50,42 @@ export interface PrDetailColumnProps {
   /** Workspace standing on this PR's branch, when there is one. */
   existingWorkspaceId: string | null;
   viewerLogin: string | null;
+}
+
+/**
+ * Nothing is still running, so nothing is still changing — and the fast
+ * cadence has nothing left to buy.
+ *
+ * `checks` undefined is "not asked yet", which is not settled: the first
+ * answer should arrive on the fast clock.
+ *
+ * A failing checks call *is* settled. Re-asking a host that just said no
+ * every two and a half seconds is the behaviour the budget gate exists
+ * to prevent, and doing it here would be doing it in the one place that
+ * asks most often.
+ *
+ * The empty list is the case worth naming, because it is two different
+ * situations wearing the same shape: a repository with no CI at all, and
+ * a pull request whose first check has not registered yet — the seconds
+ * right after a push, which is exactly when someone opens the column to
+ * watch. Only the row can tell them apart. `"none"` is the host having
+ * looked and found nothing; `null` is nobody having asked. So an empty
+ * list settles on the host's own word and on nothing else, and a
+ * just-pushed pull request keeps the fast cadence until its checks show
+ * up rather than going quiet for the twenty seconds that matter most.
+ */
+export function checksAreSettled(
+  checks: CheckInfo[] | undefined,
+  checksFailed: boolean,
+  rowChecks: string | null,
+): boolean {
+  if (checksFailed) return true;
+  if (!checks) return false;
+  if (checks.length === 0) return rowChecks === "none";
+  // `checkState` returns "running" for anything it does not recognise —
+  // queued, in_progress, waiting, action_required — so an unfamiliar
+  // status keeps the fast cadence rather than silencing the column.
+  return !checks.some((check) => checkState(check.conclusion, check.status) === "running");
 }
 
 /**
@@ -44,23 +106,43 @@ export function PrDetailColumn({
   const path = row.projectRoot;
   const number = row.number;
 
-  const detailQuery = useQuery({
-    queryKey: ["pr", "page-detail", path, number] as const,
-    queryFn: () => getGithubPrByPath(path, number),
-    staleTime: DETAIL_POLL_MS,
-    refetchInterval: DETAIL_POLL_MS,
-  });
+  // The cadence both live queries read, through a ref so that changing
+  // it never tears down and re-creates their timers: React Query calls
+  // the callback form each time a timer fires, which is exactly when a
+  // new value should take effect.
+  const pollMsRef = useRef(DETAIL_POLL_MS);
+
+  // The same budget gate the list obeys. An open pull request polling
+  // twice every couple of seconds is the most expensive surface in the
+  // app, so leaving it outside the gate would mean the page stopped
+  // asking and the column carried on spending on its behalf — and every
+  // one of those calls is refused anyway while the budget is gone.
+  const paused = useRateLimitPause() > 0 && budgetApplies(row.providerKind);
 
   const checksQuery = useQuery({
     queryKey: ["pr", "page-checks", path, number] as const,
     queryFn: () => getPullRequestChecks(path, number),
+    enabled: !paused,
     staleTime: DETAIL_POLL_MS,
-    refetchInterval: DETAIL_POLL_MS,
+    refetchInterval: () => pollMsRef.current,
+  });
+
+  pollMsRef.current = checksAreSettled(checksQuery.data, checksQuery.isError, row.checks)
+    ? SETTLED_POLL_MS
+    : DETAIL_POLL_MS;
+
+  const detailQuery = useQuery({
+    queryKey: ["pr", "page-detail", path, number] as const,
+    queryFn: () => getGithubPrByPath(path, number),
+    enabled: !paused,
+    staleTime: DETAIL_POLL_MS,
+    refetchInterval: () => pollMsRef.current,
   });
 
   const reviewsQuery = useQuery({
     queryKey: ["pr", "page-reviews", path, number] as const,
     queryFn: () => getPrReviewComments(path, number),
+    enabled: !paused,
     staleTime: CONVERSATION_POLL_MS,
     refetchInterval: CONVERSATION_POLL_MS,
   });
@@ -82,11 +164,17 @@ export function PrDetailColumn({
   const inlineQuery = useQuery({
     queryKey: ["pr", "page-inline", path, number] as const,
     queryFn: () => getPrInlineComments(path, number),
+    enabled: !paused,
     staleTime: CONVERSATION_POLL_MS,
     refetchInterval: CONVERSATION_POLL_MS,
   });
 
   const refresh = useCallback(() => {
+    // Same meaning as the list's Retry: asking by hand lifts the gate,
+    // because otherwise this invalidates a set of queries that are
+    // disabled — marking them stale and refreshing nothing, which is a
+    // control that quietly does not do what it says.
+    clearRateLimitPause();
     queryClient.invalidateQueries({
       predicate: (q) =>
         q.queryKey[0] === "pr" &&

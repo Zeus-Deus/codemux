@@ -46,6 +46,15 @@ const MAX_RENDERED = 200;
 
 const EMPTY_MOVED: Set<string> = new Set();
 
+/** `14:12` — the user's own clock, because the only question it answers
+ *  is "when can I look again". */
+export function clockTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 const STATE_LABEL: Record<PrStateFilter, string> = {
   open: "Open",
   closed: "Closed",
@@ -70,6 +79,11 @@ export interface PrListProps {
   allRootsFailed?: boolean;
   /** The refresh cycle settled with nothing to show for itself. */
   refreshFailed?: boolean;
+  /** Epoch ms the host's budget refills at, when a refusal for exceeding
+   *  it has paused the polling; 0 when nothing is paused. It gets its
+   *  own sentence because it is the one failure with an answer to "what
+   *  do I do about it" that isn't "press the button again". */
+  rateLimitedUntil?: number;
   isLoading: boolean;
   selectedKey: string | null;
   stateFilter: PrStateFilter;
@@ -91,6 +105,7 @@ export function PrList({
   carriedAt = null,
   allRootsFailed = false,
   refreshFailed = false,
+  rateLimitedUntil = 0,
   isLoading,
   selectedKey,
   stateFilter,
@@ -227,7 +242,13 @@ export function PrList({
   // you are reading is carried and the refresh behind it didn't land.
   // Partial failure keeps the quieter footer treatment: the other
   // repositories are current, and one line saying so is proportionate.
-  const showStaleStrip = total > 0 && (allRootsFailed || (carried && refreshFailed));
+  // A budget that is spent raises the strip on its own, without waiting
+  // for every root to have been refused individually: the polling is
+  // already paused at that point, and a page that has quietly stopped
+  // refreshing while looking perfectly normal is the one outcome worse
+  // than saying so.
+  const showStaleStrip =
+    rateLimitedUntil > 0 || (total > 0 && (allRootsFailed || (carried && refreshFailed)));
 
   return (
     <div className="flex h-full min-h-0 w-full flex-col" data-testid="pr-list">
@@ -295,7 +316,14 @@ export function PrList({
         </DropdownMenu>
       </div>
 
-      {showStaleStrip && <StaleStrip age={age} onRetry={onRefresh} />}
+      {showStaleStrip && (
+        <StaleStrip
+          age={age}
+          hasRows={total > 0}
+          resumesAt={rateLimitedUntil > 0 ? rateLimitedUntil : null}
+          onRetry={onRefresh}
+        />
+      )}
 
       <div
         role="listbox"
@@ -315,6 +343,7 @@ export function PrList({
             hasRows={rows.length > 0}
             hasHosts={hostCount > 0}
             isLoading={isLoading}
+            unanswered={rateLimitedUntil > 0 && allRootsFailed}
             query={query}
             onClearQuery={() => setQuery("")}
           />
@@ -415,8 +444,47 @@ export function PrList({
  * It is a strip and not a dialog, and it appears above the list rather
  * than over it, so nothing that was readable a moment ago stops being
  * readable.
+ *
+ * `resumesAt` swaps the sentence for the one case where "it failed"
+ * would be a lie by omission: the host refused because the account's
+ * hourly API budget is spent, and the page has stopped asking until it
+ * refills. That is not a broken repository and pressing Retry is not
+ * what fixes it — waiting is — so the strip says which, and until when.
+ * Retry stays offered anyway, because a user who thinks we are wrong
+ * should be able to find out for the price of one request.
+ *
+ * A clock time rather than "in 15m", and the reason is specific to this
+ * state: while the gate is up nothing is polling, so nothing re-renders,
+ * so a countdown would sit frozen at whatever it read when the strip
+ * first painted. "14:12" is still true an hour later.
  */
-function StaleStrip({ age, onRetry }: { age: string | null; onRetry: () => void }) {
+function StaleStrip({
+  age,
+  hasRows,
+  resumesAt,
+  onRetry,
+}: {
+  age: string | null;
+  /** Whether there is in fact a list underneath. On a cold start that
+   *  was refused there isn't one, and the clause about what you are
+   *  looking at has to go — it would sit directly above an empty state
+   *  saying the opposite. */
+  hasRows: boolean;
+  resumesAt: number | null;
+  onRetry: () => void;
+}) {
+  // Three facts, and the sentence names only the ones that are true:
+  // what happened, what you are looking at instead (nothing, on a cold
+  // start), and when it will right itself (only the budget knows that).
+  const headline = resumesAt == null ? "The latest refresh failed" : "Rate limit reached";
+  const showing = !hasRows
+    ? null
+    : age
+      ? `showing the list from ${age} ago`
+      : "showing the last list loaded";
+  const resuming = resumesAt == null ? null : `resuming at ${clockTime(resumesAt)}`;
+  const rest = [showing, resuming].filter(Boolean).join(", ");
+  const sentence = rest ? `${headline} · ${rest}` : headline;
   return (
     <div
       role="status"
@@ -425,7 +493,7 @@ function StaleStrip({ age, onRetry }: { age: string | null; onRetry: () => void 
     >
       <span aria-hidden className="size-2 shrink-0 rounded-full bg-status-working" />
       <span className={cn("min-w-[11rem] flex-1 leading-snug text-foreground/80", tzBody)}>
-        The latest refresh failed{age ? ` · showing the list from ${age} ago` : " · showing the last list loaded"}
+        {sentence}
       </span>
       <button
         type="button"
@@ -470,12 +538,19 @@ function EmptyList({
   hasRows,
   hasHosts,
   isLoading,
+  unanswered,
   query,
   onClearQuery,
 }: {
   hasRows: boolean;
   hasHosts: boolean;
   isLoading: boolean;
+  /** *Every* root refused and the page has stopped asking, so it has no
+   *  answer to give — as opposed to having one that happens to be
+   *  empty. One root being over budget while twenty others answered
+   *  "nothing open" is an answer, and saying otherwise would be the same
+   *  lie in the other direction. */
+  unanswered: boolean;
   query: string;
   onClearQuery: () => void;
 }) {
@@ -509,6 +584,21 @@ function EmptyList({
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           This page lists pull requests across the projects you have open. Open one and
           its repository shows up here.
+        </p>
+      </div>
+    );
+  }
+
+  // Asked, and refused. The same rule as the loading case immediately
+  // below, for the same reason: "no open pull requests" is an answer,
+  // and we do not have one. The strip above this says when we will.
+  if (unanswered) {
+    return (
+      <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-unanswered">
+        <p className="text-xs text-foreground">Nothing to show yet.</p>
+        <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
+          The host is not answering requests right now, so this page has not been able to
+          ask what is open. It tries again on its own.
         </p>
       </div>
     );

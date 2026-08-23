@@ -79,9 +79,14 @@ export function PullRequestsView() {
     carriedAt,
     allRootsFailed,
     refreshFailed,
+    rateLimitedUntil,
     isLoading,
     refresh,
-  } = usePrOverview(true, stateFilter);
+    // "page": this is the surface someone is actually looking at, and
+    // the only one that earns the fast cadence. Everything else sharing
+    // these rows — the badge, the toasts, the palette — runs in the
+    // slower `watch` mode by default.
+  } = usePrOverview(true, stateFilter, "page");
 
   // Escape closes, matching the other full-screen destinations — but
   // only when nothing nearer to the user wanted the key first.
@@ -271,6 +276,7 @@ export function PullRequestsView() {
             viewerByRoot={viewerByRoot}
             workspaceByBranch={workspaceByBranch}
             failures={failures}
+            rateLimitedUntil={rateLimitedUntil}
             hostCount={roots.length}
             updatedAt={updatedAt}
             carried={carried}

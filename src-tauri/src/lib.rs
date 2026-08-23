@@ -2207,6 +2207,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::list_incoming_prs,
             commands::list_prs_overview,
             commands::list_prs_overview_stats,
+            commands::github_rate_limit,
             commands::merge_pull_request,
             commands::close_pull_request,
             commands::reopen_pull_request,
