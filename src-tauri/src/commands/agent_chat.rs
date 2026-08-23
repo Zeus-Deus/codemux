@@ -693,6 +693,16 @@ pub async fn agent_chat_start_session<R: Runtime>(
             .as_ref()
             .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
         input.env = workspace_env_overlay(ws, &pane_id, input.env.take());
+        // First-class copy of the owning workspace id, sourced from the same
+        // snapshot as the env's CODEMUX_WORKSPACE_ID so the two can't
+        // disagree. Adapters attach it per-call to MCP dispatches, where the
+        // shared MCP child's env cannot identify the calling session. A
+        // caller-supplied value wins, mirroring the env overlay's
+        // insert-if-absent semantics.
+        input.workspace_id = input
+            .workspace_id
+            .take()
+            .or_else(|| ws.map(|w| w.workspace_id.0.clone()));
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
@@ -1705,7 +1715,11 @@ pub async fn ensure_live_session<R: Runtime>(
     // browser / CLI subprocesses route to its OWN workspace, exactly
     // like `agent_chat_start_session`. Resolve the pane from the thread;
     // an orphaned thread (no pane) injects nothing.
-    let env = {
+    // Also capture the owning workspace id itself: the rebuilt session
+    // attaches it per-call to MCP dispatches, same as a fresh start (see
+    // `agent_chat_start_session`). Sourced from the same snapshot as the
+    // env overlay so the two can't disagree.
+    let (env, workspace_id) = {
         let state: State<'_, AppStateStore> = app.state();
         match state.agent_chat_pane_id_for_thread(&thread_id.0) {
             Some(pane_id) => {
@@ -1714,9 +1728,12 @@ pub async fn ensure_live_session<R: Runtime>(
                 let ws = workspace_id
                     .as_ref()
                     .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
-                workspace_env_overlay(ws, &pane_id, None)
+                (
+                    workspace_env_overlay(ws, &pane_id, None),
+                    ws.map(|w| w.workspace_id.0.clone()),
+                )
             }
-            None => None,
+            None => (None, None),
         }
     };
 
@@ -1784,6 +1801,7 @@ pub async fn ensure_live_session<R: Runtime>(
         fast_mode: record.fast_mode,
         additional_directories: vec![],
         env: env.clone(),
+        workspace_id: workspace_id.clone(),
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     };

@@ -25,6 +25,12 @@ use super::McpConfigSource;
 /// config, so serving them back would double every tool. If another provider
 /// ever attaches, the gateway will need per-consumer identity (a token or path
 /// per consumer) instead of this fixed list.
+///
+/// Per-CALL identity can already travel in-band: a `tools/call` request may
+/// carry `_meta["codemux/workspace_id"]`, which the gateway forwards to the
+/// registry so workspace-scoped built-in tools bind to the caller's
+/// workspace. OpenCode does not send it today, so its calls keep the legacy
+/// env/cwd fallback until per-consumer identity lands.
 const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] =
     [McpConfigSource::OpenCodeUser, McpConfigSource::OpenCodeProject];
 
@@ -192,7 +198,19 @@ async fn handle_post(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match state.registry.dispatch_tool_call(name, arguments).await {
+            // Forward the caller's workspace identity when the request
+            // carries it, so built-in workspace-scoped tools route to the
+            // calling session's workspace. Absent for OpenCode today.
+            let workspace_id = params
+                .get("_meta")
+                .and_then(|meta| meta.get("codemux/workspace_id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            match state
+                .registry
+                .dispatch_tool_call(name, arguments, workspace_id)
+                .await
+            {
                 Ok(result) => rpc_result(id, result).into_response(),
                 Err(message) => rpc_result(
                     id,

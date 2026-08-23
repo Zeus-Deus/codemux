@@ -30,6 +30,7 @@ fn start_input(
         fast_mode,
         additional_directories: vec![],
         env: None,
+        workspace_id: None,
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }
@@ -55,6 +56,7 @@ fn fixture_start_input(thread_id: &str) -> StartSessionInput {
         fast_mode: false,
         additional_directories: vec![],
         env: None,
+        workspace_id: None,
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     }

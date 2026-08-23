@@ -930,6 +930,24 @@ fn pane_split_direction(tool: &str) -> &'static str {
     }
 }
 
+/// Resolve the workspace id a tool call should act on. Per-call `_meta`
+/// wins over the process env: every agent-chat session shares ONE
+/// `codemux mcp` child (spawned with no workspace env), so the registry
+/// tags each call with the calling session's workspace in
+/// `_meta["codemux/workspace_id"]`. The env var still covers children the
+/// workspace lifecycle spawns per-workspace via `.mcp.json` (which never
+/// send `_meta`). `env_fallback` is passed in so tests stay hermetic.
+fn resolve_workspace_id(params: &Value, env_fallback: Option<String>) -> String {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("codemux/workspace_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .or(env_fallback)
+        .unwrap_or_default()
+}
+
 async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
@@ -937,8 +955,10 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Workspace ID for workspace-scoped browser routing.
-    let workspace_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
+    // Workspace ID for workspace-scoped routing (browser session binding,
+    // git cwd). Caller-tagged `_meta` first, env second.
+    let workspace_id =
+        resolve_workspace_id(&params, std::env::var("CODEMUX_WORKSPACE_ID").ok());
     // Best-effort cwd so the control layer can resolve the owning workspace
     // by path when this MCP server's `CODEMUX_WORKSPACE_ID` env is missing
     // (covers MCP callers whose env wasn't injected). Empty string on error;
@@ -1285,23 +1305,23 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
 
         // -- Git tools (shell out) --
-        "git_status" => run_git(&["status", "--porcelain"]).await,
+        "git_status" => run_git(&["status", "--porcelain"], &workspace_id).await,
         "git_diff" => {
             let file = arguments.get("file").and_then(Value::as_str);
             match file {
-                Some(f) => run_git(&["diff", f]).await,
-                None => run_git(&["diff"]).await,
+                Some(f) => run_git(&["diff", f], &workspace_id).await,
+                None => run_git(&["diff"], &workspace_id).await,
             }
         }
         "git_stage" => {
             let file = arguments.get("file").and_then(Value::as_str).unwrap_or(".");
-            run_git(&["add", file]).await
+            run_git(&["add", file], &workspace_id).await
         }
         "git_commit" => {
             let message = arguments.get("message").and_then(Value::as_str).unwrap_or_default();
-            run_git(&["commit", "-m", message]).await
+            run_git(&["commit", "-m", message], &workspace_id).await
         }
-        "git_push" => run_git(&["push"]).await,
+        "git_push" => run_git(&["push"], &workspace_id).await,
 
         // -- Terminal / workspace / status / ports (Phase 1) --
         "terminal_write" => {
@@ -1583,9 +1603,14 @@ async fn call_socket(command: &str, params: Value) -> Result<Value, String> {
 // Git helper (shell out in workspace cwd)
 // ---------------------------------------------------------------------------
 
-async fn get_workspace_cwd() -> Result<String, String> {
-    // Try CODEMUX_WORKSPACE_ID env var first to get workspace path via app state.
-    if let Ok(workspace_id) = std::env::var("CODEMUX_WORKSPACE_ID") {
+/// `workspace_id` is the already-resolved id from `handle_tool_call`
+/// (per-call `_meta` first, env fallback second — see
+/// `resolve_workspace_id`), so git tools route to the same workspace the
+/// browser tools bind to. Empty means "no workspace known" and falls
+/// through to the process cwd.
+async fn get_workspace_cwd(workspace_id: &str) -> Result<String, String> {
+    // Map the workspace id to its path via app state.
+    if !workspace_id.is_empty() {
         let response = call_socket("get_app_state", json!({})).await?;
         if let Some(workspaces) = response.get("workspaces").and_then(Value::as_array) {
             for ws in workspaces {
@@ -1593,7 +1618,7 @@ async fn get_workspace_cwd() -> Result<String, String> {
                 let wid_str = wid
                     .and_then(Value::as_str)
                     .or_else(|| wid.and_then(|v| v.as_object()).and_then(|o| o.get("0")).and_then(Value::as_str));
-                if wid_str == Some(&workspace_id) {
+                if wid_str == Some(workspace_id) {
                     if let Some(cwd) = ws.get("cwd").and_then(Value::as_str) {
                         return Ok(cwd.to_string());
                     }
@@ -1607,8 +1632,8 @@ async fn get_workspace_cwd() -> Result<String, String> {
         .map_err(|e| format!("Cannot determine workspace directory: {e}"))
 }
 
-async fn run_git(args: &[&str]) -> Result<Value, String> {
-    let cwd = get_workspace_cwd().await?;
+async fn run_git(args: &[&str], workspace_id: &str) -> Result<Value, String> {
+    let cwd = get_workspace_cwd(workspace_id).await?;
     let output = tokio::process::Command::new("git")
         .args(args)
         .current_dir(&cwd)
@@ -2049,6 +2074,47 @@ mod tests {
         let resp = JsonRpcResponse::error(json!(3), -32601, "Not found");
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(!serialized.contains("\"data\""), "data field should be omitted when None");
+    }
+
+    // -----------------------------------------------------------------------
+    // Workspace-id resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workspace_id_prefers_call_meta_over_env_fallback() {
+        let params = json!({
+            "name": "browser_navigate",
+            "arguments": {},
+            "_meta": { "codemux/workspace_id": "ws-from-meta" }
+        });
+        assert_eq!(
+            resolve_workspace_id(&params, Some("ws-from-env".into())),
+            "ws-from-meta"
+        );
+    }
+
+    #[test]
+    fn workspace_id_falls_back_to_env_without_meta() {
+        let params = json!({ "name": "browser_navigate", "arguments": {} });
+        assert_eq!(
+            resolve_workspace_id(&params, Some("ws-from-env".into())),
+            "ws-from-env"
+        );
+        assert_eq!(resolve_workspace_id(&params, None), "");
+    }
+
+    #[test]
+    fn workspace_id_ignores_empty_or_non_string_meta() {
+        let empty = json!({ "name": "t", "_meta": { "codemux/workspace_id": "" } });
+        assert_eq!(
+            resolve_workspace_id(&empty, Some("ws-from-env".into())),
+            "ws-from-env"
+        );
+        let wrong_type = json!({ "name": "t", "_meta": { "codemux/workspace_id": 7 } });
+        assert_eq!(
+            resolve_workspace_id(&wrong_type, Some("ws-from-env".into())),
+            "ws-from-env"
+        );
     }
 
     // -----------------------------------------------------------------------
