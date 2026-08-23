@@ -76,6 +76,10 @@ function isBrowserDocked(workspaceId: string): boolean {
 
 interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;
+  /** The pane each workspace was showing when its panel was last collapsed.
+   *  Opening on {@link RIGHT_PANEL_EMPTY} comes back here (if the pane is
+   *  still in the deck) instead of landing on the first tab. */
+  rightPanelLastTabs: Record<string, RightPanelTab>;
   /** Ordered open panes per workspace. Absent ⇒ {@link DEFAULT_RIGHT_PANEL_PANES}. */
   rightPanelPanes: Record<string, RightPanelTab[]>;
   /** Availability-gated panes (tasks, orchestration, subagents) auto-open
@@ -252,6 +256,7 @@ export const useUIStore = create<UIStore>()(
   persist(
     (set, get) => ({
       rightPanelTabs: {},
+      rightPanelLastTabs: {},
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
       rightPanelWidth: 320,
@@ -296,11 +301,20 @@ export const useUIStore = create<UIStore>()(
           return;
         }
         set((s) => {
-          const tabs = { ...s.rightPanelTabs, [workspaceId]: tab };
-          // The picker sentinel is a view state, not a pane — it must never
-          // join the deck or clear a dismissal.
-          if (tab === RIGHT_PANEL_EMPTY) return { rightPanelTabs: tabs };
           const list = s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
+          // The picker sentinel is "open to whatever it was showing": a
+          // collapsed panel comes back on the pane it was collapsed from,
+          // provided that pane is still in the deck. It is a view state,
+          // not a pane — it must never join the deck or clear a dismissal.
+          if (tab === RIGHT_PANEL_EMPTY) {
+            const last = s.rightPanelLastTabs[workspaceId];
+            const restored =
+              s.rightPanelTabs[workspaceId] == null && last && list.includes(last)
+                ? last
+                : tab;
+            return { rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: restored } };
+          }
+          const tabs = { ...s.rightPanelTabs, [workspaceId]: tab };
           const dismissed = s.rightPanelDismissedPanes[workspaceId] ?? [];
           return {
             rightPanelTabs: tabs,
@@ -328,13 +342,20 @@ export const useUIStore = create<UIStore>()(
         if (isBrowserDocked(workspaceId)) {
           undockBrowserFromRightPanel(workspaceId, false).catch(console.error);
         }
-        set((s) => ({
-          rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: null },
+        set((s) => {
+          const active = s.rightPanelTabs[workspaceId] ?? null;
+          return {
+            rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: null },
+            rightPanelLastTabs:
+              active === null || active === RIGHT_PANEL_EMPTY
+                ? s.rightPanelLastTabs
+                : { ...s.rightPanelLastTabs, [workspaceId]: active },
           // Collapsing always drops full-expand: a maximized panel that is
           // no longer on screen would leave the workspace column at zero
           // width with nothing beside it.
           rightPanelMaximized: false,
-        }));
+          };
+        });
       },
 
       toggleRightPanel: (workspaceId, tab) => {
@@ -525,6 +546,7 @@ export const useUIStore = create<UIStore>()(
       version: 1,
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
+        rightPanelLastTabs: state.rightPanelLastTabs,
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
         rightPanelWidth: state.rightPanelWidth,
