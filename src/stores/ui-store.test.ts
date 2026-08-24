@@ -21,6 +21,7 @@ beforeEach(() => {
   // non-default snapshot across tests.
   useUIStore.setState({
     rightPanelTabs: {},
+    rightPanelLastTabs: {},
     rightPanelWidth: 320,
     rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
@@ -355,6 +356,29 @@ describe("ui-store — the empty-panel sentinel", () => {
       RIGHT_PANEL_EMPTY,
     );
     expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual(["files"]);
+  });
+
+  it("reopens on the pane the panel was collapsed from", () => {
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "diff", "review"] } });
+    useUIStore.getState().setRightPanelTab("ws-1", "review");
+    useUIStore.getState().collapseRightPanel("ws-1");
+
+    useUIStore.getState().setRightPanelTab("ws-1", RIGHT_PANEL_EMPTY);
+
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe("review");
+  });
+
+  it("falls back to the picker when the remembered pane left the deck", () => {
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "review"] } });
+    useUIStore.getState().setRightPanelTab("ws-1", "review");
+    useUIStore.getState().collapseRightPanel("ws-1");
+    useUIStore.getState().closeRightPanelPane("ws-1", "review");
+
+    useUIStore.getState().setRightPanelTab("ws-1", RIGHT_PANEL_EMPTY);
+
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe(
+      RIGHT_PANEL_EMPTY,
+    );
   });
 
   it("catches the last closed pane instead of collapsing the panel", () => {
