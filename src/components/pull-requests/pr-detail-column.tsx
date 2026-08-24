@@ -168,8 +168,9 @@ export function PrDetailColumn({
   // rather than from a value worked out during render: a render-time
   // value would be assigned after the checks query had already
   // registered its options for that render, and take effect one render
-  // late. React Query re-evaluates the callback form whenever the query
-  // updates, and only resets a timer when the answer actually changes.
+  // late. React Query re-evaluates the callback form on every render
+  // and on every update of the query it belongs to, so a checks answer
+  // that changes the cadence reaches the detail query within a render.
   const pollMsFor = (state: { data?: CheckInfo[]; status: QueryStatus } | undefined) =>
     checksAreSettled(state?.data, state?.status === "error", row, Date.now() - watchingSince)
       ? SETTLED_POLL_MS
@@ -188,6 +189,10 @@ export function PrDetailColumn({
     enabled: !paused,
     staleTime: DETAIL_POLL_MS,
     refetchInterval: (query) => pollMsFor(query.state),
+    // One retry, and none for a refusal — the same rule as the list. The
+    // default retry would spend a second refused request per query and
+    // hold the refusal back from the gate below until it had.
+    retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
   });
 
   const detailQuery = useQuery({
@@ -196,6 +201,7 @@ export function PrDetailColumn({
     enabled: !paused,
     staleTime: DETAIL_POLL_MS,
     refetchInterval: () => pollMsFor(queryClient.getQueryState<CheckInfo[]>(checksKey)),
+    retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
   });
 
   // And the gate hears about refusals from here, not only from the
@@ -214,6 +220,7 @@ export function PrDetailColumn({
     enabled: !paused,
     staleTime: CONVERSATION_POLL_MS,
     refetchInterval: CONVERSATION_POLL_MS,
+    retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
   });
 
   /**
@@ -236,6 +243,7 @@ export function PrDetailColumn({
     enabled: !paused,
     staleTime: CONVERSATION_POLL_MS,
     refetchInterval: CONVERSATION_POLL_MS,
+    retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
   });
 
   const refresh = useCallback(() => {
