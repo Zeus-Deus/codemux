@@ -18,6 +18,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// `_meta` key under which a `tools/call` carries the calling session's
+/// workspace id to the built-in `codemux mcp` server. Every agent-chat
+/// session shares ONE spawned child, so the child's env cannot identify
+/// the caller; the registry tags each dispatch with this key instead and
+/// the server prefers it over `CODEMUX_WORKSPACE_ID` (see
+/// `mcp_server::resolve_workspace_id`).
+pub const WORKSPACE_META_KEY: &str = "codemux/workspace_id";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum McpConfigSource {

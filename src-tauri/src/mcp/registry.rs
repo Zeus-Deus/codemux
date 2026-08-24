@@ -507,15 +507,26 @@ impl McpRegistry {
     /// `tools/call` response with `content: [...]` and optional
     /// `isError`). Errors come through as `Err(String)` so the caller
     /// can wrap them in a synthetic `isError: true` result for the SDK.
+    ///
+    /// `workspace_id` is the calling session's owning workspace. All
+    /// provider sessions share ONE spawned `codemux mcp` child, so the
+    /// child's env cannot identify the caller — the id travels per-call
+    /// in the request's `_meta` instead (see [`tool_call_params`]) so
+    /// workspace-scoped tools (browser routing, git cwd) bind to the
+    /// session's own workspace rather than whichever one the app
+    /// process happens to sit in. `None` keeps the child's env/cwd
+    /// fallback behavior.
     pub async fn dispatch_tool_call(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
+        workspace_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let (raw_name, child, remote) = {
+        let (raw_name, is_codemux_self, child, remote) = {
             let inner = self.inner.lock().await;
             let mut found: Option<(
                 String,
+                bool,
                 Option<std::sync::Arc<crate::json_rpc_child::JsonRpcChild>>,
                 Option<std::sync::Arc<super::http_client::HttpMcpClient>>,
             )> = None;
@@ -536,7 +547,14 @@ impl McpRegistry {
                                 handle.config.name
                             ));
                         }
-                        found = Some((tool.name.clone(), child, remote));
+                        // Only the built-in server understands the
+                        // `_meta` workspace tag; the Codemux source is
+                        // its marker (see `codemux_self_config`).
+                        let is_self = handle
+                            .config
+                            .sources
+                            .contains(&super::McpConfigSource::Codemux);
+                        found = Some((tool.name.clone(), is_self, child, remote));
                         break;
                     }
                 }
@@ -550,10 +568,7 @@ impl McpRegistry {
             }
         };
 
-        let params = serde_json::json!({
-            "name": raw_name,
-            "arguments": arguments,
-        });
+        let params = tool_call_params(&raw_name, arguments, is_codemux_self, workspace_id);
         if let Some(child) = child {
             child
                 .request("tools/call", params)
@@ -602,6 +617,30 @@ impl McpRegistry {
             let _ = t.await;
         }
     }
+}
+
+/// Build the `tools/call` params for a registry dispatch. The caller's
+/// workspace id rides in `_meta` (MCP's per-request metadata channel)
+/// under a namespaced key, and ONLY for the built-in codemux server —
+/// third-party servers must keep receiving the exact `{name, arguments}`
+/// shape they got before, so a stray `_meta` cannot confuse a strict
+/// implementation.
+fn tool_call_params(
+    raw_name: &str,
+    arguments: serde_json::Value,
+    is_codemux_self: bool,
+    workspace_id: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "name": raw_name,
+        "arguments": arguments,
+    });
+    if is_codemux_self {
+        if let Some(id) = workspace_id {
+            params["_meta"] = serde_json::json!({ super::WORKSPACE_META_KEY: id });
+        }
+    }
+    params
 }
 
 /// Emit a status-changed event so the frontend updates without
@@ -678,10 +717,117 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
     super::dedupe_servers(out)
 }
 
+/// Shared fixture for tests that need to observe the exact `tools/call`
+/// the registry sends to the built-in server: a mock HTTP MCP server
+/// registered under the `Codemux` source (the marker `dispatch_tool_call`
+/// keys the `_meta` workspace tag on), so the adapters' dispatch paths can
+/// assert on the outbound wire shape without spawning a real child.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport};
+    use mockito::Matcher;
+
+    /// One mock `codemux-remote` server exposing a single `echo` tool. The
+    /// returned `Mock` is the `tools/call` expectation: it only matches a
+    /// request whose params carry `_meta[WORKSPACE_META_KEY] == workspace_id`,
+    /// so `assert_async` proves the tag reached the wire.
+    pub(crate) async fn codemux_remote_server(
+        workspace_id: &str,
+    ) -> (mockito::ServerGuard, McpRegistry, mockito::Mock) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "initialize" })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "codemux", "version": "1"}
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "method": "notifications/initialized" }),
+            ))
+            .with_status(202)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "tools/list" })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [{
+                        "name": "echo",
+                        "description": "Echo",
+                        "inputSchema": {"type": "object"}
+                    }]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let call = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "echo",
+                    "_meta": { crate::mcp::WORKSPACE_META_KEY: workspace_id }
+                }
+            })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {"content": [{"type": "text", "text": "routed"}]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let registry = McpRegistry::new();
+        let config = McpServerConfig {
+            id: "codemux-remote".into(),
+            name: "codemux-remote".into(),
+            sources: vec![McpConfigSource::Codemux],
+            command: format!("{}/mcp", server.url()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            disabled: false,
+            transport: McpTransport::Http,
+            raw: serde_json::json!({}),
+        };
+        let row = registry
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+            .await;
+        assert!(
+            matches!(row.status, McpServerStatus::Running { tool_count: 1 }),
+            "{row:?}"
+        );
+        (server, registry, call)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport};
+    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport, WORKSPACE_META_KEY};
     use std::collections::HashMap;
 
     fn make_config(id: &str, name: &str, command: &str) -> McpServerConfig {
@@ -898,11 +1044,62 @@ mod tests {
         assert_eq!(user_tools, 4, "all user MCP tools must be registered");
     }
 
+    #[test]
+    fn tool_call_params_tags_codemux_self_with_workspace_meta() {
+        let params = tool_call_params(
+            "browser_navigate",
+            serde_json::json!({"url": "http://localhost:1420"}),
+            true,
+            Some("ws-42"),
+        );
+        assert_eq!(params["name"], "browser_navigate");
+        assert_eq!(params["arguments"]["url"], "http://localhost:1420");
+        assert_eq!(params["_meta"][WORKSPACE_META_KEY], "ws-42");
+    }
+
+    #[test]
+    fn tool_call_params_omits_meta_without_workspace() {
+        let params = tool_call_params("browser_navigate", serde_json::json!({}), true, None);
+        assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn tool_call_params_never_tags_third_party_servers() {
+        // A third-party server must see the exact pre-existing shape even
+        // when the caller supplied a workspace id.
+        let params = tool_call_params("create_issue", serde_json::json!({}), false, Some("ws-42"));
+        assert!(params.get("_meta").is_none());
+        assert_eq!(
+            params,
+            serde_json::json!({ "name": "create_issue", "arguments": {} })
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_call_sends_workspace_meta_to_builtin_server() {
+        // The wire check for the whole chain: a dispatch with a workspace id
+        // against the built-in server must produce an outbound `tools/call`
+        // whose params carry `_meta[WORKSPACE_META_KEY]` — the mock only
+        // answers a request that has it.
+        let (_server, reg, call) =
+            super::test_support::codemux_remote_server("ws-42").await;
+        let result = reg
+            .dispatch_tool_call(
+                "mcp__codemux-remote__echo",
+                serde_json::json!({"text": "hi"}),
+                Some("ws-42"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "routed");
+        call.assert_async().await;
+    }
+
     #[tokio::test]
     async fn dispatch_tool_call_unknown_tool_errors() {
         let reg = McpRegistry::new();
         let err = reg
-            .dispatch_tool_call("mcp__nope__x", serde_json::json!({}))
+            .dispatch_tool_call("mcp__nope__x", serde_json::json!({}), None)
             .await
             .unwrap_err();
         assert!(err.contains("unknown MCP tool"));
@@ -926,7 +1123,7 @@ mod tests {
             inner.handles.insert("github".into(), h);
         }
         let err = reg
-            .dispatch_tool_call("mcp__github__create_issue", serde_json::json!({}))
+            .dispatch_tool_call("mcp__github__create_issue", serde_json::json!({}), None)
             .await
             .unwrap_err();
         assert!(err.contains("not running"));
@@ -1023,6 +1220,7 @@ mod tests {
             .dispatch_tool_call(
                 "mcp__remote__echo",
                 serde_json::json!({"text": "hi"}),
+                None,
             )
             .await
             .unwrap();
@@ -1057,6 +1255,7 @@ mod tests {
             .dispatch_tool_call(
                 &tool.prefixed_name,
                 serde_json::json!({"query": "default browser"}),
+                None,
             )
             .await
             .expect("real MCP tool call should succeed");

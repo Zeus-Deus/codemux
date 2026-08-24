@@ -226,6 +226,12 @@ pub(crate) struct CodexSession {
     /// Handed to the notification task's demux so a resumed thread does
     /// not re-record its history. Zero for a fresh thread.
     recorded_usage_baseline: UsageBaseline,
+    /// Owning workspace of the chat pane this session runs in, from
+    /// `StartSessionInput.workspace_id`. Attached per-call to dynamic
+    /// tool dispatches so workspace-scoped built-in tools bind to THIS
+    /// session's workspace — the registry's shared MCP child cannot
+    /// learn the caller from its env.
+    workspace_id: Option<String>,
 }
 
 impl CodexSession {
@@ -245,6 +251,9 @@ impl CodexSession {
         fast_mode: bool,
         resume_cursor: Option<Value>,
         caller_env: Option<HashMap<String, String>>,
+        // Owning workspace of the calling chat pane; stored on the
+        // session and tagged onto MCP dispatches (see the field doc).
+        workspace_id: Option<String>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
         // Usage already in the ledger for this thread. Seeded into the
@@ -520,6 +529,7 @@ impl CodexSession {
             tasks: Mutex::new(Vec::new()),
             dead: Arc::new(AtomicBool::new(false)),
             recorded_usage_baseline: recorded_usage_baseline.unwrap_or_default(),
+            workspace_id,
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -1274,7 +1284,12 @@ fn spawn_incoming_requests_task(
                     let Some(req) = maybe_req else { break; };
                     let msg = ServerRequestMessage::from_raw(&req.method, req.params.clone());
                     if let ServerRequestMessage::ToolCall(params) = msg {
-                        let result = handle_dynamic_tool_call(mcp_registry.as_ref(), params).await;
+                        let result = handle_dynamic_tool_call(
+                            mcp_registry.as_ref(),
+                            session.workspace_id.as_deref(),
+                            params,
+                        )
+                        .await;
                         if let Err(error) = child.respond(req.id, Ok(result)).await {
                             let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                                 thread_id: Some(session.thread_id.clone()),
@@ -1299,11 +1314,15 @@ fn spawn_incoming_requests_task(
 
 /// Execute a Codex dynamic-tool request through the process-wide registry and
 /// translate the MCP content envelope into Codex's input-content shape.
-async fn handle_dynamic_tool_call(registry: Option<&McpRegistry>, raw: Value) -> Value {
+async fn handle_dynamic_tool_call(
+    registry: Option<&McpRegistry>,
+    workspace_id: Option<&str>,
+    raw: Value,
+) -> Value {
     let parsed = serde_json::from_value::<DynamicToolCallParams>(raw);
     let (success, result) = match (registry, parsed) {
         (Some(registry), Ok(call)) => match registry
-            .dispatch_tool_call(&registry_tool_name(&call.tool), call.arguments)
+            .dispatch_tool_call(&registry_tool_name(&call.tool), call.arguments, workspace_id)
             .await
         {
             Ok(result) => {
@@ -1664,8 +1683,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_tool_call_tags_builtin_dispatch_with_session_workspace() {
+        // The session's workspace id must reach the built-in server as
+        // `_meta[WORKSPACE_META_KEY]` on the outbound `tools/call`; the mock
+        // only answers a request that carries it.
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let response = handle_dynamic_tool_call(
+            Some(&registry),
+            Some("ws-42"),
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux-remote__echo",
+                "arguments": {"text": "hi"}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["contentItems"][0]["text"], "routed");
+        call.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn dynamic_tool_call_without_registry_returns_failed_response() {
         let response = handle_dynamic_tool_call(
+            None,
             None,
             json!({
                 "threadId": "thread",

@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             additional_directories: vec![],
             recorded_usage_baseline: None,
             env: None,
+            workspace_id: None,
             extra: serde_json::Value::Null,
         })
         .await?;

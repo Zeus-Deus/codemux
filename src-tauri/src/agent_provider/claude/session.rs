@@ -186,6 +186,12 @@ pub(crate) struct ClaudeSession {
     /// `handle_mcp_tool_call` to route `mcp-tool-call` requests from
     /// the sidecar to the right MCP child.
     mcp_registry: Option<crate::mcp::registry::McpRegistry>,
+    /// Owning workspace of the chat pane this session runs in, from
+    /// `StartSessionInput.workspace_id`. Attached per-call to MCP
+    /// dispatches so workspace-scoped built-in tools bind to THIS
+    /// session's workspace — the registry's shared MCP child cannot
+    /// learn the caller from its env.
+    workspace_id: Option<String>,
 }
 
 impl ClaudeSession {
@@ -354,6 +360,7 @@ impl ClaudeSession {
             intentionally_closed: Arc::new(RwLock::new(false)),
             dead: Arc::new(AtomicBool::new(false)),
             mcp_registry: spawn.mcp_registry.clone(),
+            workspace_id: input.workspace_id.clone(),
         });
 
         // Announce the session up front.
@@ -1374,7 +1381,10 @@ async fn handle_mcp_tool_call(
         return;
     };
 
-    match registry.dispatch_tool_call(&prefixed_name, arguments).await {
+    match registry
+        .dispatch_tool_call(&prefixed_name, arguments, session.workspace_id.as_deref())
+        .await
+    {
         Ok(result) => {
             // The MCP child returns the full `tools/call` result —
             // including `content` and optional `isError`. Forward it

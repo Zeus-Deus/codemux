@@ -71,6 +71,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         additional_directories: vec![],
         recorded_usage_baseline: None,
         env: None,
+        workspace_id: None,
         extra: serde_json::Value::Null,
     }
 }
@@ -1137,6 +1138,7 @@ mod auto_resume {
                 additional_directories: vec![],
                 recorded_usage_baseline: None,
                 env: None,
+                workspace_id: None,
                 extra: Value::Null,
             })
             .await
@@ -1805,5 +1807,124 @@ async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
             .status()
             .unwrap();
         assert!(!status.success(), "checkpoint ref leaked: {ref_name}");
+    }
+}
+
+// ── Workspace identity handed to the provider ─────────────────────────
+//
+// Both session-minting paths must hand the adapter the workspace that
+// OWNS the chat pane — never one an IPC caller supplied — so the
+// adapter's MCP dispatches route to the pane's workspace. The fresh-start
+// command itself can't be driven here: `agent_chat_start_session` primes
+// the MCP registry, which spawns the built-in `<current_exe> mcp` child
+// (this test binary) plus the user's real MCP configs. Its derivation is
+// the shared `pane_workspace_context` helper, asserted directly; the
+// rebuild path is driven end-to-end through `ensure_live_session` with
+// the mock provider capturing the `StartSessionInput`.
+
+mod workspace_identity {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use codemux_lib::agent_provider::{ProviderKind, StartSessionInput, ThreadId};
+    use codemux_lib::commands::agent_chat::{
+        ensure_live_session, pane_workspace_context, ProviderRegistry,
+    };
+    use codemux_lib::database::DatabaseStore;
+    use codemux_lib::state::AppStateStore;
+    use tauri::Manager;
+
+    use crate::mock_agent_provider::MockAgentProvider;
+
+    #[test]
+    fn fresh_start_context_derives_workspace_id_from_pane_binding() {
+        let state = AppStateStore::default();
+        let ws = state.create_workspace_at_path(PathBuf::from("/tmp/codemux-ws-identity"));
+        let pane = state
+            .create_agent_chat_pane(&ws.0, None, None, None)
+            .expect("create_agent_chat_pane");
+
+        let caller_env = HashMap::from([("KEEP_ME".to_string(), "1".to_string())]);
+        let (env, workspace_id) = pane_workspace_context(&state, &pane.0, Some(caller_env));
+
+        assert_eq!(
+            workspace_id.as_deref(),
+            Some(ws.0.as_str()),
+            "the owning workspace comes from the pane binding"
+        );
+        let env = env.expect("env overlay present for a bound pane");
+        assert_eq!(
+            env.get("CODEMUX_WORKSPACE_ID"),
+            Some(&ws.0),
+            "env and first-class id come from the same snapshot"
+        );
+        assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("1"));
+
+        // An orphaned pane injects nothing and names no workspace.
+        assert_eq!(pane_workspace_context(&state, "pane-orphan", None), (None, None));
+    }
+
+    #[test]
+    fn ipc_input_cannot_carry_a_workspace_id() {
+        // The IPC shape never sets `workspace_id`; a caller that tries must
+        // be ignored so a pane cannot point its tool calls at a workspace it
+        // does not live in.
+        let input: StartSessionInput = serde_json::from_value(serde_json::json!({
+            "thread_id": "thread-ipc",
+            "cwd": "/tmp/codemux-test",
+            "fast_mode": false,
+            "additional_directories": [],
+            "workspace_id": "ws-somebody-elses"
+        }))
+        .expect("StartSessionInput deserializes");
+        assert_eq!(input.workspace_id, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_hands_provider_the_pane_workspace_id() {
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let mock = Arc::new(MockAgentProvider::new(ProviderKind::Codex));
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry.set_codex(mock.clone() as _).await;
+        }
+
+        // A chat pane bound to the thread inside a workspace, plus the
+        // persisted row the rebuild reads.
+        let thread = ThreadId("thread-rebuild-identity".into());
+        let state: tauri::State<'_, AppStateStore> = handle.state();
+        let ws = state.create_workspace_at_path(PathBuf::from("/tmp/codemux-ws-rebuild"));
+        super::bind_chat_pane(&state, &ws.0, &thread.0);
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(&thread.0, &ws.0, Some("/tmp/codemux-ws-rebuild"), "codex")
+                .unwrap();
+        }
+
+        ensure_live_session(&handle, ProviderKind::Codex, &thread)
+            .await
+            .expect("rebuild should succeed");
+
+        let inputs = mock.start_inputs();
+        assert_eq!(inputs.len(), 1, "exactly one start_session was sent");
+        assert_eq!(
+            inputs[0].workspace_id.as_deref(),
+            Some(ws.0.as_str()),
+            "the rebuilt session carries the pane's owning workspace"
+        );
+        assert_eq!(
+            inputs[0]
+                .env
+                .as_ref()
+                .and_then(|env| env.get("CODEMUX_WORKSPACE_ID")),
+            Some(&ws.0),
+            "env overlay agrees with the first-class id"
+        );
     }
 }

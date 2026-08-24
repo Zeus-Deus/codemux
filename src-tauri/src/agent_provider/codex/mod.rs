@@ -213,6 +213,7 @@ impl AgentProvider for CodexAgentProvider {
             input.fast_mode,
             input.resume_cursor.clone(),
             input.env,
+            input.workspace_id,
             self.spawn_config(),
             self.event_tx.clone(),
             input.recorded_usage_baseline,
