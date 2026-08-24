@@ -1888,6 +1888,11 @@ pub struct GhRateLimit {
 /// with its own default back-off.
 const RATE_LIMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `repo_path` is only a working directory for `gh`. `gh api` does not
+/// pick a host from the checkout it runs in — it reads whichever host
+/// `gh` treats as its default — so the answer is that account's budget
+/// wherever this is asked from, and the page treats it as one budget
+/// for every root `gh` serves.
 pub fn rate_limit(repo_path: &Path) -> Result<GhRateLimit, String> {
     let output = run_gh_timed(repo_path, &["api", "rate_limit"], RATE_LIMIT_TIMEOUT)?;
     parse_rate_limit(&output)

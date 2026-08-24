@@ -668,8 +668,10 @@ export const listPrsOverviewStats = (path: string) =>
  *
  *  Asked only after a call has come back refused for exceeding it —
  *  GitHub does not charge for this endpoint, so it is the one request
- *  still safe to make when there is nothing left to spend. `path` picks
- *  the host: an enterprise root and a github.com root meter separately. */
+ *  still safe to make when there is nothing left to spend. `path` is
+ *  only a working directory for `gh`: the reply is the budget of the
+ *  host `gh` treats as its default, and the gate it feeds is one gate
+ *  for every root `gh` serves. */
 export const githubRateLimit = (path: string) =>
   invoke<GhRateLimit>("github_rate_limit", { path });
 

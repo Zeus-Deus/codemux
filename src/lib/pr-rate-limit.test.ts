@@ -16,8 +16,7 @@ import {
   isRateLimitError,
   noteRateLimited,
   pauseUntil,
-  publishForTest,
-  subscribeRateLimit,
+  subscribe,
 } from "./pr-rate-limit";
 
 const ROOT = "/home/dev/projects/codemux";
@@ -150,16 +149,70 @@ describe("noteRateLimited", () => {
     expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
   });
 
-  it("wakes its subscribers when the gate is reset", () => {
+  it("wakes its subscribers when the gate lifts", async () => {
     // Assigning the module value without publishing would leave a
     // mounted subscriber holding the old snapshot forever — the one way
     // to produce a gate that never lifts.
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: Math.floor(NOW / 1000) + 600,
+    });
     const seen: number[] = [];
-    const stop = subscribeRateLimit(() => seen.push(getPausedUntil()));
-    publishForTest(Date.now() + 60_000);
-    _resetRateLimitGate();
+    const stop = subscribe(() => seen.push(getPausedUntil()));
+    await noteRateLimited(ROOT, NOW);
+    expect(seen[seen.length - 1]).toBeGreaterThan(0);
+    clearRateLimitPause();
     stop();
     expect(seen[seen.length - 1]).toBe(0);
+  });
+
+  it("ignores a refusal no newer than the last one it acted on", async () => {
+    // A query that already holds rows keeps its error, and the error's
+    // timestamp, for as long as its refetch is in flight — so after the
+    // gate lifts, the page is briefly still showing refusals from before
+    // it went up, and any of them can be handed back here as the other
+    // roots recover. The pause that just ended already answered for
+    // them; raising the gate again on one would pause the page on news
+    // from before the pause, and again on every lift after.
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: Math.floor(NOW / 1000) + 600,
+    });
+
+    await noteRateLimited("/home/dev/projects/site", NOW + 5);
+    clearRateLimitPause();
+    expect(getPausedUntil()).toBe(0);
+
+    // Older than the one acted on: not news.
+    await noteRateLimited(ROOT, NOW);
+    expect(getPausedUntil()).toBe(0);
+    // The same one again: not news either.
+    await noteRateLimited("/home/dev/projects/site", NOW + 5);
+    expect(getPausedUntil()).toBe(0);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+
+    // Newer: the host has refused *since* the lift, and that is news.
+    await noteRateLimited(ROOT, NOW + 6);
+    expect(getPausedUntil()).toBeGreaterThan(0);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(2);
+  });
+
+  it("remembers a refusal it declined to act on", async () => {
+    // A refusal seen *during* a pause does not pay for a lookup, but it
+    // is still a refusal the pause answered for: replayed after the
+    // lift, it must not raise the gate a second time.
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: Math.floor(NOW / 1000) + 600,
+    });
+
+    await noteRateLimited(ROOT, NOW);
+    await noteRateLimited("/home/dev/projects/site", NOW + 5);
+    clearRateLimitPause();
+
+    await noteRateLimited("/home/dev/projects/site", NOW + 5);
+    expect(getPausedUntil()).toBe(0);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the default when the host will not say", async () => {
@@ -177,7 +230,10 @@ describe("noteRateLimited", () => {
     clearRateLimitPause();
     expect(getPausedUntil()).toBe(0);
 
-    await noteRateLimited(ROOT, NOW);
+    // A second refusal is one that landed after the lift, so it is
+    // newer than the first by construction.
+    await noteRateLimited(ROOT, NOW + MIN_PAUSE_MS);
     expect(mockGithubRateLimit).toHaveBeenCalledTimes(2);
+    expect(getPausedUntil()).toBeGreaterThan(0);
   });
 });

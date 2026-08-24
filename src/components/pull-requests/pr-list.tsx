@@ -597,8 +597,8 @@ function EmptyList({
       <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-unanswered">
         <p className="text-xs text-foreground">Nothing to show yet.</p>
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
-          The host is not answering requests right now, so this page has not been able to
-          ask what is open. It tries again on its own.
+          The host is refusing requests until the account&apos;s API budget refills, so this
+          page has not been able to ask what is open. It tries again on its own.
         </p>
       </div>
     );

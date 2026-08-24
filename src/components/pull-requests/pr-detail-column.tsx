@@ -1,5 +1,5 @@
-import { useCallback, useRef } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo } from "react";
+import { useQuery, useQueryClient, type QueryStatus } from "@tanstack/react-query";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -15,7 +15,13 @@ import type { CheckInfo } from "@/tauri/types";
 import { ReviewDetail } from "@/components/workspace/review/review-detail";
 import { RepoUnreachableState } from "@/components/workspace/review/review-empty-states";
 import { checkState } from "@/components/workspace/review/review-ui";
-import { budgetApplies, clearRateLimitPause, useRateLimitPause } from "@/lib/pr-rate-limit";
+import {
+  budgetApplies,
+  clearRateLimitPause,
+  isRateLimitError,
+  noteRateLimited,
+  useRateLimitPause,
+} from "@/lib/pr-rate-limit";
 
 /**
  * How often the open pull request re-reads itself while its checks are
@@ -53,6 +59,16 @@ export interface PrDetailColumnProps {
 }
 
 /**
+ * How long an open pull request may sit with an empty check list on the
+ * fast cadence before the column concludes nothing is coming.
+ *
+ * A check that is going to register does so within seconds of the push.
+ * A minute of nothing is a repository with no CI, whatever the row says
+ * — and the row may well say nothing: see `checksAreSettled`.
+ */
+export const EMPTY_CHECKS_GRACE_MS = 60_000;
+
+/**
  * Nothing is still running, so nothing is still changing — and the fast
  * cadence has nothing left to buy.
  *
@@ -68,24 +84,60 @@ export interface PrDetailColumnProps {
  * situations wearing the same shape: a repository with no CI at all, and
  * a pull request whose first check has not registered yet — the seconds
  * right after a push, which is exactly when someone opens the column to
- * watch. Only the row can tell them apart. `"none"` is the host having
- * looked and found nothing; `null` is nobody having asked. So an empty
- * list settles on the host's own word and on nothing else, and a
- * just-pushed pull request keeps the fast cadence until its checks show
- * up rather than going quiet for the twenty seconds that matter most.
+ * watch. The row can sometimes tell them apart: `"none"` is the host
+ * having looked and found nothing, and a closed or merged pull request
+ * is not about to grow a check. But the row's `null` only means nobody
+ * has asked — the history list never does, and the stats that fill it
+ * in for open rows take up to a cycle to land, or never land at all —
+ * so it cannot be read as "keep asking", or a merged pull request with
+ * no CI would hold the fast cadence for as long as it stayed selected.
+ * An empty list therefore settles on the host's word, on the row being
+ * closed, or on `watchedForMs`: the column having sat on the fast clock
+ * for the whole grace window and seen nothing register. A just-pushed
+ * pull request still gets its first minute at full speed.
  */
 export function checksAreSettled(
   checks: CheckInfo[] | undefined,
   checksFailed: boolean,
-  rowChecks: string | null,
+  row: Pick<PrRow, "checks" | "state">,
+  watchedForMs: number,
 ): boolean {
   if (checksFailed) return true;
   if (!checks) return false;
-  if (checks.length === 0) return rowChecks === "none";
+  if (checks.length === 0) {
+    if (row.checks === "none") return true;
+    // An absent state is open: the overview only lists open pull
+    // requests, and only the history list stamps a state on its rows.
+    if (row.state != null && row.state.toUpperCase() !== "OPEN") return true;
+    return watchedForMs >= EMPTY_CHECKS_GRACE_MS;
+  }
   // `checkState` returns "running" for anything it does not recognise —
   // queued, in_progress, waiting, action_required — so an unfamiliar
   // status keeps the fast cadence rather than silencing the column.
   return !checks.some((check) => checkState(check.conclusion, check.status) === "running");
+}
+
+/**
+ * When the newest refusal-for-spending among these queries landed, or 0
+ * when none of them is refused.
+ *
+ * The column's own calls are GraphQL too, and the most frequent in the
+ * app, so this is the surface most likely to be refused first. A refusal
+ * it sees is the same fact about the account that a refusal on the list
+ * is, and it has to reach the same gate — otherwise the list would stop
+ * asking and the column would carry on spending on its behalf until the
+ * list happened to be refused as well.
+ */
+export function newestRefusalAt(
+  queries: readonly { error: unknown; errorUpdatedAt: number }[],
+): number {
+  let newest = 0;
+  for (const query of queries) {
+    if (isRateLimitError(query.error) && query.errorUpdatedAt > newest) {
+      newest = query.errorUpdatedAt;
+    }
+  }
+  return newest;
 }
 
 /**
@@ -105,12 +157,23 @@ export function PrDetailColumn({
   const queryClient = useQueryClient();
   const path = row.projectRoot;
   const number = row.number;
+  const checksKey = ["pr", "page-checks", path, number] as const;
 
-  // The cadence both live queries read, through a ref so that changing
-  // it never tears down and re-creates their timers: React Query calls
-  // the callback form each time a timer fires, which is exactly when a
-  // new value should take effect.
-  const pollMsRef = useRef(DETAIL_POLL_MS);
+  // When the column started watching this pull request — the clock the
+  // empty-list grace in `checksAreSettled` runs against.
+  const watchingSince = useMemo(() => Date.now(), [path, number]);
+
+  // The cadence both live queries read. It is derived from the checks
+  // query's *cached* state inside each query's own interval callback,
+  // rather than from a value worked out during render: a render-time
+  // value would be assigned after the checks query had already
+  // registered its options for that render, and take effect one render
+  // late. React Query re-evaluates the callback form whenever the query
+  // updates, and only resets a timer when the answer actually changes.
+  const pollMsFor = (state: { data?: CheckInfo[]; status: QueryStatus } | undefined) =>
+    checksAreSettled(state?.data, state?.status === "error", row, Date.now() - watchingSince)
+      ? SETTLED_POLL_MS
+      : DETAIL_POLL_MS;
 
   // The same budget gate the list obeys. An open pull request polling
   // twice every couple of seconds is the most expensive surface in the
@@ -120,24 +183,30 @@ export function PrDetailColumn({
   const paused = useRateLimitPause() > 0 && budgetApplies(row.providerKind);
 
   const checksQuery = useQuery({
-    queryKey: ["pr", "page-checks", path, number] as const,
+    queryKey: checksKey,
     queryFn: () => getPullRequestChecks(path, number),
     enabled: !paused,
     staleTime: DETAIL_POLL_MS,
-    refetchInterval: () => pollMsRef.current,
+    refetchInterval: (query) => pollMsFor(query.state),
   });
-
-  pollMsRef.current = checksAreSettled(checksQuery.data, checksQuery.isError, row.checks)
-    ? SETTLED_POLL_MS
-    : DETAIL_POLL_MS;
 
   const detailQuery = useQuery({
     queryKey: ["pr", "page-detail", path, number] as const,
     queryFn: () => getGithubPrByPath(path, number),
     enabled: !paused,
     staleTime: DETAIL_POLL_MS,
-    refetchInterval: () => pollMsRef.current,
+    refetchInterval: () => pollMsFor(queryClient.getQueryState<CheckInfo[]>(checksKey)),
   });
+
+  // And the gate hears about refusals from here, not only from the
+  // list. The gate remembers what it has already acted on, so the
+  // refusal a query keeps wearing while its refetch is in flight cannot
+  // raise it a second time after it lifts.
+  const refusedAt = newestRefusalAt([checksQuery, detailQuery]);
+  useEffect(() => {
+    if (refusedAt === 0 || !budgetApplies(row.providerKind)) return;
+    void noteRateLimited(path, refusedAt);
+  }, [refusedAt, path, row.providerKind]);
 
   const reviewsQuery = useQuery({
     queryKey: ["pr", "page-reviews", path, number] as const,

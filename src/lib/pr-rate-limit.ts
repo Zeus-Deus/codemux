@@ -119,6 +119,22 @@ export function pauseUntil(resetEpochSec: number, now: number): number {
 // spending while the page waits.
 
 let pausedUntil = 0;
+/**
+ * When the newest refusal this gate has acted on landed, epoch ms.
+ *
+ * A refusal outlives the pause it raised. A query that already holds
+ * rows keeps its error — and the error's timestamp — for as long as its
+ * refetch is in flight, so for a moment after the gate lifts the page
+ * is still showing refusals from before it went up, and as the other
+ * roots recover any one of them can become the "newest" on screen and
+ * be handed back here. The pause that just ended already answered for
+ * them; re-raising the gate on one would pause the page on news from
+ * before the pause, and do it again on every lift.
+ *
+ * Deliberately *not* cleared when the gate lifts, for that reason. A
+ * refusal that is genuinely new is newer than this by construction.
+ */
+let lastRefusalAt = 0;
 const listeners = new Set<() => void>();
 
 function publish(value: number): void {
@@ -127,16 +143,7 @@ function publish(value: number): void {
   for (const listener of listeners) listener();
 }
 
-export function subscribeRateLimit(listener: () => void): () => void {
-  return subscribe(listener);
-}
-
-/** Test seam: raise the gate without a refusal to raise it from. */
-export function publishForTest(until: number): void {
-  publish(until);
-}
-
-function subscribe(listener: () => void): () => void {
+export function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
@@ -148,38 +155,52 @@ export function getPausedUntil(): number {
   return pausedUntil;
 }
 
-/** Lift the gate — what Retry means, and what the timer does. */
+/** Lift the gate — what Retry means, and what the timer does.
+ *
+ *  Leaves `lastRefusalAt` alone: the refusals still on screen were
+ *  answered for by the pause this is ending, and forgetting that is how
+ *  the gate would go straight back up on one of them. */
 export function clearRateLimitPause(): void {
   publish(0);
 }
 
-/** Test seam: a fresh gate without reloading the module.
+/** Test seam: a fresh gate without reloading the module — the pause
+ *  lifted *and* the refusal memory cleared, which is the one thing
+ *  `clearRateLimitPause` must not do.
  *
  *  Goes through `publish` rather than assigning: a subscriber that is
  *  still mounted would otherwise keep the old snapshot and never
  *  re-render, which is the one way to produce the permanently-stuck gate
  *  this file is written to avoid. */
 export function _resetRateLimitGate(): void {
+  lastRefusalAt = 0;
   publish(0);
 }
 
 /**
  * Record a refusal and work out how long to wait.
  *
- * `path` is the repository whose call was refused, and is only there to
- * give `gh` a working directory that resolves the right host — an
- * enterprise root and a github.com root have separate budgets.
+ * `path` is the repository whose call was refused. It only gives `gh` a
+ * working directory to run in: `gh api rate_limit` reads the budget of
+ * whichever host `gh` treats as its default, wherever it is invoked
+ * from, and the gate pauses every root `gh` serves. This is one gate
+ * for the account `gh` is signed in to, not one per host.
  *
- * Idempotent while a pause is in force: many roots fail in the same
- * cycle and each will call this, but only the first one pays for the
- * lookup.
+ * `refusedAt` is when the refusal landed — the query's `errorUpdatedAt`
+ * rather than the clock now — and is what tells a refusal that is news
+ * from one the page has already been paused for. Idempotent on both
+ * counts: many roots fail in the same cycle and each will call this,
+ * but only the first one pays for the lookup, and a refusal no newer
+ * than the last one acted on is not acted on again.
  */
-export async function noteRateLimited(path: string, now = Date.now()): Promise<void> {
-  if (pausedUntil > now) return;
+export async function noteRateLimited(path: string, refusedAt = Date.now()): Promise<void> {
+  if (refusedAt <= lastRefusalAt) return;
+  lastRefusalAt = refusedAt;
+  if (pausedUntil > refusedAt) return;
   // Pause on the default *first*. Everything below this line is a
   // request, and until the gate is up the polls it is meant to stop are
   // still firing.
-  publish(now + DEFAULT_PAUSE_MS);
+  publish(refusedAt + DEFAULT_PAUSE_MS);
   try {
     const limit = await githubRateLimit(path);
     // `now` again, not the one captured above: the lookup is a shell-out

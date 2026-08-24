@@ -401,7 +401,7 @@ export function usePrOverview(
   let statsPending = false;
   let anyRootFresh = false;
   // The newest refusal-for-spending seen this render, and when it
-  // landed. Both halves matter: the path points `gh` at the right host,
+  // landed. Both halves matter: the path gives `gh` somewhere to run,
   // and the timestamp is what tells a *second* refusal apart from the
   // first one still sitting in the query's error state. Without it the
   // gate would raise once per session and every pause after the first
@@ -553,12 +553,15 @@ export function usePrOverview(
   // repository whose call happened to carry the refusal — it is a fact
   // about the account, and every other root is about to be told the same
   // thing. So one refusal speaks for all of them.
+  //
+  // The timestamp goes with it. "Newest on screen" is not "new": a root
+  // with rows keeps its error while it refetches, so once the pause
+  // lifts and the other roots recover, the newest refusal left on the
+  // page is one from before the pause — and the gate, not this hook, is
+  // what remembers it has already been paused for.
   useEffect(() => {
     if (!rateLimitedRoot) return;
-    void noteRateLimited(rateLimitedRoot);
-    // `rateLimitedAt` is deliberately a dependency: it is the only thing
-    // that changes when the same root is refused a second time.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void noteRateLimited(rateLimitedRoot, rateLimitedAt);
   }, [rateLimitedRoot, rateLimitedAt]);
 
   const refresh = () => {

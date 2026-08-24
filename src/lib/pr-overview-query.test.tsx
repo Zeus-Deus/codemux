@@ -840,4 +840,60 @@ describe("usePrOverview — the gate can be raised more than once", () => {
     await waitFor(() => expect(mockGithubRateLimit).toHaveBeenCalledTimes(2));
     expect(result.current.rateLimitedUntil).toBeGreaterThan(0);
   });
+
+  it("does not raise the gate again on a refusal from before the pause", async () => {
+    // Two roots with rows are both refused, and the newer refusal is
+    // the one that raised the gate. When the pause lifts both refetch,
+    // and a root with rows keeps its error — and its old timestamp —
+    // while its refetch is in flight. If the *other* root answers
+    // first, the newest refusal on the page is suddenly the older one,
+    // the effect sees a change, and a refusal that the pause already
+    // answered for would put the gate straight back up. The gate has
+    // to remember what it has already acted on.
+    const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+    setRoots(ROOT, OTHER);
+    const calls = new Map<string, number>();
+    const rootRefetch = deferred<unknown>();
+    mockListPrsOverview.mockImplementation((path: string) => {
+      const n = (calls.get(path) ?? 0) + 1;
+      calls.set(path, n);
+      if (n === 1) return Promise.resolve({ viewer: "mock-dev", items: [item({ number: n })] });
+      if (n === 2) return Promise.reject("GraphQL: API rate limit already exceeded for user ID 1.");
+      return path === ROOT
+        ? rootRefetch.promise
+        : Promise.resolve({ viewer: "mock-dev", items: [item({ number: 7 })] });
+    });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+
+    await act(async () => {
+      await client.refetchQueries({ predicate: (q) => q.queryKey[1] === "overview" });
+    });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+    expect(result.current.failures).toHaveLength(2);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+
+    act(() => clearRateLimitPause());
+
+    // The second root has answered; the first is still asking, and
+    // still wearing the refusal from before the pause.
+    await waitFor(() => expect(result.current.rows.map((r) => r.number)).toContain(7));
+    expect(result.current.failures.map((f) => f.root.path)).toEqual([ROOT]);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    expect(result.current.rateLimitedUntil).toBe(0);
+
+    rootRefetch.resolve({ viewer: "mock-dev", items: [item({ number: 8 })] });
+    await waitFor(() => expect(result.current.failures).toHaveLength(0));
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    expect(result.current.rateLimitedUntil).toBe(0);
+  });
 });
