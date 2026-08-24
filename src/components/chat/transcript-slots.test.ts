@@ -493,3 +493,59 @@ describe("buildTranscriptSlots — turn boundaries", () => {
     expect(slots[2].turnStart).toBe(true);
   });
 });
+
+describe("buildTranscriptSlots — interim turn ends (provider yielded on background work)", () => {
+  const interimEnd = (seq: number, completedAt: number): ChatViewItem => ({
+    ...(turnEnd(seq, completedAt) as Extract<ChatViewItem, { kind: "turn_ended" }>),
+    interim: true,
+  });
+
+  it("keeps the turn live across an interim boundary: no fold, tail work stays working", () => {
+    const slots = buildTranscriptSlots(
+      [
+        userMsg(0, "fix it", 1_000),
+        tool(1, { tool_name: "Bash" }),
+        assistantMsg(2, "Waiting on the report — still in flight."),
+        interimEnd(3, 405_000),
+        reasoning(4),
+        tool(5, { tool_name: "Bash", status: "running" }),
+      ],
+      true,
+    );
+    expect(slots.map((slot) => slot.body.kind)).toEqual([
+      "item",
+      "activity",
+      "item",
+      "activity",
+    ]);
+    expect(slots.some((slot) => slot.body.kind === "turn_fold")).toBe(false);
+    const tail = slots[3].body;
+    if (tail.kind === "activity") expect(tail.working).toBe(true);
+  });
+
+  it("folds once at the final boundary with the honest prompt-to-settle duration", () => {
+    const slots = buildTranscriptSlots([
+      userMsg(0, "fix it", 1_000),
+      tool(1),
+      assistantMsg(2, "Waiting on the report — still in flight."),
+      interimEnd(3, 405_000),
+      reasoning(4),
+      tool(5, { tool_name: "Bash" }),
+      assistantMsg(6, "Verified end to end."),
+      turnEnd(7, 724_000),
+    ]);
+    const folds = slots.filter((slot) => slot.body.kind === "turn_fold");
+    expect(folds).toHaveLength(1);
+    const fold = folds[0].body;
+    if (fold.kind === "turn_fold") {
+      expect(fold.label).toBe("Worked for 12m 3s");
+      // Work on both sides of the interim marker folds together (the
+      // interim marker itself is invisible and never counted).
+      expect(fold.hiddenCount).toBe(4);
+    }
+    const last = slots[slots.length - 1].body;
+    if (last.kind === "item" && last.item.kind === "assistant_message") {
+      expect(last.item.text).toBe("Verified end to end.");
+    }
+  });
+});

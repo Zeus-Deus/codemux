@@ -2221,3 +2221,40 @@ describe("MessageList viewport edge fade", () => {
     expect(viewport.style.getPropertyValue("--transcript-sbw")).toBe("0px");
   });
 });
+
+describe("MessageList — live marker when the live tail row is not on screen", () => {
+  it("reinstates the marker for a running tool hidden inside a settled fold", () => {
+    // `shouldShowThinkingIndicator` steps back for a running tool (it
+    // assumes the tool row shows its own spinner) — but this one is folded
+    // into a "Worked for …" turn, so nothing on screen would read as live.
+    renderList(
+      [
+        { kind: "user_message", id: "um-1", seq: 0, text: "go", created_at: 1_000 },
+        readCall(1, "/a"),
+        {
+          kind: "turn_ended",
+          id: "te-1",
+          seq: 2,
+          turn_id: "t1",
+          status: { kind: "success" },
+          completed_at: 61_000,
+        },
+        { ...readCall(3, "/b"), tool_name: "Bash", status: "running" },
+      ],
+      { showThinking: false, streaming: true },
+    );
+    expect(screen.getByRole("status", { name: "Agent is working" })).toBeInTheDocument();
+  });
+
+  it("stays quiet when the running tool is visible as the working activity tail", () => {
+    renderList(
+      [
+        { kind: "user_message", id: "um-1", seq: 0, text: "go" },
+        readCall(1, "/a"),
+        { ...readCall(2, "/b"), tool_name: "Bash", status: "running" },
+      ],
+      { showThinking: false, streaming: true },
+    );
+    expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
+  });
+});

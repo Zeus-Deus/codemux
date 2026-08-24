@@ -2627,3 +2627,120 @@ describe("context-window usage", () => {
     });
   });
 });
+
+describe("agent-chat reducer — interim turn ends (provider yields on background work)", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const running = (): ProviderRuntimeEvent => ({
+    type: "session_state_changed",
+    thread_id: "t1",
+    status: { status: "running", active_turn: "turn-1" },
+  });
+  const completed = (
+    status: { kind: "success" } | { kind: "error"; subtype: string; message: string } = {
+      kind: "success",
+    },
+  ): ProviderRuntimeEvent => ({
+    type: "turn_completed",
+    thread_id: "t1",
+    turn_id: "turn-1",
+    status,
+    usage: null,
+  });
+  const text = (t: string): ProviderRuntimeEvent => ({
+    type: "item_completed",
+    thread_id: "t1",
+    turn_id: "turn-1",
+    item: { kind: "assistant_text", text: t },
+  });
+  const subagent = (snap: Record<string, unknown>): ProviderRuntimeEvent =>
+    ({
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: snap,
+    }) as unknown as ProviderRuntimeEvent;
+  const turnEnds = (state: ChatThreadState) =>
+    state.messages.filter((m) => m.kind === "turn_ended");
+
+  it("reopens a successful boundary when parent output resumes without a new prompt", () => {
+    let state = runEvents([running(), text("Waiting on the report…"), completed()]);
+    expect(state.streaming).toBe(false);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+
+    // Task notifications woke the model: a completed item lands in the
+    // same session with no user message in between.
+    state = applyEvent(state, text("The report is in."));
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)).toHaveLength(1);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("reopens on a resumed thinking delta, walking back over the waking task snapshots", () => {
+    let state = runEvents([
+      running(),
+      completed(),
+      // The notifications that woke the model arrive right after the result.
+      subagent({ subagent_id: "bg", status: "completed", background_task: true }),
+    ]);
+    expect(state.streaming).toBe(false);
+    state = applyEvent(state, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "thinking", text: "Both reports are in." },
+    });
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("holds the turn open on a success reported while a delegated subagent still runs", () => {
+    const state = runEvents([
+      running(),
+      subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+      completed(),
+    ]);
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("does NOT hold the turn open on background shell jobs or watch loops", () => {
+    const state = runEvents([
+      running(),
+      subagent({ subagent_id: "dev", status: "running", background_task: true }),
+      subagent({ subagent_id: "ci", status: "running", task_kind: "monitor" }),
+      completed(),
+    ]);
+    expect(state.streaming).toBe(false);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+  });
+
+  it("never reopens an error boundary (a stopped turn stays stopped)", () => {
+    let state = runEvents([
+      running(),
+      completed({ kind: "error", subtype: "interrupted", message: "stopped" }),
+    ]);
+    state = applyEvent(state, text("late output"));
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+    expect(state.streaming).toBe(false);
+  });
+
+  it("leaves the previous turn settled once a new prompt has been sent", () => {
+    let state = runEvents([running(), text("done"), completed()]);
+    state = appendUserMessage(state, "follow-up");
+    state = applyEvent(state, text("answer to the follow-up"));
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+  });
+
+  it("the next non-interim completion settles the whole turn", () => {
+    let state = runEvents([running(), completed(), text("resumed")]);
+    expect(state.streaming).toBe(true);
+    state = applyEvent(state, completed());
+    expect(state.streaming).toBe(false);
+    const ends = turnEnds(state);
+    expect(ends).toHaveLength(2);
+    expect(ends[0]).toMatchObject({ interim: true });
+    expect(ends[1]).not.toHaveProperty("interim");
+  });
+});

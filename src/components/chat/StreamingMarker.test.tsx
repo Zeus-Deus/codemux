@@ -4,7 +4,11 @@ import { cleanup, render, screen } from "@testing-library/react";
 
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 
-import { StreamingMarker, deriveTurnStartedAt } from "./StreamingMarker";
+import {
+  StreamingMarker,
+  deriveStreamingLabel,
+  deriveTurnStartedAt,
+} from "./StreamingMarker";
 
 afterEach(() => {
   cleanup();
@@ -68,5 +72,65 @@ describe("StreamingMarker elapsed time", () => {
     render(<StreamingMarker messages={[userMsg(0)]} />);
     expect(screen.getByText("Working…")).toBeInTheDocument();
     expect(screen.queryByText(/·\s*\d+s/)).toBeNull();
+  });
+});
+
+describe("deriveStreamingLabel — waiting on background work", () => {
+  const subagentRun = (
+    subagents: Array<{ id: string; status: "running" | "completed"; backgroundTask?: boolean; taskKind?: "monitor" }>,
+  ): ChatViewItem => ({
+    kind: "subagent_run",
+    id: "sr-1",
+    seq: 1,
+    turn_id: "t1",
+    subagents: subagents.map((s) => ({ ...s, items: [] })),
+  }) as unknown as ChatViewItem;
+  const sealedText = (seq: number): ChatViewItem => ({
+    kind: "assistant_message",
+    id: `a${seq}`,
+    seq,
+    turn_id: "t1",
+    text: "Waiting on the report…",
+    streaming: false,
+  });
+
+  it("names the wait when the tail is settled and tasks are still running", () => {
+    expect(
+      deriveStreamingLabel([
+        userMsg(0),
+        subagentRun([
+          { id: "catalog", status: "running" },
+          { id: "npm-ci", status: "running", backgroundTask: true },
+        ]),
+        sealedText(2),
+      ]),
+    ).toBe("Waiting on 2 background tasks…");
+    expect(
+      deriveStreamingLabel([
+        userMsg(0),
+        subagentRun([{ id: "catalog", status: "running" }]),
+        sealedText(2),
+      ]),
+    ).toBe("Waiting on a background task…");
+  });
+
+  it("ignores watch loops and finished tasks, and defers to a live tail", () => {
+    expect(
+      deriveStreamingLabel([
+        userMsg(0),
+        subagentRun([
+          { id: "ci", status: "running", taskKind: "monitor" },
+          { id: "done", status: "completed" },
+        ]),
+        sealedText(2),
+      ]),
+    ).toBe("Working…");
+    expect(
+      deriveStreamingLabel([
+        userMsg(0),
+        subagentRun([{ id: "catalog", status: "running" }]),
+        toolCall(2),
+      ]),
+    ).toBe("Running Read…");
   });
 });

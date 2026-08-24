@@ -108,10 +108,13 @@ function splitTurns(messages: ChatViewItem[]): TurnSegment[] {
   return segments;
 }
 
+/** The boundary that actually ends the turn. An `interim` marker is the
+ *  provider yielding to wait on background work before resuming the same
+ *  turn, so it neither settles the segment nor stamps its duration. */
 function lastTurnEnd(segment: TurnSegment): TurnEndedItem | null {
   for (let i = segment.items.length - 1; i >= 0; i--) {
     const item = segment.items[i];
-    if (item.kind === "turn_ended") return item;
+    if (item.kind === "turn_ended" && !item.interim) return item;
   }
   return null;
 }

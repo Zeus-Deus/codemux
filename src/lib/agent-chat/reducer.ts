@@ -11,6 +11,8 @@ import type {
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 import {
   interruptRunningSubagents,
+  isMonitorTask,
+  isRunning,
   mergeSnapshot,
   newSubagentView,
   settleSubagentsForToolResult,
@@ -913,6 +915,44 @@ function routeSubagentItem(
 
 /** Best-effort current turn id from the trailing turn-bearing item, so a
  *  freshly-opened card records which turn spawned it. */
+/** Delegated agent work still running in the parent flow — a real launch
+ *  that is running or pending. Background shell jobs and watch loops are
+ *  excluded on purpose: either can outlive the turn indefinitely without a
+ *  terminal snapshot, so holding the turn open on them would pin the thread
+ *  at "working" forever (the issue-#153 shape). Mirrors the backend's
+ *  pane-status rule so the sidebar and the thread settle together. */
+function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
+  for (const item of messages) {
+    if (item.kind !== "subagent_run") continue;
+    for (const sub of item.subagents) {
+      if (isRunning(sub) && !sub.backgroundTask && !isMonitorTask(sub)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Parent-scoped output just landed. If the most recent boundary of the
+ *  current prompt is a successful `turn_ended` with no output after it, the
+ *  provider had only yielded to wait on background work and has now resumed
+ *  the SAME turn — flag that boundary `interim` so the transcript stops
+ *  presenting the turn as finished. The scan walks back over subagent
+ *  snapshots (the task notifications that woke the model) and stops at the
+ *  first rendered row: output already past the marker means it was
+ *  reopened when that output arrived, so this stays O(1) per token. */
+function reopenInterimTurnEnd(messages: ChatViewItem[]): ChatViewItem[] {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "subagent_run") continue;
+    if (item.kind === "user_message" && item.queued) continue;
+    if (item.kind !== "turn_ended") return messages;
+    if (item.interim || item.status.kind !== "success") return messages;
+    return replaceItem(messages, i, { ...item, interim: true });
+  }
+  return messages;
+}
+
 function trailingTurnId(messages: ChatViewItem[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -1356,7 +1396,10 @@ function applyEventInner(
       // the shared builder (seal-on-boundary + tail-merge discipline);
       // both mark the turn as streaming.
       const ctx = applyContentDeltaToList(
-        { messages: state.messages, nextSeq: state.nextSeq },
+        {
+          messages: reopenInterimTurnEnd(state.messages),
+          nextSeq: state.nextSeq,
+        },
         delta,
         event.turn_id,
         now,
@@ -1385,8 +1428,11 @@ function applyEventInner(
           now,
         );
       }
+      // Parent output after a successful boundary means the provider had
+      // only yielded to wait on background work: the turn is live again.
+      const reopened = reopenInterimTurnEnd(state.messages);
       const ctx = applyCompletedItemToList(
-        { messages: state.messages, nextSeq: state.nextSeq },
+        { messages: reopened, nextSeq: state.nextSeq },
         item,
         event.turn_id,
         now,
@@ -1415,7 +1461,13 @@ function applyEventInner(
       if (messages === state.messages && ctx.nextSeq === state.nextSeq) {
         return state;
       }
-      return { ...state, messages, nextSeq: ctx.nextSeq };
+      return {
+        ...state,
+        // A reopened turn is streaming again even before the next delta.
+        streaming: reopened !== state.messages ? true : state.streaming,
+        messages,
+        nextSeq: ctx.nextSeq,
+      };
     }
 
     case "subagent_updated": {
@@ -1489,10 +1541,22 @@ function applyEventInner(
       // only synthesizes while `active_turn` is still set, which the result
       // message clears), so clearing here — live AND on hydrate replay — keeps
       // a genuinely-finished run from being mislabelled "Run interrupted".
+      //
+      // A success reported while delegated agent work is still running is
+      // the provider's main loop *yielding*, not the turn ending — Claude
+      // Code emits a `result` whenever it has nothing left to do but wait
+      // on a background task, then resumes the same session when the task
+      // notification lands. Keep the turn live and record the boundary as
+      // interim; the final settle arrives with the next non-interim
+      // completion (or a session `ready` / close). Background shell jobs
+      // and watch loops deliberately do NOT hold the turn open (see
+      // `hasLiveDelegatedWork`); if the model resumes after one of those
+      // the boundary is reopened in hindsight by the first parent output.
+      const interim = hasLiveDelegatedWork(messages);
       const { seq, next: seqBumped } = takeSeq({ ...state, messages });
       return {
         ...seqBumped,
-        streaming: false,
+        streaming: interim,
         interrupted: false,
         messages: [
           ...seqBumped.messages,
@@ -1503,6 +1567,7 @@ function applyEventInner(
             turn_id: event.turn_id,
             status: event.status,
             completed_at: now(),
+            ...(interim ? { interim: true } : {}),
           },
         ],
       };
