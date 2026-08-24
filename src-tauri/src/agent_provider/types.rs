@@ -144,14 +144,16 @@ pub struct StartSessionInput {
     /// Environment variables to overlay onto the spawned child, or inherit
     /// the runtime's env when `None`.
     pub env: Option<std::collections::HashMap<String, String>>,
-    /// Id of the workspace that owns this session's chat pane, resolved by
-    /// the command layer (see `workspace_env_overlay` in
-    /// `commands/agent_chat.rs`). Adapters attach it to MCP tool dispatches
-    /// so workspace-scoped built-in tools (browser routing, git cwd) act on
-    /// the session's OWN workspace — the registry's shared MCP child cannot
-    /// learn it from env. `None` for orphaned panes and provider sessions
-    /// with no owning workspace.
-    #[serde(default)]
+    /// Id of the workspace that owns this session's chat pane. Filled by
+    /// the command layer from the pane binding (see `pane_workspace_context`
+    /// in `commands/agent_chat.rs`) and never taken from the IPC caller —
+    /// a frontend value could otherwise point a pane's tool calls at a
+    /// workspace it does not live in. Adapters attach it to MCP tool
+    /// dispatches so workspace-scoped built-in tools (browser routing, git
+    /// cwd) act on the session's OWN workspace — the registry's shared MCP
+    /// child cannot learn it from env. `None` for orphaned panes and
+    /// provider sessions with no owning workspace.
+    #[serde(skip_deserializing)]
     pub workspace_id: Option<String>,
     /// Free-form provider-specific extras. Adapters parse what they
     /// understand and ignore the rest. First-class fields above win over

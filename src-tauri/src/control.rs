@@ -1131,34 +1131,19 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             let state: State<'_, AppStateStore> = app.state();
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
             let observability: State<'_, crate::observability::ObservabilityStore> = app.state();
-            let mut workspace_id = request.params
+            let requested_workspace_id = request.params
                 .get("workspace_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-
-            // Layer B fallback: when the caller sent no `workspace_id` (its
-            // `CODEMUX_WORKSPACE_ID` env was never injected — the agent-chat
-            // sidecar's Bash subprocesses, OpenCode's shared server, etc.)
-            // but did include a `cwd` hint, resolve the owning workspace by
-            // path so the pane lands in the *agent's* workspace instead of
-            // the "Legacy global path" below, which targets whatever
-            // workspace the user is currently viewing.
-            let mut cwd_resolved = false;
-            if workspace_id.is_empty() {
-                let cwd = request.params
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !cwd.is_empty() {
-                    if let Some(resolved) =
-                        resolve_workspace_id_by_cwd(&state.snapshot().workspaces, cwd)
-                    {
-                        workspace_id = resolved;
-                        cwd_resolved = true;
-                    }
-                }
-            }
+                .unwrap_or_default();
+            let cwd_hint = request.params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (workspace_id, cwd_resolved) = resolve_browser_workspace_id(
+                &state.snapshot().workspaces,
+                requested_workspace_id,
+                cwd_hint,
+            );
 
             let action_kind = request.params.get("action")
                 .and_then(|v| v.get("kind"))
@@ -1803,6 +1788,33 @@ fn should_create_legacy_browser_pane(
     browser_sessions_empty
 }
 
+/// Pick the workspace a `browser_automation` call acts on. Returns
+/// `(workspace_id, cwd_resolved)`; an empty id means "legacy global path"
+/// (whatever workspace the user is viewing).
+///
+/// A caller-supplied id only counts when it names a workspace in the
+/// snapshot. The shared `codemux mcp` child forwards whatever `_meta` tag
+/// or env var it was handed, so an id from a session whose workspace has
+/// since closed would otherwise reach `resolve_agent_browser_session` and
+/// mint a phantom `ws-<id>` session that no pane can show. An unknown or
+/// empty id falls through to the Layer B `cwd` hint: when the caller's
+/// `CODEMUX_WORKSPACE_ID` env was never injected (the agent-chat sidecar's
+/// Bash subprocesses, OpenCode's shared server, etc.) the owning workspace
+/// is resolved by path so the pane lands in the *agent's* workspace.
+fn resolve_browser_workspace_id(
+    workspaces: &[crate::state::WorkspaceSnapshot],
+    requested: &str,
+    cwd: &str,
+) -> (String, bool) {
+    if !requested.is_empty() && workspaces.iter().any(|ws| ws.workspace_id.0 == requested) {
+        return (requested.to_string(), false);
+    }
+    match resolve_workspace_id_by_cwd(workspaces, cwd) {
+        Some(resolved) => (resolved, true),
+        None => (String::new(), false),
+    }
+}
+
 /// Resolve which workspace owns a given `cwd`, for browser routing when the
 /// caller sent an empty `workspace_id` (agent-chat Bash subprocesses,
 /// OpenCode's shared server, or any MCP/CLI caller whose
@@ -2070,6 +2082,54 @@ mod tests {
             last_active_at: None,
             last_visited_at: None,
         }
+    }
+
+    // ─── resolve_browser_workspace_id (id validation + cwd fallback) ────
+
+    #[test]
+    fn browser_workspace_known_id_wins_over_cwd() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None), ws("ws-b", "/home/user/proj-b", None)];
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "ws-b", "/home/user/proj-a"),
+            ("ws-b".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn browser_workspace_unknown_id_falls_back_to_cwd() {
+        // A stale `_meta` / env id (workspace closed, app restarted) must
+        // not mint a phantom `ws-<id>` session; the cwd hint takes over.
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "ws-zombie", "/home/user/proj-a/src"),
+            ("ws-a".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn browser_workspace_unknown_id_without_cwd_is_legacy_global() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "ws-zombie", ""),
+            (String::new(), false)
+        );
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "ws-zombie", "/elsewhere"),
+            (String::new(), false)
+        );
+    }
+
+    #[test]
+    fn browser_workspace_empty_id_uses_cwd_then_legacy() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "", "/home/user/proj-a"),
+            ("ws-a".to_string(), true)
+        );
+        assert_eq!(
+            resolve_browser_workspace_id(&workspaces, "", ""),
+            (String::new(), false)
+        );
     }
 
     #[test]

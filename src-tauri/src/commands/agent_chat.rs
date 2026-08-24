@@ -513,6 +513,32 @@ fn workspace_env_overlay(
     Some(env)
 }
 
+/// Everything a chat session inherits from the pane it runs in: the env
+/// overlay (`CODEMUX_WORKSPACE_ID`, `CODEMUX_PANE_ID`, …) for the agent's
+/// own subprocesses, and the owning workspace id itself, which adapters tag
+/// onto MCP dispatches because the registry's shared `codemux mcp` child
+/// cannot learn the caller from env. Both come from ONE snapshot so they
+/// can't disagree, and the id is derived from the pane binding only — never
+/// from the IPC caller. An orphaned pane (no workspace) yields `existing`
+/// untouched and `None`. Shared by `agent_chat_start_session` and the
+/// `ensure_live_session` rebuild so the two session-minting paths stay in
+/// lockstep.
+pub fn pane_workspace_context(
+    state: &AppStateStore,
+    pane_id: &str,
+    existing: Option<HashMap<String, String>>,
+) -> (Option<HashMap<String, String>>, Option<String>) {
+    let workspace_id = state.workspace_id_for_pane(pane_id);
+    let snapshot = state.snapshot();
+    let ws = workspace_id
+        .as_ref()
+        .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
+    (
+        workspace_env_overlay(ws, pane_id, existing),
+        ws.map(|w| w.workspace_id.0.clone()),
+    )
+}
+
 /// Start a new provider session for the given pane.
 ///
 /// The returned [`ThreadId`] is the identifier the provider itself
@@ -682,27 +708,15 @@ pub async fn agent_chat_start_session<R: Runtime>(
     }
     // Overlay the chat pane's workspace env onto `input.env` BEFORE the
     // provider consumes it, so the agent's browser/CLI subprocesses route to
-    // the agent's own workspace instead of the user's active one. Resolve the
-    // owning workspace from the pane; an orphaned pane (no workspace) injects
-    // nothing, matching the terminal path's behavior.
+    // the agent's own workspace instead of the user's active one, and stamp
+    // the owning workspace id for the adapter's MCP dispatches. Both derive
+    // from the pane binding (`pane_workspace_context`); an orphaned pane (no
+    // workspace) injects nothing, matching the terminal path's behavior.
     {
         let state: State<'_, AppStateStore> = app.state();
-        let workspace_id = state.workspace_id_for_pane(&pane_id);
-        let snapshot = state.snapshot();
-        let ws = workspace_id
-            .as_ref()
-            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
-        input.env = workspace_env_overlay(ws, &pane_id, input.env.take());
-        // First-class copy of the owning workspace id, sourced from the same
-        // snapshot as the env's CODEMUX_WORKSPACE_ID so the two can't
-        // disagree. Adapters attach it per-call to MCP dispatches, where the
-        // shared MCP child's env cannot identify the calling session. A
-        // caller-supplied value wins, mirroring the env overlay's
-        // insert-if-absent semantics.
-        input.workspace_id = input
-            .workspace_id
-            .take()
-            .or_else(|| ws.map(|w| w.workspace_id.0.clone()));
+        let (env, workspace_id) = pane_workspace_context(&state, &pane_id, input.env.take());
+        input.env = env;
+        input.workspace_id = workspace_id;
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
@@ -1711,28 +1725,15 @@ pub async fn ensure_live_session<R: Runtime>(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    // Rebuild the workspace env overlay so the resumed agent's
-    // browser / CLI subprocesses route to its OWN workspace, exactly
-    // like `agent_chat_start_session`. Resolve the pane from the thread;
-    // an orphaned thread (no pane) injects nothing.
-    // Also capture the owning workspace id itself: the rebuilt session
-    // attaches it per-call to MCP dispatches, same as a fresh start (see
-    // `agent_chat_start_session`). Sourced from the same snapshot as the
-    // env overlay so the two can't disagree.
+    // Rebuild the workspace env overlay and owning workspace id so the
+    // resumed agent's browser / CLI subprocesses and MCP dispatches route
+    // to its OWN workspace, exactly like `agent_chat_start_session`
+    // (`pane_workspace_context`). Resolve the pane from the thread; an
+    // orphaned thread (no pane) injects nothing.
     let (env, workspace_id) = {
         let state: State<'_, AppStateStore> = app.state();
         match state.agent_chat_pane_id_for_thread(&thread_id.0) {
-            Some(pane_id) => {
-                let workspace_id = state.workspace_id_for_pane(&pane_id);
-                let snapshot = state.snapshot();
-                let ws = workspace_id
-                    .as_ref()
-                    .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
-                (
-                    workspace_env_overlay(ws, &pane_id, None),
-                    ws.map(|w| w.workspace_id.0.clone()),
-                )
-            }
+            Some(pane_id) => pane_workspace_context(&state, &pane_id, None),
             None => (None, None),
         }
     };

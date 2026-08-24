@@ -6,38 +6,58 @@
 # "codemux/workspace_id" on tools/call binds the agent browser session to the
 # intended workspace, overriding both the cwd fallback and the env var.
 #
-# Runs against a DEBUG build only: debug builds use codemux-dev.sock and
-# ~/.config/codemux-dev, so a production instance is never touched.
+# Isolation: the serve process and every CLI invocation below run with their
+# own XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_RUNTIME_DIR under a throwaway
+# root (the app resolves its store through `dirs::config_dir()` /
+# `dirs::data_dir()` and its control socket through XDG_RUNTIME_DIR), so
+# neither the release store (~/.config/codemux) nor the dev store
+# (~/.config/codemux-dev, which `npm run tauri:dev` shares) is read or
+# written. Only a DEBUG build is accepted as a second guard: its socket and
+# store names differ from the release build's.
 #
 # Usage: scripts/e2e/mcp-workspace-routing-e2e.sh [path-to-debug-codemux]
 set -euo pipefail
 
+for tool in jq strings ss; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required tool: $tool" >&2; exit 1; }
+done
+
 BIN="${1:-src-tauri/target/debug/codemux}"
 BIN="$(readlink -f "$BIN" 2>/dev/null || echo "$BIN")"
-PORT="${E2E_SERVE_PORT:-4477}"
 ROOT="$(mktemp -d /tmp/codemux-mcp-routing-e2e.XXXXXX)"
 WS_A="$ROOT/ws-a"
 WS_B="$ROOT/ws-b"
 SERVE_PID=""
 SERVE_LOG="$ROOT/serve.log"
 
+# Every codemux invocation from here on (serve, `json`, the `mcp` child)
+# sees only the throwaway root.
+export XDG_CONFIG_HOME="$ROOT/config"
+export XDG_DATA_HOME="$ROOT/data"
+export XDG_STATE_HOME="$ROOT/state"
+export XDG_CACHE_HOME="$ROOT/cache"
+export XDG_RUNTIME_DIR="$ROOT/run"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
 cleanup() {
-  # Close any browser sessions we opened, then stop only the serve process
-  # we started ourselves.
-  for ws in "${WSID_A:-}" "${WSID_B:-}"; do
-    [ -n "$ws" ] && "$BIN" json browser_automation \
-      "{\"workspace_id\":\"$ws\",\"action\":{\"kind\":\"close\"}}" >/dev/null 2>&1 || true
-  done
+  # Close what we opened (browser sessions, then the workspaces themselves)
+  # while the serve is still answering, then stop only the serve process we
+  # started ourselves. Every step is best-effort so a dead serve can't wedge
+  # teardown.
   if [ -n "$SERVE_PID" ] && kill -0 "$SERVE_PID" 2>/dev/null; then
+    for ws in "${WSID_A:-}" "${WSID_B:-}"; do
+      [ -n "$ws" ] || continue
+      timeout 15 "$BIN" json browser_automation \
+        "{\"workspace_id\":\"$ws\",\"action\":{\"kind\":\"close\"}}" >/dev/null 2>&1 || true
+      timeout 15 "$BIN" json close_workspace "{\"workspace_id\":\"$ws\"}" >/dev/null 2>&1 || true
+    done
     kill "$SERVE_PID" 2>/dev/null || true
     for _ in $(seq 1 20); do kill -0 "$SERVE_PID" 2>/dev/null || break; sleep 0.25; done
     kill -9 "$SERVE_PID" 2>/dev/null || true
-    # The dev control socket belongs to the serve we just stopped; drop it
-    # so the next debug run doesn't see a stale file.
-    rm -f "${XDG_RUNTIME_DIR:-/tmp}/codemux-dev.sock"
   fi
   rm -rf "$ROOT"
 }
@@ -45,19 +65,24 @@ trap cleanup EXIT
 
 [ -x "$BIN" ] || fail "debug binary not found at $BIN (build with: cargo build --manifest-path src-tauri/Cargo.toml)"
 # Refuse anything that doesn't look like a debug build — a release binary
-# would target the user's live instance via codemux.sock.
+# uses different socket/store names, and the XDG isolation above is the only
+# thing standing between this test and a live instance.
 # (the socket name is assembled at runtime, so match the debug-only
 # "codemux-dev" basename constant rather than the joined filename; the
 # `|| true` absorbs strings' SIGPIPE when grep stops at the first match,
 # which pipefail would otherwise misread as "not found")
 DEBUG_MARKER=$(strings -a "$BIN" 2>/dev/null | grep -c -m1 'codemux-dev' || true)
 [ "$DEBUG_MARKER" = "1" ] \
-  || fail "$BIN does not look like a debug build; refusing to run against a live instance"
-# Refuse to run beside an existing debug backend (tauri:dev, another serve):
-# the readiness probe would latch onto IT and the test would pollute it.
-if "$BIN" json status '{}' >/dev/null 2>&1; then
-  fail "a debug backend is already answering on codemux-dev.sock — stop it first"
+  || fail "$BIN does not look like a debug build; refusing to run"
+
+# Pick a free loopback port for the web-remote listener the serve binds.
+PORT="${E2E_SERVE_PORT:-}"
+if [ -z "$PORT" ]; then
+  for candidate in $(seq 4477 4577); do
+    if ! ss -ltn 2>/dev/null | grep -q ":$candidate "; then PORT="$candidate"; break; fi
+  done
 fi
+[ -n "$PORT" ] || fail "no free port in 4477-4577"
 
 mkdir -p "$WS_A" "$WS_B"
 
@@ -72,7 +97,12 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 "$BIN" json status '{}' >/dev/null 2>&1 || fail "control socket never came up"
-pass "headless debug backend up (pid $SERVE_PID)"
+pass "headless debug backend up (pid $SERVE_PID, port $PORT)"
+# Prove the isolation actually took: the store and socket must live under
+# our root, not the user's.
+[ -S "$XDG_RUNTIME_DIR/codemux-dev.sock" ] || fail "control socket not under $XDG_RUNTIME_DIR"
+[ -e "$XDG_CONFIG_HOME/codemux-dev/codemux.db" ] || fail "sqlite store not under $XDG_CONFIG_HOME"
+pass "store and socket isolated under $ROOT"
 
 # ── Two workspaces ─────────────────────────────────────────────────────────
 WSID_A=$("$BIN" json create_workspace "{\"path\":\"$WS_A\"}" | jq -re '.data.workspace_id // .workspace_id')
@@ -132,5 +162,18 @@ mcp_call "$WS_A" "$WSID_A" \
   "{\"name\":\"browser_navigate\",\"arguments\":{\"url\":\"http://127.0.0.1:9/nope\"},\"_meta\":{\"codemux/workspace_id\":\"$WSID_B\"}}" >/dev/null
 [ "$(session_ws_of "$WSID_B")" = "$WSID_B" ] || fail "case 2: _meta workspace id did not override env+cwd (session for B missing)"
 pass "case 2: _meta codemux/workspace_id routes the session to B over env+cwd"
+
+# Case 3 — a stale/unknown _meta id must not reach the browser layer (it
+# would mint a phantom `ws-<id>` session); the control layer drops it and
+# falls through to the cwd hint (ws-a). The handler logs the id it settled
+# on, so the serve log is the witness.
+mcp_call "$WS_A" "" \
+  '{"name":"browser_navigate","arguments":{"url":"http://127.0.0.1:9/nope"},"_meta":{"codemux/workspace_id":"ws-does-not-exist"}}' >/dev/null
+grep -q 'workspace_id=ws-does-not-exist' "$SERVE_LOG" \
+  && fail "case 3: unknown _meta id was forwarded to the browser handler"
+[ "$(grep -c "workspace_id=$WSID_A cwd_resolved=true" "$SERVE_LOG")" -ge 2 ] \
+  || fail "case 3: unknown _meta id did not fall through to the cwd hint"
+[ -z "$(session_ws_of "ws-does-not-exist")" ] || fail "case 3: phantom session recorded"
+pass "case 3: unknown _meta workspace id is dropped in favour of the cwd hint"
 
 echo "ALL PASS"

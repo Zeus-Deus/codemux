@@ -66,6 +66,10 @@ pub struct MockAgentProvider {
     /// `start_session` inserts, `stop_session` removes.
     live: Arc<Mutex<HashSet<ThreadId>>>,
     rollback_error: Arc<Mutex<Option<String>>>,
+    /// Every `StartSessionInput` received, in order, so tests can assert
+    /// on what the command layer actually handed the provider (workspace
+    /// id, env overlay, resume cursor) rather than only that it was called.
+    start_inputs: Arc<Mutex<Vec<StartSessionInput>>>,
 }
 
 impl MockAgentProvider {
@@ -77,7 +81,14 @@ impl MockAgentProvider {
             event_tx,
             live: Arc::new(Mutex::new(HashSet::new())),
             rollback_error: Arc::new(Mutex::new(None)),
+            start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Snapshot of every `start_session` input received so far.
+    #[allow(dead_code)]
+    pub fn start_inputs(&self) -> Vec<StartSessionInput> {
+        self.start_inputs.lock().unwrap().clone()
     }
 
     pub fn fail_next_rollback(&self, message: impl Into<String>) {
@@ -114,6 +125,7 @@ impl AgentProvider for MockAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         self.calls.push(MockCall::StartSession(input.thread_id.clone()));
+        self.start_inputs.lock().unwrap().push(input.clone());
         self.live.lock().unwrap().insert(input.thread_id.clone());
         Ok(ProviderSession {
             thread_id: input.thread_id.clone(),

@@ -934,13 +934,15 @@ fn pane_split_direction(tool: &str) -> &'static str {
 /// wins over the process env: every agent-chat session shares ONE
 /// `codemux mcp` child (spawned with no workspace env), so the registry
 /// tags each call with the calling session's workspace in
-/// `_meta["codemux/workspace_id"]`. The env var still covers children the
+/// `_meta[WORKSPACE_META_KEY]`. The env var still covers children the
 /// workspace lifecycle spawns per-workspace via `.mcp.json` (which never
 /// send `_meta`). `env_fallback` is passed in so tests stay hermetic.
+/// The id is forwarded as-is; the control layer drops one that names no
+/// live workspace (`resolve_browser_workspace_id`).
 fn resolve_workspace_id(params: &Value, env_fallback: Option<String>) -> String {
     params
         .get("_meta")
-        .and_then(|meta| meta.get("codemux/workspace_id"))
+        .and_then(|meta| meta.get(crate::mcp::WORKSPACE_META_KEY))
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
@@ -2085,7 +2087,7 @@ mod tests {
         let params = json!({
             "name": "browser_navigate",
             "arguments": {},
-            "_meta": { "codemux/workspace_id": "ws-from-meta" }
+            "_meta": { crate::mcp::WORKSPACE_META_KEY: "ws-from-meta" }
         });
         assert_eq!(
             resolve_workspace_id(&params, Some("ws-from-env".into())),
@@ -2105,12 +2107,12 @@ mod tests {
 
     #[test]
     fn workspace_id_ignores_empty_or_non_string_meta() {
-        let empty = json!({ "name": "t", "_meta": { "codemux/workspace_id": "" } });
+        let empty = json!({ "name": "t", "_meta": { crate::mcp::WORKSPACE_META_KEY: "" } });
         assert_eq!(
             resolve_workspace_id(&empty, Some("ws-from-env".into())),
             "ws-from-env"
         );
-        let wrong_type = json!({ "name": "t", "_meta": { "codemux/workspace_id": 7 } });
+        let wrong_type = json!({ "name": "t", "_meta": { crate::mcp::WORKSPACE_META_KEY: 7 } });
         assert_eq!(
             resolve_workspace_id(&wrong_type, Some("ws-from-env".into())),
             "ws-from-env"

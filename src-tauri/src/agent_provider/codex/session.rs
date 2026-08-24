@@ -1683,6 +1683,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_tool_call_tags_builtin_dispatch_with_session_workspace() {
+        // The session's workspace id must reach the built-in server as
+        // `_meta[WORKSPACE_META_KEY]` on the outbound `tools/call`; the mock
+        // only answers a request that carries it.
+        let (_server, registry, call) =
+            crate::mcp::registry::test_support::codemux_remote_server("ws-42").await;
+        let response = handle_dynamic_tool_call(
+            Some(&registry),
+            Some("ws-42"),
+            json!({
+                "threadId": "thread",
+                "turnId": "turn",
+                "callId": "call",
+                "namespace": null,
+                "tool": "codemux_mcp__codemux-remote__echo",
+                "arguments": {"text": "hi"}
+            }),
+        )
+        .await;
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["contentItems"][0]["text"], "routed");
+        call.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn dynamic_tool_call_without_registry_returns_failed_response() {
         let response = handle_dynamic_tool_call(
             None,

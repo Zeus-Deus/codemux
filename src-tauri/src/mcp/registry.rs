@@ -637,7 +637,7 @@ fn tool_call_params(
     });
     if is_codemux_self {
         if let Some(id) = workspace_id {
-            params["_meta"] = serde_json::json!({ "codemux/workspace_id": id });
+            params["_meta"] = serde_json::json!({ super::WORKSPACE_META_KEY: id });
         }
     }
     params
@@ -717,10 +717,117 @@ fn discover_configs(project_root: Option<&std::path::Path>) -> Vec<McpServerConf
     super::dedupe_servers(out)
 }
 
+/// Shared fixture for tests that need to observe the exact `tools/call`
+/// the registry sends to the built-in server: a mock HTTP MCP server
+/// registered under the `Codemux` source (the marker `dispatch_tool_call`
+/// keys the `_meta` workspace tag on), so the adapters' dispatch paths can
+/// assert on the outbound wire shape without spawning a real child.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport};
+    use mockito::Matcher;
+
+    /// One mock `codemux-remote` server exposing a single `echo` tool. The
+    /// returned `Mock` is the `tools/call` expectation: it only matches a
+    /// request whose params carry `_meta[WORKSPACE_META_KEY] == workspace_id`,
+    /// so `assert_async` proves the tag reached the wire.
+    pub(crate) async fn codemux_remote_server(
+        workspace_id: &str,
+    ) -> (mockito::ServerGuard, McpRegistry, mockito::Mock) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "initialize" })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "codemux", "version": "1"}
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({ "method": "notifications/initialized" }),
+            ))
+            .with_status(202)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "method": "tools/list" })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [{
+                        "name": "echo",
+                        "description": "Echo",
+                        "inputSchema": {"type": "object"}
+                    }]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let call = server
+            .mock("POST", "/mcp")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "method": "tools/call",
+                "params": {
+                    "name": "echo",
+                    "_meta": { crate::mcp::WORKSPACE_META_KEY: workspace_id }
+                }
+            })))
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {"content": [{"type": "text", "text": "routed"}]}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let registry = McpRegistry::new();
+        let config = McpServerConfig {
+            id: "codemux-remote".into(),
+            name: "codemux-remote".into(),
+            sources: vec![McpConfigSource::Codemux],
+            command: format!("{}/mcp", server.url()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            disabled: false,
+            transport: McpTransport::Http,
+            raw: serde_json::json!({}),
+        };
+        let row = registry
+            .ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, config)
+            .await;
+        assert!(
+            matches!(row.status, McpServerStatus::Running { tool_count: 1 }),
+            "{row:?}"
+        );
+        (server, registry, call)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport};
+    use crate::mcp::{McpConfigSource, McpServerConfig, McpTransport, WORKSPACE_META_KEY};
     use std::collections::HashMap;
 
     fn make_config(id: &str, name: &str, command: &str) -> McpServerConfig {
@@ -947,7 +1054,7 @@ mod tests {
         );
         assert_eq!(params["name"], "browser_navigate");
         assert_eq!(params["arguments"]["url"], "http://localhost:1420");
-        assert_eq!(params["_meta"]["codemux/workspace_id"], "ws-42");
+        assert_eq!(params["_meta"][WORKSPACE_META_KEY], "ws-42");
     }
 
     #[test]
@@ -966,6 +1073,26 @@ mod tests {
             params,
             serde_json::json!({ "name": "create_issue", "arguments": {} })
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_call_sends_workspace_meta_to_builtin_server() {
+        // The wire check for the whole chain: a dispatch with a workspace id
+        // against the built-in server must produce an outbound `tools/call`
+        // whose params carry `_meta[WORKSPACE_META_KEY]` — the mock only
+        // answers a request that has it.
+        let (_server, reg, call) =
+            super::test_support::codemux_remote_server("ws-42").await;
+        let result = reg
+            .dispatch_tool_call(
+                "mcp__codemux-remote__echo",
+                serde_json::json!({"text": "hi"}),
+                Some("ws-42"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "routed");
+        call.assert_async().await;
     }
 
     #[tokio::test]

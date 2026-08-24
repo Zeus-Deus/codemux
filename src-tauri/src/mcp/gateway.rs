@@ -26,11 +26,20 @@ use super::McpConfigSource;
 /// ever attaches, the gateway will need per-consumer identity (a token or path
 /// per consumer) instead of this fixed list.
 ///
-/// Per-CALL identity can already travel in-band: a `tools/call` request may
-/// carry `_meta["codemux/workspace_id"]`, which the gateway forwards to the
-/// registry so workspace-scoped built-in tools bind to the caller's
-/// workspace. OpenCode does not send it today, so its calls keep the legacy
-/// env/cwd fallback until per-consumer identity lands.
+/// Per-CALL identity can travel in-band: a `tools/call` request may carry
+/// `_meta[WORKSPACE_META_KEY]`, which the gateway forwards to the registry
+/// so workspace-scoped built-in tools bind to the caller's workspace.
+///
+/// OpenCode remains on the legacy cwd fallback. Codemux runs ONE
+/// `opencode serve` process for every chat session and registers this
+/// gateway once, by name, on that shared instance (`attach_mcp_gateway`);
+/// OpenCode's MCP registrations are instance-global and its client sends no
+/// per-session `_meta`, so there is no channel through which an OpenCode
+/// tool call can identify its session or workspace. Fixing that means
+/// moving the OpenCode adapter to per-directory instances, which is a
+/// separate change. Until then OpenCode's browser/git/conversation tools
+/// bind to whatever `resolve_workspace_id_by_cwd` finds for the process
+/// cwd — see the note in `opencode/server.rs`.
 const GATEWAY_NATIVE_SOURCES: [McpConfigSource; 2] =
     [McpConfigSource::OpenCodeUser, McpConfigSource::OpenCodeProject];
 
@@ -200,10 +209,11 @@ async fn handle_post(
                 .unwrap_or_else(|| json!({}));
             // Forward the caller's workspace identity when the request
             // carries it, so built-in workspace-scoped tools route to the
-            // calling session's workspace. Absent for OpenCode today.
+            // calling session's workspace. Absent for OpenCode (see the
+            // module note on `GATEWAY_NATIVE_SOURCES`).
             let workspace_id = params
                 .get("_meta")
-                .and_then(|meta| meta.get("codemux/workspace_id"))
+                .and_then(|meta| meta.get(super::WORKSPACE_META_KEY))
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty());
             match state
