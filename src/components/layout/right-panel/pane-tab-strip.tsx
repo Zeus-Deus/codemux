@@ -24,8 +24,27 @@
  * Live activity is carried by the badge itself (a mono count, accent-tinted
  * while its pane is active) — nothing in the strip blinks; app-wide
  * "working" is an orb.
+ *
+ * **Overflow.** The deck grows: every file opened from the tree is another
+ * tab, and a busy thread adds tasks, orchestration and subagents on top of
+ * the three defaults. Rather than ellipsize every inactive label down to
+ * an identical unreadable stub the moment the row gets tight, the strip
+ * switches modes: once the full-label row would overflow, inactive tabs
+ * collapse to icon + badge (the pinned-tab convention — the label lives in
+ * the tooltip) and the active tab alone keeps its label. Whatever still
+ * doesn't fit scrolls, with a soft fade on the clipped edge so the
+ * overflow is visible without a scrollbar, and a plain vertical wheel pans
+ * it. Tabs reorder by drag, same gesture as the titlebar tabs.
  */
-import { memo, useEffect, useRef, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ChevronsLeftRight,
   PanelRight,
@@ -45,10 +64,13 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { topRightReserve } from "@/lib/titlebar-geometry";
 import { cn } from "@/lib/utils";
+import { useHorizontalWheelScroll } from "@/lib/wheel";
 import type { RightPanelTab } from "@/stores/ui-store";
 
+import { TabDropIndicator } from "../tab-drop-indicator";
 import { PaneActionButton } from "./pane-actions";
 import { PANE_REGISTRY, type PaneMeta } from "./pane-registry";
 import type { SurfaceAction } from "./surface-actions";
@@ -67,15 +89,23 @@ export interface DeckTab {
 function DeckTabChip({
   tab,
   active,
+  compact,
+  dragging,
   inTitlebar,
+  reorderProps,
   onSelect,
   onClose,
 }: {
   tab: DeckTab;
   active: boolean;
+  /** Icon-only: the strip has overflowed and this (inactive) tab gave up
+   *  its label. See the file header. */
+  compact: boolean;
+  dragging: boolean;
   /** Which surface the row is painted on, so the close affordance's mask
    *  can match it — see its `bg-*` below. */
   inTitlebar: boolean;
+  reorderProps: PillReorderHandlers;
   onSelect: () => void;
   onClose: () => void;
 }) {
@@ -90,82 +120,193 @@ function DeckTabChip({
     ref.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
   }, [active]);
 
+  const badge = tab.badge != null && (
+    <span
+      className={cn(
+        "font-mono text-[9.5px] tabular-nums",
+        active && tab.accentBadgeWhenActive
+          ? "text-accent-ember"
+          : "text-foreground/38",
+      )}
+    >
+      {tab.badge}
+    </span>
+  );
+
   return (
     <div
       ref={ref}
+      {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
+      data-compact={compact ? "true" : undefined}
+      // Middle-click closes, as in every browser and editor tab strip —
+      // and it is the only close gesture a compact tab has, since an X
+      // overlaid on a 28px chip would be the thing you hit when aiming for
+      // the tab.
+      onAuxClick={(event) => {
+        if (event.button !== 1) return;
+        event.preventDefault();
+        onClose();
+      }}
       className={cn(
         // No border, no shadow, no ring — the fill is the whole signal.
-        "group/tab relative flex h-[26px] items-center rounded-[7px]",
+        "group/tab relative flex h-[26px] shrink-0 items-center rounded-[7px]",
         "transition-colors duration-[120ms]",
-        // The panel starts near 320px and the pane actions now share this
-        // row, so a deck of four or five tabs has to give somewhere at its
-        // narrow end. The pane you're *looking at* keeps its whole label;
-        // the others ellipsize down to a stub, floored where the icon and
-        // badge still read. Past that the row scrolls, and the effect above
-        // keeps the active tab inside the scrolled window.
         active
-          ? "shrink-0 bg-foreground/7 font-semibold text-foreground"
-          : "min-w-[58px] font-medium text-foreground/42 hover:bg-foreground/5 hover:text-foreground/70",
+          ? "bg-foreground/7 font-semibold text-foreground"
+          : "font-medium text-foreground/42 hover:bg-foreground/5 hover:text-foreground/70",
+        dragging && "opacity-40",
       )}
     >
       <button
         type="button"
         onClick={onSelect}
         aria-pressed={active}
-        // Truncated labels stay readable on hover rather than earning a
-        // second row to spell themselves out in.
+        aria-label={compact ? tab.label : undefined}
+        // Compact tabs spell their name out on hover rather than earning a
+        // second row to do it in.
         title={tab.label}
         className={cn(
-          "flex h-full min-w-0 items-center gap-[7px] pl-[9px] text-[12px] whitespace-nowrap",
-          // Room for the close affordance only where it is actually shown;
-          // an always-reserved slot per tab costs a whole label at this
-          // width.
-          active ? "pr-[20px]" : "pr-[9px]",
-        )}
-      >
-        <Icon className="size-[13px] shrink-0" strokeWidth={1.6} />
-        <span className="truncate">{tab.label}</span>
-        {tab.badge != null && (
-          <span
-            className={cn(
-              "font-mono text-[9.5px] tabular-nums",
-              active && tab.accentBadgeWhenActive
-                ? "text-accent-ember"
-                : "text-foreground/38",
-            )}
-          >
-            {tab.badge}
-          </span>
-        )}
-      </button>
-      <button
-        type="button"
-        aria-label={`Close ${tab.label}`}
-        onClick={(event) => {
-          event.stopPropagation();
-          onClose();
-        }}
-        className={cn(
-          // Overlays the tab's right edge rather than taking a layout slot,
-          // so revealing it on hover doesn't shove the row around.
-          "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-[4px] transition-opacity",
-          "hover:bg-foreground/15 focus-visible:opacity-100",
-          active
-            ? "opacity-50 hover:opacity-100"
-            : // Opaque on purpose: it masks the truncated label it sits on
-              // top of, so it has to match whatever the row is painted on.
-              cn(
-                "opacity-0 group-hover/tab:opacity-70",
-                inTitlebar ? "bg-background" : "bg-card",
+          "flex h-full min-w-0 items-center whitespace-nowrap text-[12px]",
+          compact
+            ? "gap-[5px] px-[8px]"
+            : cn(
+                "gap-[7px] pl-[9px]",
+                // Room for the close affordance only where it is actually
+                // shown; an always-reserved slot per tab costs a whole
+                // label at this width.
+                active ? "pr-[20px]" : "pr-[9px]",
               ),
         )}
       >
-        <X className="size-[10px]" strokeWidth={1.8} />
+        <Icon className="size-[13px] shrink-0" strokeWidth={1.6} />
+        {!compact && <span className="truncate">{tab.label}</span>}
+        {badge}
       </button>
+      {!compact && (
+        <button
+          type="button"
+          data-no-drag
+          aria-label={`Close ${tab.label}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onClose();
+          }}
+          className={cn(
+            // Overlays the tab's right edge rather than taking a layout
+            // slot, so revealing it on hover doesn't shove the row around.
+            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-[4px] transition-opacity",
+            "hover:bg-foreground/15 focus-visible:opacity-100",
+            active
+              ? "opacity-50 hover:opacity-100"
+              : // Opaque on purpose: it masks the label it sits on top of,
+                // so it has to match whatever the row is painted on.
+                cn(
+                  "opacity-0 group-hover/tab:opacity-70",
+                  inTitlebar ? "bg-background" : "bg-card",
+                ),
+          )}
+        >
+          <X className="size-[10px]" strokeWidth={1.8} />
+        </button>
+      )}
     </div>
   );
+}
+
+/** Width of the edge fade that marks clipped tabs. */
+const EDGE_FADE_PX = 16;
+/** The drag gap's `min-w-4`: the part of it that can never be lent back to
+ *  the tabs. */
+const DRAG_GAP_MIN_PX = 16;
+
+/**
+ * Decides between the full-label and the icon-only strip, and tracks which
+ * edges have tabs hidden behind them.
+ *
+ * The two layouts have different widths, so "does it overflow?" cannot be
+ * asked of the compact strip about the full one: the answer would flip
+ * every frame. Instead the full strip's width is measured once whenever it
+ * is laid out (`naturalWidth`), and the compact strip only lets go once
+ * the room available — its own width plus whatever the drag gap next to it
+ * could give back — covers that. Every change to the tab set (or to which
+ * tab is active, since only that one keeps its label) re-runs the full
+ * layout under `useLayoutEffect`, so the expanded frame is measured but
+ * never painted.
+ */
+function useDeckOverflow(
+  scrollerRef: React.RefObject<HTMLDivElement | null>,
+  gapRef: React.RefObject<HTMLDivElement | null>,
+  layoutKey: string,
+) {
+  const [compact, setCompact] = useState(false);
+  const [edges, setEdges] = useState({ start: false, end: false });
+  const naturalWidthRef = useRef(0);
+
+  const measureEdges = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const start = el.scrollLeft > 1;
+    const end = el.scrollWidth - el.clientWidth - el.scrollLeft > 1;
+    setEdges((prev) =>
+      prev.start === start && prev.end === end ? prev : { start, end },
+    );
+  }, [scrollerRef]);
+
+  // A new tab set is measured from the full layout.
+  useLayoutEffect(() => {
+    setCompact(false);
+  }, [layoutKey]);
+
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    if (!compact) {
+      naturalWidthRef.current = el.scrollWidth;
+      if (el.scrollWidth > el.clientWidth + 1) {
+        setCompact(true);
+        return;
+      }
+    }
+    measureEdges();
+  }, [compact, layoutKey, measureEdges, scrollerRef]);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const onResize = () => {
+      const gap = gapRef.current;
+      const available =
+        el.clientWidth + Math.max(0, (gap?.clientWidth ?? 0) - DRAG_GAP_MIN_PX);
+      if (compact && available >= naturalWidthRef.current) setCompact(false);
+      else if (!compact && el.scrollWidth > el.clientWidth + 1)
+        setCompact(true);
+      measureEdges();
+    };
+    el.addEventListener("scroll", measureEdges, { passive: true });
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(onResize);
+      observer.observe(el);
+      if (gapRef.current) observer.observe(gapRef.current);
+    }
+    return () => {
+      el.removeEventListener("scroll", measureEdges);
+      observer?.disconnect();
+    };
+  }, [compact, gapRef, measureEdges, scrollerRef]);
+
+  return { compact, edges };
+}
+
+function edgeMask(edges: { start: boolean; end: boolean }): string | undefined {
+  if (!edges.start && !edges.end) return undefined;
+  const from = edges.start ? `transparent, black ${EDGE_FADE_PX}px` : "black";
+  const to = edges.end
+    ? `black calc(100% - ${EDGE_FADE_PX}px), transparent`
+    : "black";
+  return `linear-gradient(to right, ${from}, ${to})`;
 }
 
 export interface PaneTabStripProps {
@@ -173,6 +314,8 @@ export interface PaneTabStripProps {
   activeTab: RightPanelTab | null;
   onSelect: (id: RightPanelTab) => void;
   onClose: (id: RightPanelTab) => void;
+  /** Drag-to-reorder landed: the strip's full new order. */
+  onReorder: (ids: RightPanelTab[]) => void;
   /**
    * The active pane's own controls, rendered in this row's right-hand slot
    * and swapped in place when the active tab changes. Built by
@@ -208,6 +351,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   activeTab,
   onSelect,
   onClose,
+  onReorder,
   actions,
   surfaces,
   onOpenFile,
@@ -219,6 +363,45 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   className,
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
+
+  const tabIds = tabs.map((tab) => tab.id);
+  const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
+    useTabReorder<HTMLDivElement>(tabIds, onReorder as (ids: string[]) => void);
+
+  // A plain vertical wheel pans the strip once it overflows — `overflow-x:
+  // auto` only answers to native horizontal input on its own. See
+  // `@/lib/wheel`. The scroller is also the reorder hook's measurement
+  // container and the overflow hook's, so all three share one ref.
+  const attachWheelScroll = useHorizontalWheelScroll<HTMLDivElement>();
+  const setScrollerNode = useCallback(
+    (node: HTMLDivElement | null) => {
+      containerRef.current = node;
+      attachWheelScroll(node);
+    },
+    [attachWheelScroll, containerRef],
+  );
+  const gapRef = useRef<HTMLDivElement>(null);
+  const { compact, edges } = useDeckOverflow(
+    containerRef,
+    gapRef,
+    `${tabIds.join("|")}#${activeTab ?? ""}`,
+  );
+  const mask = edgeMask(edges);
+
+  // The active chip scrolls itself into view, but that runs against the
+  // full-label layout the strip measures and discards (passive effects
+  // flush before the collapse re-render), which leaves the compact strip
+  // sitting on a stale offset with its first icon under the fade. Re-seat
+  // from zero once the layout has settled.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollLeft = 0;
+    el.querySelector<HTMLElement>(
+      '[data-tab-id][data-state="active"]',
+    )?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [compact, containerRef]);
+
   return (
     <div
       data-testid="right-panel-tabs-header"
@@ -256,13 +439,25 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           any panel width. */}
       {/* `no-scrollbar` is referenced elsewhere in the tree but never
           defined, so the hiding is spelled out here rather than trusted. */}
-      <div className="flex min-w-0 items-center gap-[2px] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div
+        ref={setScrollerNode}
+        data-testid="right-panel-tabs-scroll"
+        data-compact={compact ? "true" : undefined}
+        className="relative flex min-w-0 items-center gap-[2px] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
+      >
+        {dragTabId && dropIndicatorLeft !== null && (
+          <TabDropIndicator left={dropIndicatorLeft} />
+        )}
         {tabs.map((tab) => (
           <DeckTabChip
             key={tab.id}
             tab={tab}
             active={tab.id === activeTab}
+            compact={compact && tab.id !== activeTab}
+            dragging={dragTabId === tab.id}
             inTitlebar={inTitlebar}
+            reorderProps={getPillProps(tab.id)}
             onSelect={() => onSelect(tab.id)}
             onClose={() => onClose(tab.id)}
           />
@@ -324,6 +519,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           only: `data-tauri-drag-region` does nothing in a browser, and the
           bare spacer has no children to shadow. */}
       <div
+        ref={gapRef}
         data-testid="right-panel-drag-gap"
         data-tauri-drag-region={inTitlebar && !remoteClient ? true : undefined}
         className="min-w-4 flex-1 self-stretch"
