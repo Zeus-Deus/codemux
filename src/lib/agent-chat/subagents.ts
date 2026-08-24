@@ -649,3 +649,119 @@ export function interruptRunningSubagents(
       : sub,
   );
 }
+
+// ── Spawn waves (the Subagents pane's grouping) ──
+
+/**
+ * One spawn wave: a `subagent_run` card together with the turn that
+ * spawned it. The pane folds each wave to a single header row so tens of
+ * finished agents read as a handful of groups instead of a growing list.
+ */
+export interface SubagentWave {
+  /** The card id — stable React key and fold-state key. */
+  id: string;
+  /** First line of the user prompt that spawned the wave, or null when
+   *  no user message precedes the card (a workflow-only or partially
+   *  hydrated transcript). See {@link subagentWaveTitle} for the fallback. */
+  prompt: string | null;
+  subagents: SubagentView[];
+}
+
+/**
+ * Group a transcript's subagents by spawn wave, in transcript order.
+ *
+ * A wave's prompt is the nearest preceding `user_message` — user
+ * messages carry no `turn_id`, but the transcript is sequenced, so the
+ * last prompt before a card is the turn that spawned it. A subagent id
+ * reported by more than one card stays in the wave that first saw it and
+ * takes the latest view, mirroring the reducer's non-regressing merge.
+ * Empty cards are skipped.
+ */
+export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
+  const waves: SubagentWave[] = [];
+  const home = new Map<string, SubagentView[]>();
+  let prompt: string | null = null;
+  for (const item of messages) {
+    if (item.kind === "user_message") {
+      const line = firstLine(item.text);
+      prompt = line.length > 0 ? line : null;
+      continue;
+    }
+    if (item.kind !== "subagent_run") continue;
+    const subagents: SubagentView[] = [];
+    for (const subagent of item.subagents) {
+      const existing = home.get(subagent.id);
+      if (existing) {
+        const idx = existing.findIndex((s) => s.id === subagent.id);
+        if (idx >= 0) existing[idx] = subagent;
+        continue;
+      }
+      subagents.push(subagent);
+      home.set(subagent.id, subagents);
+    }
+    if (subagents.length > 0) waves.push({ id: item.id, prompt, subagents });
+  }
+  return waves;
+}
+
+/** Wave header title: the spawning prompt, else "Ran N subagents". */
+export function subagentWaveTitle(wave: SubagentWave): string {
+  if (wave.prompt) return wave.prompt;
+  const n = wave.subagents.length;
+  return `Ran ${n} subagent${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * Whole-wave status for the header glyph. Precedence: a failure surfaces
+ * even when the wave is folded (failed > running > halted > completed),
+ * so a red header is never hidden behind a green one.
+ */
+export function subagentWaveStatus(
+  subagents: readonly SubagentView[],
+): SubagentViewStatus {
+  let status: SubagentViewStatus = "completed";
+  let rank = 0;
+  for (const subagent of subagents) {
+    const r =
+      subagent.status === "failed"
+        ? 3
+        : isRunning(subagent)
+          ? 2
+          : subagent.status === "stopped" || subagent.status === "interrupted"
+            ? 1
+            : 0;
+    if (r > rank) {
+      rank = r;
+      status = isRunning(subagent) ? "running" : subagent.status;
+    }
+  }
+  return status;
+}
+
+/**
+ * Ordinals for repeated names inside one wave ("Explore 1", "Explore 2").
+ * Unique names get null so a lone "Verify" is not suffixed with a
+ * pointless "1".
+ */
+export function subagentOrdinals(
+  subagents: readonly SubagentView[],
+): Map<string, number | null> {
+  const label = (s: SubagentView) => s.name ?? s.agentType ?? "Subagent";
+  const counts = new Map<string, number>();
+  for (const s of subagents) {
+    counts.set(label(s), (counts.get(label(s)) ?? 0) + 1);
+  }
+  const seen = new Map<string, number>();
+  const out = new Map<string, number | null>();
+  for (const s of subagents) {
+    const name = label(s);
+    if ((counts.get(name) ?? 0) < 2) {
+      out.set(s.id, null);
+      continue;
+    }
+    const next = (seen.get(name) ?? 0) + 1;
+    seen.set(name, next);
+    out.set(s.id, next);
+  }
+  return out;
+}

@@ -23,7 +23,11 @@ import {
   subagentMetaLine,
   subagentOrdinal,
   subagentStatusLabel,
+  subagentOrdinals,
   subagentToolCount,
+  subagentWaveStatus,
+  subagentWaveTitle,
+  subagentWaves,
   toneIndexForId,
 } from "./subagents";
 import type {
@@ -85,7 +89,10 @@ describe("mergeStatus", () => {
     // hand-built payloads can omit it (Rust serde-defaults to `pending`).
     // An `undefined` leaking through used to crash `statusTone` at render.
     expect(
-      mergeStatus("running", undefined as unknown as SubagentSnapshot["status"]),
+      mergeStatus(
+        "running",
+        undefined as unknown as SubagentSnapshot["status"],
+      ),
     ).toBe("running");
     expect(
       mergeStatus("completed", "bogus" as SubagentSnapshot["status"]),
@@ -121,13 +128,18 @@ describe("mergeSnapshot revive / statusAssumed (issue #153)", () => {
     // A later snapshot that simply omits the flag must not promote the row
     // back to "real subagent" (same additive-merge rule as every field).
     expect(
-      mergeSnapshot(merged, { subagent_id: "bg", status: "running" } as SubagentSnapshot)
-        .backgroundTask,
+      mergeSnapshot(merged, {
+        subagent_id: "bg",
+        status: "running",
+      } as SubagentSnapshot).backgroundTask,
     ).toBe(true);
     // A row that was never flagged stays shape-identical (no stray key).
     expect(
       "backgroundTask" in
-        mergeSnapshot(view(), { subagent_id: "s1", status: "running" } as SubagentSnapshot),
+        mergeSnapshot(view(), {
+          subagent_id: "s1",
+          status: "running",
+        } as SubagentSnapshot),
     ).toBe(false);
   });
 
@@ -182,7 +194,13 @@ describe("mergeSnapshot revive / statusAssumed (issue #153)", () => {
 
 describe("settleSubagentsForToolResult / interruptRunningSubagents", () => {
   function card(subs: SubagentView[]): SubagentRunItem {
-    return { kind: "subagent_run", id: "run-1", seq: 0, turn_id: "t", subagents: subs };
+    return {
+      kind: "subagent_run",
+      id: "run-1",
+      seq: 0,
+      turn_id: "t",
+      subagents: subs,
+    };
   }
   function workflowWith(agents: SubagentView[]): WorkflowRunItem {
     return {
@@ -220,11 +238,15 @@ describe("settleSubagentsForToolResult / interruptRunningSubagents", () => {
     expect(c1.subagents[2].status).toBe("running"); // untouched
 
     const byParent = settleSubagentsForToolResult(messages, "tool-b", false);
-    expect((byParent[0] as SubagentRunItem).subagents[1].status).toBe("completed");
+    expect((byParent[0] as SubagentRunItem).subagents[1].status).toBe(
+      "completed",
+    );
   });
 
   it("uses failed when the tool_result is an error", () => {
-    const messages: ChatViewItem[] = [card([view({ id: "tool-a", status: "running" })])];
+    const messages: ChatViewItem[] = [
+      card([view({ id: "tool-a", status: "running" })]),
+    ];
     const out = settleSubagentsForToolResult(messages, "tool-a", true);
     expect((out[0] as SubagentRunItem).subagents[0].status).toBe("failed");
   });
@@ -233,9 +255,13 @@ describe("settleSubagentsForToolResult / interruptRunningSubagents", () => {
     const done = view({ id: "tool-a", status: "completed" });
     const messages: ChatViewItem[] = [card([done])];
     // Already terminal → untouched, same ref.
-    expect(settleSubagentsForToolResult(messages, "tool-a", false)).toBe(messages);
+    expect(settleSubagentsForToolResult(messages, "tool-a", false)).toBe(
+      messages,
+    );
     // No id/parent match → same ref.
-    expect(settleSubagentsForToolResult(messages, "nope", false)).toBe(messages);
+    expect(settleSubagentsForToolResult(messages, "nope", false)).toBe(
+      messages,
+    );
   });
 
   it("settles running agents inside workflow phases too", () => {
@@ -250,18 +276,25 @@ describe("settleSubagentsForToolResult / interruptRunningSubagents", () => {
 
   it("interruptRunningSubagents flips running/pending to interrupted across cards and phases", () => {
     const messages: ChatViewItem[] = [
-      card([view({ id: "a", status: "running" }), view({ id: "b", status: "completed" })]),
+      card([
+        view({ id: "a", status: "running" }),
+        view({ id: "b", status: "completed" }),
+      ]),
       workflowWith([view({ id: "c", status: "pending" })]),
     ];
     const out = interruptRunningSubagents(messages);
     expect((out[0] as SubagentRunItem).subagents[0].status).toBe("interrupted");
     expect((out[0] as SubagentRunItem).subagents[0].statusAssumed).toBe(true);
     expect((out[0] as SubagentRunItem).subagents[1].status).toBe("completed"); // untouched
-    expect((out[1] as WorkflowRunItem).phases[0].agents[0].status).toBe("interrupted");
+    expect((out[1] as WorkflowRunItem).phases[0].agents[0].status).toBe(
+      "interrupted",
+    );
   });
 
   it("interruptRunningSubagents returns the SAME ref when nothing is running", () => {
-    const messages: ChatViewItem[] = [card([view({ id: "a", status: "completed" })])];
+    const messages: ChatViewItem[] = [
+      card([view({ id: "a", status: "completed" })]),
+    ];
     expect(interruptRunningSubagents(messages)).toBe(messages);
   });
 });
@@ -321,15 +354,32 @@ describe("mergeSnapshot", () => {
 
 describe("derived meta / activity fallbacks", () => {
   it("tool-count falls back to counting child tool calls", () => {
-    const v = view({ items: [toolCall(), toolCall(), { kind: "assistant_message", id: "a", seq: 1, turn_id: null, text: "x", streaming: false }] });
+    const v = view({
+      items: [
+        toolCall(),
+        toolCall(),
+        {
+          kind: "assistant_message",
+          id: "a",
+          seq: 1,
+          turn_id: null,
+          text: "x",
+          streaming: false,
+        },
+      ],
+    });
     expect(subagentToolCount(v)).toBe(2);
     // Provider usage wins when present.
-    expect(subagentToolCount(view({ toolUseCount: 9, items: [toolCall()] }))).toBe(9);
+    expect(
+      subagentToolCount(view({ toolUseCount: 9, items: [toolCall()] })),
+    ).toBe(9);
   });
 
   it("elapsed falls back to now - startedAt when no duration", () => {
     expect(subagentElapsedMs(view({ startedAt: 1000 }), 3000)).toBe(2000);
-    expect(subagentElapsedMs(view({ durationMs: 52000, startedAt: 1000 }), 9e9)).toBe(52000);
+    expect(
+      subagentElapsedMs(view({ durationMs: 52000, startedAt: 1000 }), 9e9),
+    ).toBe(52000);
     expect(subagentElapsedMs(view({}), 5000)).toBeNull();
   });
 
@@ -345,14 +395,18 @@ describe("derived meta / activity fallbacks", () => {
     );
     const withTool = view({
       activity: undefined,
-      items: [toolCall({ tool_name: "Bash", input: { command: "npm run verify" } })],
+      items: [
+        toolCall({ tool_name: "Bash", input: { command: "npm run verify" } }),
+      ],
     });
     expect(subagentActivityLine(withTool)).toBe("run npm run verify");
   });
 
   it("done rows show the result first line, else 'Done'", () => {
     expect(
-      subagentActivityLine(view({ status: "completed", resultText: "Line 1\nLine 2" })),
+      subagentActivityLine(
+        view({ status: "completed", resultText: "Line 1\nLine 2" }),
+      ),
     ).toBe("Line 1");
     expect(subagentActivityLine(view({ status: "completed" }))).toBe("Done");
     expect(subagentActivityLine(view({ status: "failed" }))).toBe("Failed");
@@ -374,16 +428,31 @@ describe("describeToolCall / peek", () => {
 
   it("running tools read as running in the peek", () => {
     const d = describeToolCall(
-      toolCall({ tool_name: "Bash", status: "running", input: { command: "npm run verify" } }),
+      toolCall({
+        tool_name: "Bash",
+        status: "running",
+        input: { command: "npm run verify" },
+      }),
     );
-    expect(d).toEqual({ verb: "run", target: "npm run verify", meta: "running" });
+    expect(d).toEqual({
+      verb: "run",
+      target: "npm run verify",
+      meta: "running",
+    });
   });
 
   it("recentToolCalls returns up to N newest, in order", () => {
     const v = view({
       items: [
         toolCall({ id: "t1" }),
-        { kind: "assistant_message", id: "a", seq: 1, turn_id: null, text: "x", streaming: false },
+        {
+          kind: "assistant_message",
+          id: "a",
+          seq: 1,
+          turn_id: null,
+          text: "x",
+          streaming: false,
+        },
         toolCall({ id: "t2" }),
         toolCall({ id: "t3" }),
         toolCall({ id: "t4" }),
@@ -482,17 +551,16 @@ describe("whole-thread lookups", () => {
 
     // Mid-run both read as live.
     expect(countRunningSubagents(withBg, true)).toBe(2);
-    expect(runningSubagentEntries(withBg, true).map((e) => e.subagent.id)).toEqual([
-      "bg",
-      "real",
-    ]);
+    expect(
+      runningSubagentEntries(withBg, true).map((e) => e.subagent.id),
+    ).toEqual(["bg", "real"]);
 
     // Run over: the never-terminating background job stops counting, so
     // the docked bar can't spin forever after the turn settled.
     expect(countRunningSubagents(withBg, false)).toBe(1);
-    expect(runningSubagentEntries(withBg, false).map((e) => e.subagent.id)).toEqual([
-      "real",
-    ]);
+    expect(
+      runningSubagentEntries(withBg, false).map((e) => e.subagent.id),
+    ).toEqual(["real"]);
   });
 
   it("labels each running subagent with its originating card once several cards exist", () => {
@@ -534,7 +602,12 @@ describe("subagentGroupRollup", () => {
           totalTokens: 20_000,
           toolUseCount: 6,
         }),
-        view({ id: "b", status: "running", totalTokens: 18_800, toolUseCount: 3 }),
+        view({
+          id: "b",
+          status: "running",
+          totalTokens: 18_800,
+          toolUseCount: 3,
+        }),
       ],
       0,
     );
@@ -588,7 +661,9 @@ describe("subagentLatestOutput", () => {
     expect(
       subagentLatestOutput(
         view({
-          items: [toolCall({ tool_name: "Bash", input: { command: "cargo test" } })],
+          items: [
+            toolCall({ tool_name: "Bash", input: { command: "cargo test" } }),
+          ],
         }),
       ),
     ).toBe("run cargo test · ok");
@@ -596,5 +671,116 @@ describe("subagentLatestOutput", () => {
 
   it("returns null when there is nothing real to show", () => {
     expect(subagentLatestOutput(view({}))).toBeNull();
+  });
+});
+
+describe("subagentWaves — spawn-wave grouping for the pane", () => {
+  const sub = (id: string, over: Partial<SubagentView> = {}): SubagentView => ({
+    id,
+    name: "Explore",
+    status: "completed",
+    items: [],
+    toneIndex: 0,
+    ...over,
+  });
+  const user = (id: string, seq: number, text: string): ChatViewItem => ({
+    kind: "user_message",
+    id,
+    seq,
+    text,
+  });
+  const card = (
+    id: string,
+    seq: number,
+    subagents: SubagentView[],
+  ): ChatViewItem => ({
+    kind: "subagent_run",
+    id,
+    seq,
+    turn_id: null,
+    subagents,
+  });
+
+  it("titles each wave with the first line of the nearest preceding prompt", () => {
+    const waves = subagentWaves([
+      user("u1", 0, "  Implement + verify\nwith detail"),
+      card("c1", 1, [sub("a")]),
+      user("u2", 2, "Issue analysis"),
+      {
+        kind: "assistant_message",
+        id: "m",
+        seq: 3,
+        turn_id: null,
+        text: "ok",
+      } as ChatViewItem,
+      card("c2", 4, [sub("b"), sub("c")]),
+    ]);
+    expect(waves.map((w) => [w.id, w.prompt, w.subagents.length])).toEqual([
+      ["c1", "Implement + verify", 1],
+      ["c2", "Issue analysis", 2],
+    ]);
+    expect(waves.map(subagentWaveTitle)).toEqual([
+      "Implement + verify",
+      "Issue analysis",
+    ]);
+  });
+
+  it("falls back to 'Ran N subagents' without a prompt, and skips empty cards", () => {
+    const waves = subagentWaves([
+      card("empty", 0, []),
+      card("c1", 1, [sub("a")]),
+      user("blank", 2, "   \n  "),
+      card("c2", 3, [sub("b"), sub("c")]),
+    ]);
+    expect(waves.map(subagentWaveTitle)).toEqual([
+      "Ran 1 subagent",
+      "Ran 2 subagents",
+    ]);
+  });
+
+  it("keeps a re-reported id in its first wave with the latest view", () => {
+    const waves = subagentWaves([
+      card("c1", 0, [sub("a", { status: "running" })]),
+      card("c2", 1, [sub("a", { status: "completed" }), sub("b")]),
+    ]);
+    expect(waves.map((w) => w.subagents.map((s) => s.id))).toEqual([
+      ["a"],
+      ["b"],
+    ]);
+    expect(waves[0].subagents[0].status).toBe("completed");
+  });
+
+  it("rolls the wave status up with failure surfacing first", () => {
+    expect(subagentWaveStatus([sub("a"), sub("b")])).toBe("completed");
+    expect(
+      subagentWaveStatus([sub("a"), sub("b", { status: "stopped" })]),
+    ).toBe("stopped");
+    expect(
+      subagentWaveStatus([
+        sub("a", { status: "interrupted" }),
+        sub("b", { status: "pending" }),
+      ]),
+    ).toBe("running");
+    expect(
+      subagentWaveStatus([
+        sub("a", { status: "running" }),
+        sub("b", { status: "failed" }),
+      ]),
+    ).toBe("failed");
+  });
+
+  it("numbers only repeated names within a wave", () => {
+    const ordinals = subagentOrdinals([
+      sub("a"),
+      sub("b", { name: "Verify" }),
+      sub("c"),
+      sub("d", { name: undefined, agentType: "general-purpose" }),
+    ]);
+    expect([...ordinals.entries()]).toEqual([
+      ["a", 1],
+      ["b", null],
+      ["c", 2],
+      ["d", null],
+    ]);
   });
 });
