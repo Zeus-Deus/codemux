@@ -26,9 +26,11 @@ export type RightPanelCorePane =
  * empty" needed a third value rather than a second boolean: every caller
  * already reads `!== null` as *is the panel on screen*, and they all stay
  * correct. It is deliberately **not** a registry pane — it never enters
- * `rightPanelPanes`, never grows a tab, and resolves to the first open pane
- * if there is one (see `right-panel.tsx`), so activating it is also the
- * honest "just open the panel to whatever it was showing" request.
+ * `rightPanelPanes`, never grows a tab, and resolves to the pane the panel
+ * was collapsed from (`rightPanelLastTabs`) when that pane is still open,
+ * else to the first open pane if there is one (see `right-panel.tsx`), so
+ * activating it is also the honest "just open the panel to whatever it was
+ * showing" request.
  */
 export const RIGHT_PANEL_EMPTY = "empty";
 
@@ -350,10 +352,10 @@ export const useUIStore = create<UIStore>()(
               active === null || active === RIGHT_PANEL_EMPTY
                 ? s.rightPanelLastTabs
                 : { ...s.rightPanelLastTabs, [workspaceId]: active },
-          // Collapsing always drops full-expand: a maximized panel that is
-          // no longer on screen would leave the workspace column at zero
-          // width with nothing beside it.
-          rightPanelMaximized: false,
+            // Collapsing always drops full-expand: a maximized panel that is
+            // no longer on screen would leave the workspace column at zero
+            // width with nothing beside it.
+            rightPanelMaximized: false,
           };
         });
       },
