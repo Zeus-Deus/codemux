@@ -49,6 +49,7 @@ import type {
   IncomingPrItem,
   PrOverviewStats,
   PrsOverview,
+  GhRateLimit,
   ReviewComment,
   InlineReviewComment,
   PrReviewThread,
@@ -662,6 +663,17 @@ export const listPrsOverview = (path: string) =>
  *  with `checks: null`. */
 export const listPrsOverviewStats = (path: string) =>
   invoke<PrOverviewStats[]>("list_prs_overview_stats", { path });
+
+/** What is left of the GitHub budget, and when it refills.
+ *
+ *  Asked only after a call has come back refused for exceeding it —
+ *  GitHub does not charge for this endpoint, so it is the one request
+ *  still safe to make when there is nothing left to spend. `path` is
+ *  only a working directory for `gh`: the reply is the budget of the
+ *  host `gh` treats as its default, and the gate it feeds is one gate
+ *  for every root `gh` serves. */
+export const githubRateLimit = (path: string) =>
+  invoke<GhRateLimit>("github_rate_limit", { path });
 
 /** Merge a PR. `deleteBranch` defaults to true on the backend, matching
  *  the behaviour before the merge sheet made it a question. */

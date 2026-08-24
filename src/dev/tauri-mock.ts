@@ -331,6 +331,21 @@ let PR_STATS_DELAY_MS = storedDelay("pr-stats-delay", 800);
  *  the slow half of it. Flipped from the console, not seeded. */
 let prOverviewOutage = false;
 let prStatsOutage = false;
+/**
+ * The host is reachable and refusing: the account's hourly API budget is
+ * spent.
+ *
+ * Its own switch rather than a flavour of the outage above, because the
+ * page treats it as its own thing — it stops polling instead of
+ * retrying, and says when it will resume rather than offering a button
+ * as the answer. Being able to see that state is the point of having it
+ * here.
+ */
+let prBudgetSpent = false;
+
+/** Verbatim what `gh pr list` prints when the GraphQL budget is gone. */
+const RATE_LIMIT_REFUSAL =
+  "GraphQL: API rate limit already exceeded for user ID 100132710.";
 
 /**
  * The expensive half of one row.
@@ -3675,6 +3690,10 @@ const handlers: Record<string, Handler> = {
     }
     const refused = undeclaredRefusal(path, "list_read", "list or read pull requests");
     if (refused) return Promise.reject(refused);
+    // Before the delay: a refusal for spending comes straight back, and
+    // it is the fact that it comes back *fast* that makes a retrying
+    // client so expensive.
+    if (prBudgetSpent) return Promise.reject(RATE_LIMIT_REFUSAL);
     await new Promise((resolve) => setTimeout(resolve, PR_LIST_DELAY_MS));
     if (prOverviewOutage) {
       return Promise.reject("could not resolve host: api.github.com");
@@ -3690,6 +3709,20 @@ const handlers: Record<string, Handler> = {
   },
 
   /**
+   * What is left of the budget, and when it refills.
+   *
+   * Asked only after a refusal, and never metered by the host — so the
+   * mock answers instantly and without a delay knob. The reset it
+   * reports is what the strip counts down to.
+   */
+  github_rate_limit: async () => ({
+    graphql_remaining: prBudgetSpent ? 0 : 4_140,
+    graphql_reset: Math.floor(Date.now() / 1000) + 15 * 60,
+    core_remaining: 5_000,
+    core_reset: Math.floor(Date.now() / 1000) + 42 * 60,
+  }),
+
+  /**
    * The slow half, deliberately slow.
    *
    * 800ms is not a guess at gh's latency — it is long enough that the
@@ -3699,6 +3732,7 @@ const handlers: Record<string, Handler> = {
    */
   list_prs_overview_stats: async (a) => {
     const path = String(a.path ?? "");
+    if (prBudgetSpent) return Promise.reject(RATE_LIMIT_REFUSAL);
     if (path === MOCK_UNREACHABLE_ROOT || prOverviewOutage) {
       return Promise.reject("could not resolve host: api.github.com");
     }
@@ -5360,18 +5394,23 @@ function kickPrOverview(): void {
 
 // Dev affordance: take the host away, and watch the rows stay.
 //
-//   __codemuxMockPrOutage()             // everything fails
-//   __codemuxMockPrOutage(true, "stats") // only the slow half fails
-//   __codemuxMockPrOutage(false)        // back to normal
+//   __codemuxMockPrOutage()              // everything fails
+//   __codemuxMockPrOutage(true, "stats")  // only the slow half fails
+//   __codemuxMockPrOutage(true, "budget") // the host refuses: budget spent
+//   __codemuxMockPrOutage(false)         // back to normal
 (
   window as unknown as {
-    __codemuxMockPrOutage: (down?: boolean, which?: "all" | "stats") => string;
+    __codemuxMockPrOutage: (down?: boolean, which?: "all" | "stats" | "budget") => string;
   }
 ).__codemuxMockPrOutage = (down = true, which = "all") => {
-  prStatsOutage = down;
+  prBudgetSpent = down && which === "budget";
+  prStatsOutage = down && which !== "budget";
   prOverviewOutage = down && which === "all";
   kickPrOverview();
   if (!down) return "pull-request host reachable again";
+  if (which === "budget") {
+    return "the host now refuses for spending — the page stops polling and says until when";
+  }
   return which === "stats"
     ? "the stats half now fails — rows keep the checks they had"
     : "every root now fails — the list keeps its rows and says how old they are";

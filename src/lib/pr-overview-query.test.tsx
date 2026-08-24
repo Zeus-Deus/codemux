@@ -1,16 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { renderHook, waitFor, cleanup } from "@testing-library/react";
+import { act, renderHook, waitFor, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 const mockListPrsOverview = vi.fn();
 const mockListPrsOverviewStats = vi.fn();
 const mockListPullRequests = vi.fn().mockResolvedValue([]);
+const mockGithubRateLimit = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   listPrsOverview: (...a: unknown[]) => mockListPrsOverview(...a),
   listPrsOverviewStats: (...a: unknown[]) => mockListPrsOverviewStats(...a),
   listPullRequests: (...a: unknown[]) => mockListPullRequests(...a),
+  githubRateLimit: (...a: unknown[]) => mockGithubRateLimit(...a),
 }));
 
 const mockWorkspaces: {
@@ -28,8 +30,11 @@ vi.mock("@/stores/app-store", () => ({
 import {
   usePrOverview,
   mergeStats,
+  prOverviewKey,
+  prOverviewStatsKey,
   _resetSnapshotWriteGuard,
 } from "./pr-overview-query";
+import { _resetRateLimitGate, clearRateLimitPause } from "./pr-rate-limit";
 import {
   PR_SNAPSHOT_VERSION,
   prSnapshotKey,
@@ -117,6 +122,8 @@ function setRoots(...paths: string[]) {
 beforeEach(() => {
   localStorage.clear();
   _resetSnapshotWriteGuard();
+  _resetRateLimitGate();
+  mockGithubRateLimit.mockReset();
   mockListPrsOverview.mockReset();
   mockListPrsOverviewStats.mockReset();
   setRoots(ROOT);
@@ -523,5 +530,370 @@ describe("usePrOverview — failure shape", () => {
     await waitFor(() => expect(result.current.failures).toHaveLength(1));
     expect(result.current.allRootsFailed).toBe(false);
     expect(result.current.rows).toHaveLength(1);
+  });
+});
+
+// ── Cadence ──────────────────────────────────────────────────────────
+//
+// The fan-out is one `gh` call per repository root, so what it costs is
+// the root count times the rate — and the watcher that feeds the sidebar
+// badge runs for the whole session whether or not anyone is looking. At
+// the page's own cadence that came to more requests per hour than the
+// host grants in an hour, and the page then found the budget already
+// spent. These two tests are the split that fixed it; they assert the
+// interval each mode actually registers rather than waiting for timers.
+
+function clientWrapper() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retryDelay: 0, gcTime: 0 } },
+  });
+  const Wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  return { client, wrapper: Wrapper };
+}
+
+function intervalOf(client: QueryClient, key: readonly unknown[]): unknown {
+  const query = client.getQueryCache().find({ queryKey: key });
+  return query?.observers[0]?.options.refetchInterval;
+}
+
+describe("usePrOverview — cadence", () => {
+  it("gives the page the cadence a person notices", async () => {
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 1 })] });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true, "open", "page"), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(30_000);
+    // The expensive half is slower even on the page: it is a second call
+    // per root, and a check rollup ticking over on a row nobody has
+    // opened yet is not what the page is for.
+    await waitFor(() =>
+      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(90_000),
+    );
+  });
+
+  it("lets the unwatched watcher run slowly", async () => {
+    mockListPrsOverview.mockResolvedValue({ viewer: "mock-dev", items: [item({ number: 1 })] });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { client, wrapper } = clientWrapper();
+    // No third argument: the badge, the toasts and the palette all take
+    // the default, and the default is the cheap one.
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    expect(intervalOf(client, prOverviewKey(ROOT))).toBe(120_000);
+    await waitFor(() =>
+      expect(intervalOf(client, prOverviewStatsKey(ROOT))).toBe(240_000),
+    );
+  });
+});
+
+// ── The budget gate ──────────────────────────────────────────────────
+
+describe("usePrOverview — the budget gate", () => {
+  const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+
+  it("stops polling when the account's budget is spent, and says until when", async () => {
+    setRoots(ROOT, OTHER);
+    mockListPrsOverview.mockRejectedValue(
+      "GraphQL: API rate limit already exceeded for user ID 100132710.",
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 4999,
+      core_reset: RESET_SEC,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBe(RESET_SEC * 1000));
+
+    // The budget belongs to the account, not to the repository whose
+    // call happened to carry the refusal — so both roots are gated and
+    // only one of them paid for the lookup.
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    const query = client.getQueryCache().find({ queryKey: prOverviewKey(ROOT) });
+    expect(query?.observers[0]?.options.enabled).toBe(false);
+  });
+
+  it("does not pause a repository metered by a different host", async () => {
+    // The gate holds GitHub's hourly budget. A GitLab root draws on an
+    // entirely separate one and has nothing to wait for — freezing its
+    // badge, its toasts and its rows on GitHub's word would be a new
+    // silent outage traded for the old one.
+    mockWorkspaces.length = 0;
+    mockWorkspaces.push({
+      workspace_id: "ws-gh",
+      project_root: ROOT,
+      cwd: ROOT,
+      provider_kind: "github",
+    });
+    mockWorkspaces.push({
+      workspace_id: "ws-gl",
+      project_root: OTHER,
+      cwd: OTHER,
+      provider_kind: "gitlab",
+    });
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT
+        ? Promise.reject("GraphQL: API rate limit already exceeded for user ID 1.")
+        : Promise.resolve({ viewer: "mock-dev", items: [item({ number: 4 })] }),
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: Math.floor(Date.now() / 1000) + 900,
+      core_remaining: 1,
+      core_reset: Math.floor(Date.now() / 1000) + 900,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+
+    const gh = client.getQueryCache().find({ queryKey: prOverviewKey(ROOT) });
+    const gl = client.getQueryCache().find({ queryKey: prOverviewKey(OTHER) });
+    expect(gh?.observers[0]?.options.enabled).toBe(false);
+    expect(gl?.observers[0]?.options.enabled).toBe(true);
+    expect(result.current.rows.map((r) => r.number)).toEqual([4]);
+  });
+
+  it("does not raise the gate on a host it cannot speak for", async () => {
+    // A GitLab root saying "rate limit" is reporting a budget this gate
+    // does not hold and `gh api rate_limit` cannot read.
+    mockWorkspaces.length = 0;
+    mockWorkspaces.push({
+      workspace_id: "ws-gl",
+      project_root: OTHER,
+      cwd: OTHER,
+      provider_kind: "gitlab",
+    });
+    mockListPrsOverview.mockRejectedValue("429: API rate limit exceeded for this project");
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.failures).toHaveLength(1));
+
+    expect(result.current.rateLimitedUntil).toBe(0);
+    expect(mockGithubRateLimit).not.toHaveBeenCalled();
+  });
+
+  it("leaves an unreachable repository to the footer", async () => {
+    // The narrowness of the match is what keeps one dead remote from
+    // pausing every other repository along with it.
+    setRoots(ROOT, OTHER);
+    mockListPrsOverview.mockImplementation((path: string) =>
+      path === ROOT
+        ? Promise.resolve({ viewer: "mock-dev", items: [item({ number: 1 })] })
+        : Promise.reject("could not resolve host github.com"),
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.failures).toHaveLength(1));
+    expect(result.current.rateLimitedUntil).toBe(0);
+    expect(mockGithubRateLimit).not.toHaveBeenCalled();
+    expect(result.current.rows).toHaveLength(1);
+  });
+
+  it("keeps the rows it already had while it waits", async () => {
+    // The gate stops fetching, never rendering: a page that emptied
+    // itself because the budget ran out would be strictly worse than the
+    // stale list it is replacing.
+    mockListPrsOverview
+      .mockResolvedValueOnce({ viewer: "mock-dev", items: [item({ number: 1 })] })
+      .mockRejectedValue("GraphQL: API rate limit already exceeded for user ID 1.");
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    await act(async () => {
+      await client.refetchQueries({ queryKey: prOverviewKey(ROOT) });
+    });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+
+    expect(result.current.rows).toHaveLength(1);
+    expect(result.current.rows[0]?.number).toBe(1);
+  });
+
+  it("lifts the gate when the user presses Retry, and recovers", async () => {
+    mockListPrsOverview.mockRejectedValue(
+      "GraphQL: API rate limit already exceeded for user ID 1.",
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+
+    // The budget refilled early, or the user simply disbelieves us.
+    // Retry is allowed to find out, for the price of one request.
+    mockListPrsOverview.mockResolvedValue({
+      viewer: "mock-dev",
+      items: [item({ number: 9 })],
+    });
+    act(() => result.current.refresh());
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+    expect(result.current.rows[0]?.number).toBe(9);
+    expect(result.current.rateLimitedUntil).toBe(0);
+  });
+});
+
+describe("usePrOverview — the gate can be raised more than once", () => {
+  it("goes back up when the budget is still spent after the pause lifts", async () => {
+    // The failure this guards against is subtle and total: if the effect
+    // that raises the gate keys off something that does not change
+    // between two refusals, the gate goes up exactly once per session.
+    // Every pause after the first one then lifts into a page that
+    // resumes hammering a host still refusing it — which is the original
+    // bug, with a fifteen-minute pause in front of it.
+    const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+    mockListPrsOverview.mockRejectedValue(
+      "GraphQL: API rate limit already exceeded for user ID 1.",
+    );
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { result } = renderHook(() => usePrOverview(true), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+
+    // The pause lifting is what Retry does by hand, so this is the same
+    // path the timer takes when it fires.
+    act(() => result.current.refresh());
+
+    await waitFor(() => expect(mockGithubRateLimit).toHaveBeenCalledTimes(2));
+    expect(result.current.rateLimitedUntil).toBeGreaterThan(0);
+  });
+
+  it("goes back up when the timer lifts the pause, on a root that already has rows", async () => {
+    // Two things at once, and the second is why the first is written
+    // this way.
+    //
+    // The timer path: Retry also invalidates the queries, while the
+    // timer only lifts the gate and leaves the re-fetch to the observers
+    // re-enabling. That is the path that actually runs in production —
+    // nobody is watching at 03:00 to press the button.
+    //
+    // And the root *succeeds first*, which is what makes this a real
+    // test of the dependency. A query that has never held data has its
+    // error cleared on every refetch, so the offending path goes null
+    // and back and the effect re-fires on the path alone — the shape
+    // every other test here has, and the shape the bug hides behind. A
+    // root with rows keeps its error across refetches, so the timestamp
+    // is genuinely the only thing that changes between two refusals.
+    const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+    mockListPrsOverview
+      .mockResolvedValueOnce({ viewer: "mock-dev", items: [item({ number: 3 })] })
+      .mockRejectedValue("GraphQL: API rate limit already exceeded for user ID 1.");
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(1));
+
+    await act(async () => {
+      await client.refetchQueries({ queryKey: prOverviewKey(ROOT) });
+    });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    // The row survived the refusal, which is the state that makes the
+    // second refusal indistinguishable from the first by path alone.
+    expect(result.current.rows).toHaveLength(1);
+
+    act(() => clearRateLimitPause());
+
+    await waitFor(() => expect(mockGithubRateLimit).toHaveBeenCalledTimes(2));
+    expect(result.current.rateLimitedUntil).toBeGreaterThan(0);
+  });
+
+  it("does not raise the gate again on a refusal from before the pause", async () => {
+    // Two roots with rows are both refused, and the newer refusal is
+    // the one that raised the gate. When the pause lifts both refetch,
+    // and a root with rows keeps its error — and its old timestamp —
+    // while its refetch is in flight. If the *other* root answers
+    // first, the newest refusal on the page is suddenly the older one,
+    // the effect sees a change, and a refusal that the pause already
+    // answered for would put the gate straight back up. The gate has
+    // to remember what it has already acted on.
+    const RESET_SEC = Math.floor(Date.now() / 1000) + 900;
+    setRoots(ROOT, OTHER);
+    const calls = new Map<string, number>();
+    const rootRefetch = deferred<unknown>();
+    mockListPrsOverview.mockImplementation((path: string) => {
+      const n = (calls.get(path) ?? 0) + 1;
+      calls.set(path, n);
+      if (n === 1) return Promise.resolve({ viewer: "mock-dev", items: [item({ number: n })] });
+      if (n === 2) return Promise.reject("GraphQL: API rate limit already exceeded for user ID 1.");
+      return path === ROOT
+        ? rootRefetch.promise
+        : Promise.resolve({ viewer: "mock-dev", items: [item({ number: 7 })] });
+    });
+    mockListPrsOverviewStats.mockResolvedValue([]);
+    mockGithubRateLimit.mockResolvedValue({
+      graphql_remaining: 0,
+      graphql_reset: RESET_SEC,
+      core_remaining: 1,
+      core_reset: RESET_SEC,
+    });
+
+    const { client, wrapper } = clientWrapper();
+    const { result } = renderHook(() => usePrOverview(true), { wrapper });
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+
+    await act(async () => {
+      await client.refetchQueries({ predicate: (q) => q.queryKey[1] === "overview" });
+    });
+    await waitFor(() => expect(result.current.rateLimitedUntil).toBeGreaterThan(0));
+    expect(result.current.failures).toHaveLength(2);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+
+    act(() => clearRateLimitPause());
+
+    // The second root has answered; the first is still asking, and
+    // still wearing the refusal from before the pause.
+    await waitFor(() => expect(result.current.rows.map((r) => r.number)).toContain(7));
+    expect(result.current.failures.map((f) => f.root.path)).toEqual([ROOT]);
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    expect(result.current.rateLimitedUntil).toBe(0);
+
+    rootRefetch.resolve({ viewer: "mock-dev", items: [item({ number: 8 })] });
+    await waitFor(() => expect(result.current.failures).toHaveLength(0));
+    expect(mockGithubRateLimit).toHaveBeenCalledTimes(1);
+    expect(result.current.rateLimitedUntil).toBe(0);
   });
 });

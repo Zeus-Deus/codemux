@@ -1863,6 +1863,74 @@ pub fn list_prs_overview_stats(repo_path: &Path) -> Result<Vec<PrOverviewStats>,
     Ok(arr.iter().map(parse_overview_stats_json).collect())
 }
 
+/// What is left of the GitHub API budget, and when it refills.
+///
+/// Asked only when a call has just been refused for exceeding it, which
+/// is exactly the moment a normal request would be wasted. `rate_limit`
+/// is the one endpoint GitHub does not charge for — checking it costs
+/// nothing when there is nothing left to spend — so the page can find
+/// out *when* it will work again rather than guessing, and say so.
+///
+/// Both buckets are reported because the two halves of this file spend
+/// from different ones: `gh pr list` is GraphQL, while the REST reads
+/// elsewhere are core. The page gates on `graphql`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GhRateLimit {
+    pub graphql_remaining: i64,
+    /// Unix seconds. Zero means the host did not say.
+    pub graphql_reset: i64,
+    pub core_remaining: i64,
+    pub core_reset: i64,
+}
+
+/// Short on purpose: this call exists to end a stall, so waiting a long
+/// time for it defeats the point. A timeout here just leaves the caller
+/// with its own default back-off.
+const RATE_LIMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `repo_path` is only a working directory for `gh`. `gh api` does not
+/// pick a host from the checkout it runs in — it reads whichever host
+/// `gh` treats as its default — so the answer is that account's budget
+/// wherever this is asked from, and the page treats it as one budget
+/// for every root `gh` serves.
+pub fn rate_limit(repo_path: &Path) -> Result<GhRateLimit, String> {
+    let output = run_gh_timed(repo_path, &["api", "rate_limit"], RATE_LIMIT_TIMEOUT)?;
+    parse_rate_limit(&output)
+}
+
+/// Split out from the shell-out so the shape can be tested without one.
+///
+/// A missing `resources` object is an error rather than a zeroed answer:
+/// the caller's fallback is a fixed back-off, which is a better thing to
+/// do with a reply we cannot read than to invent "exhausted, refills at
+/// the epoch" from it.
+fn parse_rate_limit(output: &str) -> Result<GhRateLimit, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
+    let resources = v.get("resources").filter(|r| r.is_object()).ok_or_else(|| {
+        "Expected a resources object from gh api rate_limit".to_string()
+    })?;
+    // A bucket the host did not report reads as exhausted-with-no-reset,
+    // which the caller turns into its minimum back-off. Guessing a
+    // generous "plenty remaining" would keep it hammering a host that
+    // has already said no.
+    let bucket = |name: &str| -> (i64, i64) {
+        let b = &resources[name];
+        (
+            b["remaining"].as_i64().unwrap_or(0),
+            b["reset"].as_i64().unwrap_or(0),
+        )
+    };
+    let (graphql_remaining, graphql_reset) = bucket("graphql");
+    let (core_remaining, core_reset) = bucket("core");
+    Ok(GhRateLimit {
+        graphql_remaining,
+        graphql_reset,
+        core_remaining,
+        core_reset,
+    })
+}
+
 /// `passing` / `failing` / `pending` / `none` — the four states a row
 /// can be drawn in, decided here so both products answer in the same
 /// vocabulary and the frontend never sees a raw check array.
@@ -4898,5 +4966,73 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         // An unrelated failure keeps its own words; replacing them would
         // send the reviewer re-anchoring notes that are fine.
         assert!(!is_stale_anchor_error("HTTP 403: Resource not accessible"));
+    }
+
+    // ── The budget the page gates on ──────────────────────────────────
+
+    #[test]
+    fn the_graphql_bucket_is_read_off_a_real_reply() {
+        // Trimmed from an actual `gh api rate_limit` response taken
+        // while the page was locked out: core untouched, GraphQL over.
+        let limit = parse_rate_limit(
+            r#"{"resources":{
+                 "core":{"limit":5000,"used":1,"remaining":4999,"reset":1787478026},
+                 "graphql":{"limit":5000,"used":5011,"remaining":0,"reset":1787474964},
+                 "search":{"limit":30,"used":0,"remaining":30,"reset":1787474853}},
+               "rate":{"limit":5000,"remaining":4999,"reset":1787478026}}"#,
+        )
+        .expect("a well-formed reply parses");
+
+        assert_eq!(limit.graphql_remaining, 0);
+        assert_eq!(limit.graphql_reset, 1787474964);
+        // The two buckets are genuinely independent, and reading the
+        // wrong one is how "the app is broken" gets diagnosed as "the
+        // app is fine": core had 4999 left the whole time.
+        assert_eq!(limit.core_remaining, 4999);
+        assert_eq!(limit.core_reset, 1787478026);
+    }
+
+    #[test]
+    fn a_bucket_the_host_did_not_report_reads_as_spent() {
+        let limit = parse_rate_limit(r#"{"resources":{"core":{"remaining":10,"reset":5}}}"#)
+            .expect("a partial reply still parses");
+        // Not "plenty left": the caller is asking because a request was
+        // already refused, and inventing headroom would send it back.
+        assert_eq!(limit.graphql_remaining, 0);
+        assert_eq!(limit.graphql_reset, 0);
+    }
+
+    /// The live path, end to end: spawn a real `gh`, against the real
+    /// host, and read the real reply.
+    ///
+    /// Ignored by default because it needs a signed-in `gh` and the
+    /// network. Run it with
+    /// `cargo test rate_limit_reads_the_live_host -- --ignored --nocapture`
+    /// — the endpoint is not metered, so running it costs nothing even
+    /// when the budget it reports is already spent.
+    #[test]
+    #[ignore]
+    fn rate_limit_reads_the_live_host() {
+        let repo = std::env::current_dir().expect("a working directory");
+        let limit = rate_limit(&repo).expect("gh answered");
+        eprintln!(
+            "graphql {} left, resets at {} · core {} left, resets at {}",
+            limit.graphql_remaining, limit.graphql_reset, limit.core_remaining, limit.core_reset
+        );
+        // Not asserting a particular budget — that is the host's
+        // business and changes by the minute. What must hold is that the
+        // reply was understood: a real reset is a plausible epoch, not
+        // the zero a silently-misparsed field would leave behind.
+        assert!(limit.graphql_reset > 1_700_000_000, "graphql reset looks unparsed");
+        assert!(limit.core_reset > 1_700_000_000, "core reset looks unparsed");
+        assert!(limit.core_remaining >= 0);
+    }
+
+    #[test]
+    fn an_unreadable_reply_is_an_error_not_a_zeroed_answer() {
+        // Both of these must fall through to the caller's own back-off
+        // rather than being read as "exhausted until the epoch".
+        assert!(parse_rate_limit("not json at all").is_err());
+        assert!(parse_rate_limit(r#"{"message":"Bad credentials"}"#).is_err());
     }
 }

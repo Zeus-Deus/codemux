@@ -712,6 +712,20 @@ export interface PrOverviewStats {
   deletions: number | null;
 }
 
+/** What is left of the GitHub API budget, and when it refills.
+ *
+ *  `graphql_*` is the bucket the pull-request listing spends from and the
+ *  one the page gates on; `core_*` is the REST bucket the detail reads
+ *  use. They are metered separately, which is why both are reported —
+ *  reading the wrong one turns "locked out" into "looks fine". */
+export interface GhRateLimit {
+  graphql_remaining: number;
+  /** Unix seconds. Zero means the host did not say. */
+  graphql_reset: number;
+  core_remaining: number;
+  core_reset: number;
+}
+
 /** One repository root's open pull requests, plus who is asking — the
  *  grouping is meaningless without the viewer. */
 export interface PrsOverview {

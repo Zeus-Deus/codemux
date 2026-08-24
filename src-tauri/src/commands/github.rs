@@ -249,6 +249,20 @@ pub async fn list_prs_overview_stats(
     .map_err(|e| format!("list_prs_overview_stats task join failed: {e}"))?
 }
 
+/// What is left of the GitHub budget, and when it refills.
+///
+/// The Pull Requests page asks this only after a call has come back
+/// refused for exceeding the limit — never speculatively. GitHub does
+/// not charge for the endpoint, so it is the one request that is still
+/// safe to make when there is nothing left to spend, and it is what lets
+/// the page say "resumes at 10:49" instead of retrying into a wall.
+#[tauri::command]
+pub async fn github_rate_limit(path: String) -> Result<crate::github::GhRateLimit, String> {
+    tokio::task::spawn_blocking(move || crate::github::rate_limit(Path::new(&path)))
+        .await
+        .map_err(|e| format!("github_rate_limit task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn merge_pull_request(
     path: String,

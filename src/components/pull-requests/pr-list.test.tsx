@@ -12,7 +12,7 @@ vi.mock("@/lib/toast", () => ({
   toast: { info: vi.fn(), success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { PrList } from "./pr-list";
+import { PrList, clockTime } from "./pr-list";
 import { rowKey, type PrRow } from "@/lib/pr-overview";
 
 const ROOT = "/home/dev/projects/codemux";
@@ -492,6 +492,57 @@ describe("PrList — carried rows and the stale strip", () => {
     expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 
+  it("says the budget is spent, and when it refills, rather than 'it failed'", async () => {
+    // The one failure with a different answer to "what do I do about
+    // this": not Retry, but wait — so the strip says which, and how
+    // long, instead of inviting the retry that spends the recovery.
+    const onRefresh = vi.fn();
+    const resumesAt = Date.now() + 15 * 60_000;
+    renderList({
+      rows: carriedRows,
+      carried: true,
+      carriedAt: Date.now() - TWO_HOURS,
+      rateLimitedUntil: resumesAt,
+      allRootsFailed: true,
+      refreshFailed: true,
+      onRefresh,
+    });
+
+    const strip = screen.getByTestId("pr-stale-strip");
+    expect(strip).toHaveTextContent("Rate limit reached");
+    // A clock time, not a countdown: nothing is polling while the gate
+    // is up, so nothing re-renders, and "in 15m" would sit frozen at
+    // whatever it said when the strip first painted.
+    expect(strip).toHaveTextContent(`resuming at ${clockTime(resumesAt)}`);
+    // Still the age of what is on screen: the rows did not become less
+    // readable because the reason for their age changed.
+    expect(strip).toHaveTextContent("showing the list from 2h ago");
+    expect(strip).not.toHaveTextContent("The latest refresh failed");
+
+    // And the rows are still there, exactly as in the ordinary case.
+    expect(screen.getByTestId(`pr-row-${ROOT}-41`)).toBeInTheDocument();
+
+    // Retry stays offered: a user who thinks we are wrong is entitled to
+    // find out for the price of one request.
+    await userEvent.click(screen.getByTestId("pr-stale-retry"));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("raises the strip on a spent budget before every root has been refused", () => {
+    // The polling is already paused at that point. A page that had
+    // quietly stopped refreshing while looking perfectly current is the
+    // one outcome worse than saying so.
+    renderList({
+      rows: carriedRows,
+      updatedAt: Date.now() - 60_000,
+      rateLimitedUntil: Date.now() + 5 * 60_000,
+      allRootsFailed: false,
+      refreshFailed: false,
+    });
+
+    expect(screen.getByTestId("pr-stale-strip")).toHaveTextContent("Rate limit reached");
+  });
+
   it("leaves a partial failure to the footer", () => {
     renderList({
       rows: [row({ number: 41 })],
@@ -575,3 +626,63 @@ describe("PrList — rows whose checks have not landed", () => {
   });
 });
 
+
+describe("PrList — nothing to show, and why", () => {
+  it("does not claim the list is empty when it never got an answer", () => {
+    // "No open pull requests" is an answer. Refused-for-budget means we
+    // do not have one, and on a cold start there are no rows to fall
+    // back on either — so the page has to say which of the two it is.
+    renderList({
+      rows: [],
+      updatedAt: null,
+      rateLimitedUntil: Date.now() + 10 * 60_000,
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+
+    expect(screen.queryByText("No open pull requests.")).not.toBeInTheDocument();
+    expect(screen.getByTestId("pr-list-unanswered")).toBeInTheDocument();
+    // And the strip still explains itself, with no rows above it.
+    expect(screen.getByTestId("pr-stale-strip")).toHaveTextContent("Rate limit reached");
+  });
+
+  it("still says the list is empty when the host actually said so", () => {
+    renderList({ rows: [], updatedAt: Date.now() });
+    expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+    expect(screen.queryByTestId("pr-stale-strip")).not.toBeInTheDocument();
+  });
+
+  it("does not claim ignorance when other repositories answered", () => {
+    // One root over budget while twenty answered "nothing open" is an
+    // answer. Refusing to give it would be the same lie in the other
+    // direction, and this page has more repositories than budgets.
+    renderList({
+      rows: [],
+      updatedAt: Date.now(),
+      rateLimitedUntil: Date.now() + 10 * 60_000,
+      allRootsFailed: false,
+    });
+
+    expect(screen.getByText("No open pull requests.")).toBeInTheDocument();
+    expect(screen.queryByTestId("pr-list-unanswered")).not.toBeInTheDocument();
+  });
+
+  it("does not say it is showing a list when there is no list", () => {
+    // A cold start that was refused has nothing behind the strip, so the
+    // clause about what you are looking at has to go — it would sit
+    // directly above an empty state saying the opposite.
+    renderList({
+      rows: [],
+      updatedAt: null,
+      rateLimitedUntil: Date.now() + 10 * 60_000,
+      allRootsFailed: true,
+      refreshFailed: true,
+    });
+
+    const strip = screen.getByTestId("pr-stale-strip");
+    expect(strip).toHaveTextContent("Rate limit reached");
+    expect(strip).toHaveTextContent("resuming at");
+    expect(strip).not.toHaveTextContent("showing the last list loaded");
+    expect(strip).not.toHaveTextContent("showing the list from");
+  });
+});

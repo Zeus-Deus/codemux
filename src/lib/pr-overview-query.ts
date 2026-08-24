@@ -23,6 +23,13 @@ import { useEffect, useMemo } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 
 import { listPrsOverview, listPrsOverviewStats, listPullRequests } from "@/tauri/commands";
+import {
+  budgetApplies,
+  clearRateLimitPause,
+  isRateLimitError,
+  noteRateLimited,
+  useRateLimitPause,
+} from "@/lib/pr-rate-limit";
 import { useAppStore } from "@/stores/app-store";
 import { repoSlugFromUrl } from "@/lib/source-control";
 import type { PrRow } from "@/lib/pr-overview";
@@ -34,9 +41,73 @@ import {
 } from "@/lib/pr-overview-snapshot";
 import type { PrOverviewStats, PullRequestInfo } from "@/tauri/types";
 
-/** 30s: PRs across every open project change on a human cadence, and
- *  each root is a CLI shell-out. The detail column polls far faster. */
+/**
+ * Who is asking, which is the same question as how often to ask.
+ *
+ * `page` is the Pull Requests page: on screen, being read, and open for
+ * as long as someone is triaging. `watch` is everything that wants these
+ * rows without anyone looking at them — the sidebar badge, the toast
+ * watcher, the palette's `pr ` mode — and it runs for the whole session.
+ */
+export type PrOverviewMode = "page" | "watch";
+
+/**
+ * 30s: PRs across every open project change on a human cadence, and each
+ * root is a CLI shell-out. The detail column polls far faster.
+ */
 export const PR_OVERVIEW_REFETCH_MS = 30_000;
+
+/**
+ * How often the listing re-runs, by mode.
+ *
+ * The fan-out is one `gh` call *per repository root*, so its cost is not
+ * a constant — it is the root count times the rate. On a machine with
+ * twenty-odd projects open, polling every root every thirty seconds is
+ * more GraphQL requests per hour than GitHub grants in an hour, and the
+ * budget is per account rather than per surface. What that bought was
+ * the watcher spending the page's quota all day and the page finding
+ * none left the moment it was opened: every root refused at once, and a
+ * page of "the latest refresh failed" over rows from twenty minutes ago.
+ *
+ * So the two cadences are split by what is actually being served. The
+ * page keeps 30s, because that is the number a person watching a list
+ * notices. The watcher — which nobody is watching — moves to two
+ * minutes, which is the same information at a fifth of the price.
+ *
+ * Two things already in the query layer keep the slower cadence from
+ * costing the badge its freshness, and they are why this is a cadence
+ * change rather than a trade:
+ *
+ * - `refetchOnWindowFocus` (on globally) refreshes the watcher when you
+ *   return to Codemux, so the badge is current exactly when you are in
+ *   front of it.
+ * - Opening the page mounts an observer with the 30s staleness, which
+ *   refetches on mount — so the page never opens onto watcher-aged rows.
+ */
+const LIST_REFETCH_MS: Record<PrOverviewMode, number> = {
+  page: PR_OVERVIEW_REFETCH_MS,
+  watch: 120_000,
+};
+
+/**
+ * How often the expensive half re-runs, by mode.
+ *
+ * Slower than the listing in both modes, because it is a second call per
+ * root and it answers a slower question. A pull request appearing, or
+ * appearing in *your* group, is news; its check rollup ticking from
+ * pending to green is a detail of a row you are not looking at yet — and
+ * the moment you do look at one, the detail column watches its checks
+ * properly, on a cadence this page has no business trying to match.
+ *
+ * This is also the half that never stops asking: the fast listing leaves
+ * `checks` null by design, so `needsStats` is true on essentially every
+ * root, forever. At the listing's own rate that quietly doubled the
+ * price of every cycle.
+ */
+const STATS_REFETCH_MS: Record<PrOverviewMode, number> = {
+  page: 90_000,
+  watch: 240_000,
+};
 
 export const prOverviewKey = (projectRoot: string) =>
   ["prs", "overview", projectRoot] as const;
@@ -189,6 +260,14 @@ export interface PrOverviewResult {
    *  later, and announcing a failed refresh in that gap would be both
    *  alarming and wrong. */
   refreshFailed: boolean;
+  /** Epoch ms at which the host's budget refills, when a refusal for
+   *  exceeding it has paused the polling; 0 when nothing is paused.
+   *
+   *  Distinct from `refreshFailed` on purpose. "It broke" and "you are
+   *  out of budget until 10:49" want different sentences: the first is a
+   *  thing to retry, the second is a thing to wait out, and the strip
+   *  can only say which if it is told. */
+  rateLimitedUntil: number;
   isLoading: boolean;
   refresh: () => void;
 }
@@ -218,20 +297,42 @@ export function _resetSnapshotWriteGuard(): void {
 export function usePrOverview(
   enabled = true,
   stateFilter: PrStateFilter = "open",
+  mode: PrOverviewMode = "watch",
 ): PrOverviewResult {
   const roots = useProjectRoots();
   const queryClient = useQueryClient();
+
+  // The host has refused for exceeding its budget and told us when it
+  // refills. Everything below stops asking until then — the rows already
+  // on screen stay exactly as they are, which is the same rule that
+  // governs an ordinary failed refresh; only the retrying stops.
+  const rateLimitedUntil = useRateLimitPause();
+  // Per root, not globally: the gate holds *one host's* budget, and a
+  // repository metered somewhere else has nothing to wait for. Pausing
+  // it too would trade one silent freeze for another.
+  const canFetch = (root: ProjectRoot) =>
+    enabled && (rateLimitedUntil === 0 || !budgetApplies(root.providerKind));
+
+  const listRefetchMs = LIST_REFETCH_MS[mode];
+  const statsRefetchMs = STATS_REFETCH_MS[mode];
 
   const results = useQueries({
     queries: roots.map((root) => ({
       queryKey: prOverviewKey(root.path),
       queryFn: () => listPrsOverview(root.path),
-      enabled,
-      staleTime: PR_OVERVIEW_REFETCH_MS,
-      refetchInterval: PR_OVERVIEW_REFETCH_MS,
+      enabled: canFetch(root),
+      // Staleness tracks the cadence rather than being pinned to the
+      // page's, so returning to the window doesn't refetch every root
+      // on every focus — `refetchOnWindowFocus` is on globally, and with
+      // twenty roots a stale-on-arrival watcher made alt-tab expensive.
+      staleTime: listRefetchMs,
+      refetchInterval: listRefetchMs,
       // One retry, then the footer says so. Retrying a repository that
-      // isn't there just delays the sentence that explains it.
-      retry: 1,
+      // isn't there just delays the sentence that explains it — and a
+      // refusal for exceeding the budget is not retried at all, because
+      // the retry is refused too and spends the recovery it is waiting
+      // for. The gate above is what handles that case.
+      retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
     })),
   });
 
@@ -249,12 +350,12 @@ export function usePrOverview(
     queries: roots.map((root, i) => ({
       queryKey: prOverviewStatsKey(root.path),
       queryFn: () => listPrsOverviewStats(root.path),
-      enabled: enabled && needsStats[i],
-      staleTime: PR_OVERVIEW_REFETCH_MS,
-      refetchInterval: PR_OVERVIEW_REFETCH_MS,
+      enabled: canFetch(root) && needsStats[i],
+      staleTime: statsRefetchMs,
+      refetchInterval: statsRefetchMs,
       // No retry. The row keeps whatever it has and the next poll tries
-      // again in thirty seconds; a second attempt at a slow call is the
-      // one thing that would make the slow half slower.
+      // again on the cadence above; a second attempt at a slow call is
+      // the one thing that would make the slow half slower.
       retry: false,
     })),
   });
@@ -268,9 +369,9 @@ export function usePrOverview(
     queries: roots.map((root) => ({
       queryKey: prHistoryKey(root.path, stateFilter),
       queryFn: () => listPullRequests(root.path, stateFilter === "closed" ? "closed" : "all"),
-      enabled: enabled && wantsHistory,
-      staleTime: PR_OVERVIEW_REFETCH_MS,
-      retry: 1,
+      enabled: canFetch(root) && wantsHistory,
+      staleTime: listRefetchMs,
+      retry: (count: number, error: unknown) => !isRateLimitError(error) && count < 1,
     })),
   });
 
@@ -299,6 +400,15 @@ export function usePrOverview(
   let carried = false;
   let statsPending = false;
   let anyRootFresh = false;
+  // The newest refusal-for-spending seen this render, and when it
+  // landed. Both halves matter: the path gives `gh` somewhere to run,
+  // and the timestamp is what tells a *second* refusal apart from the
+  // first one still sitting in the query's error state. Without it the
+  // gate would raise once per session and every pause after the first
+  // would lift into a page that resumed hammering a host still saying
+  // no — the original bug with a fifteen-minute delay in front of it.
+  let rateLimitedRoot: string | null = null;
+  let rateLimitedAt = 0;
 
   results.forEach((result, i) => {
     const root = roots[i];
@@ -362,6 +472,19 @@ export function usePrOverview(
     // failing refresh keeps its rows and still reports the failure.
     if (result.isError) {
       failures.push({ root, message: String(result.error) });
+      // Only a host the gate can actually speak for. A GitLab root that
+      // says "rate limit" is telling us about a budget this gate does
+      // not hold and `gh api rate_limit` cannot read — raising it from
+      // there would pause every GitHub repository on someone else's
+      // word, and look up the wrong host's reset to decide for how long.
+      if (
+        budgetApplies(root.providerKind) &&
+        isRateLimitError(result.error) &&
+        result.errorUpdatedAt >= rateLimitedAt
+      ) {
+        rateLimitedRoot = root.path;
+        rateLimitedAt = result.errorUpdatedAt;
+      }
     }
   });
 
@@ -424,7 +547,28 @@ export function usePrOverview(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [writeToken]);
 
+  // ── Raising the gate ──
+  //
+  // Being refused for exceeding the budget is not a fact about the
+  // repository whose call happened to carry the refusal — it is a fact
+  // about the account, and every other root is about to be told the same
+  // thing. So one refusal speaks for all of them.
+  //
+  // The timestamp goes with it. "Newest on screen" is not "new": a root
+  // with rows keeps its error while it refetches, so once the pause
+  // lifts and the other roots recover, the newest refusal left on the
+  // page is one from before the pause — and the gate, not this hook, is
+  // what remembers it has already been paused for.
+  useEffect(() => {
+    if (!rateLimitedRoot) return;
+    void noteRateLimited(rateLimitedRoot, rateLimitedAt);
+  }, [rateLimitedRoot, rateLimitedAt]);
+
   const refresh = () => {
+    // Retry means "try now", gate or no gate: the user is entitled to
+    // disbelieve us, and the cost of being wrong is a single request
+    // that puts the gate straight back up.
+    clearRateLimitPause();
     queryClient.invalidateQueries({ predicate: (q) => q.queryKey[0] === "prs" });
   };
 
@@ -438,6 +582,7 @@ export function usePrOverview(
     carriedAt: carried ? (snapshot?.savedAt ?? null) : null,
     allRootsFailed: roots.length > 0 && failures.length === roots.length,
     refreshFailed: failures.length > 0 && !anyRootFresh && !isLoading,
+    rateLimitedUntil,
     isLoading,
     refresh,
   };
