@@ -253,8 +253,16 @@ impl CodexSubagentDemux {
     }
 
     /// Register `child` as a sub-agent spawned by `parent`.
+    ///
+    /// The session's own thread is never a sub-agent of itself. Codex
+    /// reports orchestrator-directed traffic (a child messaging the
+    /// parent) as a `subAgentActivity` whose `agentThreadId` is the
+    /// PARENT; without this guard that one item demotes the whole
+    /// session: every later parent item is routed as a child transcript
+    /// and the parent's `turn/completed` becomes a `SubagentUpdated`
+    /// instead of a `TurnCompleted`, so the run never settles.
     fn register(&mut self, child: &str, parent: &str) {
-        if child.is_empty() {
+        if child.is_empty() || child == self.parent_thread_id {
             return;
         }
         self.subagents.insert(child.to_string());
@@ -659,13 +667,18 @@ fn handle_collab_agent_tool_call(
         .unwrap_or_else(|| demux.parent_thread_id.clone());
 
     // Every receiver and every agent mentioned in `agentsStates` is a
-    // sub-agent of `parent`. Use a sorted set so emission order is stable.
+    // sub-agent of `parent` — except the session's own thread, which a
+    // `wait` / `sendInput` may list alongside real children and which
+    // must never be snapshotted as a sub-agent of itself. Use a sorted set
+    // so emission order is stable.
+    let own = demux.parent_thread_id.clone();
     let mut affected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for rid in &call.receiver_thread_ids {
-        demux.register(rid, &parent);
-        affected.insert(rid.clone());
-    }
-    for id in call.agents_states.keys() {
+    for id in call
+        .receiver_thread_ids
+        .iter()
+        .chain(call.agents_states.keys())
+        .filter(|id| **id != own)
+    {
         demux.register(id, &parent);
         affected.insert(id.clone());
     }
@@ -711,6 +724,14 @@ fn handle_sub_agent_activity(
         Err(_) => return vec![],
     };
     let parent = demux.parent_thread_id.clone();
+    // Activity attributed to the orchestrator itself (a child interacting
+    // with the parent) is not a sub-agent tick: there is no child to
+    // update, and a snapshot keyed by the parent id would render the
+    // session as its own sub-agent. `register` refuses it too; skipping
+    // here also suppresses the spurious event.
+    if act.agent_thread_id == parent {
+        return vec![];
+    }
     demux.register(&act.agent_thread_id, &parent);
     let status = match act.kind.as_str() {
         "started" | "interacted" => SubagentStatus::Running,
@@ -731,13 +752,17 @@ fn handle_thread_started(
     thread_id: &ThreadId,
     p: &ThreadStartedParams,
 ) -> Vec<ProviderRuntimeEvent> {
-    let is_child = match &p.parent_thread_id {
-        Some(parent) => parent == &demux.parent_thread_id || demux.is_subagent(parent),
-        // No parentThreadId (legacy flat shape or the parent's own
-        // started): only a child if a prior collab call already
-        // registered this thread id.
-        None => demux.is_subagent(&p.thread_id),
-    };
+    // The session's own thread is never a child, whatever `parentThreadId`
+    // claims — see `register`.
+    let is_own = p.thread_id == demux.parent_thread_id;
+    let is_child = !is_own
+        && match &p.parent_thread_id {
+            Some(parent) => parent == &demux.parent_thread_id || demux.is_subagent(parent),
+            // No parentThreadId (legacy flat shape or the parent's own
+            // started): only a child if a prior collab call already
+            // registered this thread id.
+            None => demux.is_subagent(&p.thread_id),
+        };
 
     if is_child {
         let parent = p
@@ -2102,6 +2127,157 @@ mod tests {
             }
             other => panic!("expected SubagentUpdated, got {other:?}"),
         }
+    }
+
+    // ── Subagent demux: the parent thread must never become a sub-agent ──
+    //
+    // Observed in the wild: when a child messages the orchestrator, Codex
+    // emits a `subAgentActivity` whose `agentThreadId` is the PARENT
+    // thread. Registering it demoted the whole session — every later
+    // parent item was tagged as a child transcript, and the parent's
+    // `turn/completed` became a `SubagentUpdated` instead of a
+    // `TurnCompleted`, so the run never settled ("Run interrupted" +
+    // Continue forever, sidebar pinned at Working).
+
+    /// Replay the observed sequence: spawn a child, then Codex reports an
+    /// `interacted` activity naming the parent thread itself.
+    fn demux_after_parent_named_as_activity() -> CodexSubagentDemux {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let _ = translate_notification_with(
+            &mut demux,
+            &tid(),
+            collab_item(json!({
+                "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+                "status": "completed", "senderThreadId": "c-1", "receiverThreadIds": ["c-child"],
+                "agentsStates": {"c-child": {"status": "running"}}
+            })),
+        );
+        let activity = NotificationMessage::from_raw(
+            "item/completed",
+            json!({"threadId": "c-1", "turnId": "pt-1", "item": {
+                "type": "subAgentActivity", "id": "sa-root", "agentThreadId": "c-1",
+                "agentPath": "root", "kind": "interacted"
+            }}),
+        );
+        let events = translate_notification_with(&mut demux, &tid(), activity);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } if subagent.subagent_id == "c-1"
+            )),
+            "an activity naming the parent must not emit a SubagentUpdated for the parent: {events:?}"
+        );
+        demux
+    }
+
+    #[test]
+    fn sub_agent_activity_naming_parent_does_not_register_parent() {
+        let demux = demux_after_parent_named_as_activity();
+        assert!(!demux.is_subagent("c-1"));
+        assert!(demux.is_subagent("c-child"), "real child registration must be unaffected");
+    }
+
+    #[test]
+    fn parent_turn_completed_still_settles_after_parent_named_as_activity() {
+        let mut demux = demux_after_parent_named_as_activity();
+        let msg = NotificationMessage::from_raw(
+            "turn/completed",
+            json!({"threadId": "c-1", "turn": {"id": "pt-1", "status": "completed",
+                "durationMs": 433439, "items": []}}),
+        );
+        let events = translate_notification_with(&mut demux, &tid(), msg);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProviderRuntimeEvent::TurnCompleted { turn_id, status: TurnStatus::Success, .. }
+                    if turn_id.0 == "pt-1"
+            )),
+            "parent turn/completed must emit TurnCompleted, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Ready, .. }
+            )),
+            "parent turn/completed must return the session to Ready, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            "parent turn/completed must not be demoted to SubagentUpdated: {events:?}"
+        );
+    }
+
+    #[test]
+    fn parent_transcript_item_stays_untagged_after_parent_named_as_activity() {
+        let mut demux = demux_after_parent_named_as_activity();
+        let msg = NotificationMessage::from_raw(
+            "item/completed",
+            json!({"threadId": "c-1", "turnId": "pt-1", "item": {
+                "type": "agentMessage", "id": "am-1", "text": "parent text"}}),
+        );
+        let events = translate_notification_with(&mut demux, &tid(), msg);
+        match &events[0] {
+            ProviderRuntimeEvent::ItemCompleted { subagent_id, .. } => {
+                assert!(subagent_id.is_none(), "parent item was routed as a child: {events:?}");
+            }
+            other => panic!("expected ItemCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_started_for_parent_with_parent_thread_id_stays_session_configured() {
+        // Third registration path: a `thread/started` for the session's own
+        // thread that (mis)reports a parentThreadId must keep the legacy
+        // SessionConfigured mapping, not become a sub-agent identity.
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let _ = translate_notification_with(
+            &mut demux,
+            &tid(),
+            collab_item(json!({
+                "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+                "status": "completed", "senderThreadId": "c-1", "receiverThreadIds": ["c-child"],
+                "agentsStates": {"c-child": {"status": "running"}}
+            })),
+        );
+        let msg = NotificationMessage::from_raw(
+            "thread/started",
+            json!({"thread": {"id": "c-1", "parentThreadId": "c-child", "agentNickname": "root"}}),
+        );
+        let events = translate_notification_with(&mut demux, &tid(), msg);
+        assert!(!demux.is_subagent("c-1"));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(&events[0], ProviderRuntimeEvent::SessionConfigured { .. }),
+            "expected SessionConfigured, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn collab_call_listing_parent_does_not_register_parent() {
+        // Belt-and-braces for the other registration path: a `wait` /
+        // `sendInput` whose receiver list or agentsStates mentions the
+        // orchestrator itself.
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            collab_item(json!({
+                "type": "collabAgentToolCall", "id": "call-2", "tool": "wait",
+                "status": "completed", "senderThreadId": "c-1",
+                "receiverThreadIds": ["c-child", "c-1"],
+                "agentsStates": {"c-child": {"status": "completed"}, "c-1": {"status": "running"}}
+            })),
+        );
+        assert!(!demux.is_subagent("c-1"));
+        assert!(demux.is_subagent("c-child"));
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } if subagent.subagent_id == "c-1"
+            )),
+            "no SubagentUpdated for the parent: {events:?}"
+        );
+        assert_eq!(events.len(), 1, "only the real child gets a snapshot: {events:?}");
     }
 
     // ── Subagent demux: child thread/started identity ──
