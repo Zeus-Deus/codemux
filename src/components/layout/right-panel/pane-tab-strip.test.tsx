@@ -268,4 +268,41 @@ describe("PaneTabStrip — overflow", () => {
       restore();
     }
   });
+
+  it("keeps the compact strip's scroll offset when another tab is activated", () => {
+    const restore = stubScrollerOverflow(800, 400);
+    try {
+      const { rerender } = renderStrip();
+      const scroller = screen.getByTestId("right-panel-tabs-scroll");
+      expect(scroller).toHaveAttribute("data-compact", "true");
+      // The user has panned to the right…
+      Object.defineProperty(scroller, "scrollLeft", {
+        value: 300,
+        writable: true,
+        configurable: true,
+      });
+      // …and activating a tab re-measures the strip (full layout, then
+      // compact again). That bounce must not throw the offset away.
+      rerender(
+        <PaneTabStrip
+          tabs={TABS}
+          activeTab="changes"
+          onSelect={() => {}}
+          onClose={() => {}}
+          onReorder={() => {}}
+          surfaces={[]}
+          onOpenFile={() => {}}
+          openFileKeys=""
+          inTitlebar
+          onToggleExpand={() => {}}
+          expanded={false}
+          onCollapsePanel={() => {}}
+        />,
+      );
+      expect(scroller).toHaveAttribute("data-compact", "true");
+      expect(scroller.scrollLeft).toBe(300);
+    } finally {
+      restore();
+    }
+  });
 });

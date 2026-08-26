@@ -143,7 +143,12 @@ function DeckTabChip({
       // Middle-click closes, as in every browser and editor tab strip —
       // and it is the only close gesture a compact tab has, since an X
       // overlaid on a 28px chip would be the thing you hit when aiming for
-      // the tab.
+      // the tab. The mousedown is cancelled too: on an overflowing strip
+      // a middle button-press would otherwise also engage the webview's
+      // autoscroll on its way to the close.
+      onMouseDown={(event) => {
+        if (event.button === 1) event.preventDefault();
+      }}
       onAuxClick={(event) => {
         if (event.button !== 1) return;
         event.preventDefault();
@@ -381,22 +386,29 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     [attachWheelScroll, containerRef],
   );
   const gapRef = useRef<HTMLDivElement>(null);
-  const { compact, edges } = useDeckOverflow(
-    containerRef,
-    gapRef,
-    `${tabIds.join("|")}#${activeTab ?? ""}`,
-  );
+  const layoutKey = `${tabIds.join("|")}#${activeTab ?? ""}`;
+  // Where the strip was scrolled when its tab set (or active tab) last
+  // changed — read before the overflow hook below swaps in the full-label
+  // layout to measure it, so the offset is the one the user actually set.
+  const settledScrollLeftRef = useRef(0);
+  useLayoutEffect(() => {
+    settledScrollLeftRef.current = containerRef.current?.scrollLeft ?? 0;
+  }, [layoutKey, containerRef]);
+  const { compact, edges } = useDeckOverflow(containerRef, gapRef, layoutKey);
   const mask = edgeMask(edges);
 
   // The active chip scrolls itself into view, but that runs against the
   // full-label layout the strip measures and discards (passive effects
   // flush before the collapse re-render), which leaves the compact strip
-  // sitting on a stale offset with its first icon under the fade. Re-seat
-  // from zero once the layout has settled.
+  // sitting on a stale offset with its first icon under the fade. Once the
+  // layout has settled, put back the offset captured above — so a strip
+  // the user had panned stays where it was after activating a tab — and
+  // then nudge the active chip into view if it is still clipped. On the
+  // first collapse that offset is zero, so the strip re-seats from the start.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    el.scrollLeft = 0;
+    el.scrollLeft = settledScrollLeftRef.current;
     el.querySelector<HTMLElement>(
       '[data-tab-id][data-state="active"]',
     )?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
