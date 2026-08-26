@@ -779,9 +779,19 @@ impl ClaudeSession {
         // state when the turn we interrupted is still the active one (the
         // notification hasn't landed yet); otherwise we would clobber the
         // freshly-dispatched turn and could double-dispatch.
+        //
+        // A Stop with NO active turn is the user cancelling a background
+        // wait: the `result` already cleared `active_turn` without emitting
+        // Ready (see the SdkMessage handler), and the frontend holds the
+        // turn open until something settles it. Announce Ready then too —
+        // but only while the session is still idle, so a turn dispatched
+        // meanwhile is never clobbered.
         {
             let mut state = self.state.lock().await;
-            if state.active_turn == active && active.is_some() {
+            let still_idle = active.is_none()
+                && state.active_turn.is_none()
+                && matches!(state.status, SessionStatus::Ready);
+            if (state.active_turn == active && active.is_some()) || still_idle {
                 state.active_turn = None;
                 state.status = SessionStatus::Ready;
                 // Announce Ready while holding the lock so subscribers
