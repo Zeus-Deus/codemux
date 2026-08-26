@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import {
   ChevronDown,
   FileCode,
@@ -27,6 +27,7 @@ import {
 } from "@/components/layout/titlebar-control-style";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
+import { useTabReorder, type PillReorderHandlers } from "@/lib/tab-reorder";
 import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { useAppStore } from "@/stores/app-store";
 import { activateTab, closeTab, reorderTabs } from "@/tauri/commands";
@@ -38,6 +39,8 @@ import type {
   TabSnapshot,
   WorkspaceSnapshot,
 } from "@/tauri/types";
+
+import { TabDropIndicator } from "./tab-drop-indicator";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -83,214 +86,6 @@ interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
 }
 
-// Movement (px) before a pointerdown on a pill turns into a reorder drag
-// instead of resolving as a plain click. Small enough to feel immediate,
-// large enough that a normal click/tap never misfires as a drag.
-const DRAG_THRESHOLD = 5;
-
-interface PillReorderHandlers {
-  "data-tab-id": string;
-  onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => void;
-  onClickCapture: (e: React.MouseEvent<HTMLDivElement>) => void;
-}
-
-/**
- * Pointer-based drag-to-reorder for the titlebar tab strip. HTML5 DnD (what
- * the legacy `TabBar` uses) is avoided on purpose: the titlebar's center is
- * a live `data-tauri-drag-region`, and stacking native HTML5 drag — which
- * Tauri/WebKit's own drag-region handling already interposes on — on top of
- * that is exactly the "not clean" combination the GUI-chrome doc flagged as
- * a follow-up. Pointer events don't interact with the OS drag region at all
- * and give full control over when a "drag" actually starts.
- *
- * Listeners for pointermove/up/cancel are attached to `document` (not the
- * pill itself) for the lifetime of one pointer session, so fast pointer
- * movement that outruns the small pill's bounds — which would otherwise
- * stop delivering events to a per-element listener — still gets tracked.
- * `setPointerCapture` isn't used: capturing on the pointerdown target would
- * retarget the browser's synthesized `click` to that same target too,
- * which would break the inner activate/close buttons ever receiving a
- * plain click.
- */
-function useTabReorder(workspace: WorkspaceSnapshot) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [dragTabId, setDragTabId] = useState<string | null>(null);
-  const [dropIndex, setDropIndexState] = useState<number | null>(null);
-
-  // Refs mirror state the pointer listeners need to read/write without
-  // forcing a hook re-subscription (workspace) or a render on every write
-  // that doesn't need one.
-  const dropIndexRef = useRef<number | null>(null);
-  const workspaceRef = useRef(workspace);
-  workspaceRef.current = workspace;
-
-  const pendingTabIdRef = useRef<string | null>(null);
-  const pointerIdRef = useRef<number | null>(null);
-  const startPosRef = useRef({ x: 0, y: 0 });
-  const draggingRef = useRef(false);
-  const suppressClickRef = useRef(false);
-  const cleanupRef = useRef<(() => void) | null>(null);
-
-  const setDropIndex = useCallback((v: number | null) => {
-    dropIndexRef.current = v;
-    setDropIndexState(v);
-  }, []);
-
-  const computeDropIndex = useCallback(
-    (clientX: number) => {
-      const el = containerRef.current;
-      if (!el) return;
-      const tabEls = el.querySelectorAll<HTMLElement>("[data-tab-id]");
-      if (tabEls.length === 0) return;
-
-      let closestIdx = 0;
-      let closestDist = Infinity;
-      let insertBefore = true;
-      tabEls.forEach((tabEl, i) => {
-        const rect = tabEl.getBoundingClientRect();
-        const midX = rect.left + rect.width / 2;
-        const dist = Math.abs(clientX - midX);
-        if (dist < closestDist) {
-          closestDist = dist;
-          closestIdx = i;
-          insertBefore = clientX < midX;
-        }
-      });
-      setDropIndex(insertBefore ? closestIdx : closestIdx + 1);
-    },
-    [setDropIndex],
-  );
-
-  const endSession = useCallback(
-    (commit: boolean) => {
-      cleanupRef.current?.();
-      cleanupRef.current = null;
-
-      const tabId = pendingTabIdRef.current;
-      const wasDragging = draggingRef.current;
-      const finalDropIndex = dropIndexRef.current;
-
-      pendingTabIdRef.current = null;
-      pointerIdRef.current = null;
-      draggingRef.current = false;
-      setDragTabId(null);
-      setDropIndex(null);
-
-      if (commit && wasDragging && tabId != null && finalDropIndex != null) {
-        const ws = workspaceRef.current;
-        const currentIds = ws.tabs.map((t) => t.tab_id);
-        const dragIdx = currentIds.indexOf(tabId);
-        if (dragIdx >= 0) {
-          const newIds = [...currentIds];
-          newIds.splice(dragIdx, 1);
-          const insertAt =
-            finalDropIndex > dragIdx ? finalDropIndex - 1 : finalDropIndex;
-          newIds.splice(Math.min(insertAt, newIds.length), 0, tabId);
-          if (newIds.join(",") !== currentIds.join(",")) {
-            reorderTabs(ws.workspace_id, newIds).catch(console.error);
-          }
-        }
-      }
-    },
-    [setDropIndex],
-  );
-
-  const handlePointerDown = useCallback(
-    (tabId: string) => (e: React.PointerEvent<HTMLDivElement>) => {
-      // Only the primary button/contact starts a reorder session, never one
-      // already in flight, and never from a close/chevron control
-      // explicitly opted out via `data-no-drag` — those need their plain
-      // click behavior preserved untouched.
-      if (e.button !== 0) return;
-      if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
-      if (pendingTabIdRef.current != null) return;
-
-      pendingTabIdRef.current = tabId;
-      pointerIdRef.current = e.pointerId;
-      startPosRef.current = { x: e.clientX, y: e.clientY };
-      draggingRef.current = false;
-
-      const handleMove = (ev: PointerEvent) => {
-        if (ev.pointerId !== pointerIdRef.current) return;
-        const dx = ev.clientX - startPosRef.current.x;
-        const dy = ev.clientY - startPosRef.current.y;
-        if (!draggingRef.current) {
-          if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
-          draggingRef.current = true;
-          setDragTabId(pendingTabIdRef.current);
-        }
-        ev.preventDefault();
-        computeDropIndex(ev.clientX);
-      };
-
-      const handleUp = (ev: PointerEvent) => {
-        if (ev.pointerId !== pointerIdRef.current) return;
-        if (draggingRef.current) suppressClickRef.current = true;
-        endSession(true);
-      };
-
-      const handleCancel = (ev: PointerEvent) => {
-        if (ev.pointerId !== pointerIdRef.current) return;
-        endSession(false);
-      };
-
-      document.addEventListener("pointermove", handleMove);
-      document.addEventListener("pointerup", handleUp);
-      document.addEventListener("pointercancel", handleCancel);
-      cleanupRef.current = () => {
-        document.removeEventListener("pointermove", handleMove);
-        document.removeEventListener("pointerup", handleUp);
-        document.removeEventListener("pointercancel", handleCancel);
-      };
-    },
-    [computeDropIndex, endSession],
-  );
-
-  // Belt-and-suspenders: drop any live document listeners if the strip
-  // unmounts mid-drag (e.g. workspace switch).
-  useEffect(() => () => cleanupRef.current?.(), []);
-
-  const getPillProps = useCallback(
-    (tabId: string): PillReorderHandlers => ({
-      "data-tab-id": tabId,
-      onPointerDown: handlePointerDown(tabId),
-      onClickCapture: (e: React.MouseEvent<HTMLDivElement>) => {
-        // Swallow the click synthesized after a real drag so it doesn't
-        // activate the tab (or, for the active chat tab, pop the history
-        // dropdown) as a side effect of the reorder gesture.
-        if (suppressClickRef.current) {
-          e.preventDefault();
-          e.stopPropagation();
-          suppressClickRef.current = false;
-        }
-      },
-    }),
-    [handlePointerDown],
-  );
-
-  // Drop-indicator screen position — a vertical mirror of TabBar's
-  // leading-dot + thin line. Converted into the strip's scrolled content
-  // coordinate space (`+ scrollLeft`) since the strip scrolls
-  // horizontally, unlike TabBar's non-scrolling list.
-  let dropIndicatorLeft: number | null = null;
-  if (dragTabId && dropIndex !== null && containerRef.current) {
-    const el = containerRef.current;
-    const tabEls = el.querySelectorAll<HTMLElement>("[data-tab-id]");
-    const listRect = el.getBoundingClientRect();
-    if (tabEls.length > 0) {
-      if (dropIndex >= tabEls.length) {
-        const lastRect = tabEls[tabEls.length - 1].getBoundingClientRect();
-        dropIndicatorLeft = lastRect.right - listRect.left + el.scrollLeft;
-      } else {
-        const targetRect = tabEls[dropIndex].getBoundingClientRect();
-        dropIndicatorLeft = targetRect.left - listRect.left + el.scrollLeft;
-      }
-    }
-  }
-
-  return { containerRef, dragTabId, dropIndicatorLeft, getPillProps };
-}
-
 /**
  * Workspace tabs merged into the title bar for GUI chrome. Each tab is a
  * compact pill; the active chat tab grows a chevron that opens the shared
@@ -298,7 +93,7 @@ function useTabReorder(workspace: WorkspaceSnapshot) {
  * inline pill here — it lives in the docked `SubagentActivityBar` above
  * the composer. Tabs stay backend-owned — activation/close/reorder go through
  * the existing commands. Reorder is a pointer-driven drag (see
- * `useTabReorder` below) rather than the legacy TabBar's HTML5 DnD.
+ * `@/lib/tab-reorder`) rather than the legacy TabBar's HTML5 DnD.
  */
 export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   const paneStatuses = useAppStore(
@@ -314,13 +109,25 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
     );
     if (!surface) continue;
     const ids = collectPaneIds(surface.root);
-    const statuses: (PaneStatus | undefined)[] = ids.map((id) => paneStatuses[id]);
+    const statuses: (PaneStatus | undefined)[] = ids.map(
+      (id) => paneStatuses[id],
+    );
     const highest = getHighestPriorityStatus(statuses);
     if (highest) tabStatusMap.set(tab.tab_id, highest);
   }
 
+  // Tabs stay backend-owned, so a drop hands the new order to the reorder
+  // command rather than a store. Shared with the right panel's pane deck —
+  // see `@/lib/tab-reorder`.
+  const tabIds = workspace.tabs.map((t) => t.tab_id);
+  const commitReorder = useCallback(
+    (ids: string[]) => {
+      reorderTabs(workspace.workspace_id, ids).catch(console.error);
+    },
+    [workspace.workspace_id],
+  );
   const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
-    useTabReorder(workspace);
+    useTabReorder<HTMLDivElement>(tabIds, commitReorder);
 
   // Let tabs scroll with a normal vertical mouse wheel once they overflow,
   // same fix as the preset bar: `overflow-x: auto` only responds to native
@@ -346,17 +153,8 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
       style={{ scrollbarWidth: "none" }}
       data-testid="titlebar-tabs-scroll"
     >
-      {/* Drop indicator — vertical mirror of the sidebar's leading-dot +
-          thin neutral line. No accent color, so it reads as a UI cue
-          rather than an alert. */}
       {dragTabId && dropIndicatorLeft !== null && (
-        <div
-          className="absolute inset-y-0.5 z-30 flex flex-col items-center pointer-events-none"
-          style={{ left: dropIndicatorLeft - 1, width: 2 }}
-        >
-          <div className="-mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-foreground/70" />
-          <div className="w-px flex-1 rounded-full bg-foreground/40" />
-        </div>
+        <TabDropIndicator left={dropIndicatorLeft} />
       )}
       {workspace.tabs.map((tab) => {
         const surface = tab.surface_id

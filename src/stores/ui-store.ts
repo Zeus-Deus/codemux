@@ -37,17 +37,13 @@ export const RIGHT_PANEL_EMPTY = "empty";
 /** What the Theme Studio should open on — one of its two tabs, or an
  *  existing custom theme to reopen. */
 export type ThemeStudioRequest =
-  | { mode: "generate" }
-  | { mode: "import" }
-  | { editThemeId: string };
+  { mode: "generate" } | { mode: "import" } | { editThemeId: string };
 
 /** A pane id in the right-panel deck. `doc:<absolute path>` panes are
  *  opened per file, so the id carries its own payload — that keeps the
  *  open-pane list a plain, persistable string array. */
 export type RightPanelTab =
-  | RightPanelCorePane
-  | `doc:${string}`
-  | typeof RIGHT_PANEL_EMPTY;
+  RightPanelCorePane | `doc:${string}` | typeof RIGHT_PANEL_EMPTY;
 
 /** The deck a workspace starts with. Matches the three panes that were
  *  always-present tabs before the deck existed, so an upgrade is a no-op
@@ -201,11 +197,22 @@ interface UIStore {
    *  availability auto-open for tasks/orchestration/subagents. */
   addRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
   closeRightPanelPane: (workspaceId: string, pane: RightPanelTab) => void;
+  /** Drag-to-reorder from the deck's tab strip. `order` is the strip's new
+   *  order — which may be only the *visible* subset of the open panes,
+   *  since availability-gated panes drop out of the strip while their
+   *  data is absent. Hidden panes keep their slots. */
+  reorderRightPanelPanes: (
+    workspaceId: string,
+    order: readonly RightPanelTab[],
+  ) => void;
   setRightPanelWidth: (width: number) => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
   toggleRightPanelMaximized: (workspaceId: string) => void;
-  setShowNewWorkspaceDialog: (show: boolean, projectDir?: string | null) => void;
+  setShowNewWorkspaceDialog: (
+    show: boolean,
+    projectDir?: string | null,
+  ) => void;
   setShowSettings: (show: boolean, section?: string | null) => void;
   /** Open Settings ▸ Presets and request creating a new preset. */
   requestNewPreset: () => void;
@@ -292,7 +299,8 @@ export const useUIStore = create<UIStore>()(
       expandProjectRequest: null,
       subagentEnterRequest: null,
 
-      getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
+      getRightPanelTab: (workspaceId) =>
+        get().rightPanelTabs[workspaceId] ?? null,
 
       setRightPanelTab: (workspaceId, tab) => {
         // Collapsing is its own action (it has a backend consequence, see
@@ -303,7 +311,8 @@ export const useUIStore = create<UIStore>()(
           return;
         }
         set((s) => {
-          const list = s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
+          const list =
+            s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
           // The picker sentinel is "open to whatever it was showing": a
           // collapsed panel comes back on the pane it was collapsed from,
           // provided that pane is still in the deck. It is a view state,
@@ -311,10 +320,14 @@ export const useUIStore = create<UIStore>()(
           if (tab === RIGHT_PANEL_EMPTY) {
             const last = s.rightPanelLastTabs[workspaceId];
             const restored =
-              s.rightPanelTabs[workspaceId] == null && last && list.includes(last)
+              s.rightPanelTabs[workspaceId] == null &&
+              last &&
+              list.includes(last)
                 ? last
                 : tab;
-            return { rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: restored } };
+            return {
+              rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: restored },
+            };
           }
           const tabs = { ...s.rightPanelTabs, [workspaceId]: tab };
           const dismissed = s.rightPanelDismissedPanes[workspaceId] ?? [];
@@ -370,7 +383,8 @@ export const useUIStore = create<UIStore>()(
 
       addRightPanelPane: (workspaceId, pane) =>
         set((s) => {
-          const list = s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
+          const list =
+            s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
           if (list.includes(pane)) return s;
           return {
             rightPanelPanes: {
@@ -387,7 +401,8 @@ export const useUIStore = create<UIStore>()(
       // titlebar is still the way to collapse.
       closeRightPanelPane: (workspaceId, pane) =>
         set((s) => {
-          const list = s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
+          const list =
+            s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
           const index = list.indexOf(pane);
           if (index === -1) return s;
           const next = list.filter((p) => p !== pane);
@@ -405,9 +420,25 @@ export const useUIStore = create<UIStore>()(
               ...s.rightPanelTabs,
               [workspaceId]:
                 active === pane
-                  ? (next[Math.min(index, next.length - 1)] ?? RIGHT_PANEL_EMPTY)
+                  ? (next[Math.min(index, next.length - 1)] ??
+                    RIGHT_PANEL_EMPTY)
                   : active,
             },
+          };
+        }),
+
+      reorderRightPanelPanes: (workspaceId, order) =>
+        set((s) => {
+          const list =
+            s.rightPanelPanes[workspaceId] ?? DEFAULT_RIGHT_PANEL_PANES;
+          const shown = new Set(order.filter((id) => list.includes(id)));
+          const queue = [...shown];
+          // Walk the current list and refill only the slots the strip
+          // showed, in the strip's new order; unknown ids are dropped.
+          const next = list.map((id) => (shown.has(id) ? queue.shift()! : id));
+          if (next.every((id, i) => id === list[i])) return s;
+          return {
+            rightPanelPanes: { ...s.rightPanelPanes, [workspaceId]: next },
           };
         }),
 
@@ -440,9 +471,16 @@ export const useUIStore = create<UIStore>()(
         }),
 
       setShowNewWorkspaceDialog: (show, projectDir = null) =>
-        set({ showNewWorkspaceDialog: show, newWorkspaceProjectDir: show ? (projectDir ?? null) : null }),
+        set({
+          showNewWorkspaceDialog: show,
+          newWorkspaceProjectDir: show ? (projectDir ?? null) : null,
+        }),
 
-      setShowSettings: (show, section = null) => set({ showSettings: show, settingsSection: show ? (section ?? null) : null }),
+      setShowSettings: (show, section = null) =>
+        set({
+          showSettings: show,
+          settingsSection: show ? (section ?? null) : null,
+        }),
       requestNewPreset: () =>
         set({
           showSettings: true,
@@ -451,9 +489,13 @@ export const useUIStore = create<UIStore>()(
         }),
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
       setShowAutomations: (show) => set({ showAutomations: show }),
-      setShowWorkspacesOverview: (show) => set({ showWorkspacesOverview: show }),
+      setShowWorkspacesOverview: (show) =>
+        set({ showWorkspacesOverview: show }),
       setShowPullRequests: (show, select = null) =>
-        set({ showPullRequests: show, pendingPrSelection: show ? select : null }),
+        set({
+          showPullRequests: show,
+          pendingPrSelection: show ? select : null,
+        }),
       clearPendingPrSelection: () => set({ pendingPrSelection: null }),
       markPrBadgeSeen: (keys) =>
         set((state) => ({
@@ -463,7 +505,10 @@ export const useUIStore = create<UIStore>()(
         set({ renameWorkspaceId: workspaceId }),
       closeRenameWorkspace: () => set({ renameWorkspaceId: null }),
       setShowFileSearch: (show, target = "editor") =>
-        set({ showFileSearch: show, fileSearchTarget: show ? target : "editor" }),
+        set({
+          showFileSearch: show,
+          fileSearchTarget: show ? target : "editor",
+        }),
       setShowContentSearch: (show) => set({ showContentSearch: show }),
 
       addPendingWorkspace: (pw) =>
@@ -477,7 +522,9 @@ export const useUIStore = create<UIStore>()(
       failPendingWorkspace: (id, error) =>
         set((s) => ({
           pendingWorkspaces: s.pendingWorkspaces.map((pw) =>
-            pw.id === id ? { ...pw, status: "failed" as const, errorMessage: error } : pw,
+            pw.id === id
+              ? { ...pw, status: "failed" as const, errorMessage: error }
+              : pw,
           ),
         })),
 
@@ -485,11 +532,15 @@ export const useUIStore = create<UIStore>()(
 
       setLastModelSelection: (family, selection) =>
         set((s) => ({
-          lastModelSelections: { ...s.lastModelSelections, [family]: selection },
+          lastModelSelections: {
+            ...s.lastModelSelections,
+            [family]: selection,
+          },
         })),
 
       setShowCommandPalette: (show) => set({ showCommandPalette: show }),
-      toggleCommandPalette: () => set((s) => ({ showCommandPalette: !s.showCommandPalette })),
+      toggleCommandPalette: () =>
+        set((s) => ({ showCommandPalette: !s.showCommandPalette })),
 
       // Deliberately does NOT close Settings. Settings is a full-screen
       // destination, so this used to have to leave it for the palette to
@@ -517,7 +568,10 @@ export const useUIStore = create<UIStore>()(
         set((s) =>
           dir === null
             ? { onboardingProjectDir: null, hasSeenOnboarding: true }
-            : { onboardingProjectDir: dir, hasSeenOnboarding: s.hasSeenOnboarding },
+            : {
+                onboardingProjectDir: dir,
+                hasSeenOnboarding: s.hasSeenOnboarding,
+              },
         ),
 
       setSidebarToggleFn: (fn) => set({ sidebarToggleFn: fn }),
@@ -562,7 +616,9 @@ export const useUIStore = create<UIStore>()(
       // it silently fall back to the default.
       migrate: (persistedState, version) => {
         if (version >= 1) return persistedState;
-        const state = persistedState as { rightPanelTabs?: Record<string, string | null> };
+        const state = persistedState as {
+          rightPanelTabs?: Record<string, string | null>;
+        };
         if (state?.rightPanelTabs) {
           const migrated: Record<string, string | null> = {};
           for (const [wsId, tab] of Object.entries(state.rightPanelTabs)) {

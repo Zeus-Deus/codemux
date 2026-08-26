@@ -62,7 +62,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
-import { ChangesPanel, type ChangesSectionFilter } from "@/components/workspace/changes-panel";
+import {
+  ChangesPanel,
+  type ChangesSectionFilter,
+} from "@/components/workspace/changes-panel";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import { ReviewPanel } from "@/components/workspace/review-panel";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
@@ -70,10 +73,7 @@ import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
-import {
-  isImageExtension,
-  isVideoExtension,
-} from "@/lib/editor-languages";
+import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
 import { maxRightPanelWidth } from "@/lib/right-panel-width";
 import { cn } from "@/lib/utils";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -162,18 +162,21 @@ function ReviewTabBadge({
   workspaceId: string;
   prNumber: number | null;
 }) {
-  const checksData = useQuery<CheckInfo[]>({
-    queryKey: ["pr", "checks", workspaceId, prNumber] as const,
-    enabled: false,
-  }).data ?? [];
-  const reviewsData = useQuery<ReviewComment[]>({
-    queryKey: ["pr", "reviews", workspaceId, prNumber] as const,
-    enabled: false,
-  }).data ?? [];
-  const inlineData = useQuery<InlineReviewComment[]>({
-    queryKey: ["pr", "inline", workspaceId, prNumber] as const,
-    enabled: false,
-  }).data ?? [];
+  const checksData =
+    useQuery<CheckInfo[]>({
+      queryKey: ["pr", "checks", workspaceId, prNumber] as const,
+      enabled: false,
+    }).data ?? [];
+  const reviewsData =
+    useQuery<ReviewComment[]>({
+      queryKey: ["pr", "reviews", workspaceId, prNumber] as const,
+      enabled: false,
+    }).data ?? [];
+  const inlineData =
+    useQuery<InlineReviewComment[]>({
+      queryKey: ["pr", "inline", workspaceId, prNumber] as const,
+      enabled: false,
+    }).data ?? [];
 
   const commentCount =
     reviewsData.length + inlineData.filter((c) => !c.in_reply_to_id).length;
@@ -182,7 +185,9 @@ function ReviewTabBadge({
   return (
     <>
       {commentCount > 0 && (
-        <span className="font-mono text-[9.5px] tabular-nums">{commentCount}</span>
+        <span className="font-mono text-[9.5px] tabular-nums">
+          {commentCount}
+        </span>
       )}
       {status === "pending" && (
         <Loader2 className="size-3 animate-spin text-status-working" />
@@ -213,7 +218,10 @@ const CHANGES_FILTER_LABEL: Record<ChangesSectionFilter, string> = {
 // #127: memo is effective because setAppState performs structural sharing — the
 // `workspace` snapshot keeps a stable ref across backend ticks that don't change
 // it, and `activeTab` is a primitive, so shallow compare skips re-renders.
-export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Props) {
+export const RightPanel = memo(function RightPanel({
+  workspace,
+  activeTab,
+}: Props) {
   const workspaceId = workspace.workspace_id;
   const cwd = workspace.worktree_path ?? workspace.cwd;
 
@@ -221,12 +229,15 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const addRightPanelPane = useUIStore((s) => s.addRightPanelPane);
   const closeRightPanelPane = useUIStore((s) => s.closeRightPanelPane);
+  const reorderRightPanelPanes = useUIStore((s) => s.reorderRightPanelPanes);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
   const rightPanelRowWidth = useUIStore((s) => s.rightPanelRowWidth);
   const storedPanes = useUIStore((s) => s.rightPanelPanes[workspaceId]);
-  const storedDismissed = useUIStore((s) => s.rightPanelDismissedPanes[workspaceId]);
+  const storedDismissed = useUIStore(
+    (s) => s.rightPanelDismissedPanes[workspaceId],
+  );
   const showHidden = useSyncedSettingsStore(selectShowHiddenFiles);
   const updateSetting = useSyncedSettingsStore((s) => s.updateSetting);
   const { getKeysForAction } = useResolvedKeybinds();
@@ -249,9 +260,13 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
     streaming: tasksThreadStreaming = false,
   } = useActiveChatTasks(workspace);
   const tasksSnapshot =
-    activeChatTasks && activeChatTasks.tasks.length > 0 ? activeChatTasks : null;
+    activeChatTasks && activeChatTasks.tasks.length > 0
+      ? activeChatTasks
+      : null;
   const messages = useAgentChatStore((s) =>
-    threadId ? (s.threads[threadId]?.messages ?? EMPTY_MESSAGES) : EMPTY_MESSAGES,
+    threadId
+      ? (s.threads[threadId]?.messages ?? EMPTY_MESSAGES)
+      : EMPTY_MESSAGES,
   );
   const contextUsage = useAgentChatStore((s) =>
     threadId ? (s.threads[threadId]?.contextUsage ?? null) : null,
@@ -265,7 +280,8 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
     workspaceWorkflow.run.status !== "pending_approval"
       ? workspaceWorkflow.run
       : null;
-  const workflowThreadId = workflowRun != null ? workspaceWorkflow.threadId : null;
+  const workflowThreadId =
+    workflowRun != null ? workspaceWorkflow.threadId : null;
 
   const subagentSummary = useMemo(() => {
     let groups = 0;
@@ -274,7 +290,8 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
       if (item.kind !== "subagent_run") continue;
       groups += 1;
       for (const view of item.subagents) {
-        if (view.status === "running" || view.status === "pending") running += 1;
+        if (view.status === "running" || view.status === "pending")
+          running += 1;
       }
     }
     return { groups, running };
@@ -382,7 +399,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         // hosting it: surfaced to the backend, invisible to the user. So
         // re-check the deck now and hand the session back if it moved on.
         const ui = useUIStore.getState();
-        const stillOpen = ui.getRightPanelPanes(workspaceId).includes("browser");
+        const stillOpen = ui
+          .getRightPanelPanes(workspaceId)
+          .includes("browser");
         const panelUp = ui.getRightPanelTab(workspaceId) !== null;
         if (stillOpen && panelUp) return;
         // Mirror the intent that raced us: closing the tab is an explicit
@@ -402,7 +421,8 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
 
   // ── Per-pane view state ──
   const [docViews, setDocViews] = useState<Record<string, DocViewState>>({});
-  const [changesFilter, setChangesFilter] = useState<ChangesSectionFilter>("all");
+  const [changesFilter, setChangesFilter] =
+    useState<ChangesSectionFilter>("all");
   const [treeRefreshKey, setTreeRefreshKey] = useState(0);
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
   const [copiedDoc, setCopiedDoc] = useState(false);
@@ -502,7 +522,13 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         remaining[Math.min(index, remaining.length - 1)] ?? RIGHT_PANEL_EMPTY,
       );
     },
-    [closeRightPanelPane, setRightPanelTab, workspaceId, activePane, visiblePanes],
+    [
+      closeRightPanelPane,
+      setRightPanelTab,
+      workspaceId,
+      activePane,
+      visiblePanes,
+    ],
   );
 
   const handleOpenTerminal = useCallback(() => {
@@ -525,7 +551,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   // has been measured the toggle still works — it just falls back to the
   // stored width so the first click can't snap the panel to a bogus size.
   const panelMaxWidth =
-    rightPanelRowWidth > 0 ? maxRightPanelWidth(rightPanelRowWidth) : rightPanelWidth;
+    rightPanelRowWidth > 0
+      ? maxRightPanelWidth(rightPanelRowWidth)
+      : rightPanelWidth;
   const expanded = rightPanelWidth >= panelMaxWidth;
   const handleToggleExpand = useCallback(() => {
     const next = expanded ? PANEL_DEFAULT_WIDTH : Math.round(panelMaxWidth);
@@ -543,8 +571,10 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   const handleCopyDoc = useCallback(() => {
     if (!activeDocPath) return;
     const content =
-      useEditorStore.getState().getTab(docEditorTabId(workspaceId, activeDocPath))
-        ?.baselineContent ?? "";
+      useEditorStore
+        .getState()
+        .getTab(docEditorTabId(workspaceId, activeDocPath))?.baselineContent ??
+      "";
     void navigator.clipboard
       ?.writeText(content)
       .then(() => {
@@ -573,7 +603,8 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
     switch (id) {
       case "changes":
         tab.testId = "changes-tab";
-        if (workspace.git_changed_files > 0) tab.badge = workspace.git_changed_files;
+        if (workspace.git_changed_files > 0)
+          tab.badge = workspace.git_changed_files;
         break;
       case "review":
         tab.testId = "review-tab";
@@ -589,7 +620,8 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
       case "tasks": {
         tab.testId = "tasks-tab";
         const done =
-          tasksSnapshot?.tasks.filter((t) => t.status === "completed").length ?? 0;
+          tasksSnapshot?.tasks.filter((t) => t.status === "completed").length ??
+          0;
         tab.badge = `${done}/${tasksSnapshot?.tasks.length ?? 0}`;
         tab.accentBadgeWhenActive = true;
         break;
@@ -752,7 +784,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         actions = (
           <>
             <PaneActionButton
-              label={diffTab?.layout === "unified" ? "Split view" : "Unified view"}
+              label={
+                diffTab?.layout === "unified" ? "Split view" : "Unified view"
+              }
               icon={diffTab?.layout === "unified" ? Columns2 : AlignJustify}
               onClick={() =>
                 diffSetLayout(
@@ -780,7 +814,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         ) : null;
         break;
       case "tasks":
-        actions = tasksSnapshot ? <TasksPaneActions snapshot={tasksSnapshot} /> : null;
+        actions = tasksSnapshot ? (
+          <TasksPaneActions snapshot={tasksSnapshot} />
+        ) : null;
         break;
     }
   }
@@ -805,7 +841,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
     },
     review: { prNumber: workspace.pr_number, state: workspace.pr_state },
     diff: {
-      filePath: diffTab?.filePath ? relativeToRoot(diffTab.filePath, cwd) : null,
+      filePath: diffTab?.filePath
+        ? relativeToRoot(diffTab.filePath, cwd)
+        : null,
     },
     browser: browserOpen
       ? {
@@ -824,6 +862,7 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         activeTab={activePane}
         onSelect={(id) => setRightPanelTab(workspaceId, id)}
         onClose={handleClose}
+        onReorder={(ids) => reorderRightPanelPanes(workspaceId, ids)}
         actions={actions}
         surfaces={surfaces}
         onOpenFile={handleOpenFile}
@@ -887,7 +926,9 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
       <PaneStatusFoot
         status={statusLine}
         tokens={
-          contextUsage?.total_processed_tokens ?? contextUsage?.used_tokens ?? null
+          contextUsage?.total_processed_tokens ??
+          contextUsage?.used_tokens ??
+          null
         }
       />
     </div>

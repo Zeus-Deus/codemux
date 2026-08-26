@@ -250,9 +250,7 @@ describe("ui-store — onboarding state", () => {
 
     it("still refuses a width below the panel minimum", () => {
       useUIStore.getState().setRightPanelWidth(10);
-      expect(useUIStore.getState().rightPanelWidth).toBe(
-        RIGHT_PANEL_MIN_WIDTH,
-      );
+      expect(useUIStore.getState().rightPanelWidth).toBe(RIGHT_PANEL_MIN_WIDTH);
     });
 
     it("does not persist the measured row width", () => {
@@ -359,7 +357,9 @@ describe("ui-store — the empty-panel sentinel", () => {
   });
 
   it("reopens on the pane the panel was collapsed from", () => {
-    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "diff", "review"] } });
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", "diff", "review"] },
+    });
     useUIStore.getState().setRightPanelTab("ws-1", "review");
     useUIStore.getState().collapseRightPanel("ws-1");
 
@@ -392,6 +392,47 @@ describe("ui-store — the empty-panel sentinel", () => {
     expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe(
       RIGHT_PANEL_EMPTY,
     );
+  });
+});
+
+describe("ui-store — reorderRightPanelPanes", () => {
+  it("applies the strip's new order", () => {
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", "changes", "review"] },
+    });
+    useUIStore
+      .getState()
+      .reorderRightPanelPanes("ws-1", ["review", "files", "changes"]);
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual([
+      "review",
+      "files",
+      "changes",
+    ]);
+  });
+
+  it("keeps panes the strip is not showing in their slots", () => {
+    // `tasks` is availability-gated: open in the deck, absent from the
+    // strip while the thread has no tasks. A drag among the visible tabs
+    // must not move it.
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["files", "tasks", "changes", "review"] },
+    });
+    useUIStore
+      .getState()
+      .reorderRightPanelPanes("ws-1", ["review", "changes", "files"]);
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual([
+      "review",
+      "tasks",
+      "changes",
+      "files",
+    ]);
+  });
+
+  it("is a no-op for an unchanged order", () => {
+    useUIStore.setState({ rightPanelPanes: { "ws-1": ["files", "changes"] } });
+    const before = useUIStore.getState().rightPanelPanes;
+    useUIStore.getState().reorderRightPanelPanes("ws-1", ["files", "changes"]);
+    expect(useUIStore.getState().rightPanelPanes).toBe(before);
   });
 });
 
