@@ -2627,3 +2627,263 @@ describe("context-window usage", () => {
     });
   });
 });
+
+describe("agent-chat reducer — interim turn ends (provider yields on background work)", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const running = (): ProviderRuntimeEvent => ({
+    type: "session_state_changed",
+    thread_id: "t1",
+    status: { status: "running", active_turn: "turn-1" },
+  });
+  const completed = (
+    status: { kind: "success" } | { kind: "error"; subtype: string; message: string } = {
+      kind: "success",
+    },
+  ): ProviderRuntimeEvent => ({
+    type: "turn_completed",
+    thread_id: "t1",
+    turn_id: "turn-1",
+    status,
+    usage: null,
+  });
+  const text = (t: string): ProviderRuntimeEvent => ({
+    type: "item_completed",
+    thread_id: "t1",
+    turn_id: "turn-1",
+    item: { kind: "assistant_text", text: t },
+  });
+  const subagent = (snap: Record<string, unknown>): ProviderRuntimeEvent =>
+    ({
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: snap,
+    }) as unknown as ProviderRuntimeEvent;
+  const turnEnds = (state: ChatThreadState) =>
+    state.messages.filter((m) => m.kind === "turn_ended");
+
+  it("reopens a successful boundary when parent output resumes without a new prompt", () => {
+    let state = runEvents([running(), text("Waiting on the report…"), completed()]);
+    expect(state.streaming).toBe(false);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+
+    // Task notifications woke the model: a completed item lands in the
+    // same session with no user message in between.
+    state = applyEvent(state, text("The report is in."));
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)).toHaveLength(1);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("reopens on a resumed thinking delta, walking back over the waking task snapshots", () => {
+    let state = runEvents([
+      running(),
+      completed(),
+      // The notifications that woke the model arrive right after the result.
+      subagent({ subagent_id: "bg", status: "completed", background_task: true }),
+    ]);
+    expect(state.streaming).toBe(false);
+    state = applyEvent(state, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "thinking", text: "Both reports are in." },
+    });
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("holds the turn open on a success reported while a delegated subagent still runs", () => {
+    const state = runEvents([
+      running(),
+      subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+      completed(),
+    ]);
+    expect(state.streaming).toBe(true);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+  });
+
+  it("does NOT hold the turn open on background shell jobs or watch loops", () => {
+    const state = runEvents([
+      running(),
+      subagent({ subagent_id: "dev", status: "running", background_task: true }),
+      subagent({ subagent_id: "ci", status: "running", task_kind: "monitor" }),
+      completed(),
+    ]);
+    expect(state.streaming).toBe(false);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+  });
+
+  it("never reopens an error boundary (a stopped turn stays stopped)", () => {
+    let state = runEvents([
+      running(),
+      completed({ kind: "error", subtype: "interrupted", message: "stopped" }),
+    ]);
+    state = applyEvent(state, text("late output"));
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+    expect(state.streaming).toBe(false);
+  });
+
+  it("leaves the previous turn settled once a new prompt has been sent", () => {
+    let state = runEvents([running(), text("done"), completed()]);
+    state = appendUserMessage(state, "follow-up");
+    state = applyEvent(state, text("answer to the follow-up"));
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+  });
+
+  it("the next non-interim completion settles the whole turn", () => {
+    let state = runEvents([running(), completed(), text("resumed")]);
+    expect(state.streaming).toBe(true);
+    state = applyEvent(state, completed());
+    expect(state.streaming).toBe(false);
+    const ends = turnEnds(state);
+    expect(ends).toHaveLength(2);
+    expect(ends[0]).toMatchObject({ interim: true });
+    expect(ends[1]).not.toHaveProperty("interim");
+  });
+
+  it("ignores a stale running subagent row from an earlier prompt", () => {
+    // An old turn leaked a `running` row (sidecar restart / resume, an
+    // unresolvable task notification) that no terminal snapshot will ever
+    // settle: here a late `running` snapshot revives the row the new
+    // prompt had already interrupted, in place, in the earlier segment.
+    // Only the current prompt's own work may hold a turn open.
+    let state = runEvents([
+      running(),
+      text("spawning"),
+      completed(),
+      subagent({ subagent_id: "stale", name: "Old", status: "running" }),
+    ]);
+    state = appendUserMessage(state, "next question");
+    state = applyEvent(
+      state,
+      subagent({ subagent_id: "stale", status: "running" }),
+    );
+    const staleCard = state.messages.find((m) => m.kind === "subagent_run");
+    expect(staleCard?.kind === "subagent_run" && staleCard.subagents[0]).toMatchObject({
+      status: "running",
+    });
+    expect(state.messages.indexOf(staleCard!)).toBeLessThan(
+      state.messages.findIndex((m) => m.kind === "user_message"),
+    );
+    state = runEvents(
+      [
+        {
+          type: "session_state_changed",
+          thread_id: "t1",
+          status: { status: "running", active_turn: "turn-2" },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-2",
+          item: { kind: "assistant_text", text: "plain answer" },
+        },
+        {
+          type: "turn_completed",
+          thread_id: "t1",
+          turn_id: "turn-2",
+          status: { kind: "success" },
+          usage: null,
+        },
+      ],
+      state,
+    );
+    const ends = turnEnds(state);
+    expect(ends).toHaveLength(2);
+    expect(ends[1]).not.toHaveProperty("interim");
+    expect(state.streaming).toBe(false);
+  });
+
+  it("a new prompt during the hold settles the interim boundary and its leftover rows", () => {
+    let state = runEvents([
+      running(),
+      subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+      completed(),
+    ]);
+    expect(turnEnds(state)[0]).toMatchObject({ interim: true });
+    expect(state.streaming).toBe(true);
+
+    // The provider has no active turn, so the backend dispatches this
+    // immediately: the previous turn ended at that boundary after all.
+    state = appendUserMessage(state, "new prompt");
+    expect(turnEnds(state)).toHaveLength(1);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+    const card = state.messages.find((m) => m.kind === "subagent_run");
+    expect(card?.kind === "subagent_run" && card.subagents[0]).toMatchObject({
+      status: "interrupted",
+      statusAssumed: true,
+    });
+  });
+
+  it("a resume that opens with a tool call flips streaming after a cold hydrate", () => {
+    // Hydrated mid-wait: the trailing marker is interim but the persisted
+    // thread state does not carry `streaming`.
+    const state = runEvents([
+      running(),
+      subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+      completed(),
+    ]);
+    const hydrated: ChatThreadState = { ...state, streaming: false };
+    expect(turnEnds(hydrated)[0]).toMatchObject({ interim: true });
+
+    const afterTool = applyEvent(hydrated, {
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      item: {
+        kind: "tool_use",
+        tool_use_id: "tu-1",
+        tool_name: "Read",
+        input: { path: "report.md" },
+      },
+    });
+    expect(afterTool.streaming).toBe(true);
+    expect(turnEnds(afterTool)[0]).toMatchObject({ interim: true });
+
+    // The streamed tool input that precedes the completed tool_use is
+    // enough on its own, even though it renders nothing.
+    const afterDelta = applyEvent(hydrated, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "tool_input", tool_name: "Read", partial_json: "{" },
+    });
+    expect(afterDelta.streaming).toBe(true);
+  });
+
+  it("session ready during the hold settles the interim boundary", () => {
+    let state = runEvents([
+      running(),
+      subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+      completed(),
+    ]);
+    expect(state.streaming).toBe(true);
+    state = applyEvent(state, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "ready" },
+    });
+    expect(state.streaming).toBe(false);
+    expect(turnEnds(state)[0]).not.toHaveProperty("interim");
+
+    // Also when `streaming` was already false (a cold hydrate mid-wait).
+    const hydrated: ChatThreadState = {
+      ...runEvents([
+        running(),
+        subagent({ subagent_id: "catalog", name: "Report", status: "running" }),
+        completed(),
+      ]),
+      streaming: false,
+    };
+    const settled = applyEvent(hydrated, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "ready" },
+    });
+    expect(settled).not.toBe(hydrated);
+    expect(turnEnds(settled)[0]).not.toHaveProperty("interim");
+  });
+});

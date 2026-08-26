@@ -2149,6 +2149,166 @@ function streamMockSubagents(
   return turnId;
 }
 
+/** Background-wait lifecycle, replayed from a real transcript: the agent
+ *  launches a delegated subagent plus a background shell job, yields with
+ *  "waiting on…" prose, and the provider emits a SUCCESSFUL `turn_completed`
+ *  even though the session is still alive. Moments later the task
+ *  notifications land, the model resumes in the SAME session (no new user
+ *  prompt) and runs a long tool call before the real end. Drives the
+ *  interim-turn-end handling in the reducer / transcript slots.
+ *  `window.__codemuxChatMock.streamBackgroundWait()` triggers it on demand.
+ *
+ *  `holdMs` is how long the resumed Bash stays running before the turn
+ *  truly finishes — long enough to screenshot the "resumed" state. */
+function streamMockBackgroundWait(
+  threadId: string = MOCK_CHAT_THREAD_ID,
+  opts: { intervalMs?: number; holdMs?: number } = {},
+): string {
+  const turnId = `live-bgwait-${++mockChatTurnSeq}`;
+  const intervalMs = Math.max(60, opts.intervalMs ?? 450);
+  const holdMs = Math.max(1_000, opts.holdMs ?? 45_000);
+  const send = (event: unknown) => emitChatEvent(threadId, event);
+  const snap = (subagent: Record<string, unknown>) =>
+    send({ type: "subagent_updated", thread_id: threadId, subagent });
+  const item = (it: Record<string, unknown>) =>
+    send({ type: "item_completed", thread_id: threadId, turn_id: turnId, item: it });
+  const toolUse = (id: string, toolName: string, input: Record<string, unknown>) =>
+    item({ kind: "tool_use", tool_name: toolName, tool_use_id: id, input });
+  const toolResult = (id: string, content: string) =>
+    item({ kind: "tool_result", tool_use_id: id, content, is_error: false });
+
+  chatActiveTurns.add(threadId);
+  const frames: Array<() => void> = [
+    () =>
+      send({
+        type: "session_state_changed",
+        thread_id: threadId,
+        status: { status: "running", active_turn: turnId },
+      }),
+    () =>
+      item({
+        kind: "assistant_thinking",
+        text: "Build the isolated container first, then fan out the catalog report while npm ci runs.",
+      }),
+    () => toolUse(`${turnId}-t0`, "Bash", { command: "docker build -t hermes-e2e -f Dockerfile.e2e ." }),
+    () => toolResult(`${turnId}-t0`, "Successfully tagged hermes-e2e:latest"),
+    () =>
+      toolUse(`${turnId}-t1`, "Agent", {
+        description: "Model-catalog report",
+        prompt: "Read the provider catalog and report which models are missing.",
+      }),
+    () =>
+      snap({
+        subagent_id: "catalog",
+        name: "Model-catalog report",
+        agent_type: "general-purpose",
+        model: "sonnet · high",
+        status: "running",
+        parent_item_id: `${turnId}-t1`,
+      }),
+    () =>
+      toolUse(`${turnId}-t2`, "Bash", {
+        command: "docker run --rm hermes-e2e npm ci",
+        run_in_background: true,
+      }),
+    () => toolResult(`${turnId}-t2`, "Command running in background with ID: bg-npm-ci"),
+    () =>
+      snap({
+        subagent_id: "bg-npm-ci",
+        name: "npm ci (Docker)",
+        status: "running",
+        background_task: true,
+        parent_item_id: `${turnId}-t2`,
+      }),
+    () =>
+      item({
+        kind: "assistant_text",
+        text: "Waiting on the model-catalog report and the Docker `npm ci` — both still in flight.",
+      }),
+    // The provider's main loop yields here: a SUCCESSFUL result lands even
+    // though the session keeps going.
+    () =>
+      send({
+        type: "turn_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      }),
+    // Nothing happens for a while: the model is parked until a task
+    // notification arrives. This is the window that used to read as done.
+    () => undefined,
+    () => undefined,
+    () => undefined,
+    () => undefined,
+    () => undefined,
+    () => undefined,
+    () =>
+      snap({
+        subagent_id: "catalog",
+        status: "completed",
+        result_text: "3 models missing from the catalog · report attached",
+        tool_use_count: 6,
+        duration_ms: 9_000,
+      }),
+    // The adapter surfaces the spawn's tool_result only once the task's
+    // terminal notification lands.
+    () => toolResult(`${turnId}-t1`, "3 models missing from the catalog · report attached"),
+    () =>
+      snap({
+        subagent_id: "bg-npm-ci",
+        status: "completed",
+        background_task: true,
+        result_text: "added 812 packages in 41s",
+      }),
+    // Task notifications woke the model: it resumes in the same session.
+    () =>
+      item({
+        kind: "assistant_thinking",
+        text: "Both reports are in. Run the end-to-end suite inside the container now.",
+      }),
+    () =>
+      toolUse(`${turnId}-t3`, "Bash", {
+        command: "docker run --rm hermes-e2e npm test -- --runInBand",
+      }),
+  ];
+
+  let i = 0;
+  const timer = window.setInterval(() => {
+    const frame = frames[i++];
+    if (frame) frame();
+    if (i < frames.length) return;
+    window.clearInterval(timer);
+    chatTurnTimers.delete(threadId);
+    // The resumed tool call runs for a while, then the turn really ends.
+    const hold = window.setTimeout(() => {
+      chatTurnTimers.delete(threadId);
+      toolResult(`${turnId}-t3`, "Tests: 48 passed, 48 total\nTime: 38.2s");
+      item({
+        kind: "assistant_text",
+        text: "End-to-end suite passes inside the isolated container — the fix is verified.",
+      });
+      send({
+        type: "turn_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      });
+      send({
+        type: "session_state_changed",
+        thread_id: threadId,
+        status: { status: "ready" },
+      });
+      chatActiveTurns.delete(threadId);
+      drainChatQueue(threadId);
+    }, holdMs);
+    chatTurnTimers.set(threadId, hold);
+  }, intervalMs);
+  chatTurnTimers.set(threadId, timer);
+  return turnId;
+}
+
 /** Dead-run detection QA (issue #154): fire a `run_stalled` on a thread,
  *  first flipping it to `streaming` so the amber "no activity" tail notice
  *  renders (the notice only shows mid-turn). */
@@ -2249,6 +2409,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       threadId: string;
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
+      streamBackgroundWait: typeof streamMockBackgroundWait;
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
       sessionError: typeof sessionErrorMockRun;
@@ -2259,6 +2420,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
+  streamBackgroundWait: streamMockBackgroundWait,
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
   sessionError: sessionErrorMockRun,
@@ -3280,7 +3442,11 @@ const handlers: Record<string, Handler> = {
       });
       return { turn_id: "", queued_id: queuedId };
     }
-    const turnId = streamMockChatReply(threadId);
+    // A prompt mentioning background work replays the yield-and-resume
+    // lifecycle (interim turn ends) instead of the plain streaming reply.
+    const turnId = /\bbackground\b/i.test(input.text)
+      ? streamMockBackgroundWait(threadId)
+      : streamMockChatReply(threadId);
     return { turn_id: turnId, queued_id: null };
   },
   agent_chat_cancel_queued_turn: (a) => {

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
+import { countRunningSubagents } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 
 import { formatActivityDuration } from "./activity-steps";
@@ -70,20 +71,30 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
 
 /** Status line derived from the transcript tail. Running tool → "Running
  *  <tool>…", streaming prose → "Writing…", streaming reasoning →
- *  "Thinking…", otherwise the neutral "Working…". */
+ *  "Thinking…". A settled tail while background tasks (delegated
+ *  subagents or background shell jobs) are still running is the agent
+ *  waiting on them → "Waiting on N background tasks…"; otherwise the
+ *  neutral "Working…". */
 export function deriveStreamingLabel(messages: ChatViewItem[]): string {
   const last = messages[messages.length - 1];
   if (!last) return "Working…";
   switch (last.kind) {
     case "tool_call":
-      return last.status === "running" ? `Running ${last.tool_name}…` : "Working…";
+      if (last.status === "running") return `Running ${last.tool_name}…`;
+      break;
     case "assistant_message":
-      return last.streaming ? "Writing…" : "Working…";
+      if (last.streaming) return "Writing…";
+      break;
     case "reasoning":
-      return last.streaming ? "Thinking…" : "Working…";
+      if (last.streaming) return "Thinking…";
+      break;
     default:
-      return "Working…";
+      break;
   }
+  const waiting = countRunningSubagents(messages, true);
+  if (waiting === 1) return "Waiting on a background task…";
+  if (waiting > 1) return `Waiting on ${waiting} background tasks…`;
+  return "Working…";
 }
 
 /**

@@ -11,6 +11,8 @@ import type {
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 import {
   interruptRunningSubagents,
+  isMonitorTask,
+  isRunning,
   mergeSnapshot,
   newSubagentView,
   settleSubagentsForToolResult,
@@ -26,6 +28,7 @@ import {
   type SubagentRunItem,
   type SubagentView,
   type ToolCallItem,
+  type TurnEndedItem,
   type UserMessageImage,
   type UserMessageItem,
   type WorkflowPhaseView,
@@ -913,6 +916,85 @@ function routeSubagentItem(
 
 /** Best-effort current turn id from the trailing turn-bearing item, so a
  *  freshly-opened card records which turn spawned it. */
+/** Delegated agent work still running in the CURRENT prompt's segment — a
+ *  real launch that is running or pending, spawned after the last
+ *  dispatched user message. Earlier segments are deliberately out of
+ *  scope: a stale `running` row leaked by an old turn (sidecar restart /
+ *  resume, an unresolvable task notification) must not pin every later
+ *  completion as interim. Background shell jobs and watch loops are
+ *  excluded on purpose: either can outlive the turn indefinitely without a
+ *  terminal snapshot, so holding the turn open on them would pin the thread
+ *  at "working" forever (the issue-#153 shape). Mirrors the backend's
+ *  pane-status rule so the sidebar and the thread settle together. */
+function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "user_message") {
+      if (!item.queued) return false;
+      continue;
+    }
+    if (item.kind !== "subagent_run") continue;
+    for (const sub of item.subagents) {
+      if (isRunning(sub) && !sub.backgroundTask && !isMonitorTask(sub)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Index of the `turn_ended` marker that is the current prompt's most
+ *  recent boundary, or -1 when the trailing rendered row is something
+ *  else. The walk skips subagent snapshots (the task notifications that
+ *  wake the model) and queued bubbles, and stops at the first rendered
+ *  row, so it stays O(1) per event. */
+function trailingTurnEndIndex(messages: ChatViewItem[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "subagent_run") continue;
+    if (item.kind === "user_message" && item.queued) continue;
+    return item.kind === "turn_ended" ? i : -1;
+  }
+  return -1;
+}
+
+/** Parent-scoped output just landed. If the most recent boundary of the
+ *  current prompt is a successful `turn_ended` with no output after it, the
+ *  provider had only yielded to wait on background work and has now resumed
+ *  the SAME turn — flag that boundary `interim` so the transcript stops
+ *  presenting the turn as finished. Output already past the marker means it
+ *  was reopened when that output arrived. `interim` reports whether the
+ *  trailing boundary is interim after the call (newly or already), so
+ *  callers can flip `streaming` back on even when nothing changed — a cold
+ *  hydrate during the wait lands with `streaming: false`. */
+function reopenInterimTurnEnd(messages: ChatViewItem[]): {
+  messages: ChatViewItem[];
+  interim: boolean;
+} {
+  const i = trailingTurnEndIndex(messages);
+  if (i < 0) return { messages, interim: false };
+  const item = messages[i] as TurnEndedItem;
+  if (item.interim) return { messages, interim: true };
+  if (item.status.kind !== "success") return { messages, interim: false };
+  return {
+    messages: replaceItem(messages, i, { ...item, interim: true }),
+    interim: true,
+  };
+}
+
+/** The wait is over with no further completion coming for it (a new
+ *  prompt dispatched, or the session went `ready`): an interim trailing
+ *  boundary was the turn's real end in hindsight, so drop the flag and let
+ *  the turn fold. Returns the SAME array when there is nothing to settle. */
+function settleInterimTurnEnd(messages: ChatViewItem[]): ChatViewItem[] {
+  const i = trailingTurnEndIndex(messages);
+  if (i < 0) return messages;
+  const item = messages[i];
+  if (item.kind !== "turn_ended" || !item.interim) return messages;
+  const { interim: _dropped, ...rest } = item;
+  return replaceItem(messages, i, rest);
+}
+
 function trailingTurnId(messages: ChatViewItem[]): string | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -981,14 +1063,17 @@ function appendUserMessageLocal(
   // #153): interrupt any leftover running subagents and stop any leftover
   // running workflow from a PRIOR turn so they don't spin under the new
   // turn. When STREAMING (this is a queued follow-up parked behind an
-  // active turn) leave them alone — that turn is still live. On hydrate
+  // active turn) leave them alone — that turn is still live. The exception
+  // is an interim hold: the provider has no active turn (it yielded on
+  // background work), so the backend dispatches this prompt immediately —
+  // the prior turn is settled in hindsight, its boundary loses `interim`
+  // so it can fold, and its leftover rows are cleaned up too. On hydrate
   // replay this also runs for each persisted user_message and self-
   // corrects: a later replayed `running` snapshot revives, a later
   // terminal snapshot wins by rank.
-  if (!state.streaming) {
-    const settled = interruptRunningSubagents(
-      stopRunningWorkflows(sealed.messages),
-    );
+  const afterHold = settleInterimTurnEnd(sealed.messages);
+  if (!state.streaming || afterHold !== sealed.messages) {
+    const settled = interruptRunningSubagents(stopRunningWorkflows(afterHold));
     if (settled !== sealed.messages) sealed = { ...sealed, messages: settled };
   }
   const { seq, next } = takeSeq(sealed);
@@ -1262,8 +1347,13 @@ function applyEventInner(
         return { ...state, streaming: true, interrupted: false };
       }
       if (status.status === "ready") {
-        if (!state.streaming) return state;
-        return { ...state, streaming: false };
+        // Idle with nothing more coming: an interim trailing boundary was
+        // the turn's real end (a Stop during a background wait, or a
+        // provider that reports `ready` after its completion), so let it
+        // fold. Settle even when `streaming` is already false.
+        const settled = settleInterimTurnEnd(state.messages);
+        if (!state.streaming && settled === state.messages) return state;
+        return { ...state, streaming: false, messages: settled };
       }
       if (status.status === "closed" || status.status === "error") {
         // Session teardown is a hard boundary with no further terminal
@@ -1349,14 +1439,24 @@ function applyEventInner(
         );
       }
       if (delta.kind === "tool_input") {
-        // tool_input deltas are not rendered in the transcript.
-        return state;
+        // tool_input deltas are not rendered in the transcript, but they
+        // are still parent output: a resume that opens with a tool call
+        // must reopen a yielded boundary and flip the turn live again.
+        const reopened = reopenInterimTurnEnd(state.messages);
+        if (!reopened.interim) return state;
+        if (reopened.messages === state.messages && state.streaming) {
+          return state;
+        }
+        return { ...state, streaming: true, messages: reopened.messages };
       }
       // text / thinking deltas render into the parent transcript through
       // the shared builder (seal-on-boundary + tail-merge discipline);
       // both mark the turn as streaming.
       const ctx = applyContentDeltaToList(
-        { messages: state.messages, nextSeq: state.nextSeq },
+        {
+          messages: reopenInterimTurnEnd(state.messages).messages,
+          nextSeq: state.nextSeq,
+        },
         delta,
         event.turn_id,
         now,
@@ -1385,8 +1485,11 @@ function applyEventInner(
           now,
         );
       }
+      // Parent output after a successful boundary means the provider had
+      // only yielded to wait on background work: the turn is live again.
+      const reopened = reopenInterimTurnEnd(state.messages);
       const ctx = applyCompletedItemToList(
-        { messages: state.messages, nextSeq: state.nextSeq },
+        { messages: reopened.messages, nextSeq: state.nextSeq },
         item,
         event.turn_id,
         now,
@@ -1412,10 +1515,22 @@ function applyEventInner(
           item.is_error,
         );
       }
-      if (messages === state.messages && ctx.nextSeq === state.nextSeq) {
+      // A reopened (or still-interim) turn is streaming again even before
+      // the next delta — including after a cold hydrate during the wait.
+      const streaming = reopened.interim || state.streaming;
+      if (
+        messages === state.messages &&
+        ctx.nextSeq === state.nextSeq &&
+        streaming === state.streaming
+      ) {
         return state;
       }
-      return { ...state, messages, nextSeq: ctx.nextSeq };
+      return {
+        ...state,
+        streaming,
+        messages,
+        nextSeq: ctx.nextSeq,
+      };
     }
 
     case "subagent_updated": {
@@ -1489,10 +1604,25 @@ function applyEventInner(
       // only synthesizes while `active_turn` is still set, which the result
       // message clears), so clearing here — live AND on hydrate replay — keeps
       // a genuinely-finished run from being mislabelled "Run interrupted".
+      //
+      // A success reported while delegated agent work is still running is
+      // the provider's main loop *yielding*, not the turn ending — Claude
+      // Code emits a `result` whenever it has nothing left to do but wait
+      // on a background task, then resumes the same session when the task
+      // notification lands. Keep the turn live and record the boundary as
+      // interim; the final settle arrives with the next non-interim
+      // completion, a session `ready` (Stop during the wait, or a provider
+      // that reports ready after completing), or the next prompt. Only
+      // work spawned in the current prompt's segment counts, and background
+      // shell jobs and watch loops deliberately do NOT hold the turn open
+      // (see `hasLiveDelegatedWork`); if the model resumes after one of
+      // those the boundary is reopened in hindsight by the first parent
+      // output.
+      const interim = hasLiveDelegatedWork(messages);
       const { seq, next: seqBumped } = takeSeq({ ...state, messages });
       return {
         ...seqBumped,
-        streaming: false,
+        streaming: interim,
         interrupted: false,
         messages: [
           ...seqBumped.messages,
@@ -1503,6 +1633,7 @@ function applyEventInner(
             turn_id: event.turn_id,
             status: event.status,
             completed_at: now(),
+            ...(interim ? { interim: true } : {}),
           },
         ],
       };

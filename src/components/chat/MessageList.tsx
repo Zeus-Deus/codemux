@@ -81,6 +81,7 @@ import {
   buildTranscriptSlots,
   reuseTranscriptSlots,
   type ActivityStep,
+  type SlotBody,
   type TranscriptSlot,
 } from "./transcript-slots";
 
@@ -332,6 +333,23 @@ export const MessageList = memo(function MessageList({
   const tailIsWorkingActivity =
     tailBody?.kind === "activity" && tailBody.working;
   const tailIsSubagentStretch = tailBody?.kind === "subagent_stretch";
+  // `shouldShowThinkingIndicator` steps back for a running tool / streaming
+  // block on the assumption that the row renders its own live affordance.
+  // That assumption fails when the row is not on screen at all — folded
+  // into a settled turn, or dropped as a quiet observational read — and
+  // the thread would show nothing live while the agent is mid-command.
+  // Reinstate the marker whenever the live tail item is invisible.
+  const tailItem = ordered.length > 0 ? ordered[ordered.length - 1] : null;
+  const tailItemIsLive =
+    tailItem != null &&
+    ((tailItem.kind === "tool_call" && tailItem.status === "running") ||
+      (tailItem.kind === "reasoning" && tailItem.streaming) ||
+      (tailItem.kind === "assistant_message" && tailItem.streaming));
+  const tailItemVisible =
+    tailItem != null && tailBody != null && slotBodyContains(tailBody, tailItem.id);
+  const showLiveMarker =
+    (showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
+    !tailIsWorkingActivity;
 
   const listRef = useRef<LegendListRef | null>(null);
   const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
@@ -1193,7 +1211,7 @@ export const MessageList = memo(function MessageList({
             <RunStalledNotice silentForSecs={stalled.silentForSecs} />
           </div>
         )}
-        {showThinking && !tailIsWorkingActivity && !(stalled && streaming) && (
+        {showLiveMarker && !(stalled && streaming) && (
           <div className="mt-[13px]">
             <StreamingMarker messages={ordered} />
           </div>
@@ -1210,10 +1228,9 @@ export const MessageList = memo(function MessageList({
       interrupted,
       ordered,
       showBrowserChip,
-      showThinking,
+      showLiveMarker,
       stalled,
       streaming,
-      tailIsWorkingActivity,
       tailIsSubagentStretch,
       workspaceId,
     ],
@@ -1396,6 +1413,20 @@ const WS_FADE_STYLE: CSSProperties = {
   WebkitMaskPosition: WS_FADE_MASK_POSITION,
   WebkitMaskRepeat: "no-repeat",
 };
+
+/** Whether a rendered slot body carries the item with `id`. */
+function slotBodyContains(body: SlotBody, id: string): boolean {
+  switch (body.kind) {
+    case "item":
+      return body.item.id === id;
+    case "activity":
+      return body.items.some((step) => step.id === id);
+    case "subagent_stretch":
+      return body.runs.some((run) => run.id === id);
+    case "turn_fold":
+      return false;
+  }
+}
 
 /** Amber "no activity" notice shown at the tail of a silently-stalled
  *  mid-turn run (issue #154). Advisory only — the run may still be alive

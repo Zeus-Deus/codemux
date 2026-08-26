@@ -197,6 +197,14 @@ export interface TurnEndedItem {
   status: TurnStatus;
   /** Wall-clock completion boundary used by the settled-turn disclosure. */
   completed_at?: number;
+  /** True when the provider's main loop merely *yielded* here — it
+   *  reported a successful completion while delegated work was still
+   *  running, or parent output resumed afterwards without a new prompt
+   *  (Claude Code re-invokes the model on background task notifications
+   *  inside the same session). An interim boundary is not the turn's end:
+   *  the transcript keeps the turn live across it and folds only at the
+   *  final, non-interim marker. */
+  interim?: boolean;
 }
 
 /**
