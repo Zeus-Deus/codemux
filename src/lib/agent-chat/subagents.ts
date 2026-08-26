@@ -670,19 +670,26 @@ export interface SubagentWave {
 /**
  * Group a transcript's subagents by spawn wave, in transcript order.
  *
- * A wave's prompt is the nearest preceding `user_message` — user
- * messages carry no `turn_id`, but the transcript is sequenced, so the
- * last prompt before a card is the turn that spawned it. A subagent id
- * reported by more than one card stays in the wave that first saw it and
- * takes the latest view, mirroring the reducer's non-regressing merge.
- * Empty cards are skipped.
+ * A wave's prompt is the nearest preceding `user_message` in seq order —
+ * user messages carry no `turn_id`, but the transcript is sequenced, so
+ * the last prompt before a card is the turn that spawned it. The store's
+ * array is not seq-ordered (a queued follow-up parks at the tail with a
+ * far-future seq, and the card the current turn spawns lands after it),
+ * so this walks a seq-sorted copy with the transcript's comparator and
+ * skips bubbles still queued: they have not spawned anything yet. A
+ * subagent id reported by more than one card stays in the wave that
+ * first saw it and takes the latest view, mirroring the reducer's
+ * non-regressing merge. Empty cards are skipped.
  */
 export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
   const waves: SubagentWave[] = [];
   const home = new Map<string, SubagentView[]>();
   let prompt: string | null = null;
-  for (const item of messages) {
+  const ordered = messages.slice();
+  ordered.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+  for (const item of ordered) {
     if (item.kind === "user_message") {
+      if (item.queued) continue;
       const line = firstLine(item.text);
       prompt = line.length > 0 ? line : null;
       continue;

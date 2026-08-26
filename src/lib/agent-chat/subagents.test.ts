@@ -750,6 +750,32 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
     expect(waves[0].subagents[0].status).toBe("completed");
   });
 
+  it("ignores a queued follow-up parked past the card it precedes in the array", () => {
+    // The reducer appends a queued bubble at the array tail with a
+    // far-future seq, then appends the card the CURRENT turn spawns after
+    // it. Walking the array would title the wave with the queued text.
+    const waves = subagentWaves([
+      user("u1", 0, "Fix the flaky test"),
+      {
+        kind: "user_message",
+        id: "q1",
+        seq: 1_000_000_001,
+        text: "Also update the docs",
+        queued: { queuedId: "queued-1" },
+      },
+      card("c1", 1, [sub("a")]),
+    ]);
+    expect(waves.map((w) => w.prompt)).toEqual(["Fix the flaky test"]);
+  });
+
+  it("walks the transcript in seq order, not array order", () => {
+    const waves = subagentWaves([
+      card("c1", 1, [sub("a")]),
+      user("u1", 0, "Fix the flaky test"),
+    ]);
+    expect(waves.map((w) => w.prompt)).toEqual(["Fix the flaky test"]);
+  });
+
   it("rolls the wave status up with failure surfacing first", () => {
     expect(subagentWaveStatus([sub("a"), sub("b")])).toBe("completed");
     expect(

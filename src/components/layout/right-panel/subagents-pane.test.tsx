@@ -1,6 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 
 import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
 import { useUIStore } from "@/stores/ui-store";
@@ -81,7 +88,10 @@ function twoWaves(): ChatViewItem[] {
 }
 
 beforeEach(() => useUIStore.setState({ subagentEnterRequest: null }));
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("SubagentsPane — grouped waves with result-first rows", () => {
   it("shows aggregate progress and titles the wave with its prompt", () => {
@@ -210,6 +220,33 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
     );
 
     expect(container.querySelector("[data-subagent-model]")).toBeNull();
+  });
+
+  it("keeps the header timer live while a sibling has failed", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(100_000));
+    render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({ id: "a", status: "failed", durationMs: 5_000 }),
+          subagent({ id: "b", status: "running", startedAt: 90_000 }),
+        ])}
+      />,
+    );
+
+    const wave = screen.getByRole("region", {
+      name: "Implement clipboard-paste fallback",
+    });
+    // The failure still wins the header glyph...
+    expect(wave).toHaveAttribute("data-wave-status", "failed");
+    // ...but the elapsed label follows the agent that is still running.
+    const header = within(wave).getByRole("button", { expanded: true });
+    const elapsed = within(header).getByText("0m 10s");
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(elapsed).toHaveTextContent("0m 13s");
   });
 
   it("opens a subagent thread from its row", () => {

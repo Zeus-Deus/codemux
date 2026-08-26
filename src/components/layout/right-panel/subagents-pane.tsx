@@ -145,7 +145,9 @@ function WaveGroup({
   const status = subagentWaveStatus(wave.subagents);
   const title = subagentWaveTitle(wave);
   const ordinals = subagentOrdinals(wave.subagents);
-  const running = status === "running";
+  // Not `status === "running"`: that rollup ranks a failure above a live
+  // agent, which would freeze the timer while a sibling is still going.
+  const running = wave.subagents.some(isRunning);
   return (
     <section
       data-wave-status={status}
