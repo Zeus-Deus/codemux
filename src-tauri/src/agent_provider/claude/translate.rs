@@ -1128,6 +1128,7 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         parent_item_id: Some(tool_use_id.to_string()),
         name,
         agent_type: get("subagent_type"),
+        description: get("description"),
         // Learned from `task_started`'s `task_type`, which arrives later; the
         // demux re-stamps it onto every subsequent snapshot for this id.
         task_kind: None,
@@ -1338,6 +1339,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         parent_item_id: Some(subagent_id.to_string()),
         name: None,
         agent_type: None,
+        description: None,
         task_kind: None,
         model: None,
         status: SubagentStatus::Running,
@@ -1879,7 +1881,8 @@ fn translate_task_started(
     snap.status = SubagentStatus::Running;
     let description = str_field(msg, "description");
     if !description.is_empty() {
-        snap.activity = Some(description);
+        snap.activity = Some(description.clone());
+        snap.description = Some(description);
     }
     stamp_task_classification(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
@@ -3169,9 +3172,11 @@ mod tests {
         let snap = only_subagent(&events);
         assert_eq!(snap.subagent_id, "toolu_root");
         assert_eq!(snap.parent_item_id.as_deref(), Some("toolu_root"));
-        // name falls back to subagent_type when `name` is absent.
+        // name falls back to subagent_type when `name` is absent; the
+        // task description rides along separately for the pane's titles.
         assert_eq!(snap.name.as_deref(), Some("Explore"));
         assert_eq!(snap.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(snap.description.as_deref(), Some("explore the repo"));
         assert_eq!(snap.model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(snap.status, SubagentStatus::Running);
     }

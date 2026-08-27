@@ -122,6 +122,12 @@ pub struct SubagentSnapshot {
     /// `subagent_type` / role / agent slug.
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// Short task label from the spawning call (`Agent.description`,
+    /// `task_started.description`): what the subagent was asked to do,
+    /// independent of its `name` / type. The Subagents pane titles a
+    /// spawn wave with it.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Whether this is agent work or a background watch loop, when the
     /// provider says. `None` means "not reported" rather than "agent": the
     /// per-thread tracker leaves an already-classified task where it is when a
@@ -878,6 +884,7 @@ mod tests {
             parent_item_id: Some("toolu_root".into()),
             name: Some("Explore".into()),
             agent_type: Some("Explore".into()),
+            description: Some("Explore the repo".into()),
             task_kind: Some(SubagentTaskKind::Agent),
             model: Some("claude-sonnet-4".into()),
             status: SubagentStatus::Running,

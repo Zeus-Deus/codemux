@@ -219,6 +219,9 @@ export interface SubagentView {
   id: string;
   name?: string;
   agentType?: string;
+  /** What the subagent was asked to do, in the spawner's own short words
+   *  (`SubagentSnapshot.description`). Titles the pane's spawn waves. */
+  description?: string;
   /** `"monitor"` marks a background watch loop rather than delegated agent
    *  work. Such a row still gets its transcript card (the user should be able
    *  to see what is being watched), but it is left out of the docked

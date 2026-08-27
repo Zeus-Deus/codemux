@@ -216,6 +216,9 @@ export interface SubagentSnapshot {
   name?: string | null;
   /** subagent_type / role / agent. */
   agent_type?: string | null;
+  /** Short task label from the spawning call (`Agent.description`,
+   *  `task_started.description`): what the subagent was asked to do. */
+  description?: string | null;
   /** Whether this is real delegated work or a background watch loop, when
    *  the provider reports it. `null`/absent means "not reported", which
    *  every consumer treats as `"agent"`. */
