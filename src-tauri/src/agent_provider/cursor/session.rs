@@ -654,10 +654,11 @@ impl CursorSession {
     /// could win the stdin write race and reach the child before the
     /// prompt it was meant to cancel, leaving the child with nothing to
     /// cancel and the user's Stop silently dropped. `biased` polls the
-    /// prompt future first, so the request is written before the cancel
-    /// arm is ever reachable, and the transport's writer mutex is FIFO so
-    /// a contended write still keeps that order. `session/cancel` is a
-    /// notification with no reply, so repeating it is harmless.
+    /// prompt future first, so the request has already claimed the
+    /// transport's writer mutex before the cancel arm is ever reachable,
+    /// and that mutex is FIFO so the cancel queues behind the prompt and
+    /// still reaches the child second. `session/cancel` is a notification
+    /// with no reply, so repeating it is harmless.
     async fn send_prompt(
         &self,
         prompt: &[Value],
@@ -680,16 +681,35 @@ impl CursorSession {
                     if !self.state.lock().await.take_interrupt(generation) {
                         continue;
                     }
-                    if let Err(error) = self
-                        .child
-                        .notify(
-                            "session/cancel",
-                            json!({ "sessionId": self.provider_session_id.0 }),
-                        )
-                        .await
-                    {
-                        self.warn(format!("Could not cancel the Cursor turn: {error}"), None);
-                    }
+                    // Hand the cancel to a detached task instead of
+                    // awaiting it here. A child's stdin is a blocking-pool
+                    // wrapper on Windows, whose `flush` yields at least
+                    // once, so the pinned prompt future can be parked
+                    // *inside* `write_line` while still holding the
+                    // transport's writer mutex. Awaiting the cancel in this
+                    // branch body would then block on that same mutex —
+                    // and `select!` does not poll the prompt arm that owns
+                    // it while a branch body is awaiting, so the turn
+                    // deadlocks and the Stop is swallowed. Spawning keeps
+                    // the loop polling the prompt so its write can finish
+                    // and release the lock; the cancel queues behind it on
+                    // the FIFO mutex, preserving the order described above.
+                    let child = Arc::clone(&self.child);
+                    let session_id = self.provider_session_id.0.clone();
+                    let event_tx = self.event_tx.clone();
+                    let thread_id = self.thread_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = child
+                            .notify("session/cancel", json!({ "sessionId": session_id }))
+                            .await
+                        {
+                            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                                thread_id: Some(thread_id),
+                                message: format!("Could not cancel the Cursor turn: {error}"),
+                                original_payload: None,
+                            });
+                        }
+                    });
                 }
             }
         }
