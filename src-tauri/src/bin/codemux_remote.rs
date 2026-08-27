@@ -767,7 +767,7 @@ fn run_workspace_register(
 /// first run (and to create the workspaces root, which is harmless).
 #[cfg(unix)]
 fn run_workspace_list(state_dir_arg: Option<PathBuf>) -> ExitCode {
-    use codemux_lib::remote::{config, manifest, workspace::WorkspaceStore};
+    use codemux_lib::remote::{config, host_status, manifest, workspace::WorkspaceStore};
 
     let state_dir = resolve_state_dir(state_dir_arg);
     let host_id = manifest::current_host_id();
@@ -789,9 +789,19 @@ fn run_workspace_list(state_dir_arg: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Host facts for the desktop's Devices page ride in the same
+    // envelope so one SSH session serves both. The disk walk is the
+    // expensive part; the desktop sets `CODEMUX_SKIP_DISK=1` on the
+    // ticks that don't need a fresh figure.
+    let facts = host_status::collect(
+        workspaces.iter().map(|w| PathBuf::from(&w.path)).collect(),
+        host_status::skip_disk_requested(),
+    );
     let payload = serde_json::json!({
         "host_id": host_id,
         "workspaces": workspaces,
+        "disk_bytes": facts.disk_bytes,
+        "remote_control_serving": facts.remote_control_serving,
     });
     println!("{}", payload);
     ExitCode::SUCCESS

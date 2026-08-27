@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { tzBodyLg, tzPageTitle } from "@/components/workspace/review/review-ui";
 import { badgeKeys, rowKey, type PrRow } from "@/lib/pr-overview";
 import { usePrOverview, type PrStateFilter } from "@/lib/pr-overview-query";
+import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { PrList } from "./pr-list";
 import { PrTabStrip } from "./pr-tab-strip";
 import { PrDetailColumn } from "./pr-detail-column";
@@ -20,35 +21,6 @@ import { PrDetailColumn } from "./pr-detail-column";
 const DEFAULT_LIST_WIDTH = 452;
 const MIN_LIST_WIDTH = 340;
 const MAX_LIST_WIDTH = 720;
-
-/** Anything Escape might reasonably mean "stop editing" rather than
- *  "leave the page" for. */
-function isEditableElement(el: Element | null | undefined): boolean {
-  if (!el || !(el instanceof HTMLElement)) return false;
-  const tag = el.tagName;
-  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
-  return el.isContentEditable;
-}
-
-/**
- * Inside a Radix overlay — a dialog, sheet, popover, dropdown or the
- * wrapper any of them are portalled into.
- *
- * Deliberately not `[role="listbox"]`: a listbox is not by itself an
- * overlay, and the page's own results list is one (`pr-list`), focusable
- * so the arrow keys work. Naming the role here meant that clicking into
- * the list — the most ordinary thing on this page — quietly switched
- * Escape off. Radix's own listboxes are portalled into the popper
- * wrapper below and are already covered by it.
- */
-function isInsideOverlay(el: Element | null | undefined): boolean {
-  if (!el || typeof el.closest !== "function") return false;
-  return (
-    el.closest(
-      '[role="dialog"], [role="alertdialog"], [role="menu"], [data-radix-popper-content-wrapper]',
-    ) != null
-  );
-}
 
 /**
  * Pull requests, across every project you have open.
@@ -97,30 +69,12 @@ export function PullRequestsView() {
   // whole destination out from under them and takes the typed text with
   // it, which is exactly the promise the review surfaces are built on
   // ("anything typed survives everything"). So the page declines the key
-  // in four cases, and this guard is why per-component workarounds are
-  // no longer the thing standing between a reply draft and oblivion.
+  // whenever `escapeClaimedElsewhere` says an editor, overlay or open
+  // dialog owns it — that guard, not per-component workarounds, is what
+  // stands between a reply draft and oblivion.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      // 1. Something closer to the event already claimed it.
-      if (event.defaultPrevented) return;
-
-      const target = event.target as HTMLElement | null;
-      const focused = document.activeElement as HTMLElement | null;
-
-      // 2. The key belongs to whatever is being typed into.
-      if (isEditableElement(target) || isEditableElement(focused)) return;
-
-      // 3. Focus is inside an overlay that dismisses itself on Escape.
-      //    Radix does not `preventDefault` when it closes a dialog, so
-      //    `defaultPrevented` alone would not catch a sheet.
-      if (isInsideOverlay(target) || isInsideOverlay(focused)) return;
-
-      // 4. A modal is open even though focus escaped it. The DOM has not
-      //    been updated with the close Radix just scheduled, so an open
-      //    dialog here means the key was for that dialog.
-      if (document.querySelector('[role="dialog"][data-state="open"]')) return;
-
+      if (event.key !== "Escape" || escapeClaimedElsewhere(event)) return;
       setShowPullRequests(false);
     };
     window.addEventListener("keydown", onKeyDown);

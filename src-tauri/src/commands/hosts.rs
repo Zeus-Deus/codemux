@@ -12,6 +12,7 @@
 //! (`~/.ssh/config`, agent, keys).
 
 use crate::database::{DatabaseStore, HostRecord};
+use crate::hosts_status::{HostStatusStore, HostStatusView};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
@@ -96,11 +97,26 @@ pub fn hosts_update<R: tauri::Runtime>(
 pub fn hosts_delete<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
+    status: State<'_, HostStatusStore>,
     id: i64,
 ) -> Result<(), String> {
     db.delete_host(id)?;
+    status.remove(id);
     schedule_background_sync(app);
     Ok(())
+}
+
+/// One status row per configured host, in `hosts_list` order. Hosts the
+/// poller hasn't probed yet (including unsynced hosts, which it never
+/// touches) come back `probed: false` with whatever `last_seen_at` /
+/// `disk_bytes` the row remembers, so the Devices page can render every
+/// card from this one call.
+#[tauri::command]
+pub fn hosts_status_list(
+    db: State<'_, DatabaseStore>,
+    status: State<'_, HostStatusStore>,
+) -> Vec<HostStatusView> {
+    status.views_for(&db.list_hosts())
 }
 
 /// Assign (or clear) the host a workspace runs on. Used by the

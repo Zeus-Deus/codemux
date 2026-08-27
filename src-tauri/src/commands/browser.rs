@@ -228,32 +228,6 @@ fn agent_browser_dir() -> PathBuf {
         .join(".agent-browser")
 }
 
-fn dir_size(path: &std::path::Path) -> u64 {
-    if !path.is_dir() {
-        return 0;
-    }
-    let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 // All three commands are `async fn` + `spawn_blocking` because they walk or
 // delete the entire `~/.agent-browser` tree. On a profile with significant
 // cache/cookie data the recursive `read_dir` and `remove_dir_all` calls take
@@ -261,8 +235,12 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 #[tauri::command]
 pub async fn get_browser_data_size() -> Result<u64, String> {
-    tokio::task::spawn_blocking(|| dir_size(&agent_browser_dir()))
-        .await
+    // No deadline: Settings waits for the real number, and the profile
+    // dir is bounded in practice. A missing dir reads as zero.
+    tokio::task::spawn_blocking(|| {
+        crate::fs_size::dir_size_bounded(&agent_browser_dir(), None).unwrap_or(0)
+    })
+    .await
         .map_err(|e| format!("get_browser_data_size task join failed: {e}"))
 }
 
@@ -294,67 +272,4 @@ pub async fn clear_all_browser_data() -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("clear_all_browser_data task join failed: {e}"))?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn dir_size_returns_zero_for_nonexistent_path() {
-        let missing = std::path::Path::new("/this/path/should/definitely/not/exist/xyz123");
-        assert_eq!(dir_size(missing), 0);
-    }
-
-    #[test]
-    fn dir_size_returns_zero_for_empty_dir() {
-        let tmp = TempDir::new().expect("tempdir");
-        assert_eq!(dir_size(tmp.path()), 0);
-    }
-
-    #[test]
-    fn dir_size_returns_zero_when_path_is_a_file() {
-        // dir_size guards `!path.is_dir()` — pointing at a regular file must
-        // be a no-op rather than crash or return the file size.
-        let tmp = TempDir::new().expect("tempdir");
-        let f = tmp.path().join("only.txt");
-        fs::write(&f, vec![0u8; 42]).expect("write file");
-        assert_eq!(dir_size(&f), 0);
-    }
-
-    #[test]
-    fn dir_size_sums_flat_files() {
-        let tmp = TempDir::new().expect("tempdir");
-        fs::write(tmp.path().join("a"), vec![0u8; 100]).expect("write a");
-        fs::write(tmp.path().join("b"), vec![0u8; 200]).expect("write b");
-        assert_eq!(dir_size(tmp.path()), 300);
-    }
-
-    #[test]
-    fn dir_size_walks_nested_dirs() {
-        let tmp = TempDir::new().expect("tempdir");
-        let nested = tmp.path().join("sub").join("deeper");
-        fs::create_dir_all(&nested).expect("mkdir -p");
-        fs::write(tmp.path().join("top.txt"), vec![0u8; 50]).expect("top");
-        fs::write(tmp.path().join("sub").join("mid.txt"), vec![0u8; 25]).expect("mid");
-        fs::write(nested.join("deep.txt"), vec![0u8; 75]).expect("deep");
-        assert_eq!(dir_size(tmp.path()), 150);
-    }
-
-    // End-to-end sanity check: the async command really does walk the
-    // filesystem through `spawn_blocking` and return the same value the
-    // synchronous helper computes. Guards against the `async`-conversion
-    // accidentally dropping the awaited result or swallowing errors.
-    #[tokio::test]
-    async fn async_dir_size_through_spawn_blocking_matches_sync() {
-        let tmp = TempDir::new().expect("tempdir");
-        fs::write(tmp.path().join("payload"), vec![0u8; 1024]).expect("write");
-        let path = tmp.path().to_path_buf();
-        let async_result = tokio::task::spawn_blocking(move || dir_size(&path))
-            .await
-            .expect("blocking task");
-        assert_eq!(async_result, 1024);
-    }
 }

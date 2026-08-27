@@ -2554,6 +2554,50 @@ export interface HostBootstrapResult {
 
 export const hostsList = () => invoke<HostView[]>("hosts_list");
 
+/**
+ * Live reachability + inventory facts for one configured device (SSH host),
+ * as observed by the background `hosts_inventory` poller. Separate from
+ * `HostView` (identity, synced to the account) because none of this is
+ * account state: it is what THIS install last saw over SSH.
+ */
+export interface HostStatusView {
+  host_id: number;
+  /** False until the poller has probed this host at least once this
+   *  session. Unprobed hosts are neither online nor offline yet. */
+  probed: boolean;
+  /** Last probe succeeded. */
+  reachable: boolean;
+  /** ISO timestamp of the last successful probe; null if never reached. */
+  last_seen_at: string | null;
+  /** Last probe problem: the unreachable reason, or — while reachable — a
+   *  degraded note such as the host agent being missing or the inventory
+   *  failing. Null when clean. */
+  last_error: string | null;
+  /** Sum of the host's workspace directories in bytes; null if unknown. */
+  disk_bytes: number | null;
+  /** A Codemux Remote Control server is up on the host. */
+  remote_control_serving: boolean;
+}
+
+/** One status row per configured host; hosts not probed yet are included
+ *  with `probed: false` and null facts. */
+export const hostsStatusList = () =>
+  invoke<HostStatusView[]>("hosts_status_list");
+
+/** Event name emitted (payload: `HostStatusView[]`) whenever the poller
+ *  finishes a round and any host's status changed. */
+export const HOSTS_STATUS_CHANGED_EVENT = "hosts-status-changed";
+
+/** Which of the given workspaces the sweep may remove, and how big each
+ *  worktree is. The backend is the single authority on eligibility: a key
+ *  is present only for a disposable local worktree (never a repo root,
+ *  attach-only or host-backed workspace). A null value means the worktree
+ *  qualifies but its size could not be measured. */
+export const workspacesWorktreeSizes = (workspaceIds: string[]) =>
+  invoke<Record<string, number | null>>("workspaces_worktree_sizes", {
+    workspaceIds,
+  });
+
 export const hostsAdd = (name: string, sshTarget: string) =>
   invoke<HostView>("hosts_add", { name, sshTarget });
 

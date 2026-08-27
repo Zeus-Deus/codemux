@@ -2901,7 +2901,21 @@ const handlers: Record<string, Handler> = {
   },
   reset_synced_settings: () => structuredClone(SYNCED_SETTINGS),
   db_get_all_settings: () => ({}),
-  db_get_ui_state: () => null,
+  // The sidebar's settled shelf. Three settled worktrees so the Devices
+  // page's "Sweep N settled" chip has something to offer.
+  db_get_ui_state: (a) =>
+    a.key === "sidebar.inbox.settled"
+      ? JSON.stringify({
+          settled: [
+            { id: "ws-codemux-auth", at: 1_756_200_000_000 },
+            { id: "ws-codemux-sidebar", at: 1_756_100_000_000 },
+            { id: "ws-vexis-bench", at: 1_756_000_000_000 },
+          ],
+          snoozed: [],
+          keepActive: [],
+          activity: {},
+        })
+      : null,
   db_set_ui_state: () => undefined,
   db_set_setting: () => undefined,
   db_get_setting: () => null,
@@ -4279,7 +4293,65 @@ const handlers: Record<string, Handler> = {
       updated_at: "2026-01-01T00:00:00Z",
       dirty: false,
     },
+    {
+      id: 2,
+      server_id: "srv-zeus",
+      name: "zeus",
+      ssh_target: "deus@zeus",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 3,
+      server_id: "srv-nas",
+      name: "nas",
+      ssh_target: "deus@nas",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      dirty: false,
+    },
   ],
+  // Reachability as the inventory poller last saw it: zeus is up with
+  // Remote Control serving, pandora has been unreachable for two days, and
+  // nas answers SSH but has no host agent — the degraded state.
+  hosts_status_list: () => [
+    {
+      host_id: 1,
+      probed: true,
+      reachable: false,
+      last_seen_at: "2026-08-25T18:00:00Z",
+      last_error: "unreachable: connection timed out",
+      disk_bytes: null,
+      remote_control_serving: false,
+    },
+    {
+      host_id: 2,
+      probed: true,
+      reachable: true,
+      last_seen_at: "2026-08-27T18:44:00Z",
+      last_error: null,
+      disk_bytes: 4_402_341_478,
+      remote_control_serving: true,
+    },
+    {
+      host_id: 3,
+      probed: true,
+      reachable: true,
+      last_seen_at: "2026-08-27T18:44:00Z",
+      last_error: "codemux-remote is not installed on this host",
+      disk_bytes: null,
+      remote_control_serving: false,
+    },
+  ],
+  // Every requested id qualifies; the last one has no measurable size so
+  // the chip's "~X GB" fragment sums only the known ones.
+  workspaces_worktree_sizes: (a) => {
+    const ids = Array.isArray(a.workspaceIds) ? (a.workspaceIds as string[]) : [];
+    return Object.fromEntries(
+      ids.map((id, i) => [id, i === ids.length - 1 ? null : 120_000_000 + i * 37_000_000]),
+    );
+  },
   hosts_add: (a) => ({
     id: Date.now(),
     server_id: null,
@@ -4372,10 +4444,137 @@ const handlers: Record<string, Handler> = {
 
   // ── Cross-device workspace sync registry ──
   //
-  // Seed a few sibling-device rows (workspace_id: null) on the "pandora"
-  // host so the Workspaces overview renders its second device bucket with
-  // "lives on another device" cards. Mirrors the redesign mock data.
+  // Sibling-device rows (workspace_id: null) for both hosts so the Devices
+  // page renders a populated online card (zeus: passpage + partpilot) and
+  // a collapsed offline one (pandora). The trailing local row shares a
+  // branch with a zeus worktree at a different HEAD so "diverged" shows.
   workspaces_sync_list: () => [
+    {
+      id: 9101,
+      server_id: "ws-zeus-passpage",
+      workspace_id: null,
+      title: "passpage",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/passpage",
+      project_remote: "github.com/deus/passpage",
+      git_branch: "main",
+      git_head_sha: "c0ffee01",
+      project_uid: "uid-passpage",
+      workspace_kind: "main",
+      default_branch: "main",
+      origin_path: "/home/deus/projects/passpage",
+      created_at: "2026-08-01T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9102,
+      server_id: "ws-zeus-passpage-ui-polish",
+      workspace_id: null,
+      title: "passpage-ui-polish",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/passpage",
+      project_remote: "github.com/deus/passpage",
+      git_branch: "ui-polish-v1",
+      git_head_sha: "c0ffee02",
+      project_uid: "uid-passpage",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: "/home/deus/.codemux/worktrees/passpage/ui-polish-v1",
+      created_at: "2026-08-10T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9103,
+      server_id: "ws-zeus-bypass-share-limit",
+      workspace_id: null,
+      title: "bypass-share-limit-owner",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/passpage",
+      project_remote: "github.com/deus/passpage",
+      git_branch: "bypass-share-limit-owner",
+      git_head_sha: "aaa111",
+      project_uid: "uid-passpage",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: "/home/deus/.codemux/worktrees/passpage/bypass-share-limit-owner",
+      created_at: "2026-08-12T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9104,
+      server_id: "ws-zeus-partpilot",
+      workspace_id: null,
+      title: "partpilot",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/partpilot",
+      project_remote: "github.com/deus/partpilot",
+      git_branch: "main",
+      git_head_sha: "d00d01",
+      project_uid: "uid-partpilot",
+      workspace_kind: "main",
+      default_branch: "main",
+      origin_path: "/home/deus/projects/partpilot",
+      created_at: "2026-08-02T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9105,
+      server_id: "ws-zeus-partpilot-bom-import",
+      workspace_id: null,
+      title: "bom-import",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/partpilot",
+      project_remote: "github.com/deus/partpilot",
+      git_branch: "feat/bom-import",
+      git_head_sha: "d00d02",
+      project_uid: "uid-partpilot",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: "/home/deus/.codemux/worktrees/partpilot/feat-bom-import",
+      created_at: "2026-08-14T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9106,
+      server_id: "ws-zeus-partpilot-supplier-sync",
+      workspace_id: null,
+      title: "supplier-sync",
+      host_server_id: "srv-zeus",
+      project_path: "/home/deus/projects/partpilot",
+      project_remote: "github.com/deus/partpilot",
+      git_branch: "feat/supplier-sync",
+      git_head_sha: "d00d03",
+      project_uid: "uid-partpilot",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: "/home/deus/.codemux/worktrees/partpilot/feat-supplier-sync",
+      created_at: "2026-08-20T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9107,
+      server_id: "ws-local-bypass-share-limit",
+      workspace_id: "ws-codemux-auth",
+      title: "bypass-share-limit-owner",
+      host_server_id: null,
+      project_path: "/home/deus/projects/passpage",
+      project_remote: "github.com/deus/passpage",
+      git_branch: "bypass-share-limit-owner",
+      git_head_sha: "bbb222",
+      project_uid: "uid-passpage",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: null,
+      created_at: "2026-08-12T00:00:00Z",
+      updated_at: "2026-08-27T00:00:00Z",
+      dirty: false,
+    },
     {
       id: 9001,
       server_id: "ws-partpilot",
@@ -4927,7 +5126,7 @@ const handlers: Record<string, Handler> = {
     // removal path (it stays available on its host in the overview).
     if (ws.host_id !== null && ws.host_id !== undefined) {
       return Promise.reject(
-        "Remote workspaces can't be archived — they're managed from the Workspaces Overview. Pull the workspace back to this device first.",
+        "Remote workspaces can't be archived — they're managed from the Devices page. Pull the workspace back to this device first.",
       );
     }
     const archiveId = `arch-${ws.workspace_id}-${++archiveSeq}`;

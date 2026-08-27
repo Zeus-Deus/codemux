@@ -667,6 +667,15 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             deleted_at TEXT,
             dirty INTEGER NOT NULL DEFAULT 1,
+            -- Local-only observation columns written by the inventory
+            -- poller (`hosts_status`): when THIS install last reached the
+            -- host over SSH and the last workspace-disk measurement with
+            -- its timestamp. They are never pushed, and a server pull
+            -- (`upsert_host_from_server`) must never overwrite them —
+            -- another device's view of 'last seen' is meaningless here.
+            last_seen_at TEXT,
+            disk_bytes INTEGER,
+            disk_measured_at TEXT,
             UNIQUE(user_id, server_id)
         );
 
@@ -838,6 +847,11 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // create it.
         "DROP TABLE IF EXISTS openflow_history",
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
+        // Devices page: local-only host observations (see the `hosts`
+        // CREATE above for why a server pull must never touch these).
+        "ALTER TABLE hosts ADD COLUMN last_seen_at TEXT",
+        "ALTER TABLE hosts ADD COLUMN disk_bytes INTEGER",
+        "ALTER TABLE hosts ADD COLUMN disk_measured_at TEXT",
         "ALTER TABLE automation_runs ADD COLUMN branch TEXT",
         "ALTER TABLE automation_runs ADD COLUMN pr_url TEXT",
         // Phase-4 divergence detection: workspace git HEAD sha so
@@ -1259,7 +1273,18 @@ pub struct HostRecord {
     pub updated_at: String,
     pub deleted_at: Option<String>,
     pub dirty: bool,
+    /// Local-only: RFC 3339 of the last tick on which this install
+    /// reached the host over SSH. Never synced.
+    pub last_seen_at: Option<String>,
+    /// Local-only: last workspace-disk measurement the host reported,
+    /// and when. Never synced.
+    pub disk_bytes: Option<u64>,
+    pub disk_measured_at: Option<String>,
 }
+
+/// Column list every `HostRecord` SELECT must use, in `row_to_host` order.
+const HOST_COLUMNS: &str = "id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty, \
+     last_seen_at, disk_bytes, disk_measured_at";
 
 impl DatabaseStore {
     /// Insert a new host. Marked dirty so the next sync round-trip pushes it.
@@ -1273,8 +1298,8 @@ impl DatabaseStore {
         .map_err(|e| format!("Failed to insert host: {e}"))?;
         let id = conn.last_insert_rowid();
         conn.query_row(
-            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
-             FROM hosts WHERE id = ?1",
+            &format!("SELECT {HOST_COLUMNS}
+             FROM hosts WHERE id = ?1"),
             params![id],
             row_to_host,
         )
@@ -1285,10 +1310,10 @@ impl DatabaseStore {
     pub fn list_hosts(&self) -> Vec<HostRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+            &format!("SELECT {HOST_COLUMNS}
              FROM hosts
              WHERE user_id = 'local' AND deleted_at IS NULL
-             ORDER BY name COLLATE NOCASE ASC",
+             ORDER BY name COLLATE NOCASE ASC"),
         ) {
             Ok(s) => s,
             Err(error) => {
@@ -1311,8 +1336,8 @@ impl DatabaseStore {
     pub fn list_hosts_for_sync(&self) -> Vec<HostRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
-             FROM hosts WHERE user_id = 'local'",
+            &format!("SELECT {HOST_COLUMNS}
+             FROM hosts WHERE user_id = 'local'"),
         ) {
             Ok(s) => s,
             Err(error) => {
@@ -1336,8 +1361,8 @@ impl DatabaseStore {
     pub fn list_dirty_hosts(&self) -> Vec<HostRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
-             FROM hosts WHERE user_id = 'local' AND dirty = 1",
+            &format!("SELECT {HOST_COLUMNS}
+             FROM hosts WHERE user_id = 'local' AND dirty = 1"),
         ) {
             Ok(s) => s,
             Err(error) => {
@@ -1369,8 +1394,8 @@ impl DatabaseStore {
             return Err(format!("No host with id {id}"));
         }
         conn.query_row(
-            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
-             FROM hosts WHERE id = ?1",
+            &format!("SELECT {HOST_COLUMNS}
+             FROM hosts WHERE id = ?1"),
             params![id],
             row_to_host,
         )
@@ -1393,6 +1418,31 @@ impl DatabaseStore {
         if affected == 0 {
             return Err(format!("No host with id {id}"));
         }
+        Ok(())
+    }
+
+    /// Stamp the local-only observation columns after a tick on which
+    /// the host answered. `disk_bytes` is `Some` only when the host
+    /// reported a fresh measurement; `None` leaves the previous figure
+    /// and its timestamp alone. Deliberately touches neither `dirty` nor
+    /// `updated_at`: these columns are this install's private view and
+    /// must not trigger a sync push.
+    pub fn record_host_seen(
+        &self,
+        id: i64,
+        seen_at: &str,
+        disk_bytes: Option<u64>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hosts
+             SET last_seen_at = ?1,
+                 disk_bytes = COALESCE(?2, disk_bytes),
+                 disk_measured_at = CASE WHEN ?2 IS NULL THEN disk_measured_at ELSE ?1 END
+             WHERE id = ?3",
+            params![seen_at, disk_bytes.map(|b| b as i64), id],
+        )
+        .map_err(|e| format!("Failed to record host observation: {e}"))?;
         Ok(())
     }
 
@@ -1429,7 +1479,9 @@ impl DatabaseStore {
     /// Upsert a row received from the server. If a local row already
     /// exists with the same `server_id`, update in place; otherwise
     /// insert. Always marked `dirty = 0` because this row came from the
-    /// server.
+    /// server. The UPDATE names its columns so the local-only
+    /// observation columns (`last_seen_at`, `disk_bytes`,
+    /// `disk_measured_at`) survive every pull.
     pub fn upsert_host_from_server(
         &self,
         server_id: &str,
@@ -1473,6 +1525,11 @@ fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         updated_at: row.get(5)?,
         deleted_at: row.get(6)?,
         dirty: dirty_int != 0,
+        last_seen_at: row.get(8)?,
+        disk_bytes: row
+            .get::<_, Option<i64>>(9)?
+            .and_then(|b| u64::try_from(b).ok()),
+        disk_measured_at: row.get(10)?,
     })
 }
 
@@ -7949,6 +8006,59 @@ mod tests {
             pending[0].dirty,
             "tombstones must be dirty so the sync layer pushes them"
         );
+    }
+
+    #[test]
+    fn host_observation_columns_are_local_only() {
+        let db = init_test_database();
+        let h = db.insert_host("pandora", "u@pandora").unwrap();
+        assert!(h.last_seen_at.is_none());
+        assert!(h.disk_bytes.is_none());
+        assert!(h.disk_measured_at.is_none());
+        let find = || db.list_hosts().into_iter().find(|r| r.id == h.id).unwrap();
+
+        // A tick that carried a disk measurement stamps all three.
+        db.record_host_seen(h.id, "2026-08-27T10:00:00Z", Some(4096)).unwrap();
+        let row = find();
+        assert_eq!(row.last_seen_at.as_deref(), Some("2026-08-27T10:00:00Z"));
+        assert_eq!(row.disk_bytes, Some(4096));
+        assert_eq!(row.disk_measured_at.as_deref(), Some("2026-08-27T10:00:00Z"));
+
+        // A tick without a walk advances last_seen_at only.
+        db.record_host_seen(h.id, "2026-08-27T10:01:00Z", None).unwrap();
+        let row = find();
+        assert_eq!(row.last_seen_at.as_deref(), Some("2026-08-27T10:01:00Z"));
+        assert_eq!(row.disk_bytes, Some(4096));
+        assert_eq!(row.disk_measured_at.as_deref(), Some("2026-08-27T10:00:00Z"));
+
+        // Observations never dirty the row: nothing here is worth a push.
+        db.mark_host_synced(h.id, Some("srv-1")).unwrap();
+        db.record_host_seen(h.id, "2026-08-27T10:02:00Z", Some(1)).unwrap();
+        assert!(!find().dirty);
+
+        // A server pull rewrites the synced fields and leaves the
+        // local-only columns untouched.
+        db.upsert_host_from_server(
+            "srv-1",
+            "renamed-elsewhere",
+            "u@pandora",
+            "2026-01-01T00:00:00Z",
+            "2026-08-27T11:00:00Z",
+            None,
+        )
+        .unwrap();
+        let row = find();
+        assert_eq!(row.name, "renamed-elsewhere");
+        assert_eq!(row.last_seen_at.as_deref(), Some("2026-08-27T10:02:00Z"));
+        assert_eq!(row.disk_bytes, Some(1));
+        assert_eq!(row.disk_measured_at.as_deref(), Some("2026-08-27T10:02:00Z"));
+
+        // The facts go with the row once the tombstone is purged; no
+        // separate cleanup is needed.
+        db.delete_host(h.id).unwrap();
+        db.mark_host_synced(h.id, None).unwrap();
+        db.purge_acknowledged_deletes().unwrap();
+        assert!(db.list_hosts_for_sync().iter().all(|r| r.id != h.id));
     }
 
     #[test]

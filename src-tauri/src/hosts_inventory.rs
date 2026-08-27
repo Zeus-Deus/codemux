@@ -17,15 +17,16 @@
 //! cloud, so no other device ever saw it.
 //!
 //! This poller closes that gap. On a 60-second cadence, for every
-//! configured host:
+//! configured host that has synced its identity (`server_id`):
 //!
 //! 1. Probe the host is reachable AND has the right `codemux-remote`
 //!    binary installed (re-using `ssh::probe::probe_host`).
 //! 2. SSH and run `codemux-remote workspace list` — a thin CLI we
 //!    added that reads the daemon's SQLite registry and prints
-//!    `{"host_id":"…","workspaces":[…]}` on stdout. The same
-//!    `~/.local/bin/codemux-remote` PATH fallback the probe uses
-//!    applies here, because non-interactive SSH on Arch/Ubuntu/etc.
+//!    `{"host_id":"…","workspaces":[…]}` on stdout, plus the host facts
+//!    the Devices page shows (`disk_bytes`, `remote_control_serving`).
+//!    The same `~/.local/bin/codemux-remote` PATH fallback the probe
+//!    uses applies here, because non-interactive SSH on Arch/Ubuntu/etc.
 //!    doesn't source `~/.profile`.
 //! 3. Reconcile the result into `workspaces_sync`:
 //!    - Each remote workspace gets a sibling-only row keyed by
@@ -34,24 +35,36 @@
 //!      survives).
 //!    - Disappeared rows (origin_uid no longer in the inventory) are
 //!      soft-deleted so the next push DELETEs the cloud row.
-//! 4. The existing `workspaces_sync::push` tick (every 30s) uploads
+//! 4. Record what the tick learned about the host itself: the live
+//!    bits (reachable or not, why not, whether a Remote Control server
+//!    is up) go to `hosts_status::HostStatusStore`; `last_seen_at` and
+//!    the disk figure are stamped on the `hosts` row so they survive a
+//!    restart. `hosts-status-changed` is emitted when any card would
+//!    look different. The disk walk is the expensive part of the
+//!    envelope, so it is requested per host only when the last
+//!    measurement is older than `DISK_REFRESH_SECS`.
+//! 5. The existing `workspaces_sync::push` tick (every 30s) uploads
 //!    every dirty row, so other devices of the same account see the
 //!    workspace within ~30-90 seconds of it appearing on the host.
 //!
 //! ## Failure model
 //!
-//! Best-effort. Per-host budget caps SSH stalls. Any of:
+//! Best-effort. Per-call budgets cap SSH stalls. Any of:
 //!
-//! - host offline / SSH refused → log, continue
-//! - host reachable but binary missing → log, continue (we don't try
-//!   to install it; that's the user's explicit consent in Settings
-//!   → Hosts)
+//! - host offline / SSH refused / probe timed out → recorded as
+//!   unreachable with the reason, continue
+//! - host reachable but binary missing, inventory failed or timed out
+//!   → recorded as seen-with-error (the card stays "online"), continue
+//!   (we don't try to install it; that's the user's explicit consent
+//!   in Settings → Hosts)
 //! - host has no `server_id` yet (host record hasn't synced to the
-//!   account) → skip silently — we'd have no stable identity to tag
-//!   the rows with, and the host_sync loop is the one in charge of
-//!   fixing that
+//!   account) → skipped entirely, not even probed: we'd have no stable
+//!   identity to tag the rows with, and the host_sync loop is the one
+//!   in charge of fixing that. Its card reads "not checked yet".
 //! - JSON parse failure → log the host + the first 200 chars of
 //!   stdout, continue
+//! - daemon predates the host facts → they are simply absent from the
+//!   envelope; the workspace list is still reconciled
 //!
 //! The task never fails the app.
 //!
@@ -74,12 +87,15 @@ use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::database::DatabaseStore;
+use crate::database::{DatabaseStore, HostRecord};
+use crate::hosts_status::{HostFacts, HostStatusStore, Observation, HOSTS_STATUS_CHANGED_EVENT};
+use crate::remote::host_status::{DISK_WALK_BUDGET, SKIP_DISK_ENV};
 use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 
 /// How often the poller runs after the first 5-second warm-up.
@@ -90,10 +106,16 @@ use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 /// proportional UX win.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Hard ceiling on how long any single host's poll can take —
-/// probe + workspace-list combined. Hosts that exceed this are
-/// logged and skipped for the cycle.
-const PER_HOST_BUDGET: Duration = Duration::from_secs(20);
+/// Ceiling on the inventory SSH call (connect + `workspace list`) on a
+/// tick that skips the disk walk. Ticks that ask for a walk get
+/// `DISK_WALK_BUDGET` on top, matching the host-side cap. The probe has
+/// its own, shorter budget inside `probe_host`.
+const INVENTORY_BUDGET: Duration = Duration::from_secs(20);
+
+/// Re-measure a host's workspace disk footprint when the last
+/// measurement is older than this. The number moves slowly, and the
+/// walk is the one expensive piece of the envelope.
+const DISK_REFRESH_SECS: i64 = 5 * 60;
 
 /// Spawn the background inventory poller. Must be called once during
 /// app setup. Like `hosts_upgrade`, it delays a few seconds so the
@@ -114,6 +136,29 @@ pub fn spawn<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
+/// The hosts a tick may touch: only those that have synced their
+/// identity. Without a `server_id` we can't tag inventory rows with a
+/// stable cross-device host identity, and any rows we created would
+/// never match up against `WorkspaceSnapshot.host_id` on this device or
+/// any other — so we don't open a connection to such a host at all.
+pub fn hosts_to_poll(hosts: &[HostRecord]) -> Vec<&HostRecord> {
+    hosts.iter().filter(|h| h.server_id.is_some()).collect()
+}
+
+/// Whether this tick should ask the host to walk its workspace
+/// directories: never measured (or an unparseable stamp), or measured
+/// longer ago than `DISK_REFRESH_SECS`.
+pub fn disk_walk_due(disk_measured_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    match disk_measured_at.and_then(|s| DateTime::parse_from_rfc3339(s).ok()) {
+        None => true,
+        Some(measured) => {
+            now.signed_duration_since(measured.with_timezone(&Utc))
+                .num_seconds()
+                >= DISK_REFRESH_SECS
+        }
+    }
+}
+
 /// One pass over every configured host. Public so tests / debug
 /// surfaces can drive a single cycle without the loop.
 pub async fn run_once<R: Runtime>(app: &AppHandle<R>) {
@@ -131,41 +176,59 @@ pub async fn run_once<R: Runtime>(app: &AppHandle<R>) {
     }
 
     let db = app.state::<DatabaseStore>();
-    for host in hosts {
-        // Skip hosts that haven't synced their identity yet. Without a
-        // `server_id` we can't tag the inventory rows with a stable
-        // cross-device host identity, and any rows we created would
-        // never match up against `WorkspaceSnapshot.host_id` on this
-        // device or any other.
-        let host_server_id = match &host.server_id {
-            Some(sid) => sid.clone(),
-            None => continue,
-        };
-
-        let outcome = timeout(
-            PER_HOST_BUDGET,
-            poll_one_host(&host.ssh_target, &host_server_id, &db),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(stats)) => {
-                if stats.changed() {
+    let status = app.state::<HostStatusStore>();
+    let mut any_changed = false;
+    for host in hosts_to_poll(&hosts) {
+        let server_id = host
+            .server_id
+            .as_deref()
+            .expect("hosts_to_poll only yields synced hosts");
+        let now = Utc::now();
+        let walk_disk = disk_walk_due(host.disk_measured_at.as_deref(), now);
+        let observation = match poll_one_host(&host.ssh_target, server_id, &db, walk_disk).await {
+            Ok(poll) => {
+                if poll.stats.changed() {
                     eprintln!(
                         "[hosts_inventory] {} synced ({} discovered, {} updated, {} disappeared)",
-                        host.name, stats.inserted, stats.updated, stats.soft_deleted
+                        host.name, poll.stats.inserted, poll.stats.updated, poll.stats.soft_deleted
                     );
                 }
+                Observation::Reachable { facts: poll.facts }
             }
-            Ok(Err(error)) => {
-                eprintln!("[hosts_inventory] {} skipped: {error}", host.name);
+            Err(PollError::Unreachable(reason)) => {
+                eprintln!("[hosts_inventory] {} unreachable: {reason}", host.name);
+                Observation::Unreachable { reason }
             }
-            Err(_) => {
-                eprintln!(
-                    "[hosts_inventory] {} timed out (>{}s) — host slow or offline",
-                    host.name,
-                    PER_HOST_BUDGET.as_secs()
-                );
+            Err(PollError::Degraded(reason)) => {
+                eprintln!("[hosts_inventory] {} skipped: {reason}", host.name);
+                Observation::Degraded { reason }
             }
+        };
+
+        if status.apply(host.id, &observation) {
+            any_changed = true;
+        }
+        // The host answered: stamp last_seen_at (and the disk figure
+        // when the envelope carried one) on its row. A new disk number
+        // changes the card even though the live bits didn't move.
+        let seen_disk = match &observation {
+            Observation::Unreachable { .. } => continue,
+            Observation::Degraded { .. } => None,
+            Observation::Reachable { facts } => facts.disk_bytes,
+        };
+        if seen_disk.is_some() && seen_disk != host.disk_bytes {
+            any_changed = true;
+        }
+        if let Err(e) = db.record_host_seen(host.id, &now.to_rfc3339(), seen_disk) {
+            eprintln!("[hosts_inventory] persist status for {}: {e}", host.name);
+        }
+    }
+
+    if any_changed {
+        // Re-read so the payload carries the columns just stamped.
+        let payload = status.views_for(&db.list_hosts());
+        if let Err(e) = app.emit(HOSTS_STATUS_CHANGED_EVENT, payload) {
+            eprintln!("[hosts_inventory] emit {HOSTS_STATUS_CHANGED_EVENT}: {e}");
         }
     }
 }
@@ -187,11 +250,27 @@ impl PollStats {
     }
 }
 
+/// Everything one successful tick learned about a host.
+struct HostPoll {
+    stats: PollStats,
+    facts: HostFacts,
+}
+
+/// Why a tick fell short, split by what the Devices card should say.
+enum PollError {
+    /// SSH never connected.
+    Unreachable(String),
+    /// SSH connected but the tick could not complete (binary missing,
+    /// fetch failed or timed out, output unparseable).
+    Degraded(String),
+}
+
 async fn poll_one_host(
     ssh_target: &str,
     host_server_id: &str,
     db: &DatabaseStore,
-) -> Result<PollStats, String> {
+    walk_disk: bool,
+) -> Result<HostPoll, PollError> {
     // Step 1: probe so we don't spend the inventory budget on a
     // host that's offline or doesn't have the binary. Re-uses the
     // same fallback-aware command the test-connection flow uses.
@@ -204,42 +283,59 @@ async fn poll_one_host(
             codemux_remote_version: None,
             ..
         } => {
-            return Err(
-                "codemux-remote not installed (use Settings → Hosts → Install)".into()
-            );
+            return Err(PollError::Degraded(
+                "codemux-remote missing on this host (use Settings → Hosts → Install)".into(),
+            ));
         }
         ProbeOutcome::Unreachable { reason } => {
-            return Err(format!("unreachable: {reason}"));
+            return Err(PollError::Unreachable(reason));
         }
     }
 
-    // Step 2: fetch the inventory.
-    let inventory = fetch_inventory(ssh_target).await?;
-    let parsed = parse_inventory_json(&inventory)
-        .map_err(|e| format!("parse inventory: {e}"))?;
+    // Step 2: fetch the envelope (inventory + host facts) in one session.
+    let stdout = fetch_inventory(ssh_target, walk_disk)
+        .await
+        .map_err(PollError::Degraded)?;
+    let parsed = parse_inventory_json(&stdout)
+        .map_err(|e| PollError::Degraded(format!("parse inventory: {e}")))?;
 
     // Step 3: reconcile.
-    Ok(reconcile_host_inventory(db, host_server_id, &parsed))
+    let stats = reconcile_host_inventory(db, host_server_id, &parsed);
+    Ok(HostPoll {
+        stats,
+        facts: parsed.facts(),
+    })
 }
 
 /// SSH into the host and capture `codemux-remote workspace list`
 /// stdout. Same SSH flags as the probe (BatchMode, ConnectTimeout,
-/// StrictHostKeyChecking) but a different remote command.
-async fn fetch_inventory(ssh_target: &str) -> Result<String, String> {
-    let argv = build_inventory_argv(ssh_target, PER_HOST_BUDGET.as_secs());
+/// StrictHostKeyChecking) but a different remote command. The child is
+/// killed if the budget elapses so a wedged SSH never outlives the tick.
+async fn fetch_inventory(ssh_target: &str, walk_disk: bool) -> Result<String, String> {
+    let budget = if walk_disk {
+        INVENTORY_BUDGET + DISK_WALK_BUDGET
+    } else {
+        INVENTORY_BUDGET
+    };
+    let argv = build_inventory_argv(ssh_target, INVENTORY_BUDGET.as_secs(), walk_disk);
     let mut cmd = Command::new("ssh");
     for arg in &argv {
         cmd.arg(arg);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
-    let result = timeout(PER_HOST_BUDGET, async { cmd.output().await }).await;
-    let output = match result {
+    let output = match timeout(budget, cmd.output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(format!("ssh: {e}")),
-        Err(_) => return Err("ssh inventory fetch timed out".into()),
+        Err(_) => {
+            return Err(format!(
+                "inventory timed out after {}s",
+                budget.as_secs()
+            ))
+        }
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -258,7 +354,14 @@ async fn fetch_inventory(ssh_target: &str) -> Result<String, String> {
 /// Arch/Ubuntu/etc. would silently break the poller for every user
 /// who installed via Settings → Hosts → Install, because
 /// non-interactive SSH shells don't put `~/.local/bin` on PATH).
-pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
+pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64, walk_disk: bool) -> Vec<String> {
+    // An env prefix rather than a flag: a daemon that predates the
+    // disk walk ignores the variable instead of rejecting the command.
+    let env_prefix = if walk_disk {
+        String::new()
+    } else {
+        format!("{SKIP_DISK_ENV}=1 ")
+    };
     vec![
         "-o".into(),
         "BatchMode=yes".into(),
@@ -273,14 +376,15 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> 
         // absolute-path fallback the poller silently degrades to
         // "no inventory" the moment a user installs via the desktop's
         // Install button.
-        "if command -v codemux-remote >/dev/null 2>&1 ; then \
-           codemux-remote workspace list ; \
-         elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
-           \"$HOME/.local/bin/codemux-remote\" workspace list ; \
-         else \
-           echo 'CMR_MISSING' >&2 ; exit 1 ; \
-         fi"
-        .into(),
+        format!(
+            "if command -v codemux-remote >/dev/null 2>&1 ; then \
+               {env_prefix}codemux-remote workspace list ; \
+             elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
+               {env_prefix}\"$HOME/.local/bin/codemux-remote\" workspace list ; \
+             else \
+               echo 'CMR_MISSING' >&2 ; exit 1 ; \
+             fi"
+        ),
     ]
 }
 
@@ -289,9 +393,25 @@ pub fn build_inventory_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> 
 /// any change there must be mirrored here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InventoryEnvelope {
-    #[allow(dead_code)] // recorded for debug logs only
+    /// The host's `gethostname`.
     pub host_id: String,
     pub workspaces: Vec<RemoteWorkspace>,
+    /// Host facts for the Devices page (`remote::host_status`). Older
+    /// daemons omit both; serde defaults them to `None`, which the
+    /// status store treats as "unknown".
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub remote_control_serving: Option<bool>,
+}
+
+impl InventoryEnvelope {
+    pub fn facts(&self) -> HostFacts {
+        HostFacts {
+            disk_bytes: self.disk_bytes,
+            remote_control_serving: self.remote_control_serving,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -540,7 +660,56 @@ mod tests {
         InventoryEnvelope {
             host_id: "test-host".into(),
             workspaces,
+            disk_bytes: None,
+            remote_control_serving: None,
         }
+    }
+
+    fn host(id: i64, server_id: Option<&str>) -> HostRecord {
+        HostRecord {
+            id,
+            server_id: server_id.map(Into::into),
+            name: format!("host-{id}"),
+            ssh_target: format!("user@host-{id}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            dirty: false,
+            last_seen_at: None,
+            disk_bytes: None,
+            disk_measured_at: None,
+        }
+    }
+
+    // ── host selection / disk cadence ───────────────────────────
+
+    #[test]
+    fn hosts_without_server_id_are_never_polled() {
+        // The no-network rule: an unsynced host gets no probe and no
+        // SSH session. Its card shows "not checked yet" until the host
+        // sync loop assigns a server_id.
+        let hosts = vec![host(1, None), host(2, Some("srv-2")), host(3, None)];
+        let polled: Vec<i64> = hosts_to_poll(&hosts).iter().map(|h| h.id).collect();
+        assert_eq!(polled, vec![2]);
+    }
+
+    #[test]
+    fn disk_walk_is_due_when_never_measured_or_stale() {
+        let now = DateTime::parse_from_rfc3339("2026-08-27T10:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(disk_walk_due(None, now), "never measured");
+        assert!(disk_walk_due(Some("not a timestamp"), now), "unparseable counts as never");
+        assert!(
+            !disk_walk_due(Some("2026-08-27T10:08:00Z"), now),
+            "two minutes old is fresh"
+        );
+        assert!(
+            !disk_walk_due(Some("2026-08-27T10:05:01Z"), now),
+            "just under five minutes is still fresh"
+        );
+        assert!(disk_walk_due(Some("2026-08-27T10:05:00Z"), now), "exactly five minutes");
+        assert!(disk_walk_due(Some("2026-08-27T09:00:00Z"), now), "an hour old");
     }
 
     // ── argv lock-in ────────────────────────────────────────────
@@ -551,7 +720,7 @@ mod tests {
         // entire reason this poller works on a freshly-installed
         // host — losing it would silently break the feature for
         // every user who installed via Settings → Hosts → Install.
-        let argv = build_inventory_argv("user@10.0.0.7", 15);
+        let argv = build_inventory_argv("user@10.0.0.7", 15, true);
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ConnectTimeout=15"));
         assert!(argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"));
@@ -570,6 +739,20 @@ mod tests {
             cmd.contains("workspace list"),
             "remote command must be the workspace list subcommand"
         );
+        assert!(
+            !cmd.contains(SKIP_DISK_ENV),
+            "a tick that wants the disk walk must not set the skip variable"
+        );
+    }
+
+    #[test]
+    fn build_inventory_argv_skips_disk_walk_via_env_prefix() {
+        let argv = build_inventory_argv("user@10.0.0.7", 15, false);
+        let cmd = argv.last().unwrap();
+        // Both branches of the PATH fallback carry the prefix, so the
+        // walk is skipped regardless of where the binary was found.
+        assert!(cmd.contains("CODEMUX_SKIP_DISK=1 codemux-remote workspace list"));
+        assert!(cmd.contains("CODEMUX_SKIP_DISK=1 \"$HOME/.local/bin/codemux-remote\" workspace list"));
     }
 
     // ── parse ──────────────────────────────────────────────────
@@ -601,6 +784,28 @@ mod tests {
         assert_eq!(w.name, "alpha");
         assert_eq!(w.branch.as_deref(), Some("main"));
         assert_eq!(w.project_root.as_deref(), Some("/srv/alpha-origin"));
+    }
+
+    #[test]
+    fn parse_inventory_json_reads_host_facts_when_present() {
+        let stdout = r#"{"host_id":"pandora","workspaces":[],"disk_bytes":42,"remote_control_serving":true}"#;
+        let facts = parse_inventory_json(stdout).unwrap().facts();
+        assert_eq!(facts.disk_bytes, Some(42));
+        assert_eq!(facts.remote_control_serving, Some(true));
+
+        // A skipped or over-budget walk reports an explicit null.
+        let stdout = r#"{"host_id":"pandora","workspaces":[],"disk_bytes":null,"remote_control_serving":false}"#;
+        let facts = parse_inventory_json(stdout).unwrap().facts();
+        assert_eq!(facts.disk_bytes, None);
+        assert_eq!(facts.remote_control_serving, Some(false));
+    }
+
+    #[test]
+    fn parse_inventory_json_tolerates_daemons_without_host_facts() {
+        let facts = parse_inventory_json(r#"{"host_id":"old","workspaces":[]}"#)
+            .unwrap()
+            .facts();
+        assert_eq!(facts, HostFacts::default());
     }
 
     #[test]

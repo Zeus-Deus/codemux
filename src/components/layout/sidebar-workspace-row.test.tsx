@@ -793,7 +793,7 @@ describe("Remote / attach-only rows: close instead of archive", () => {
     expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-remote", false);
     await waitFor(() =>
       expect(mockToast.success).toHaveBeenCalledWith(
-        'Closed "On host" — it stays available on its host in the Workspaces Overview',
+        'Closed "On host" — it stays available on its host under Devices',
       ),
     );
   });

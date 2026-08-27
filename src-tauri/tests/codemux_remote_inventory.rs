@@ -423,3 +423,64 @@ fn cli_to_reconcile_propagates_host_side_renames_and_closes() {
         Some(format!("cloud-{doomed_uid}").as_str())
     );
 }
+
+#[test]
+fn workspace_list_carries_host_facts_and_honours_skip_disk() {
+    // The Devices page facts ride in the same envelope as the
+    // inventory. `CODEMUX_SKIP_DISK=1` (an env prefix on the remote
+    // command, so old daemons ignore it) must turn the disk figure into
+    // an explicit null while everything else is unchanged.
+    let bin = binary_path();
+    if !bin.exists() {
+        return;
+    }
+
+    let state_tmp = TempDir::new().unwrap();
+    let state_dir = state_tmp.path();
+    let ws_dir = state_tmp.path().join("ws");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(ws_dir.join("payload"), vec![b'x'; 1234]).unwrap();
+    {
+        let store = WorkspaceStore::open(
+            &config::database_path(state_dir),
+            "test-host".into(),
+            config::workspaces_root(state_dir),
+        )
+        .unwrap();
+        store
+            .create(Some("sized".into()), ws_dir.display().to_string(), None, None)
+            .unwrap();
+    }
+
+    let run = |skip_disk: bool| {
+        let mut cmd = Command::new(&bin);
+        cmd.arg("workspace")
+            .arg("list")
+            .arg("--state-dir")
+            .arg(state_dir)
+            .env_remove("CODEMUX_SKIP_DISK");
+        if skip_disk {
+            cmd.env("CODEMUX_SKIP_DISK", "1");
+        }
+        let output = cmd.output().expect("spawn codemux-remote workspace list");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        parse_inventory_json(&String::from_utf8(output.stdout).unwrap()).unwrap()
+    };
+
+    let walked = run(false);
+    assert_eq!(walked.workspaces.len(), 1);
+    assert_eq!(
+        walked.facts().disk_bytes,
+        Some(1234),
+        "the walk sums the registered workspace directories"
+    );
+    assert!(
+        walked.facts().remote_control_serving.is_some(),
+        "a current daemon always answers the serving flag"
+    );
+
+    let skipped = run(true);
+    assert_eq!(skipped.workspaces.len(), 1, "the inventory itself is unaffected");
+    assert_eq!(skipped.facts().disk_bytes, None, "skip-disk must report null");
+    assert!(skipped.facts().remote_control_serving.is_some());
+}

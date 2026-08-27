@@ -93,8 +93,8 @@ export function EmptyWorkspaceState() {
   // A per-branch worktree can have its files removed; a repo root
   // (protected) or a non-worktree workspace (primary checkout, plain
   // folder, Home — `worktree_path` null) can only be closed. This mirrors
-  // `canRemoveWorktree` in the workspaces-overview row so the two delete
-  // affordances stay in lockstep with the backend's removal guard.
+  // the sidebar row's delete gate so the two affordances stay in lockstep
+  // with the backend's removal guard.
   const isWorktree = !!ws?.worktree_path;
   const isRepoRoot = ws?.protected === true;
   const canRemoveWorktree = isWorktree && !isRepoRoot;

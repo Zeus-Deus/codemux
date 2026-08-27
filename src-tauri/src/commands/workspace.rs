@@ -23,6 +23,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 
 /// Snapshot of the git fields written to a workspace by `populate_git_info`.
@@ -1249,6 +1250,74 @@ pub(crate) fn refuse_archived_file_delete(
     } else {
         None
     }
+}
+
+/// Overall budget for one `workspaces_worktree_sizes` call. The sweep
+/// dialog would rather show "size unknown" for a monster `node_modules`
+/// than wait on it; ids not sized in time come back `None`.
+const WORKTREE_SIZE_BUDGET: Duration = Duration::from_secs(5);
+
+/// The workspaces among `ids` the sweep may offer to delete, paired with
+/// the directory to size. Single authority: exactly the guards the
+/// close-with-worktree and archive paths enforce —
+/// [`refuse_worktree_removal`] (not protected, not the main checkout,
+/// has a worktree) and [`archive_refusal_reason`] (not attach-only, not
+/// remote) — plus "the worktree still exists on disk". Ids that don't
+/// qualify or don't resolve are simply absent. Pure apart from the
+/// `is_dir` stat, so the command can compute it from a snapshot and walk
+/// on the blocking pool afterwards.
+fn disposable_worktree_targets(
+    snapshot: &AppStateSnapshot,
+    ids: &[String],
+) -> Vec<(String, PathBuf)> {
+    ids.iter()
+        .filter_map(|id| {
+            let ws = snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id)?;
+            if refuse_worktree_removal(ws).is_some() || archive_refusal_reason(ws).is_some() {
+                return None;
+            }
+            let path = PathBuf::from(ws.worktree_path.as_deref()?);
+            if !path.is_dir() {
+                return None;
+            }
+            Some((id.clone(), path))
+        })
+        .collect()
+}
+
+/// Size each target independently against one shared deadline. Every
+/// target keeps its key; a walk cut off by the deadline (or any later
+/// target, which never starts) yields `None` so the caller can say
+/// "qualifies, size unknown" rather than dropping the row.
+fn size_worktree_targets(
+    targets: Vec<(String, PathBuf)>,
+    deadline: Instant,
+) -> std::collections::HashMap<String, Option<u64>> {
+    targets
+        .into_iter()
+        .map(|(id, path)| (id, crate::fs_size::dir_size_bounded(&path, Some(deadline))))
+        .collect()
+}
+
+/// On-disk size of each sweepable worktree in `workspace_ids`, keyed by
+/// workspace id. A key is present iff the workspace qualifies for the
+/// sweep (see [`disposable_worktree_targets`]); its value is `None` when
+/// the size walk ran out of budget. The walk runs on the blocking pool
+/// with no lock held: a large `node_modules` must not stall state access
+/// or the UI thread.
+#[tauri::command]
+pub async fn workspaces_worktree_sizes(
+    state: State<'_, AppStateStore>,
+    workspace_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, Option<u64>>, String> {
+    let targets = {
+        let snapshot = state.snapshot();
+        disposable_worktree_targets(&snapshot, &workspace_ids)
+    };
+    let deadline = Instant::now() + WORKTREE_SIZE_BUDGET;
+    tokio::task::spawn_blocking(move || size_worktree_targets(targets, deadline))
+        .await
+        .map_err(|e| format!("worktree size walk failed: {e}"))
 }
 
 /// Central archivability decision: `Some(reason)` when `ws` must not
@@ -3924,5 +3993,119 @@ mod worktree_adopt_tests {
             "the adopter must resolve to the creator's workspace id"
         );
         assert_eq!(created[0], claimants[0]);
+    }
+}
+
+#[cfg(test)]
+mod worktree_size_tests {
+    //! `workspaces_worktree_sizes` must only ever size a worktree the
+    //! sweep could delete — the same set the close-with-worktree and
+    //! archive guards allow. Sizing a protected root would invite a
+    //! "free up 2 GB" affordance on the user's primary checkout.
+
+    use super::*;
+    use crate::state::AppStateStore;
+
+    /// A snapshot with one disposable worktree workspace per id, each
+    /// pointing at a real temp directory, that the individual tests then
+    /// mutate into the refused shapes.
+    fn snapshot_with(ids: &[&str], dir: &Path) -> (AppStateSnapshot, Vec<String>) {
+        let store = AppStateStore::default();
+        let mut created = Vec::new();
+        for id in ids {
+            let wt = dir.join(id);
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::write(wt.join("f"), b"12345").unwrap();
+            let ws_id = store.create_workspace_at_path(wt.clone());
+            store.set_workspace_worktree(&ws_id.0, wt.display().to_string(), (*id).to_string());
+            created.push(ws_id.0);
+        }
+        let mut snapshot = store.snapshot();
+        for ws in snapshot.workspaces.iter_mut() {
+            ws.protected = false;
+            ws.workspace_kind = Some("worktree".into());
+            ws.attach_only = false;
+            ws.host_id = None;
+        }
+        (snapshot, created)
+    }
+
+    #[test]
+    fn sizes_only_disposable_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut snapshot, ids) = snapshot_with(
+            &["ok", "protected", "attach", "remote", "root", "main", "gone"],
+            dir.path(),
+        );
+        for ws in snapshot.workspaces.iter_mut() {
+            match ws.title.as_str() {
+                "protected" => ws.protected = true,
+                "attach" => ws.attach_only = true,
+                "remote" => ws.host_id = Some(7),
+                "root" => ws.worktree_path = None,
+                "main" => ws.workspace_kind = Some("main".into()),
+                "gone" => ws.worktree_path = Some(dir.path().join("missing").display().to_string()),
+                _ => {}
+            }
+        }
+        let mut requested = ids.clone();
+        requested.push("no-such-workspace".into());
+
+        let targets = disposable_worktree_targets(&snapshot, &requested);
+        let titles: Vec<&str> = targets
+            .iter()
+            .map(|(id, _)| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| &w.workspace_id.0 == id)
+                    .unwrap()
+                    .title
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(titles, vec!["ok"], "only the plain unprotected worktree qualifies");
+        assert_eq!(targets[0].1, dir.path().join("ok"));
+
+        // The predicate is exactly the guards the delete paths use, so
+        // every qualifying target passes both.
+        for (id, _) in &targets {
+            let ws = snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id).unwrap();
+            assert!(refuse_worktree_removal(ws).is_none());
+            assert!(archive_refusal_reason(ws).is_none());
+        }
+
+        let sizes = size_worktree_targets(targets, Instant::now() + Duration::from_secs(30));
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes.values().next().copied(), Some(Some(5)));
+    }
+
+    #[test]
+    fn ids_not_requested_are_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (snapshot, ids) = snapshot_with(&["a", "b"], dir.path());
+        let targets = disposable_worktree_targets(&snapshot, &ids[..1]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, ids[0]);
+    }
+
+    #[test]
+    fn expired_budget_keeps_keys_with_unknown_size() {
+        // The contract: key present = qualifies; null = size unknown.
+        // A deadline hit must not make a qualifying worktree vanish
+        // from the sweep list.
+        let dir = tempfile::tempdir().unwrap();
+        let (snapshot, ids) = snapshot_with(&["a", "b"], dir.path());
+        // Enough entries that the walk's periodic clock check fires.
+        for i in 0..700 {
+            std::fs::write(dir.path().join("a").join(format!("f{i}")), b"x").unwrap();
+        }
+        let targets = disposable_worktree_targets(&snapshot, &ids);
+        let sizes = size_worktree_targets(targets, Instant::now() - Duration::from_secs(1));
+        assert_eq!(sizes.len(), 2, "both qualifying ids keep their key");
+        assert_eq!(sizes[&ids[0]], None, "the big one ran out of budget");
+        // The small one has too few entries to reach a clock check, so
+        // it still sizes; what matters is that no key disappeared.
+        assert!(sizes.contains_key(&ids[1]));
     }
 }
