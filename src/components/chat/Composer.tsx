@@ -105,6 +105,10 @@ const EMPTY_FOLDER_MATCHES: FolderMatch[] = [];
 const EMPTY_ISSUE_MATCHES: GitHubIssue[] = [];
 const EMPTY_PR_MATCHES: PullRequestInfo[] = [];
 const EMPTY_SESSION_MATCHES: AgentChatSessionMention[] = [];
+/** Chat rows shown above FILES on a bare `@`. Small on purpose: the
+ *  group exists to advertise handoffs, not to compete with file
+ *  search. `@session:` shows the unfiltered list. */
+const BARE_MENTION_SESSION_ROWS = 3;
 /** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
  *  typing doesn't flood the backend during the popup's open lifetime. */
 const MENTION_FETCH_DEBOUNCE_MS = 100;
@@ -127,7 +131,14 @@ const ATTACHMENT_SOFT_LIMIT = 10;
  *  insert an inline `@<basename>` token on pick; `issue` and `pr`
  *  swap the row pipeline for a dedicated picker panel that owns
  *  search + state colours. */
-type AttachSubmode = "main" | "file" | "folder" | "issue" | "pr" | "mcp";
+type AttachSubmode =
+  | "main"
+  | "file"
+  | "folder"
+  | "issue"
+  | "pr"
+  | "mcp"
+  | "session";
 
 interface Props {
   draft: string;
@@ -455,6 +466,10 @@ export function Composer({
   const [mentionHighlighted, setMentionHighlighted] = useState<string | null>(
     null,
   );
+  /** True once the user has moved the mention highlight themselves
+   *  with the arrow keys. Until then the highlight is ours to re-pick
+   *  as late-arriving matches land — see the auto-highlight effect. */
+  const mentionHighlightPinnedRef = useRef(false);
   const [fileMatches, setFileMatches] = useState<FileMatch[]>(EMPTY_FILE_MATCHES);
   /** Step 8 Stage 4 — `@issue:` mode. The mention popup decodes the
    *  category prefix on every keystroke; when it lands on `issue`
@@ -503,6 +518,14 @@ export function Composer({
   const [attachFolderMatches, setAttachFolderMatches] = useState<FolderMatch[]>(
     EMPTY_FOLDER_MATCHES,
   );
+  // `+ → Chat…` submode. Mirrors the file/folder submode pattern
+  // (own cached match array, fetched on submode entry) rather than
+  // sharing the mention popup's state, so the two surfaces can be
+  // open-and-stale independently.
+  const [attachSessionMatches, setAttachSessionMatches] = useState<
+    AgentChatSessionMention[]
+  >(EMPTY_SESSION_MATCHES);
+  const [attachSessionsLoading, setAttachSessionsLoading] = useState(false);
   // (issue submode renders <IssuePickerPanel /> directly, which
   // owns its own list + loading + error state — no flat-row state
   // needed at the Composer level.)
@@ -882,8 +905,20 @@ export function Composer({
   // filesystem scraping. One workspace-scoped query supplies every provider's
   // persisted conversations; adding another GUI provider therefore requires
   // no picker changes as long as it writes the standard session records.
+  //
+  // Fetched for the bare `@` query too, not just `@session:`. The
+  // prefix is not discoverable on its own — a user who never types it
+  // never learns handoffs exist — so the default mention list carries
+  // a short CHATS group above FILES and `@session:` stays as the way
+  // to see every conversation.
   useEffect(() => {
-    if (!mentionOpen || parsedMention.category !== "session") return;
+    if (!mentionOpen) return;
+    if (
+      parsedMention.category !== "session" &&
+      parsedMention.category !== "file"
+    ) {
+      return;
+    }
     if (!workspaceId) {
       setMentionSessionMatches(EMPTY_SESSION_MATCHES);
       setMentionSessionsLoading(false);
@@ -918,6 +953,7 @@ export function Composer({
   const closeMention = useCallback(() => {
     setMentionAnchor(null);
     setMentionHighlighted(null);
+    mentionHighlightPinnedRef.current = false;
     setFileMatches(EMPTY_FILE_MATCHES);
     setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
     setMentionPrMatches(EMPTY_PR_MATCHES);
@@ -1053,6 +1089,33 @@ export function Composer({
     };
   }, [attachOpen, attachSubmode, cwd]);
 
+  // `+ → Chat…` — same lazy-on-submode-entry shape as file/folder.
+  // Workspace-scoped (not cwd-scoped) so conversations from sibling
+  // worktrees stay reachable; the row's own copy says which checkout
+  // each one came from.
+  useEffect(() => {
+    if (!attachOpen || attachSubmode !== "session") return;
+    if (!workspaceId) {
+      setAttachSessionMatches(EMPTY_SESSION_MATCHES);
+      return;
+    }
+    let cancelled = false;
+    setAttachSessionsLoading(true);
+    void agentChatListSessionMentions(workspaceId, cwd, threadId, 30)
+      .then((sessions) => {
+        if (!cancelled) setAttachSessionMatches(sessions);
+      })
+      .catch(() => {
+        if (!cancelled) setAttachSessionMatches(EMPTY_SESSION_MATCHES);
+      })
+      .finally(() => {
+        if (!cancelled) setAttachSessionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachOpen, attachSubmode, workspaceId, cwd, threadId]);
+
   // Lazy-fetch the `+` popup's file/folder list when its submode
   // changes. Uses alphabetical ordering (no live search) — the user
   // searches via `@`. 30 entries is the popup's browse cap. The
@@ -1090,23 +1153,23 @@ export function Composer({
     };
   }, [attachOpen, attachSubmode, cwd]);
 
-  // Build SlashCommandItem[] from the fuzzy matches. The popup
-  // component renders these generically — no file-specific knowledge.
-  // `onSelect` is intentionally a no-op here because the popup-side
-  // dispatch goes through `handleMentionPopupSelect`, which has the
-  // full anchor + draft state in scope (the per-item closure would
-  // capture stale values otherwise).
-  // Stage 4 — branched by `parsedMention.category`. The id prefix
-  // (`file:` vs `issue:`) routes the pick handler.
-  const mentionItems = useMemo<SlashCommandItem[]>(() => {
-    if (parsedMention.category === "session") {
-      const filter = parsedMention.filter.trim().toLowerCase();
+  // Session rows, shared by three surfaces: the `@session:` list, the
+  // capped CHATS group on a bare `@`, and the `+ → Chat…` submode.
+  // `group` and `limit` are the only things that differ between them.
+  const buildSessionRows = useCallback(
+    (
+      sessions: AgentChatSessionMention[],
+      rawFilter: string,
+      options: { group?: string; limit?: number; idPrefix?: string } = {},
+    ): SlashCommandItem[] => {
+      const { group, limit, idPrefix = "session" } = options;
+      const filter = rawFilter.trim().toLowerCase();
       const alreadyAttached = new Set(
         stagedAttachments
           .filter((attachment) => attachment.kind === "session")
           .map((attachment) => attachment.ref),
       );
-      return mentionSessionMatches
+      const matched = sessions
         .filter((session) => !alreadyAttached.has(session.thread_id))
         .filter((session) => {
           if (!filter) return true;
@@ -1116,8 +1179,9 @@ export function Composer({
             session.provider,
             session.cwd ?? "",
           ].some((value) => value.toLowerCase().includes(filter));
-        })
-        .map((session) => {
+        });
+      return (typeof limit === "number" ? matched.slice(0, limit) : matched).map(
+        (session) => {
           const timestamp = parseSqliteTimestamp(session.last_active_at);
           const when = Number.isFinite(timestamp)
             ? relativeTime(new Date(timestamp))
@@ -1134,7 +1198,7 @@ export function Composer({
                     ? "text-chart-4"
                     : "text-muted-foreground";
           return {
-            id: `session:${session.thread_id}`,
+            id: `${idPrefix}:${session.thread_id}`,
             label: sessionMentionTitle(session),
             description:
               compactSessionPreview(session.preview) ||
@@ -1142,10 +1206,12 @@ export function Composer({
             command: `@session:${sessionMentionToken(session)}`,
             icon: MessagesSquare,
             iconClassName: providerTint,
-            group: cwd && session.cwd === cwd ? "CURRENT CHECKOUT" : "WORKSPACE",
+            group:
+              group ??
+              (cwd && session.cwd === cwd ? "CURRENT CHECKOUT" : "WORKSPACE"),
             stacked: true,
             rightAdornment: (
-              <span className="flex h-full min-w-24 flex-col items-end justify-center leading-none">
+              <span className="flex h-full min-w-20 flex-col items-end justify-center leading-none">
                 <span className="text-[10px] font-medium text-foreground/70">
                   {sessionProviderLabel(session.provider)}
                 </span>
@@ -1156,7 +1222,23 @@ export function Composer({
             ),
             onSelect: () => {},
           };
-        });
+        },
+      );
+    },
+    [stagedAttachments, cwd],
+  );
+
+  // Build SlashCommandItem[] from the fuzzy matches. The popup
+  // component renders these generically — no file-specific knowledge.
+  // `onSelect` is intentionally a no-op here because the popup-side
+  // dispatch goes through `handleMentionPopupSelect`, which has the
+  // full anchor + draft state in scope (the per-item closure would
+  // capture stale values otherwise).
+  // Stage 4 — branched by `parsedMention.category`. The id prefix
+  // (`file:` vs `issue:`) routes the pick handler.
+  const mentionItems = useMemo<SlashCommandItem[]>(() => {
+    if (parsedMention.category === "session") {
+      return buildSessionRows(mentionSessionMatches, parsedMention.filter);
     }
     if (parsedMention.category === "issue") {
       // Match the IssuePickerPanel's visual language so users see
@@ -1214,22 +1296,33 @@ export function Composer({
         };
       });
     }
-    return fileMatches.map((match) => ({
-      id: `file:${match.absolute_path}`,
-      label: match.path,
-      command: `@${basename(match.path)}`,
-      icon: FileIcon,
-      group: "FILES",
-      onSelect: () => {},
-    }));
+    // Default (bare `@`) — files, preceded by a short CHATS group so
+    // handoffs are discoverable without knowing the `@session:`
+    // prefix. Capped at three: enough to advertise the affordance,
+    // small enough that file search stays the dominant result set.
+    // `@session:` remains the way to browse all of them.
+    return [
+      ...buildSessionRows(mentionSessionMatches, parsedMention.filter, {
+        group: "CHATS",
+        limit: BARE_MENTION_SESSION_ROWS,
+      }),
+      ...fileMatches.map((match) => ({
+        id: `file:${match.absolute_path}`,
+        label: match.path,
+        command: `@${basename(match.path)}`,
+        icon: FileIcon,
+        group: "FILES",
+        onSelect: () => {},
+      })),
+    ];
   }, [
     parsedMention.category,
+    parsedMention.filter,
     mentionIssueMatches,
     mentionPrMatches,
     mentionSessionMatches,
     fileMatches,
-    stagedAttachments,
-    cwd,
+    buildSessionRows,
   ]);
 
   // Why the hosting affordances are inert, in the product's own words:
@@ -1341,15 +1434,23 @@ export function Composer({
         message: "Open this chat in a project to attach files.",
       };
     }
+    // Bare `@` — name the prefix that opens the full list, since the
+    // CHATS group above is deliberately only a few rows deep.
+    if (mentionItems.some((item) => item.id.startsWith("session:"))) {
+      return {
+        tone: "muted" as const,
+        message: "Type @session: to browse every chat in this workspace.",
+      };
+    }
     return null;
   }, [
     parsedMention.category,
     parsedMention.filter,
+    mentionItems,
     workspaceId,
     stagedAttachments,
     mentionSessionsLoading,
     mentionSessionsError,
-    mentionItems.length,
     provider,
     cwd,
     repoSupported,
@@ -1451,6 +1552,22 @@ export function Composer({
           onSelect: () => {},
         },
         {
+          id: "attach:session",
+          label: "Chat…",
+          // Local + provider-neutral, so unlike Issue/PR this row has
+          // no CLI or repo-host preflight to fail — only a workspace
+          // to belong to.
+          description: workspaceId
+            ? "Hand off another conversation's context"
+            : "Open a workspace to attach a conversation",
+          command: "",
+          icon: MessagesSquare,
+          tone: "muted",
+          group: "ATTACH",
+          disabled: !workspaceId,
+          onSelect: () => {},
+        },
+        {
           id: "attach:issue",
           label: `${scProvider.name} Issue…`,
           // Stage 4 — flavoured disabled-state copy so the user knows
@@ -1533,6 +1650,14 @@ export function Composer({
       });
       return rows;
     }
+    if (attachSubmode === "session") {
+      // The menu's own search box filters these rows, so the builder
+      // gets an empty filter and does no matching of its own.
+      return buildSessionRows(attachSessionMatches, "", {
+        group: "CHATS",
+        idPrefix: "attach-session",
+      });
+    }
     if (attachSubmode === "file") {
       return attachFileMatches.map((match) => ({
         id: `attach-file:${match.absolute_path}`,
@@ -1561,6 +1686,9 @@ export function Composer({
     attachSubmode,
     attachFileMatches,
     attachFolderMatches,
+    attachSessionMatches,
+    buildSessionRows,
+    workspaceId,
     attachMcpServers,
     mcpRuntimes,
     mcpDisabledIds,
@@ -1575,6 +1703,24 @@ export function Composer({
 
   const attachPopupFooter = useMemo(() => {
     if (attachSubmode === "main") return null;
+    if (attachSubmode === "session") {
+      if (attachSessionsLoading && attachSessionMatches.length === 0) {
+        return {
+          tone: "muted" as const,
+          message: "Finding conversations in this workspace… (Esc to go back)",
+        };
+      }
+      if (attachSessionMatches.length === 0) {
+        return {
+          tone: "muted" as const,
+          message: "No other conversations in this workspace yet.",
+        };
+      }
+      return {
+        tone: "muted" as const,
+        message: `Shares visible chat prose with ${sessionProviderLabel(provider)} · tools and hidden reasoning stay private.`,
+      };
+    }
     if (!cwd) {
       return {
         tone: "muted" as const,
@@ -1602,6 +1748,9 @@ export function Composer({
     cwd,
     attachFileMatches.length,
     attachFolderMatches.length,
+    attachSessionMatches.length,
+    attachSessionsLoading,
+    provider,
   ]);
 
   // Rows the command menu actually shows for the current query.
@@ -1650,6 +1799,11 @@ export function Composer({
       }
       if (item.id === "attach:pr") {
         setAttachSubmode("pr");
+        setAttachQuery("");
+        return;
+      }
+      if (item.id === "attach:session") {
+        setAttachSubmode("session");
         setAttachQuery("");
         return;
       }
@@ -1742,6 +1896,21 @@ export function Composer({
         closeAttachPopup();
         return;
       }
+      // Chat picks — same inline-token + stage-the-chip contract as
+      // the `@session:` path, so a handoff picked from `+` and one
+      // picked from `@` produce an identical draft.
+      if (item.id.startsWith("attach-session:")) {
+        const sourceThreadId = item.id.slice("attach-session:".length);
+        const session = attachSessionMatches.find(
+          (candidate) => candidate.thread_id === sourceThreadId,
+        );
+        if (session) {
+          insertInlineToken(`session:${sessionMentionToken(session)}`);
+          onAttachSession?.(session);
+        }
+        closeAttachPopup();
+        return;
+      }
       // Note: issue picks are handled by IssuePickerPanel directly,
       // not via this items pipeline. The pivot above
       // (`attach:issue` → setAttachSubmode("issue")) is the only
@@ -1750,22 +1919,45 @@ export function Composer({
     [
       attachFileMatches,
       attachFolderMatches,
+      attachSessionMatches,
       insertInlineToken,
       insertAtCursor,
       closeAttachPopup,
       onAttachFile,
       onAttachFolder,
+      onAttachSession,
       onModeActivate,
     ],
   );
 
   // Keep the highlighted file id valid as the match list shifts.
+  //
+  // On a bare `@` the CHATS group renders first (that's what makes it
+  // discoverable), but the default highlight deliberately skips it:
+  // `@foo` + Enter has always meant "the top file match", and silently
+  // attaching a whole conversation instead would be a nasty surprise.
+  // Under `@session:` the chat rows ARE the list, so the first row wins
+  // as usual.
   useEffect(() => {
     if (!mentionOpen) return;
     const ids = mentionItems.map((item) => item.id);
-    if (mentionHighlighted && ids.includes(mentionHighlighted)) return;
-    setMentionHighlighted(ids[0] ?? null);
-  }, [mentionOpen, mentionItems, mentionHighlighted]);
+    const autoPick =
+      parsedMention.category === "file"
+        ? (ids.find((id) => !id.startsWith("session:")) ?? ids[0] ?? null)
+        : (ids[0] ?? null);
+    if (mentionHighlighted && ids.includes(mentionHighlighted)) {
+      // The highlight is still valid. Re-pick it anyway in exactly one
+      // case: we auto-landed on a chat row because chat results (a
+      // local query) beat the file scan, and files have since arrived.
+      const strandedOnChat =
+        !mentionHighlightPinnedRef.current &&
+        parsedMention.category === "file" &&
+        mentionHighlighted.startsWith("session:") &&
+        autoPick !== mentionHighlighted;
+      if (!strandedOnChat) return;
+    }
+    setMentionHighlighted(autoPick);
+  }, [mentionOpen, mentionItems, mentionHighlighted, parsedMention.category]);
 
   /** Replace the typed `@<query>` with the picked token + trailing
    *  space and keep the cursor right after the insertion. Shared
@@ -2149,7 +2341,10 @@ export function Composer({
           const ids = mentionItems.map((i) => i.id);
           const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : -1;
           const next = ids[(idx + 1) % ids.length];
-          if (next) setMentionHighlighted(next);
+          if (next) {
+            mentionHighlightPinnedRef.current = true;
+            setMentionHighlighted(next);
+          }
           return;
         }
         if (e.key === "ArrowUp") {
@@ -2157,7 +2352,10 @@ export function Composer({
           const ids = mentionItems.map((i) => i.id);
           const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : 0;
           const next = ids[(idx - 1 + ids.length) % ids.length];
-          if (next) setMentionHighlighted(next);
+          if (next) {
+            mentionHighlightPinnedRef.current = true;
+            setMentionHighlighted(next);
+          }
           return;
         }
         if (e.key === "Enter" && !e.shiftKey) {
@@ -2325,6 +2523,10 @@ export function Composer({
           <SlashCommandPopup
             items={mentionItems}
             highlightedId={mentionHighlighted}
+            // NOT a pin: cmdk fires `onValueChange` for its own
+            // internal re-selection (list churn), not just hover, so
+            // treating it as user intent would freeze the auto-pick
+            // below on whichever row happened to arrive first.
             onHighlightChange={setMentionHighlighted}
             onSelect={handleMentionPopupSelect}
             open={mentionOpen}
@@ -2396,7 +2598,9 @@ export function Composer({
                     ? "Filter folders"
                     : attachSubmode === "mcp"
                       ? "Filter servers"
-                      : "Search or type /"
+                      : attachSubmode === "session"
+                        ? "Filter chats"
+                        : "Search or type /"
               }
             />
           )}

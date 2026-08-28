@@ -150,12 +150,24 @@ export function SlashCommandPopup({
         <ScrollArea
           type="always"
           className={cn(
-            "max-h-80",
+            "max-h-80 w-full",
             // Viewport: cap height + force the inner div cmdk renders
             // to sit on a single block (cmdk's <Command> spreads
             // multi-children inside CommandList; the viewport's
             // default flex layout otherwise stretches a single child).
             "[&>[data-slot=scroll-area-viewport]]:max-h-80",
+            // Radix's viewport wraps children in a `display: table;
+            // min-width: 100%` div (inline styles). A table box is
+            // shrink-to-fit, so any row wider than the popup — a long
+            // chat title plus its provider/timestamp adornment —
+            // stretches the table past 100% and gets clipped by the
+            // wrapper's `overflow-hidden` instead of truncating.
+            // Forcing the wrapper back to a plain full-width block
+            // gives `truncate` a definite width to work against.
+            // `!` is required: these override inline styles.
+            "[&>[data-slot=scroll-area-viewport]>div]:!block",
+            "[&>[data-slot=scroll-area-viewport]>div]:!w-full",
+            "[&>[data-slot=scroll-area-viewport]>div]:!min-w-0",
             // Scrollbar: solid track + visible thumb in the popover's
             // contrast tier so it reads against the dark popup bg.
             "[&_[data-slot=scroll-area-scrollbar]]:w-2",

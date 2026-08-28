@@ -18,6 +18,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
     ...actual,
     listProjectFiles: vi.fn(),
     listGithubIssuesByPath: vi.fn().mockResolvedValue([]),
+    agentChatListSessionMentions: vi.fn().mockResolvedValue([]),
     getGithubIssueByPath: vi.fn(),
     // Skills loader is unrelated but the Composer pulls it from the
     // store on slash-popup open; stub it so we don't trip the real
@@ -28,10 +29,12 @@ vi.mock("@/tauri/commands", async (importActual) => {
 
 import { Composer } from "./Composer";
 import {
+  agentChatListSessionMentions,
   getGithubIssueByPath,
   listGithubIssuesByPath,
   listProjectFiles,
 } from "@/tauri/commands";
+import type { AgentChatSessionMention } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 
 type ComposerProps = ComponentProps<typeof Composer>;
@@ -42,6 +45,24 @@ const listGithubIssuesMock =
   listGithubIssuesByPath as unknown as ReturnType<typeof vi.fn>;
 const getGithubIssueMock =
   getGithubIssueByPath as unknown as ReturnType<typeof vi.fn>;
+const listSessionMentionsMock =
+  agentChatListSessionMentions as unknown as ReturnType<typeof vi.fn>;
+
+function makeSession(
+  overrides: Partial<AgentChatSessionMention> = {},
+): AgentChatSessionMention {
+  return {
+    thread_id: "thread-aaa111",
+    workspace_id: "workspace-1",
+    cwd: "/repo",
+    provider: "codex",
+    title: "Harden authentication",
+    last_active_at: new Date().toISOString(),
+    preview: "Implemented refresh token rotation.",
+    message_count: 12,
+    ...overrides,
+  };
+}
 
 function makeIssue(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
   return {
@@ -144,6 +165,8 @@ beforeEach(() => {
   listGithubIssuesMock.mockReset();
   listGithubIssuesMock.mockResolvedValue([]);
   getGithubIssueMock.mockReset();
+  listSessionMentionsMock.mockReset();
+  listSessionMentionsMock.mockResolvedValue([]);
 });
 
 afterEach(() => cleanup());
@@ -409,5 +432,136 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
         "svg.lucide-circle-check.text-muted-foreground",
       ).length,
     ).toBe(1);
+  });
+});
+
+
+describe("bare @ chats group", () => {
+  const WORKSPACE = { workspaceId: "workspace-1", threadId: "current-thread" };
+
+  it("shows chats above files on a bare @ without the session: prefix", async () => {
+    listProjectFilesMock.mockResolvedValue([makeMatch()]);
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { findByTestId, container } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@");
+
+    await findByTestId("slash-item-session:thread-aaa111");
+    await findByTestId("slash-item-file:/repo/src/components/chat/Composer.tsx");
+    const headings = Array.from(
+      container.querySelectorAll("[cmdk-group-heading]"),
+    ).map((el) => el.textContent);
+    expect(headings).toEqual(["CHATS", "FILES"]);
+  });
+
+  it("caps the bare-@ chats group so file search stays dominant", async () => {
+    listProjectFilesMock.mockResolvedValue([makeMatch()]);
+    listSessionMentionsMock.mockResolvedValue([
+      makeSession({ thread_id: "t-1", title: "One" }),
+      makeSession({ thread_id: "t-2", title: "Two" }),
+      makeSession({ thread_id: "t-3", title: "Three" }),
+      makeSession({ thread_id: "t-4", title: "Four" }),
+    ]);
+    const { findByTestId, queryByTestId } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@");
+
+    await findByTestId("slash-item-session:t-3");
+    expect(queryByTestId("slash-item-session:t-4")).toBeNull();
+  });
+
+  it("shows every match under @session:, ignoring the bare-@ cap", async () => {
+    listSessionMentionsMock.mockResolvedValue([
+      makeSession({ thread_id: "t-1", title: "One" }),
+      makeSession({ thread_id: "t-2", title: "Two" }),
+      makeSession({ thread_id: "t-3", title: "Three" }),
+      makeSession({ thread_id: "t-4", title: "Four" }),
+    ]);
+    const { findByTestId } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@session:");
+    expect(await findByTestId("slash-item-session:t-4")).toBeInTheDocument();
+  });
+
+  it("filters the chats group by the same text that filters files", async () => {
+    listProjectFilesMock.mockResolvedValue([]);
+    listSessionMentionsMock.mockResolvedValue([
+      makeSession({ thread_id: "t-1", title: "Harden authentication" }),
+      makeSession({ thread_id: "t-2", title: "Search indexing" }),
+    ]);
+    const { findByTestId, queryByTestId } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@harden");
+    await findByTestId("slash-item-session:t-1");
+    expect(queryByTestId("slash-item-session:t-2")).toBeNull();
+  });
+
+  it("keeps the default highlight on the top file when chats resolve first", async () => {
+    // Chats come from a local query and land well before the file
+    // scan. `@foo` + Enter has always meant "top file match" — an
+    // auto-highlighted chat row would silently attach a whole
+    // conversation instead.
+    let resolveFiles: (matches: FileMatch[]) => void = () => {};
+    listProjectFilesMock.mockReturnValue(
+      new Promise<FileMatch[]>((resolve) => {
+        resolveFiles = resolve;
+      }),
+    );
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { findByTestId } = renderComposer(WORKSPACE);
+    // Matches both the chat title and (via the stubbed backend) a file.
+    typeIntoTextarea("@harden");
+
+    const chatRow = await findByTestId("slash-item-session:thread-aaa111");
+    expect(chatRow).toHaveAttribute("data-selected", "true");
+
+    resolveFiles([makeMatch()]);
+    const fileRow = await findByTestId(
+      "slash-item-file:/repo/src/components/chat/Composer.tsx",
+    );
+    await waitFor(() => {
+      expect(fileRow).toHaveAttribute("data-selected", "true");
+    });
+    expect(chatRow).toHaveAttribute("data-selected", "false");
+  });
+
+  it("respects an arrow-key highlight when files land afterwards", async () => {
+    // The auto-pick above must not fight the user: once they have
+    // moved the highlight themselves, a late file result leaves it
+    // where they put it.
+    let resolveFiles: (matches: FileMatch[]) => void = () => {};
+    listProjectFilesMock.mockReturnValue(
+      new Promise<FileMatch[]>((resolve) => {
+        resolveFiles = resolve;
+      }),
+    );
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { findByTestId } = renderComposer(WORKSPACE);
+    const textarea = typeIntoTextarea("@harden");
+
+    const chatRow = await findByTestId("slash-item-session:thread-aaa111");
+    fireEvent.keyDown(textarea, { key: "ArrowDown" });
+    expect(chatRow).toHaveAttribute("data-selected", "true");
+
+    resolveFiles([makeMatch()]);
+    await findByTestId("slash-item-file:/repo/src/components/chat/Composer.tsx");
+    expect(chatRow).toHaveAttribute("data-selected", "true");
+  });
+
+  it("inserts the session token when a bare-@ chat row is picked", async () => {
+    listProjectFilesMock.mockResolvedValue([]);
+    const session = makeSession();
+    listSessionMentionsMock.mockResolvedValue([session]);
+    const onAttachSession = vi.fn();
+    const onDraftChange = vi.fn();
+    const { findByTestId } = renderControlled({
+      ...WORKSPACE,
+      onAttachSession,
+      onDraftChange,
+    });
+    typeIntoTextarea("@");
+    fireEvent.click(await findByTestId("slash-item-session:thread-aaa111"));
+
+    expect(onAttachSession).toHaveBeenCalledWith(session);
+    const calls = onDraftChange.mock.calls;
+    expect(calls[calls.length - 1]?.[0]).toBe(
+      "@session:harden-authentication-aaa111 ",
+    );
   });
 });
