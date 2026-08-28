@@ -683,3 +683,95 @@ describe("cursor hydrate — read-after-attach", () => {
     expect(transcript()).toEqual(["seed", "row-11"]);
   });
 });
+
+/**
+ * The liveness probe's failure mode.
+ *
+ * `agent_chat_turn_active` rejects for reasons unrelated to liveness — the
+ * feature flag being off, a `provider_not_configured` registry miss during
+ * startup. The old `.catch(() => false)` turned every one of those into
+ * "the run is dead", which is the single answer that flips a healthy
+ * transcript to "Run interrupted" with a Continue chip.
+ */
+describe("cursor hydrate — the turn-active probe", () => {
+  beforeEach(() => {
+    useAgentChatStore.setState({ threads: {} });
+  });
+
+  /** A warm slice mid-run: streaming, with its last turn settled by an
+   *  interim `turn_completed` (the provider yielded on delegated work). */
+  function seedStreamingSlice(cursor: number) {
+    const store = useAgentChatStore.getState();
+    store.ensureThread(THREAD);
+    store.applyEvent(THREAD, {
+      type: "user_message",
+      thread_id: THREAD,
+      text: "go",
+    } as ProviderRuntimeEvent);
+    store.applyEvent(THREAD, {
+      type: "session_state_changed",
+      thread_id: THREAD,
+      status: { status: "running" },
+    } as ProviderRuntimeEvent);
+    useAgentChatStore.setState((state) => ({
+      threads: {
+        ...state.threads,
+        [THREAD]: { ...state.threads[THREAD], lastPersistedEventId: cursor },
+      },
+    }));
+    expect(useAgentChatStore.getState().threads[THREAD].streaming).toBe(true);
+  }
+
+  it("a rejected probe does not mark a live thread interrupted", async () => {
+    seedStreamingSlice(10);
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async (_t, afterId) =>
+        afterId === null ? [] : [row(11, assistantEvent("still working"))],
+      headId: async () => 11,
+      turnActive: async () => {
+        throw new Error("provider_not_configured: Claude");
+      },
+    });
+    const slice = useAgentChatStore.getState().threads[THREAD];
+    expect(slice.interrupted).toBe(false);
+    expect(slice.streaming).toBe(true);
+  });
+
+  it("a definite false still settles a thread that is not streaming", async () => {
+    // The probe answering "dead" is honoured — only an UNANSWERED probe
+    // falls back to the slice. Otherwise a genuinely dead run could never
+    // earn its divider.
+    seedStreamingSlice(10);
+    useAgentChatStore.setState((state) => ({
+      threads: {
+        ...state.threads,
+        [THREAD]: { ...state.threads[THREAD], streaming: false },
+      },
+    }));
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async (_t, afterId) =>
+        afterId === null ? [] : [row(11, assistantEvent("last words"))],
+      headId: async () => 11,
+      turnActive: async () => false,
+    });
+    const slice = useAgentChatStore.getState().threads[THREAD];
+    expect(slice.streaming).toBe(false);
+    expect(slice.interrupted).toBe(true);
+  });
+
+  it("a probe reporting a delegated-work hold keeps the run live", async () => {
+    // The backend fix: `agent_chat_turn_active` now ORs in "the parent turn
+    // settled but delegated agents are still working", so the probe answers
+    // true across the whole delegated phase.
+    seedStreamingSlice(10);
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async (_t, afterId) =>
+        afterId === null ? [] : [row(11, assistantEvent("subagent output"))],
+      headId: async () => 11,
+      turnActive: async () => true,
+    });
+    const slice = useAgentChatStore.getState().threads[THREAD];
+    expect(slice.interrupted).toBe(false);
+    expect(slice.streaming).toBe(true);
+  });
+});

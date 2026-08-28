@@ -192,6 +192,113 @@ describe("agent-chat-store", () => {
     });
   });
 
+  // End-to-end over the store action, which is where the `previousUnsettled`
+  // seed actually lives. Nothing here was covered before: this file had zero
+  // assertions on `interrupted`.
+  describe("applyPayloadsTail — interrupted across a remount", () => {
+    function rows(startId: number, ...payloads: string[]) {
+      return payloads.map((payload, index) => ({
+        id: startId + index,
+        payload,
+      }));
+    }
+    const subagentRow = (status: string) =>
+      JSON.stringify({
+        type: "subagent_updated",
+        thread_id: "t",
+        subagent: { subagent_id: "sub-1", name: "Explore", status },
+      });
+
+    /** Drive a thread into an interim hold through the live event path,
+     *  then park a cursor on it — a pane that watched a delegated `Task`
+     *  start and is about to be unmounted by a tab switch. */
+    function seedInterimHold() {
+      const store = useAgentChatStore.getState();
+      store.ensureThread("t");
+      store.applyEvent("t", {
+        type: "user_message",
+        thread_id: "t",
+        text: "go",
+      } as never);
+      store.applyEvent("t", JSON.parse(subagentRow("running")));
+      store.applyEvent("t", {
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+      } as never);
+      useAgentChatStore.setState((state) => ({
+        threads: {
+          ...state.threads,
+          t: { ...state.threads.t, lastPersistedEventId: 10 },
+        },
+      }));
+      return useAgentChatStore.getState().threads["t"];
+    }
+
+    it("keeps a delegated-work hold live instead of showing Continue", () => {
+      const before = seedInterimHold();
+      expect(before.streaming).toBe(true);
+      expect(before.turnUnsettled).toBe(false);
+
+      // Remount: the tail is the subagent rows persisted while unmounted,
+      // and the backend reports the run live because delegated work holds it.
+      useAgentChatStore
+        .getState()
+        .applyPayloadsTail("t", rows(11, subagentRow("running")), {
+          runLive: true,
+          provider: "claude",
+        });
+
+      const after = useAgentChatStore.getState().threads["t"];
+      expect(after.interrupted).toBe(false);
+      expect(after.streaming).toBe(true);
+      expect(after.interrupted && !after.streaming).toBe(false);
+    });
+
+    it("does not resurrect an unsettled tail from the streaming flag alone", () => {
+      // The narrow regression: even if the probe comes back false (a stale
+      // read, a slow tracker), the tail scan must not INVENT an unsettled
+      // turn — history genuinely ended on a `turn_completed`.
+      seedInterimHold();
+      useAgentChatStore
+        .getState()
+        .applyPayloadsTail("t", rows(11, subagentRow("running")), {
+          runLive: false,
+          provider: "claude",
+        });
+      expect(useAgentChatStore.getState().threads["t"].interrupted).toBe(false);
+    });
+
+    it("still raises the divider for a turn that never settled", () => {
+      const store = useAgentChatStore.getState();
+      store.ensureThread("t");
+      store.applyEvent("t", {
+        type: "user_message",
+        thread_id: "t",
+        text: "go",
+      } as never);
+      useAgentChatStore.setState((state) => ({
+        threads: {
+          ...state.threads,
+          t: { ...state.threads.t, lastPersistedEventId: 10 },
+        },
+      }));
+      expect(useAgentChatStore.getState().threads["t"].turnUnsettled).toBe(true);
+
+      useAgentChatStore
+        .getState()
+        .applyPayloadsTail("t", rows(11, subagentRow("running")), {
+          runLive: false,
+          provider: "claude",
+        });
+
+      const after = useAgentChatStore.getState().threads["t"];
+      expect(after.interrupted).toBe(true);
+      expect(after.streaming).toBe(false);
+    });
+  });
+
   describe("hydrateThread", () => {
     /** Wrap raw payloads as cursor rows (ids ascending from 1), the shape
      *  `agent_chat_list_messages_after` returns. */

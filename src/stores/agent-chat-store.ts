@@ -730,10 +730,13 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         const timed = parseTimedReplayPayloads(fresh);
         const merged = applyTimedReplayTail(slice, timed, {
             ...opts,
-            // Summarizes the prefix for the unsettled-tail scan: a slice
-            // that is streaming or already flagged interrupted ends on an
-            // unsettled user turn.
-            previousUnsettled: slice.interrupted || slice.streaming,
+            // Summarizes the prefix for the unsettled-tail scan. This is the
+            // tracked answer for the rows already folded, NOT a guess derived
+            // from `streaming`: a provider that yields to wait on a delegated
+            // agent stays `streaming` with its last turn genuinely settled,
+            // and seeding `true` there made every remount mid-delegation
+            // render a false "Run interrupted" divider + Continue chip.
+            previousUnsettled: slice.turnUnsettled,
         });
         return {
           ...slice,

@@ -80,6 +80,9 @@ const registerMountedThreadMock = vi.fn(() => unregisterMountedThreadMock);
 // Hoisted so the deferred-worktree submit tests can assert the
 // optimistic user bubble was appended to the NEW worktree's thread.
 const appendUserMessageMock = vi.fn();
+/** Stable across `getState()` calls so a test can assert what the pane
+ *  imperatively folded into the slice (e.g. Stop's local settle). */
+const applyEventMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -631,7 +634,7 @@ vi.mock("@/stores/agent-chat-store", () => {
     {
       getState: () => ({
         threads: buildThreads(),
-        applyEvent: vi.fn(),
+        applyEvent: applyEventMock,
         // Session bring-up seeds the agent-chat slice through these
         // after start_session resolves.
         ensureThread: vi.fn(),
@@ -2773,6 +2776,45 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     fireEvent.click(getByTestId("context-window-change"));
     await waitFor(() =>
       expect(agentChatStopSession).toHaveBeenCalledWith("claude", "thread-x"),
+    );
+  });
+
+  // Stop has to be an escape hatch even when the provider cannot be
+  // reached. Without a local settle the pane is trapped: the interrupt
+  // fails, no provider settlement event ever arrives, `streaming` stays
+  // true — which hides the Continue chip and re-renders the Stop button
+  // that just failed. This matters most for a run the liveness probe is
+  // holding open on a subagent that never reported a terminal snapshot.
+  it("settles the thread locally when the interrupt fails", async () => {
+    applyEventMock.mockClear();
+    vi.mocked(agentChatInterruptTurn)
+      .mockClear()
+      .mockRejectedValue(new Error("session not found"));
+
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(getByTestId("composer-stop"));
+
+    await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(applyEventMock).toHaveBeenCalledWith("thread-x", {
+        type: "session_state_changed",
+        thread_id: "thread-x",
+        status: { status: "ready" },
+      }),
+    );
+  });
+
+  it("leaves settling to the provider when the interrupt succeeds", async () => {
+    applyEventMock.mockClear();
+    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(undefined);
+
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(getByTestId("composer-stop"));
+
+    await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
+    expect(applyEventMock).not.toHaveBeenCalledWith(
+      "thread-x",
+      expect.objectContaining({ type: "session_state_changed" }),
     );
   });
 });

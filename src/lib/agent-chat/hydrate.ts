@@ -141,11 +141,10 @@ export function replayTimed(
  * workflow stop, the unsettled-tail flag) is a property of the whole
  * history, not of the tail.
  *
- * `previousUnsettled` summarizes the prefix for the unsettled-tail scan:
- * a warm slice that is streaming or already flagged interrupted ends on
- * an unsettled user turn. Any `user_message` / `turn_completed` in the
- * tail overrides it, which makes the merged answer identical to scanning
- * the concatenated history.
+ * `previousUnsettled` summarizes the prefix for the unsettled-tail scan —
+ * the caller passes the slice's tracked `turnUnsettled`. Any `user_message`
+ * / `turn_completed` in the tail overrides it, which makes the merged
+ * answer identical to scanning the concatenated history.
  *
  * When the run is live the settle passes are skipped entirely: their job
  * is to reconcile a transcript that ends mid-run, and a confirmed
@@ -357,6 +356,8 @@ function finalizeReplay(
     );
   }
 
+  const turnUnsettled = lastTurnUnsettled(parsed, previousUnsettled);
+
   return {
     ...state,
     messages,
@@ -375,9 +376,13 @@ function finalizeReplay(
     // `runLive` overrides both signals: a confirmed in-flight turn means
     // the run is alive, so neither the unsettled-tail heuristic nor a
     // stale replay-observed `child_exited` should surface the divider.
-    interrupted: runLive
-      ? false
-      : state.interrupted || lastTurnUnsettled(parsed, previousUnsettled),
+    interrupted: runLive ? false : state.interrupted || turnUnsettled,
+    // Recorded raw — WITHOUT the `runLive` override — because this is the
+    // seed the next cursor-tail merge scans from, and it has to describe the
+    // history, not the current liveness verdict. Folding `runLive` in here
+    // would make a tail read taken while a turn happened to be live disagree
+    // with a full-history scan of the same rows.
+    turnUnsettled,
     // Transient — never persisted, so a hydrated thread always starts clear.
     stalled: null,
   };

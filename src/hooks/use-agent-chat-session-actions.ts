@@ -106,6 +106,14 @@ export function useAgentChatSessionActions(
           // here on sorts above the resumed history's head.
           const rows = await agentChatListMessagesAfter(record.thread_id, null);
           if (rows.length > 0) {
+            // `runLive` is omitted DELIBERATELY, unlike the remount and
+            // revert paths which now probe for it. `newLocalThreadId` is
+            // minted one line above and has no provider session yet, so the
+            // only honest answer is "not live" — and `runLive: true` would
+            // additionally set `streaming`, arming a Stop button for a run
+            // this pane does not own. If the resumed history ends mid-turn
+            // the Continue chip is then the correct affordance: continuing
+            // is exactly what the user is here to do.
             useAgentChatStore
               .getState()
               .hydrateThread(newLocalThreadId, rows, {

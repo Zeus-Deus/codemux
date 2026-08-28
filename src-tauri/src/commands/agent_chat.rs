@@ -3222,15 +3222,46 @@ pub async fn agent_chat_stop_monitoring<R: Runtime>(
     Ok(())
 }
 
-/// Whether a live turn is currently in flight on a thread.
+/// Whether a live RUN is currently in flight on a thread.
 ///
 /// Cheap in-memory probe used by the frontend hydrate-on-remount path to
 /// tell "run still in flight" apart from "run died mid-turn": a healthy
 /// mid-flight run must not be labeled "Run interrupted" after a workspace
 /// switch remount. Deliberately does NOT auto-resume — this is a read-only
-/// check against the provider's live session registry, and a thread with no
-/// live session (e.g. after a restart) is correctly `false`. The frontend
-/// treats any error as `false`, so gating/lookup failures degrade safely.
+/// check against process-local live state, and a thread with no live
+/// session (e.g. after a restart) is correctly `false`.
+///
+/// "Run", not "turn", and the distinction is the whole point. Two
+/// independent signals are ORed:
+///
+/// 1. The provider has an `active_turn` — a prompt is genuinely in flight.
+/// 2. The thread's parent turn settled but real delegated agent work is
+///    still holding the run open ([`SubagentTracker::delegated_work_holding_turn`]).
+///
+/// (2) exists because a provider can end a turn while work it delegated is
+/// still streaming. Signal (1) alone then reads `false` across the whole
+/// delegated phase of a healthy run, and hydrate paints a live thread as
+/// interrupted: "Run interrupted" divider, a Continue chip, and the still-
+/// running subagent card flipped to `interrupted` by the settle passes.
+/// The frontend reducer models the same yield as an `interim` turn
+/// boundary; this keeps the backend's answer consistent with it.
+///
+/// This is NOT Claude-specific, though Claude is where it always happens:
+///
+/// * **Claude** — by design. The SDK emits a `result` every time the model
+///   yields to wait on a `Task` it spawned, and `claude/session.rs` clears
+///   `active_turn` on *every* `result` with no subagent check.
+/// * **Codex** — structurally exposed. Its `turn/completed` handler
+///   (`codex/session.rs`) checks only thread + turn identity, never
+///   subagent liveness, so a turn ended without a blocking `wait` leaves
+///   collab-agent children streaming on a still-open pump.
+/// * **OpenCode** — guarded. `translate.rs` suppresses child-session idle
+///   so only the parent's idle ends the turn.
+/// * **Cursor** — immune. It has no delegation concept and emits no
+///   `SubagentUpdated`, so (2) is always `false` and this is a strict no-op.
+///
+/// The frontend treats an error as "no information" rather than "dead", so
+/// gating/lookup failures no longer downgrade a live thread.
 #[tauri::command]
 pub async fn agent_chat_turn_active<R: Runtime>(
     app: AppHandle<R>,
@@ -3241,7 +3272,11 @@ pub async fn agent_chat_turn_active<R: Runtime>(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    Ok(impl_.turn_active(&thread_id).await)
+    if impl_.turn_active(&thread_id).await {
+        return Ok(true);
+    }
+    let tracker: State<'_, SubagentTracker> = app.state();
+    Ok(tracker.delegated_work_holding_turn(&thread_id.0))
 }
 
 /// Respond to a pending approval / tool / input request.
@@ -3644,12 +3679,29 @@ pub async fn agent_chat_stop_session<R: Runtime>(
 /// Skips the feature-flag gate intentionally: the gate guards new session
 /// creation, but already-running sessions must be reaped regardless of
 /// whether the flag has since been flipped off.
+///
+/// Also drops each thread's [`SubagentTracker`] entry, mirroring
+/// `agent_chat_close_pane`. Relying on the session's `Closed` event to do
+/// it is not enough on this path: `stop_session` can answer
+/// `SessionNotFound` (nothing to emit), and the broadcast bridge swallows
+/// `Lagged`, so the terminal event can simply never arrive. A surviving
+/// entry with `turn_settled` still set would keep answering
+/// [`SubagentTracker::delegated_work_holding_turn`] — which
+/// `agent_chat_turn_active` reads — so a reopened thread would hydrate as
+/// a phantom live run until the stall watchdog tombstoned it.
 pub fn shutdown_agent_chat_threads<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
 ) {
     if threads.is_empty() {
         return;
+    }
+    // Synchronous and before the spawn: the pane is already gone, so the
+    // tracking is dead the moment we are called, and this must not depend
+    // on the async cleanup task being scheduled.
+    let tracker: State<'_, SubagentTracker> = app.state();
+    for (_, thread_id) in &threads {
+        tracker.clear_thread(thread_id);
     }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -5622,6 +5674,55 @@ impl SubagentTracker {
         if should_remove {
             threads.remove(thread_id);
         }
+    }
+
+    /// Whether real delegated agent work is still holding `thread_id`'s run
+    /// open after its parent turn settled.
+    ///
+    /// This is the "interim yield": a provider whose parent turn ended while
+    /// work it delegated keeps streaming. The provider-level `active_turn`
+    /// bit reads `false` for a run that is very much alive, which is why
+    /// `agent_chat_turn_active` ORs this in. See that command for the
+    /// per-provider breakdown; it is fed from the provider-agnostic
+    /// `forward_event` path, so it covers every provider that reports
+    /// subagents and is a strict no-op for one that does not.
+    ///
+    /// Deliberately reuses [`ThreadSubagentState::review_pending`], the same
+    /// derivation that owes the sidebar its `Review` dot, so the transcript
+    /// and the pane indicator can never disagree about whether a run is
+    /// still going.
+    ///
+    /// In-memory and process-local: after a restart the map is empty and a
+    /// genuinely dead run correctly reads `false`. That is exactly the trust
+    /// boundary hydrate needs — persisted history alone cannot distinguish
+    /// "yielded, subagents running" from "killed mid-run with `running`
+    /// snapshots on disk".
+    ///
+    /// # False-positive bound
+    ///
+    /// A subagent that never reports a terminal snapshot holds this `true`
+    /// while the thread stays quiet — and a `true` here is the expensive
+    /// direction, because hydrate turns it into `streaming` and suppresses
+    /// the Continue chip. Three things bound it:
+    ///
+    /// * The stall watchdog force-settles a silent owed-review after
+    ///   `STALL_THRESHOLD`, flipping `forced_settled` and making
+    ///   `review_pending` false from then on.
+    /// * `review_owed_since` only stays fresh while real run activity keeps
+    ///   arriving — and activity arriving IS the run being alive, so the
+    ///   unbounded case and the correct case are the same case.
+    /// * `begin_turn` / `reset` clear the entry on the next send, a
+    ///   `Running` snapshot, and session `Closed`/`Error`.
+    ///
+    /// Note that Codex and OpenCode report no `task_kind`, so every row they
+    /// emit classifies as `Unreported` and defaults to `TaskClass::Agent`
+    /// (see `classify_snapshot`) — they have no monitor/background escape
+    /// hatch, which makes a stuck row likelier for them than for Claude.
+    pub fn delegated_work_holding_turn(&self, thread_id: &str) -> bool {
+        let threads = self.threads.lock().expect("subagent tracker poisoned");
+        threads
+            .get(thread_id)
+            .is_some_and(ThreadSubagentState::review_pending)
     }
 
     /// Drop `thread_id`'s watch-loop tasks and report the status the pane
@@ -8755,6 +8856,132 @@ mod tests {
             "and the pane falls to the settled status when it ends"
         );
         assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // `agent_chat_turn_active`'s second signal, exercised through the
+    // provider-agnostic event vocabulary it actually keys on. Claude hits
+    // this on every SDK `result` it emits to yield; Codex hits it whenever a
+    // turn ends without a blocking `wait` on a spawned collab agent. Without
+    // it the hydrate probe reads "dead" across the whole delegated phase of a
+    // healthy run and the transcript renders "Run interrupted".
+    #[test]
+    fn delegated_work_holds_the_turn_open_after_the_parent_settles() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "an unknown thread holds nothing"
+        );
+
+        // Real agent work spawns mid-turn. The parent still owns the run,
+        // so `active_turn` covers it and this signal stays quiet.
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "mid-turn the parent's own active_turn is the live signal"
+        );
+
+        // The interim yield: Claude emits `result`, clearing `active_turn`,
+        // while the subagent keeps streaming.
+        tracker.decide("t", &turn_completed(), now);
+        assert!(
+            tracker.delegated_work_holding_turn("t"),
+            "the run is still alive — this is what stops the false Continue chip"
+        );
+
+        // The subagent finishes: the run is genuinely over.
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed), now);
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "nothing is holding the run open once delegated work ends"
+        );
+    }
+
+    // The no-op guarantee for a provider with no delegation concept (Cursor
+    // emits zero `SubagentUpdated` events). `track` is the only writer to the
+    // task map and it lives in the `SubagentUpdated` arm, so such a thread
+    // can never grow an Agent entry and `agent_chat_turn_active` keeps its
+    // pre-existing behaviour bit for bit.
+    #[test]
+    fn a_provider_that_reports_no_subagents_never_holds_the_turn_open() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        // A whole turn's worth of non-subagent traffic, then a completion.
+        tracker.decide("t", &turn_completed(), now);
+        assert!(!tracker.delegated_work_holding_turn("t"));
+        // ...and the entry does not even survive: nothing was tracked.
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // Pane/tab/workspace teardown must drop the hold, not leave it to the
+    // session's `Closed` event: `stop_session` can answer `SessionNotFound`
+    // (nothing to emit) and the broadcast bridge swallows `Lagged`, so that
+    // event can simply never arrive. `shutdown_agent_chat_threads` and
+    // `agent_chat_close_pane` both route here.
+    #[test]
+    fn clearing_a_thread_releases_the_delegated_work_hold() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(tracker.delegated_work_holding_turn("t"));
+
+        tracker.clear_thread("t");
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "a torn-down thread must not hydrate as a phantom live run"
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+        // Idempotent: the two teardown paths can both fire for one pane.
+        tracker.clear_thread("t");
+        assert!(!tracker.delegated_work_holding_turn("t"));
+    }
+
+    // A new prompt is a turn boundary, so the previous turn's delegated hold
+    // must not leak into it and keep the composer pinned at streaming.
+    #[test]
+    fn beginning_a_new_turn_releases_the_delegated_work_hold() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(tracker.delegated_work_holding_turn("t"));
+
+        tracker.begin_turn("t");
+        assert!(!tracker.delegated_work_holding_turn("t"));
+    }
+
+    // Watch loops deliberately do NOT hold a run open — they can outlive the
+    // turn indefinitely, so treating them as live would pin the composer at
+    // "streaming" forever (the issue-#153 shape).
+    #[test]
+    fn a_watch_loop_alone_does_not_hold_the_turn_open() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(!tracker.delegated_work_holding_turn("t"));
+    }
+
+    // The watchdog's force-settle is the timeout on the whole mechanism: a
+    // subagent that never reports a terminal status must not pin the
+    // transcript at "streaming" indefinitely.
+    #[test]
+    fn a_force_settled_thread_stops_holding_the_turn_open() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(tracker.delegated_work_holding_turn("t"));
+
+        let overdue =
+            tracker.take_overdue_reviews(now + Duration::from_secs(3_600), Duration::ZERO);
+        assert!(overdue.iter().any(|id| id == "t"));
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "the force-settle releases the frontend's streaming state too"
+        );
     }
 
     #[test]

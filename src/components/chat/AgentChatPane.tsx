@@ -92,6 +92,7 @@ import {
   agentChatStartSession,
   agentChatStopMonitoring,
   agentChatStopSession,
+  agentChatTurnActive,
   agentChatUpdateSessionConfig,
   getGithubIssueByPath,
   getGithubPrByPath,
@@ -735,8 +736,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const promise = (async () => {
         flushAgentChatEvents(payload.thread_id);
         const rows = await agentChatListMessagesAfter(payload.thread_id, null);
+        // A revert is normally driven from this pane while nothing is
+        // streaming, but the trigger is a backend event that another window
+        // (or a remote client) can raise mid-run. Hardcoding `runLive: false`
+        // told the cold replay "this run is dead", which paints a live thread
+        // with the Run-interrupted divider and settles its in-flight subagent
+        // cards. Ask instead.
+        const runLive = await agentChatTurnActive(
+          provider,
+          payload.thread_id,
+        ).catch(() => false);
         useAgentChatStore.getState().hydrateThread(payload.thread_id, rows, {
-          runLive: false,
+          runLive,
           provider,
         });
         setSendAnchor(null);
@@ -2136,6 +2147,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         await agentChatInterruptTurn(provider, threadId, null);
       } catch (err) {
         toast.error(`Failed to stop turn: ${err}`);
+        // The interrupt never reached a provider (no live session, a
+        // registry miss), so NO settlement event is coming — and without
+        // one the pane is trapped: `streaming` stays true, which hides the
+        // Continue chip and keeps re-rendering the Stop button that just
+        // failed. Stop has to be an escape hatch even when the provider
+        // cannot be reached.
+        //
+        // `ready` is exactly the event a provider sends when it stops
+        // during a background wait: the reducer clears `streaming` and
+        // folds an interim turn boundary, so a run that had yielded on
+        // delegated work settles the same way it would have live.
+        useAgentChatStore.getState().applyEvent(threadId, {
+          type: "session_state_changed",
+          thread_id: threadId,
+          status: { status: "ready" },
+        });
       } finally {
         restartInFlightRef.current = false;
         setRestarting(false);

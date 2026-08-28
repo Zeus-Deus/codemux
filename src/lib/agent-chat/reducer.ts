@@ -1094,6 +1094,12 @@ function appendUserMessageLocal(
   return {
     ...next,
     interrupted: false,
+    // A user turn with no completion after it is the definition of an
+    // unsettled tail. Set optimistically for the same reason the bubble is:
+    // a remount before the turn's first output must not read the thread as
+    // settled. The persisted `user_message` row folds through here too and
+    // is deduped by nonce, so live and replay agree.
+    turnUnsettled: true,
     messages: [...next.messages, item],
   };
 }
@@ -1584,6 +1590,10 @@ function applyEventInner(
           ...seqBumped,
           streaming: false,
           interrupted,
+          // A terminal event settles the tail even when it failed — the run
+          // recorded an ending, which is all `lastTurnUnsettled` asks. The
+          // `interrupted` flag above carries the "it died" meaning.
+          turnUnsettled: false,
           messages: [
             ...seqBumped.messages,
             {
@@ -1624,6 +1634,10 @@ function applyEventInner(
         ...seqBumped,
         streaming: interim,
         interrupted: false,
+        // Settled even when the boundary is `interim`: a `turn_completed`
+        // row IS persisted, so a later hydrate scanning history finds it and
+        // must reach the same answer this live fold does.
+        turnUnsettled: false,
         messages: [
           ...seqBumped.messages,
           {

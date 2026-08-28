@@ -423,6 +423,21 @@ export interface ChatThreadState {
    *  Drives the "Run interrupted" divider and the composer's Continue
    *  chip. */
   interrupted: boolean;
+  /** Whether the thread's history ends on an unsettled user turn: a
+   *  `user_message` with no later `turn_completed`.
+   *
+   *  Maintained live by the reducer and recomputed by every hydrate, so a
+   *  warm cursor-tail merge can seed `lastTurnUnsettled` with the answer
+   *  for the prefix it is NOT re-scanning and get the same result as
+   *  scanning the whole concatenated history.
+   *
+   *  Deliberately NOT derived from `streaming`. Those two came apart when
+   *  the interim-turn hold landed: a provider that yields to wait on a
+   *  delegated agent emits a real `turn_completed` (so the last turn IS
+   *  settled) while the thread stays `streaming` because the run is still
+   *  alive. Using `streaming` as the proxy made every remount during a
+   *  delegated phase report a false "Run interrupted". */
+  turnUnsettled: boolean;
   /** Latest context-window occupancy reported by the provider, or
    *  `null` before the first usage report lands (which is also the
    *  signal to hide the composer's meter entirely). Latest snapshot
@@ -442,6 +457,7 @@ export function emptyThreadState(): ChatThreadState {
     nextSeq: 0,
     stalled: null,
     interrupted: false,
+    turnUnsettled: false,
     contextUsage: null,
   };
 }
