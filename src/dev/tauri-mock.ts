@@ -1297,7 +1297,7 @@ const HERMES_CAPABILITIES: ProviderChatCapabilities = {
       id: "openai-codex:gpt-5.6-sol",
       label: "OpenAI Codex · gpt-5.6-sol",
       description: "Provider: OpenAI Codex",
-      profile: "codemuxdev",
+      profile: "default",
       supports_images: true,
     },
     {
@@ -1305,7 +1305,7 @@ const HERMES_CAPABILITIES: ProviderChatCapabilities = {
       id: "openai-codex:gpt-5.6-luna",
       label: "OpenAI Codex · gpt-5.6-luna",
       description: "Provider: OpenAI Codex",
-      profile: "codemuxdev",
+      profile: "default",
       supports_images: true,
     },
     {
@@ -1313,7 +1313,7 @@ const HERMES_CAPABILITIES: ProviderChatCapabilities = {
       id: "anthropic:claude-opus-5",
       label: "Anthropic · claude-opus-5",
       description: "Provider: Anthropic",
-      profile: "coder",
+      profile: "review",
       supports_images: true,
     },
     {
@@ -1321,7 +1321,7 @@ const HERMES_CAPABILITIES: ProviderChatCapabilities = {
       id: "anthropic:claude-sonnet-5",
       label: "Anthropic · claude-sonnet-5",
       description: "Provider: Anthropic",
-      profile: "coder",
+      profile: "review",
       supports_images: true,
     },
   ],
