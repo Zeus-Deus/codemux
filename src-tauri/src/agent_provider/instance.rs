@@ -59,6 +59,7 @@ impl ProviderInstanceId {
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
+            ProviderKind::Hermes => "hermes",
         };
         Self(slug.to_string())
     }
@@ -85,6 +86,7 @@ mod tests {
             (ProviderKind::Codex, "codex"),
             (ProviderKind::Cursor, "cursor"),
             (ProviderKind::OpenCode, "opencode"),
+            (ProviderKind::Hermes, "hermes"),
         ];
         for (driver, slug) in cases {
             let id = ProviderInstanceId::from_driver(driver);

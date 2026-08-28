@@ -11,6 +11,7 @@ pub mod cursor;
 pub mod errors;
 pub mod events;
 pub mod health;
+pub mod hermes;
 pub mod instance;
 pub mod opencode;
 pub mod pricing;

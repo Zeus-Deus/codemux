@@ -86,25 +86,42 @@ const OPENCODE_CAPS = makeCaps([
   }),
 ]);
 
+const HERMES_CAPS = makeCaps([
+  makeModel({
+    id: "openai-codex:gpt-5.6-sol",
+    label: "OpenAI Codex · gpt-5.6-sol",
+    profile: "codemuxdev",
+  }),
+  makeModel({
+    id: "anthropic:claude-opus-5",
+    label: "Anthropic · claude-opus-5",
+    profile: "coder",
+  }),
+]);
+
 function seedStore(opts: {
   claude?: ProviderChatCapabilities | null;
   codex?: ProviderChatCapabilities | null;
   cursor?: ProviderChatCapabilities | null;
   opencode?: ProviderChatCapabilities | null;
+  hermes?: ProviderChatCapabilities | null;
   claudeError?: string | null;
   codexError?: string | null;
   cursorError?: string | null;
   opencodeError?: string | null;
+  hermesError?: string | null;
 } = {}) {
   useProviderCapabilities.setState({
     claude: opts.claude ?? null,
     codex: opts.codex ?? null,
     cursor: opts.cursor ?? null,
     opencode: opts.opencode ?? null,
+    hermes: opts.hermes ?? null,
     claudeError: opts.claudeError ?? null,
     codexError: opts.codexError ?? null,
     cursorError: opts.cursorError ?? null,
     opencodeError: opts.opencodeError ?? null,
+    hermesError: opts.hermesError ?? null,
     loaded: false,
   });
 }
@@ -115,6 +132,7 @@ beforeEach(() => {
     codex: CODEX_CAPS,
     cursor: CURSOR_CAPS,
     opencode: OPENCODE_CAPS,
+    hermes: HERMES_CAPS,
   });
   // Clear any favorites from a previous test so the search-boost
   // assertions start from a known sort order.
@@ -269,7 +287,7 @@ describe("MultiProviderModelPicker — model descriptions", () => {
 });
 
 describe("MultiProviderModelPicker — provider rail", () => {
-  it("renders all four providers in the rail", async () => {
+  it("renders every provider in the rail", async () => {
     const user = userEvent.setup();
     renderPicker();
     await openPicker(user);
@@ -277,6 +295,7 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(screen.getByTestId("provider-rail-codex")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
+    expect(screen.getByTestId("provider-rail-hermes")).toBeInTheDocument();
   });
 
   it("marks the active provider as selected", async () => {
@@ -388,6 +407,31 @@ describe("MultiProviderModelPicker — provider rail", () => {
     expect(await screen.findByText("OpenCode · openai")).toBeInTheDocument();
     expect(screen.getByText("OpenCode · anthropic")).toBeInTheDocument();
     expect(screen.getByText("OpenCode · openrouter")).toBeInTheDocument();
+  });
+
+  it("Hermes rail names the profile each row belongs to", async () => {
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-hermes"));
+
+    // The profile is an explicit field, not a prefix on the model id,
+    // so the row has to compose it into the subtitle: the model label
+    // reads on the first line, `Hermes · {profile}` beneath it.
+    expect(await screen.findByText("Hermes · codemuxdev")).toBeInTheDocument();
+    expect(screen.getByText("Hermes · coder")).toBeInTheDocument();
+    expect(screen.getByText("Anthropic · claude-opus-5")).toBeInTheDocument();
+  });
+
+  it("resolves the Hermes trigger against Hermes caps, not OpenCode's", async () => {
+    // The old ternary chain dead-ended in `: opencodeCaps`, so a
+    // provider it did not name resolved its trigger label against
+    // OpenCode's catalogue instead of its own.
+    renderPicker({ provider: "hermes", model: "anthropic:claude-opus-5" });
+    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+    expect(trigger.textContent).toContain("Anthropic · claude-opus-5");
+    // The profile takes the pill's one compact qualifier slot.
+    expect(trigger.textContent).toContain("coder");
   });
 });
 

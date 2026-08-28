@@ -71,6 +71,7 @@ describe("provider-health-store", () => {
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
+        hermes: emptyHealthSlot(),
       },
     });
   });

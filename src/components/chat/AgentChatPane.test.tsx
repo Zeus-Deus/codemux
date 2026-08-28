@@ -1,6 +1,10 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+// Type-only (erased at runtime, so it is safe above the hoisted
+// `vi.mock` factories): the composer mock used to hand-copy the
+// provider union, which then drifted every time a provider was added.
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -223,12 +227,12 @@ vi.mock("./Composer", () => ({
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
     onProviderModelChange: (
-      provider: "claude" | "codex" | "cursor" | "opencode",
+      provider: AgentChatProviderKind,
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "opencode";
+    provider: AgentChatProviderKind;
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;

@@ -253,6 +253,18 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
+# Test helper binary used by `tests/hermes_adapter.rs` — simulates
+# `hermes -p <profile> acp`. A sibling of fake_cursor_acp rather than a
+# mode of it: the two agents share only the JSON-RPC framing. Gated like
+# fake_rpc_child above.
+[[bin]]
+name = "fake_hermes_acp"
+path = "tests/helpers/fake_hermes_acp/main.rs"
+test = false
+doctest = false
+bench = false
+required-features = ["test-fixtures"]
+
 # Test helper binary used by `tests/claude_adapter.rs` — simulates the
 # claude-agent sidecar without involving the real SDK. Gated like
 # fake_rpc_child above.

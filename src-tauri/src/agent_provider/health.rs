@@ -18,6 +18,7 @@ use super::errors::ProviderError;
 use super::types::ProviderKind;
 use crate::agent_provider::claude;
 use crate::agent_provider::codex;
+use crate::agent_provider::hermes;
 use crate::agent_provider::opencode;
 use std::time::Duration;
 
@@ -89,6 +90,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
         ProviderKind::Codex => check_codex_health().await,
         ProviderKind::Cursor => check_cursor_health().await,
         ProviderKind::OpenCode => check_opencode_health().await,
+        ProviderKind::Hermes => check_hermes_health().await,
     }
 }
 
@@ -333,6 +335,33 @@ async fn check_cursor_health() -> ProviderHealthReport {
     }
 }
 
+// ── Hermes ──────────────────────────────────────────────────────────
+
+async fn check_hermes_health() -> ProviderHealthReport {
+    // `hermes acp --check` is the whole probe: it exercises the same ACP
+    // entry point a chat session launches and returns in well under a
+    // second, so there is nothing cheaper worth splitting out.
+    let availability = hermes::check_hermes_availability().await;
+    hermes_report_from_availability(&availability)
+}
+
+/// Pure mapping from the Hermes probe onto the wire report, so the
+/// classification is unit-testable without shelling anything.
+fn hermes_report_from_availability(
+    availability: &hermes::HermesAvailability,
+) -> ProviderHealthReport {
+    let Some(message) = availability.message.clone() else {
+        return ProviderHealthReport::ready(ProviderKind::Hermes, availability.version.clone());
+    };
+    if availability.binary.is_none() {
+        return ProviderHealthReport::error(ProviderKind::Hermes, false, message);
+    }
+    // The binary is present but the self-check did not come back clean.
+    // Warning, not error: the probe is advisory and a session may still
+    // start, so this must not black out a provider the user can use.
+    ProviderHealthReport::warning(ProviderKind::Hermes, availability.version.clone(), message)
+}
+
 // ── OpenCode ────────────────────────────────────────────────────────
 
 async fn check_opencode_health() -> ProviderHealthReport {
@@ -369,6 +398,46 @@ fn opencode_report_from_availability(
 mod tests {
     use super::*;
     use crate::agent_provider::opencode::OpenCodeAvailability;
+
+    #[test]
+    fn hermes_missing_binary_maps_to_not_installed_error() {
+        let report = hermes_report_from_availability(&hermes::HermesAvailability {
+            binary: None,
+            acp_ready: false,
+            version: None,
+            message: Some("Hermes CLI (`hermes`) is not installed or not on PATH.".into()),
+        });
+        assert_eq!(report.status, ProviderHealthStatus::Error);
+        assert!(!report.installed);
+    }
+
+    #[test]
+    fn hermes_failing_self_check_stays_a_warning() {
+        // Installed-but-inconclusive must not black the provider out: the
+        // probe is advisory and a session may still start.
+        let report = hermes_report_from_availability(&hermes::HermesAvailability {
+            binary: Some(std::path::PathBuf::from("/usr/bin/hermes")),
+            acp_ready: false,
+            version: Some("0.20.6".into()),
+            message: Some("Hermes is installed but its ACP self-check failed.".into()),
+        });
+        assert_eq!(report.status, ProviderHealthStatus::Warning);
+        assert!(report.installed);
+        assert_eq!(report.version.as_deref(), Some("0.20.6"));
+    }
+
+    #[test]
+    fn hermes_clean_probe_maps_to_ready_with_version() {
+        let report = hermes_report_from_availability(&hermes::HermesAvailability {
+            binary: Some(std::path::PathBuf::from("/usr/bin/hermes")),
+            acp_ready: true,
+            version: Some("0.20.6".into()),
+            message: None,
+        });
+        assert_eq!(report.status, ProviderHealthStatus::Ready);
+        assert!(report.message.is_none());
+        assert_eq!(report.version.as_deref(), Some("0.20.6"));
+    }
 
     #[test]
     fn claude_sidecar_missing_maps_to_not_installed_error() {

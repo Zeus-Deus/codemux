@@ -112,6 +112,7 @@ pub struct ProviderRegistry {
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    hermes: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
 impl ProviderRegistry {
@@ -146,6 +147,14 @@ impl ProviderRegistry {
         *self.opencode.write().await = Some(provider);
     }
 
+    /// Inject the Hermes ACP provider. The Stage 1 scaffold registers a
+    /// handle that refuses every driving call, so a Hermes-routed command
+    /// reports "not implemented yet" rather than the ambiguous
+    /// `provider_not_configured`.
+    pub async fn set_hermes(&self, provider: Arc<dyn AgentProvider>) {
+        *self.hermes.write().await = Some(provider);
+    }
+
     /// Look up the provider for a given kind. Returns `None` when no
     /// provider has been registered — commands must return a clean
     /// error in that case instead of panicking.
@@ -155,6 +164,7 @@ impl ProviderRegistry {
             ProviderKind::Codex => self.codex.read().await.clone(),
             ProviderKind::Cursor => self.cursor.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
+            ProviderKind::Hermes => self.hermes.read().await.clone(),
         }
     }
 
@@ -173,6 +183,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.opencode.read().await.clone() {
             out.push((ProviderKind::OpenCode, p));
+        }
+        if let Some(p) = self.hermes.read().await.clone() {
+            out.push((ProviderKind::Hermes, p));
         }
         out
     }
@@ -609,6 +622,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
+            ProviderKind::Hermes => "hermes",
         };
         let db: State<'_, DatabaseStore> = app.state();
         let record = db
@@ -730,6 +744,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         ProviderKind::Codex => "codex",
         ProviderKind::Cursor => "cursor",
         ProviderKind::OpenCode => "opencode",
+        ProviderKind::Hermes => "hermes",
     };
     // The session row is created BEFORE the provider starts, not after.
     //
@@ -1369,6 +1384,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
         "codex" => Ok(ProviderKind::Codex),
         "cursor" => Ok(ProviderKind::Cursor),
         "opencode" => Ok(ProviderKind::OpenCode),
+        "hermes" => Ok(ProviderKind::Hermes),
         other => Err(format!("unsupported provider stored for chat: {other}")),
     }
 }
@@ -1634,13 +1650,17 @@ fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// (`agent_provider/{claude,codex,opencode}/capabilities.rs`); they are
 /// duplicated here as a cheap `&'static str` rather than building the full
 /// capabilities bundle (which allocates the model list) just to read one
-/// field. OpenCode has no permission modes, so it stays `None`.
+/// field. OpenCode has no permission modes, so it stays `None`. Hermes
+/// borrows the const from its capabilities module so the two cannot drift.
 fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::Cursor => Some("agent"),
         ProviderKind::OpenCode => None,
+        ProviderKind::Hermes => Some(
+            crate::agent_provider::hermes::capabilities::HERMES_DEFAULT_PERMISSION_MODE,
+        ),
     }
 }
 
@@ -1692,6 +1712,21 @@ fn resolve_start_permission_mode(
                 "bypassPermissions" | "danger-full-access" => "agent",
                 "agent" | "ask" | "plan" => mode.as_str(),
                 _ => "ask",
+            }
+            .to_string(),
+        ),
+        // Hermes' three ACP modes are its own vocabulary, so a thread
+        // carried over from another provider arrives speaking a language
+        // `session/set_mode` does not accept. Full-access strings map onto
+        // its most permissive edit mode; anything unrecognised degrades to
+        // the ask-first `default` rather than silently widening.
+        Some(mode) if provider == ProviderKind::Hermes => Some(
+            match mode.as_str() {
+                "bypassPermissions" | "danger-full-access" | "agent" => {
+                    crate::agent_provider::hermes::capabilities::HERMES_FULL_ACCESS_PERMISSION_MODE
+                }
+                "default" | "accept_edits" | "dont_ask" => mode.as_str(),
+                _ => crate::agent_provider::hermes::capabilities::HERMES_DEFAULT_PERMISSION_MODE,
             }
             .to_string(),
         ),
@@ -1855,6 +1890,10 @@ pub async fn ensure_live_session<R: Runtime>(
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
         model: record.model.clone(),
+        // `agent_chat_sessions` has no profile column yet, so a rebuilt
+        // Hermes session falls back to the provider's default profile.
+        // Persisting it lands with the runtime adapter.
+        profile: None,
         resume_cursor,
         permission_mode: permission_mode.clone(),
         effort: record.effort.clone(),
@@ -1960,6 +1999,9 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
         // ACP prompt exactly as they are for the other providers.
         ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
+        // Hermes has no native SKILL.md inventory either. Same portable
+        // `.agents/skills` projection as Cursor.
+        ProviderKind::Hermes => crate::skills::SkillProvider::Codex,
     }
 }
 
@@ -3458,6 +3500,14 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
             )
             .await
         }
+        // Hermes only returns its model catalogue from `session/new`, which
+        // boots a real agent — far too expensive for a picker open, so the
+        // live harvest lands with the session driver. The permission modes
+        // are statically known and served now, which is what the picker
+        // needs to render its mode control.
+        ProviderKind::Hermes => {
+            Ok(crate::agent_provider::hermes::capabilities::hermes_stage1_capabilities())
+        }
     }
 }
 
@@ -3506,6 +3556,18 @@ pub async fn list_chat_slash_commands(
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     match provider {
         ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
+        // Hermes PUSHES its vocabulary — an `available_commands_update`
+        // notification arrives unprompted right after `session/new` — and
+        // there is no method that asks for it. So the pull reads what a
+        // live session already recorded for this cwd rather than booting
+        // an agent (seconds, a whole child process) to populate a menu.
+        // A cwd no session has run in answers with an empty list, which is
+        // the same honest answer the providers below give.
+        ProviderKind::Hermes => {
+            Ok(crate::agent_provider::hermes::slash_command_cache()
+                .get(&cwd)
+                .await)
+        }
         // No discovery surface on these providers (yet) — empty list,
         // not an error, so the popup renders without a failure footer.
         ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::OpenCode => Ok(Vec::new()),
@@ -4156,6 +4218,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         "codex" => ProviderKind::Codex,
         "cursor" => ProviderKind::Cursor,
         "opencode" => ProviderKind::OpenCode,
+        "hermes" => ProviderKind::Hermes,
         other => return Err(format!("unsupported_provider: {other}")),
     };
 
@@ -4722,6 +4785,24 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // sole accounting source, and writing both streams would count every
     // Codemux-launched turn twice.
     if matches!(event, ProviderRuntimeEvent::UsageRecorded { .. }) {
+        return;
+    }
+
+    // The provider named the conversation itself. Apply it ONLY to a
+    // thread that has no title of its own: the user's own rename and the
+    // auto-title derived from the first user turn both live in the same
+    // column, and neither should be overwritten by the agent's summary of
+    // the same conversation. In practice this fires for a thread whose
+    // history came from the agent rather than from Codemux — a resumed or
+    // adopted session, where there was no first user turn to derive a
+    // title from. Intercepted and returned: it is level state about the
+    // session row, not transcript, so it is neither persisted as a message
+    // nor fanned out.
+    if let ProviderRuntimeEvent::ThreadTitleSuggested { thread_id, title } = &event {
+        let db: State<'_, DatabaseStore> = app.state();
+        if db.get_agent_chat_title(&thread_id.0).is_none() {
+            let _ = db.set_agent_chat_title(&thread_id.0, title);
+        }
         return;
     }
 
@@ -5738,6 +5819,8 @@ fn map_event_to_pane_status(
         },
         ProviderRuntimeEvent::SessionConfigured { .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
+        // A title is metadata about the session row, not progress.
+        | ProviderRuntimeEvent::ThreadTitleSuggested { .. }
         | ProviderRuntimeEvent::RuntimeWarning { .. }
         // Follow-up queue transitions don't drive the sidebar dot on
         // their own: a dispatched turn's own `SessionStateChanged {
@@ -6491,6 +6574,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
+        | ProviderRuntimeEvent::ThreadTitleSuggested { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
@@ -6874,6 +6958,24 @@ mod tests {
         assert_eq!(shape_persisted_payload(1, &padded), padded);
     }
 
+    #[test]
+    fn stored_provider_kind_accepts_every_persisted_slug() {
+        // The slug written into `agent_chat_sessions.provider` is read
+        // back here and in `agent_chat_open_search_result`, both of which
+        // hard-error on an unknown string. A row a newer build wrote must
+        // stay openable and revertible, so the two sides are pinned.
+        for (slug, expected) in [
+            ("claude", ProviderKind::Claude),
+            ("codex", ProviderKind::Codex),
+            ("cursor", ProviderKind::Cursor),
+            ("opencode", ProviderKind::OpenCode),
+            ("hermes", ProviderKind::Hermes),
+        ] {
+            assert_eq!(stored_provider_kind(slug).unwrap(), expected);
+        }
+        assert!(stored_provider_kind("not-a-provider").is_err());
+    }
+
     // ── start-path permission_mode heal ──
 
     #[test]
@@ -6896,6 +6998,13 @@ mod tests {
         assert_eq!(
             resolve_start_permission_mode(ProviderKind::OpenCode, None),
             None
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Hermes, None),
+            Some(
+                crate::agent_provider::hermes::capabilities::HERMES_DEFAULT_PERMISSION_MODE
+                    .to_string()
+            )
         );
     }
 
@@ -6939,6 +7048,38 @@ mod tests {
             resolve_start_permission_mode(ProviderKind::Codex, Some("agent".to_string())),
             Some("danger-full-access".to_string())
         );
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Hermes,
+                Some("bypassPermissions".to_string())
+            ),
+            Some("dont_ask".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Hermes, Some("agent".to_string())),
+            Some("dont_ask".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_degrades_foreign_hermes_modes_to_ask() {
+        // Same hazard as Cursor: a thread handed over from another
+        // provider must not reach `session/set_mode` speaking a vocabulary
+        // Hermes does not accept, and must never widen on the way.
+        for foreign in ["acceptEdits", "read-only", "workspace-write", "plan"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Hermes, Some(foreign.to_string())),
+                Some("default".to_string()),
+                "{foreign} should degrade to Hermes' ask-first mode"
+            );
+        }
+        // Hermes' own three modes pass through untouched.
+        for native in ["default", "accept_edits", "dont_ask"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Hermes, Some(native.to_string())),
+                Some(native.to_string())
+            );
+        }
     }
 
     #[test]

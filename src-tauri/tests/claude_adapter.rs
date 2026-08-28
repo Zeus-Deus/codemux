@@ -109,6 +109,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         thread_id: ThreadId(thread_id.into()),
         cwd: std::env::temp_dir(),
         model: None,
+        profile: None,
         resume_cursor: None,
         permission_mode: None,
         effort: None,

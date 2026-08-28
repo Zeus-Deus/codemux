@@ -1013,6 +1013,19 @@ fn build_core_app<R: tauri::Runtime>(
                             .set_opencode(std::sync::Arc::new(opencode_provider) as _)
                             .await;
 
+                        // Hermes — the real ACP driver. One
+                        // `hermes -p <profile> acp` child per chat thread,
+                        // spawned on demand by `start_session`; nothing is
+                        // launched here. Registered unconditionally, like
+                        // its siblings: whether Hermes is installed is the
+                        // health probe's answer, not the registry's.
+                        let hermes = agent_provider::hermes::HermesAgentProvider::new(
+                            agent_provider::hermes::HermesProviderConfig::default(),
+                        );
+                        registry
+                            .set_hermes(std::sync::Arc::new(hermes) as _)
+                            .await;
+
                         // Bridge provider events to the frontend
                         // exactly once, after both providers have been
                         // injected (or attempted). spawn_event_bridge

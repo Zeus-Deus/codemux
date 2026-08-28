@@ -26,6 +26,7 @@ import {
   usePickerFavorites,
 } from "@/stores/picker-favorites-store";
 import {
+  selectCapabilities,
   selectError,
   selectModel,
   useProviderCapabilities,
@@ -77,6 +78,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "codex", label: "Codex" },
   { kind: "cursor", label: "Cursor" },
   { kind: "opencode", label: "OpenCode" },
+  { kind: "hermes", label: "Hermes" },
 ];
 
 /**
@@ -122,14 +124,17 @@ function parseProviderError(error: string | null): ParsedProviderError | null {
     case "codex_not_installed":
     case "cursor_not_installed":
     case "opencode_not_installed":
+    case "hermes_not_installed":
       return { kind: "not_installed", detail };
     case "codex_not_authenticated":
     case "cursor_not_authenticated":
     case "opencode_not_authenticated":
+    case "hermes_not_authenticated":
       return { kind: "not_authenticated", detail };
     case "codex_harvest_failed":
     case "cursor_harvest_failed":
     case "opencode_harvest_failed":
+    case "hermes_harvest_failed":
       return { kind: "harvest_failed", detail };
     default:
       return { kind: "unknown", detail: error };
@@ -241,6 +246,7 @@ export function MultiProviderModelPicker({
   const codexCaps = allCaps.codex;
   const cursorCaps = allCaps.cursor;
   const opencodeCaps = allCaps.opencode;
+  const hermesCaps = allCaps.hermes;
 
   // Subscribe to the favorites array so toggling a star while the
   // popover is open re-sorts the visible rows immediately. Reading
@@ -279,8 +285,9 @@ export function MultiProviderModelPicker({
       codex: rowsFromCaps("codex", codexCaps),
       cursor: rowsFromCaps("cursor", cursorCaps),
       opencode: rowsFromCaps("opencode", opencodeCaps),
+      hermes: rowsFromCaps("hermes", hermesCaps),
     };
-  }, [claudeCaps, codexCaps, cursorCaps, opencodeCaps]);
+  }, [claudeCaps, codexCaps, cursorCaps, opencodeCaps, hermesCaps]);
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
@@ -373,14 +380,13 @@ export function MultiProviderModelPicker({
   // out by the backend — resolves to the concrete `models[0]` row.
   // The trigger label/subtitle/tooltip and the active-row highlight
   // all derive from this one resolution so they can't disagree.
-  const capsForCurrentProvider =
-    provider === "claude"
-      ? claudeCaps
-      : provider === "codex"
-        ? codexCaps
-        : provider === "cursor"
-          ? cursorCaps
-          : opencodeCaps;
+  // Routed through the store's exhaustive selector rather than a chain
+  // of ternaries: the old chain dead-ended in `: opencodeCaps`, so any
+  // provider it did not name resolved its trigger label, subtitle and
+  // active-row highlight against OpenCode's catalogue -- silently, with
+  // no typecheck error. The selector makes the next provider a compile
+  // error instead.
+  const capsForCurrentProvider = selectCapabilities(allCaps, provider);
   const resolvedModel = useMemo(
     () => selectModel(capsForCurrentProvider, model),
     [capsForCurrentProvider, model],
@@ -394,7 +400,12 @@ export function MultiProviderModelPicker({
     return "Select model";
   }, [capsForCurrentProvider, model, resolvedModel]);
 
-  const triggerSubtitle = resolvedModel?.sub_provider ?? null;
+  // One compact slot in the pill. A Hermes profile decides which
+  // credentials and approval policy the session runs under -- and
+  // switching it restarts the session -- so it outranks the federated
+  // `sub_provider` hint when both are present.
+  const triggerSubtitle =
+    resolvedModel?.profile ?? resolvedModel?.sub_provider ?? null;
 
   // The active model's resolved-version blurb, surfaced only in the
   // trigger's tooltip so the pill itself stays compact. Combines the
@@ -487,6 +498,7 @@ export function MultiProviderModelPicker({
                       codexCaps,
                       cursorCaps,
                       opencodeCaps,
+                      hermesCaps,
                     )}
                     error={errorForRail(railKey, allCaps)}
                   />
@@ -500,6 +512,7 @@ export function MultiProviderModelPicker({
                       codexCaps,
                       cursorCaps,
                       opencodeCaps,
+                      hermesCaps,
                     )}
                     error={errorForRail(railKey, allCaps)}
                     query={query}
@@ -697,6 +710,7 @@ function capsForRail(
   codexCaps: ProviderChatCapabilities | null,
   cursorCaps: ProviderChatCapabilities | null,
   opencodeCaps: ProviderChatCapabilities | null,
+  hermesCaps: ProviderChatCapabilities | null,
 ): ProviderChatCapabilities | null {
   switch (rail) {
     case "claude":
@@ -707,6 +721,8 @@ function capsForRail(
       return cursorCaps;
     case "opencode":
       return opencodeCaps;
+    case "hermes":
+      return hermesCaps;
     case "favorites":
       return null;
   }
@@ -746,9 +762,13 @@ function ModelRow({
   // append it after another dot so the row reads
   // "Claude · Opus 4.8 with 1M context · Best…" — single line,
   // truncated, with the full text in the `title` tooltip.
-  const subtitleBase = model.sub_provider
-    ? `${driverLabel} · ${model.sub_provider}`
-    : driverLabel;
+  // `Hermes · coder`, `OpenCode · anthropic`, or a bare driver
+  // label. The profile is its own field rather than a prefix baked
+  // into the model id, so it is composed in here rather than read off
+  // `model.label`.
+  const subtitleBase = [driverLabel, model.profile, model.sub_provider]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
   const subtitle = model.description
     ? `${subtitleBase} · ${model.description}`
     : subtitleBase;
@@ -911,6 +931,46 @@ function ModelListEmptyState({
       );
     }
   }
+  if (railKey === "hermes") {
+    const parsed = parseProviderError(error);
+    if (parsed?.kind === "not_installed") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Hermes not detected on your system
+          </p>
+          <p className="mt-1">
+            Install the <code className="rounded bg-muted px-1">hermes</code>{" "}
+            CLI and ensure it is on your PATH.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "not_authenticated") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">Hermes is not signed in</p>
+          {/* No login command is named here: each profile advertises its
+              own auth methods, derived from the runtime it is configured
+              against, so there is no single correct one to print. */}
+          <p className="mt-1">
+            Configure the profile&rsquo;s provider credentials in Hermes, then
+            reopen this picker.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          Hermes harvest failed:{" "}
+          <span className="text-foreground">
+            {parsed.detail ?? error ?? ""}
+          </span>
+        </div>
+      );
+    }
+  }
   if (railKey === "codex") {
     const parsed = parseProviderError(error);
     if (parsed?.kind === "not_installed") {
@@ -1032,6 +1092,9 @@ function matchesQuery(row: ResolvedRow, query: string): boolean {
   if (row.model.sub_provider) {
     haystack.push(row.model.sub_provider.toLowerCase());
   }
+  if (row.model.profile) {
+    haystack.push(row.model.profile.toLowerCase());
+  }
   return haystack.some((s) => s.includes(query));
 }
 
@@ -1045,5 +1108,7 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Cursor";
     case "opencode":
       return "OpenCode";
+    case "hermes":
+      return "Hermes";
   }
 }

@@ -16,6 +16,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   opencode: "OpenCode",
+  hermes: "Hermes",
 };
 
 interface WireProviderError {

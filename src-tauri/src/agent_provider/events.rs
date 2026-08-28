@@ -606,6 +606,24 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         resume_cursor: serde_json::Value,
     },
+    /// The provider named the conversation itself, and Codemux may adopt
+    /// that name for the thread.
+    ///
+    /// A *suggestion*, never an assignment: the command layer applies it
+    /// only to a thread that has no title of its own, so a title the user
+    /// typed — or the one Codemux derived from the first user turn — is
+    /// never overwritten by the agent's summary of the same conversation.
+    ///
+    /// It exists for the case where Codemux has no title to derive: a
+    /// session that already existed agent-side, opened through a picker or
+    /// resumed after the thread's own rows were never written. Hermes
+    /// auto-titles every session and reports the title on `session/list`,
+    /// which is where this comes from.
+    ThreadTitleSuggested {
+        thread_id: ThreadId,
+        /// Already trimmed by the adapter; never empty.
+        title: String,
+    },
     /// A user turn was persisted to `agent_chat_messages`, fanned out to
     /// every client attached to the thread.
     ///

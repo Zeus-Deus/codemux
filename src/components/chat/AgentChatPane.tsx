@@ -166,6 +166,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   codex: "Codex",
   cursor: "Cursor",
   opencode: "OpenCode",
+  hermes: "Hermes",
 };
 
 /** Step 8 Stage 7 — issue/PR fetches go stale at this age. On send,

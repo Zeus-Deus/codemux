@@ -1132,7 +1132,9 @@ export function Composer({
                   ? "text-accent-violet"
                   : sourceProvider === "opencode"
                     ? "text-chart-4"
-                    : "text-muted-foreground";
+                    : sourceProvider === "hermes"
+                      ? "text-chart-1"
+                      : "text-muted-foreground";
           return {
             id: `session:${session.thread_id}`,
             label: sessionMentionTitle(session),

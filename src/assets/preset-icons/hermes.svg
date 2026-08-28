@@ -1,0 +1,11 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- Winged disc — the messenger's mark, reduced to a solid orb under
+     two swept wings so it still reads at 10px (the picker row's h-2.5
+     logo). Rendered through <img>, like every sibling asset, so the
+     fill is a literal color: currentColor cannot cross the image
+     boundary. The single gold tone holds contrast on both the light
+     and dark washes. -->
+<path d="M10.6 3.6 1 6.4V8l9.6 2z" fill="#C8963E"/>
+<path d="M13.4 3.6 23 6.4V8l-9.6 2z" fill="#C8963E"/>
+<circle cx="12" cy="15.2" r="6" fill="#C8963E"/>
+</svg>

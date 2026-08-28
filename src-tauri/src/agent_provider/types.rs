@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// The set of CLI-backed coding agents the chat runtime can drive.
 ///
 /// Serialized as lowercase strings (`"claude"`, `"codex"`, `"cursor"`,
-/// `"opencode"`) so
+/// `"opencode"`, `"hermes"`) so
 /// values round-trip cleanly through JSON settings and IPC surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +30,10 @@ pub enum ProviderKind {
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.
     OpenCode,
+    /// Hermes via `hermes -p <profile> acp`, its Agent Client Protocol
+    /// stdio server. Stage 1 scaffold — the runtime adapter is not
+    /// implemented yet and command dispatch returns a placeholder error.
+    Hermes,
 }
 
 /// Capabilities a provider declares statically so the UI can enable or hide
@@ -116,6 +120,21 @@ pub struct StartSessionInput {
     /// Optional initial model identifier. Providers fall back to their
     /// default when absent.
     pub model: Option<String>,
+    /// Optional provider-scoped configuration profile.
+    ///
+    /// Only Hermes reads it today: it maps to the `-p <profile>` global
+    /// flag on the launch line (`hermes -p <profile> acp`), which selects
+    /// the runtime, model catalogue and approval policy the child boots
+    /// with. It is deliberately a first-class typed field rather than a
+    /// suffix on `model` so the two stay independently selectable.
+    ///
+    /// Profile is a LAUNCH parameter, not a live setting: there is no
+    /// protocol call that re-profiles a running child, so a change must
+    /// restart the session (stop, then start again with the new value)
+    /// rather than being poked at the live one like a model swap.
+    /// Providers that do not recognise profiles ignore it.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// Opaque resume state previously returned by the provider. When
     /// present the provider should attempt to resume instead of starting a
     /// fresh session.

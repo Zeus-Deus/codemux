@@ -4,7 +4,7 @@ import { render } from "@testing-library/react";
 import { ProviderLogo } from "./provider-logo";
 
 // Vite serves `?import` URLs for SVGs in dev mode; vitest's jsdom env
-// doesn't. Stub the two asset modules so the component gets back a
+// doesn't. Stub the asset modules so the component gets back a
 // predictable path string we can assert on. The prod build uses the
 // real asset-url loader via Vite.
 vi.mock("@/assets/preset-icons/claude.svg", () => ({
@@ -12,6 +12,11 @@ vi.mock("@/assets/preset-icons/claude.svg", () => ({
 }));
 vi.mock("@/assets/preset-icons/codex.svg", () => ({
   default: "/mock/codex.svg",
+}));
+// Small marks are inlined as data URIs by the asset loader, so the
+// stub is what makes the src assertable at all.
+vi.mock("@/assets/preset-icons/hermes.svg", () => ({
+  default: "/mock/hermes.svg",
 }));
 
 describe("ProviderLogo", () => {
@@ -31,6 +36,15 @@ describe("ProviderLogo", () => {
     expect(img.getAttribute("data-provider")).toBe("codex");
     expect(img.getAttribute("src")).toContain("codex.svg");
     expect(img.getAttribute("alt")).toBe("Codex");
+  });
+
+  it("renders the Hermes icon for provider='hermes'", () => {
+    const { container } = render(<ProviderLogo provider="hermes" />);
+    const img = container.querySelector("img") as HTMLImageElement;
+    expect(img).not.toBeNull();
+    expect(img.getAttribute("data-provider")).toBe("hermes");
+    expect(img.getAttribute("src")).toContain("hermes.svg");
+    expect(img.getAttribute("alt")).toBe("Hermes");
   });
 
   it("forwards className for sizing", () => {

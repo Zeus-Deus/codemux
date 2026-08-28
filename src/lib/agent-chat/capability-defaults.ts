@@ -29,6 +29,11 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> 
   // happen to read the bare fallback during the brief
   // pre-hydration window still produces a recognisable identifier.
   opencode: "anthropic/claude-sonnet-4-6",
+  // Hermes model ids are `provider:model` — the runtime the active
+  // profile is configured against, then the upstream model slug. The
+  // live catalogue arrives with `session/new`, so this only has to be
+  // shaped like a real id for the pre-hydration window.
+  hermes: "anthropic:claude-opus-5",
 };
 
 /**
@@ -49,6 +54,12 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
   codex: "danger-full-access",
   cursor: "agent",
   opencode: null,
+  // Hermes exposes exactly three ACP modes — `default` / `accept_edits`
+  // / `dont_ask`. Bootstrap on `default` ("Ask before edits"): the
+  // modes govern EDITS only, and shell approvals are decided by the
+  // profile's own `approvals.mode`, so a permissive bootstrap would
+  // widen more than the picker implies.
+  hermes: "default",
 };
 
 /**
@@ -65,6 +76,8 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
  * non-interactive mode, so a Cursor selection would either fail with
  * `utility_provider_unsupported` or (in the resolver's case) silently
  * fall through to the `claude` binary carrying a Cursor model slug.
+ * Hermes is absent for the same reason: `hermes acp` is a session
+ * protocol over stdio, not a one-shot pipe.
  * Every picker bound to one of those backends passes this list as its
  * `allowedProviders` so the choice cannot be made in the first place.
  */
@@ -95,6 +108,10 @@ const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
   codex: false,
   cursor: false,
   opencode: true,
+  // Hermes runs one process per thread and its `session/close` is a
+  // no-op, so process exit is the only reclamation: a rebuilt session
+  // can never answer a request the old process was holding.
+  hermes: false,
 };
 
 /** Predicate form of {@link REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER}.

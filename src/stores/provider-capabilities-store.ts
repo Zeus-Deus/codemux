@@ -44,10 +44,15 @@ interface ProviderCapabilitiesStore {
    *  `opencodeError`; the slot itself stays `null` so the picker can
    *  render an empty state rather than a stale list. */
   opencode: ProviderChatCapabilities | null;
+  /** Hermes' per-profile model catalogue, flattened across every
+   *  configured profile — each row carries its own `profile`. Stays
+   *  `null` until `refresh("hermes")` resolves. */
+  hermes: ProviderChatCapabilities | null;
   claudeError: string | null;
   codexError: string | null;
   cursorError: string | null;
   opencodeError: string | null;
+  hermesError: string | null;
   loaded: boolean;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
   refreshAll: () => Promise<void>;
@@ -59,10 +64,12 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
     codex: null,
     cursor: null,
     opencode: null,
+    hermes: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
     opencodeError: null,
+    hermesError: null,
     loaded: false,
     refresh: async (provider) => {
       try {
@@ -87,6 +94,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
         store.refresh("codex"),
         store.refresh("cursor"),
         store.refresh("opencode"),
+        store.refresh("hermes"),
       ]);
       set({ loaded: true });
     },
@@ -156,6 +164,8 @@ export function selectCapabilities(
       return state.cursor;
     case "opencode":
       return state.opencode;
+    case "hermes":
+      return state.hermes;
   }
 }
 
@@ -173,6 +183,8 @@ export function selectError(
       return state.cursorError;
     case "opencode":
       return state.opencodeError;
+    case "hermes":
+      return state.hermesError;
   }
 }
 
@@ -218,9 +230,15 @@ function storeOk(
       return { cursor: caps, cursorError: null };
     case "opencode":
       return { opencode: caps, opencodeError: null };
+    case "hermes":
+      return { hermes: caps, hermesError: null };
   }
   // Exhaustive switch above; the void return is unreachable but keeps
-  // TS happy when AgentChatProviderKind grows.
+  // TS happy when AgentChatProviderKind grows. It also DEFEATS the
+  // exhaustiveness check: a provider with no arm here compiles clean
+  // and silently writes the whole state back, leaving that rail empty
+  // forever with no error. Add the arm by hand — `npm run check` will
+  // not catch it.
   return state;
 }
 
@@ -238,6 +256,8 @@ function storeErr(
       return { cursorError: message };
     case "opencode":
       return { opencodeError: message };
+    case "hermes":
+      return { hermesError: message };
   }
   return state;
 }

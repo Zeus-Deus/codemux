@@ -55,6 +55,7 @@ const SERIES_FILL: Record<string, string> = {
   codex: "bg-foreground/45",
   cursor: "bg-accent-violet",
   opencode: "bg-status-open",
+  hermes: "bg-chart-1",
 };
 
 /** The same series tones as CSS colors, for the SVG chart. Codex's
@@ -65,6 +66,7 @@ const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
   codex: { color: "var(--foreground)", opacity: 0.55 },
   cursor: { color: "var(--accent-violet)", opacity: 1 },
   opencode: { color: "var(--status-open)", opacity: 1 },
+  hermes: { color: "var(--chart-1)", opacity: 1 },
 };
 
 const UNKNOWN_COLOR = { color: "var(--muted-foreground)", opacity: 0.5 };
@@ -78,6 +80,7 @@ const SERIES_LABEL: Record<string, string> = {
   codex: "Codex",
   cursor: "Cursor",
   opencode: "OpenCode",
+  hermes: "Hermes",
 };
 
 /** Fallback for a provider id the frontend does not know — the ledger
@@ -98,7 +101,8 @@ function isKnownProvider(provider: string): provider is AgentChatProviderKind {
     provider === "claude" ||
     provider === "codex" ||
     provider === "cursor" ||
-    provider === "opencode"
+    provider === "opencode" ||
+    provider === "hermes"
   );
 }
 
@@ -235,6 +239,11 @@ export function UsageSection() {
       .finally(() => setRefreshing(false));
   }, [period]);
 
+  // Scans the on-disk transcripts of the providers that keep them --
+  // Claude and Codex only. Hermes is deliberately NOT among them: it
+  // writes no provider history file of its own, and the Rust scanner
+  // parses anything that is not "claude" as a Codex rollout, so adding
+  // it would import garbage rows rather than nothing.
   const scan = useCallback(async () => {
     setScanning(true);
     try {

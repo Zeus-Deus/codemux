@@ -34,6 +34,7 @@ const PRESET_TITLE_TO_ICON: Record<string, string> = {
   "Grok": "grok",
   "Droid": "factory",
   "Mastracode": "mastracode",
+  "Hermes": "hermes",
   "Shell": "terminal",
 };
 

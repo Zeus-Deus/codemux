@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cwd,
             model: Some(model.clone()),
             resume_cursor: None,
+            // Hermes-only; OpenCode has no profile concept.
+            profile: None,
             permission_mode: None,
             effort: None,
             context_window: None,

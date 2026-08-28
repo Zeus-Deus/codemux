@@ -98,6 +98,7 @@ export const useProviderHealth = create<ProviderHealthStore>((set, get) => ({
     codex: emptyHealthSlot(),
     cursor: emptyHealthSlot(),
     opencode: emptyHealthSlot(),
+    hermes: emptyHealthSlot(),
   },
   refresh: async (provider, opts) => {
     const slot = get().slots[provider];

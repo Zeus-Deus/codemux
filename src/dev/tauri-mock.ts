@@ -1279,6 +1279,84 @@ const CURSOR_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_turn",
 };
 
+/** Hermes' catalogue is per PROFILE, not per install: `hermes -p
+ * <profile> acp` runs against that profile's own runtime credentials
+ * and approval policy, so two profiles advertise two different model
+ * lists. The mock ships two so the picker's `Hermes · <profile>` row
+ * subtitle is exercisable with no Hermes binary present.
+ *
+ * Shapes follow the live `session/new` payload: `provider:model` ids,
+ * `Provider · model` labels, and the three real ACP modes. The profile
+ * is a field of its own -- never a prefix on the id -- because picking
+ * a different one restarts the session rather than poking
+ * `session/set_model`. */
+const HERMES_CAPABILITIES: ProviderChatCapabilities = {
+  models: [
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "openai-codex:gpt-5.6-sol",
+      label: "OpenAI Codex · gpt-5.6-sol",
+      description: "Provider: OpenAI Codex",
+      profile: "codemuxdev",
+      supports_images: true,
+    },
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "openai-codex:gpt-5.6-luna",
+      label: "OpenAI Codex · gpt-5.6-luna",
+      description: "Provider: OpenAI Codex",
+      profile: "codemuxdev",
+      supports_images: true,
+    },
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "anthropic:claude-opus-5",
+      label: "Anthropic · claude-opus-5",
+      description: "Provider: Anthropic",
+      profile: "coder",
+      supports_images: true,
+    },
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "anthropic:claude-sonnet-5",
+      label: "Anthropic · claude-sonnet-5",
+      description: "Provider: Anthropic",
+      profile: "coder",
+      supports_images: true,
+    },
+  ],
+  // Hermes exposes no reasoning-effort control over ACP.
+  effort_granularity: "per_session",
+  effort_label_map: {},
+  // The three modes `session/new` reports, verbatim. They govern EDITS
+  // only -- shell approvals go through the profile's own approvals
+  // policy, which can auto-approve a command without ever prompting.
+  permission_modes: [
+    {
+      value: "default",
+      label: "Default",
+      description: "Ask before edits.",
+      is_default: true,
+    },
+    {
+      value: "accept_edits",
+      label: "Accept Edits",
+      description:
+        "Auto-allow workspace and scratch-dir edits; still asks for sensitive paths.",
+      is_default: false,
+    },
+    {
+      value: "dont_ask",
+      label: "Don't Ask",
+      description:
+        "Auto-allow file edits for this session except sensitive paths.",
+      is_default: false,
+    },
+  ],
+  default_permission_mode: "default",
+  permission_granularity: "per_session",
+};
+
 /** Number of simulated turns in the seeded transcript. Every 5th turn
  * includes an 8-call tool burst (exercises run folding). At 520 turns the
  * derived transcript still has more than 1,100 independently virtualized
@@ -2330,7 +2408,12 @@ function streamMockRunStalled(
 
 /** Provider-health QA: per-provider override served by the
  *  `agent_chat_provider_health` mock handler. Absent → healthy. */
-type MockProviderKind = "claude" | "codex" | "cursor" | "opencode";
+type MockProviderKind =
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "opencode"
+  | "hermes";
 const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
@@ -3008,6 +3091,8 @@ const handlers: Record<string, Handler> = {
         ? CODEX_UTILITY_CAPABILITIES
         : a.provider === "cursor"
           ? CURSOR_CAPABILITIES
+          : a.provider === "hermes"
+            ? HERMES_CAPABILITIES
         : EMPTY_CAPABILITIES,
   // Provider slash commands — in production these are harvested live
   // from the deployed Claude Code CLI (SDK `supportedCommands()`),

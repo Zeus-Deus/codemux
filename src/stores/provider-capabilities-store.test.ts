@@ -72,10 +72,12 @@ function resetStore() {
     codex: null,
     cursor: null,
     opencode: null,
+    hermes: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
     opencodeError: null,
+    hermesError: null,
     loaded: false,
   });
   mockList.mockReset();
@@ -114,7 +116,7 @@ describe("provider-capabilities-store", () => {
     expect(state.codexError).toBeNull();
   });
 
-  it("refreshAll fires all four providers in parallel", async () => {
+  it("refreshAll fires every provider in parallel", async () => {
     const calls: AgentChatProviderKind[] = [];
     mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
       calls.push(provider);
@@ -124,13 +126,20 @@ describe("provider-capabilities-store", () => {
     await useProviderCapabilities.getState().refreshAll();
     // Order is not guaranteed, but every provider must have been
     // called exactly once.
-    expect(calls.sort()).toEqual(["claude", "codex", "cursor", "opencode"]);
+    expect(calls.sort()).toEqual([
+      "claude",
+      "codex",
+      "cursor",
+      "hermes",
+      "opencode",
+    ]);
     const state = useProviderCapabilities.getState();
     expect(state.loaded).toBe(true);
     expect(state.claude).not.toBeNull();
     expect(state.codex).not.toBeNull();
     expect(state.cursor).not.toBeNull();
     expect(state.opencode).not.toBeNull();
+    expect(state.hermes).not.toBeNull();
   });
 
   it("refreshAll continues when one provider fails", async () => {
@@ -150,6 +159,12 @@ describe("provider-capabilities-store", () => {
     expect(state.cursor?.models[0]?.id).toBe("model-cursor");
     expect(state.opencode).toBeNull();
     expect(state.opencodeError).toBe("opencode_not_installed");
+    // `storeOk` / `storeErr` end in `return state;`, which defeats the
+    // switch's exhaustiveness check — a provider with no arm there
+    // compiles clean, writes nothing, and leaves that rail empty
+    // forever. Asserting the slot AFTER a real refresh is what catches
+    // that; a `setState` assertion would not.
+    expect(state.hermes?.models[0]?.id).toBe("model-hermes");
   });
 
   it("selectCapabilities returns the matching provider's slot", () => {
@@ -158,11 +173,13 @@ describe("provider-capabilities-store", () => {
     const codexCaps = makeCaps("gpt-5.4");
     const cursorCaps = makeCaps("auto");
     const opencodeCaps = makeCaps("openai/gpt-5");
+    const hermesCaps = makeCaps("anthropic:claude-opus-5");
     useProviderCapabilities.setState({
       claude: claudeCaps,
       codex: codexCaps,
       cursor: cursorCaps,
       opencode: opencodeCaps,
+      hermes: hermesCaps,
     });
 
     const updated = useProviderCapabilities.getState();
@@ -174,6 +191,7 @@ describe("provider-capabilities-store", () => {
     // can't reintroduce it silently.
     expect(selectCapabilities(updated, "opencode")).toBe(opencodeCaps);
     expect(selectCapabilities(updated, "opencode")).not.toBe(codexCaps);
+    expect(selectCapabilities(updated, "hermes")).toBe(hermesCaps);
 
     // Smoke: caps.opencode used (not unused-import warning material).
     expect(caps).toBeDefined();
@@ -185,12 +203,14 @@ describe("provider-capabilities-store", () => {
       codexError: "codex broke",
       cursorError: "cursor_not_authenticated",
       opencodeError: "opencode_not_installed",
+      hermesError: "hermes_not_installed",
     });
     const state = useProviderCapabilities.getState();
     expect(selectError(state, "claude")).toBe("claude broke");
     expect(selectError(state, "codex")).toBe("codex broke");
     expect(selectError(state, "cursor")).toBe("cursor_not_authenticated");
     expect(selectError(state, "opencode")).toBe("opencode_not_installed");
+    expect(selectError(state, "hermes")).toBe("hermes_not_installed");
   });
 
   it("selectModel finds models by id within capabilities", () => {

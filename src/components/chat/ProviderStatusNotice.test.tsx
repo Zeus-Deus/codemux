@@ -51,6 +51,7 @@ function resetStore() {
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
+        hermes: emptyHealthSlot(),
       },
     });
   });

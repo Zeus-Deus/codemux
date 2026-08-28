@@ -13,6 +13,7 @@ import antigravityIcon from "@/assets/preset-icons/antigravity.svg";
 import ampIcon from "@/assets/preset-icons/amp.svg";
 import grokIcon from "@/assets/preset-icons/grok.svg";
 import factoryIcon from "@/assets/preset-icons/factory.svg";
+import hermesIcon from "@/assets/preset-icons/hermes.svg";
 
 interface PresetIconProps {
   icon: string | null;
@@ -32,6 +33,7 @@ const ICON_MAP: Record<string, string> = {
   amp: ampIcon,
   grok: grokIcon,
   factory: factoryIcon,
+  hermes: hermesIcon,
 };
 
 export function PresetIcon({ icon, className }: PresetIconProps) {

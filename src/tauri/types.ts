@@ -837,7 +837,8 @@ export type AgentChatProviderKind =
   | "claude"
   | "codex"
   | "cursor"
-  | "opencode";
+  | "opencode"
+  | "hermes";
 
 /** Launch-time model / reasoning / context choice for a CLI agent
  *  preset. Every field is optional — `null` means "use the agent's own
@@ -971,6 +972,16 @@ export interface ChatModelInfo {
    *  favorites. Today only OpenCode federated entries can ever set
    *  this — Claude / Codex always emit `false`. */
   is_free: boolean;
+  /** Hermes only — the named Hermes profile this model was harvested
+   *  from (`hermes -p <profile> acp`). A profile bundles its own
+   *  runtime credentials and approval policy, so the SAME provider
+   *  advertises a different catalogue per profile and the picker has
+   *  to show which one a row belongs to. Deliberately a field of its
+   *  own rather than a prefix on `id`: the profile is an explicit
+   *  input to session start, and changing it RESTARTS the session
+   *  (it is not a live `set_model` poke). Null/absent for every
+   *  provider that has no profile concept. */
+  profile?: string | null;
 }
 
 export interface PermissionModeOption {
