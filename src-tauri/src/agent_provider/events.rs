@@ -609,12 +609,20 @@ pub enum ProviderRuntimeEvent {
     /// A user turn was persisted to `agent_chat_messages`, fanned out to
     /// every client attached to the thread.
     ///
-    /// **No provider ever emits this** — it is minted by the command layer
-    /// right after [`persist_user_message`](crate::commands::agent_chat)
-    /// writes the row, and its serialized shape is deliberately identical
-    /// to that persisted envelope (`{"type":"user_message", thread_id,
-    /// text, images?, client_nonce?}`) so the frontend folds a live copy
-    /// and a replayed row through exactly one reducer case.
+    /// Normally it is minted by the command layer right after
+    /// [`persist_user_message`](crate::commands::agent_chat) writes the
+    /// row, and its serialized shape is deliberately identical to that
+    /// persisted envelope (`{"type":"user_message", thread_id, text,
+    /// images?, client_nonce?}`) so the frontend folds a live copy and a
+    /// replayed row through exactly one reducer case.
+    ///
+    /// One adapter path also emits it: adopting the transcript a provider
+    /// replays for a session Codemux did NOT create (ACP's `session/load`
+    /// replays every entry, user turns included). Those turns have no row
+    /// anywhere, so `should_persist_event` writes them — safe precisely
+    /// because the minted copy above bypasses `forward_event`. Such an
+    /// event carries no `client_nonce`: no client optimistically rendered
+    /// a bubble for someone else's transcript.
     ///
     /// It exists because user turns are the one transcript-affecting thing
     /// providers never echo back. Without the fan-out, a second client

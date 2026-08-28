@@ -359,10 +359,13 @@ pub fn agent_chat_create_pane<R: Runtime>(
 
 /// Close an `agent_chat` pane.
 ///
-/// Idempotent: calling twice (or on an unknown id) returns `Ok(())`
-/// the second time instead of surfacing an error. The intent is to
-/// match the frontend's "closing an already-closed pane is fine"
-/// expectation; the feature-flag gate still applies.
+/// Thin wrapper over [`crate::commands::workspace::close_pane_impl`], which
+/// is the single close path for every pane kind (it also backs the pane "x"
+/// affordance and the control-socket `pane_close` tool) and owns the
+/// agent-chat detach. Keeping two pane-close implementations is how the
+/// generic path ended up leaking agent-chat sidecars, so this one only adds
+/// the feature-flag gate and the "closing an already-closed pane is fine"
+/// idempotency the frontend expects.
 #[tauri::command]
 pub fn agent_chat_close_pane<R: Runtime>(
     app: AppHandle<R>,
@@ -371,39 +374,9 @@ pub fn agent_chat_close_pane<R: Runtime>(
     pane_id: String,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
-    // Capture the chat session bound to this pane *before* the tree
-    // mutation so the cleanup path still has provider + thread_id to
-    // hand to `stop_session`. Without this the JSON-RPC sidecar and
-    // its background tokio tasks live on after the pane disappears.
-    let chat_thread = state.agent_chat_pane_thread(&pane_id);
-    // Drop any lingering status dot for this pane. The session tear-down
-    // below emits SessionStateChanged::Closed → Idle, but that races the
-    // tree mutation: once close_pane removes the node, the thread→pane
-    // walk can no longer resolve it, so clear by pane id here while the
-    // key is still meaningful.
-    state.set_pane_status(&pane_id, PaneStatus::Idle);
-    // Same for a manual monitoring flag: the agent that claimed it is about to
-    // be torn down, so the claim goes with it.
-    state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
-    // Forget any running-subagent tracking for this thread. The
-    // SessionStateChanged::Closed event below also clears it, but that
-    // races the tear-down (and may be dropped if no channel is attached),
-    // so clear eagerly by thread id while it is still resolvable —
-    // otherwise a subagent whose terminal status is never observed could
-    // pin a stuck "working" spinner forever.
-    if let Some((_, thread_id)) = &chat_thread {
-        let tracker: State<'_, SubagentTracker> = app.state();
-        tracker.clear_thread(thread_id);
-        let activity: State<'_, RunActivityTracker> = app.state();
-        activity.clear_thread(thread_id);
-    }
-    // close_pane errors when the pane id is unknown — treat that as a
+    // close_pane_impl errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
-    let _ = state.close_pane(&pane_id);
-    if let Some(pair) = chat_thread {
-        shutdown_agent_chat_threads(&app, vec![pair]);
-    }
-    crate::state::emit_app_state(&app);
+    let _ = crate::commands::workspace::close_pane_impl(app, &state, pane_id);
     Ok(())
 }
 
@@ -591,6 +564,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     input.permission_mode = resolved_permission_mode;
     // Provider history, not runtime deltas, owns accounting.
     input.recorded_usage_baseline = None;
+    // Transcript adoption is a REQUEST from the caller, never a grant.
+    // Re-resolved here, server-side, against what this thread already
+    // stores — a frontend caller must not be able to assert that fact for
+    // itself.
+    input.extra =
+        resolve_transcript_adoption(&app, &input.thread_id, std::mem::take(&mut input.extra));
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
@@ -617,22 +596,50 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // kept the same thread/provider. New Chat uses a new thread id, and a
     // provider handoff has a different provider, so neither can accidentally
     // inherit an old provider's cursor through this fallback.
-    if input.resume_cursor.is_none() {
+    //
+    // The DB is consulted on EVERY start, not only when the cursor is absent:
+    // the frontend's own cursors are the lossy `{"resume": <id>}` shape (both
+    // the mount seed and the history-dropdown pick rebuild it from the scalar
+    // column), so an incoming cursor naming a session we have an envelope for
+    // gets UPGRADED to that envelope here. A cursor naming a different session
+    // is left exactly as sent.
+    {
         let provider_name = match provider {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
             ProviderKind::OpenCode => "opencode",
         };
-        let persisted_sdk_session_id = {
-            let db: State<'_, DatabaseStore> = app.state();
-            db.get_agent_chat_session(&input.thread_id.0)
-                .filter(|record| record.provider == provider_name)
-                .and_then(|record| record.sdk_session_id)
-        };
-        if let Some(sdk_session_id) = persisted_sdk_session_id {
-            input.resume_cursor = Some(serde_json::json!({ "resume": sdk_session_id }));
+        let db: State<'_, DatabaseStore> = app.state();
+        let record = db
+            .get_agent_chat_session(&input.thread_id.0)
+            .filter(|record| record.provider == provider_name);
+        // Legacy rows carry only the scalar id; synthesise the same shape the
+        // rebuild has always produced for them.
+        let mut stored = record.as_ref().and_then(|record| {
+            record.resume_cursor.clone().or_else(|| {
+                record
+                    .sdk_session_id
+                    .as_ref()
+                    .map(|id| serde_json::json!({ "resume": id }).to_string())
+            })
+        });
+        // History-dropdown resume mints a BRAND-NEW thread id while carrying
+        // the old session id, so this thread has no row (or a row for another
+        // session). Find the envelope by session id instead, scoped to the
+        // provider so a foreign cursor shape can never reach this adapter.
+        if let Some(incoming_id) = input.resume_cursor.as_ref().and_then(extract_sdk_session_id) {
+            let stored_matches = stored
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| extract_sdk_session_id(&value))
+                .is_some_and(|id| id == incoming_id);
+            if !stored_matches {
+                stored = db.resume_cursor_for_sdk_session_id(&incoming_id, provider_name);
+            }
         }
+        input.resume_cursor =
+            merge_stored_resume_envelope(input.resume_cursor.take(), stored.as_deref());
     }
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
@@ -718,24 +725,36 @@ pub async fn agent_chat_start_session<R: Runtime>(
         input.env = env;
         input.workspace_id = workspace_id;
     }
-    let session = impl_.start_session(input).await.map_err(provider_err)?;
-    let state: State<'_, AppStateStore> = app.state();
-    // Session startup is authoritative for BOTH halves of the pane binding.
-    // This matters when the model picker hands an existing pane from Claude
-    // to Codex/OpenCode: persisting only `thread_id` would leave the pane's
-    // provider stale and route the next app-restart resume through Claude.
-    state.set_agent_chat_binding(&pane_id, provider, session.thread_id.0.clone());
-    // Persist the session for the history dropdown. Scope is
-    // (workspace_id, cwd): workspace lookup goes through the state
-    // store because the command layer only knows the pane id.
-    if let Some(workspace_id) = state.workspace_id_for_pane(&pane_id) {
+    let provider_str = match provider {
+        ProviderKind::Claude => "claude",
+        ProviderKind::Codex => "codex",
+        ProviderKind::Cursor => "cursor",
+        ProviderKind::OpenCode => "opencode",
+    };
+    // The session row is created BEFORE the provider starts, not after.
+    //
+    // A `session/load` replay is emitted from inside `start_session` and
+    // reaches `append_agent_chat_message` through the spawned bridge task.
+    // `agent_chat_messages` has a foreign key on `agent_chat_sessions`, and
+    // the insert path deliberately swallows `SQLITE_CONSTRAINT_FOREIGNKEY`
+    // as "the parent row was deleted mid-flight". Upserting the parent
+    // afterwards therefore does not merely race: every adopted transcript
+    // row is rejected, silently, and the replay is gone on the next hydrate
+    // — the exact durability the replay path exists to provide.
+    //
+    // `thread_id` is runtime-owned (`StartSessionInput::thread_id`) and every
+    // adapter returns it unchanged, so the row can be keyed before the
+    // provider is consulted.
+    //
+    // Scope is (workspace_id, cwd); the workspace lookup goes through the
+    // state store because the command layer only knows the pane id.
+    let thread_id_for_persist = input.thread_id.0.clone();
+    let workspace_id_for_persist = {
+        let state: State<'_, AppStateStore> = app.state();
+        state.workspace_id_for_pane(&pane_id)
+    };
+    if let Some(workspace_id) = workspace_id_for_persist.as_deref() {
         let db: State<'_, DatabaseStore> = app.state();
-        let provider_str = match provider {
-            ProviderKind::Claude => "claude",
-            ProviderKind::Codex => "codex",
-            ProviderKind::Cursor => "cursor",
-            ProviderKind::OpenCode => "opencode",
-        };
         // A CodeMux thread can keep its transcript while changing provider,
         // but provider-native resume cursors are not portable. The upsert
         // atomically clears the old cursor when `provider` changes, then the
@@ -743,13 +762,46 @@ pub async fn agent_chat_start_session<R: Runtime>(
         // adapter. Keeping this inside one SQL statement avoids a second
         // clear racing a new provider's cursor event.
         if let Err(error) = db.upsert_agent_chat_session(
-            &session.thread_id.0,
-            &workspace_id,
+            &thread_id_for_persist,
+            workspace_id,
             cwd_for_persist.as_deref(),
             provider_str,
         ) {
             eprintln!("[codemux::agent_chat] failed to persist session record: {error}");
         }
+    }
+
+    let session = match impl_.start_session(input).await {
+        Ok(session) => session,
+        Err(error) => {
+            // The row above was speculative. A start that never produced a
+            // session leaves an empty shell in the history dropdown, so drop
+            // it again — but only when it owns no messages, since a failed
+            // RESTART must not delete the transcript it was resuming.
+            if workspace_id_for_persist.is_some() {
+                let db: State<'_, DatabaseStore> = app.state();
+                if db.max_agent_chat_message_id(&thread_id_for_persist).is_none() {
+                    if let Err(cleanup) = db.delete_agent_chat_session(&thread_id_for_persist) {
+                        eprintln!(
+                            "[codemux::agent_chat] failed to drop empty session row after a \
+                             failed start: {cleanup}"
+                        );
+                    }
+                }
+            }
+            return Err(provider_err(error));
+        }
+    };
+    let state: State<'_, AppStateStore> = app.state();
+    // Session startup is authoritative for BOTH halves of the pane binding.
+    // This matters when the model picker hands an existing pane from Claude
+    // to Codex/OpenCode: persisting only `thread_id` would leave the pane's
+    // provider stale and route the next app-restart resume through Claude.
+    state.set_agent_chat_binding(&pane_id, provider, session.thread_id.0.clone());
+    // Only threads bound to a workspace own a session row (the upsert above
+    // is gated the same way), so the follow-up persists are gated on it too.
+    if workspace_id_for_persist.is_some() {
+        let db: State<'_, DatabaseStore> = app.state();
         // Persist a provider-returned resume cursor NOW, after the row
         // exists. The async `ResumeCursorUpdated` persist path is a plain
         // UPDATE racing this upsert across a spawned bridge task — when the
@@ -757,13 +809,17 @@ pub async fn agent_chat_start_session<R: Runtime>(
         // leaving the FIRST dead-run rebuild with no conversation context
         // (OpenCode and Codex return their cursors at start; Claude's SDK id
         // arrives later by event). Best-effort like the neighboring persists.
-        if let Some(sdk_session_id) = session
+        if let Some((cursor, sdk_session_id)) = session
             .resume_cursor
             .as_ref()
-            .and_then(extract_sdk_session_id)
+            .and_then(|cursor| extract_sdk_session_id(cursor).map(|id| (cursor, id)))
         {
+            // Store the WHOLE envelope, not just the extracted id: for Cursor
+            // this is the only persist that lands (its `ResumeCursorUpdated`
+            // fires before the row exists), so a scalar-only write here is
+            // exactly where `schemaVersion` used to disappear.
             if let Err(error) =
-                db.set_agent_chat_sdk_session_id(&session.thread_id.0, &sdk_session_id)
+                db.set_agent_chat_resume_cursor(&session.thread_id.0, &sdk_session_id, cursor)
             {
                 eprintln!(
                     "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
@@ -1738,13 +1794,17 @@ pub async fn ensure_live_session<R: Runtime>(
         }
     };
 
-    // Build the resume cursor from the persisted id, but for Claude run a
+    // Replay the persisted resume envelope, but for Claude run a
     // preflight: if the CLI's on-disk session JSONL is confirmed gone,
     // skip the cursor and start fresh rather than wedging the rebuild on a
-    // dead id. Best-effort clear the column so no later rebuild reuses it.
+    // dead id. Best-effort clear the columns so no later rebuild reuses them.
     // Codex / OpenCode carry their own cursor shapes and are untouched.
-    let resume_cursor = match record.sdk_session_id.as_ref() {
-        Some(id) if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) => {
+    let persisted =
+        persisted_resume(record.sdk_session_id.as_deref(), record.resume_cursor.as_deref());
+    let resume_cursor = match persisted {
+        Some((ref id, _))
+            if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) =>
+        {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor for thread={} \
                  (Claude session file for {id} is gone); starting fresh",
@@ -1759,7 +1819,7 @@ pub async fn ensure_live_session<R: Runtime>(
             }
             None
         }
-        Some(id) => Some(serde_json::json!({ "resume": id })),
+        Some((_, cursor)) => Some(cursor),
         None => None,
     };
 
@@ -1803,6 +1863,10 @@ pub async fn ensure_live_session<R: Runtime>(
         additional_directories: vec![],
         env: env.clone(),
         workspace_id: workspace_id.clone(),
+        // No `adoptTranscript`, deliberately: this thread's visible
+        // transcript hydrates from its own `agent_chat_messages` rows (see
+        // the doc comment above), so materialising a provider's replay of
+        // the same conversation would duplicate every bubble.
         extra: serde_json::Value::Null,
         recorded_usage_baseline: None,
     };
@@ -3449,6 +3513,12 @@ pub async fn list_chat_slash_commands(
 }
 
 /// Gracefully terminate a session. Idempotent on the provider side.
+///
+/// This is the EXPLICIT user-initiated stop: it ends the conversation as
+/// far as the provider is concerned (for OpenCode that means the durable
+/// server-side session is deleted). Surfaces that merely stop *showing* a
+/// session — pane/tab/workspace close, swapping the pane to a different
+/// session — must call [`agent_chat_detach_session`] instead.
 #[tauri::command]
 pub async fn agent_chat_stop_session<R: Runtime>(
     app: AppHandle<R>,
@@ -3465,18 +3535,48 @@ pub async fn agent_chat_stop_session<R: Runtime>(
     }
 }
 
+/// Release the local hold on a session without ending the conversation.
+///
+/// Same teardown of Codemux-owned resources as
+/// [`agent_chat_stop_session`] (child process, background tasks), but a
+/// provider backed by a durable external session leaves that session
+/// intact so a later `start_session` with the persisted resume cursor
+/// picks the same conversation back up. Idempotent — an unknown thread is
+/// `Ok(())`, matching its sibling.
+#[tauri::command]
+pub async fn agent_chat_detach_session<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    match impl_.detach_session(thread_id).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
+}
+
 /// Fire-and-forget cleanup for chat sessions whose owning pane/tab/workspace
-/// just got removed. Without this, `provider.stop_session` is never called
-/// during workspace or tab close — the session keeps its JSON-RPC sidecar
+/// just got removed. Without this, nothing tears the session down during
+/// pane, tab or workspace close — the session keeps its JSON-RPC sidecar
 /// child alive and its background tokio tasks hold `Arc<Session>` in a
 /// refcycle with the session's own `JoinHandle` vec, so `Drop` never
 /// fires. Each closed worktree leaks one sidecar process plus its task
 /// graph until the whole app is killed.
 ///
+/// Uses `detach_session`, not `stop_session`: closing the surface that
+/// shows a conversation is not a request to end it. The leak argument above
+/// still holds — detach kills the child and aborts the tasks exactly the
+/// same way — but a provider whose session is durable server-side (OpenCode)
+/// keeps that session alive so reopening the pane can resume it.
+///
 /// Skips the feature-flag gate intentionally: the gate guards new session
 /// creation, but already-running sessions must be reaped regardless of
 /// whether the flag has since been flipped off.
-pub fn shutdown_agent_chat_threads<R: Runtime>(
+pub fn detach_agent_chat_threads<R: Runtime>(
     app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
 ) {
@@ -3490,9 +3590,9 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
             let Some(impl_) = registry.get(kind).await else {
                 continue;
             };
-            if let Err(error) = impl_.stop_session(ThreadId(thread_id.clone())).await {
+            if let Err(error) = impl_.detach_session(ThreadId(thread_id.clone())).await {
                 eprintln!(
-                    "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
+                    "[agent_chat] cleanup detach_session failed for {kind:?} {thread_id}: {error:?}"
                 );
             }
         }
@@ -4170,6 +4270,10 @@ pub async fn agent_chat_rename_session(
 /// Delete a persisted chat session. Idempotent. Note this does not
 /// stop a live session — the UI should call `agent_chat_stop_session`
 /// first if the row being deleted is the current pane's active chat.
+/// This is the one genuine TERMINATE in the product, so it pairs with
+/// `stop_session` rather than `detach_session`: deleting the row means
+/// the conversation is gone, and any durable provider-side session
+/// behind it should go with it.
 /// Persisted messages cascade-delete from the FK on agent_chat_messages.
 #[tauri::command]
 pub async fn agent_chat_delete_session(
@@ -4628,8 +4732,12 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     {
         if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
             let db: State<'_, DatabaseStore> = app.state();
-            if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
-                eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
+            // Both halves in one UPDATE: the id keys the dropdown / collapse,
+            // the verbatim envelope is what the next rebuild replays.
+            if let Err(error) =
+                db.set_agent_chat_resume_cursor(&thread_id.0, &sdk_session_id, resume_cursor)
+            {
+                eprintln!("[codemux::agent_chat] failed to persist resume cursor: {error}");
             }
             // Resume creates a fresh DB row (new thread_id) carrying the
             // same sdk_session_id as the original. Collapse the
@@ -4843,9 +4951,12 @@ fn fan_out_to_thread_channels<R: Runtime>(
 /// client drops its own copy on `client_nonce`.
 ///
 /// Deliberately NOT routed through [`forward_event`]: that function owns
-/// persistence, and this row is already on disk — re-entering it would
-/// either double-write the envelope or lose the `persisted_id` stamp,
-/// since `should_persist_event` returns `false` for this variant.
+/// persistence, and this row is already on disk. `should_persist_event`
+/// now returns `true` for `UserMessage` (so an adapter adopting a
+/// replayed foreign transcript can make its user turns durable), which
+/// makes bypassing it load-bearing rather than merely tidy: re-entering
+/// `forward_event` here would write the envelope a second time and
+/// double the bubble on the next hydrate.
 /// Pane-status publication and stall-watchdog activity are likewise
 /// skipped: `agent_chat_send_turn` already owns the send's status
 /// transition, and a user turn is an input, not provider liveness.
@@ -6125,17 +6236,65 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
                 status: crate::agent_provider::SessionStatus::Error { .. },
                 ..
             }
+            // A user turn that reaches `forward_event` came from a
+            // PROVIDER, and the only provider that emits one is an adapter
+            // adopting the transcript a foreign session replayed (see
+            // `adopt_transcript` in the cursor adapter). That bubble has no
+            // row anywhere, so this is its one chance to become durable.
+            // The command layer's own copy never arrives here — see the
+            // note below.
+            | ProviderRuntimeEvent::UserMessage { .. }
     )
-    // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
-    // MINTED from a row `persist_user_message` has already written, and
-    // re-persisting it in `forward_event` would double the bubble on every
-    // hydrate. Its `persisted_id` is stamped by `fan_out_user_message`
-    // instead, which is why that path bypasses `forward_event`.
+    // NOTE: the command layer's OWN user-message fan-out is not affected by
+    // the arm above: it is MINTED from a row `persist_user_message` has
+    // already written and is pushed straight out by `fan_out_user_message`,
+    // which stamps `persisted_id` itself and deliberately bypasses
+    // `forward_event`. Only a provider-sourced copy can reach this
+    // function, so re-persisting cannot double a bubble the command layer
+    // already wrote.
     //
     // NOTE: `RunStalled` is deliberately NOT persisted. It is a transient
     // advisory recomputed live by the stall watchdog; the durable record of
     // a dead run is the settled/`child_exited` `TurnCompleted`, which drives
     // the "Run interrupted" divider on hydrate.
+}
+
+/// Resolve a caller's transcript-adoption request against what the thread
+/// already stores.
+///
+/// Some providers replay a loaded session's whole transcript as runtime
+/// events (ACP's `session/load` does exactly that). Materialising that
+/// replay is only ever correct for a thread with NO transcript of its own
+/// — a session created outside Codemux, where the replay is the single
+/// source of the conversation. A thread Codemux itself created and drove
+/// hydrates from `agent_chat_messages` instead, and that table cannot
+/// absorb a duplicate: it is a pure append keyed only by an autoincrement
+/// id (see [`DatabaseStore::append_agent_chat_message`]), so a wrongly
+/// granted adoption doubles every bubble with no recovery short of
+/// deleting the thread.
+fn resolve_transcript_adoption<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &ThreadId,
+    mut extra: serde_json::Value,
+) -> serde_json::Value {
+    let requested = extra
+        .get("adoptTranscript")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !requested {
+        return extra;
+    }
+    let db: State<'_, DatabaseStore> = app.state();
+    let granted = db.max_agent_chat_message_id(&thread_id.0).is_none();
+    if !granted {
+        eprintln!(
+            "[codemux::agent_chat] refusing transcript adoption for thread={}: \
+             it already owns persisted messages",
+            thread_id.0,
+        );
+    }
+    extra["adoptTranscript"] = serde_json::Value::Bool(granted);
+    extra
 }
 
 /// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
@@ -6152,6 +6311,66 @@ pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
         .or_else(|| cursor.get("threadId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Resolve the `(session id, resume cursor)` pair a dead session should be
+/// rebuilt from, out of the two persisted columns.
+///
+/// The envelope is replayed VERBATIM so every sibling key survives a restart
+/// (Cursor's `schemaVersion`, and whatever provenance a future adapter hangs
+/// off it). Rows written before the envelope column existed carry only the
+/// scalar id and fall back to the `{"resume": <id>}` shape the rebuild has
+/// always synthesised for them. `None` when neither column names a session.
+///
+/// Extracted so the rebuild's column precedence is unit-testable without an
+/// app handle.
+pub fn persisted_resume(
+    sdk_session_id: Option<&str>,
+    resume_cursor: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    let envelope = resume_cursor
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .filter(serde_json::Value::is_object);
+    // Prefer the dedicated identity column; an envelope-only row (the scalar
+    // was never written) can still name its own session.
+    let id = sdk_session_id
+        .map(str::to_string)
+        .or_else(|| envelope.as_ref().and_then(extract_sdk_session_id))?;
+    let cursor = envelope.unwrap_or_else(|| serde_json::json!({ "resume": id }));
+    Some((id, cursor))
+}
+
+/// Upgrade a caller-supplied resume cursor with the envelope we persisted for
+/// the same session.
+///
+/// The frontend rebuilds its cursors from the scalar `sdk_session_id` column,
+/// so what arrives on the wire is the lossy `{"resume": <id>}` shape even when
+/// the adapter originally emitted a richer envelope. `stored` is the raw JSON
+/// text of that envelope:
+///
+/// - no incoming cursor → the stored envelope stands in for it;
+/// - an incoming cursor naming the SAME session → replaced by the envelope;
+/// - an incoming cursor naming a different session (or an unparsable /
+///   non-object stored value) → returned untouched.
+///
+/// Extracted so the merge is unit-testable without an app handle.
+pub fn merge_stored_resume_envelope(
+    incoming: Option<serde_json::Value>,
+    stored: Option<&str>,
+) -> Option<serde_json::Value> {
+    let envelope = stored
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .filter(serde_json::Value::is_object);
+    match (incoming, envelope) {
+        (None, envelope) => envelope,
+        (Some(cursor), Some(envelope)) => {
+            let same_session = extract_sdk_session_id(&envelope)
+                .zip(extract_sdk_session_id(&cursor))
+                .is_some_and(|(stored_id, incoming_id)| stored_id == incoming_id);
+            Some(if same_session { envelope } else { cursor })
+        }
+        (Some(cursor), None) => Some(cursor),
+    }
 }
 
 /// Whether `session_id` looks like a value we are willing to probe for on
@@ -7189,12 +7408,18 @@ mod tests {
         assert!(captured.lock().unwrap().is_empty());
     }
 
-    /// `forward_event` must never re-persist a fanned-out user turn: the row
-    /// already exists (that is where the event came from), so persisting it
-    /// again would double the bubble on the next hydrate.
+    /// A fanned-out user turn is never re-persisted, because it never
+    /// reaches `forward_event`: `fan_out_user_message` mints it from a row
+    /// `persist_user_message` has already written and pushes it straight to
+    /// the attached channels, stamping `persisted_id` itself.
+    ///
+    /// The only user turn that DOES reach `forward_event` is one an adapter
+    /// emitted while adopting a foreign session's replayed transcript. That
+    /// bubble has no row anywhere, so it must persist or it is lost on the
+    /// next hydrate.
     #[test]
-    fn user_message_is_not_persisted_by_forward_event() {
-        assert!(!should_persist_event(&ProviderRuntimeEvent::UserMessage {
+    fn a_provider_sourced_user_message_persists() {
+        assert!(should_persist_event(&ProviderRuntimeEvent::UserMessage {
             thread_id: ThreadId("t1".into()),
             text: "hi".into(),
             images: Vec::new(),
@@ -9363,11 +9588,107 @@ mod tests {
         assert_eq!(rendered, "review");
     }
 
+    // ── persisted_resume ──
+
+    #[test]
+    fn persisted_resume_replays_a_multi_field_envelope_verbatim() {
+        let (id, cursor) = persisted_resume(
+            Some("sess-1"),
+            Some(r#"{"schemaVersion":1,"sessionId":"sess-1"}"#),
+        )
+        .expect("row names a session");
+        assert_eq!(id, "sess-1");
+        // Byte-for-byte the envelope the adapter emitted — `schemaVersion` is
+        // the sibling key that used to be dropped on restart.
+        assert_eq!(cursor, json!({"schemaVersion": 1, "sessionId": "sess-1"}));
+    }
+
+    #[test]
+    fn persisted_resume_falls_back_to_the_legacy_scalar_shape() {
+        // A pre-column row: scalar id, no envelope. Byte-identical to what
+        // the rebuild produced before the envelope column existed.
+        let (id, cursor) = persisted_resume(Some("sess-1"), None).expect("row names a session");
+        assert_eq!(id, "sess-1");
+        assert_eq!(cursor, json!({"resume": "sess-1"}));
+
+        // Unparsable / non-object stored text degrades the same way.
+        for stored in [Some("not json"), Some("\"sess-1\"")] {
+            let (_, cursor) = persisted_resume(Some("sess-1"), stored).unwrap();
+            assert_eq!(cursor, json!({"resume": "sess-1"}), "stored={stored:?}");
+        }
+    }
+
+    #[test]
+    fn persisted_resume_recovers_the_id_from_an_envelope_only_row() {
+        let (id, cursor) = persisted_resume(None, Some(r#"{"threadId":"thread-9","kind":"codex"}"#))
+            .expect("envelope names a session");
+        assert_eq!(id, "thread-9");
+        assert_eq!(cursor, json!({"threadId": "thread-9", "kind": "codex"}));
+    }
+
+    #[test]
+    fn persisted_resume_is_none_when_no_column_names_a_session() {
+        assert!(persisted_resume(None, None).is_none());
+        assert!(persisted_resume(None, Some(r#"{"unrelated":true}"#)).is_none());
+    }
+
+    // ── merge_stored_resume_envelope ──
+
+    #[test]
+    fn merge_envelope_supplies_cursor_when_caller_sent_none() {
+        // Cold frontend slice after a restart: the stored envelope IS the
+        // cursor, sibling keys and all.
+        let merged =
+            merge_stored_resume_envelope(None, Some(r#"{"schemaVersion":1,"sessionId":"sess-1"}"#));
+        assert_eq!(
+            merged,
+            Some(json!({"schemaVersion": 1, "sessionId": "sess-1"}))
+        );
+    }
+
+    #[test]
+    fn merge_envelope_upgrades_lossy_frontend_cursor() {
+        // What the mount seed / history dropdown actually sends.
+        let merged = merge_stored_resume_envelope(
+            Some(json!({"resume": "sess-1"})),
+            Some(r#"{"schemaVersion":1,"sessionId":"sess-1"}"#),
+        );
+        assert_eq!(
+            merged,
+            Some(json!({"schemaVersion": 1, "sessionId": "sess-1"}))
+        );
+    }
+
+    #[test]
+    fn merge_envelope_leaves_a_different_session_alone() {
+        // The caller asked for another conversation; the stored envelope for
+        // this thread must not hijack it.
+        let merged = merge_stored_resume_envelope(
+            Some(json!({"resume": "sess-2"})),
+            Some(r#"{"schemaVersion":1,"sessionId":"sess-1"}"#),
+        );
+        assert_eq!(merged, Some(json!({"resume": "sess-2"})));
+    }
+
+    #[test]
+    fn merge_envelope_falls_through_on_unusable_stored_text() {
+        // Unparsable and non-object stored values both degrade to today's
+        // behavior rather than dropping the caller's cursor.
+        for stored in [None, Some("not json"), Some("\"sess-1\"")] {
+            assert_eq!(
+                merge_stored_resume_envelope(Some(json!({"resume": "sess-1"})), stored),
+                Some(json!({"resume": "sess-1"})),
+                "stored={stored:?}"
+            );
+            assert_eq!(merge_stored_resume_envelope(None, stored), None);
+        }
+    }
+
     #[test]
     fn should_not_persist_resume_cursor_updated() {
         // Already persisted via the dedicated agent_chat_sessions
-        // sdk_session_id column; persisting it twice would clutter
-        // the message replay log without adding any rendered output.
+        // sdk_session_id / resume_cursor columns; persisting it twice would
+        // clutter the message replay log without adding any rendered output.
         let e = ProviderRuntimeEvent::ResumeCursorUpdated {
             thread_id: tid(),
             resume_cursor: json!({"resume": "uuid"}),

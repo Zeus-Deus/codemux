@@ -25,6 +25,7 @@ vi.mock("@/tauri/commands", () => ({
     ) => Promise.resolve(input.thread_id),
   ),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  agentChatDetachSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -54,7 +55,7 @@ import { useAgentChatSessionActions } from "./use-agent-chat-session-actions";
 import {
   agentChatListMessages,
   agentChatStartSession,
-  agentChatStopSession,
+  agentChatDetachSession,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import {
@@ -112,9 +113,9 @@ beforeEach(() => {
   useAgentChatStore.setState({ threads: {} });
   vi.mocked(agentChatListMessages).mockClear();
   vi.mocked(agentChatStartSession).mockClear();
-  vi.mocked(agentChatStopSession).mockClear();
+  vi.mocked(agentChatDetachSession).mockClear();
   vi.mocked(agentChatListMessages).mockResolvedValue([]);
-  vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
+  vi.mocked(agentChatDetachSession).mockResolvedValue(undefined);
 });
 
 afterEach(() => {

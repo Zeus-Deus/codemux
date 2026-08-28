@@ -1026,6 +1026,87 @@ mod auto_resume {
             .expect("send_turn succeeds on the resumed session");
     }
 
+    // The rebuild must replay the persisted resume ENVELOPE, not a cursor
+    // re-synthesised from the scalar id. Seeds a Cursor-shaped
+    // `{schemaVersion, sessionId}` envelope on a Claude row: the Claude
+    // adapter resolves its identity through the envelope's `sessionId` key,
+    // which only works if the whole object reached it. A rebuild that
+    // reconstructed `{"resume": <id>}` from the column would also work here,
+    // so the companion unit tests (`persisted_resume`) pin the verbatim half;
+    // this pins that a richer envelope survives the DB round trip and is
+    // still understood by an adapter that never emitted it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_resume_replays_the_persisted_resume_envelope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("start-session-capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        // Same preflight staging as the test above: the session's on-disk
+        // JSONL must EXIST or the cursor is dropped as stale.
+        let config_dir = tmp.path().join("claude-config");
+        let proj = config_dir.join("projects").join("-workdir");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sdk-uuid-123.jsonl"), b"{}").unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry
+                .set_claude(provider.clone() as Arc<dyn AgentProvider>)
+                .await;
+        }
+
+        let thread = ThreadId("chat-pane-envelope-replay".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(&thread.0, "ws-1", Some(&cwd.to_string_lossy()), "claude")
+                .unwrap();
+            // A multi-field envelope with NO `resume` key — the shape the
+            // scalar column cannot hold.
+            db.set_agent_chat_resume_cursor(
+                &thread.0,
+                "sdk-uuid-123",
+                &serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-uuid-123" }),
+            )
+            .unwrap();
+        }
+
+        // The envelope survives persist -> read unchanged.
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            let record = db.get_agent_chat_session(&thread.0).expect("row exists");
+            let stored: Value =
+                serde_json::from_str(record.resume_cursor.as_deref().expect("envelope stored"))
+                    .unwrap();
+            assert_eq!(
+                stored,
+                serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-uuid-123" }),
+                "the whole envelope round-trips through the database"
+            );
+        }
+
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("auto-resume should succeed");
+
+        let captured = read_capture(&capture);
+        assert_eq!(captured.len(), 1, "exactly one start-session was sent");
+        assert_eq!(
+            captured[0]["params"]["resume"].as_str(),
+            Some("sdk-uuid-123"),
+            "the replayed envelope's sessionId reached the sidecar"
+        );
+    }
+
     // Regression: a row whose `permission_mode` is NULL (created before the
     // column existed) must NOT rebuild the live session in `default` mode.
     // The frontend shows "Full access" (bypassPermissions) for such rows, so

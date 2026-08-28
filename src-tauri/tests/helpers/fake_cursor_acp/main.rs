@@ -7,8 +7,17 @@
 //! Methods understood:
 //!   - `initialize` / `authenticate` → empty result.
 //!   - `session/new`  → `{sessionId, configOptions}`.
-//!   - `session/load` → empty result (ACP omits the id on purpose).
-//!   - `session/set_config_option` → echoes the config options back.
+//!   - `session/load` → empty result (ACP omits the id on purpose). When
+//!     the requested `sessionId` is `replay-session` it first REPLAYS a
+//!     two-turn transcript as `session/update` notifications, in one burst
+//!     ahead of its own response, exactly as a real ACP agent does. Any
+//!     other id replays nothing, mirroring an agent that answers an
+//!     unknown id with `{}` and a fresh empty session.
+//!   - `session/set_config_option` → emits one `agent_message_chunk`
+//!     with NO turn in flight (start-up configuration runs before the
+//!     first prompt), then echoes the config options back. That stray
+//!     frame must be reported and dropped, never folded into whatever
+//!     turn runs next.
 //!   - `session/prompt` → behavior is chosen by the prompt text:
 //!       * `chunks:<n>` streams `<n>` `agent_message_chunk` updates
 //!         immediately before the response, all on the same line-oriented
@@ -79,6 +88,59 @@ fn chunk(session_id: &str, text: &str) -> Value {
     })
 }
 
+fn update(session_id: &str, update: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"sessionId": session_id, "update": update}
+    })
+}
+
+/// The transcript a real ACP agent replays for a loaded session: two user
+/// turns with reasoning, a tool call and its result, and a `usage_update`
+/// carrying the session's context occupancy.
+fn replay_transcript(session_id: &str) {
+    let frames = [
+        json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "first question"}
+        }),
+        json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "thinking about it"}
+        }),
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-replay-1",
+            "kind": "read",
+            "title": "read: notes.md",
+            "rawInput": {"tool": "read_file", "arguments": {"path": "notes.md"}}
+        }),
+        json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-replay-1",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "ok"}}]
+        }),
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "first answer"}
+        }),
+        json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "second question"}
+        }),
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "second answer"}
+        }),
+        json!({"sessionUpdate": "usage_update", "inputTokens": 900, "outputTokens": 100}),
+    ];
+    for frame in frames {
+        write_line(&update(session_id, frame));
+    }
+}
+
 /// The prompt's plain text, concatenated across content blocks.
 fn prompt_text(params: &Value) -> String {
     params
@@ -134,7 +196,23 @@ fn main() {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
 
         match method {
-            "initialize" | "authenticate" | "session/load" => {
+            "initialize" | "authenticate" => {
+                if let Some(id) = id {
+                    write_line(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+                }
+            }
+            "session/load" => {
+                let session_id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // Burst first, response second — the ordering that makes
+                // the replay invisible to a client that only starts
+                // listening once the load has resolved.
+                if session_id == "replay-session" {
+                    replay_transcript(&session_id);
+                }
                 if let Some(id) = id {
                     write_line(&json!({"jsonrpc": "2.0", "id": id, "result": {}}));
                 }
@@ -152,6 +230,12 @@ fn main() {
                 }
             }
             "session/set_config_option" => {
+                let session_id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fake-cursor-session")
+                    .to_string();
+                write_line(&chunk(&session_id, "stray"));
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc": "2.0",

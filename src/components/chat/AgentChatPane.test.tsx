@@ -411,6 +411,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  agentChatDetachSession: vi.fn().mockResolvedValue(undefined),
   // Picker handlers (design G) mirror every change into this DB-only
   // persist command, fire-and-forget. Default no-op.
   agentChatUpdateSessionConfig: vi.fn().mockResolvedValue(undefined),
@@ -644,6 +645,7 @@ import {
   agentChatSendTurn,
   agentChatSetPermissionMode,
   agentChatStartSession,
+  agentChatDetachSession,
   agentChatStopSession,
   agentChatUpdateSessionConfig,
   grepCountPattern,
@@ -2086,6 +2088,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatStartSession).mockClear();
     vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
+    vi.mocked(agentChatDetachSession).mockClear().mockResolvedValue(undefined);
   });
 
   afterEach(() => cleanup());
@@ -2107,6 +2110,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
         ),
       );
       expect(agentChatStopSession).not.toHaveBeenCalled();
+      expect(agentChatDetachSession).not.toHaveBeenCalled();
       expect(agentChatStartSession).not.toHaveBeenCalled();
       expect(getByTestId("transcript")).toHaveAttribute(
         "data-thread-key",
@@ -2136,6 +2140,9 @@ describe("AgentChatPane provider handoff", () => {
     vi.mocked(agentChatStopSession)
       .mockReset()
       .mockResolvedValue(undefined);
+    vi.mocked(agentChatDetachSession)
+      .mockReset()
+      .mockResolvedValue(undefined);
     setModelMock.mockClear();
     setEffortMock.mockClear();
     setContextWindowMock.mockClear();
@@ -2155,10 +2162,13 @@ describe("AgentChatPane provider handoff", () => {
     await waitFor(() =>
       expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1),
     );
-    expect(vi.mocked(agentChatStopSession)).toHaveBeenCalledWith(
+    // DETACH, not stop: the old provider's session stays in the history
+    // dropdown and must survive if the user switches back.
+    expect(vi.mocked(agentChatDetachSession)).toHaveBeenCalledWith(
       "claude",
       "thread-x",
     );
+    expect(vi.mocked(agentChatStopSession)).not.toHaveBeenCalled();
     expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledWith(
       "pane-1",
       "codex",
@@ -2234,6 +2244,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     markRequestResolvedMock.mockClear();
     vi.mocked(agentChatStartSession).mockClear().mockResolvedValue("thread-x");
     vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
+    vi.mocked(agentChatDetachSession).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatSetPermissionMode).mockClear().mockResolvedValue(undefined);
   });
   afterEach(() => cleanup());
@@ -2380,6 +2391,7 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(acceptMode).toBe("default");
     expect(agentChatStartSession).not.toHaveBeenCalled();
     expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatDetachSession).not.toHaveBeenCalled();
   });
 });
 
@@ -2433,6 +2445,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
     );
     vi.mocked(agentChatStartSession).mockClear();
     vi.mocked(agentChatStopSession).mockClear();
+    vi.mocked(agentChatDetachSession).mockClear();
     vi.mocked(agentChatSendTurn).mockClear();
     vi.mocked(agentChatUpdateSessionConfig).mockClear().mockResolvedValue(
       undefined,
@@ -2474,6 +2487,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
     );
     // Per-turn granularity means no session teardown.
     expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatDetachSession).not.toHaveBeenCalled();
     expect(agentChatStartSession).not.toHaveBeenCalled();
   });
 
@@ -2507,6 +2521,7 @@ describe("AgentChatPane — Cursor per-turn permission + plan accept", () => {
     // Cursor applies the mode live — no restart, and no synthetic
     // "Proceed with the plan." turn (the RPC answer is the go-ahead).
     expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatDetachSession).not.toHaveBeenCalled();
     expect(agentChatSendTurn).not.toHaveBeenCalled();
   });
 

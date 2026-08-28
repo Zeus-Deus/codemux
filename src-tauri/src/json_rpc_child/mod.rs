@@ -65,7 +65,12 @@ const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const INCOMING_REQUEST_CHANNEL_CAPACITY: usize = 256;
 /// Depth of the notifications broadcast channel. Lagging subscribers
 /// observe a `Lagged` error rather than blocking the reader task.
-const NOTIFICATION_CHANNEL_CAPACITY: usize = 512;
+///
+/// Sized for the burstiest thing an ACP agent does: `session/load`
+/// replays a session's ENTIRE transcript as `session/update`
+/// notifications, in one burst, before the load response resolves. At 512
+/// a long conversation lagged its own restored history away.
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 8192;
 
 /// Parameters for spawning a JSON-RPC child process.
 #[derive(Debug, Clone)]

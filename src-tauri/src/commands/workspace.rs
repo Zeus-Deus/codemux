@@ -1143,7 +1143,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
+    crate::commands::agent_chat::detach_agent_chat_threads(
         &app,
         close_result.removed_agent_chat_threads,
     );
@@ -1916,7 +1916,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
+    crate::commands::agent_chat::detach_agent_chat_threads(
         &app,
         result.removed_agent_chat_threads,
     );
@@ -1998,7 +1998,9 @@ pub fn close_pane<R: tauri::Runtime>(
 /// Shared close-pane implementation backing both the Tauri command
 /// (pane "x" affordances in the in-app split header) and the
 /// `close_pane` control-socket command exposed via the Phase 1.6
-/// `pane_close` MCP tool.
+/// `pane_close` MCP tool. It is also the single close path for
+/// agent-chat panes — `agent_chat_close_pane` delegates here rather
+/// than keeping a second, divergent teardown.
 ///
 /// Last-pane behavior matches the in-app path: `state.close_pane` removes
 /// the surface + tab when the closed pane was the last leaf, the
@@ -2012,11 +2014,42 @@ pub(crate) fn close_pane_impl<R: tauri::Runtime>(
     pane_id: String,
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
+    // Capture the chat session bound to this pane *before* the tree
+    // mutation: once the node is gone the pane→thread walk can no longer
+    // resolve it, and the detach below would have nothing to target. Until
+    // this landed, closing an agent-chat pane through the normal pane "x"
+    // left its sidecar child and background tasks running forever.
+    let chat_thread = state.agent_chat_pane_thread(&pane_id);
+    // Drop any lingering status dot for this pane. The detach below emits
+    // SessionStateChanged::Closed → Idle, but that races the tree mutation,
+    // so clear by pane id here while the key is still meaningful.
+    if chat_thread.is_some() {
+        state.set_pane_status(&pane_id, crate::state::PaneStatus::Idle);
+    }
     let removed = state.close_pane(&pane_id)?;
     // A `codemux monitor start` flag belongs to the process that was running
     // in this pane. The pane is gone, so the claim is too — and a flag with no
     // pane behind it has no UI left that could ever turn it off.
     state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
+
+    if let Some(pair) = chat_thread {
+        // Forget any running-subagent / activity tracking for this thread.
+        // The Closed event also clears it, but that races the tear-down (and
+        // may be dropped if no channel is attached), so clear eagerly while
+        // the thread id is still resolvable — otherwise a subagent whose
+        // terminal status is never observed pins a stuck spinner forever.
+        {
+            let tracker: State<'_, crate::commands::agent_chat::SubagentTracker> = app.state();
+            tracker.clear_thread(&pair.1);
+            let activity: State<'_, crate::commands::agent_chat::RunActivityTracker> = app.state();
+            activity.clear_thread(&pair.1);
+        }
+        // Detach, not stop: the user closed a window onto the agent's work,
+        // they did not ask to end the conversation. The local child and its
+        // tasks still go away; a durable provider-side session survives so
+        // reopening the pane can resume it.
+        crate::commands::agent_chat::detach_agent_chat_threads(&app, vec![pair]);
+    }
 
     if let Some(ref session_id) = removed {
         // Kill the PTY child + its process group. `state.close_pane` already
@@ -2260,7 +2293,7 @@ pub fn close_tab<R: tauri::Runtime>(
         state.detach_agent_browser_from_pane(&browser_id.0, false);
     }
 
-    crate::commands::agent_chat::shutdown_agent_chat_threads(
+    crate::commands::agent_chat::detach_agent_chat_threads(
         &app,
         result.removed_agent_chat_threads,
     );

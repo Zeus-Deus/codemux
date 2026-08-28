@@ -60,8 +60,11 @@ impl Default for OpenCodeProviderConfig {
 /// id), so the cursor is simply `{"resume": <session_id>}` — the same shape
 /// `ensure_live_session` threads back into `StartSessionInput.resume_cursor`
 /// and, crucially, the shape `extract_sdk_session_id` in
-/// `commands::agent_chat` knows how to persist. Keep those three in lockstep:
-/// a key rename here silently breaks the start-time cursor persist.
+/// `commands::agent_chat` knows how to extract an identity from. Keep those
+/// three in lockstep: a key rename here silently breaks the start-time cursor
+/// persist. The envelope itself is stored verbatim in
+/// `agent_chat_sessions.resume_cursor`, so extra keys added here would survive
+/// a restart — only the identity key has to stay recognizable.
 pub fn resume_cursor_for(session_id: &crate::agent_provider::ProviderSessionId) -> serde_json::Value {
     serde_json::json!({ "resume": session_id.0 })
 }
@@ -121,8 +124,15 @@ impl OpenCodeAgentProvider {
 /// Reaps every live session on drop. Mirrors the Claude/Codex
 /// pattern — sessions own their SSE listener tasks and an HTTP
 /// client; both wind down cleanly when their `Arc` count hits zero,
-/// but we additionally call `shutdown()` to DELETE the OpenCode-side
-/// session and free its server-side memory.
+/// and we additionally call `detach()` to abort the SSE listener
+/// promptly rather than waiting on the refcount.
+///
+/// Deliberately `detach()` and not `shutdown()`: app quit is a surface
+/// close, not a request to end every conversation. `shutdown()` would
+/// `DELETE /session/{id}` for every live session, so quitting Codemux
+/// would destroy exactly the sessions the persisted resume cursors want
+/// to readopt on the next launch. OpenCode's own session GC is the
+/// backstop for sessions nobody ever reopens.
 impl Drop for OpenCodeAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
@@ -133,7 +143,7 @@ impl Drop for OpenCodeAgentProvider {
                     std::mem::take(&mut *guard)
                 };
                 for (_, session) in map {
-                    session.shutdown().await;
+                    session.detach().await;
                 }
             });
         }
@@ -201,12 +211,12 @@ impl AgentProvider for OpenCodeAgentProvider {
                 None => None,
             }
         };
-        // Drop the corpse WITHOUT calling `shutdown()`: its SSE listener task
-        // has already exited (the give-up path returns after flipping `dead`),
-        // so there is nothing to abort, and `shutdown()` would
-        // `DELETE /session/{id}` — destroying the very server-side session the
-        // resume below wants to readopt. Just let the Arc drop.
-        drop(dead_evicted);
+        // Detach the corpse rather than `shutdown()` it: `shutdown()` would
+        // `DELETE /session/{id}`, destroying the very server-side session the
+        // resume below wants to readopt.
+        if let Some(dead) = dead_evicted {
+            dead.detach().await;
+        }
         // Best-effort resume: `ensure_live_session` passes
         // `{"resume": <opencode_session_id>}` when the persisted row carries the
         // server-side session id. OpenCode keeps sessions on disk, so a rebuilt
@@ -351,6 +361,12 @@ impl AgentProvider for OpenCodeAgentProvider {
         })
     }
 
+    /// DESTRUCTIVE for OpenCode, unlike every other provider: `shutdown()`
+    /// issues `DELETE /session/{id}` against the live server, so the durable
+    /// server-side conversation is gone and its resume cursor is dead. That
+    /// is the correct semantics for an explicit user terminate, and it is
+    /// deliberately left unchanged here — surface-close paths route to
+    /// [`Self::detach_session`] instead.
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
         let session = {
             let mut sessions = self.sessions.write().await;
@@ -369,6 +385,29 @@ impl AgentProvider for OpenCodeAgentProvider {
             usage_states.remove(&session.provider_session_id.0);
         }
         session.shutdown().await;
+        Ok(())
+    }
+
+    /// Drop the local hold on the session and leave the OpenCode-side
+    /// session intact, so a later `start_session` carrying
+    /// `{"resume": <opencode_session_id>}` readopts the same conversation.
+    /// This is the one provider where detach and stop genuinely differ.
+    async fn detach_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        let session = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(&thread_id)
+        };
+        let session = session.ok_or_else(|| ProviderError::SessionNotFound {
+            thread_id: thread_id.clone(),
+        })?;
+        // Same bounding rule as `stop_session`: `usage_states` tracks live
+        // sessions, and the entry is rebuilt from `carried_usage` when the
+        // server-side session is readopted on resume.
+        {
+            let mut usage_states = self.usage_states.write().await;
+            usage_states.remove(&session.provider_session_id.0);
+        }
+        session.detach().await;
         Ok(())
     }
 
@@ -469,6 +508,27 @@ mod tests {
         );
         let err = provider
             .interrupt_turn(ThreadId("nope".into()), None)
+            .await
+            .expect_err("must fail");
+        match err {
+            ProviderError::SessionNotFound { thread_id } => {
+                assert_eq!(thread_id.0, "nope");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detach_unknown_thread_returns_session_not_found() {
+        // The command layer collapses SessionNotFound into Ok(()), so detach
+        // must report it rather than inventing a success — otherwise a
+        // genuine registry desync would be invisible.
+        let provider = OpenCodeAgentProvider::new(
+            Arc::new(OpenCodeServerManager::new()),
+            OpenCodeProviderConfig::default(),
+        );
+        let err = provider
+            .detach_session(ThreadId("nope".into()))
             .await
             .expect_err("must fail");
         match err {

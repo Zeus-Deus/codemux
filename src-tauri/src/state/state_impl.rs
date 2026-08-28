@@ -5406,11 +5406,13 @@ pub fn collect_terminal_sessions(surfaces: &[SurfaceSnapshot]) -> Vec<String> {
 
 /// Walk every surface in a workspace and pull out `(provider, thread_id)`
 /// pairs for `AgentChat` panes that have an active session bound. Used by
-/// the workspace/tab close paths to feed `provider.stop_session` so the
-/// JSON-RPC sidecar process and its background tokio tasks tear down
-/// instead of leaking — the tasks keep `Arc<Session>` alive in a refcycle
-/// with the session's `JoinHandle` vec, so `Drop` never fires unless
-/// `stop_session` aborts them via the shutdown channel.
+/// the pane/tab/workspace close paths to feed `provider.detach_session`
+/// so the JSON-RPC sidecar process and its background tokio tasks tear
+/// down instead of leaking — the tasks keep `Arc<Session>` alive in a
+/// refcycle with the session's `JoinHandle` vec, so `Drop` never fires
+/// unless the detach aborts them via the shutdown channel. Detach, not
+/// stop: closing the surface is not a request to end the conversation,
+/// so a durable provider-side session survives and stays resumable.
 pub fn collect_agent_chat_threads(
     surfaces: &[SurfaceSnapshot],
 ) -> Vec<(crate::agent_provider::ProviderKind, String)> {
@@ -8454,7 +8456,7 @@ mod tests {
     /// Regression guard for the agent-chat sidecar leak fix.
     ///
     /// Closing a workspace must surface every bound `(provider, thread_id)`
-    /// pair so the command layer can call `provider.stop_session` for
+    /// pair so the command layer can call `provider.detach_session` for
     /// each. Without this list the JSON-RPC sidecar children stayed
     /// alive and their background tokio tasks held `Arc<Session>` in a
     /// refcycle with the session's own `JoinHandle` vec, so `Drop`

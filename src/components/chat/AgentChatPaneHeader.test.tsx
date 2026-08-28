@@ -18,6 +18,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  agentChatDetachSession: vi.fn().mockResolvedValue(undefined),
   closePane: vi.fn().mockResolvedValue(undefined),
   splitPane: vi.fn().mockResolvedValue(undefined),
 }));
@@ -80,7 +81,7 @@ import {
   agentChatListMessages,
   agentChatListMessagesAfter,
   agentChatStartSession,
-  agentChatStopSession,
+  agentChatDetachSession,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
@@ -138,14 +139,14 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     vi.mocked(agentChatListMessages).mockReset();
     vi.mocked(agentChatListMessagesAfter).mockReset();
     vi.mocked(agentChatStartSession).mockReset();
-    vi.mocked(agentChatStopSession).mockReset();
+    vi.mocked(agentChatDetachSession).mockReset();
     vi.mocked(toast.error).mockReset();
     vi.mocked(toast.success).mockReset();
     vi.mocked(toast.warning).mockReset();
     vi.mocked(agentChatListMessages).mockResolvedValue([]);
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
     vi.mocked(agentChatStartSession).mockResolvedValue("thread-new");
-    vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
+    vi.mocked(agentChatDetachSession).mockResolvedValue(undefined);
   });
 
   it("reads the picked record's transcript BEFORE start_session", async () => {
@@ -260,25 +261,27 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     expect(vi.mocked(toast.warning)).toHaveBeenCalled();
   });
 
-  it("stops the existing live session before resuming", async () => {
+  it("detaches the existing live session before resuming", async () => {
     renderHeader();
     await lastSessionSelectorProps.current!.onSelect(makeRecord());
-    expect(vi.mocked(agentChatStopSession)).toHaveBeenCalledWith(
+    // DETACH, not stop: the session being swapped away from stays in the
+    // history dropdown and must remain resumable.
+    expect(vi.mocked(agentChatDetachSession)).toHaveBeenCalledWith(
       "claude",
       "thread-old",
     );
-    // Stop before start.
-    const stopOrder =
-      vi.mocked(agentChatStopSession).mock.invocationCallOrder[0];
+    // Detach before start.
+    const detachOrder =
+      vi.mocked(agentChatDetachSession).mock.invocationCallOrder[0];
     const startOrder =
       vi.mocked(agentChatStartSession).mock.invocationCallOrder[0];
-    expect(stopOrder).toBeLessThan(startOrder);
+    expect(detachOrder).toBeLessThan(startOrder);
   });
 
-  it("succeeds when stop_session rejects (stale dead session)", async () => {
+  it("succeeds when detach_session rejects (stale dead session)", async () => {
     // Common case: the user is resuming AFTER the prior session
-    // already crashed. The stop call rejects, we proceed anyway.
-    vi.mocked(agentChatStopSession).mockRejectedValueOnce(
+    // already crashed. The detach call rejects, we proceed anyway.
+    vi.mocked(agentChatDetachSession).mockRejectedValueOnce(
       new Error("session_not_found"),
     );
     renderHeader();

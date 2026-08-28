@@ -1743,10 +1743,26 @@ export const agentChatSetPermissionMode = (
     mode,
   });
 
+/// Explicit user-initiated TERMINATE. Ends the conversation on the
+/// provider side — for OpenCode that deletes the durable server-side
+/// session, so it can never be resumed. Use this only when the user asked
+/// to end the chat (e.g. deleting it from the history dropdown), never for
+/// merely closing or swapping away from a pane.
 export const agentChatStopSession = (
   provider: AgentChatProviderKind,
   threadId: string,
 ) => invoke<void>("agent_chat_stop_session", { provider, threadId });
+
+/// Release the local hold on a session without ending it. Same local
+/// teardown as `agentChatStopSession` (child process + background tasks),
+/// but a durable provider-side session survives so the persisted resume
+/// cursor can pick the conversation back up. This is what every
+/// hand-off — new chat, resume another session, in-place restart, provider
+/// switch — should call.
+export const agentChatDetachSession = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+) => invoke<void>("agent_chat_detach_session", { provider, threadId });
 
 // ── Session history (pane-header dropdown) ──
 
@@ -1769,6 +1785,11 @@ export interface AgentChatSessionRecord {
   context_window: string | null;
   permission_mode: string | null;
   fast_mode?: boolean;
+  /** Raw JSON text of the provider's resume envelope, stored verbatim by the
+   *  backend. The frontend never has to parse it: `agent_chat_start_session`
+   *  upgrades a `{resume: sdk_session_id}` cursor to this envelope on the way
+   *  through. Absent for rows written before the column existed. */
+  resume_cursor?: string | null;
 }
 
 /** Provider-neutral conversation row for the composer's `@session:` picker.

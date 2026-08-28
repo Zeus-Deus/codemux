@@ -121,6 +121,26 @@ pub trait AgentProvider: Send + Sync {
     /// already-closed session is a no-op.
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError>;
 
+    /// Release Codemux's local hold on the session WITHOUT ending the
+    /// provider-side conversation.
+    ///
+    /// Called when the surface showing a session goes away — pane close,
+    /// tab close, workspace close, app quit. The user closed a window onto
+    /// the agent's work; they did not ask to end it. A later
+    /// `start_session` with the persisted resume cursor must be able to
+    /// pick the same conversation back up.
+    ///
+    /// Providers whose session lives only inside the child process have
+    /// nothing to preserve, so the default forwards to `stop_session` and
+    /// existing adapters are unaffected. Providers backed by a durable
+    /// external session override this to drop the local child/listener and
+    /// leave the remote session intact.
+    ///
+    /// Idempotent; `SessionNotFound` is a success at every call site.
+    async fn detach_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        self.stop_session(thread_id).await
+    }
+
     /// Enumerate every currently live session the provider is tracking.
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError>;
 

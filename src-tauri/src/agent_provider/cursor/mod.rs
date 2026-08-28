@@ -21,6 +21,24 @@ use crate::agent_provider::{
 
 use self::session::{CursorSession, CursorSpawnConfig};
 
+/// Whether the caller asked this start to ADOPT the transcript the agent
+/// replays for a loaded session.
+///
+/// Off by default, and deliberately so. A thread Codemux itself created
+/// and drove already owns authoritative rows in `agent_chat_messages`,
+/// and its transcript hydrates from those rows on rebuild — adopting the
+/// replay there would duplicate every bubble, permanently, because that
+/// table is a pure append with no idempotency key. The flag is for the
+/// opposite case: a session created elsewhere (an agent CLI, another
+/// host, a `session/list` picker), where the replay is the ONLY source of
+/// the conversation and Codemux holds nothing.
+fn adopt_transcript(extra: &serde_json::Value) -> bool {
+    extra
+        .get("adoptTranscript")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone)]
 pub struct CursorProviderConfig {
     pub binary: PathBuf,
@@ -132,6 +150,11 @@ impl AgentProvider for CursorAgentProvider {
             input.context_window,
             input.fast_mode,
             input.resume_cursor,
+            // Opt-in, and only ever set by a caller that has checked the
+            // thread owns no transcript rows of its own: `agent_chat_messages`
+            // has no idempotency key, so adopting a replay onto a thread that
+            // already has rows doubles every bubble with no way back.
+            adopt_transcript(&input.extra),
             input.env,
             CursorSpawnConfig {
                 binary: self.config.binary.clone(),
@@ -160,12 +183,9 @@ impl AgentProvider for CursorAgentProvider {
         Ok(ProviderSession {
             thread_id,
             provider: ProviderKind::Cursor,
-            session_id: session.provider_session_id.clone(),
+            session_id: session.provider_session_id(),
             status: SessionStatus::Ready,
-            resume_cursor: Some(serde_json::json!({
-                "schemaVersion": 1,
-                "sessionId": session.provider_session_id.0,
-            })),
+            resume_cursor: Some(session.resume_cursor()),
         })
     }
 
@@ -267,9 +287,9 @@ impl AgentProvider for CursorAgentProvider {
             result.push(ProviderSession {
                 thread_id: session.thread_id.clone(),
                 provider: ProviderKind::Cursor,
-                session_id: session.provider_session_id.clone(),
+                session_id: session.provider_session_id(),
                 status: session.state.lock().await.status.clone(),
-                resume_cursor: Some(serde_json::json!({ "schemaVersion": 1, "sessionId": session.provider_session_id.0 })),
+                resume_cursor: Some(session.resume_cursor()),
             });
         }
         Ok(result)

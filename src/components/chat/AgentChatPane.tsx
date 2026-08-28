@@ -90,7 +90,7 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopMonitoring,
-  agentChatStopSession,
+  agentChatDetachSession,
   agentChatUpdateSessionConfig,
   getGithubIssueByPath,
   getGithubPrByPath,
@@ -2274,9 +2274,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           : currentSlice.fastMode;
       void (async () => {
         try {
-          await agentChatStopSession(provider, threadId);
+          // Detach, not stop: the very next call resumes this same thread
+          // from `resumeCursor`. A stop would end the provider-side
+          // conversation (OpenCode deletes the server session outright),
+          // so the "restart" would silently come back with blank context.
+          await agentChatDetachSession(provider, threadId);
         } catch (err) {
-          console.warn("[agent-chat] stop_session during restart failed", err);
+          console.warn("[agent-chat] detach_session during restart failed", err);
         }
         try {
           const newId = await agentChatStartSession(pane.pane_id, provider, {
@@ -2865,12 +2869,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
       void (async () => {
         try {
-          // Stop first so provider events for the shared thread id cannot
+          // Detach first so provider events for the shared thread id cannot
           // race: an old Claude `closed` arriving after Codex `ready` would
           // otherwise make the new session look dead. SessionNotFound is an
           // idempotent success in the backend, covering restored panes whose
-          // provider process has not been rebuilt yet.
-          await agentChatStopSession(oldProvider, oldThreadId);
+          // provider process has not been rebuilt yet. Detach rather than
+          // stop: the old provider's session stays in the history dropdown
+          // and must remain resumable if the user switches back.
+          await agentChatDetachSession(oldProvider, oldThreadId);
 
           const startedThreadId = await agentChatStartSession(
             pane.pane_id,

@@ -1,7 +1,7 @@
 //! One Cursor ACP subprocess and session per Codemux thread.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,13 @@ use super::protocol::{
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const DISPATCHING_TURN_ID: &str = "cursor-dispatching-turn";
+/// How many replayed transcript events one `session/load` may materialise.
+///
+/// ACP replays a transcript uncapped and inline, so a long session would
+/// otherwise flood the runtime event stream (and every persisted row
+/// behind it) in one burst. Only the newest `REPLAY_ITEM_LIMIT` events
+/// survive; the dropped head is announced by a marker item.
+const REPLAY_ITEM_LIMIT: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct CursorSpawnConfig {
@@ -81,6 +88,80 @@ struct CursorUsageTotals {
     cache_write: u64,
 }
 
+/// The window in which a `session/load` transcript replay is being
+/// consumed.
+///
+/// ACP emits every transcript entry as a `session/update` **before** the
+/// load response resolves, so those frames arrive with no turn in flight.
+/// The window is what tells [`CursorSession::handle_session_update`] that
+/// a turn-less transcript frame is expected rather than stray, and it is
+/// deliberately NOT `active_turn`: replay must never claim the session's
+/// single prompt slot (see [`CursorSessionState::open_replay`]).
+#[derive(Debug)]
+struct ReplayWindow {
+    /// Synthetic id of the replayed turn currently being rebuilt. Rotated
+    /// at every user message, because a user message is what starts a new
+    /// turn in the replayed stream.
+    turn_id: TurnId,
+    /// Whether the replayed transcript should be materialised into this
+    /// thread's transcript, or only consumed to prime session state.
+    ///
+    /// A thread Codemux itself drove already owns authoritative rows in
+    /// `agent_chat_messages`, and that table has no idempotency key — so
+    /// adopting there would double every bubble permanently. Adoption is
+    /// only correct for a session created elsewhere, where the replay is
+    /// the ONLY source of the transcript.
+    adopt: bool,
+    /// Transcript frames observed across the whole window. Zero is the
+    /// only evidence that a `session/load` invented a fresh session: ACP
+    /// answers an unknown session id with `{}` rather than an error.
+    transcript_frames: u64,
+    /// Non-user frames seen since the current synthetic turn opened, so a
+    /// user message split across several chunks rotates the turn once
+    /// rather than once per chunk.
+    agent_frames_in_turn: u64,
+    /// Text of the replayed user message being accumulated, flushed as a
+    /// single bubble ahead of the first agent frame that follows it.
+    user_text: String,
+    /// Events staged for the flush in [`CursorSession::finish_replay`].
+    /// Staged rather than streamed so the tail can be capped and so a
+    /// suppressed (or abandoned) window emits nothing at all.
+    buffered: VecDeque<ProviderRuntimeEvent>,
+    /// Whether anything was dropped — by the cap here or by a lagging
+    /// broadcast subscriber — so the adopted transcript can say so.
+    truncated: bool,
+}
+
+impl ReplayWindow {
+    fn stage(&mut self, event: ProviderRuntimeEvent) {
+        self.buffered.push_back(event);
+        while self.buffered.len() > REPLAY_ITEM_LIMIT {
+            self.buffered.pop_front();
+            self.truncated = true;
+        }
+    }
+
+    /// Flush the accumulated user message, if any, as its own bubble.
+    ///
+    /// Called before the first agent frame that follows it so the
+    /// replayed turn keeps its real order, and again when the turn is
+    /// sealed so a trailing user message is not lost.
+    fn flush_user_message(&mut self, thread_id: &ThreadId) {
+        let text = std::mem::take(&mut self.user_text);
+        if text.trim().is_empty() {
+            return;
+        }
+        self.stage(ProviderRuntimeEvent::UserMessage {
+            thread_id: thread_id.clone(),
+            text,
+            images: Vec::new(),
+            // No nonce: nothing optimistically rendered a replayed
+            // bubble, so there is no optimistic copy to reconcile with.
+            client_nonce: None,
+        });
+    }
+}
+
 pub(crate) struct CursorSessionState {
     pub status: SessionStatus,
     pub active_turn: Option<TurnId>,
@@ -112,6 +193,8 @@ pub(crate) struct CursorSessionState {
     /// Context-window occupancy, clamped/deduplicated by the shared
     /// tracker every other adapter uses.
     context: ContextUsageTracker,
+    /// Open while a `session/load` transcript replay is being consumed.
+    replay: Option<ReplayWindow>,
 }
 
 impl CursorSessionState {
@@ -151,6 +234,45 @@ impl CursorSessionState {
         self.active_turn = None;
         self.interrupt_generation = None;
     }
+
+    /// Open the `session/load` replay window.
+    ///
+    /// `active_turn` deliberately stays `None` and no generation is
+    /// claimed. Replay is not a turn: if it borrowed the prompt slot,
+    /// `enqueue_or_send` would queue the user's first prompt behind a
+    /// phantom turn, `turn_active()` would report a busy session to the
+    /// frontend, and a Stop arriving during startup would be aimed at a
+    /// generation no prompt worker owns.
+    fn open_replay(&mut self, adopt: bool) {
+        self.replay = Some(ReplayWindow {
+            turn_id: replay_turn_id(),
+            adopt,
+            transcript_frames: 0,
+            agent_frames_in_turn: 0,
+            user_text: String::new(),
+            buffered: VecDeque::new(),
+            truncated: false,
+        });
+    }
+
+    /// Start a fresh synthetic turn inside the open window.
+    fn rotate_replay_turn(&mut self) {
+        if let Some(replay) = self.replay.as_mut() {
+            replay.turn_id = replay_turn_id();
+            replay.agent_frames_in_turn = 0;
+        }
+    }
+
+    /// Close the window and hand back everything it collected.
+    fn close_replay(&mut self) -> Option<ReplayWindow> {
+        self.replay.take()
+    }
+}
+
+/// One synthetic turn id per replayed turn boundary. Namespaced so a
+/// replayed turn can never be mistaken for one this session dispatched.
+fn replay_turn_id() -> TurnId {
+    TurnId(format!("cursor-replay-{}", Uuid::new_v4()))
 }
 
 /// A token a message pump answers once it has drained everything the
@@ -160,7 +282,14 @@ type NotificationBarrier = oneshot::Sender<()>;
 
 pub(crate) struct CursorSession {
     pub thread_id: ThreadId,
-    pub provider_session_id: ProviderSessionId,
+    /// The ACP session id this thread is bound to.
+    ///
+    /// Interior mutability because the id is not final when the session
+    /// object is built: the message pumps have to already be draining
+    /// when `session/load` is issued (that is where the transcript replay
+    /// arrives), and a load that fails falls back to `session/new`, which
+    /// mints a different id.
+    provider_session_id: std::sync::RwLock<ProviderSessionId>,
     pub state: Mutex<CursorSessionState>,
     child: Arc<JsonRpcChild>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
@@ -187,6 +316,7 @@ impl CursorSession {
         context_window: Option<String>,
         fast_mode: bool,
         resume_cursor: Option<Value>,
+        adopt_transcript: bool,
         env: Option<HashMap<String, String>>,
         spawn: CursorSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
@@ -208,7 +338,7 @@ impl CursorSession {
                 message: "Cursor ACP request receiver was already claimed".into(),
             })?;
 
-        let setup = async {
+        let handshake = async {
             child
                 .request("initialize", initialize_params("codemux"))
                 .await
@@ -217,67 +347,36 @@ impl CursorSession {
                 .request("authenticate", json!({ "methodId": "cursor_login" }))
                 .await
                 .map_err(map_auth_error)?;
-
-            let resume_id = resume_cursor.as_ref().and_then(resume_session_id);
-            if let Some(session_id) = resume_id {
-                match child
-                    .request(
-                        "session/load",
-                        json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
-                    )
-                    .await
-                {
-                    // ACP's LoadSessionResponse deliberately omits sessionId:
-                    // the client already supplied it in the request. Keep the
-                    // requested id instead of treating a standards-compliant
-                    // response as a failed restart.
-                    Ok(response) => Ok(loaded_session_setup(response, session_id)),
-                    Err(load_error) => {
-                        let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
-                            thread_id: Some(thread_id.clone()),
-                            message: format!(
-                                "Cursor could not resume the prior ACP session; started a new session instead: {load_error}"
-                            ),
-                            original_payload: resume_cursor.clone(),
-                        });
-                        let response = child
-                            .request(
-                                "session/new",
-                                json!({ "cwd": cwd, "mcpServers": [] }),
-                            )
-                            .await
-                            .map_err(map_rpc_error)?;
-                        new_session_setup(response)
-                    }
-                }
-            } else {
-                let response = child
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
-                    .await
-                    .map_err(map_rpc_error)?;
-                new_session_setup(response)
-            }
+            Ok::<(), ProviderError>(())
         }
         .await;
+        if let Err(error) = handshake {
+            let _ = child.shutdown().await;
+            return Err(error);
+        }
 
-        let (setup, provider_session_id) = match setup {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = child.shutdown().await;
-                return Err(error);
-            }
-        };
+        let resume_id = resume_cursor.as_ref().and_then(resume_session_id);
         let (notification_barrier_tx, notification_barrier_rx) = mpsc::unbounded_channel();
         let (request_barrier_tx, request_barrier_rx) = mpsc::unbounded_channel();
+        // Built BEFORE the session exists agent-side, and with the message
+        // pumps already draining. `session/load` replays the whole
+        // transcript as `session/update` notifications *ahead of* its own
+        // response, so a session assembled only after that response can
+        // never see them — they would sit in the transport's bounded
+        // broadcast until it lagged them away.
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
-            provider_session_id: ProviderSessionId(provider_session_id),
+            provider_session_id: std::sync::RwLock::new(ProviderSessionId(
+                resume_id.clone().unwrap_or_default(),
+            )),
             state: Mutex::new(CursorSessionState {
                 status: SessionStatus::Ready,
                 active_turn: None,
                 model: None,
                 permission_mode: permission_mode.clone().unwrap_or_else(|| "agent".into()),
-                config_options: config_options(&setup),
+                // Filled from the setup response below; the session has to
+                // exist before that response can be asked for.
+                config_options: Vec::new(),
                 pending: HashMap::new(),
                 queued: VecDeque::new(),
                 assistant_text: String::new(),
@@ -286,6 +385,7 @@ impl CursorSession {
                 interrupt_generation: None,
                 usage_totals: CursorUsageTotals::default(),
                 context: ContextUsageTracker::default(),
+                replay: None,
             }),
             child,
             event_tx,
@@ -303,6 +403,18 @@ impl CursorSession {
                 request_barrier_rx,
             )
             .await;
+
+        let setup = match session
+            .establish_session(&cwd, resume_id, resume_cursor.as_ref(), adopt_transcript)
+            .await
+        {
+            Ok(setup) => setup,
+            Err(error) => {
+                session.shutdown().await;
+                return Err(error);
+            }
+        };
+        session.state.lock().await.config_options = config_options(&setup);
 
         let configuration_result = async {
             if let Some(model) = model {
@@ -337,7 +449,7 @@ impl CursorSession {
             .event_tx
             .send(ProviderRuntimeEvent::SessionConfigured {
                 thread_id: thread_id.clone(),
-                provider_session_id: session.provider_session_id.clone(),
+                provider_session_id: session.provider_session_id(),
             });
         let _ = session
             .event_tx
@@ -348,8 +460,97 @@ impl CursorSession {
         Ok(session)
     }
 
-    fn resume_cursor(&self) -> Value {
-        json!({ "schemaVersion": 1, "sessionId": self.provider_session_id.0 })
+    /// Create or resume the ACP session this thread talks to.
+    ///
+    /// Runs with the message pumps already live, so a `session/load`
+    /// replay is consumed as it arrives instead of piling up in the
+    /// transport's bounded broadcast. Returns the setup response the
+    /// configuration pass reads its option list from.
+    async fn establish_session(
+        self: &Arc<Self>,
+        cwd: &Path,
+        resume_id: Option<String>,
+        resume_cursor: Option<&Value>,
+        adopt_transcript: bool,
+    ) -> Result<Value, ProviderError> {
+        if let Some(session_id) = resume_id {
+            self.begin_replay(adopt_transcript).await;
+            let loaded = self
+                .child
+                .request(
+                    "session/load",
+                    json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+                )
+                .await;
+            // The tail of the replay and the load response wake together,
+            // so closing the window on the response alone would drop the
+            // end of the transcript — the same race
+            // `await_child_messages_drained` was written for.
+            self.await_child_messages_drained().await;
+            let replayed_frames = self.finish_replay(loaded.is_ok()).await;
+            match loaded {
+                // ACP's LoadSessionResponse deliberately omits sessionId:
+                // the client already supplied it in the request. Keep the
+                // requested id instead of treating a standards-compliant
+                // response as a failed restart.
+                Ok(response) => {
+                    let (setup, session_id) = loaded_session_setup(response, session_id);
+                    self.set_provider_session_id(session_id);
+                    // A successful `session/load` is NOT proof the session
+                    // existed: an unknown id is answered with `{}` and a
+                    // fresh empty session, not an error. The replayed
+                    // transcript is the only evidence, so an adoption that
+                    // saw none is reported rather than claimed.
+                    if adopt_transcript && replayed_frames == 0 {
+                        self.warn(
+                            "Cursor ACP replayed no transcript for the loaded session; \
+                             treating it as a fresh session"
+                                .into(),
+                            resume_cursor.cloned(),
+                        );
+                    }
+                    return Ok(setup);
+                }
+                Err(load_error) => self.warn(
+                    format!(
+                        "Cursor could not resume the prior ACP session; \
+                         started a new session instead: {load_error}"
+                    ),
+                    resume_cursor.cloned(),
+                ),
+            }
+        }
+        let response = self
+            .child
+            .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            .await
+            .map_err(map_rpc_error)?;
+        let (setup, provider_session_id) = new_session_setup(response)?;
+        self.set_provider_session_id(provider_session_id);
+        Ok(setup)
+    }
+
+    /// The ACP session id this thread is currently bound to.
+    pub(crate) fn provider_session_id(&self) -> ProviderSessionId {
+        self.provider_session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_provider_session_id(&self, session_id: String) {
+        *self
+            .provider_session_id
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ProviderSessionId(session_id);
+    }
+
+    /// The provider-native resume envelope. Persisted VERBATIM by the command
+    /// layer (`agent_chat_sessions.resume_cursor`) and replayed unchanged on
+    /// rebuild, so keys beyond `sessionId` survive a restart. Single source of
+    /// truth — `mod.rs` hands this same value out in `ProviderSession`.
+    pub(crate) fn resume_cursor(&self) -> Value {
+        json!({ "schemaVersion": 1, "sessionId": self.provider_session_id().0 })
     }
 
     pub fn is_dead(&self) -> bool {
@@ -375,8 +576,30 @@ impl CursorSession {
                     received = notification_rx.recv() => match received {
                         Ok(notification) => notifications.handle_notification(notification).await,
                         Err(broadcast::error::RecvError::Lagged(count)) => {
+                            // Losing frames mid-replay is not the same
+                            // failure as losing them mid-turn: the dropped
+                            // frames are transcript that has no other
+                            // source, so the adopted history has to admit
+                            // the hole rather than start mid-thought.
+                            let replaying = {
+                                let mut state = notifications.state.lock().await;
+                                match state.replay.as_mut() {
+                                    Some(replay) => {
+                                        replay.truncated = true;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            };
+                            let context = if replaying {
+                                " during session-load replay; the restored transcript is incomplete"
+                            } else {
+                                ""
+                            };
                             notifications.warn(
-                                format!("Cursor ACP notification stream dropped {count} messages"),
+                                format!(
+                                    "Cursor ACP notification stream dropped {count} messages{context}"
+                                ),
                                 None,
                             );
                         }
@@ -667,7 +890,7 @@ impl CursorSession {
         let request = self.child.request_with_timeout(
             "session/prompt",
             json!({
-                "sessionId": self.provider_session_id.0,
+                "sessionId": self.provider_session_id().0,
                 "prompt": prompt
             }),
             PROMPT_TIMEOUT,
@@ -695,7 +918,7 @@ impl CursorSession {
                     // and release the lock; the cancel queues behind it on
                     // the FIFO mutex, preserving the order described above.
                     let child = Arc::clone(&self.child);
-                    let session_id = self.provider_session_id.0.clone();
+                    let session_id = self.provider_session_id().0;
                     let event_tx = self.event_tx.clone();
                     let thread_id = self.thread_id.clone();
                     tokio::spawn(async move {
@@ -1064,7 +1287,7 @@ impl CursorSession {
             .child
             .request(
                 "session/set_config_option",
-                set_config_params(&self.provider_session_id.0, id, value),
+                set_config_params(&self.provider_session_id().0, id, value),
             )
             .await
             .map_err(map_rpc_error)?;
@@ -1309,33 +1532,254 @@ impl CursorSession {
         }
     }
 
+    /// Open the `session/load` replay window.
+    async fn begin_replay(&self, adopt: bool) {
+        self.state.lock().await.open_replay(adopt);
+    }
+
+    /// Close the replay window and, when the load is worth committing,
+    /// emit everything it collected.
+    ///
+    /// Returns the number of transcript frames the replay carried — the
+    /// only evidence that the loaded session actually existed.
+    async fn finish_replay(&self, commit: bool) -> u64 {
+        self.seal_replay_turn(false).await;
+        let closed = self.state.lock().await.close_replay();
+        let Some(replay) = closed else {
+            return 0;
+        };
+        let frames = replay.transcript_frames;
+        // Suppression is at the emission level, never the drop level: the
+        // frames were still consumed, so the usage totals and context
+        // meter are primed either way.
+        if !commit || !replay.adopt || frames == 0 {
+            return frames;
+        }
+        if replay.truncated {
+            // Say so in the transcript rather than silently opening a
+            // conversation mid-thought. Its own synthetic turn, so it is
+            // sealed no matter which turn the cap trimmed into.
+            let turn_id = replay_turn_id();
+            let _ = self.event_tx.send(ProviderRuntimeEvent::ItemCompleted {
+                thread_id: self.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                item: CompletedItem::AssistantText {
+                    text: "_Earlier history from this session is not shown._".into(),
+                },
+                subagent_id: None,
+            });
+            let _ = self.event_tx.send(ProviderRuntimeEvent::TurnCompleted {
+                thread_id: self.thread_id.clone(),
+                turn_id,
+                status: TurnStatus::Success,
+                usage: None,
+            });
+        }
+        for event in replay.buffered {
+            let _ = self.event_tx.send(event);
+        }
+        frames
+    }
+
+    /// Seal the synthetic turn currently being rebuilt: flush its text
+    /// buffers as completed items and mark the turn done.
+    ///
+    /// The trailing `TurnCompleted` is what seals the turn's last
+    /// reasoning / assistant blocks; without it the pane hydrates into a
+    /// turn that never closes.
+    async fn seal_replay_turn(&self, rotate: bool) {
+        let mut state = self.state.lock().await;
+        if state.replay.is_none() {
+            return;
+        }
+        let assistant_text = std::mem::take(&mut state.assistant_text);
+        let thinking_text = std::mem::take(&mut state.thinking_text);
+        let thread_id = self.thread_id.clone();
+        if let Some(replay) = state.replay.as_mut() {
+            let produced = !replay.user_text.trim().is_empty()
+                || replay.agent_frames_in_turn > 0
+                || !assistant_text.is_empty()
+                || !thinking_text.is_empty();
+            replay.flush_user_message(&thread_id);
+            if produced {
+                let turn_id = replay.turn_id.clone();
+                if !thinking_text.is_empty() {
+                    replay.stage(ProviderRuntimeEvent::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: CompletedItem::AssistantThinking {
+                            text: thinking_text,
+                        },
+                        subagent_id: None,
+                    });
+                }
+                if !assistant_text.is_empty() {
+                    replay.stage(ProviderRuntimeEvent::ItemCompleted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item: CompletedItem::AssistantText {
+                            text: assistant_text,
+                        },
+                        subagent_id: None,
+                    });
+                }
+                replay.stage(ProviderRuntimeEvent::TurnCompleted {
+                    thread_id,
+                    turn_id,
+                    // A replayed turn already happened; the stop reason it
+                    // ended on is not part of the replay.
+                    status: TurnStatus::Success,
+                    usage: None,
+                });
+            }
+        }
+        if rotate {
+            state.rotate_replay_turn();
+        }
+    }
+
+    /// Fold one replayed `user_message_chunk` into the open window.
+    ///
+    /// A user message is what starts a new turn in the replayed stream,
+    /// so the turn being rebuilt is sealed and rotated first. A live echo
+    /// of a prompt Codemux itself sent is ignored: that bubble already
+    /// exists, minted by the command layer.
+    async fn replay_user_chunk(&self, text: &str) {
+        let rotate = {
+            let state = self.state.lock().await;
+            match state.replay.as_ref() {
+                Some(replay) => replay.agent_frames_in_turn > 0,
+                None => return,
+            }
+        };
+        if rotate {
+            self.seal_replay_turn(true).await;
+        }
+        if let Some(replay) = self.state.lock().await.replay.as_mut() {
+            replay.user_text.push_str(text);
+        }
+    }
+
+    /// Route one transcript event: staged in the replay window while one
+    /// is open, sent live otherwise.
+    async fn emit_transcript_event(&self, event: ProviderRuntimeEvent) {
+        let live = {
+            let mut state = self.state.lock().await;
+            match state.replay.as_mut() {
+                Some(replay) => {
+                    // Ordering: the user message that opened this replayed
+                    // turn has to land before the agent work it prompted.
+                    replay.flush_user_message(&self.thread_id);
+                    replay.stage(event);
+                    None
+                }
+                None => Some(event),
+            }
+        };
+        if let Some(event) = live {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
     async fn handle_session_update(&self, params: Value) {
         let update = params.get("update").unwrap_or(&params);
         let kind = update
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let Some(turn_id) = self.state.lock().await.active_turn.clone() else {
-            // Session-load replay is already persisted in Codemux. Avoid
-            // duplicating it, but don't call a valid replay frame unknown.
+        // Kinds that legitimately arrive with no turn in flight. An ACP
+        // agent pushes `available_commands_update` and `usage_update`
+        // unprompted right after `session/new`, so they have to be routed
+        // BEFORE a turn is resolved — otherwise every session start would
+        // fan two warnings into the UI.
+        match kind {
+            "usage_update" => {
+                self.handle_usage_update(update).await;
+                return;
+            }
+            "config_option_update" | "current_mode_update" | "available_commands_update" => return,
+            _ => {}
+        }
+        // Everything below is transcript, and the gate is "not replaying",
+        // NOT "no active turn". `session/load` replays every transcript
+        // entry as a `session/update` before its own response resolves, so
+        // dropping turn-less frames discarded the entire history of any
+        // session Codemux did not itself create and drive — which is the
+        // only case where the replay is the sole source of that history.
+        let transcript_frame = matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "user_message_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        );
+        let turn_id = {
+            let mut state = self.state.lock().await;
+            if let Some(replay) = state.replay.as_mut() {
+                if transcript_frame {
+                    replay.transcript_frames += 1;
+                    if kind != "user_message_chunk" {
+                        replay.agent_frames_in_turn += 1;
+                    }
+                }
+            }
+            state
+                .replay
+                .as_ref()
+                .map(|replay| replay.turn_id.clone())
+                .or_else(|| state.active_turn.clone())
+        };
+        let Some(turn_id) = turn_id else {
+            // A warning, never a silent return: a transcript frame that
+            // arrives outside both a turn and a replay window is a real
+            // gap, and swallowing it is exactly what hid the `session/load`
+            // replay. The frame is still dropped, so a stray post-turn
+            // chunk cannot fold into the next turn's buffer.
+            self.warn(
+                format!("Cursor ACP session update `{kind}` arrived with no active turn"),
+                Some(update.clone()),
+            );
             return;
         };
         match kind {
             "agent_message_chunk" | "agent_thought_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
-                    let delta = if kind == "agent_thought_chunk" {
-                        self.state.lock().await.thinking_text.push_str(text);
-                        ContentDelta::Thinking { text: text.into() }
-                    } else {
-                        self.state.lock().await.assistant_text.push_str(text);
-                        ContentDelta::Text { text: text.into() }
+                    let stream = {
+                        let mut state = self.state.lock().await;
+                        if kind == "agent_thought_chunk" {
+                            state.thinking_text.push_str(text);
+                        } else {
+                            state.assistant_text.push_str(text);
+                        }
+                        // A replayed message is materialised whole when its
+                        // turn is sealed. Streaming it delta by delta would
+                        // only be superseded by that item anyway, and one
+                        // staged event per chunk would burn the replay cap
+                        // on a single long answer.
+                        state.replay.is_none()
                     };
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::ContentDelta {
-                        thread_id: self.thread_id.clone(),
-                        turn_id,
-                        delta,
-                        subagent_id: None,
-                    });
+                    if stream {
+                        let delta = if kind == "agent_thought_chunk" {
+                            ContentDelta::Thinking { text: text.into() }
+                        } else {
+                            ContentDelta::Text { text: text.into() }
+                        };
+                        let _ = self.event_tx.send(ProviderRuntimeEvent::ContentDelta {
+                            thread_id: self.thread_id.clone(),
+                            turn_id,
+                            delta,
+                            subagent_id: None,
+                        });
+                    }
+                }
+            }
+            // Only a replay carries user turns; a live echo of the prompt
+            // Codemux just sent already has its bubble.
+            "user_message_chunk" => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    self.replay_user_chunk(text).await;
                 }
             }
             "tool_call" => {
@@ -1352,7 +1796,7 @@ impl CursorSession {
                     .get("rawInput")
                     .cloned()
                     .unwrap_or_else(|| update.clone());
-                let _ = self.event_tx.send(ProviderRuntimeEvent::ItemCompleted {
+                self.emit_transcript_event(ProviderRuntimeEvent::ItemCompleted {
                     thread_id: self.thread_id.clone(),
                     turn_id,
                     item: CompletedItem::ToolUse {
@@ -1361,7 +1805,8 @@ impl CursorSession {
                         tool_use_id: id.into(),
                     },
                     subagent_id: None,
-                });
+                })
+                .await;
             }
             "tool_call_update" => {
                 let terminal = update
@@ -1379,7 +1824,7 @@ impl CursorSession {
                         .or_else(|| update.get("content"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::ItemCompleted {
+                    self.emit_transcript_event(ProviderRuntimeEvent::ItemCompleted {
                         thread_id: self.thread_id.clone(),
                         turn_id,
                         item: CompletedItem::ToolResult {
@@ -1388,19 +1833,19 @@ impl CursorSession {
                             is_error,
                         },
                         subagent_id: None,
-                    });
+                    })
+                    .await;
                 }
             }
             "plan" => {
                 if let Some(tasks) = tasks_from_value(update) {
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::TasksUpdated {
+                    self.emit_transcript_event(ProviderRuntimeEvent::TasksUpdated {
                         thread_id: self.thread_id.clone(),
                         tasks,
-                    });
+                    })
+                    .await;
                 }
             }
-            "usage_update" => self.handle_usage_update(update).await,
-            "config_option_update" | "current_mode_update" | "available_commands_update" => {}
             _ => self.warn(
                 format!("Unknown Cursor ACP session update `{kind}`"),
                 Some(update.clone()),
@@ -1419,7 +1864,7 @@ impl CursorSession {
         let Some(totals) = usage_totals_from_value(update) else {
             return;
         };
-        let (delta, model, context_events) = {
+        let (delta, model, context_events, replaying) = {
             let mut state = self.state.lock().await;
             let previous = state.usage_totals;
             state.usage_totals = totals;
@@ -1444,12 +1889,17 @@ impl CursorSession {
                 // Codemux-side toggle for it.
                 Some(true),
             );
-            (delta, state.model.clone(), events)
+            (delta, state.model.clone(), events, state.replay.is_some())
         };
         for event in context_events {
             let _ = self.event_tx.send(event);
         }
-        if !delta.is_empty() {
+        // A `usage_update` replayed by `session/load` reports the loaded
+        // session's totals — exactly what the context meter needs, and
+        // priming them here is what keeps the first live delta honest. But
+        // it is history, not work this run performed, so it must never be
+        // billed to the ledger a second time.
+        if !delta.is_empty() && !replaying {
             let cost_usd = pricing::cost_for(
                 model.as_deref(),
                 delta.input,
@@ -1509,7 +1959,7 @@ impl CursorSession {
             .child
             .notify(
                 "session/cancel",
-                json!({ "sessionId": self.provider_session_id.0 }),
+                json!({ "sessionId": self.provider_session_id().0 }),
             )
             .await;
         let _ = self.child.shutdown().await;
@@ -2245,6 +2695,7 @@ mod tests {
             interrupt_generation: None,
             usage_totals: CursorUsageTotals::default(),
             context: ContextUsageTracker::default(),
+            replay: None,
         }
     }
 
@@ -2302,6 +2753,97 @@ mod tests {
         state.release_turn();
         state.request_interrupt();
         assert_eq!(state.interrupt_generation, None);
+    }
+
+    /// A replay window must be invisible to the turn state machine. If it
+    /// claimed the prompt slot, `enqueue_or_send` would queue the user's
+    /// first prompt behind a phantom turn, `turn_active()` would report a
+    /// busy session, and a Stop during startup would be aimed at a
+    /// generation no prompt worker owns.
+    #[test]
+    fn a_replay_window_never_claims_the_prompt_slot() {
+        let mut state = interrupt_test_state();
+        state.open_replay(true);
+
+        assert!(state.replay.is_some());
+        assert!(
+            state.active_turn.is_none(),
+            "replay is not a turn: the prompt slot has to stay free"
+        );
+        assert_eq!(state.turn_generation, 0, "replay claims no generation");
+        // And a Stop arriving mid-replay has nothing to cancel.
+        state.request_interrupt();
+        assert_eq!(state.interrupt_generation, None);
+
+        // A real turn can start while the window is still open, and the
+        // replay's frames keep going to the replay's own turn.
+        let replay_turn = state.replay.as_ref().expect("open window").turn_id.clone();
+        state.active_turn = Some(TurnId("turn-a".into()));
+        let turn_a = state.claim_turn();
+        assert!(!state.take_interrupt(turn_a));
+        assert_eq!(
+            state.replay.as_ref().expect("open window").turn_id.0,
+            replay_turn.0
+        );
+    }
+
+    /// One synthetic turn per replayed turn boundary, namespaced so it can
+    /// never be confused with a turn this session dispatched.
+    #[test]
+    fn each_replayed_turn_boundary_mints_its_own_turn_id() {
+        let mut state = interrupt_test_state();
+        state.open_replay(false);
+        let first = state.replay.as_ref().expect("open window").turn_id.clone();
+        {
+            let replay = state.replay.as_mut().expect("open window");
+            replay.agent_frames_in_turn = 3;
+        }
+
+        state.rotate_replay_turn();
+        let replay = state.replay.as_ref().expect("open window");
+        let second = replay.turn_id.clone();
+
+        assert_ne!(first.0, second.0);
+        assert!(first.0.starts_with("cursor-replay-"));
+        assert!(second.0.starts_with("cursor-replay-"));
+        assert_ne!(first.0, DISPATCHING_TURN_ID);
+        assert_eq!(
+            replay.agent_frames_in_turn, 0,
+            "the rotated turn starts empty, so a chunked user message \
+             cannot rotate it again"
+        );
+
+        let closed = state.close_replay().expect("window was open");
+        assert_eq!(closed.transcript_frames, 0);
+        assert!(state.replay.is_none());
+    }
+
+    /// The cap keeps the NEWEST events and records that it trimmed, so an
+    /// adopted transcript can admit the hole rather than open mid-thought.
+    #[test]
+    fn a_replay_window_caps_what_it_materialises() {
+        let mut state = interrupt_test_state();
+        state.open_replay(true);
+        let replay = state.replay.as_mut().expect("open window");
+        for index in 0..(REPLAY_ITEM_LIMIT + 10) {
+            replay.stage(ProviderRuntimeEvent::ItemCompleted {
+                thread_id: ThreadId("t1".into()),
+                turn_id: TurnId("turn-a".into()),
+                item: CompletedItem::AssistantText {
+                    text: index.to_string(),
+                },
+                subagent_id: None,
+            });
+        }
+        assert_eq!(replay.buffered.len(), REPLAY_ITEM_LIMIT);
+        assert!(replay.truncated);
+        assert!(matches!(
+            replay.buffered.front(),
+            Some(ProviderRuntimeEvent::ItemCompleted {
+                item: CompletedItem::AssistantText { text },
+                ..
+            }) if text == "10"
+        ));
     }
 
     #[test]

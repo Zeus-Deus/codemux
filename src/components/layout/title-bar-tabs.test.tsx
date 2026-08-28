@@ -33,6 +33,7 @@ vi.mock("@/tauri/commands", () => ({
   // shared session-actions hook.
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  agentChatDetachSession: vi.fn().mockResolvedValue(undefined),
   agentChatListMessages: vi.fn().mockResolvedValue([]),
 }));
 

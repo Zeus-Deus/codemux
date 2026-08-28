@@ -11,8 +11,10 @@ import { cn } from "@/lib/utils";
 import {
   agentChatDeleteSession,
   agentChatListSessions,
+  agentChatStopSession,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 const LIST_LIMIT = 50;
 
@@ -77,10 +79,26 @@ export function useSessionHistory({
   }, [open, workspaceId, cwd, sessionsOverride]);
 
   const handleDelete = (threadId: string) => {
+    // Grab the row before the optimistic filter drops it — its `provider`
+    // is what the terminate below has to be addressed to.
+    const row = sessions.find((s) => s.thread_id === threadId);
     setSessions((prev) => prev.filter((s) => s.thread_id !== threadId));
     if (onDeleteOverride) {
       onDeleteOverride(threadId);
       return;
+    }
+    // Deleting the row IS the explicit terminate — the only one in the
+    // product. Every other teardown path detaches, so without this a
+    // deleted session's provider-side conversation would be orphaned
+    // (for OpenCode, left on the server with no row pointing at it).
+    // Idempotent on the backend: an unknown/already-dead thread is Ok.
+    if (row) {
+      agentChatStopSession(
+        row.provider as AgentChatProviderKind,
+        threadId,
+      ).catch(() => {
+        // Non-fatal: the transcript delete below is the user-visible part.
+      });
     }
     agentChatDeleteSession(threadId).catch((err) => {
       console.warn("[agent-chat] failed to delete session", err);

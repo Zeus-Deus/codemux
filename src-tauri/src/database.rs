@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -27,6 +27,15 @@ pub struct RecentProject {
 pub struct AgentChatSessionRecord {
     pub thread_id: String,
     pub sdk_session_id: Option<String>,
+    /// Raw JSON text of the provider's resume envelope, stored verbatim so
+    /// every sibling key survives a restart (Cursor's `schemaVersion`, and
+    /// whatever richer provenance a future adapter hangs off it).
+    /// `sdk_session_id` above stays the identity extracted from it — that is
+    /// what the history dropdown and the duplicate-collapse key on. `None`
+    /// for rows written before this column existed; those rebuild from the
+    /// scalar id as they always did.
+    #[serde(default)]
+    pub resume_cursor: Option<String>,
     pub workspace_id: String,
     pub cwd: Option<String>,
     pub provider: String,
@@ -375,6 +384,9 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS agent_chat_sessions (
             thread_id TEXT PRIMARY KEY,
             sdk_session_id TEXT,
+            -- Verbatim provider resume envelope; `sdk_session_id` above is
+            -- the identity extracted from it. Nullable for legacy rows.
+            resume_cursor TEXT,
             workspace_id TEXT NOT NULL,
             cwd TEXT,
             provider TEXT NOT NULL,
@@ -881,6 +893,12 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN fast_mode INTEGER",
+        // The whole provider resume envelope, kept verbatim. The scalar
+        // `sdk_session_id` remains the dropdown / collapse key; this column
+        // is what gets replayed into `StartSessionInput::resume_cursor` so
+        // sibling keys (Cursor's `schemaVersion`, …) survive a restart.
+        // Legacy rows stay NULL and fall back to `{"resume": <id>}`.
+        "ALTER TABLE agent_chat_sessions ADD COLUMN resume_cursor TEXT",
         // Web-remote account mode (Stage A): how a session was admitted and,
         // for account-minted sessions, the verified Codemux account user id.
         // `source` defaults to 'pair' so every pre-existing (pairing-token) row
@@ -3270,8 +3288,8 @@ impl DatabaseStore {
     /// silent restart (same thread_id after migrate) the ON CONFLICT
     /// bumps `last_active_at` and preserves `sdk_session_id`/`title`.
     /// A provider handoff keeps the human-facing title but atomically
-    /// clears `sdk_session_id`: provider-native resume cursors cannot be
-    /// passed between adapters.
+    /// clears `sdk_session_id` AND `resume_cursor`: provider-native resume
+    /// cursors cannot be passed between adapters.
     pub fn upsert_agent_chat_session(
         &self,
         thread_id: &str,
@@ -3291,6 +3309,10 @@ impl DatabaseStore {
                      WHEN agent_chat_sessions.provider != ?4 THEN NULL
                      ELSE agent_chat_sessions.sdk_session_id
                  END,
+                 resume_cursor = CASE
+                     WHEN agent_chat_sessions.provider != ?4 THEN NULL
+                     ELSE agent_chat_sessions.resume_cursor
+                 END,
                  provider = ?4,
                  last_active_at = datetime('now')",
             params![thread_id, workspace_id, cwd, provider],
@@ -3299,8 +3321,8 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Copy metadata (title, sdk_session_id, created_at) from an old
-    /// thread id to a new one. Used on silent restart so the session
+    /// Copy metadata (title, sdk_session_id, resume_cursor, created_at)
+    /// from an old thread id to a new one. Used on silent restart so the session
     /// keeps its history-dropdown identity after
     /// `migrateThreadId`. The caller is expected to `upsert` the new
     /// row first; this just carries forward the human-facing fields.
@@ -3322,6 +3344,10 @@ impl DatabaseStore {
                  sdk_session_id = COALESCE(
                      (SELECT sdk_session_id FROM agent_chat_sessions WHERE thread_id = ?1),
                      sdk_session_id
+                 ),
+                 resume_cursor = COALESCE(
+                     (SELECT resume_cursor FROM agent_chat_sessions WHERE thread_id = ?1),
+                     resume_cursor
                  ),
                  created_at = COALESCE(
                      (SELECT created_at FROM agent_chat_sessions WHERE thread_id = ?1),
@@ -3387,6 +3413,53 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Record BOTH halves of a provider resume cursor in one UPDATE: the
+    /// extracted `sdk_session_id` (the dropdown / collapse identity) and the
+    /// verbatim `envelope` JSON that gets replayed into
+    /// `StartSessionInput::resume_cursor` on the next rebuild. Only an object
+    /// envelope is stored — anything else writes NULL into `resume_cursor`
+    /// while still recording the id, which keeps the tolerant behaviour of
+    /// [`Self::set_agent_chat_sdk_session_id`] for odd cursor shapes.
+    pub fn set_agent_chat_resume_cursor(
+        &self,
+        thread_id: &str,
+        sdk_session_id: &str,
+        envelope: &serde_json::Value,
+    ) -> Result<(), String> {
+        let envelope_json = envelope.is_object().then(|| envelope.to_string());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET sdk_session_id = ?2, resume_cursor = ?3, last_active_at = datetime('now')
+                 WHERE thread_id = ?1",
+            params![thread_id, sdk_session_id, envelope_json],
+        )
+        .map_err(|e| format!("Failed to set resume cursor: {e}"))?;
+        Ok(())
+    }
+
+    /// Look up the stored envelope for an sdk session id that may live on a
+    /// DIFFERENT thread row. The history-dropdown resume mints a brand-new
+    /// thread id while carrying the old session id, so a thread-keyed read
+    /// would miss the envelope entirely. The `provider` predicate is what
+    /// stops a Codex `{"threadId": …}` envelope from being handed to Claude.
+    pub fn resume_cursor_for_sdk_session_id(
+        &self,
+        sdk_session_id: &str,
+        provider: &str,
+    ) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT resume_cursor FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1 AND provider = ?2 AND resume_cursor IS NOT NULL
+                 ORDER BY last_active_at DESC LIMIT 1",
+            params![sdk_session_id, provider],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
     /// Clear the persisted SDK session UUID for a thread. Called when the
     /// sidecar reports it could not resume the stored session (its on-disk
     /// conversation JSONL was gone) and rebuilt a fresh query — the dead
@@ -3394,11 +3467,14 @@ impl DatabaseStore {
     /// itself survives (the visible transcript still hydrates from it); it
     /// just drops out of the history dropdown until a new `sdk-session-id`
     /// repopulates the column.
+    ///
+    /// Clears `resume_cursor` too — leaving the envelope behind would let the
+    /// rebuild path replay the very session we just declared dead.
     pub fn clear_agent_chat_sdk_session_id(&self, thread_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE agent_chat_sessions
-                 SET sdk_session_id = NULL
+                 SET sdk_session_id = NULL, resume_cursor = NULL
                  WHERE thread_id = ?1",
             params![thread_id],
         )
@@ -3544,6 +3620,7 @@ impl DatabaseStore {
                 context_window: row.get(10)?,
                 permission_mode: row.get(11)?,
                 fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                resume_cursor: row.get(13)?,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -3555,7 +3632,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, resume_cursor
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -3568,7 +3645,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, resume_cursor
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -4100,15 +4177,16 @@ impl DatabaseStore {
         cleanup.checkpoint_refs.sort();
         // Merge identity + config fields onto the survivor: keep the
         // earliest created_at, and carry forward any non-null title /
-        // per-thread config (model / effort / context_window /
-        // permission_mode / fast_mode) across the whole set. The survivor is the
-        // most-recently-active row — for a resume that's the freshly
-        // minted thread whose config columns are still NULL — so
-        // without this backfill the user's persisted per-thread model /
-        // effort / context / permission-mode / speed selection would be lost
-        // when the original row is DELETEd below. Each config column
-        // prefers the survivor's own non-null value, then the
-        // most-recently-active non-null value across the group.
+        // resume envelope / per-thread config (model / effort /
+        // context_window / permission_mode / fast_mode) across the whole
+        // set. The survivor is the most-recently-active row — for a resume
+        // that's the freshly minted thread whose config columns are still
+        // NULL — so without this backfill the user's persisted per-thread
+        // model / effort / context / permission-mode / speed selection, and
+        // the resume envelope the rebuild replays, would be lost when the
+        // original row is DELETEd below. Each column prefers the survivor's
+        // own non-null value, then the most-recently-active non-null value
+        // across the group.
         transaction.execute(
             "UPDATE agent_chat_sessions
                  SET created_at = COALESCE(
@@ -4152,6 +4230,12 @@ impl DatabaseStore {
                       WHERE sdk_session_id = ?1 AND fast_mode IS NOT NULL
                       ORDER BY last_active_at DESC LIMIT 1),
                      0
+                 ),
+                 resume_cursor = COALESCE(
+                     resume_cursor,
+                     (SELECT resume_cursor FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND resume_cursor IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
                  )
              WHERE thread_id = ?2",
             params![sdk_session_id, survivor],
@@ -4199,7 +4283,7 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, resume_cursor
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -4217,6 +4301,7 @@ impl DatabaseStore {
                     context_window: row.get(10)?,
                     permission_mode: row.get(11)?,
                     fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                    resume_cursor: row.get(13)?,
                 })
             },
         )
@@ -5805,6 +5890,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_replayed_message_needs_its_session_row_to_already_exist() {
+        // Pins the invariant that `agent_chat_start_session` orders itself
+        // around: the parent row must be upserted BEFORE the provider starts,
+        // because a `session/load` replay is emitted from inside
+        // `start_session` and lands here through the bridge task.
+        //
+        // `append_agent_chat_message` deliberately swallows an FK violation as
+        // "the parent was deleted mid-flight", so a replay that arrives early
+        // is discarded with no error and no log line. That silence is why the
+        // ordering has to be a test and not a comment.
+        let db = init_test_database();
+        let payload = r#"{"kind":"user_message","text":"replayed"}"#;
+
+        let orphaned = db
+            .append_agent_chat_message("thread-replay", payload)
+            .expect("an FK violation is swallowed, not surfaced as an error");
+        assert_eq!(
+            orphaned, None,
+            "without a session row the insert is silently dropped"
+        );
+        assert!(
+            db.list_agent_chat_messages("thread-replay").is_empty(),
+            "nothing should have been persisted"
+        );
+
+        db.upsert_agent_chat_session("thread-replay", "workspace-1", Some("/tmp"), "cursor")
+            .expect("failed to create the parent session row");
+
+        let adopted = db
+            .append_agent_chat_message("thread-replay", payload)
+            .expect("append should succeed once the parent row exists");
+        assert!(
+            adopted.is_some(),
+            "with the parent row in place the replay must actually persist"
+        );
+        assert_eq!(
+            db.list_agent_chat_messages("thread-replay").len(),
+            1,
+            "the adopted transcript must survive to the next hydrate"
+        );
+    }
+
+    #[test]
+    fn schema_v16_upgrade_adds_resume_cursor_column() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            // Rebuild `agent_chat_sessions` exactly as a pre-v17 install has
+            // it — no `resume_cursor` — and rewind the recorded version.
+            conn.execute_batch(
+                "DROP TABLE agent_chat_sessions;
+                 CREATE TABLE agent_chat_sessions (
+                     thread_id TEXT PRIMARY KEY,
+                     sdk_session_id TEXT,
+                     workspace_id TEXT NOT NULL,
+                     cwd TEXT,
+                     provider TEXT NOT NULL,
+                     title TEXT,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     model TEXT,
+                     effort TEXT,
+                     context_window TEXT,
+                     permission_mode TEXT,
+                     fast_mode INTEGER
+                 );
+                 INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider)
+                 VALUES ('legacy', 'sdk-legacy', 'ws', 'claude');
+                 UPDATE schema_version SET version = 16;",
+            )
+            .unwrap();
+
+            // The additive ALTER list is the only thing that reaches an
+            // existing database; `CREATE TABLE IF NOT EXISTS` is a no-op here.
+            create_schema(&conn).unwrap();
+
+            let version: u32 = conn
+                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+
+        // The legacy row survives with a NULL envelope and still resumes off
+        // its scalar id.
+        let rec = db.get_agent_chat_session("legacy").expect("row survives");
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-legacy"));
+        assert_eq!(rec.resume_cursor, None);
+
+        // And the new column is writable.
+        db.set_agent_chat_resume_cursor(
+            "legacy",
+            "sdk-legacy",
+            &serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-legacy" }),
+        )
+        .unwrap();
+        assert!(db
+            .get_agent_chat_session("legacy")
+            .unwrap()
+            .resume_cursor
+            .is_some());
+    }
+
     // ── Settings Persistence ──
 
     #[test]
@@ -6505,8 +6694,12 @@ mod tests {
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
             .unwrap();
         db.set_agent_chat_title("t", "Original title").unwrap();
-        db.set_agent_chat_sdk_session_id("t", "sdk-uuid-xyz")
-            .unwrap();
+        db.set_agent_chat_resume_cursor(
+            "t",
+            "sdk-uuid-xyz",
+            &serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-uuid-xyz" }),
+        )
+        .unwrap();
 
         // A same-provider restart keeps the provider-native cursor.
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
@@ -6529,6 +6722,10 @@ mod tests {
         assert_eq!(rec.provider, "codex");
         assert_eq!(rec.title.as_deref(), Some("Original title"));
         assert_eq!(rec.sdk_session_id, None);
+        // The envelope is provider-native too — it must not survive the
+        // handoff either, or the next rebuild would replay a Claude cursor
+        // into the Codex adapter.
+        assert_eq!(rec.resume_cursor, None);
     }
 
     #[test]
@@ -6558,8 +6755,12 @@ mod tests {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws-1", None, "claude")
             .unwrap();
-        db.set_agent_chat_sdk_session_id("t", "sdk-uuid-abc")
-            .unwrap();
+        db.set_agent_chat_resume_cursor(
+            "t",
+            "sdk-uuid-abc",
+            &serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-uuid-abc" }),
+        )
+        .unwrap();
         assert_eq!(
             db.get_agent_chat_session("t")
                 .unwrap()
@@ -6572,6 +6773,9 @@ mod tests {
         db.clear_agent_chat_sdk_session_id("t").unwrap();
         let rec = db.get_agent_chat_session("t").unwrap();
         assert_eq!(rec.sdk_session_id, None);
+        // The envelope goes with it — a surviving envelope would be replayed
+        // by `ensure_live_session` and resurrect the session we just buried.
+        assert_eq!(rec.resume_cursor, None);
 
         // Idempotent — clearing an already-null / unknown row is a no-op.
         db.clear_agent_chat_sdk_session_id("t").unwrap();
@@ -6900,7 +7104,12 @@ mod tests {
         db.upsert_agent_chat_session("old", "ws", Some("/p"), "claude")
             .unwrap();
         db.set_agent_chat_title("old", "My chat").unwrap();
-        db.set_agent_chat_sdk_session_id("old", "sdk-uuid").unwrap();
+        db.set_agent_chat_resume_cursor(
+            "old",
+            "sdk-uuid",
+            &serde_json::json!({ "schemaVersion": 1, "sessionId": "sdk-uuid" }),
+        )
+        .unwrap();
 
         // Simulate migrateThreadId: caller upserts the new row first,
         // then asks us to carry forward the identity fields.
@@ -6912,6 +7121,121 @@ mod tests {
         let rec = db.get_agent_chat_session("new").unwrap();
         assert_eq!(rec.title.as_deref(), Some("My chat"));
         assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid"));
+        assert_eq!(rec.resume_cursor.as_deref(), Some(r#"{"schemaVersion":1,"sessionId":"sdk-uuid"}"#));
+    }
+
+    // ── Resume envelope (whole-cursor persistence) ──
+
+    #[test]
+    fn agent_chat_sessions_resume_cursor_roundtrip_keeps_sibling_keys() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "cursor")
+            .unwrap();
+        // Cursor's real two-field envelope: the id alone cannot rebuild it,
+        // which is the whole point of the column.
+        let envelope = serde_json::json!({ "schemaVersion": 1, "sessionId": "sess-1" });
+        db.set_agent_chat_resume_cursor("t", "sess-1", &envelope)
+            .unwrap();
+
+        let rec = db.get_agent_chat_session("t").expect("row exists");
+        // The identity still lands in its own column so the history dropdown
+        // (which filters on it) keeps working.
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sess-1"));
+        let replayed: serde_json::Value =
+            serde_json::from_str(rec.resume_cursor.as_deref().expect("envelope stored")).unwrap();
+        assert_eq!(replayed, envelope);
+    }
+
+    #[test]
+    fn agent_chat_sessions_resume_cursor_ignores_non_object_envelope() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "claude")
+            .unwrap();
+        // A scalar cursor carries no sibling keys worth storing; the id is
+        // still recorded so nothing regresses versus the old writer.
+        db.set_agent_chat_resume_cursor("t", "sess-1", &serde_json::Value::String("sess-1".into()))
+            .unwrap();
+
+        let rec = db.get_agent_chat_session("t").expect("row exists");
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.resume_cursor, None);
+    }
+
+    #[test]
+    fn agent_chat_sessions_legacy_row_reads_back_with_null_envelope() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", Some("/p"), "claude")
+            .unwrap();
+        // Exactly what a pre-v17 row looks like: a scalar id, no envelope.
+        db.set_agent_chat_sdk_session_id("t", "sdk-legacy").unwrap();
+
+        let rec = db.get_agent_chat_session("t").expect("row exists");
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-legacy"));
+        assert_eq!(rec.resume_cursor, None);
+        // And it still reaches the history dropdown.
+        let listed = db.list_agent_chat_sessions("ws-1", Some("/p"), 10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].resume_cursor, None);
+    }
+
+    #[test]
+    fn agent_chat_sessions_resume_cursor_lookup_is_provider_scoped() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "cursor")
+            .unwrap();
+        db.set_agent_chat_resume_cursor(
+            "t",
+            "shared-id",
+            &serde_json::json!({ "schemaVersion": 1, "sessionId": "shared-id" }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.resume_cursor_for_sdk_session_id("shared-id", "cursor")
+                .as_deref(),
+            Some(r#"{"schemaVersion":1,"sessionId":"shared-id"}"#)
+        );
+        // A provider-native envelope must never be handed to another adapter.
+        assert_eq!(
+            db.resume_cursor_for_sdk_session_id("shared-id", "claude"),
+            None
+        );
+        assert_eq!(
+            db.resume_cursor_for_sdk_session_id("other-id", "cursor"),
+            None
+        );
+    }
+
+    #[test]
+    fn collapse_duplicate_agent_chat_sessions_carries_resume_cursor_to_survivor() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            // The original row holds the envelope; the freshly-minted resume
+            // row is more recent and therefore the survivor.
+            conn.execute(
+                r#"INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, resume_cursor, workspace_id, provider,
+                      created_at, last_active_at)
+                 VALUES ('original', 'sdk-env', '{"schemaVersion":1,"sessionId":"sdk-env"}',
+                         'ws', 'cursor', '2025-01-01', '2025-01-01')"#,
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('resume', 'sdk-env', 'ws', 'cursor', '2025-02-01', '2025-02-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-env").unwrap();
+
+        assert!(db.get_agent_chat_session("original").is_none());
+        let survivor = db.get_agent_chat_session("resume").expect("survivor");
+        assert_eq!(survivor.resume_cursor.as_deref(), Some(r#"{"schemaVersion":1,"sessionId":"sdk-env"}"#));
     }
 
     // ── Per-thread chat config (restart-resume follow-up) ──

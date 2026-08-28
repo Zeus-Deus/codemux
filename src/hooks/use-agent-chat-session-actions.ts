@@ -9,7 +9,7 @@ import { useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessagesAfter,
   agentChatStartSession,
-  agentChatStopSession,
+  agentChatDetachSession,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import type {
@@ -80,7 +80,9 @@ export function useAgentChatSessionActions(
       }
       try {
         if (threadId) {
-          await agentChatStopSession(provider, threadId).catch(() => {
+          // Detach, not stop: the session being swapped away from goes
+          // back to the history dropdown and must stay resumable.
+          await agentChatDetachSession(provider, threadId).catch(() => {
             // Non-fatal: a stale session may already be dead. Proceed
             // with the resume regardless.
           });
@@ -171,7 +173,9 @@ export function useAgentChatSessionActions(
     }
     try {
       if (threadId) {
-        await agentChatStopSession(provider, threadId).catch(() => {});
+        // Detach, not stop: the chat being abandoned stays listed in the
+        // history dropdown, so it must stay resumable.
+        await agentChatDetachSession(provider, threadId).catch(() => {});
         // Clear the old slice so the transcript doesn't flash the
         // previous chat's messages while the new session boots.
         useAgentChatStore.getState().resetThread(threadId);

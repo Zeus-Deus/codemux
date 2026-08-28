@@ -502,8 +502,34 @@ impl OpenCodeSession {
         );
     }
 
+    /// Release the local hold on the session: abort the SSE listener and
+    /// emit the closed state, but leave the OpenCode-side session alone.
+    ///
+    /// This is what every surface-close path wants. OpenCode sessions are
+    /// durable on the server's disk, so the persisted resume cursor can
+    /// readopt this exact session id later and keep its conversation
+    /// context. Nothing is sent on the wire.
+    pub async fn detach(&self) {
+        if let Some(handle) = self.sse_handle.lock().await.take() {
+            handle.abort();
+        }
+        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: self.thread_id.clone(),
+            status: SessionStatus::Closed,
+        });
+    }
+
     /// Tear down the session. Aborts the SSE task, deletes the
     /// OpenCode-side session, and emits the closed state.
+    ///
+    /// DESTRUCTIVE, and uniquely so among the providers: the
+    /// `DELETE /session/{id}` below destroys the durable server-side
+    /// session, so the conversation cannot be resumed afterwards — a later
+    /// `start` with this session's resume cursor finds nothing and falls
+    /// back to a blank session. Claude/Codex/Cursor only kill their own
+    /// child process, so for them stop and detach are the same thing.
+    /// Reserve this for an explicit user-initiated terminate; use
+    /// [`Self::detach`] for pane/tab/workspace close and app quit.
     pub async fn shutdown(&self) {
         if let Some(handle) = self.sse_handle.lock().await.take() {
             handle.abort();
@@ -1072,6 +1098,38 @@ mod tests {
             mock_session(server.url(), "pw".into(), "sess_1").await;
         session.shutdown().await;
         mock.assert_async().await;
+        let event = rx.try_recv().expect("closed event published");
+        match event {
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Closed,
+                ..
+            } => {}
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    /// Detach must NOT issue the `DELETE /session/{id}` that `shutdown`
+    /// does — the whole point is that the server-side session survives a
+    /// surface close so the resume cursor can readopt it. The mock server
+    /// registers no routes at all, so any request mockito receives is
+    /// unmatched; the assertion is that the only observable effect is the
+    /// Closed event.
+    #[tokio::test]
+    async fn detach_does_not_delete_session_but_emits_closed_state() {
+        let mut server = Server::new_async().await;
+        // Registered ONLY to be asserted as never-hit: a DELETE reaching the
+        // server would match here and bump the hit count.
+        let delete = server
+            .mock("DELETE", "/session/sess_1")
+            .with_status(200)
+            .with_body("true")
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _tx, mut rx) =
+            mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.detach().await;
+        delete.assert_async().await;
         let event = rx.try_recv().expect("closed event published");
         match event {
             ProviderRuntimeEvent::SessionStateChanged {
