@@ -35,12 +35,19 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
+import {
+  buildAdoptableSessionItems,
+  buildWidenScopeItem,
+  externalSessionRowId,
+  RESUME_WIDEN_SCOPE_ITEM_ID,
+} from "@/lib/agent-chat/external-sessions";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   buildModelCommand,
   buildProviderCommands,
+  buildResumeCommand,
   buildWorkflowCommand,
   filterCommandMenuItems,
   filterSlashItems,
@@ -64,6 +71,7 @@ import {
 import {
   getGithubIssueByPath,
   getGithubPrByPath,
+  agentChatListAdoptableSessions,
   agentChatListSessionMentions,
   listGithubIssuesByPath,
   listMcpServers,
@@ -73,6 +81,7 @@ import {
   MCP_CODEMUX_SELF_ID,
   pasteClipboardImage,
   startSkillsWatcher,
+  type AdoptableAgentSession,
   type AgentChatSessionMention,
   type McpServerConfig,
 } from "@/tauri/commands";
@@ -105,6 +114,11 @@ const EMPTY_FOLDER_MATCHES: FolderMatch[] = [];
 const EMPTY_ISSUE_MATCHES: GitHubIssue[] = [];
 const EMPTY_PR_MATCHES: PullRequestInfo[] = [];
 const EMPTY_SESSION_MATCHES: AgentChatSessionMention[] = [];
+const EMPTY_ADOPTABLE_SESSIONS: AdoptableAgentSession[] = [];
+/** How many conversations `/resume` asks the backend for. Codemux's own
+ *  noise filtering trims the list further, so this is a ceiling on the
+ *  provider read, not on the rows the user sees. */
+const RESUME_FETCH_LIMIT = 200;
 /** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
  *  typing doesn't flood the backend during the popup's open lifetime. */
 const MENTION_FETCH_DEBOUNCE_MS = 100;
@@ -251,6 +265,13 @@ interface Props {
   onAttachPr?: (pr: PullRequestInfo) => void;
   /** Attach one persisted GUI conversation as a safe, budgeted handoff. */
   onAttachSession?: (session: AgentChatSessionMention) => void;
+  /** Adopt a conversation the agent's own CLI created outside Codemux
+   *  (the `/resume` picker). The composer only discovers and picks; the
+   *  pane owns stopping the current session, hydrating the adopted
+   *  thread, and launching it. Omitted on surfaces with no pane behind
+   *  them (an unmaterialised draft) — `/resume` then stays hidden
+   *  rather than offering an action nothing can perform. */
+  onResumeExternalSession?: (session: AdoptableAgentSession) => void | Promise<void>;
   /** Step 8 Stage 6 — invoked when the user attaches an image via
    *  paste, drag-drop, or the `+ → Image…` picker. Composer just
    *  forwards the raw File; the parent runs the allowlist check and
@@ -357,6 +378,7 @@ export function Composer({
   onAttachIssue,
   onAttachPr,
   onAttachSession,
+  onResumeExternalSession,
   onAttachImage,
   modelSupportsImages = false,
   repoSupported = null,
@@ -503,6 +525,25 @@ export function Composer({
   const [attachFolderMatches, setAttachFolderMatches] = useState<FolderMatch[]>(
     EMPTY_FOLDER_MATCHES,
   );
+  // ─── `/resume` picker state ──────────────────────────────────────
+  // Conversations the agent's own CLI created outside Codemux. Opened
+  // from the `/resume` slash row (never from `@` or `+`), rendered on
+  // the same ComposerCommandMenu surface as the `+` menu so the search
+  // box, grouping, and keyboard nav are the ones users already know.
+  // Refetched on every open: local history changes while the app runs,
+  // and a stale picker is the whole problem this affordance solves.
+  const [resumeOpen, setResumeOpen] = useState(false);
+  const [resumeQuery, setResumeQuery] = useState("");
+  const [resumeSessions, setResumeSessions] = useState<AdoptableAgentSession[]>(
+    EMPTY_ADOPTABLE_SESSIONS,
+  );
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
+  /** Opt-in widening past the current checkout (and its worktrees) to
+   *  every project on the machine. Reset on each open so the default
+   *  scope is always the checkout the user is looking at. */
+  const [resumeAllProjects, setResumeAllProjects] = useState(false);
+
   // (issue submode renders <IssuePickerPanel /> directly, which
   // owns its own list + loading + error state — no flat-row state
   // needed at the Composer level.)
@@ -537,6 +578,23 @@ export function Composer({
     () =>
       buildModelCommand({
         onOpen: () => setModelPickerOpenSignal((n) => n + 1),
+      }),
+    [],
+  );
+
+  // `/resume` — GUI-local built-in. Picking it strips the typed text
+  // and opens the adoptable-session picker (state-only activation, same
+  // handling as `/model`). Only offered when the surface can actually
+  // perform the adoption.
+  const canResumeExternal = onResumeExternalSession !== undefined;
+  const resumeCommand = useMemo(
+    () =>
+      buildResumeCommand({
+        onOpen: () => {
+          setResumeAllProjects(false);
+          setResumeQuery("");
+          setResumeOpen(true);
+        },
       }),
     [],
   );
@@ -609,6 +667,7 @@ export function Composer({
       "debug",
       "default",
       "model",
+      "resume",
       "workflow",
     ]);
     for (const skill of skills) names.add(skill.name.toLowerCase());
@@ -643,6 +702,7 @@ export function Composer({
       ...modeCommands,
       workflowCommand,
       modelCommand,
+      ...(canResumeExternal ? [resumeCommand] : []),
       ...skillItems,
       ...(slashLeadsMessage ? providerCommandItems : []),
     ],
@@ -650,6 +710,8 @@ export function Composer({
       modeCommands,
       workflowCommand,
       modelCommand,
+      canResumeExternal,
+      resumeCommand,
       skillItems,
       providerCommandItems,
       slashLeadsMessage,
@@ -935,6 +997,101 @@ export function Composer({
     // changes invalidate them.
   }, []);
 
+  const closeResumePicker = useCallback(() => {
+    setResumeOpen(false);
+    setResumeQuery("");
+    // Drop the rows too: unlike files, history moves while the app runs,
+    // so a reopen must show what is on disk NOW rather than flashing a
+    // stale list first.
+    setResumeSessions(EMPTY_ADOPTABLE_SESSIONS);
+    setResumeError(null);
+    setResumeLoading(false);
+  }, []);
+
+  // Discover adoptable sessions each time the picker opens, and again
+  // when the user widens the scope. Scoped to the pane's cwd: the
+  // backend resolves the checkout (worktrees included) from it and uses
+  // the same path to decide which results count as this repo.
+  useEffect(() => {
+    if (!resumeOpen) return;
+    if (!cwd) {
+      setResumeSessions(EMPTY_ADOPTABLE_SESSIONS);
+      setResumeError("No working directory for this pane.");
+      return;
+    }
+    let cancelled = false;
+    setResumeLoading(true);
+    setResumeError(null);
+    agentChatListAdoptableSessions(provider, {
+      current_cwd: cwd,
+      all_projects: resumeAllProjects,
+      include_worktrees: true,
+      limit: RESUME_FETCH_LIMIT,
+    })
+      .then((rows) => {
+        if (cancelled) return;
+        setResumeSessions(rows);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // A discovery failure is reported in the footer rather than
+        // swallowed into an empty list that reads as "no history".
+        setResumeSessions(EMPTY_ADOPTABLE_SESSIONS);
+        setResumeError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setResumeLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [resumeOpen, resumeAllProjects, cwd, provider]);
+
+  const resumeItems = useMemo(() => {
+    const rows = buildAdoptableSessionItems({ sessions: resumeSessions });
+    // The widening row is a scope control, not a result, so it survives
+    // the search filter and always sits last.
+    const filtered = filterCommandMenuItems(rows, resumeQuery);
+    return resumeAllProjects ? filtered : [...filtered, buildWidenScopeItem()];
+  }, [resumeSessions, resumeQuery, resumeAllProjects]);
+
+  const resumePopupFooter = useMemo(() => {
+    if (resumeError) {
+      return { tone: "error" as const, message: `Resume: ${resumeError}` };
+    }
+    if (resumeLoading) {
+      return { tone: "muted" as const, message: "Reading local history…" };
+    }
+    if (resumeSessions.length === 0) {
+      return {
+        tone: "muted" as const,
+        message: resumeAllProjects
+          ? "No conversations found outside Codemux."
+          : "Nothing in this checkout yet — widen to every project below.",
+      };
+    }
+    return null;
+  }, [resumeError, resumeLoading, resumeSessions.length, resumeAllProjects]);
+
+  const handleResumeSelect = useCallback(
+    (item: SlashCommandItem) => {
+      if (item.id === RESUME_WIDEN_SCOPE_ITEM_ID) {
+        // Stay open — the effect refetches with the wider scope.
+        setResumeAllProjects(true);
+        setResumeQuery("");
+        return;
+      }
+      const picked = resumeSessions.find(
+        (session) => externalSessionRowId(session.session_id) === item.id,
+      );
+      closeResumePicker();
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      if (!picked) return;
+      void onResumeExternalSession?.(picked);
+    },
+    [resumeSessions, closeResumePicker, onResumeExternalSession],
+  );
+
   // Dismiss any open popup when the user clicks outside of it. Without
   // this, the only escape hatches are the textarea Escape handler or
   // re-clicking the `+` trigger — clicking elsewhere on screen leaves
@@ -942,7 +1099,7 @@ export function Composer({
   // toggle handler fires unhindered; pickers' interior elements are
   // excluded so dragging the scrollbar / clicking items still works.
   useEffect(() => {
-    if (!attachOpen && !slashAnchor && !mentionAnchor) return;
+    if (!attachOpen && !slashAnchor && !mentionAnchor && !resumeOpen) return;
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
@@ -956,6 +1113,7 @@ export function Composer({
         return;
       }
       if (attachOpen) closeAttachPopup();
+      if (resumeOpen) closeResumePicker();
       if (slashAnchor) {
         setSlashAnchor(null);
         setSlashHighlighted(null);
@@ -968,9 +1126,11 @@ export function Composer({
     };
   }, [
     attachOpen,
+    resumeOpen,
     slashAnchor,
     mentionAnchor,
     closeAttachPopup,
+    closeResumePicker,
     closeMention,
   ]);
 
@@ -1021,6 +1181,7 @@ export function Composer({
     setAttachOpen(true);
     setAttachSubmode("main");
     setAttachQuery("");
+    if (resumeOpen) closeResumePicker();
     if (slashAnchor) {
       setSlashAnchor(null);
       setSlashHighlighted(null);
@@ -1029,6 +1190,8 @@ export function Composer({
   }, [
     attachOpen,
     closeAttachPopup,
+    resumeOpen,
+    closeResumePicker,
     slashAnchor,
     mentionAnchor,
     closeMention,
@@ -1913,11 +2076,12 @@ export function Composer({
         // Mode picks (and any future non-text-token items) strip the
         // typed `/<query>` because the activation is state-only.
         onDraftChange(before + after);
-        // `/model` hands focus to the footer's model-picker popover —
-        // refocusing the textarea here would immediately dismiss it
-        // (Radix closes on focus-outside). Every other state-only pick
-        // returns focus to the textarea so the user keeps typing.
-        if (item.id !== "composer:model") {
+        // `/model` hands focus to the footer's model-picker popover and
+        // `/resume` to the session picker's own search box — refocusing
+        // the textarea here would immediately dismiss the popover (Radix
+        // closes on focus-outside) or steal the search caret. Every other
+        // state-only pick returns focus so the user keeps typing.
+        if (item.id !== "composer:model" && item.id !== "composer:resume") {
           requestAnimationFrame(() => textareaRef.current?.focus());
         }
       }
@@ -2400,6 +2564,26 @@ export function Composer({
               }
             />
           )}
+          {/* `/resume` picker — the same command-menu surface as the `+`
+              menu (search box, grouped rows, cmdk keyboard nav), listing
+              conversations the agent CLI created outside Codemux.
+              Mutually exclusive with the attach menu; both render null
+              while closed, so only one is ever in the tree. */}
+          <ComposerCommandMenu
+            open={resumeOpen}
+            items={resumeItems}
+            query={resumeQuery}
+            onQueryChange={setResumeQuery}
+            onSelect={handleResumeSelect}
+            onEscape={() => {
+              closeResumePicker();
+              requestAnimationFrame(() => textareaRef.current?.focus());
+            }}
+            footerNote={resumePopupFooter}
+            // Re-focuses the search box when widening swaps the list.
+            submode={resumeAllProjects ? "resume-all" : "resume"}
+            placeholder="Filter conversations"
+          />
           {/* Flush top-edge strip (running subagents). First element in
               flow order — everything above it is either `hidden` or
               absolutely positioned — so it sits on the card's top edge. */}

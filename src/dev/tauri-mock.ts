@@ -3124,6 +3124,81 @@ const handlers: Record<string, Handler> = {
       },
     ];
   },
+  // `/resume` fixture — conversations the agent CLI created outside
+  // Codemux. Two sit in the demo checkout (one of them already adopted,
+  // so the picker's "switch instead of adopt" row is reachable) and one
+  // lives in an unrelated project, which only shows once the user
+  // widens the scope past the current checkout.
+  agent_chat_list_adoptable_sessions: (a) => {
+    const scope = (a.scope ?? {}) as {
+      current_cwd?: string;
+      all_projects?: boolean;
+    };
+    const cwd = scope.current_cwd ?? `${MOCK_HOME_DIR}/projects/codemux`;
+    const local = [
+      {
+        session_id: "ext-2f9c1a70-terminal-refactor",
+        title: "Refactor the pane splitter drag handles",
+        cwd,
+        git_branch: "main",
+        last_modified: new Date(Date.now() - 25 * 60_000).toISOString(),
+        created_at: new Date(Date.now() - 95 * 60_000).toISOString(),
+        file_size: 184_320,
+        title_source: "summary",
+        existing_thread_id: null,
+        same_repo: true,
+      },
+      {
+        session_id: "ext-7b3e0d12-already-adopted",
+        title: "Wire the usage ledger import key",
+        cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/search-index`,
+        git_branch: "search-index",
+        last_modified: new Date(Date.now() - 4 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 6 * 3_600_000).toISOString(),
+        file_size: 92_160,
+        title_source: "custom",
+        existing_thread_id: MOCK_CHAT_THREAD_ID,
+        same_repo: true,
+      },
+    ];
+    if (!scope.all_projects) return local;
+    return [
+      ...local,
+      {
+        session_id: "ext-c41a8be5-other-project",
+        title: "Port the invoice exporter to the new schema",
+        cwd: `${MOCK_HOME_DIR}/projects/ledger`,
+        git_branch: "schema-v3",
+        last_modified: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+        created_at: new Date(Date.now() - 4 * 86_400_000).toISOString(),
+        file_size: 51_200,
+        title_source: "prompt",
+        existing_thread_id: null,
+        same_repo: false,
+      },
+    ];
+  },
+  agent_chat_adopt_external_session: (a) => {
+    const session = (a.session ?? {}) as {
+      session_id?: string;
+      title?: string;
+      cwd?: string;
+    };
+    const cwd = session.cwd ?? `${MOCK_HOME_DIR}/projects/codemux`;
+    return {
+      thread_id: `chat-adopted-${session.session_id ?? "unknown"}`,
+      workspace_id: "ws-codemux-chat",
+      // The mock never opens panes, so the conversation stays on the pane
+      // that asked; the real backend re-homes it when `cwd` is elsewhere.
+      pane_id: String(a.paneId ?? ""),
+      cwd,
+      title: session.title ?? "Adopted conversation",
+      sdk_session_id: session.session_id ?? "unknown",
+      existing_thread_id: null,
+      foreign_project: !cwd.startsWith(`${MOCK_HOME_DIR}/projects/codemux`),
+      resume_divider_written: true,
+    };
+  },
   // Provider-neutral `@session:` picker fixture. Two source chats share the
   // main demo workspace: one in the current checkout and one in a worktree,
   // making grouping, provider labels, filtering, and the handoff chip easy to

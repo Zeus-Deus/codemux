@@ -1769,6 +1769,9 @@ export interface AgentChatSessionRecord {
   context_window: string | null;
   permission_mode: string | null;
   fast_mode?: boolean;
+  /** How the row was created: `"codemux"` or `"external_cli"`. Rows
+   *  written before this column existed read back `"codemux"`. */
+  origin?: string;
 }
 
 /** Provider-neutral conversation row for the composer's `@session:` picker.
@@ -1846,6 +1849,89 @@ export interface AgentChatSessionConfigUpdate {
   fast_mode?: boolean;
 }
 
+/** Where an adoptable session's title came from. `"fallback"` means the
+ *  provider reported none at all. */
+export type ExternalSessionTitleSource =
+  | "custom"
+  | "summary"
+  | "prompt"
+  | "fallback";
+
+/** A conversation the provider's own CLI created outside Codemux.
+ *  Mirrors the Rust `ExternalSession` (snake_case, like every other
+ *  chat-session record crossing this boundary). */
+export interface ExternalAgentSession {
+  /** Provider session id — becomes `sdk_session_id` once adopted. */
+  session_id: string;
+  /** Resolved backend-side from custom title / summary / first prompt.
+   *  Never null and never empty. */
+  title: string;
+  /** Absolute directory the session ran in. Adoption attaches here; no
+   *  worktree is ever created. */
+  cwd: string;
+  git_branch: string | null;
+  /** ISO-8601 UTC. */
+  last_modified: string;
+  /** ISO-8601 UTC, or null when the provider reports no creation time. */
+  created_at: string | null;
+  file_size: number;
+  title_source: ExternalSessionTitleSource;
+}
+
+/** An `ExternalAgentSession` plus the Codemux-side facts the picker needs
+ *  to choose between "adopt", "switch", and "open elsewhere". */
+export interface AdoptableAgentSession extends ExternalAgentSession {
+  /** Non-null when this conversation is already a Codemux thread. Offer
+   *  switching to it — never a second adoption. */
+  existing_thread_id: string | null;
+  /** False means the session belongs to an unrelated project. Surface
+   *  that as an explicit separate action instead of silently re-pointing
+   *  the current pane. */
+  same_repo: boolean;
+}
+
+/** Which slice of local history to offer. `current_cwd` is required —
+ *  it is both the default directory filter and the reference point that
+ *  decides `same_repo` when the scope is widened. */
+export interface ExternalSessionScope {
+  current_cwd: string;
+  /** Opt in to every project on the machine. Default scope is the
+   *  current checkout. */
+  all_projects?: boolean;
+  /** Include sibling git worktrees of `current_cwd`. Defaults to true
+   *  backend-side; ignored when `all_projects` is set. */
+  include_worktrees?: boolean;
+  /** Rows requested from the provider before Codemux filtering. */
+  limit?: number;
+}
+
+export interface AdoptExternalSessionResult {
+  thread_id: string;
+  workspace_id: string;
+  /** The pane the adopted thread must be started in, which is NOT always
+   *  the pane adoption was requested from. A thread's directory and its
+   *  pane's directory may never diverge — the history dropdown, the pane
+   *  header and `@file` completion all resolve against the pane's cwd —
+   *  so when the conversation lives in another folder the backend opens a
+   *  chat pane rooted THERE, binds the thread to it, focuses it, and
+   *  returns it here. Always the pane rooted at {@link cwd}. */
+  pane_id: string;
+  /** The session's own directory. Adoption attaches here; no worktree is
+   *  ever created. Always the cwd {@link pane_id} is rooted at. */
+  cwd: string;
+  title: string;
+  sdk_session_id: string;
+  /** Set when the session was already in Codemux; nothing was inserted
+   *  and this is the thread to switch to. */
+  existing_thread_id: string | null;
+  /** True when `cwd` sits outside the pane workspace's own repo. */
+  foreign_project: boolean;
+  /** False means the "resumed from the terminal" divider could not be
+   *  persisted — say so; do not show a success toast over a blank
+   *  transcript. */
+  resume_divider_written: boolean;
+}
+
 export const agentChatListSessions = (
   workspaceId: string,
   cwd: string | null = null,
@@ -1855,6 +1941,36 @@ export const agentChatListSessions = (
     workspaceId,
     cwd,
     limit,
+  });
+
+/** List conversations the provider's own CLI created outside Codemux
+ *  that can be adopted into this pane. Never throws for "nothing to
+ *  offer" — an unsupported provider resolves to an empty array. */
+export const agentChatListAdoptableSessions = (
+  provider: AgentChatProviderKind,
+  scope: ExternalSessionScope,
+) =>
+  invoke<AdoptableAgentSession[]>("agent_chat_list_adoptable_sessions", {
+    provider,
+    scope,
+  });
+
+/** Adopt a discovered session into a fresh thread bound to the pane.
+ *  Writes the session row only — it does NOT start the provider
+ *  session. Follow up with `agentChatStartSession(paneId, provider,
+ *  { ...input, cwd: result.cwd, resume_cursor: null })`; the backend
+ *  recovers the persisted `sdk_session_id` as the resume cursor. Pass
+ *  the pane's CURRENT permission mode: the external session's mode is
+ *  deliberately not restored. */
+export const agentChatAdoptExternalSession = (
+  paneId: string,
+  provider: AgentChatProviderKind,
+  session: ExternalAgentSession,
+) =>
+  invoke<AdoptExternalSessionResult>("agent_chat_adopt_external_session", {
+    paneId,
+    provider,
+    session,
   });
 
 export const agentChatListSessionMentions = (

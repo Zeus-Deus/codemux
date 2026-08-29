@@ -927,3 +927,21 @@ describe("applyReplayTail — a live run's streaming reasoning", () => {
     expect(block.kind === "reasoning" && block.streaming).toBe(false);
   });
 });
+
+describe("adopted external session", () => {
+  it("replays the divider row and does not read as an interrupted run", () => {
+    // The whole transcript of a freshly adopted thread. It must render
+    // as a marker, not as an empty thread and not as a dead run.
+    const state = replayPayloads([
+      JSON.stringify({
+        type: "resume_divider",
+        source: "external_cli",
+        session_started_at: "2026-04-24T10:00:00.000Z",
+        branch: "main",
+      }),
+    ]);
+    expect(state.messages.map((item) => item.kind)).toEqual(["resume_divider"]);
+    expect(state.interrupted).toBe(false);
+    expect(state.streaming).toBe(false);
+  });
+});

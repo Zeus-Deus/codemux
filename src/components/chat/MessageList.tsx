@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import type {
   ChatViewItem,
   PermissionRequestItem,
+  ResumeDividerItem,
 } from "@/lib/agent-chat/types";
 import {
   assistantReferenceCwds,
@@ -1465,6 +1466,42 @@ function RunInterruptedDivider() {
   );
 }
 
+/** "Resumed from a session started outside Codemux" divider — the first
+ *  row of an adopted thread. Shares the SessionStartMarker hairline
+ *  pattern, with the branch and original start time when the provider
+ *  reported them.
+ *
+ *  It says the earlier turns are not here on purpose. There is no
+ *  history backfill: the agent still holds the conversation, Codemux
+ *  does not, and an empty transcript would read as a failed resume. */
+function ResumeDividerRow({ item }: { item: ResumeDividerItem }) {
+  const detail = [
+    item.branch,
+    item.startedAt != null ? formatSessionStart(item.startedAt) : null,
+  ]
+    .filter((part): part is string => !!part)
+    .join(" · ");
+  return (
+    <div
+      data-testid="resume-divider"
+      className="flex flex-col items-center gap-1 text-muted-foreground/70"
+    >
+      <div className="flex w-full items-center gap-3">
+        <span className="h-px flex-1 bg-border/60" />
+        <span className="font-mono text-[11px] font-medium tracking-wide">
+          Resumed from a session started outside Codemux
+        </span>
+        <span className="h-px flex-1 bg-border/60" />
+      </div>
+      <span className="text-[11px] text-muted-foreground/60">
+        {detail
+          ? `${detail} — earlier turns stay with the agent`
+          : "Earlier turns stay with the agent"}
+      </span>
+    </div>
+  );
+}
+
 function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
     <div className="flex items-center gap-3 text-muted-foreground/70">
@@ -1607,6 +1644,12 @@ function ItemRow({
     return null;
   }
 
+  // Full-width hairline, no gutter: the adopted-session marker is a
+  // divider across the transcript, not an assistant utterance.
+  if (item.kind === "resume_divider") {
+    return <ResumeDividerRow item={item} />;
+  }
+
   // Same full-width, no-gutter treatment for a Workflow tool run.
   if (item.kind === "workflow_run") {
     return (
@@ -1745,6 +1788,7 @@ function renderAssistantBody(
       );
     case "subagent_run":
     case "workflow_run":
+    case "resume_divider":
       // Rendered full-width above (before the AssistantGutter wrap); this
       // arm only keeps the switch exhaustive.
       return null;

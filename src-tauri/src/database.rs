@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -54,6 +54,25 @@ pub struct AgentChatSessionRecord {
     /// `false` for rows created before this column existed.
     #[serde(default)]
     pub fast_mode: bool,
+    /// How the row came to exist — [`AGENT_CHAT_ORIGIN_CODEMUX`] or
+    /// [`AGENT_CHAT_ORIGIN_EXTERNAL_CLI`]. The column is NOT NULL with a
+    /// default, so this is always populated from SQLite; the serde
+    /// default only covers JSON round-trips of payloads written before
+    /// the field existed. Provenance only: it records how the thread
+    /// STARTED, not whether it is currently resumable (a provider handoff
+    /// clears the resume cursor without touching `origin`).
+    #[serde(default = "default_agent_chat_origin")]
+    pub origin: String,
+}
+
+/// `agent_chat_sessions.origin` for a thread started inside Codemux.
+pub const AGENT_CHAT_ORIGIN_CODEMUX: &str = "codemux";
+/// `agent_chat_sessions.origin` for a conversation adopted from the
+/// provider's own CLI.
+pub const AGENT_CHAT_ORIGIN_EXTERNAL_CLI: &str = "external_cli";
+
+fn default_agent_chat_origin() -> String {
+    AGENT_CHAT_ORIGIN_CODEMUX.to_string()
 }
 
 /// Lightweight provider-neutral conversation row used by the composer's
@@ -390,7 +409,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             effort TEXT,
             context_window TEXT,
             permission_mode TEXT,
-            fast_mode INTEGER
+            fast_mode INTEGER,
+            -- How the row came to exist: 'codemux' for a thread started
+            -- here, 'external_cli' for a conversation adopted from the
+            -- provider's own CLI. NOT NULL DEFAULT so upgraded rows and
+            -- every existing writer read back 'codemux' with no code
+            -- change (same shape as web_remote_sessions.source).
+            origin TEXT NOT NULL DEFAULT 'codemux'
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
@@ -937,6 +962,15 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // to be distinct from one another.
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_usage_ledger_import_key \
              ON agent_usage_ledger(import_key) WHERE import_key IS NOT NULL",
+        // Cross-device resume v17: provenance for adopted conversations.
+        // Existing rows were all started here, which is exactly what the
+        // column default reads back for them.
+        "ALTER TABLE agent_chat_sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'codemux'",
+        // Adopted-thread lookups (the picker's "already in Codemux"
+        // dedupe pass) scan by origin; keep that off a full table walk.
+        // Ordered after the ALTER above so the column exists.
+        "CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_origin \
+             ON agent_chat_sessions(origin, last_active_at DESC)",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -944,6 +978,30 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
                 return Err(format!("Schema migration failed ({stmt}): {msg}"));
             }
         }
+    }
+
+    // One adopted thread per provider session id. Deliberately scoped to
+    // adopted rows: threads started here routinely share an
+    // `sdk_session_id` for a moment — resuming from the history dropdown
+    // mints a new thread_id, stamps it with the same id, and only then
+    // merges the pair via `collapse_duplicate_agent_chat_sessions` — so a
+    // table-wide unique index would make that handover fail. Restricted
+    // this way the index covers no pre-existing row, so it cannot fail to
+    // build on an upgrade, and it still turns a racing double adoption
+    // into a clean UNIQUE error instead of two copies of one conversation.
+    //
+    // Created outside the loop above because a unique index is the one
+    // statement here that can fail on real user data, and that loop only
+    // tolerates "duplicate column name". A missing invariant is far better
+    // than a database that refuses to open: the adopt path checks for an
+    // existing thread before inserting either way.
+    if let Err(e) = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_chat_sessions_adopted_sdk_session_id
+             ON agent_chat_sessions(sdk_session_id)
+             WHERE sdk_session_id IS NOT NULL AND origin = 'external_cli'",
+        [],
+    ) {
+        eprintln!("[codemux::database] adopted-session unique index unavailable: {e}");
     }
 
     let installed_schema_version = conn
@@ -3264,6 +3322,123 @@ impl DatabaseStore {
 // (text-only, ~200 bytes each) so we never prune automatically — the
 // user deletes explicitly from the dropdown.
 
+/// Map one `agent_chat_sessions` row selected in declared column order
+/// (`thread_id` … `fast_mode`, `origin`). Shared by the history list, the
+/// single-thread fetch and the provider-session-id lookup so a new column
+/// is wired up in exactly one place.
+fn map_agent_chat_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentChatSessionRecord> {
+    Ok(AgentChatSessionRecord {
+        thread_id: row.get(0)?,
+        sdk_session_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        cwd: row.get(3)?,
+        provider: row.get(4)?,
+        title: row.get(5)?,
+        created_at: row.get(6)?,
+        last_active_at: row.get(7)?,
+        model: row.get(8)?,
+        effort: row.get(9)?,
+        context_window: row.get(10)?,
+        permission_mode: row.get(11)?,
+        fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+        origin: row.get(13)?,
+    })
+}
+
+/// Thread id that currently owns `sdk_session_id`, most-recently-active
+/// first. The dedupe primitive shared by the adoption lookup and the
+/// duplicate-session collapse.
+fn thread_id_owning_sdk_session_id(conn: &Connection, sdk_session_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT thread_id FROM agent_chat_sessions
+         WHERE sdk_session_id = ?1
+         ORDER BY last_active_at DESC LIMIT 1",
+        params![sdk_session_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// The one on-disk shape the `agent_chat_sessions` timestamp columns are
+/// allowed to hold: exactly what SQLite's own `datetime('now')` writes,
+/// in UTC.
+///
+/// `created_at` / `last_active_at` are TEXT, so every comparison on them
+/// (`ORDER BY last_active_at DESC`, `MIN(created_at)`) is a BINARY string
+/// compare. A row stored in any other shape does not just look different,
+/// it sorts wrong: `'T'` (0x54) sorts above `' '` (0x20), so a single
+/// ISO-8601 stamp outranks EVERY same-day `datetime('now')` stamp — which
+/// would hand the duplicate-session collapse the wrong survivor and delete
+/// the thread a live pane is still writing to.
+const SQLITE_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Coerce an externally-supplied timestamp into [`SQLITE_DATETIME_FORMAT`].
+///
+/// Provider CLIs report ISO-8601 (`2026-08-28T09:30:00.000Z`); every other
+/// writer of these columns uses `datetime('now')`. Normalising at the write
+/// boundary keeps the whole column in one comparable format instead of
+/// asking each reader to parse two.
+///
+/// An unparseable or empty stamp falls back to `datetime('now')` semantics:
+/// filing an adopted conversation as "just now" is a small ordering lie,
+/// while storing the raw garbage is an unbounded one.
+fn normalize_session_timestamp(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Already on-disk shape (the common case for anything Codemux wrote).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, SQLITE_DATETIME_FORMAT) {
+        return naive.format(SQLITE_DATETIME_FORMAT).to_string();
+    }
+    // ISO-8601 carrying a zone: `Z` and `+02:00` both land on UTC, so a
+    // session recorded on another device sorts against local rows correctly.
+    if let Ok(zoned) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return zoned
+            .with_timezone(&chrono::Utc)
+            .format(SQLITE_DATETIME_FORMAT)
+            .to_string();
+    }
+    // Zoneless ISO-8601 / fractional seconds: read as UTC, matching the
+    // assumption `datetime('now')` itself makes.
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
+            return naive.format(SQLITE_DATETIME_FORMAT).to_string();
+        }
+    }
+    chrono::Utc::now().format(SQLITE_DATETIME_FORMAT).to_string()
+}
+
+/// Everything needed to materialise the row for an adopted external
+/// session. A struct rather than nine positional arguments, matching how
+/// [`AgentChatCheckpointRecord`] is handed to its upsert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedAgentChatSession {
+    pub thread_id: String,
+    /// Provider-native session id of the conversation being adopted.
+    pub sdk_session_id: String,
+    pub workspace_id: String,
+    /// The session's own directory — adoption attaches in place and
+    /// never creates a worktree, so this may legitimately sit outside
+    /// the workspace root.
+    pub cwd: String,
+    /// Lowercase provider name, matching `upsert_agent_chat_session`.
+    pub provider: String,
+    pub title: String,
+    /// Normally [`AGENT_CHAT_ORIGIN_EXTERNAL_CLI`].
+    pub origin: String,
+    /// The EXTERNAL session's creation time, bound explicitly so an
+    /// adopted week-old conversation is not filed as brand new. Supplied
+    /// in whatever shape the provider reports (usually ISO-8601);
+    /// [`DatabaseStore::insert_adopted_agent_chat_session`] normalises it.
+    pub created_at: String,
+    /// The external session's last-write time, bound explicitly, so the
+    /// adopted thread sorts by when the work actually happened. Normalised
+    /// on write like `created_at`.
+    pub last_active_at: String,
+}
+
 impl DatabaseStore {
     /// Insert or refresh a session row. Called from
     /// `agent_chat_start_session`: on a brand-new chat we INSERT, on a
@@ -3529,23 +3704,6 @@ impl DatabaseStore {
         limit: u32,
     ) -> Vec<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
-        let map_row = |row: &rusqlite::Row<'_>| {
-            Ok(AgentChatSessionRecord {
-                thread_id: row.get(0)?,
-                sdk_session_id: row.get(1)?,
-                workspace_id: row.get(2)?,
-                cwd: row.get(3)?,
-                provider: row.get(4)?,
-                title: row.get(5)?,
-                created_at: row.get(6)?,
-                last_active_at: row.get(7)?,
-                model: row.get(8)?,
-                effort: row.get(9)?,
-                context_window: row.get(10)?,
-                permission_mode: row.get(11)?,
-                fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
-            })
-        };
         // Only surface rows that actually have an sdk_session_id —
         // without one the Claude SDK cannot resume the conversation
         // so offering them in the dropdown leads to a dead-end toast.
@@ -3555,7 +3713,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, origin
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -3563,12 +3721,15 @@ impl DatabaseStore {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            stmt.query_map(params![workspace_id, cwd, limit], map_row)
-                .map(|iter| iter.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
+            stmt.query_map(
+                params![workspace_id, cwd, limit],
+                map_agent_chat_session_row,
+            )
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, origin
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -3576,7 +3737,7 @@ impl DatabaseStore {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            stmt.query_map(params![workspace_id, limit], map_row)
+            stmt.query_map(params![workspace_id, limit], map_agent_chat_session_row)
                 .map(|iter| iter.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default()
         }
@@ -4015,15 +4176,7 @@ impl DatabaseStore {
             .transaction()
             .map_err(|e| format!("Failed to start duplicate-session merge: {e}"))?;
         // Pick the most-recently-active row as the survivor.
-        let survivor: Option<String> = transaction
-            .query_row(
-                "SELECT thread_id FROM agent_chat_sessions
-                 WHERE sdk_session_id = ?1
-                 ORDER BY last_active_at DESC LIMIT 1",
-                params![sdk_session_id],
-                |row| row.get(0),
-            )
-            .ok();
+        let survivor = thread_id_owning_sdk_session_id(&transaction, sdk_session_id);
         let Some(survivor) = survivor else {
             return Ok(AgentChatSessionCleanup::default());
         };
@@ -4199,28 +4352,125 @@ impl DatabaseStore {
     pub fn get_agent_chat_session(&self, thread_id: &str) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, origin
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
-            |row| {
-                Ok(AgentChatSessionRecord {
-                    thread_id: row.get(0)?,
-                    sdk_session_id: row.get(1)?,
-                    workspace_id: row.get(2)?,
-                    cwd: row.get(3)?,
-                    provider: row.get(4)?,
-                    title: row.get(5)?,
-                    created_at: row.get(6)?,
-                    last_active_at: row.get(7)?,
-                    model: row.get(8)?,
-                    effort: row.get(9)?,
-                    context_window: row.get(10)?,
-                    permission_mode: row.get(11)?,
-                    fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
-                })
-            },
+            map_agent_chat_session_row,
         )
         .ok()
+    }
+
+    /// Look up the session row that owns a provider session id.
+    ///
+    /// The adoption dedupe primitive: a non-`None` result means this
+    /// conversation is already in Codemux, so the picker offers switching
+    /// to that thread and never a second adoption. Resume transiently
+    /// leaves two rows carrying one id (until
+    /// [`Self::collapse_duplicate_agent_chat_sessions`] merges them), so
+    /// the most-recently-active row wins — the same survivor the collapse
+    /// would pick.
+    pub fn get_agent_chat_session_by_sdk_session_id(
+        &self,
+        sdk_session_id: &str,
+    ) -> Option<AgentChatSessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        let thread_id = thread_id_owning_sdk_session_id(&conn, sdk_session_id)?;
+        conn.query_row(
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode, origin
+             FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            map_agent_chat_session_row,
+        )
+        .ok()
+    }
+
+    /// Bulk form of the lookup above: map each supplied provider session
+    /// id to the thread that already owns it. Ids with no row are absent
+    /// from the map. Decorates a whole picker page in one query instead
+    /// of N round-trips; an empty input slice returns an empty map
+    /// without touching the database.
+    pub fn find_agent_chat_threads_by_sdk_session_ids(
+        &self,
+        sdk_session_ids: &[String],
+    ) -> HashMap<String, String> {
+        if sdk_session_ids.is_empty() {
+            return HashMap::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = vec!["?"; sdk_session_ids.len()].join(", ");
+        // Ascending activity so the most-recently-active row overwrites
+        // its predecessors — the same survivor the collapse would pick.
+        let sql = format!(
+            "SELECT sdk_session_id, thread_id FROM agent_chat_sessions
+             WHERE sdk_session_id IN ({placeholders})
+             ORDER BY last_active_at ASC"
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return HashMap::new(),
+        };
+        let rows = stmt.query_map(
+            params_from_iter(sdk_session_ids.iter().map(|id| Value::from(id.clone()))),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        match rows {
+            Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Insert the row for a newly adopted external session.
+    ///
+    /// A plain INSERT, deliberately not an upsert and not `OR IGNORE`:
+    /// `thread_id` is freshly minted so it cannot collide, and a
+    /// collision on `sdk_session_id` means another adoption won the race.
+    /// That surfaces as a `UNIQUE constraint failed` error the caller
+    /// maps to "already in Codemux — switch to that thread" rather than
+    /// silently producing a duplicate conversation.
+    ///
+    /// Adoption must not route through
+    /// [`Self::upsert_agent_chat_session`]: that path hardcodes
+    /// `datetime('now')`, which would file a week-old conversation as
+    /// brand new, and its ON CONFLICT arm drops the resume cursor
+    /// whenever the provider string differs.
+    ///
+    /// `permission_mode` is left NULL on purpose — the external
+    /// session's mode is never restored; the follow-up session start
+    /// heals NULL to the pane's current default.
+    ///
+    /// This is also the single choke point for timestamp normalisation.
+    /// It is the ONLY writer of `created_at` / `last_active_at` that does
+    /// not bind `datetime('now')`, so normalising the two provider-supplied
+    /// stamps here — rather than at the adopt command — is what guarantees
+    /// the whole column stays in one comparable format no matter which
+    /// caller (command, test, future importer) mints the row. See
+    /// [`normalize_session_timestamp`].
+    pub fn insert_adopted_agent_chat_session(
+        &self,
+        adopted: &AdoptedAgentChatSession,
+    ) -> Result<(), String> {
+        let created_at = normalize_session_timestamp(&adopted.created_at);
+        let last_active_at = normalize_session_timestamp(&adopted.last_active_at);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_sessions
+                 (thread_id, sdk_session_id, workspace_id, cwd, provider,
+                  title, origin, created_at, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                adopted.thread_id,
+                adopted.sdk_session_id,
+                adopted.workspace_id,
+                adopted.cwd,
+                adopted.provider,
+                adopted.title,
+                adopted.origin,
+                created_at,
+                last_active_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert adopted agent_chat_session: {e}"))?;
+        Ok(())
     }
 }
 
@@ -4278,6 +4528,30 @@ impl DatabaseStore {
             }
             Err(e) => Err(format!("Failed to append agent_chat_message: {e}")),
         }
+    }
+
+    /// Persist the "resumed from the terminal" divider as an adopted
+    /// thread's first transcript row, so the thread never opens blank.
+    ///
+    /// Returns the inserted `agent_chat_messages.id`. Unlike
+    /// [`Self::append_agent_chat_message`] a missing parent row is an
+    /// error, not a swallowed no-op: the caller has to be able to tell
+    /// the user the adopted thread would open empty instead of showing a
+    /// success toast over a blank transcript.
+    ///
+    /// The payload is written verbatim; give it a `type` the transcript
+    /// renderer switches on and that does NOT match the search triggers'
+    /// `user_message` / `item_completed` shapes, so the divider stays out
+    /// of full-text search.
+    pub fn insert_agent_chat_resume_divider(
+        &self,
+        thread_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64, String> {
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|e| format!("Failed to serialize resume divider: {e}"))?;
+        self.append_agent_chat_message(thread_id, &payload_json)?
+            .ok_or_else(|| format!("No agent_chat_session row for thread {thread_id}"))
     }
 
     /// Return every persisted message for a thread, ordered by
@@ -6577,6 +6851,387 @@ mod tests {
         db.clear_agent_chat_sdk_session_id("t").unwrap();
         db.clear_agent_chat_sdk_session_id("no-such-thread")
             .unwrap();
+    }
+
+    // ── Adopted external sessions (cross-device resume) ──
+
+    fn sample_adopted_session(thread_id: &str, sdk_session_id: &str) -> AdoptedAgentChatSession {
+        AdoptedAgentChatSession {
+            thread_id: thread_id.to_string(),
+            sdk_session_id: sdk_session_id.to_string(),
+            workspace_id: "ws-adopt".to_string(),
+            cwd: "/projects/checkout".to_string(),
+            provider: "claude".to_string(),
+            title: "Fix the flaky import test".to_string(),
+            origin: AGENT_CHAT_ORIGIN_EXTERNAL_CLI.to_string(),
+            // ISO-8601, because that is what the provider CLIs report and
+            // therefore what `agent_chat_adopt_external_session` actually
+            // hands this insert. A fixture in on-disk shape would test a
+            // string no caller ever passes.
+            created_at: "2025-03-01T09:15:00.000Z".to_string(),
+            last_active_at: "2025-03-02T18:40:00.000Z".to_string(),
+        }
+    }
+
+    /// An adopted session whose real timestamps are TODAY — the shape that
+    /// collides with `datetime('now')` rows in a plain string comparison.
+    fn adopted_session_active_minutes_ago(
+        thread_id: &str,
+        sdk_session_id: &str,
+        minutes: i64,
+    ) -> AdoptedAgentChatSession {
+        let when = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        AdoptedAgentChatSession {
+            created_at: when.clone(),
+            last_active_at: when,
+            ..sample_adopted_session(thread_id, sdk_session_id)
+        }
+    }
+
+    #[test]
+    fn adopted_session_insert_roundtrips_every_field() {
+        let db = init_test_database();
+        let adopted = sample_adopted_session("thread-adopted", "sdk-external-1");
+        db.insert_adopted_agent_chat_session(&adopted).unwrap();
+
+        let rec = db
+            .get_agent_chat_session("thread-adopted")
+            .expect("adopted row should exist");
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-external-1"));
+        assert_eq!(rec.workspace_id, "ws-adopt");
+        assert_eq!(rec.cwd.as_deref(), Some("/projects/checkout"));
+        assert_eq!(rec.provider, "claude");
+        assert_eq!(rec.title.as_deref(), Some("Fix the flaky import test"));
+        assert_eq!(rec.origin, AGENT_CHAT_ORIGIN_EXTERNAL_CLI);
+        // The session's real timestamps, not `datetime('now')` — an
+        // adopted conversation must sort by when the work happened — but
+        // rewritten into the on-disk shape every other writer of these
+        // columns uses, so ORDER BY compares like with like.
+        assert_eq!(rec.created_at, "2025-03-01 09:15:00");
+        assert_eq!(rec.last_active_at, "2025-03-02 18:40:00");
+        // The external session's permission mode is never restored.
+        assert_eq!(rec.permission_mode, None);
+    }
+
+    #[test]
+    fn rows_started_in_codemux_read_back_as_codemux_origin() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", Some("/p"), "claude")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t").unwrap().origin,
+            AGENT_CHAT_ORIGIN_CODEMUX
+        );
+    }
+
+    #[test]
+    fn adopted_session_is_found_by_sdk_session_id() {
+        let db = init_test_database();
+        assert!(db
+            .get_agent_chat_session_by_sdk_session_id("sdk-external-1")
+            .is_none());
+
+        let adopted = sample_adopted_session("thread-adopted", "sdk-external-1");
+        db.insert_adopted_agent_chat_session(&adopted).unwrap();
+
+        let found = db
+            .get_agent_chat_session_by_sdk_session_id("sdk-external-1")
+            .expect("adoption dedupe lookup should find the row");
+        assert_eq!(found.thread_id, "thread-adopted");
+        assert_eq!(found.origin, AGENT_CHAT_ORIGIN_EXTERNAL_CLI);
+    }
+
+    #[test]
+    fn adopting_the_same_session_twice_never_creates_a_second_row() {
+        let db = init_test_database();
+        db.insert_adopted_agent_chat_session(&sample_adopted_session("thread-a", "sdk-shared"))
+            .unwrap();
+
+        // The racing second adoption mints its own thread_id, so only the
+        // partial unique index can stop it. The caller maps this error to
+        // "already in Codemux — switch to that thread".
+        let error = db
+            .insert_adopted_agent_chat_session(&sample_adopted_session("thread-b", "sdk-shared"))
+            .expect_err("a second adoption of one session must be rejected");
+        assert!(
+            error.contains("UNIQUE constraint failed"),
+            "unexpected error: {error}"
+        );
+        assert!(db.get_agent_chat_session("thread-b").is_none());
+
+        let rows: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM agent_chat_sessions WHERE sdk_session_id = 'sdk-shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(rows, 1);
+        assert_eq!(
+            db.get_agent_chat_session_by_sdk_session_id("sdk-shared")
+                .unwrap()
+                .thread_id,
+            "thread-a"
+        );
+    }
+
+    #[test]
+    fn adoption_index_leaves_the_resume_handover_alone() {
+        // Resuming a chat from the history dropdown deliberately parks the
+        // same provider session id on two rows until the collapse merges
+        // them. That handover must keep working alongside the adoption
+        // invariant, so the index is scoped to adopted rows only.
+        let db = init_test_database();
+        db.insert_adopted_agent_chat_session(&sample_adopted_session("adopted", "sdk-shared"))
+            .unwrap();
+        db.upsert_agent_chat_session("resumed", "ws-adopt", Some("/projects/checkout"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("resumed", "sdk-shared")
+            .unwrap();
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-shared")
+            .unwrap();
+
+        assert!(db.get_agent_chat_session("adopted").is_none());
+        let survivor = db.get_agent_chat_session("resumed").unwrap();
+        assert_eq!(survivor.sdk_session_id.as_deref(), Some("sdk-shared"));
+        // Identity carried forward from the adopted row.
+        assert_eq!(survivor.title.as_deref(), Some("Fix the flaky import test"));
+        assert_eq!(survivor.created_at, "2025-03-01 09:15:00");
+    }
+
+    #[test]
+    fn provider_timestamps_are_rewritten_into_the_on_disk_shape() {
+        // The three shapes a provider CLI can hand us all land on the one
+        // shape `datetime('now')` writes, in UTC.
+        assert_eq!(
+            normalize_session_timestamp("2026-08-28T09:30:00.000Z"),
+            "2026-08-28 09:30:00"
+        );
+        assert_eq!(
+            normalize_session_timestamp("2026-08-28T11:30:00+02:00"),
+            "2026-08-28 09:30:00"
+        );
+        assert_eq!(
+            normalize_session_timestamp("2026-08-28T09:30:00"),
+            "2026-08-28 09:30:00"
+        );
+        // A value already in on-disk shape passes through untouched.
+        assert_eq!(
+            normalize_session_timestamp("2026-08-28 09:30:00"),
+            "2026-08-28 09:30:00"
+        );
+        // Garbage falls back to `datetime('now')` semantics rather than
+        // poisoning the column with something that sorts arbitrarily.
+        for garbage in ["", "   ", "yesterday-ish"] {
+            let healed = normalize_session_timestamp(garbage);
+            assert!(
+                chrono::NaiveDateTime::parse_from_str(&healed, SQLITE_DATETIME_FORMAT).is_ok(),
+                "{garbage:?} healed to an unusable {healed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_adopted_row_does_not_out_sort_a_same_day_codemux_row() {
+        // Both columns are TEXT compared with BINARY collation, so an
+        // ISO-8601 stamp ('T' = 0x54) would beat every same-day
+        // `datetime('now')` stamp (' ' = 0x20) and park a week-old adopted
+        // conversation at the top of the history dropdown.
+        let db = init_test_database();
+        db.upsert_agent_chat_session("live", "ws-adopt", Some("/projects/checkout"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("live", "sdk-live").unwrap();
+        // Adopted, but last touched an hour BEFORE the live row.
+        db.insert_adopted_agent_chat_session(&adopted_session_active_minutes_ago(
+            "adopted",
+            "sdk-adopted",
+            60,
+        ))
+        .unwrap();
+
+        let listed = db.list_agent_chat_sessions("ws-adopt", Some("/projects/checkout"), 10);
+        let order: Vec<&str> = listed.iter().map(|row| row.thread_id.as_str()).collect();
+        assert_eq!(order, vec!["live", "adopted"]);
+    }
+
+    #[test]
+    fn collapse_keeps_the_live_thread_over_a_stale_adopted_row() {
+        // Adoption mints a row, then the follow-up session start mints the
+        // thread the pane is actually bound to; both carry the same provider
+        // session id until the collapse merges them. The survivor must be the
+        // live thread — picking the adopted row deletes the thread the pane
+        // still writes to, and `append_agent_chat_message` then swallows every
+        // message of the conversation as an FK violation.
+        let db = init_test_database();
+        let adopted = adopted_session_active_minutes_ago("adopted", "sdk-shared", 60);
+        db.insert_adopted_agent_chat_session(&adopted).unwrap();
+        db.upsert_agent_chat_session("live", "ws-adopt", Some("/projects/checkout"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("live", "sdk-shared")
+            .unwrap();
+        db.append_agent_chat_message("live", r#"{"type":"user_message","text":"hi"}"#)
+            .unwrap()
+            .expect("the live thread accepts messages before the collapse");
+
+        let cleanup = db
+            .collapse_duplicate_agent_chat_sessions("sdk-shared")
+            .unwrap();
+
+        assert_eq!(cleanup.thread_ids, vec!["adopted".to_string()]);
+        assert!(db.get_agent_chat_session("adopted").is_none());
+        let survivor = db
+            .get_agent_chat_session("live")
+            .expect("the thread the pane is bound to must survive the merge");
+        // The adopted row's identity is carried forward, including the
+        // genuinely earliest created_at.
+        assert_eq!(survivor.title.as_deref(), Some("Fix the flaky import test"));
+        assert_eq!(
+            survivor.created_at,
+            normalize_session_timestamp(&adopted.created_at)
+        );
+        assert_eq!(db.list_agent_chat_messages("live").len(), 1);
+        // The pane keeps writing to the same thread id after the merge.
+        assert!(db
+            .append_agent_chat_message("live", r#"{"type":"user_message","text":"still here"}"#)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn find_threads_by_sdk_session_ids_decorates_a_picker_page() {
+        let db = init_test_database();
+        db.insert_adopted_agent_chat_session(&sample_adopted_session("thread-a", "sdk-a"))
+            .unwrap();
+        db.upsert_agent_chat_session("thread-b", "ws-adopt", Some("/p"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("thread-b", "sdk-b")
+            .unwrap();
+
+        assert!(db
+            .find_agent_chat_threads_by_sdk_session_ids(&[])
+            .is_empty());
+
+        let found = db.find_agent_chat_threads_by_sdk_session_ids(&[
+            "sdk-a".to_string(),
+            "sdk-b".to_string(),
+            "sdk-never-seen".to_string(),
+        ]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found.get("sdk-a").map(String::as_str), Some("thread-a"));
+        assert_eq!(found.get("sdk-b").map(String::as_str), Some("thread-b"));
+        assert!(!found.contains_key("sdk-never-seen"));
+    }
+
+    #[test]
+    fn resume_divider_lands_in_the_transcript_but_not_in_search() {
+        let db = init_test_database();
+        db.insert_adopted_agent_chat_session(&sample_adopted_session("thread-adopted", "sdk-1"))
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "type": "resume_divider",
+            "source": AGENT_CHAT_ORIGIN_EXTERNAL_CLI,
+            "session_started_at": "2025-03-01 09:15:00",
+            "branch": "main",
+        });
+        let id = db
+            .insert_agent_chat_resume_divider("thread-adopted", &payload)
+            .unwrap();
+        assert!(id > 0);
+
+        let messages = db.list_agent_chat_messages("thread-adopted");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&messages[0]).unwrap(),
+            payload
+        );
+
+        // The divider is not prose, so it must stay out of the FTS index.
+        let indexed: i64 = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM agent_chat_search", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(indexed, 0);
+    }
+
+    #[test]
+    fn resume_divider_reports_a_missing_thread_instead_of_swallowing_it() {
+        // R7: the adopt command has to be able to say the thread would
+        // open blank rather than show a success toast over nothing.
+        let db = init_test_database();
+        let error = db
+            .insert_agent_chat_resume_divider("no-such-thread", &serde_json::json!({}))
+            .expect_err("divider without a session row must fail loudly");
+        assert!(error.contains("no-such-thread"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn schema_v16_upgrade_adds_session_origin_and_its_indexes() {
+        let db = init_test_database();
+        let conn = db.conn.lock().unwrap();
+        // Rebuild the table as it shipped in v16 (no `origin`), with a
+        // pre-existing row, then re-run the migration over it.
+        conn.execute_batch(
+            "DROP INDEX idx_agent_chat_sessions_adopted_sdk_session_id;
+             DROP INDEX idx_agent_chat_sessions_origin;
+             DROP TABLE agent_chat_sessions;
+             CREATE TABLE agent_chat_sessions (
+                 thread_id TEXT PRIMARY KEY,
+                 sdk_session_id TEXT,
+                 workspace_id TEXT NOT NULL,
+                 cwd TEXT,
+                 provider TEXT NOT NULL,
+                 title TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 model TEXT,
+                 effort TEXT,
+                 context_window TEXT,
+                 permission_mode TEXT,
+                 fast_mode INTEGER
+             );
+             INSERT INTO agent_chat_sessions
+                 (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+             VALUES ('legacy', 'sdk-legacy', 'ws', 'claude', '2025-01-01', '2025-01-01');
+             UPDATE schema_version SET version = 16;",
+        )
+        .unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The upgraded row reads back as a thread that started here.
+        let origin: String = conn
+            .query_row(
+                "SELECT origin FROM agent_chat_sessions WHERE thread_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(origin, AGENT_CHAT_ORIGIN_CODEMUX);
+        for index in [
+            "idx_agent_chat_sessions_origin",
+            "idx_agent_chat_sessions_adopted_sdk_session_id",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{index} should exist after the upgrade");
+        }
     }
 
     #[test]

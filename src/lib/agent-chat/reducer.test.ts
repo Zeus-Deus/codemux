@@ -2887,3 +2887,42 @@ describe("agent-chat reducer — interim turn ends (provider yields on backgroun
     expect(turnEnds(settled)[0]).not.toHaveProperty("interim");
   });
 });
+
+describe("resume divider (adopted external session)", () => {
+  it("renders the adopted marker so the thread never opens blank", () => {
+    const state = runEvents([
+      {
+        type: "resume_divider",
+        thread_id: "t1",
+        source: "external_cli",
+        session_started_at: "2026-04-24T10:00:00.000Z",
+        branch: "main",
+      },
+    ]);
+    expect(state.messages).toHaveLength(1);
+    const item = state.messages[0];
+    expect(item.kind).toBe("resume_divider");
+    if (item.kind !== "resume_divider") throw new Error("wrong kind");
+    expect(item.source).toBe("external_cli");
+    expect(item.branch).toBe("main");
+    expect(item.startedAt).toBe(Date.parse("2026-04-24T10:00:00.000Z"));
+  });
+
+  it("stays single when the same head is replayed twice", () => {
+    const event: ProviderRuntimeEvent = {
+      type: "resume_divider",
+      thread_id: "t1",
+      source: "external_cli",
+      session_started_at: null,
+      branch: null,
+    };
+    const state = runEvents([event, event]);
+    expect(
+      state.messages.filter((m) => m.kind === "resume_divider"),
+    ).toHaveLength(1);
+    const item = state.messages[0];
+    if (item.kind !== "resume_divider") throw new Error("wrong kind");
+    expect(item.startedAt).toBeNull();
+    expect(item.branch).toBeNull();
+  });
+});

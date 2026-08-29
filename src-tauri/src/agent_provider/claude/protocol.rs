@@ -32,6 +32,7 @@ pub const METHOD_INITIALIZATION_RESULT: &str = "initialization-result";
 pub const METHOD_STOP_SESSION: &str = "stop-session";
 pub const METHOD_PROBE_INSTALLED: &str = "probe-installed";
 pub const METHOD_PROBE_AUTHENTICATED: &str = "probe-authenticated";
+pub const METHOD_LIST_SESSIONS: &str = "list-sessions";
 
 // ---------------------------------------------------------------------------
 // Request params — client → sidecar

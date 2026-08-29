@@ -504,3 +504,89 @@ pub struct ProviderSession {
     /// [`StartSessionInput::resume_cursor`] after a restart.
     pub resume_cursor: Option<serde_json::Value>,
 }
+
+/// Where an [`ExternalSession`]'s title came from.
+///
+/// `Fallback` means the provider reported no title of any kind; paired
+/// with a tiny `file_size` that identifies the zero-message stubs the
+/// picker must hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalSessionTitleSource {
+    Custom,
+    Summary,
+    Prompt,
+    Fallback,
+}
+
+/// One conversation the provider's own CLI created OUTSIDE Codemux,
+/// discovered through the provider's supported session-history API.
+///
+/// Adoption attaches to [`cwd`](Self::cwd) as it already exists — it
+/// never creates a git worktree — so `cwd` is required, not optional:
+/// the provider layer drops any discovered session with no usable
+/// working directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSession {
+    /// Provider-native session id. For Claude this is the SDK session
+    /// UUID that becomes `agent_chat_sessions.sdk_session_id`.
+    pub session_id: String,
+    /// Human-facing title, already resolved by the provider layer.
+    /// Never empty.
+    pub title: String,
+    /// Absolute directory the session ran in.
+    pub cwd: String,
+    /// Git branch recorded at the end of the session, when known.
+    pub git_branch: Option<String>,
+    /// RFC3339 / ISO-8601 timestamp of the last transcript write.
+    pub last_modified: String,
+    /// RFC3339 creation timestamp, when the provider reports one.
+    pub created_at: Option<String>,
+    /// Transcript size in bytes; 0 when the provider does not report it.
+    pub file_size: u64,
+    pub title_source: ExternalSessionTitleSource,
+}
+
+/// What slice of the machine's session history to offer for adoption.
+///
+/// `current_cwd` is always required and does double duty: it is the
+/// provider-side directory filter for the default scope, AND the
+/// reference point that classifies each result as same-repo once the
+/// scope is widened to every project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSessionScope {
+    /// The pane's working directory.
+    pub current_cwd: PathBuf,
+    /// Widen past the current checkout to every project on this machine.
+    /// Opt-in: the picker's default scope is the checkout.
+    #[serde(default)]
+    pub all_projects: bool,
+    /// Include sibling git worktrees of `current_cwd`. Ignored when
+    /// `all_projects` is set.
+    #[serde(default = "default_include_worktrees")]
+    pub include_worktrees: bool,
+    /// Hard cap on rows requested from the provider, BEFORE Codemux's
+    /// own noise filtering trims the list further.
+    #[serde(default = "default_external_session_limit")]
+    pub limit: u32,
+}
+
+fn default_include_worktrees() -> bool {
+    true
+}
+
+fn default_external_session_limit() -> u32 {
+    200
+}
+
+impl ExternalSessionScope {
+    /// Scope anchored at `current_cwd` with the shipped defaults.
+    pub fn for_cwd(current_cwd: PathBuf) -> Self {
+        Self {
+            current_cwd,
+            all_projects: false,
+            include_worktrees: default_include_worktrees(),
+            limit: default_external_session_limit(),
+        }
+    }
+}

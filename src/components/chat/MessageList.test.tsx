@@ -2258,3 +2258,42 @@ describe("MessageList — live marker when the live tail row is not on screen", 
     expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
   });
 });
+
+describe("MessageList adopted-session divider", () => {
+  it("states that the earlier turns stay with the agent", () => {
+    renderList([
+      {
+        kind: "resume_divider",
+        id: "divider-1",
+        seq: 0,
+        source: "external_cli",
+        startedAt: Date.parse("2026-04-24T10:00:00.000Z"),
+        branch: "feature-branch",
+      },
+    ]);
+    expect(screen.getByTestId("resume-divider")).toBeInTheDocument();
+    expect(
+      screen.getByText("Resumed from a session started outside Codemux"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/feature-branch/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/earlier turns stay with the agent/i),
+    ).toBeInTheDocument();
+  });
+
+  it("still explains itself when the provider reported no branch or start time", () => {
+    renderList([
+      {
+        kind: "resume_divider",
+        id: "divider-1",
+        seq: 0,
+        source: "external_cli",
+        startedAt: null,
+        branch: null,
+      },
+    ]);
+    expect(
+      screen.getByText("Earlier turns stay with the agent"),
+    ).toBeInTheDocument();
+  });
+});

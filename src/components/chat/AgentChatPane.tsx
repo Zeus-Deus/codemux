@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
+import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { useAgentChatTurnCheckpoints } from "@/hooks/use-agent-chat-turn-checkpoints";
 import { useAttachSessionHandoff } from "@/hooks/use-attach-session-handoff";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
@@ -142,6 +143,7 @@ import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
+import { AdoptForeignSessionDialog } from "./adopt-foreign-session-dialog";
 import { RevertTurnDialog } from "./revert-turn-dialog";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -213,6 +215,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const clearConversationSearchJump = useConversationSearchStore(
     (state) => state.clearHandled,
   );
+  // `/resume` — adopt a conversation the agent CLI created outside
+  // Codemux. Shares the pane-header's session orchestration so both
+  // entry points stop / hydrate / launch through one implementation.
+  const {
+    handleAdoptExternalSession,
+    foreignProjectPrompt,
+    confirmForeignProjectAdopt,
+    dismissForeignProjectAdopt,
+  } = useAgentChatSessionActions(pane);
   const turnCheckpoints = useAgentChatTurnCheckpoints(threadId);
   const turnCheckpointByNonce = useMemo(() => {
     const byNonce = new Map<string, AgentChatTurnCheckpointRecord>();
@@ -3205,6 +3216,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
       onAttachSession={handleAttachSession}
+      onResumeExternalSession={handleAdoptExternalSession}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
@@ -3329,6 +3341,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           if (!open) setRevertTarget(null);
         }}
         onConfirm={() => void handleConfirmTurnRevert()}
+      />
+      <AdoptForeignSessionDialog
+        prompt={foreignProjectPrompt}
+        onOpenChange={(open) => {
+          if (!open) dismissForeignProjectAdopt();
+        }}
+        onConfirm={() => void confirmForeignProjectAdopt()}
       />
     </div>
   );

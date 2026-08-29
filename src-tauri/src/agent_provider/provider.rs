@@ -12,8 +12,9 @@ use futures_core::Stream;
 use super::errors::ProviderError;
 use super::events::ProviderRuntimeEvent;
 use super::types::{
-    ApprovalDecision, ProviderCapabilities, ProviderKind, ProviderSession, RequestId,
-    SendTurnInput, StartSessionInput, ThreadId, TurnId, TurnStartResult,
+    ApprovalDecision, ExternalSession, ExternalSessionScope, ProviderCapabilities, ProviderKind,
+    ProviderSession, RequestId, SendTurnInput, StartSessionInput, ThreadId, TurnId,
+    TurnStartResult,
 };
 
 /// Boxed, pinned, Send-capable stream of runtime events emitted by a
@@ -123,6 +124,28 @@ pub trait AgentProvider: Send + Sync {
 
     /// Enumerate every currently live session the provider is tracking.
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError>;
+
+    /// Enumerate conversations the provider's own CLI created OUTSIDE
+    /// Codemux, so the user can adopt one into a thread.
+    ///
+    /// Deliberately NOT `list_sessions`: that method reports the live
+    /// in-memory sessions this process is currently driving. This one
+    /// reports durable on-disk history Codemux has never touched.
+    ///
+    /// Discovery must go through the provider's supported
+    /// session-history API. On-disk transcript layouts are documented as
+    /// internal and unstable and must never be parsed directly.
+    /// Implementations resolve a non-empty title and drop entries with
+    /// no usable working directory.
+    ///
+    /// The default returns an empty list so a provider with no discovery
+    /// surface renders an empty picker instead of a failure footer.
+    async fn list_adoptable_sessions(
+        &self,
+        _scope: ExternalSessionScope,
+    ) -> Result<Vec<ExternalSession>, ProviderError> {
+        Ok(Vec::new())
+    }
 
     /// Whether a live session is currently bound to `thread_id`.
     ///

@@ -2096,6 +2096,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
+            commands::agent_chat_list_adoptable_sessions,
+            commands::agent_chat_adopt_external_session,
             commands::agent_chat_list_session_mentions,
             commands::agent_chat_get_session_context,
             commands::agent_chat_search,

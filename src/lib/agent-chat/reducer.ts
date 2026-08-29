@@ -24,6 +24,7 @@ import {
   type ChatViewItem,
   type PermissionRequestItem,
   type ReasoningItem,
+  type ResumeDividerItem,
   type RuntimeNoticeItem,
   type SubagentRunItem,
   type SubagentView,
@@ -1330,6 +1331,30 @@ function applyEventInner(
         event.client_nonce,
         images,
       );
+    }
+
+    case "resume_divider": {
+      // Replay-only: the adopt command writes this row before the
+      // thread has ever run, so it lands during hydrate. Idempotent by
+      // construction — one row per adopted thread — but guarded anyway,
+      // because a cold hydrate followed by a cursor replay of the same
+      // head would otherwise stack two identical markers.
+      if (state.messages.some((m) => m.kind === "resume_divider")) {
+        return state;
+      }
+      const startedAtMs = event.session_started_at
+        ? Date.parse(event.session_started_at)
+        : NaN;
+      const { seq, next } = takeSeq(state);
+      const item: ResumeDividerItem = {
+        kind: "resume_divider",
+        id: nextId("resume-divider"),
+        seq,
+        source: event.source,
+        startedAt: Number.isFinite(startedAtMs) ? startedAtMs : null,
+        branch: event.branch ?? null,
+      };
+      return { ...next, messages: [...next.messages, item] };
     }
 
     case "session_configured": {

@@ -3,6 +3,7 @@ import type * as React from "react";
 import {
   Bug,
   Cpu,
+  History,
   ListTodo,
   MessageCircleQuestion,
   RotateCcw,
@@ -367,6 +368,37 @@ export function buildModelCommand({
     command: "/model",
     icon: Cpu,
     group: "SETTINGS",
+    onSelect: onOpen,
+  };
+}
+
+interface BuildResumeCommandArgs {
+  /** Called when the user picks `/resume`. The composer opens the
+   *  adoptable-session picker — the typed text is stripped, because
+   *  nothing is inserted into the draft (state-only activation, same
+   *  handling as `/model`). */
+  onOpen: () => void;
+}
+
+/**
+ * Build the `/resume` row — a GUI-local built-in that opens the picker
+ * of conversations the agent CLI created outside Codemux (in a
+ * terminal, or on another checkout of the same repo).
+ *
+ * Picking one adopts it into a thread bound to the folder the session
+ * already lives in; it never inserts text and never reaches the
+ * provider as a command.
+ */
+export function buildResumeCommand({
+  onOpen,
+}: BuildResumeCommandArgs): SlashCommandItem {
+  return {
+    id: "composer:resume",
+    label: "Resume",
+    description: "Pick up a conversation started outside Codemux",
+    command: "/resume",
+    icon: History,
+    group: "SESSIONS",
     onSelect: onOpen,
   };
 }

@@ -14,6 +14,7 @@
 //! event bridge land in follow-up commits.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -23,6 +24,10 @@ use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::io::AsyncReadExt;
 
+use crate::agent_provider::claude::external_sessions::EXTERNAL_SESSION_MIN_BYTES;
+use crate::agent_provider::types::{
+    ExternalSession, ExternalSessionScope, ExternalSessionTitleSource,
+};
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
     ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
@@ -31,9 +36,10 @@ use crate::agent_provider::{
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::database::{
-    AgentChatCheckpointRecord, AgentChatSearchResult, AgentChatSessionConfig,
-    AgentChatSessionMention, AgentChatSessionRecord, AgentChatTurnCheckpointRecord,
-    AgentChatVisibleMessage, DatabaseStore,
+    AdoptedAgentChatSession, AgentChatCheckpointRecord, AgentChatSearchResult,
+    AgentChatSessionConfig, AgentChatSessionMention, AgentChatSessionRecord,
+    AgentChatTurnCheckpointRecord, AgentChatVisibleMessage, DatabaseStore,
+    AGENT_CHAT_ORIGIN_EXTERNAL_CLI,
 };
 use crate::observability::ObservabilityStore;
 use crate::state::{AppStateStore, PaneNodeSnapshot, PaneStatus};
@@ -3523,6 +3529,540 @@ pub async fn agent_chat_list_sessions(
     Ok(db.list_agent_chat_sessions(&workspace_id, cwd.as_deref(), limit))
 }
 
+// ── Adopting sessions created outside Codemux ───────────────────────
+
+/// One discovered external session decorated with the Codemux-side
+/// facts the picker needs to choose between "adopt", "switch to the
+/// thread that already has it", and "this belongs to another project".
+///
+/// Flattened so the frontend sees a single flat object rather than a
+/// nested `session` key.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptableSession {
+    #[serde(flatten)]
+    pub session: ExternalSession,
+    /// Set when an `agent_chat_sessions` row already carries this
+    /// `sdk_session_id`. The picker then offers switching to that thread
+    /// and never a second adoption.
+    ///
+    /// Deliberately a decoration and not a drop: the user is still
+    /// looking for that conversation by name, they just must not end up
+    /// with two copies of it.
+    pub existing_thread_id: Option<String>,
+    /// True when the session's cwd resolves to the same canonical git
+    /// root as the scope's `current_cwd`. False means an unrelated
+    /// project — surface that as an explicit separate action, never
+    /// silently re-point the pane at it.
+    pub same_repo: bool,
+}
+
+/// Outcome of adopting an external session into a Codemux thread.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptExternalSessionResult {
+    /// The thread the conversation now lives in. When
+    /// `existing_thread_id` is set this IS that thread and nothing was
+    /// inserted.
+    pub thread_id: ThreadId,
+    pub workspace_id: String,
+    /// The pane the adopted thread must be started in, which is NOT always
+    /// the pane adoption was requested from: a thread's directory and its
+    /// pane's directory may never diverge (the history dropdown, the pane
+    /// header and `@file` completion all resolve against the pane's cwd),
+    /// so when the conversation lives in another folder of this repo the
+    /// backend opens a chat pane rooted THERE and returns it here.
+    pub pane_id: String,
+    /// The session's own directory. Adoption attaches here; no worktree
+    /// is ever created. Always the cwd `pane_id` is rooted at.
+    pub cwd: String,
+    pub title: String,
+    pub sdk_session_id: String,
+    /// Set when the session was already in Codemux — the caller switches
+    /// to that thread instead of adopting again.
+    pub existing_thread_id: Option<String>,
+    /// True when `cwd` is outside the pane workspace's own repo. The UI
+    /// must confirm explicitly before re-pointing anything.
+    pub foreign_project: bool,
+    /// Whether the "resumed from the terminal" divider was persisted.
+    /// False means the thread would open blank — say so rather than
+    /// showing a success toast over an empty transcript.
+    ///
+    /// Always false on the `existing_thread_id` path: nothing was written
+    /// this call, and that thread already carries the divider written
+    /// when it was first adopted.
+    pub resume_divider_written: bool,
+}
+
+/// Payload `type` of the marker that opens an adopted transcript.
+///
+/// Chosen so it matches neither `user_message` nor `item_completed` —
+/// the two shapes the full-text-search triggers index — which keeps the
+/// divider out of search results.
+const RESUME_DIVIDER_TYPE: &str = "resume_divider";
+
+/// Whether a discovered session is worth putting in front of the user.
+///
+/// Lives in the command layer rather than the adapter or the sidecar so
+/// it is unit-testable without spawning anything. Three drops:
+///
+/// 1. cwd under the platform temp directory — throwaway fixture runs
+///    rather than work anyone wants back. `std::env::temp_dir()` is
+///    passed in rather than hardcoding a POSIX path so the rule also
+///    holds on Windows.
+/// 2. cwd the filesystem DEFINITIVELY reports as absent. Asymmetric on
+///    purpose: only a confirmed `NotFound` drops the row, because
+///    thinning the list on a transient IO error is indistinguishable
+///    from "you have no sessions".
+/// 3. a titleless transcript too small to hold a turn — a conversation
+///    abandoned before it started.
+fn is_offerable_session(session: &ExternalSession, temp_dir: &Path) -> bool {
+    let cwd = Path::new(&session.cwd);
+    if cwd.starts_with(temp_dir) {
+        return false;
+    }
+    if matches!(
+        std::fs::symlink_metadata(cwd),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return false;
+    }
+    if session.title_source == ExternalSessionTitleSource::Fallback
+        && session.file_size < EXTERNAL_SESSION_MIN_BYTES
+    {
+        return false;
+    }
+    true
+}
+
+/// Canonical git roots resolved once per directory.
+///
+/// [`crate::git::git_canonical_root`] shells out to `git`, and a long
+/// history collapses to a handful of distinct directories, so memoizing
+/// turns a per-session subprocess into a per-folder one.
+#[derive(Default)]
+struct RepoRootCache {
+    roots: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl RepoRootCache {
+    fn root_of(&mut self, dir: &Path) -> Option<PathBuf> {
+        if let Some(hit) = self.roots.get(dir) {
+            return hit.clone();
+        }
+        let resolved = crate::git::git_canonical_root(dir).map(|repo| repo.canonical_root_path());
+        self.roots.insert(dir.to_path_buf(), resolved.clone());
+        resolved
+    }
+}
+
+/// Whether two directories belong to the same checkout.
+///
+/// Compares canonical git roots, which deliberately treats a main
+/// checkout and its linked worktrees as one unit — exactly the set
+/// discovery returns when worktrees are included. When either side is
+/// not a git repository there is no root to compare, so it falls back to
+/// exact path equality.
+///
+/// Takes already-resolved roots so the decision is pure and the
+/// subprocess stays at the call site.
+fn same_repo(
+    reference_cwd: &Path,
+    reference_root: Option<&Path>,
+    session_cwd: &Path,
+    session_root: Option<&Path>,
+) -> bool {
+    match (reference_root, session_root) {
+        (Some(reference), Some(session)) => reference == session,
+        _ => reference_cwd == session_cwd,
+    }
+}
+
+/// Attach the Codemux-side facts to a page of discovered sessions.
+///
+/// Pure given `repo_root_of`, so the dedupe marking and the same-repo
+/// classification are testable without a git checkout or a database.
+fn decorate_adoptable_sessions(
+    sessions: Vec<ExternalSession>,
+    existing_threads: &HashMap<String, String>,
+    reference_cwd: &Path,
+    mut repo_root_of: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Vec<AdoptableSession> {
+    let reference_root = repo_root_of(reference_cwd);
+    sessions
+        .into_iter()
+        .map(|session| {
+            let session_cwd = PathBuf::from(&session.cwd);
+            let session_root = repo_root_of(&session_cwd);
+            AdoptableSession {
+                existing_thread_id: existing_threads.get(&session.session_id).cloned(),
+                same_repo: same_repo(
+                    reference_cwd,
+                    reference_root.as_deref(),
+                    &session_cwd,
+                    session_root.as_deref(),
+                ),
+                session,
+            }
+        })
+        .collect()
+}
+
+/// List conversations the provider's own CLI created outside Codemux
+/// that can be adopted into a thread.
+///
+/// Not gated on the feature flag, and a provider with no discovery
+/// surface (or one that was never registered) resolves to an empty list
+/// rather than a raw `provider_not_configured` string — the picker
+/// should render empty, not fail. A provider that IS present and then
+/// errors still propagates, so a broken sidecar is visible instead of
+/// looking like an empty history.
+#[tauri::command]
+pub async fn agent_chat_list_adoptable_sessions(
+    db: State<'_, DatabaseStore>,
+    registry: State<'_, ProviderRegistry>,
+    provider: ProviderKind,
+    scope: ExternalSessionScope,
+) -> Result<Vec<AdoptableSession>, String> {
+    let Some(impl_) = registry.get(provider).await else {
+        return Ok(Vec::new());
+    };
+    let reference_cwd = scope.current_cwd.clone();
+    let discovered = impl_
+        .list_adoptable_sessions(scope)
+        .await
+        .map_err(|error| format!("list_adoptable_sessions failed: {error:?}"))?;
+
+    let temp_dir = std::env::temp_dir();
+    let offerable: Vec<ExternalSession> = discovered
+        .into_iter()
+        .filter(|session| is_offerable_session(session, &temp_dir))
+        .collect();
+
+    // One query for the whole page instead of a lookup per row.
+    let ids: Vec<String> = offerable
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
+    let existing_threads = db.find_agent_chat_threads_by_sdk_session_ids(&ids);
+
+    // Classification shells out to `git`, so it runs off the async
+    // runtime even though memoization keeps the call count to one per
+    // distinct directory.
+    tokio::task::spawn_blocking(move || {
+        let mut cache = RepoRootCache::default();
+        decorate_adoptable_sessions(offerable, &existing_threads, &reference_cwd, |dir| {
+            cache.root_of(dir)
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to classify adoptable sessions: {error}"))
+}
+
+/// The idempotent answer for a session Codemux already has: point the
+/// caller at the thread that owns it instead of minting a second one.
+///
+/// The existing row wins for workspace/cwd/title — it is what the rest
+/// of the app already renders — with the discovered session only filling
+/// in columns a legacy row may have left NULL. `pane_id` is resolved by
+/// the caller: the pane already bound to that thread when one exists,
+/// otherwise the pane the request came from.
+fn already_adopted_result(
+    existing: AgentChatSessionRecord,
+    session: &ExternalSession,
+    foreign_project: bool,
+    pane_id: String,
+) -> AdoptExternalSessionResult {
+    AdoptExternalSessionResult {
+        thread_id: ThreadId(existing.thread_id.clone()),
+        workspace_id: existing.workspace_id,
+        pane_id,
+        cwd: existing.cwd.unwrap_or_else(|| session.cwd.clone()),
+        title: existing.title.unwrap_or_else(|| session.title.clone()),
+        sdk_session_id: session.session_id.clone(),
+        existing_thread_id: Some(existing.thread_id),
+        foreign_project,
+        resume_divider_written: false,
+    }
+}
+
+/// The `cwd` recorded on an agent-chat pane. The outer `Option`
+/// distinguishes "no such chat pane" from "pane found, no cwd of its own",
+/// which falls back to the workspace directory the same way the pane header
+/// does.
+fn agent_chat_pane_cwd(root: &PaneNodeSnapshot, target: &str) -> Option<Option<String>> {
+    match root {
+        PaneNodeSnapshot::AgentChat { pane_id, cwd, .. } if pane_id.0 == target => Some(cwd.clone()),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| agent_chat_pane_cwd(child, target)),
+        _ => None,
+    }
+}
+
+/// Whether two directories are the same place. Plain equality first (the
+/// common case, and the only one available for a path that no longer
+/// exists), then canonicalisation so a symlinked or trailing-slash spelling
+/// of one directory does not read as two.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// `(workspace_id, tab_id)` of the surface holding `pane_id`. Pane
+/// activation selects the workspace/surface while tab activation is a
+/// separate state field, so both are resolved from ONE immutable snapshot
+/// before either is written.
+fn pane_location(
+    snapshot: &crate::state::AppStateSnapshot,
+    pane_id: &str,
+) -> Option<(String, Option<String>)> {
+    snapshot.workspaces.iter().find_map(|workspace| {
+        workspace.surfaces.iter().find_map(|surface| {
+            if !pane_tree_contains_id(&surface.root, pane_id) {
+                return None;
+            }
+            let tab_id = workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.surface_id.as_ref() == Some(&surface.surface_id))
+                .map(|tab| tab.tab_id.clone());
+            Some((workspace.workspace_id.0.clone(), tab_id))
+        })
+    })
+}
+
+/// Adopt an externally-created session into a Codemux thread.
+///
+/// Mints a fresh `thread_id`, resolves the owning workspace from the
+/// PANE BINDING (never from the session's cwd and never from an
+/// IPC-supplied value), and writes ONE `agent_chat_sessions` row bound to
+/// the session's own directory with `origin = 'external_cli'` and the
+/// session's real timestamps. It never creates a git worktree: adoption
+/// attaches to the folder the conversation already lives in, which is
+/// exactly why that folder may sit outside the workspace root — the
+/// `foreign_project` flag reports when it does.
+///
+/// Attaching in place means the thread's directory can differ from the
+/// requesting pane's — the picker offers every session in the repo, and a
+/// sibling worktree is still the same repo. A thread and the pane it runs
+/// in must never disagree about their directory: the history dropdown
+/// queries `list_agent_chat_sessions(workspace_id, pane_cwd)` on an exact
+/// `cwd` match, so a divergent thread disappears from the very pane that
+/// adopted it, while the header and `@file` completion describe one folder
+/// and the agent edits another. This command therefore RE-HOMES the
+/// conversation when the directories differ: it opens a chat pane rooted at
+/// the session's own folder and returns it as `pane_id`. Callers must start
+/// the session in the RETURNED pane, not the one they asked with.
+///
+/// It does NOT start a provider session and does NOT restore the
+/// external session's permission mode; Codemux's current mode wins and
+/// the row's `permission_mode` is left NULL for the normal start path to
+/// heal. The caller follows up with `agent_chat_start_session`, which
+/// recovers the persisted `sdk_session_id` as the resume cursor when the
+/// frontend passes `resume_cursor: null`.
+#[tauri::command]
+pub async fn agent_chat_adopt_external_session<R: Runtime>(
+    app: AppHandle<R>,
+    pane_id: String,
+    provider: ProviderKind,
+    session: ExternalSession,
+) -> Result<AdoptExternalSessionResult, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+
+    // Workspace comes from the pane binding, like every other
+    // session-minting path. `agent_chat_sessions.workspace_id` is NOT
+    // NULL and `list_agent_chat_sessions` filters on it, so an orphaned
+    // pane must fail loudly rather than produce an invisible row.
+    let state: State<'_, AppStateStore> = app.state();
+    let workspace_id = state
+        .workspace_id_for_pane(&pane_id)
+        .ok_or_else(|| format!("pane_not_in_workspace: {pane_id}"))?;
+    // One snapshot for both directory questions below, so the pane root and
+    // the workspace root cannot come from two different states.
+    let snapshot = state.snapshot();
+    let workspace_cwd = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        .map(|workspace| PathBuf::from(&workspace.cwd));
+    // What the pane is rooted at, resolved exactly the way the frontend
+    // resolves it: the pane's own cwd, else the workspace's.
+    let pane_cwd = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.surfaces.iter())
+        .find_map(|surface| agent_chat_pane_cwd(&surface.root, &pane_id))
+        .flatten()
+        .map(PathBuf::from)
+        .or_else(|| workspace_cwd.clone());
+    drop(snapshot);
+
+    let session_cwd = PathBuf::from(&session.cwd);
+    let foreign_project = match workspace_cwd.as_deref() {
+        Some(workspace_cwd) => {
+            let mut cache = RepoRootCache::default();
+            let workspace_root = cache.root_of(workspace_cwd);
+            let session_root = cache.root_of(&session_cwd);
+            !same_repo(
+                workspace_cwd,
+                workspace_root.as_deref(),
+                &session_cwd,
+                session_root.as_deref(),
+            )
+        }
+        // No directory to compare against: assume foreign so the UI still
+        // confirms before re-pointing anything.
+        None => true,
+    };
+
+    let db: State<'_, DatabaseStore> = app.state();
+    if let Some(existing) = db.get_agent_chat_session_by_sdk_session_id(&session.session_id) {
+        // Nothing is written on this path, so the directory invariant is
+        // whatever the owning thread already established: hand back the pane
+        // that thread lives in when it still has one.
+        let owning_pane = state
+            .agent_chat_pane_id_for_thread(&existing.thread_id)
+            .unwrap_or_else(|| pane_id.clone());
+        return Ok(already_adopted_result(
+            existing,
+            &session,
+            foreign_project,
+            owning_pane,
+        ));
+    }
+
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    let provider_name = match provider {
+        ProviderKind::Claude => "claude",
+        ProviderKind::Codex => "codex",
+        ProviderKind::Cursor => "cursor",
+        ProviderKind::OpenCode => "opencode",
+    };
+    let adopted = AdoptedAgentChatSession {
+        thread_id: thread_id.clone(),
+        sdk_session_id: session.session_id.clone(),
+        workspace_id: workspace_id.clone(),
+        // R1: the session's own directory, verbatim.
+        cwd: session.cwd.clone(),
+        provider: provider_name.to_string(),
+        title: session.title.clone(),
+        origin: AGENT_CHAT_ORIGIN_EXTERNAL_CLI.to_string(),
+        // Real timestamps: a week-old conversation must not sort as if it
+        // started just now.
+        created_at: session
+            .created_at
+            .clone()
+            .unwrap_or_else(|| session.last_modified.clone()),
+        last_active_at: session.last_modified.clone(),
+    };
+    if let Err(error) = db.insert_adopted_agent_chat_session(&adopted) {
+        // The check above is the friendly path; the partial unique index
+        // is the real guard, because two panes can open the picker at
+        // once. Re-read rather than string-matching the driver's error:
+        // if the id now belongs to a thread, that thread is the answer,
+        // and if it does not, the failure was something else and the
+        // caller deserves to see it.
+        if let Some(existing) = db.get_agent_chat_session_by_sdk_session_id(&session.session_id) {
+            let owning_pane = state
+                .agent_chat_pane_id_for_thread(&existing.thread_id)
+                .unwrap_or_else(|| pane_id.clone());
+            return Ok(already_adopted_result(
+                existing,
+                &session,
+                foreign_project,
+                owning_pane,
+            ));
+        }
+        return Err(error);
+    }
+
+    // R7: an adopted thread opens on an explicit marker, never on a
+    // blank transcript behind a success toast. There is no history
+    // backfill in this build, so this divider IS the visible transcript
+    // until the first new turn.
+    let divider = serde_json::json!({
+        "type": RESUME_DIVIDER_TYPE,
+        "source": AGENT_CHAT_ORIGIN_EXTERNAL_CLI,
+        "session_started_at": session.created_at,
+        "branch": session.git_branch,
+    });
+    let resume_divider_written = match db.insert_agent_chat_resume_divider(&thread_id, &divider) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!(
+                "[codemux::agent_chat] adopted thread {thread_id} has no resume divider: {error}"
+            );
+            false
+        }
+    };
+
+    // Keep the thread and the pane it runs in on ONE directory. When the
+    // requesting pane is already rooted at the session's folder it just takes
+    // the conversation over; otherwise the conversation gets its own tab,
+    // rooted where it lives and already bound to the new thread, so the pane
+    // header, the history dropdown, `@file` completion and the agent all
+    // describe the same place. Best-effort like the divider above: the row is
+    // already committed, so a pane that cannot be opened is reported and the
+    // caller falls back to the pane it asked with rather than losing the
+    // adoption outright.
+    let pane_is_rooted_at_session = pane_cwd
+        .as_deref()
+        .is_some_and(|pane_cwd| same_directory(&session_cwd, pane_cwd));
+    let target_pane_id = if pane_is_rooted_at_session {
+        pane_id
+    } else {
+        match state.create_agent_chat_pane(
+            &workspace_id,
+            Some(provider),
+            Some(session.cwd.clone()),
+            Some(crate::presets::LaunchMode::NewTab),
+        ) {
+            Ok(rehomed) => {
+                state.set_agent_chat_binding(&rehomed.0, provider, thread_id.clone());
+                let snapshot = state.snapshot();
+                if let Some((owner, tab_id)) = pane_location(&snapshot, &rehomed.0) {
+                    if let Some(tab_id) = tab_id {
+                        if let Err(error) = state.activate_tab(&owner, &tab_id) {
+                            eprintln!(
+                                "[codemux::agent_chat] adopted pane {} could not be focused: {error}",
+                                rehomed.0
+                            );
+                        }
+                    }
+                    state.activate_pane(&rehomed.0);
+                }
+                crate::state::emit_app_state(&app);
+                rehomed.0
+            }
+            Err(error) => {
+                eprintln!(
+                    "[codemux::agent_chat] adopted thread {thread_id} stays on pane {pane_id}, \
+                     whose directory is not {}: {error}",
+                    session.cwd
+                );
+                pane_id
+            }
+        }
+    };
+
+    Ok(AdoptExternalSessionResult {
+        thread_id: ThreadId(thread_id),
+        workspace_id,
+        pane_id: target_pane_id,
+        cwd: session.cwd,
+        title: session.title,
+        sdk_session_id: session.session_id,
+        existing_thread_id: None,
+        foreign_project,
+        resume_divider_written,
+    })
+}
+
 /// Compact session record returned to the composer's `@session:` picker.
 /// The database query is provider-neutral, so every future GUI provider that
 /// persists the standard agent-chat session/message records participates
@@ -4074,24 +4614,10 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         pane_id.0
     };
 
-    // Pane activation selects the workspace/surface, while tab activation is
-    // a separate state field. Resolve both from one immutable snapshot and
-    // then update them before emitting the final state once.
+    // Resolve the tab and the workspace from one immutable snapshot, then
+    // update both before emitting the final state once.
     let snapshot = state.snapshot();
-    let location = snapshot.workspaces.iter().find_map(|workspace| {
-        workspace.surfaces.iter().find_map(|surface| {
-            if !pane_tree_contains_id(&surface.root, &pane_id) {
-                return None;
-            }
-            let tab_id = workspace
-                .tabs
-                .iter()
-                .find(|tab| tab.surface_id.as_ref() == Some(&surface.surface_id))
-                .map(|tab| tab.tab_id.clone());
-            Some((workspace.workspace_id.0.clone(), tab_id))
-        })
-    });
-    let Some((workspace_id, tab_id)) = location else {
+    let Some((workspace_id, tab_id)) = pane_location(&snapshot, &pane_id) else {
         return Err(format!("conversation_pane_not_found: {pane_id}"));
     };
     if let Some(tab_id) = tab_id {
@@ -9373,5 +9899,344 @@ mod tests {
             resume_cursor: json!({"resume": "uuid"}),
         };
         assert!(!should_persist_event(&e));
+    }
+
+    // ── Adoption of sessions created outside Codemux ─────────────────
+
+    fn external_session(session_id: &str, cwd: &str) -> ExternalSession {
+        ExternalSession {
+            session_id: session_id.to_string(),
+            title: "Fix the resume cursor".to_string(),
+            cwd: cwd.to_string(),
+            git_branch: Some("main".to_string()),
+            last_modified: "2026-08-28T10:11:12.000Z".to_string(),
+            created_at: Some("2026-08-27T09:00:00.000Z".to_string()),
+            file_size: 48_000,
+            title_source: ExternalSessionTitleSource::Summary,
+        }
+    }
+
+    /// A path guaranteed absent that is NOT under the temp dir, so the
+    /// dead-cwd rule can be exercised on its own.
+    fn missing_dir() -> PathBuf {
+        PathBuf::from("/codemux-nonexistent-project-4f1c9a")
+    }
+
+    #[test]
+    fn offerable_filter_keeps_a_real_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = external_session("s-1", &dir.path().to_string_lossy());
+        // The fixture lives under the temp dir, so judge it against a
+        // temp root it is not inside of.
+        assert!(is_offerable_session(&session, &missing_dir()));
+    }
+
+    #[test]
+    fn offerable_filter_drops_sessions_under_the_temp_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = external_session("s-1", &dir.path().to_string_lossy());
+        assert!(!is_offerable_session(&session, dir.path()));
+    }
+
+    #[test]
+    fn offerable_filter_drops_a_cwd_that_is_gone() {
+        let session = external_session("s-1", &missing_dir().to_string_lossy());
+        assert!(!is_offerable_session(
+            &session,
+            &PathBuf::from("/nowhere-temp")
+        ));
+    }
+
+    #[test]
+    fn offerable_filter_drops_titleless_stubs_but_keeps_titled_small_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let temp_root = missing_dir();
+
+        let mut stub = external_session("s-1", &dir.path().to_string_lossy());
+        stub.title_source = ExternalSessionTitleSource::Fallback;
+        stub.file_size = EXTERNAL_SESSION_MIN_BYTES - 1;
+        assert!(!is_offerable_session(&stub, &temp_root));
+
+        // A real title means the conversation happened, however small the
+        // transcript is.
+        let mut tiny_but_titled = stub.clone();
+        tiny_but_titled.title_source = ExternalSessionTitleSource::Custom;
+        assert!(is_offerable_session(&tiny_but_titled, &temp_root));
+
+        // And a titleless transcript big enough to hold a turn stays.
+        let mut big_untitled = stub.clone();
+        big_untitled.file_size = EXTERNAL_SESSION_MIN_BYTES;
+        assert!(is_offerable_session(&big_untitled, &temp_root));
+    }
+
+    #[test]
+    fn same_repo_compares_canonical_roots_across_worktrees() {
+        let main = PathBuf::from("/repos/codemux");
+        let worktree = PathBuf::from("/worktrees/codemux/feature");
+        let root = PathBuf::from("/repos/codemux");
+        assert!(same_repo(&main, Some(&root), &worktree, Some(&root)));
+
+        let other_root = PathBuf::from("/repos/other");
+        assert!(!same_repo(
+            &main,
+            Some(&root),
+            &PathBuf::from("/repos/other"),
+            Some(&other_root)
+        ));
+    }
+
+    #[test]
+    fn same_repo_falls_back_to_path_equality_outside_git() {
+        let plain = PathBuf::from("/notes");
+        assert!(same_repo(&plain, None, &plain, None));
+        assert!(!same_repo(
+            &plain,
+            None,
+            &PathBuf::from("/other-notes"),
+            None
+        ));
+        // A git cwd and a non-git cwd have no comparable root, so only an
+        // identical path counts as the same place.
+        assert!(!same_repo(
+            &plain,
+            Some(&PathBuf::from("/notes")),
+            &PathBuf::from("/other-notes"),
+            None
+        ));
+    }
+
+    #[test]
+    fn decoration_marks_sessions_already_in_codemux_without_dropping_them() {
+        let reference = PathBuf::from("/repos/codemux");
+        let sessions = vec![
+            external_session("already-here", "/repos/codemux"),
+            external_session("brand-new", "/repos/codemux"),
+        ];
+        let mut existing = HashMap::new();
+        existing.insert("already-here".to_string(), "thread-7".to_string());
+
+        let decorated = decorate_adoptable_sessions(sessions, &existing, &reference, |dir| {
+            Some(PathBuf::from(dir))
+        });
+
+        assert_eq!(decorated.len(), 2, "a known session is marked, not hidden");
+        assert_eq!(decorated[0].existing_thread_id.as_deref(), Some("thread-7"));
+        assert_eq!(decorated[0].session.session_id, "already-here");
+        assert_eq!(decorated[1].existing_thread_id, None);
+    }
+
+    #[test]
+    fn decoration_flags_sessions_from_an_unrelated_project() {
+        let reference = PathBuf::from("/worktrees/codemux/feature");
+        let sessions = vec![
+            external_session("sibling-worktree", "/worktrees/codemux/other"),
+            external_session("elsewhere", "/repos/unrelated"),
+        ];
+        // Both codemux worktrees canonicalize to the same main checkout.
+        let decorated = decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
+            if dir.starts_with("/worktrees/codemux") {
+                Some(PathBuf::from("/repos/codemux"))
+            } else {
+                Some(PathBuf::from(dir))
+            }
+        });
+
+        assert!(decorated[0].same_repo, "a linked worktree is the same repo");
+        assert!(!decorated[1].same_repo);
+    }
+
+    #[test]
+    fn decoration_resolves_each_directory_once() {
+        let reference = PathBuf::from("/repos/codemux");
+        let sessions = vec![
+            external_session("a", "/repos/codemux"),
+            external_session("b", "/repos/codemux"),
+            external_session("c", "/repos/other"),
+        ];
+        let mut cache = RepoRootCache::default();
+        let mut resolved: Vec<PathBuf> = Vec::new();
+        decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
+            if !cache.roots.contains_key(dir) {
+                resolved.push(dir.to_path_buf());
+            }
+            // Stand in for `git_canonical_root` so the test stays offline.
+            cache
+                .roots
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| Some(dir.to_path_buf()))
+                .clone()
+        });
+
+        assert_eq!(
+            resolved,
+            vec![
+                PathBuf::from("/repos/codemux"),
+                PathBuf::from("/repos/other")
+            ],
+            "three sessions in two folders cost two lookups"
+        );
+    }
+
+    #[test]
+    fn adopting_a_known_session_resolves_to_the_existing_thread() {
+        let session = external_session("sdk-abc", "/repos/codemux");
+        let existing = AgentChatSessionRecord {
+            thread_id: "thread-existing".to_string(),
+            sdk_session_id: Some("sdk-abc".to_string()),
+            workspace_id: "ws-1".to_string(),
+            cwd: Some("/repos/codemux".to_string()),
+            provider: "claude".to_string(),
+            title: Some("Adopted last week".to_string()),
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+            last_active_at: "2026-08-21T00:00:00Z".to_string(),
+            model: None,
+            effort: None,
+            context_window: None,
+            permission_mode: None,
+            fast_mode: false,
+            origin: crate::database::AGENT_CHAT_ORIGIN_EXTERNAL_CLI.to_string(),
+        };
+
+        let result = already_adopted_result(existing, &session, false, "pane-7".to_string());
+
+        assert_eq!(result.thread_id.0, "thread-existing");
+        // The caller resolved the pane that already owns the thread.
+        assert_eq!(result.pane_id, "pane-7");
+        assert_eq!(
+            result.existing_thread_id.as_deref(),
+            Some("thread-existing")
+        );
+        assert_eq!(result.workspace_id, "ws-1");
+        // The row Codemux already renders wins over the discovered copy.
+        assert_eq!(result.title, "Adopted last week");
+        assert_eq!(result.sdk_session_id, "sdk-abc");
+        // Nothing was written this call; the divider landed at first adoption.
+        assert!(!result.resume_divider_written);
+    }
+
+    #[test]
+    fn adopting_a_known_session_falls_back_to_discovered_metadata() {
+        let session = external_session("sdk-abc", "/repos/codemux");
+        let existing = AgentChatSessionRecord {
+            thread_id: "thread-legacy".to_string(),
+            sdk_session_id: Some("sdk-abc".to_string()),
+            workspace_id: "ws-1".to_string(),
+            cwd: None,
+            provider: "claude".to_string(),
+            title: None,
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+            last_active_at: "2026-08-21T00:00:00Z".to_string(),
+            model: None,
+            effort: None,
+            context_window: None,
+            permission_mode: None,
+            fast_mode: false,
+            origin: crate::database::AGENT_CHAT_ORIGIN_CODEMUX.to_string(),
+        };
+
+        let result = already_adopted_result(existing, &session, true, "pane-7".to_string());
+
+        assert_eq!(result.cwd, "/repos/codemux");
+        assert_eq!(result.title, "Fix the resume cursor");
+        assert!(result.foreign_project);
+    }
+
+    #[test]
+    fn adopt_result_tells_the_caller_which_pane_to_start_in() {
+        // The field exists so the frontend cannot silently start the thread in
+        // a pane rooted somewhere else.
+        let value = serde_json::to_value(AdoptExternalSessionResult {
+            thread_id: ThreadId("thread-1".into()),
+            workspace_id: "ws-1".into(),
+            pane_id: "pane-rehomed".into(),
+            cwd: "/repos/codemux/wt-feature".into(),
+            title: "Fix the resume cursor".into(),
+            sdk_session_id: "sdk-abc".into(),
+            existing_thread_id: None,
+            foreign_project: false,
+            resume_divider_written: true,
+        })
+        .unwrap();
+        assert_eq!(value["pane_id"], json!("pane-rehomed"));
+        assert_eq!(value["cwd"], json!("/repos/codemux/wt-feature"));
+    }
+
+    #[test]
+    fn a_chat_panes_directory_is_its_own_cwd_when_it_has_one() {
+        use crate::state::{PaneId, SplitDirection};
+        let tree = PaneNodeSnapshot::Split {
+            pane_id: PaneId("split-1".into()),
+            direction: SplitDirection::Horizontal,
+            child_sizes: vec![0.5, 0.5],
+            children: vec![
+                PaneNodeSnapshot::AgentChat {
+                    pane_id: PaneId("pane-rooted".into()),
+                    title: "Agent Chat".into(),
+                    thread_id: None,
+                    provider: None,
+                    cwd: Some("/repos/codemux/wt-feature".into()),
+                },
+                PaneNodeSnapshot::AgentChat {
+                    pane_id: PaneId("pane-inherits".into()),
+                    title: "Agent Chat".into(),
+                    thread_id: None,
+                    provider: None,
+                    cwd: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            agent_chat_pane_cwd(&tree, "pane-rooted"),
+            Some(Some("/repos/codemux/wt-feature".to_string()))
+        );
+        // Found, but rooted at the workspace — the caller supplies that.
+        assert_eq!(agent_chat_pane_cwd(&tree, "pane-inherits"), Some(None));
+        // Not a chat pane in this tree at all.
+        assert_eq!(agent_chat_pane_cwd(&tree, "pane-elsewhere"), None);
+    }
+
+    #[test]
+    fn a_sibling_worktree_is_not_the_same_directory() {
+        assert!(same_directory(
+            Path::new("/repos/codemux"),
+            Path::new("/repos/codemux")
+        ));
+        // Same repo, different checkout: adopting here must re-home the pane.
+        assert!(!same_directory(
+            Path::new("/repos/codemux"),
+            Path::new("/repos/codemux-wt-feature")
+        ));
+        // A path that does not exist cannot be canonicalised; equality is the
+        // only honest answer left, and it must not claim a match.
+        assert!(!same_directory(
+            Path::new("/repos/codemux/"),
+            Path::new("/repos/codemux/sub")
+        ));
+    }
+
+    #[test]
+    fn adoptable_session_serializes_flat_and_snake_case() {
+        let decorated = AdoptableSession {
+            session: external_session("sdk-abc", "/repos/codemux"),
+            existing_thread_id: None,
+            same_repo: true,
+        };
+        let value = serde_json::to_value(&decorated).unwrap();
+
+        // Flattened: no nested `session` key for the frontend to unwrap.
+        assert!(value.get("session").is_none());
+        assert_eq!(value["session_id"], json!("sdk-abc"));
+        assert_eq!(value["title_source"], json!("summary"));
+        assert_eq!(value["existing_thread_id"], json!(null));
+        assert_eq!(value["same_repo"], json!(true));
+    }
+
+    #[test]
+    fn resume_divider_payload_stays_out_of_full_text_search() {
+        // The search triggers index only `user_message` and
+        // `item_completed`; the divider must match neither.
+        assert_ne!(RESUME_DIVIDER_TYPE, "user_message");
+        assert_ne!(RESUME_DIVIDER_TYPE, "item_completed");
     }
 }

@@ -21,6 +21,7 @@ import {
 import type { ApprovalDecision } from "../permissions.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
+import { listSessions, type ListSessionsInput } from "./list-sessions.ts";
 import { ping } from "./ping.ts";
 
 /** The live sessions this process is managing, keyed by `threadId`. */
@@ -65,6 +66,14 @@ function optBoolean(v: unknown, field: string): boolean | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "boolean") {
     throw new InvalidParamsError(`${field} must be a boolean when present`);
+  }
+  return v;
+}
+
+function optNumber(v: unknown, field: string): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new InvalidParamsError(`${field} must be a number when present`);
   }
   return v;
 }
@@ -378,6 +387,18 @@ const listCommandsMethod: MethodHandler = async (params) => {
   });
 };
 
+const listSessionsMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "list-sessions");
+  const input: ListSessionsInput = {
+    includeWorktrees:
+      optBoolean(p["includeWorktrees"], "includeWorktrees") ?? true,
+    limit: optNumber(p["limit"], "limit") ?? 200,
+  };
+  const dir = optString(p["dir"], "dir");
+  if (dir !== undefined) input.dir = dir;
+  return listSessions(input);
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -402,6 +423,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "probe-authenticated": probeAuthenticatedMethod,
     "list-models": listModelsMethod,
     "list-commands": listCommandsMethod,
+    "list-sessions": listSessionsMethod,
   };
 }
 

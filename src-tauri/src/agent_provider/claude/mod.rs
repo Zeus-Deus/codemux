@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod capabilities;
+pub mod external_sessions;
 pub mod protocol;
 pub mod slash_commands;
 pub(crate) mod session;
@@ -33,6 +34,7 @@ use crate::agent_provider::{
     ProviderEventStream, ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId,
     SendTurnInput, SessionStatus, StartSessionInput, ThreadId, TurnId, TurnStartResult,
 };
+use crate::agent_provider::types::{ExternalSession, ExternalSessionScope};
 
 use self::session::{ClaudeSession, ClaudeSpawnConfig};
 
@@ -395,6 +397,17 @@ impl AgentProvider for ClaudeAgentProvider {
             });
         }
         Ok(out)
+    }
+
+    async fn list_adoptable_sessions(
+        &self,
+        scope: ExternalSessionScope,
+    ) -> Result<Vec<ExternalSession>, ProviderError> {
+        // Durable history, not the live map above: a transient sidecar
+        // reads it through the SDK's session-history API. Uses the
+        // already-resolved sidecar path and needs no `claude` binary —
+        // the probe is a metadata read, not a `query()` handshake.
+        external_sessions::list_adoptable_sessions(&self.sidecar_binary, &scope).await
     }
 
     fn event_stream(&self) -> ProviderEventStream {

@@ -365,6 +365,27 @@ export interface RuntimeNoticeItem {
   severity?: "warning" | "error";
 }
 
+/**
+ * "Resumed from a session started outside Codemux" marker — the first
+ * row of an adopted thread.
+ *
+ * There is no history backfill: the provider still holds the earlier
+ * conversation, but Codemux has none of it locally, so this divider is
+ * the whole transcript until the next turn. It exists so that state is
+ * stated plainly instead of presenting as an empty thread.
+ */
+export interface ResumeDividerItem {
+  kind: "resume_divider";
+  id: ChatItemId;
+  seq: number;
+  /** Provenance, e.g. `"external_cli"`. */
+  source: string;
+  /** Epoch ms the adopted conversation began, when the provider knew. */
+  startedAt: number | null;
+  /** Branch the conversation was last on, when known. */
+  branch: string | null;
+}
+
 export type ChatViewItem =
   | UserMessageItem
   | AssistantMessageItem
@@ -374,7 +395,8 @@ export type ChatViewItem =
   | TurnEndedItem
   | SubagentRunItem
   | WorkflowRunItem
-  | RuntimeNoticeItem;
+  | RuntimeNoticeItem
+  | ResumeDividerItem;
 
 /**
  * A live provider event plus the durable row id it was persisted as

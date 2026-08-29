@@ -462,6 +462,23 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       resume_cursor: unknown;
     }
+  // Marks the point where a conversation the agent's own CLI started
+  // OUTSIDE Codemux was adopted into a thread. Written once, by the
+  // adopt command, as the adopted thread's first `agent_chat_messages`
+  // row — so it only ever arrives through hydrate replay, never live.
+  // Until the first new turn lands it is the entire visible transcript,
+  // and that is the point: the earlier history stays with the agent, and
+  // the thread says so instead of looking empty.
+  | {
+      type: "resume_divider";
+      thread_id?: string;
+      /** Where the conversation came from, e.g. `"external_cli"`. */
+      source: string;
+      /** ISO-8601 start time of the adopted conversation, when known. */
+      session_started_at?: string | null;
+      /** Branch the conversation was last on, when known. */
+      branch?: string | null;
+    }
   // A user turn that was written to `agent_chat_messages`, fanned out to
   // every client attached to the thread (mirrors
   // `ProviderRuntimeEvent::UserMessage`). No provider emits this: the
