@@ -476,28 +476,134 @@ async fn run_capture_with_timeout(
 ///
 /// Returns `~/.codemux/worktrees/<sanitized-project>/<sanitized-branch>`
 /// with leading-slash + non-`[A-Za-z0-9_.-]` collapsed to `-`.
+/// Length at which the encoded name is truncated and given a hash
+/// suffix. Matches the constant the CLI ships with.
+const CLAUDE_PROJECT_DIR_MAX_LEN: usize = 200;
+
 /// Encode an absolute path the way Claude Code does for its
 /// per-project session-history directory. Claude stores each
 /// project's conversation JSONLs at
-/// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`, where
-/// the encoding replaces both `/` AND `.` with `-`.
+/// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`.
+///
+/// The encoding is: replace EVERY character outside `[A-Za-z0-9]`
+/// with `-`. Not just `/` and `.` — `_`, spaces, `+`, `@`, accented
+/// letters and CJK all collapse to `-` too. If the result exceeds
+/// `CLAUDE_PROJECT_DIR_MAX_LEN`, it is cut to that length and a
+/// `-<hash>` suffix is appended, where the hash is taken over the
+/// ORIGINAL (unencoded) path.
 ///
 /// Example: `/home/zeus/.codemux/worktrees/proj/main` →
 /// `-home-zeus--codemux-worktrees-proj-main`. The double dash comes
 /// from `/.codemux`: the `/` becomes `-` AND the `.` becomes `-`,
-/// adjacent. (Confirmed empirically: replacing only `/` produces
-/// `-home-zeus-.codemux-...` which Claude doesn't recognize — Claude
-/// uses `-home-zeus--codemux-...` with the dot ALSO mapped to `-`.)
+/// adjacent.
+///
+/// The character class, the 200-char cap and the base-36 `h * 31 + c`
+/// hash are ported from the encoder in the shipped CLI/SDK bundle and
+/// are pinned by the tests below, so the ENCODING STEP is byte-exact.
+/// Two subtleties there are load-bearing and are why this iterates
+/// UTF-16 code units instead of `chars()`:
+/// - The CLI's regex has no `u` flag, so it matches per UTF-16 unit.
+///   A non-BMP character (one `char`, two units) becomes `--`.
+/// - "Alphanumeric" means ASCII only. Rust's `char::is_alphanumeric`
+///   is Unicode-aware and would wrongly keep `é` or `日`.
+///
+/// PARITY IS NOT UNCONDITIONAL, though, and the boundary matters. The
+/// CLI never encodes a raw path: every caller first resolves it with
+/// `realpath()` (falling back to the raw path when that fails) and
+/// then applies Unicode NFC. This function does neither — it is a
+/// pure function of its argument. It therefore agrees with the CLI
+/// exactly when the path handed to it is ALREADY fully resolved and
+/// ALREADY NFC, and not otherwise. Concretely:
+/// - Symlinked `$HOME` (`/home` → `/var/home` on ostree-based
+///   distros): the CLI writes under `-var-home-user-…` while a raw
+///   encode yields `-home-user-…`. For paths on THIS machine, call
+///   `claude_project_dir_name_local`, which performs the `realpath()`
+///   step. Paths on a REMOTE host must stay raw — resolving those
+///   against the local filesystem would be a worse guess than not
+///   resolving them at all.
+/// - Decomposed (NFD) paths encode differently from their NFC form:
+///   `café` written as `e` + U+0301 is one UTF-16 unit longer, so it
+///   gains an extra `-`. This gap is NOT closed: no Unicode-
+///   normalization crate is in the dependency tree and one is not
+///   worth adding for it. ASCII is NFC by definition, so every path
+///   CodeMux itself builds is unaffected; a user-chosen directory
+///   carrying decomposed accents is the exposed case.
 ///
 /// Used by the push flow to figure out where on the remote host to
 /// rsync the laptop's Claude session JSONLs so `claude --resume <uuid>`
-/// finds them.
+/// finds them. Getting this wrong syncs to a directory the remote
+/// `claude --resume` will never look in, so it fails silently.
 pub fn claude_project_dir_name(absolute_path: &std::path::Path) -> String {
-    absolute_path
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
-        .collect()
+    let path = absolute_path.to_string_lossy();
+    let encoded: String = path
+        .encode_utf16()
+        .map(|unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect();
+
+    if encoded.len() <= CLAUDE_PROJECT_DIR_MAX_LEN {
+        return encoded;
+    }
+    // `encoded` is pure ASCII by construction, so slicing by bytes
+    // can't split a char boundary.
+    format!(
+        "{}-{}",
+        &encoded[..CLAUDE_PROJECT_DIR_MAX_LEN],
+        claude_path_hash(&path)
+    )
+}
+
+/// `claude_project_dir_name` for a path on THIS machine, including the
+/// `realpath()` step the CLI performs before encoding. Resolves
+/// symlinks — a symlinked `$HOME` otherwise sends the sync to a
+/// directory the CLI never reads — and falls back to the raw path
+/// when resolution fails, same as the CLI, whose resolver is wrapped
+/// in a try/catch that returns the input unchanged.
+///
+/// Touches the filesystem, so it is only meaningful for local paths;
+/// remote paths keep using the pure encoder.
+///
+/// Residual gap: the CLI also NFC-normalizes and this does not — see
+/// `claude_project_dir_name`.
+pub fn claude_project_dir_name_local(
+    local_path: &std::path::Path,
+) -> String {
+    let resolved = std::fs::canonicalize(local_path)
+        .unwrap_or_else(|_| local_path.to_path_buf());
+    claude_project_dir_name(&resolved)
+}
+
+/// The CLI's hash for over-long project paths: the classic
+/// `h = h * 31 + code` string hash accumulated in a wrapping 32-bit
+/// signed integer over UTF-16 code units, then rendered as unsigned
+/// base-36. Deliberately not a cryptographic hash — the point is to
+/// reproduce the CLI's directory name byte for byte, not to be
+/// collision-resistant, so `sha2` would be the wrong tool here.
+fn claude_path_hash(input: &str) -> String {
+    let mut hash: i32 = 0;
+    for unit in input.encode_utf16() {
+        hash = hash
+            .wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit));
+    }
+    // Widen before taking the magnitude: `i32::MIN.abs()` overflows,
+    // whereas the CLI's arithmetic is on doubles and yields 2^31.
+    let mut magnitude = i64::from(hash).unsigned_abs();
+    if magnitude == 0 {
+        return "0".to_string();
+    }
+
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    while magnitude > 0 {
+        out.push(DIGITS[(magnitude % 36) as usize]);
+        magnitude /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base-36 digits are ASCII")
 }
 
 /// Cross-platform — see `crate::workspace_paths::conventional_remote_path`.
@@ -517,10 +623,8 @@ mod tests {
     fn claude_project_dir_name_matches_observed_encoding() {
         // Pinned against a real directory listing on the author's
         // machine — Claude Code stores per-project session JSONLs at
-        // `~/.claude/projects/<encoded>/` where the encoding is just
-        // `/` → `-`. The double-dash for `/.codemux` is incidental
-        // (leading `/` of `.codemux` becomes `-`, adjacent to the
-        // preceding `-`).
+        // `~/.claude/projects/<encoded>/`. The double-dash for
+        // `/.codemux` comes from `/` and `.` both mapping to `-`.
         assert_eq!(
             claude_project_dir_name(std::path::Path::new(
                 "/home/zeus/.codemux/worktrees/codemux-step1-test/final-smoke"
@@ -544,6 +648,187 @@ mod tests {
         assert_eq!(
             claude_project_dir_name(std::path::Path::new("foo/bar")),
             "foo-bar"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_replaces_underscores() {
+        // Regression: the encoder used to map only `/` and `.`, so
+        // `my_project` survived verbatim and the rsync landed in a
+        // directory `claude --resume` never reads.
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new(
+                "/home/zeus/my_project"
+            )),
+            "-home-zeus-my-project"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_replaces_all_punctuation() {
+        // Every non-`[A-Za-z0-9]` byte collapses to `-`, one `-` per
+        // character, with no run-squashing.
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new(
+                "/home/zeus/proj (v2)/a+b@c!/x_y.z"
+            )),
+            "-home-zeus-proj--v2--a-b-c--x-y-z"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_replaces_non_ascii_per_utf16_unit() {
+        // `char::is_alphanumeric` would keep `é`; the CLI does not.
+        // Non-BMP characters cost two `-` because the CLI's regex runs
+        // over UTF-16 units.
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new(
+                "/home/zeus/café/日本/x"
+            )),
+            // `café` → `caf-` (1), `/` → `-`, `日本` → `--` (2 BMP
+            // chars, 1 unit each), `/` → `-`.
+            "-home-zeus-caf-----x"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_truncates_long_paths_with_hash() {
+        // 20 × 25-char segments blows past the 200-char cap.
+        let long: String = (0..20)
+            .map(|i| format!("/segment_{i}_longish_name"))
+            .collect();
+        let path = format!("/home/zeus{long}");
+        let encoded = claude_project_dir_name(std::path::Path::new(&path));
+
+        let (head, hash) = encoded.rsplit_once('-').expect("has suffix");
+        assert_eq!(head.len(), 200, "head must be cut to exactly 200");
+        assert!(!hash.is_empty(), "hash suffix must not be empty");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "hash must be lowercase base-36, got {hash}"
+        );
+        // Pinned against the encoder in the shipped CLI bundle.
+        assert_eq!(
+            encoded,
+            "-home-zeus-segment-0-longish-name-segment-1-longish-name-segment-2-longish-name-segment-3-longish-name-segment-4-longish-name-segment-5-longish-name-segment-6-longish-name-segment-7-longish-name-segme-zbggsa"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_leaves_short_paths_unhashed() {
+        // Exactly at the cap: no truncation, no suffix.
+        let path = format!("/{}", "a".repeat(199));
+        let encoded = claude_project_dir_name(std::path::Path::new(&path));
+        assert_eq!(encoded.len(), 200);
+        assert_eq!(encoded, format!("-{}", "a".repeat(199)));
+    }
+
+    #[test]
+    fn claude_project_dir_name_is_stable_and_idempotent() {
+        // Both sides of a push must agree, so the same input has to
+        // give the same output every call — including for the hashed
+        // long-path branch, and including across the local/remote
+        // encode pair in `sync_claude_projects`.
+        for path in [
+            "/home/zeus/my_project",
+            "/home/zeus/.codemux/worktrees/proj/main",
+            "/a/very/long/path/that/repeats/itself/over/and/over/again/until/it/comfortably/exceeds/the/two/hundred/character/cap/imposed/by/the/encoder/and/therefore/needs/a/trailing/hash/suffix/to/stay/unique",
+        ] {
+            let p = std::path::Path::new(path);
+            assert_eq!(claude_project_dir_name(p), claude_project_dir_name(p));
+        }
+
+        // Distinct long paths sharing a 200-char prefix must not
+        // collide — that is what the hash suffix is for.
+        let prefix = "/home/zeus/".to_string() + &"padding/".repeat(30);
+        let a = claude_project_dir_name(std::path::Path::new(
+            &(prefix.clone() + "alpha"),
+        ));
+        let b = claude_project_dir_name(std::path::Path::new(
+            &(prefix + "beta"),
+        ));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn claude_project_dir_name_treats_nfd_and_nfc_as_different_dirs() {
+        // Documents the one divergence from the CLI we knowingly keep:
+        // it NFC-normalizes before encoding, we do not. Precomposed
+        // `é` is one UTF-16 unit; decomposed it is two, so the
+        // decomposed form spends an extra `-`.
+        let nfc =
+            claude_project_dir_name(std::path::Path::new("/home/zeus/café"));
+        let nfd = claude_project_dir_name(std::path::Path::new(
+            "/home/zeus/cafe\u{301}",
+        ));
+        assert_eq!(nfc, "-home-zeus-caf-");
+        assert_eq!(nfd, "-home-zeus-cafe-");
+        assert_ne!(
+            nfc, nfd,
+            "if these ever match, the NFC gap has been closed and the \
+             doc comment needs updating"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_local_resolves_symlinks() {
+        // The CLI realpath()s before encoding, so a symlinked $HOME
+        // (`/home` → `/var/home`) puts the session JSONLs under the
+        // RESOLVED name. Encoding the unresolved path points the sync
+        // at a directory the CLI never reads.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The tempdir itself may sit behind a symlink (`/var` →
+        // `/private/var`), so start from its resolved form.
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let target = root.join("var-home");
+        let real = target.join("proj");
+        std::fs::create_dir_all(&real).expect("create dirs");
+        let link = root.join("home");
+        if std::os::unix::fs::symlink(&target, &link).is_err() {
+            // No usable symlinks on this platform/filesystem.
+            return;
+        }
+
+        let via_link = link.join("proj");
+        assert_eq!(
+            claude_project_dir_name_local(&via_link),
+            claude_project_dir_name(&real),
+            "local encode must follow the symlink"
+        );
+        assert_ne!(
+            claude_project_dir_name(&via_link),
+            claude_project_dir_name(&real),
+            "the pure encoder deliberately does not resolve — that is \
+             why the _local variant exists"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_local_falls_back_to_the_raw_path() {
+        // The CLI's resolver is wrapped in a try/catch that hands back
+        // the input, so an unresolvable path must encode raw rather
+        // than blow up. Reached whenever the workspace dir has not
+        // been created yet.
+        let missing =
+            std::path::Path::new("/codemux-does-not-exist/proj/main");
+        assert_eq!(
+            claude_project_dir_name_local(missing),
+            claude_project_dir_name(missing)
+        );
+        assert!(!missing.exists(), "test premise: path must not exist");
+    }
+
+    #[test]
+    fn claude_project_dir_name_local_matches_pure_encode_when_canonical() {
+        // Already-resolved input: the realpath() step is a no-op, so
+        // the two entry points must not drift apart.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create dir");
+        assert_eq!(
+            claude_project_dir_name_local(&workspace),
+            claude_project_dir_name(&workspace)
         );
     }
 
