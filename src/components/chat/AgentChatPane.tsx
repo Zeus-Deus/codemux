@@ -124,7 +124,10 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
-import { formatProviderError } from "@/lib/agent-chat/provider-error";
+import {
+  formatProviderError,
+  grokModelChangeRequiresRestart,
+} from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { MonitoringBar } from "./MonitoringBar";
@@ -165,6 +168,7 @@ const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
   cursor: "Cursor",
+  grok: "Grok",
   opencode: "OpenCode",
 };
 
@@ -238,6 +242,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const [starting, setStarting] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  // React state does not update synchronously. Keep a ref beside it so two
+  // delayed model-set failures cannot both begin a native-session rebuild
+  // before the next render observes `restarting=true`.
+  const restartInFlightRef = useRef(false);
   // Optimistic in-flight flag mirroring the reference impl's
   // `isSendBusy` (ChatView.tsx:406). Set synchronously on submit so
   // the button disables BEFORE the backend's Running event
@@ -708,6 +716,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // Combined live signal, so the optimistic window between Enter and the
   // backend's first `Running` reads as streaming in the transcript.
   const transcriptStreaming = streaming || isSending;
+  // Grok applies model/reasoning changes to the native ACP session itself.
+  // Freeze those controls for an active turn so its queued-input snapshot and
+  // completion lifecycle cannot be invalidated by a mid-turn family switch.
+  const grokConfigurationBusy =
+    provider === "grok" && (transcriptStreaming || activeTurnId != null);
   const lastRevertRefreshRef = useRef<{
     key: string;
     promise: Promise<void>;
@@ -2249,13 +2262,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       contextWindow?: string | null;
       model?: string | null;
       fastMode?: boolean;
+      /** Drop provider-native continuity. Required when Grok reports that
+       * the chosen model belongs to an incompatible agent family. */
+      freshSession?: boolean;
+      /** Restore optimistic picker state if rebuilding the provider fails. */
+      onFailure?: () => void;
     }) => {
       if (!threadId) return;
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
-      if (restarting) return;
+      if (restartInFlightRef.current) return;
+      restartInFlightRef.current = true;
       setRestarting(true);
-      const resumeCursor = currentSlice.resumeCursor;
+      const resumeCursor = updates.freshSession
+        ? null
+        : currentSlice.resumeCursor;
       const nextMode =
         provider === "opencode"
           ? null
@@ -2284,6 +2305,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             cwd: cwd ?? "",
             model: nextModel,
             resume_cursor: resumeCursor,
+            fresh_session: updates.freshSession ?? false,
             permission_mode: nextMode,
             effort: nextEffort,
             context_window: nextContext,
@@ -2299,6 +2321,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           setSessionLaunchMode(newId, nextMode);
           void useProviderHealth.getState().noteProviderSuccess(provider);
         } catch (err) {
+          updates.onFailure?.();
           toast.error(
             `Failed to restart session: ${formatProviderError(err)}`,
           );
@@ -2306,6 +2329,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             .getState()
             .refresh(provider, { force: true });
         } finally {
+          restartInFlightRef.current = false;
           setRestarting(false);
         }
       })();
@@ -2315,7 +2339,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       provider,
       cwd,
       pane.pane_id,
-      restarting,
       setSessionLaunchMode,
     ],
   );
@@ -2332,6 +2355,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAcceptPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "grok") {
+        // Grok's private exit-plan request is itself the blocking gate.
+        // The Rust ACP adapter maps this to the provider's flat
+        // `outcome: approved` response, so no synthetic follow-up turn or
+        // permission-mode mutation is needed.
+        await handleRespond(requestId, { decision: "allow" }, true);
+        return;
+      }
       if (provider === "cursor") {
         // Cursor's documented create_plan extension is a blocking RPC.
         // Resolve that request directly; no synthetic follow-up turn is
@@ -2426,6 +2457,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleRejectPlan = useCallback(
     async (requestId: string) => {
       if (!threadId) return;
+      if (provider === "grok") {
+        await handleRespond(
+          requestId,
+          { decision: "deny", message: "Please revise the plan." },
+          true,
+        );
+        return;
+      }
       if (provider === "cursor") {
         await handleRespond(
           requestId,
@@ -2468,6 +2507,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleModeActivate = useCallback(
     async (newMode: ActivePillMode) => {
       if (!threadId) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
+      if (provider === "grok" && (newMode === "plan" || newMode === "ask")) {
+        toast.error("Grok does not expose a client-controlled read-only mode.");
+        return;
+      }
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
       if (currentSlice.mode === newMode) return;
@@ -2508,6 +2552,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      grokConfigurationBusy,
       setStoreModePriorPermissionMode,
       setStorePermissionMode,
       setSessionLaunchMode,
@@ -2586,6 +2631,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // session is never left in an orphan state.
   const handleModeRemove = useCallback(async () => {
     if (!threadId) return;
+    if (grokConfigurationBusy || restartInFlightRef.current) return;
     const currentSlice = useAgentChatStore.getState().threads[threadId];
     if (!currentSlice) return;
     if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
@@ -2618,6 +2664,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModePriorPermissionMode(threadId, null);
   }, [
     threadId,
+    grokConfigurationBusy,
     setStorePermissionMode,
     setStoreMode,
     setStoreModePriorPermissionMode,
@@ -2649,6 +2696,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleModelChange = useCallback(
     (next: string) => {
       if (!threadId) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
+      const previous = useAgentChatStore.getState().threads[threadId];
+      if (!previous) return;
+      const rollback = () => {
+        // A slower failed request must not undo a newer picker choice.
+        if (useAgentChatStore.getState().threads[threadId]?.model !== next) {
+          return;
+        }
+        setStoreModel(threadId, previous.model);
+        setStoreEffort(threadId, previous.effort);
+        setStoreContextWindow(threadId, previous.contextWindow);
+        setStoreFastMode(threadId, previous.fastMode);
+        persistSessionConfig({
+          model: previous.model,
+          effort: previous.effort,
+          context_window: previous.contextWindow,
+          fast_mode: previous.fastMode,
+        });
+      };
       setStoreModel(threadId, next);
       // Compatibility rule — use a pure planner so the decision is
       // testable in isolation (see `planModelChange`). Reads from the
@@ -2679,16 +2745,41 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       persistSessionConfig(configPatch);
       if (plan.resetFastMode !== undefined) {
-        restartSessionWith({ model: next, fastMode: plan.resetFastMode });
+        restartSessionWith({
+          model: next,
+          fastMode: plan.resetFastMode,
+          onFailure: rollback,
+        });
       } else {
         agentChatSetModel(provider, threadId, next).catch((err) => {
-          toast.error(`Failed to set model: ${err}`);
+          if (provider === "grok" && grokModelChangeRequiresRestart(err)) {
+            // This request may have failed after a newer picker choice was
+            // already accepted. Never rebuild the native session around the
+            // stale model in that case.
+            if (
+              useAgentChatStore.getState().threads[threadId]?.model !== next
+            ) {
+              return;
+            }
+            // Grok locks the underlying agent family after the first turn.
+            // Keep the durable Codemux transcript, but create a fresh native
+            // Grok session so the newly selected family can start cleanly.
+            restartSessionWith({
+              model: next,
+              freshSession: true,
+              onFailure: rollback,
+            });
+            return;
+          }
+          rollback();
+          toast.error(`Failed to set model: ${formatProviderError(err)}`);
         });
       }
     },
     [
       threadId,
       provider,
+      grokConfigurationBusy,
       capabilities,
       effort,
       contextWindow,
@@ -2705,6 +2796,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handlePermissionModeChange = useCallback(
     (next: string) => {
       if (!threadId) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
       // Delegate the decision to `planPermissionModeChange` — it
@@ -2743,6 +2835,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      grokConfigurationBusy,
       capabilities,
       setStorePermissionMode,
       setSessionLaunchMode,
@@ -2760,6 +2853,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleEffortChange = useCallback(
     (next: string) => {
       if (!threadId) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
       const plan = planEffortChange({
         nextEffort: next,
         model: activeModel,
@@ -2783,6 +2877,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       activeModel,
       draft,
       provider,
+      grokConfigurationBusy,
       setInputDraft,
       setStoreEffort,
       restartSessionWith,
@@ -2793,6 +2888,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleContextWindowChange = useCallback(
     (next: string) => {
       if (!threadId) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
       setStoreContextWindow(threadId, next);
       persistSessionConfig({ context_window: next });
       // Claude encodes context into the model id; Cursor exposes context as
@@ -2805,6 +2901,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       provider,
+      grokConfigurationBusy,
       setStoreContextWindow,
       restartSessionWith,
       persistSessionConfig,
@@ -2814,6 +2911,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleFastModeChange = useCallback(
     (next: boolean) => {
       if (!threadId || (next && !activeModel?.supports_fast_mode)) return;
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
       const current = useAgentChatStore.getState().threads[threadId];
       if (!current || current.fastMode === next) return;
       setStoreFastMode(threadId, next);
@@ -2826,6 +2924,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [
       threadId,
       activeModel,
+      grokConfigurationBusy,
       setStoreFastMode,
       persistSessionConfig,
       restartSessionWith,
@@ -2841,14 +2940,116 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [fastMode, activeModel, handleFastModeChange]);
 
+  // Grok's installed CLI owns this catalogue and the store refreshes it while
+  // Codemux is running. Reconcile removals as well as additions: a retired
+  // model or effort must not remain hidden in persisted state and then be sent
+  // back to the next turn.
+  const grokReconcileAttemptsRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (
+      provider !== "grok" ||
+      grokConfigurationBusy ||
+      restartInFlightRef.current ||
+      !threadId ||
+      !capabilities ||
+      !model
+    ) {
+      return;
+    }
+    const advertisedModel = capabilities.models.find(
+      (candidate) => candidate.id === model,
+    );
+    if (!advertisedModel) {
+      const replacement = capabilities.models[0];
+      if (replacement && replacement.id !== model) {
+        const attemptKey = `${threadId}:${model}->${replacement.id}:${capabilities.models
+          .map((candidate) => candidate.id)
+          .join(",")}`;
+        if (grokReconcileAttemptsRef.current.has(attemptKey)) return;
+        grokReconcileAttemptsRef.current.add(attemptKey);
+        handleModelChange(replacement.id);
+      }
+      return;
+    }
+
+    const compat = planModelChange({
+      newModel: advertisedModel,
+      currentEffort: effort,
+      currentContextWindow: contextWindow,
+      currentFastMode: fastMode,
+    });
+    const previousEffort = effort;
+    const effortAttemptKey =
+      compat.resetEffort !== undefined
+        ? `${threadId}:${model}:effort:${previousEffort ?? "default"}->${compat.resetEffort ?? "default"}`
+        : null;
+    const shouldApplyEffort =
+      effortAttemptKey !== null &&
+      !grokReconcileAttemptsRef.current.has(effortAttemptKey);
+    if (shouldApplyEffort) {
+      // Record before the optimistic write. If the native setter rejects and
+      // rolls back, the rerender must not reapply a value the live session
+      // never accepted.
+      grokReconcileAttemptsRef.current.add(effortAttemptKey);
+    }
+    const patch: AgentChatSessionConfigUpdate = {};
+    if (compat.resetEffort !== undefined && shouldApplyEffort) {
+      setStoreEffort(threadId, compat.resetEffort);
+      patch.effort = compat.resetEffort;
+    }
+    if (compat.resetContextWindow !== undefined) {
+      setStoreContextWindow(threadId, compat.resetContextWindow);
+      patch.context_window = compat.resetContextWindow;
+    }
+    if (Object.keys(patch).length > 0) persistSessionConfig(patch);
+
+    if (compat.resetEffort !== undefined && shouldApplyEffort) {
+        // Grok applies the model catalogue's current default effort when
+        // session/set_model omits _meta.reasoningEffort. Re-selecting the
+        // unchanged model therefore clears a retired effort immediately,
+        // including for turns that were queued before this catalogue refresh.
+        agentChatSetModel("grok", threadId, model).catch((err) => {
+          // Keep the UI/DB truthful when the live native session rejected the
+          // reconciliation. The attempt key prevents a failing CLI from
+          // causing an effect retry loop on every render.
+          const current = useAgentChatStore.getState().threads[threadId];
+          if (
+            current?.model !== model ||
+            current.effort !== compat.resetEffort
+          ) {
+            return;
+          }
+          setStoreEffort(threadId, previousEffort);
+          persistSessionConfig({ effort: previousEffort });
+          toast.error(
+            `Failed to reconcile Grok reasoning effort: ${formatProviderError(err)}`,
+          );
+        });
+    }
+  }, [
+    provider,
+    grokConfigurationBusy,
+    threadId,
+    capabilities,
+    model,
+    effort,
+    contextWindow,
+    fastMode,
+    handleModelChange,
+    persistSessionConfig,
+    setStoreEffort,
+    setStoreContextWindow,
+  ]);
+
   const handleProviderModelChange = useCallback(
     (nextProvider: AgentChatProviderKind, nextModel: string) => {
+      if (grokConfigurationBusy || restartInFlightRef.current) return;
       // A model pick inside the current provider is the cheap live setter.
       if (nextProvider === provider) {
         handleModelChange(nextModel);
         return;
       }
-      if (!threadId || !cwd || restarting) return;
+      if (!threadId || !cwd) return;
 
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
@@ -2861,6 +3062,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         oldProvider === "opencode"
           ? null
           : (currentSlice.sessionLaunchMode ?? currentSlice.permissionMode);
+      restartInFlightRef.current = true;
       setRestarting(true);
 
       void (async () => {
@@ -2933,17 +3135,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               recoveryError,
             );
           }
-          toast.error(`Failed to switch provider: ${switchError}`);
+          toast.error(
+            `Failed to switch provider: ${formatProviderError(switchError)}`,
+          );
+          void useProviderHealth
+            .getState()
+            .refresh(nextProvider, { force: true });
         } finally {
+          restartInFlightRef.current = false;
           setRestarting(false);
         }
       })();
     },
     [
       provider,
+      grokConfigurationBusy,
       threadId,
       cwd,
-      restarting,
       pane.pane_id,
       handleModelChange,
       migrateThreadId,
@@ -3184,6 +3392,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
       contextUsageProviderLabel={contextUsageProviderLabel}
       sessionReady={sessionReady}
+      configurationReady={!grokConfigurationBusy}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
       stagedAttachments={stagedAttachments}

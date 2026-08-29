@@ -18,6 +18,7 @@ use super::errors::ProviderError;
 use super::types::ProviderKind;
 use crate::agent_provider::claude;
 use crate::agent_provider::codex;
+use crate::agent_provider::grok;
 use crate::agent_provider::opencode;
 use std::time::Duration;
 
@@ -88,6 +89,7 @@ pub async fn check_provider_health(provider: ProviderKind) -> ProviderHealthRepo
         ProviderKind::Claude => check_claude_health().await,
         ProviderKind::Codex => check_codex_health().await,
         ProviderKind::Cursor => check_cursor_health().await,
+        ProviderKind::Grok => check_grok_health().await,
         ProviderKind::OpenCode => check_opencode_health().await,
     }
 }
@@ -333,6 +335,61 @@ async fn check_cursor_health() -> ProviderHealthReport {
     }
 }
 
+// ── Grok ────────────────────────────────────────────────────────────
+
+async fn check_grok_health() -> ProviderHealthReport {
+    let binary = match which::which("grok") {
+        Ok(path) => path,
+        Err(_) => {
+            return ProviderHealthReport::error(
+                ProviderKind::Grok,
+                false,
+                "Grok CLI (`grok`) is not installed or not on PATH.".into(),
+            )
+        }
+    };
+    grok_report_from_probe(grok::capabilities::probe_grok_health(&binary).await)
+}
+
+fn grok_report_from_probe(
+    result: Result<grok::capabilities::GrokHealthProbe, grok::capabilities::HarvestError>,
+) -> ProviderHealthReport {
+    match result {
+        Ok(probe) if probe.authenticated => {
+            ProviderHealthReport::ready(ProviderKind::Grok, probe.version)
+        }
+        Ok(probe) => {
+            let mut report = ProviderHealthReport::error(
+                ProviderKind::Grok,
+                true,
+                "Grok CLI is not authenticated. Run `grok login --device-auth` or set `XAI_API_KEY`, then try again."
+                    .into(),
+            );
+            report.version = probe.version;
+            report
+        }
+        Err(grok::capabilities::HarvestError::NotInstalled { hint }) => {
+            ProviderHealthReport::error(ProviderKind::Grok, false, hint)
+        }
+        Err(grok::capabilities::HarvestError::NotAuthenticated { hint }) => {
+            ProviderHealthReport::error(
+                ProviderKind::Grok,
+                true,
+                format!("Grok CLI is not authenticated. {hint}"),
+            )
+        }
+        Err(grok::capabilities::HarvestError::HarvestFailed { message }) => {
+            ProviderHealthReport::error(
+                ProviderKind::Grok,
+                true,
+                format!(
+                    "Grok CLI is installed but its ACP server failed to initialize. ({message})"
+                ),
+            )
+        }
+    }
+}
+
 // ── OpenCode ────────────────────────────────────────────────────────
 
 async fn check_opencode_health() -> ProviderHealthReport {
@@ -451,6 +508,42 @@ mod tests {
         assert_eq!(report.status, ProviderHealthStatus::Warning);
         assert!(report.installed);
         assert!(report.message.as_deref().unwrap().contains("version"));
+    }
+
+    #[test]
+    fn grok_cached_or_api_key_auth_probe_maps_to_ready() {
+        let report = grok_report_from_probe(Ok(grok::capabilities::GrokHealthProbe {
+            authenticated: true,
+            version: Some("1.0.4".into()),
+        }));
+        assert_eq!(report.status, ProviderHealthStatus::Ready);
+        assert_eq!(report.version.as_deref(), Some("1.0.4"));
+    }
+
+    #[test]
+    fn grok_browser_only_auth_maps_to_actionable_error() {
+        let report = grok_report_from_probe(Ok(grok::capabilities::GrokHealthProbe {
+            authenticated: false,
+            version: Some("1.0.4".into()),
+        }));
+        assert_eq!(report.status, ProviderHealthStatus::Error);
+        assert!(report.installed);
+        let message = report.message.as_deref().unwrap();
+        assert!(message.contains("device-auth"));
+        assert!(message.contains("XAI_API_KEY"));
+    }
+
+    #[test]
+    fn grok_acp_auth_rejection_stays_classified_as_not_authenticated() {
+        let report =
+            grok_report_from_probe(Err(grok::capabilities::HarvestError::NotAuthenticated {
+                hint: "Run `grok login --device-auth`.".into(),
+            }));
+        assert_eq!(report.status, ProviderHealthStatus::Error);
+        assert!(report.installed);
+        let message = report.message.as_deref().unwrap();
+        assert!(message.contains("not authenticated"));
+        assert!(message.contains("device-auth"));
     }
 
     #[test]

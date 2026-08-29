@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// The set of CLI-backed coding agents the chat runtime can drive.
 ///
 /// Serialized as lowercase strings (`"claude"`, `"codex"`, `"cursor"`,
-/// `"opencode"`) so
+/// `"grok"`, `"opencode"`) so
 /// values round-trip cleanly through JSON settings and IPC surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +26,8 @@ pub enum ProviderKind {
     Codex,
     /// Cursor Agent via its official Agent Client Protocol server.
     Cursor,
+    /// Grok Build via its official Agent Client Protocol server.
+    Grok,
     /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
     /// the runtime adapter is not implemented yet and command dispatch
     /// returns a placeholder error.
@@ -120,6 +122,11 @@ pub struct StartSessionInput {
     /// present the provider should attempt to resume instead of starting a
     /// fresh session.
     pub resume_cursor: Option<serde_json::Value>,
+    /// Suppress command-layer recovery of a persisted resume cursor. This is
+    /// distinct from an omitted cursor: callers use it when the provider has
+    /// explicitly rejected reuse of the current native session.
+    #[serde(default)]
+    pub fresh_session: bool,
     /// Initial permission mode name. String to avoid baking each provider's
     /// enum into the trait.
     pub permission_mode: Option<String>,

@@ -17,6 +17,7 @@ type SliceOverrides = {
   model?: string | null;
   effort?: string | null;
   contextWindow?: string | null;
+  fastMode?: boolean;
   resumeCursor?: Record<string, string> | null;
   hasDebugActivity?: boolean;
   debugActivityResolved?: boolean;
@@ -93,6 +94,7 @@ vi.mock("./ChatTranscript", () => ({
     sendAnchor,
     threadKey,
     onAcceptPlan,
+    onRejectPlan,
     onEnterSubagent,
     onCancelQueued,
     onSendQueuedNow,
@@ -102,6 +104,7 @@ vi.mock("./ChatTranscript", () => ({
     sendAnchor?: { clientNonce: string; nonce: number } | null;
     threadKey?: string | null;
     onAcceptPlan: (requestId: string) => void;
+    onRejectPlan: (requestId: string) => void;
     onEnterSubagent?: (subagentId: string) => void;
     onCancelQueued?: (queuedId: string, text: string) => void;
     onSendQueuedNow?: (queuedId: string) => void;
@@ -124,6 +127,10 @@ vi.mock("./ChatTranscript", () => ({
       <button
         data-testid="accept-plan"
         onClick={() => onAcceptPlan("req-1")}
+      />
+      <button
+        data-testid="reject-plan"
+        onClick={() => onRejectPlan("req-1")}
       />
       {/* Lets the viewMode-swap test trigger the pane's real
           onEnterSubagent handler without mounting the full card. */}
@@ -212,6 +219,7 @@ vi.mock("./Composer", () => ({
     providerCliInstalled,
     providerAuthenticated,
     focusOnMount,
+    configurationReady,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -223,15 +231,16 @@ vi.mock("./Composer", () => ({
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
     onProviderModelChange: (
-      provider: "claude" | "codex" | "cursor" | "opencode",
+      provider: "claude" | "codex" | "cursor" | "grok" | "opencode",
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
     onPermissionModeChange: (mode: string) => void;
-    provider: "claude" | "codex" | "cursor" | "opencode";
+    provider: "claude" | "codex" | "cursor" | "grok" | "opencode";
     providerCliInstalled?: boolean | null;
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
+    configurationReady?: boolean;
   }) => (
     <div
       data-testid="composer"
@@ -239,6 +248,7 @@ vi.mock("./Composer", () => ({
       data-provider-cli-installed={String(providerCliInstalled)}
       data-provider-authenticated={String(providerAuthenticated)}
       data-focus-on-mount={focusOnMount ? "true" : "false"}
+      data-configuration-ready={configurationReady ? "true" : "false"}
     >
       {/* The running-subagents strip is welded inside the real composer's
           top edge, so the mock has to render the slot for the pane's
@@ -271,6 +281,18 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="model-change"
         onClick={() => onModelChange("claude-sonnet-4-6")}
+      />
+      <button
+        data-testid="grok-model-change"
+        onClick={() => onModelChange("grok-future")}
+      />
+      <button
+        data-testid="grok-model-change-a"
+        onClick={() => onModelChange("grok-a")}
+      />
+      <button
+        data-testid="grok-model-change-b"
+        onClick={() => onModelChange("grok-b")}
       />
       <button
         data-testid="provider-model-change"
@@ -542,7 +564,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
       effort: overrides.effort ?? null,
       contextWindow: overrides.contextWindow ?? null,
-      fastMode: false,
+      fastMode: overrides.fastMode ?? false,
       hasDebugActivity: overrides.hasDebugActivity ?? false,
       debugActivityResolved: overrides.debugActivityResolved ?? false,
       pendingRequestIds: [],
@@ -641,7 +663,9 @@ import {
   agentChatThreadHeadId,
   agentChatTurnActive,
   agentChatListSessions,
+  agentChatRespondToRequest,
   agentChatSendTurn,
+  agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
@@ -652,6 +676,7 @@ import {
 } from "@/tauri/commands";
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import type { ChatModelInfo } from "@/tauri/types";
 
 const pane = {
   kind: "agent_chat" as const,
@@ -1311,7 +1336,7 @@ describe("AgentChatPane session-start marker wiring (D2)", () => {
   function makeSessionRecord(overrides: {
     thread_id: string;
     created_at: string;
-  }) {
+  }): AgentChatSessionRecord {
     return {
       thread_id: overrides.thread_id,
       sdk_session_id: "sdk-1",
@@ -2074,6 +2099,459 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
   });
 });
 
+const grokPane = { ...pane, provider: "grok" as const };
+
+function grokModel(
+  id: string,
+  efforts: string[] = ["high", "low"],
+  defaultEffort: string | null = efforts[0] ?? null,
+): ChatModelInfo {
+  return {
+    id,
+    label: id,
+    description: null,
+    effort_levels: efforts,
+    default_effort: defaultEffort,
+    effort_descriptions: {},
+    prompt_injected_effort_levels: [],
+    context_window_options: [],
+    supports_adaptive_thinking: false,
+    supports_thinking_toggle: efforts.length > 0,
+    supports_fast_mode: false,
+    supports_images: false,
+    sub_provider: null,
+    max_context_tokens: 500_000,
+    is_free: false,
+  };
+}
+
+function seedGrokCapabilities(
+  models: ChatModelInfo[] = [grokModel("grok-4.6")],
+): void {
+  useProviderCapabilities.setState({
+    grok: {
+      models,
+      effort_granularity: "per_turn",
+      effort_label_map: {},
+      permission_modes: [
+        {
+          value: "agent",
+          label: "Agent",
+          description: "Provider-controlled approvals.",
+          is_default: true,
+        },
+      ],
+      default_permission_mode: "agent",
+      permission_granularity: "per_session",
+    },
+    grokError: null,
+  });
+}
+
+describe("AgentChatPane Grok live capability reconciliation", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null);
+    vi.mocked(agentChatSetModel).mockReset().mockResolvedValue(undefined);
+    vi.mocked(agentChatRespondToRequest).mockReset().mockResolvedValue(
+      undefined,
+    );
+    vi.mocked(agentChatStartSession)
+      .mockReset()
+      .mockResolvedValue("thread-x");
+    vi.mocked(agentChatStopSession).mockReset().mockResolvedValue(undefined);
+    vi.mocked(agentChatSendTurn).mockClear();
+    vi.mocked(agentChatSetPermissionMode).mockClear();
+    vi.mocked(agentChatUpdateSessionConfig)
+      .mockReset()
+      .mockResolvedValue(undefined);
+    setModelMock.mockReset();
+    setEffortMock.mockReset();
+    setContextWindowMock.mockReset();
+    setFastModeMock.mockReset();
+    setModeMock.mockClear();
+    setModePriorMock.mockClear();
+    setPermissionModeMock.mockClear();
+    seedGrokCapabilities();
+  });
+
+  afterEach(() => {
+    cleanup();
+    useProviderCapabilities.setState({ grok: null, grokError: null });
+    vi.mocked(agentChatSetModel).mockReset().mockResolvedValue(undefined);
+    vi.mocked(agentChatRespondToRequest).mockReset().mockResolvedValue(
+      undefined,
+    );
+    vi.mocked(agentChatStartSession)
+      .mockReset()
+      .mockResolvedValue("thread-new");
+    vi.mocked(agentChatStopSession).mockReset().mockResolvedValue(undefined);
+    vi.mocked(agentChatUpdateSessionConfig)
+      .mockReset()
+      .mockResolvedValue(undefined);
+    setModelMock.mockReset();
+    setEffortMock.mockReset();
+    setContextWindowMock.mockReset();
+    setFastModeMock.mockReset();
+  });
+
+  it("reselects the live model when a retired effort falls back to the advertised default", async () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", effort: "retired-effort" },
+    };
+
+    render(<AgentChatPane pane={grokPane} />);
+
+    await waitFor(() =>
+      expect(setEffortMock).toHaveBeenCalledWith("thread-x", "high"),
+    );
+    expect(agentChatUpdateSessionConfig).toHaveBeenCalledWith("thread-x", {
+      effort: "high",
+    });
+    // Omitting `_meta.reasoningEffort` on Grok's session/set_model makes
+    // the CLI resolve its current catalogue default for this model.
+    expect(agentChatSetModel).toHaveBeenCalledWith(
+      "grok",
+      "thread-x",
+      "grok-4.6",
+    );
+  });
+
+  it("keeps a rejected retired-effort reconciliation rolled back after rerender", async () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", effort: "retired-effort" },
+    };
+    setEffortMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        effort: value,
+      };
+    });
+    vi.mocked(agentChatSetModel).mockRejectedValueOnce(
+      new Error("provider rejected effort reset"),
+    );
+
+    const view = render(<AgentChatPane pane={grokPane} />);
+    await waitFor(() =>
+      expect(setEffortMock).toHaveBeenLastCalledWith(
+        "thread-x",
+        "retired-effort",
+      ),
+    );
+
+    view.rerender(<AgentChatPane pane={grokPane} />);
+    await Promise.resolve();
+
+    expect(agentChatSetModel).toHaveBeenCalledTimes(1);
+    expect(setEffortMock).toHaveBeenCalledTimes(2);
+    expect(setEffortMock).toHaveBeenLastCalledWith(
+      "thread-x",
+      "retired-effort",
+    );
+    expect(agentChatUpdateSessionConfig).toHaveBeenLastCalledWith(
+      "thread-x",
+      { effort: "retired-effort" },
+    );
+  });
+
+  it("moves a retired model to the first live model with one coherent compatibility patch", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        model: "grok-retired",
+        effort: "xhigh",
+        contextWindow: "1m",
+      },
+    };
+    seedGrokCapabilities([grokModel("grok-future")]);
+
+    render(<AgentChatPane pane={grokPane} />);
+
+    await waitFor(() =>
+      expect(agentChatSetModel).toHaveBeenCalledWith(
+        "grok",
+        "thread-x",
+        "grok-future",
+      ),
+    );
+    expect(setModelMock).toHaveBeenCalledWith("thread-x", "grok-future");
+    expect(setEffortMock).toHaveBeenCalledWith("thread-x", "high");
+    expect(setContextWindowMock).toHaveBeenCalledWith("thread-x", null);
+    expect(agentChatUpdateSessionConfig).toHaveBeenCalledWith("thread-x", {
+      model: "grok-future",
+      effort: "high",
+      context_window: null,
+    });
+  });
+
+  it("starts a fresh native Grok session for an incompatible model family while preserving the Codemux thread", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        model: "grok-4.6",
+        effort: "low",
+        resumeCursor: { resume: "native-grok-session" },
+      },
+    };
+    seedGrokCapabilities([
+      grokModel("grok-4.6"),
+      grokModel("grok-future"),
+    ]);
+    setModelMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        model: value,
+      };
+    });
+    vi.mocked(agentChatSetModel).mockRejectedValueOnce(
+      new Error("grok_model_restart_required: incompatible agent family"),
+    );
+
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    fireEvent.click(getByTestId("grok-model-change"));
+
+    await waitFor(() =>
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-1",
+        "grok",
+        expect.objectContaining({
+          thread_id: "thread-x",
+          model: "grok-future",
+          resume_cursor: null,
+          fresh_session: true,
+          effort: "low",
+        }),
+      ),
+    );
+    expect(agentChatStopSession).toHaveBeenCalledWith("grok", "thread-x");
+  });
+
+  it("ignores an obsolete incompatible-family rejection after a newer model succeeds", async () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", effort: "high" },
+    };
+    seedGrokCapabilities([
+      grokModel("grok-4.6"),
+      grokModel("grok-a"),
+      grokModel("grok-b"),
+    ]);
+    setModelMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        model: value,
+      };
+    });
+    let rejectFirst!: (reason?: unknown) => void;
+    vi.mocked(agentChatSetModel)
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
+      )
+      .mockResolvedValueOnce(undefined);
+
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStopSession).mockClear();
+
+    fireEvent.click(getByTestId("grok-model-change-a"));
+    fireEvent.click(getByTestId("grok-model-change-b"));
+    expect(agentChatSetModel).toHaveBeenNthCalledWith(
+      1,
+      "grok",
+      "thread-x",
+      "grok-a",
+    );
+    expect(agentChatSetModel).toHaveBeenNthCalledWith(
+      2,
+      "grok",
+      "thread-x",
+      "grok-b",
+    );
+
+    await act(async () => {
+      rejectFirst(
+        new Error("grok_model_restart_required: incompatible agent family"),
+      );
+      await Promise.resolve();
+    });
+
+    expect(currentSliceOverrides["thread-x"]?.model).toBe("grok-b");
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+  });
+
+  it("freezes Grok configuration during an active turn", async () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", effort: "high", streaming: true },
+    };
+    seedGrokCapabilities([
+      grokModel("grok-4.6"),
+      grokModel("grok-future"),
+    ]);
+
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    expect(getByTestId("composer")).toHaveAttribute(
+      "data-configuration-ready",
+      "false",
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    vi.mocked(agentChatSetModel).mockClear();
+    vi.mocked(agentChatSetPermissionMode).mockClear();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStopSession).mockClear();
+    setModelMock.mockClear();
+    setPermissionModeMock.mockClear();
+    setContextWindowMock.mockClear();
+    setModeMock.mockClear();
+
+    fireEvent.click(getByTestId("grok-model-change"));
+    fireEvent.click(getByTestId("provider-model-change"));
+    fireEvent.click(getByTestId("permission-mode-change"));
+    fireEvent.click(getByTestId("context-window-change"));
+    fireEvent.click(getByTestId("mode-activate-debug"));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(agentChatSetModel).not.toHaveBeenCalled();
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(setModelMock).not.toHaveBeenCalled();
+    expect(setPermissionModeMock).not.toHaveBeenCalled();
+    expect(setContextWindowMock).not.toHaveBeenCalled();
+    expect(setModeMock).not.toHaveBeenCalled();
+  });
+
+  it("rolls model, effort, context, and persistence back when a live model change fails", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        model: "grok-4.6",
+        effort: "xhigh",
+        contextWindow: "1m",
+      },
+    };
+    const currentModel = {
+      ...grokModel("grok-4.6", ["xhigh", "high"], "xhigh"),
+      context_window_options: [
+        {
+          value: "1m",
+          label: "1M",
+          is_default: true,
+          context_window_tokens: 1_000_000,
+        },
+      ],
+    };
+    seedGrokCapabilities([
+      currentModel,
+      grokModel("grok-future", ["high"], "high"),
+    ]);
+    setModelMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        model: value,
+      };
+    });
+    setEffortMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        effort: value,
+      };
+    });
+    setContextWindowMock.mockImplementation(
+      (threadId: string, value: string | null) => {
+        currentSliceOverrides[threadId] = {
+          ...currentSliceOverrides[threadId],
+          contextWindow: value,
+        };
+      },
+    );
+    vi.mocked(agentChatSetModel).mockRejectedValueOnce(
+      new Error("provider rejected model"),
+    );
+
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    fireEvent.click(getByTestId("grok-model-change"));
+
+    await waitFor(() => {
+      expect(setModelMock).toHaveBeenLastCalledWith("thread-x", "grok-4.6");
+      expect(setEffortMock).toHaveBeenLastCalledWith("thread-x", "xhigh");
+      expect(setContextWindowMock).toHaveBeenLastCalledWith(
+        "thread-x",
+        "1m",
+      );
+    });
+    expect(agentChatUpdateSessionConfig).toHaveBeenLastCalledWith(
+      "thread-x",
+      {
+        model: "grok-4.6",
+        effort: "xhigh",
+        context_window: "1m",
+        fast_mode: false,
+      },
+    );
+  });
+
+  it("does not expose Plan or Ask as client-controlled Grok modes", () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", permissionMode: "agent" },
+    };
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+
+    fireEvent.click(getByTestId("mode-activate-plan"));
+    fireEvent.click(getByTestId("mode-activate-ask"));
+
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(setModeMock).not.toHaveBeenCalled();
+    expect(setPermissionModeMock).not.toHaveBeenCalled();
+  });
+
+  it("answers Grok's native plan gate directly without synthetic turns or mode changes", async () => {
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", permissionMode: "agent" },
+    };
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+
+    fireEvent.click(getByTestId("accept-plan"));
+    await waitFor(() =>
+      expect(agentChatRespondToRequest).toHaveBeenCalledWith(
+        "grok",
+        "thread-x",
+        "req-1",
+        { decision: "allow" },
+      ),
+    );
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+
+    vi.mocked(agentChatRespondToRequest).mockClear();
+    fireEvent.click(getByTestId("reject-plan"));
+    await waitFor(() =>
+      expect(agentChatRespondToRequest).toHaveBeenCalledWith(
+        "grok",
+        "thread-x",
+        "req-1",
+        { decision: "deny", message: "Please revise the plan." },
+      ),
+    );
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+    expect(setModeMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("AgentChatPane Stop preserves its durable thread", () => {
   beforeEach(() => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
@@ -2090,7 +2568,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
 
   afterEach(() => cleanup());
 
-  it.each(["claude", "codex", "opencode"] as const)(
+  it.each(["claude", "codex", "grok", "opencode"] as const)(
     "interrupts %s without stopping, restarting, or replacing the thread",
     async (provider) => {
       const { getByTestId } = render(

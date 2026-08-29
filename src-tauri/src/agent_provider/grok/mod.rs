@@ -1,6 +1,7 @@
-//! Cursor Agent provider using Cursor's official ACP stdio server.
+//! Grok Build provider using xAI's official ACP stdio server.
 
 pub mod capabilities;
+pub mod slash_commands;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,40 +12,51 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::agent_provider::acp::session::{AcpDialect, AcpSession, AcpSpawnConfig};
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderCapabilities, ProviderError, ProviderEventStream,
     ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId, SendOutcome, SendTurnInput,
     SessionStatus, StartSessionInput, ThreadId, TurnId, TurnStartResult,
 };
 
-use crate::agent_provider::acp::session::{AcpDialect, AcpSession, AcpSpawnConfig};
-
 #[derive(Debug, Clone)]
-pub struct CursorProviderConfig {
+pub struct GrokProviderConfig {
     pub binary: PathBuf,
     pub event_channel_capacity: usize,
 }
 
-impl Default for CursorProviderConfig {
+impl Default for GrokProviderConfig {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("cursor-agent"),
+            binary: PathBuf::from("grok"),
             event_channel_capacity: 1024,
         }
     }
 }
 
-pub struct CursorAgentProvider {
-    config: CursorProviderConfig,
+pub struct GrokAgentProvider {
+    config: GrokProviderConfig,
+    slash_command_cache: Arc<slash_commands::GrokSlashCommandCache>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<AcpSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
 
-impl CursorAgentProvider {
-    pub fn new(config: CursorProviderConfig) -> Self {
+impl GrokAgentProvider {
+    pub fn new(config: GrokProviderConfig) -> Self {
+        Self::new_with_slash_command_cache(
+            config,
+            Arc::new(slash_commands::GrokSlashCommandCache::new()),
+        )
+    }
+
+    pub fn new_with_slash_command_cache(
+        config: GrokProviderConfig,
+        slash_command_cache: Arc<slash_commands::GrokSlashCommandCache>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity.max(16));
         Self {
             config,
+            slash_command_cache,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
         }
@@ -62,7 +74,7 @@ impl CursorAgentProvider {
     }
 }
 
-impl Drop for CursorAgentProvider {
+impl Drop for GrokAgentProvider {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -77,15 +89,17 @@ impl Drop for CursorAgentProvider {
 }
 
 #[async_trait]
-impl AgentProvider for CursorAgentProvider {
+impl AgentProvider for GrokAgentProvider {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::Cursor
+        ProviderKind::Grok
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_mid_session_model_change: true,
-            supports_mid_session_permission_change: true,
+            // Grok's ask/full permission choice is supplied when the ACP
+            // session is created; the live setter reports restart-required.
+            supports_mid_session_permission_change: false,
             supports_synchronous_tool_approval: true,
             supports_interrupt: true,
             supports_session_resume: true,
@@ -98,21 +112,22 @@ impl AgentProvider for CursorAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
-        // Evict a corpse under the write lock so check→remove is atomic
-        // against a concurrent rebuild. A read-lock check followed by a
-        // separate write-lock remove lets two starts both observe the same
-        // dead session. A still-live session is a genuine double-start and
-        // stays a ValidationError.
+        // Keep the provider boundary safe for callers other than the Tauri
+        // command layer. An explicit fresh start must never attempt to load
+        // the stale native session even if a cursor was supplied alongside
+        // it (the incompatible-model recovery path intentionally does this).
+        let resume_cursor = if input.fresh_session {
+            None
+        } else {
+            input.resume_cursor
+        };
         let dead_evicted = {
             let mut sessions = self.sessions.write().await;
             match sessions.get(&thread_id) {
                 Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
                 Some(_) => {
                     return Err(ProviderError::ValidationError {
-                        message: format!(
-                            "Cursor session already exists for thread {}",
-                            thread_id.0
-                        ),
+                        message: format!("Grok session already exists for thread {}", thread_id.0),
                     });
                 }
                 None => None,
@@ -121,6 +136,7 @@ impl AgentProvider for CursorAgentProvider {
         if let Some(dead) = dead_evicted {
             dead.shutdown().await;
         }
+
         let session = AcpSession::spawn_and_initialize(
             thread_id.clone(),
             input.cwd,
@@ -129,20 +145,17 @@ impl AgentProvider for CursorAgentProvider {
             input.effort,
             input.context_window,
             input.fast_mode,
-            input.resume_cursor,
+            resume_cursor,
             input.env,
             AcpSpawnConfig {
                 binary: self.config.binary.clone(),
-                dialect: AcpDialect::Cursor,
-                grok_slash_command_cache: None,
+                dialect: AcpDialect::Grok,
+                grok_slash_command_cache: Some(Arc::clone(&self.slash_command_cache)),
             },
             self.event_tx.clone(),
         )
         .await?;
-        // Spawning is async, so two starts that both got past the eviction
-        // above can arrive here with two live children. Never overwrite a
-        // live entry: the loser's `cursor-agent` process would stay running
-        // with nothing holding a handle to shut it down.
+
         {
             let mut sessions = self.sessions.write().await;
             if sessions
@@ -152,14 +165,15 @@ impl AgentProvider for CursorAgentProvider {
                 drop(sessions);
                 session.shutdown().await;
                 return Err(ProviderError::ValidationError {
-                    message: format!("Cursor session already exists for thread {}", thread_id.0),
+                    message: format!("Grok session already exists for thread {}", thread_id.0),
                 });
             }
             sessions.insert(thread_id.clone(), Arc::clone(&session));
         }
+
         Ok(ProviderSession {
             thread_id,
-            provider: ProviderKind::Cursor,
+            provider: ProviderKind::Grok,
             session_id: session.provider_session_id.clone(),
             status: SessionStatus::Ready,
             resume_cursor: Some(serde_json::json!({
@@ -266,10 +280,13 @@ impl AgentProvider for CursorAgentProvider {
         for session in sessions {
             result.push(ProviderSession {
                 thread_id: session.thread_id.clone(),
-                provider: ProviderKind::Cursor,
+                provider: ProviderKind::Grok,
                 session_id: session.provider_session_id.clone(),
                 status: session.state.lock().await.status.clone(),
-                resume_cursor: Some(serde_json::json!({ "schemaVersion": 1, "sessionId": session.provider_session_id.0 })),
+                resume_cursor: Some(serde_json::json!({
+                    "schemaVersion": 1,
+                    "sessionId": session.provider_session_id.0,
+                })),
             });
         }
         Ok(result)

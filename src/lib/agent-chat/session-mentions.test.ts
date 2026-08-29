@@ -29,6 +29,7 @@ describe("session mention presentation", () => {
   it("falls back cleanly for missing titles and future providers", () => {
     expect(sessionMentionTitle({ ...session, title: null })).toBe("Chat 8f51ab");
     expect(sessionProviderLabel("gemini")).toBe("Gemini");
+    expect(sessionProviderLabel("grok")).toBe("Grok");
     expect(sessionProviderLabel("opencode")).toBe("OpenCode");
   });
 

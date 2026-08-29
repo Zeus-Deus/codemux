@@ -58,6 +58,7 @@ impl ProviderInstanceId {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
+            ProviderKind::Grok => "grok",
             ProviderKind::OpenCode => "opencode",
         };
         Self(slug.to_string())
@@ -84,6 +85,7 @@ mod tests {
             (ProviderKind::Claude, "claude"),
             (ProviderKind::Codex, "codex"),
             (ProviderKind::Cursor, "cursor"),
+            (ProviderKind::Grok, "grok"),
             (ProviderKind::OpenCode, "opencode"),
         ];
         for (driver, slug) in cases {

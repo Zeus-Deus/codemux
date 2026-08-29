@@ -50,6 +50,7 @@ function resetStore() {
         claude: emptyHealthSlot(),
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
+        grok: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });
@@ -91,6 +92,20 @@ describe("ProviderStatusNotice", () => {
     expect(banner).toHaveTextContent("Claude");
     expect(banner).toHaveTextContent(
       "Claude Agent runtime is installed but failed to run.",
+    );
+  });
+
+  it("uses the Grok label for Grok health failures", () => {
+    render(<ProviderStatusNotice provider="grok" />);
+    seedReport({
+      provider: "grok",
+      status: "error",
+      installed: false,
+      message: "Grok CLI is not installed or not on PATH.",
+      version: null,
+    });
+    expect(screen.getByTestId("provider-status-notice")).toHaveTextContent(
+      "Grok",
     );
   });
 

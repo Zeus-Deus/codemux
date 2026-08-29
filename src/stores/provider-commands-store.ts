@@ -14,14 +14,11 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  *
  * Sibling of `skills-store` — same lazy-load-on-popup-open shape, but
  * keyed per `(provider, cwd)` because project-scoped custom commands
- * are cwd-sensitive and each provider reports its own vocabulary
- * (currently only Claude reports one; Codex/OpenCode resolve empty).
+ * are cwd-sensitive and each provider reports its own vocabulary.
  *
- * The backend caches successful harvests per cwd for the app's
- * lifetime and exposes no invalidation hook, so this store mirrors
- * that: once an entry loads it stays cached for the app's lifetime.
- * It exists so multiple composers share one in-flight fetch and
- * re-opening the popup doesn't re-invoke IPC. A stale cache clears
+ * Static provider catalogues stay cached for the app's lifetime. Grok's ACP
+ * runtime can replace its backend snapshot, so the composer force-refreshes
+ * this inexpensive IPC read whenever its popup reopens. A stale cache clears
  * on `invalidate()` (used by tests) or an app restart.
  */
 interface ProviderCommandsEntry {

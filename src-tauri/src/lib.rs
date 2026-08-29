@@ -319,6 +319,10 @@ fn build_core_app<R: tauri::Runtime>(
         // events (incl. the content_delta token stream) to it instead
         // of broadcasting on the global event bus. See issue #75.
         .manage(commands::agent_chat::AgentChatChannelRegistry::default())
+        // Grok reports an exact per-prompt bill over ACP but has no separate
+        // local-history importer. Hold that bill until TurnCompleted supplies
+        // its stable turn id, then materialize it in the usage ledger.
+        .manage(commands::agent_chat::GrokUsageLedgerBridge::default())
         // Per-thread running-subagent tracker: keeps the sidebar
         // "working" spinner alive when the parent chat turn finishes
         // while subagents it spawned are still running. Consulted by
@@ -344,6 +348,17 @@ fn build_core_app<R: tauri::Runtime>(
         // Codemux, so provider releases appear after a capability refresh.
         .manage(std::sync::Arc::new(
             crate::agent_provider::cursor::capabilities::CursorCapabilityCache::new(),
+        ))
+        // Grok owns its live model/reasoning catalogue. Refreshing this ACP
+        // cache picks up CLI/model releases without a Codemux release.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::grok::capabilities::GrokCapabilityCache::new(),
+        ))
+        // Grok's ACP command catalogue starts in initialize metadata and can
+        // be replaced by a live session update. The command IPC and running
+        // provider share this cache so the composer sees the latest snapshot.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::grok::slash_commands::GrokSlashCommandCache::new(),
         ))
         // Claude capability cache — populated lazily on the first
         // `list_chat_provider_capabilities` call for Claude when
@@ -984,6 +999,23 @@ fn build_core_app<R: tauri::Runtime>(
                         );
                         registry
                             .set_cursor(std::sync::Arc::new(cursor) as _)
+                            .await;
+
+                        // Grok Build also speaks ACP over stdio and is
+                        // spawned lazily per chat session.
+                        let grok_slash_commands: tauri::State<
+                            '_,
+                            std::sync::Arc<
+                                agent_provider::grok::slash_commands::GrokSlashCommandCache,
+                            >,
+                        > = registry_handle.state();
+                        let grok =
+                            agent_provider::grok::GrokAgentProvider::new_with_slash_command_cache(
+                                agent_provider::grok::GrokProviderConfig::default(),
+                                grok_slash_commands.inner().clone(),
+                            );
+                        registry
+                            .set_grok(std::sync::Arc::new(grok) as _)
                             .await;
 
                         // OpenCode provider — Step 12 Stage 8. Shares

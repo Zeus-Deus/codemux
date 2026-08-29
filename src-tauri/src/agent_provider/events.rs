@@ -397,7 +397,7 @@ pub struct UserMessageImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostSource {
-    /// The provider's own catalogue rates (OpenCode).
+    /// Provider-owned pricing or a provider-measured bill (OpenCode/Grok).
     Provider,
     /// Codemux's static list-price table (`agent_provider::pricing`).
     Table,
@@ -706,9 +706,11 @@ pub enum ProviderRuntimeEvent {
     /// lets the sink sum the four fields for a token total and lets
     /// [`pricing`](super::pricing) price the split as a dot product.
     ///
-    /// Not persisted or fanned out. Provider-owned durable history is the
-    /// Settings → Usage source of truth, so the command layer discards this
-    /// signal; writing both would double-count Codemux-launched work.
+    /// Never fanned out. For providers with a separate durable history the
+    /// command layer discards this signal, because writing both would
+    /// double-count Codemux-launched work. Grok has no history importer, so
+    /// its exact provider bill is paired with the following `TurnCompleted`
+    /// turn id and persisted once into the same usage ledger.
     ///
     /// [`ContextUsageUpdated`]: ProviderRuntimeEvent::ContextUsageUpdated
     UsageRecorded {

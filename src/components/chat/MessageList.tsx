@@ -142,7 +142,7 @@ interface Props {
    *  Stage 3 wires the real value through AgentChatPane. */
   sessionStartedAt?: number;
   /** The session's chat provider. Drives the assistant-turn avatar's
-   *  official mark (Claude / Codex / OpenCode). Stable per session, so it
+   *  official mark. Stable per session, so it
    *  is safe to thread into the memoized rows. Absent → sparkle fallback. */
   provider?: AgentChatProviderKind | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;

@@ -26,14 +26,17 @@ import {
   usePickerFavorites,
 } from "@/stores/picker-favorites-store";
 import {
+  selectCapabilities,
   selectError,
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { useProviderHealth } from "@/stores/provider-health-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
   ProviderChatCapabilities,
+  ProviderHealthReport,
 } from "@/tauri/types";
 
 import { ProviderLogo } from "../provider-logo";
@@ -76,6 +79,7 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "claude", label: "Claude" },
   { kind: "codex", label: "Codex" },
   { kind: "cursor", label: "Cursor" },
+  { kind: "grok", label: "Grok" },
   { kind: "opencode", label: "OpenCode" },
 ];
 
@@ -121,19 +125,34 @@ function parseProviderError(error: string | null): ParsedProviderError | null {
   switch (head) {
     case "codex_not_installed":
     case "cursor_not_installed":
+    case "grok_not_installed":
     case "opencode_not_installed":
       return { kind: "not_installed", detail };
     case "codex_not_authenticated":
     case "cursor_not_authenticated":
+    case "grok_not_authenticated":
     case "opencode_not_authenticated":
       return { kind: "not_authenticated", detail };
     case "codex_harvest_failed":
     case "cursor_harvest_failed":
+    case "grok_harvest_failed":
     case "opencode_harvest_failed":
       return { kind: "harvest_failed", detail };
     default:
       return { kind: "unknown", detail: error };
   }
+}
+
+function grokHealthCapabilityError(
+  report: ProviderHealthReport | null,
+): string | null {
+  if (!report || report.status !== "error") return null;
+  const detail = report.message ?? "Grok is unavailable.";
+  if (!report.installed) return `grok_not_installed: ${detail}`;
+  if (detail.toLowerCase().includes("not authenticated")) {
+    return `grok_not_authenticated: ${detail}`;
+  }
+  return `grok_harvest_failed: ${detail}`;
 }
 
 function providerErrorTooltipLabel(parsed: ParsedProviderError): string {
@@ -240,7 +259,11 @@ export function MultiProviderModelPicker({
   const claudeCaps = allCaps.claude;
   const codexCaps = allCaps.codex;
   const cursorCaps = allCaps.cursor;
+  const grokCaps = allCaps.grok;
   const opencodeCaps = allCaps.opencode;
+  const grokHealthReport = useProviderHealth((state) => state.slots.grok.report);
+  const grokAvailabilityError =
+    allCaps.grokError ?? grokHealthCapabilityError(grokHealthReport);
 
   // Subscribe to the favorites array so toggling a star while the
   // popover is open re-sorts the visible rows immediately. Reading
@@ -278,9 +301,17 @@ export function MultiProviderModelPicker({
       claude: rowsFromCaps("claude", claudeCaps),
       codex: rowsFromCaps("codex", codexCaps),
       cursor: rowsFromCaps("cursor", cursorCaps),
+      grok: grokAvailabilityError ? [] : rowsFromCaps("grok", grokCaps),
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
-  }, [claudeCaps, codexCaps, cursorCaps, opencodeCaps]);
+  }, [
+    claudeCaps,
+    codexCaps,
+    cursorCaps,
+    grokCaps,
+    grokAvailabilityError,
+    opencodeCaps,
+  ]);
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
@@ -373,14 +404,7 @@ export function MultiProviderModelPicker({
   // out by the backend — resolves to the concrete `models[0]` row.
   // The trigger label/subtitle/tooltip and the active-row highlight
   // all derive from this one resolution so they can't disagree.
-  const capsForCurrentProvider =
-    provider === "claude"
-      ? claudeCaps
-      : provider === "codex"
-        ? codexCaps
-        : provider === "cursor"
-          ? cursorCaps
-          : opencodeCaps;
+  const capsForCurrentProvider = selectCapabilities(allCaps, provider);
   const resolvedModel = useMemo(
     () => selectModel(capsForCurrentProvider, model),
     [capsForCurrentProvider, model],
@@ -456,10 +480,29 @@ export function MultiProviderModelPicker({
             selected={railKey}
             favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
-            getError={(kind) => selectError(allCaps, kind)}
+            getError={(kind) =>
+              kind === "grok"
+                ? grokAvailabilityError
+                : selectError(allCaps, kind)
+            }
             onSelect={(next) => {
               setRailKey(next);
               setQuery("");
+              if (next === "grok" && grokAvailabilityError) {
+                // An explicit rail click is also the recovery path after the
+                // user installs/signs in out-of-band. Refresh health first,
+                // then re-harvest the live ACP catalogue so a stale discovery
+                // error cannot keep every model hidden until the timer fires.
+                void (async () => {
+                  try {
+                    await useProviderHealth
+                      .getState()
+                      .refresh("grok", { force: true });
+                  } finally {
+                    await useProviderCapabilities.getState().refresh("grok");
+                  }
+                })();
+              }
             }}
           />
           <div className="flex min-h-0 min-w-0 flex-col">
@@ -486,9 +529,14 @@ export function MultiProviderModelPicker({
                       claudeCaps,
                       codexCaps,
                       cursorCaps,
+                      grokCaps,
                       opencodeCaps,
                     )}
-                    error={errorForRail(railKey, allCaps)}
+                    error={
+                      railKey === "grok"
+                        ? grokAvailabilityError
+                        : errorForRail(railKey, allCaps)
+                    }
                   />
                 </CommandEmpty>
                 {visibleRows.length === 0 ? (
@@ -499,9 +547,14 @@ export function MultiProviderModelPicker({
                       claudeCaps,
                       codexCaps,
                       cursorCaps,
+                      grokCaps,
                       opencodeCaps,
                     )}
-                    error={errorForRail(railKey, allCaps)}
+                    error={
+                      railKey === "grok"
+                        ? grokAvailabilityError
+                        : errorForRail(railKey, allCaps)
+                    }
                     query={query}
                   />
                 ) : (
@@ -696,6 +749,7 @@ function capsForRail(
   claudeCaps: ProviderChatCapabilities | null,
   codexCaps: ProviderChatCapabilities | null,
   cursorCaps: ProviderChatCapabilities | null,
+  grokCaps: ProviderChatCapabilities | null,
   opencodeCaps: ProviderChatCapabilities | null,
 ): ProviderChatCapabilities | null {
   switch (rail) {
@@ -705,6 +759,8 @@ function capsForRail(
       return codexCaps;
     case "cursor":
       return cursorCaps;
+    case "grok":
+      return grokCaps;
     case "opencode":
       return opencodeCaps;
     case "favorites":
@@ -958,6 +1014,51 @@ function ModelListEmptyState({
       );
     }
   }
+  if (railKey === "grok") {
+    const parsed = parseProviderError(error);
+    if (parsed?.kind === "not_installed") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Grok not detected on your system
+          </p>
+          <p className="mt-1">
+            Install the <code className="rounded bg-muted px-1">grok</code> CLI
+            and ensure it is on your PATH.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "not_authenticated") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">Grok is not signed in</p>
+          <p className="mt-1">
+            {parsed.detail ?? (
+              <>
+                Run{" "}
+                <code className="rounded bg-muted px-1">
+                  grok login --device-auth
+                </code>{" "}
+                or set <code className="rounded bg-muted px-1">XAI_API_KEY</code>
+                , then try again.
+              </>
+            )}
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          Grok model discovery failed: {" "}
+          <span className="text-foreground">
+            {parsed.detail ?? error ?? ""}
+          </span>
+        </div>
+      );
+    }
+  }
   if (caps && caps.models.length === 0) {
     return (
       <div className="px-4 py-6 text-center text-xs text-muted-foreground">
@@ -1043,6 +1144,8 @@ function providerDisplayLabel(provider: AgentChatProviderKind): string {
       return "Codex";
     case "cursor":
       return "Cursor";
+    case "grok":
+      return "Grok";
     case "opencode":
       return "OpenCode";
   }

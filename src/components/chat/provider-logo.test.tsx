@@ -13,6 +13,9 @@ vi.mock("@/assets/preset-icons/claude.svg", () => ({
 vi.mock("@/assets/preset-icons/codex.svg", () => ({
   default: "/mock/codex.svg",
 }));
+vi.mock("@/assets/preset-icons/grok.svg", () => ({
+  default: "/mock/grok.svg",
+}));
 
 describe("ProviderLogo", () => {
   it("renders the Claude icon for provider='claude'", () => {
@@ -31,6 +34,14 @@ describe("ProviderLogo", () => {
     expect(img.getAttribute("data-provider")).toBe("codex");
     expect(img.getAttribute("src")).toContain("codex.svg");
     expect(img.getAttribute("alt")).toBe("Codex");
+  });
+
+  it("renders the Grok icon and accessible label", () => {
+    const { container } = render(<ProviderLogo provider="grok" />);
+    const img = container.querySelector("img") as HTMLImageElement;
+    expect(img.getAttribute("data-provider")).toBe("grok");
+    expect(img.getAttribute("src")).toContain("grok.svg");
+    expect(img.getAttribute("alt")).toBe("Grok");
   });
 
   it("forwards className for sizing", () => {

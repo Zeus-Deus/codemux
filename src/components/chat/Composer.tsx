@@ -35,6 +35,7 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
+import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -156,6 +157,10 @@ interface Props {
    *  render. */
   onContinueRun?: () => void;
   sessionReady: boolean;
+  /** Whether provider/model/runtime controls may mutate the native session.
+   *  Submit and attachments remain governed by `sessionReady`, so a provider
+   *  can freeze configuration during a turn without disabling follow-ups. */
+  configurationReady?: boolean;
   showProviderPicker: boolean;
   /** True on the pre-session draft surface (no live session yet). Only
    *  affects the default-mode placeholder copy: draft reads "Describe
@@ -333,6 +338,7 @@ export function Composer({
   interrupted = false,
   onContinueRun,
   sessionReady,
+  configurationReady = true,
   showProviderPicker,
   isDraft = false,
   focusOnMount = false,
@@ -377,6 +383,7 @@ export function Composer({
   onModeActivate,
   onModeRemove,
 }: Props) {
+  const configurationEnabled = sessionReady && configurationReady;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
   const scProvider = resolveProvider(providerKind);
@@ -525,8 +532,22 @@ export function Composer({
         activeMode: mode,
         onActivate: onModeActivate,
         onDeactivate: onModeRemove,
-      }),
-    [mode, onModeActivate, onModeRemove],
+      }).map((item) => ({
+        ...item,
+        disabled:
+          item.disabled ||
+          !configurationEnabled ||
+          (item.id === "mode:plan" &&
+            !isChatModeSupported(provider, "plan")) ||
+          (item.id === "mode:ask" && !isChatModeSupported(provider, "ask")),
+      })),
+    [
+      mode,
+      onModeActivate,
+      onModeRemove,
+      configurationEnabled,
+      provider,
+    ],
   );
 
   // `/model` — GUI-local built-in. Picking it strips the typed text
@@ -534,11 +555,13 @@ export function Composer({
   // (state-only activation, same handling as mode picks).
   const [modelPickerOpenSignal, setModelPickerOpenSignal] = useState(0);
   const modelCommand = useMemo(
-    () =>
-      buildModelCommand({
+    () => ({
+      ...buildModelCommand({
         onOpen: () => setModelPickerOpenSignal((n) => n + 1),
       }),
-    [],
+      disabled: !configurationEnabled,
+    }),
+    [configurationEnabled],
   );
 
   // `/workflow` — gated to the Claude provider (server-side runtime
@@ -726,11 +749,11 @@ export function Composer({
     void startSkillsWatcher(cwd ?? null, useSkillsStore.getState().includePlugins).catch(
       (error) => console.warn("[skills] watcher failed to start:", error),
     );
-    // Provider command discovery rides the same first-open trigger.
-    // The store's lifetime cache + backend per-cwd cache make re-fires
-    // cheap; a null cwd (Home draft, no project anchored) is a no-op
-    // inside the store.
-    void loadProviderCommands(provider, cwd ?? null);
+    // Provider command discovery rides the same first-open trigger. Grok can
+    // replace its ACP command snapshot while a session is running, so each
+    // popup reopen asks the backend cache for the latest value. Other
+    // providers retain the app-lifetime frontend cache.
+    void loadProviderCommands(provider, cwd ?? null, provider === "grok");
   }, [slashOpen, cwd, loadSkills, loadProviderCommands, provider]);
 
   // ─── Mention popup: debounced file fetch ─────────────────────────
@@ -1130,6 +1153,8 @@ export function Composer({
                 ? "text-success"
                 : sourceProvider === "cursor"
                   ? "text-accent-violet"
+                  : sourceProvider === "grok"
+                    ? "text-foreground/70"
                   : sourceProvider === "opencode"
                     ? "text-chart-4"
                     : "text-muted-foreground";
@@ -1379,12 +1404,18 @@ export function Composer({
         {
           id: "mode:plan",
           label: "Plan",
-          description: "Plan and design before coding",
+          description:
+            provider === "grok"
+              ? "Grok does not expose a client-controlled Plan mode"
+              : "Plan and design before coding",
           command: "/plan",
           icon: ListTodo,
           tone: "sky",
           group: "MODES",
-          disabled: mode === "plan",
+          disabled:
+            !configurationEnabled ||
+            mode === "plan" ||
+            !isChatModeSupported(provider, "plan"),
           onSelect: () => {},
         },
         {
@@ -1395,18 +1426,24 @@ export function Composer({
           icon: Bug,
           tone: "amber",
           group: "MODES",
-          disabled: mode === "debug",
+          disabled: !configurationEnabled || mode === "debug",
           onSelect: () => {},
         },
         {
           id: "mode:ask",
           label: "Ask",
-          description: "Read-only conversational mode",
+          description:
+            provider === "grok"
+              ? "Grok does not expose a client-controlled read-only mode"
+              : "Read-only conversational mode",
           command: "/ask",
           icon: MessageCircleQuestion,
           tone: "violet",
           group: "MODES",
-          disabled: mode === "ask",
+          disabled:
+            !configurationEnabled ||
+            mode === "ask" ||
+            !isChatModeSupported(provider, "ask"),
           onSelect: () => {},
         },
         // WORKFLOWS — single row, gated to the Claude provider. Kept
@@ -1566,11 +1603,13 @@ export function Composer({
     mcpDisabledIds,
     mcpToggleDisabled,
     mode,
+    provider,
     hostingBlockedHint,
     hostingAttachDisabled,
     scProvider,
     modelSupportsImages,
     workflowCommand,
+    configurationEnabled,
   ]);
 
   const attachPopupFooter = useMemo(() => {
@@ -2082,7 +2121,16 @@ export function Composer({
     // textarea via native tab navigation.
     if (e.shiftKey && e.key === "Tab") {
       e.preventDefault();
-      const next = nextModeInCycle(mode);
+      if (!configurationEnabled) return;
+      // Grok exposes ask/agent as restart-scoped permissions, not the
+      // client-controlled Plan/Ask chat modes. Keep keyboard cycling useful
+      // by skipping those two unsupported states.
+      const next =
+        !isChatModeSupported(provider, "plan")
+          ? mode === "debug"
+            ? "default"
+            : "debug"
+          : nextModeInCycle(mode);
       if (next === "default") {
         onModeRemove();
       } else {
@@ -2766,6 +2814,7 @@ export function Composer({
             onSubmit={onSubmit}
             onStop={onStop}
             controlsDisabled={!sessionReady}
+            configurationDisabled={!configurationEnabled}
             onAttachClick={handleAttachClick}
             attachOpen={attachOpen}
             modelPickerOpenSignal={modelPickerOpenSignal}

@@ -15,11 +15,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::agent_provider::acp::protocol::initialize_params;
 use crate::agent_provider::{
     ChatModelInfo, ContextWindowOption, EffortGranularity, PermissionModeOption,
     ProviderChatCapabilities,
 };
 use crate::json_rpc_child::{JsonRpcChild, RpcChildError, SpawnConfig};
+
+pub(crate) use crate::agent_provider::acp::protocol::looks_unauthenticated;
 
 const HARVEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -93,21 +96,6 @@ struct AvailableModel {
     name: String,
     #[serde(default, rename = "configOptions")]
     config_options: Vec<Value>,
-}
-
-pub(crate) fn initialize_params(client_name: &str) -> Value {
-    json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {
-            "session": { "configOptions": { "boolean": {} } },
-            "_meta": { "parameterizedModelPicker": true }
-        },
-        "clientInfo": {
-            "name": client_name,
-            "title": "Codemux",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    })
 }
 
 pub async fn harvest_cursor_capabilities(
@@ -190,14 +178,6 @@ fn map_rpc_error(err: RpcChildError) -> HarvestError {
     } else {
         HarvestError::HarvestFailed { message }
     }
-}
-
-pub(crate) fn looks_unauthenticated(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("authentication required")
-        || lower.contains("not authenticated")
-        || lower.contains("not logged in")
-        || lower.contains("login required")
 }
 
 fn build_capabilities(entries: Vec<AvailableModel>) -> ProviderChatCapabilities {

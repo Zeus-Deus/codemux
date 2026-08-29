@@ -16,7 +16,7 @@ import type {
 // slice we seed lands on the same thread the transcript hydrates into.
 
 vi.mock("@/tauri/commands", () => ({
-  agentChatListMessages: vi.fn().mockResolvedValue([]),
+  agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
   agentChatStartSession: vi.fn(
     (
       _paneId: string,
@@ -52,7 +52,7 @@ vi.mock("@/stores/app-store", () => ({
 
 import { useAgentChatSessionActions } from "./use-agent-chat-session-actions";
 import {
-  agentChatListMessages,
+  agentChatListMessagesAfter,
   agentChatStartSession,
   agentChatStopSession,
   type AgentChatSessionRecord,
@@ -110,10 +110,10 @@ function newestSlice() {
 
 beforeEach(() => {
   useAgentChatStore.setState({ threads: {} });
-  vi.mocked(agentChatListMessages).mockClear();
+  vi.mocked(agentChatListMessagesAfter).mockClear();
   vi.mocked(agentChatStartSession).mockClear();
   vi.mocked(agentChatStopSession).mockClear();
-  vi.mocked(agentChatListMessages).mockResolvedValue([]);
+  vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
   vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
 });
 
@@ -182,6 +182,30 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
 });
 
 describe("useAgentChatSessionActions — handleSelect (resume)", () => {
+  it("uses the selected record's provider for its model and native cursor", async () => {
+    const record = makeRecord({
+      provider: "grok",
+      model: "grok-4-future",
+      sdk_session_id: "grok-native-cursor",
+    });
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "claude" })),
+    );
+
+    await result.current.handleSelect(record);
+
+    expect(agentChatStopSession).toHaveBeenCalledWith("claude", "thread-old");
+    const [, targetProvider, input] = vi.mocked(agentChatStartSession).mock
+      .calls[0];
+    expect(targetProvider).toBe("grok");
+    expect(input).toEqual(
+      expect.objectContaining({
+        model: "grok-4-future",
+        resume_cursor: { resume: "grok-native-cursor" },
+      }),
+    );
+  });
+
   it("passes the record's persisted config through to start_session", async () => {
     const record = makeRecord({
       model: "claude-sonnet-4-6",

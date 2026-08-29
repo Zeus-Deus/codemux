@@ -837,6 +837,7 @@ export type AgentChatProviderKind =
   | "claude"
   | "codex"
   | "cursor"
+  | "grok"
   | "opencode";
 
 /** Launch-time model / reasoning / context choice for a CLI agent

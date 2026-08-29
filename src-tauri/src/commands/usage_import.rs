@@ -33,7 +33,7 @@ use crate::database::{DatabaseStore, ProviderUsageCacheRow};
 /// |---|---|
 /// | 1 | initial import (implicit — installs predating this constant) |
 /// | 2 | per-turn Codex, Claude cache TTLs, corrected model prices |
-/// | 3 | provider history authoritative; growing rows upsert; OpenCode imported |
+/// | 3 | provider history authoritative where available; growing rows upsert; OpenCode imported |
 pub const IMPORT_VERSION: i64 = 3;
 
 /// Settings key holding the [`IMPORT_VERSION`] the current rows were
@@ -1040,7 +1040,9 @@ pub async fn usage_scan_provider_history(
     Ok(report)
 }
 
-/// Drop a cache produced by an older importer, so this scan rebuilds it.
+/// Drop rebuildable rows produced by an older importer, so this scan rebuilds
+/// them. Exact Grok live rows are retained because no history scan can replace
+/// them.
 ///
 /// Returns whether a purge happened, which is also the caller's signal
 /// that the new version still needs recording — deliberately *after* the

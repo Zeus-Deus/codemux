@@ -253,6 +253,17 @@ doctest = false
 bench = false
 required-features = ["test-fixtures"]
 
+# Test helper binary used by `tests/grok_adapter.rs` — simulates the
+# official `grok --no-auto-update agent --no-leader stdio` ACP process.
+# Gated like the other fake provider executables above.
+[[bin]]
+name = "fake_grok_acp"
+path = "tests/helpers/fake_grok_acp/main.rs"
+test = false
+doctest = false
+bench = false
+required-features = ["test-fixtures"]
+
 # Test helper binary used by `tests/claude_adapter.rs` — simulates the
 # claude-agent sidecar without involving the real SDK. Gated like
 # fake_rpc_child above.

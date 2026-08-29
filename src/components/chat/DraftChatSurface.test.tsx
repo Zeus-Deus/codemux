@@ -81,9 +81,13 @@ vi.mock("@/lib/toast", () => ({
 const STUB_CAP_STATE = {
   claude: null,
   codex: null,
+  cursor: null,
+  grok: null,
   opencode: null,
   claudeError: null,
   codexError: null,
+  cursorError: null,
+  grokError: null,
   opencodeError: null,
   loaded: false,
   refresh: vi.fn(),
@@ -910,6 +914,33 @@ describe("DraftChatSurface", () => {
   });
 
   describe("config handlers", () => {
+    it.each(["plan", "ask"] as const)(
+      "heals a stale Grok %s draft mode to default",
+      async (mode) => {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        useChatDraftStore.getState().updateDraftConfig(draft.draftId, {
+          provider: "grok",
+          mode,
+        });
+        useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+        const { queryByRole } = renderSurface();
+
+        // Rendering uses the normalized mode immediately, before the healing
+        // effect has persisted it back into the debounced draft store.
+        expect(
+          queryByRole("status", {
+            name: `${mode === "plan" ? "Plan" : "Ask"} mode active`,
+          }),
+        ).toBeNull();
+        await vi.waitFor(() => {
+          expect(
+            useChatDraftStore.getState().draftsById[draft.draftId]?.mode,
+          ).toBe("default");
+        });
+      },
+    );
+
     it("provider change resets model/effort/contextWindow/permissionMode", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().updateDraftConfig(draft.draftId, {

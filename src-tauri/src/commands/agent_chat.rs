@@ -24,10 +24,10 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::io::AsyncReadExt;
 
 use crate::agent_provider::{
-    AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
-    ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    SerializableProviderError, StartSessionInput, SubagentTaskKind, ThreadId, TurnId,
-    TurnDispatchCheckpoint, UserMessageImage,
+    AgentProvider, ApprovalDecision, CostSource, ProviderChatCapabilities, ProviderError,
+    ProviderKind, ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
+    SerializableProviderError, SessionStatus, StartSessionInput, SubagentTaskKind, ThreadId,
+    TurnDispatchCheckpoint, TurnId, UserMessageImage,
 };
 use crate::commands::usage::PlanQuotaStore;
 use crate::database::{
@@ -111,6 +111,7 @@ pub struct ProviderRegistry {
     claude: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     cursor: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    grok: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
@@ -139,6 +140,11 @@ impl ProviderRegistry {
         *self.cursor.write().await = Some(provider);
     }
 
+    /// Inject the Grok Build ACP provider.
+    pub async fn set_grok(&self, provider: Arc<dyn AgentProvider>) {
+        *self.grok.write().await = Some(provider);
+    }
+
     /// Inject the OpenCode provider. Reserved for a later stage; the
     /// Stage 1 scaffold never calls this so the slot stays `None`
     /// in production.
@@ -154,6 +160,7 @@ impl ProviderRegistry {
             ProviderKind::Claude => self.claude.read().await.clone(),
             ProviderKind::Codex => self.codex.read().await.clone(),
             ProviderKind::Cursor => self.cursor.read().await.clone(),
+            ProviderKind::Grok => self.grok.read().await.clone(),
             ProviderKind::OpenCode => self.opencode.read().await.clone(),
         }
     }
@@ -170,6 +177,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.cursor.read().await.clone() {
             out.push((ProviderKind::Cursor, p));
+        }
+        if let Some(p) = self.grok.read().await.clone() {
+            out.push((ProviderKind::Grok, p));
         }
         if let Some(p) = self.opencode.read().await.clone() {
             out.push((ProviderKind::OpenCode, p));
@@ -222,6 +232,81 @@ struct AgentChatChannelEntry {
 pub struct AgentChatChannelRegistry {
     channels: Mutex<HashMap<String, Vec<AgentChatChannelEntry>>>,
     next_generation: AtomicU64,
+}
+
+/// One authoritative Grok bill waiting for the immediately-following
+/// `TurnCompleted`, which supplies the stable Codemux turn id used to dedupe
+/// the ledger row. Grok emits exactly one final usage record per prompt; a map
+/// keyed by thread also bounds abandoned entries to one per live conversation.
+#[derive(Debug, Clone)]
+struct PendingGrokUsage {
+    model: Option<String>,
+    subagent: bool,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    /// Only a provider-measured cost is retained. A missing or estimated cost
+    /// stays unknown rather than being made precise by Codemux.
+    cost_usd: Option<f64>,
+}
+
+/// Command-layer bridge from Grok's exact runtime bill to the durable usage
+/// ledger. Other providers remain history-import-only, avoiding the double
+/// count that originally caused all adapter `UsageRecorded` events to be
+/// discarded here.
+#[derive(Default)]
+pub struct GrokUsageLedgerBridge {
+    pending: Mutex<HashMap<String, PendingGrokUsage>>,
+}
+
+impl GrokUsageLedgerBridge {
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        thread_id: &ThreadId,
+        model: Option<String>,
+        subagent: bool,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+        cost_usd: Option<f64>,
+        cost_source: Option<CostSource>,
+    ) {
+        if thread_id.0.is_empty() {
+            return;
+        }
+        let cost_usd = match (cost_usd, cost_source) {
+            (Some(cost), Some(CostSource::Provider)) if cost.is_finite() && cost >= 0.0 => {
+                Some(cost)
+            }
+            _ => None,
+        };
+        self.pending.lock().unwrap().insert(
+            thread_id.0.clone(),
+            PendingGrokUsage {
+                model,
+                subagent,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                cost_usd,
+            },
+        );
+    }
+
+    fn take(&self, thread_id: &ThreadId) -> Option<PendingGrokUsage> {
+        self.pending.lock().unwrap().remove(&thread_id.0)
+    }
+
+    fn clear(&self, thread_id: &ThreadId) {
+        self.pending.lock().unwrap().remove(&thread_id.0);
+    }
 }
 
 impl AgentChatChannelRegistry {
@@ -539,6 +624,13 @@ pub fn pane_workspace_context(
     )
 }
 
+fn should_recover_persisted_resume_cursor(
+    fresh_session: bool,
+    resume_cursor: &Option<serde_json::Value>,
+) -> bool {
+    !fresh_session && resume_cursor.is_none()
+}
+
 /// Start a new provider session for the given pane.
 ///
 /// The returned [`ThreadId`] is the identifier the provider itself
@@ -617,11 +709,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // kept the same thread/provider. New Chat uses a new thread id, and a
     // provider handoff has a different provider, so neither can accidentally
     // inherit an old provider's cursor through this fallback.
-    if input.resume_cursor.is_none() {
+    if should_recover_persisted_resume_cursor(input.fresh_session, &input.resume_cursor) {
         let provider_name = match provider {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
+            ProviderKind::Grok => "grok",
             ProviderKind::OpenCode => "opencode",
         };
         let persisted_sdk_session_id = {
@@ -734,6 +827,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
             ProviderKind::Cursor => "cursor",
+            ProviderKind::Grok => "grok",
             ProviderKind::OpenCode => "opencode",
         };
         // A CodeMux thread can keep its transcript while changing provider,
@@ -1312,6 +1406,7 @@ fn stored_provider_kind(provider: &str) -> Result<ProviderKind, String> {
         "claude" => Ok(ProviderKind::Claude),
         "codex" => Ok(ProviderKind::Codex),
         "cursor" => Ok(ProviderKind::Cursor),
+        "grok" => Ok(ProviderKind::Grok),
         "opencode" => Ok(ProviderKind::OpenCode),
         other => Err(format!("unsupported provider stored for chat: {other}")),
     }
@@ -1584,6 +1679,7 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::Cursor => Some("agent"),
+        ProviderKind::Grok => Some("agent"),
         ProviderKind::OpenCode => None,
     }
 }
@@ -1635,6 +1731,15 @@ fn resolve_start_permission_mode(
             match mode.as_str() {
                 "bypassPermissions" | "danger-full-access" => "agent",
                 "agent" | "ask" | "plan" => mode.as_str(),
+                _ => "ask",
+            }
+            .to_string(),
+        ),
+        // Grok's yolo flag is fixed when an ACP session starts. Translate
+        // foreign providers' values without ever widening an unknown mode.
+        Some(mode) if provider == ProviderKind::Grok => Some(
+            match mode.as_str() {
+                "bypassPermissions" | "danger-full-access" | "agent" => "agent",
                 _ => "ask",
             }
             .to_string(),
@@ -1796,6 +1901,7 @@ pub async fn ensure_live_session<R: Runtime>(
         cwd: cwd.clone(),
         model: record.model.clone(),
         resume_cursor,
+        fresh_session: false,
         permission_mode: permission_mode.clone(),
         effort: record.effort.clone(),
         context_window: record.context_window.clone(),
@@ -1895,6 +2001,8 @@ fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
         // `.agents/skills` projection; selected bodies are inlined into the
         // ACP prompt exactly as they are for the other providers.
         ProviderKind::Cursor => crate::skills::SkillProvider::Codex,
+        // Grok also consumes the portable `.agents/skills` projection.
+        ProviderKind::Grok => crate::skills::SkillProvider::Codex,
         ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
     }
 }
@@ -3328,6 +3436,10 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
         '_,
         std::sync::Arc<crate::agent_provider::cursor::capabilities::CursorCapabilityCache>,
     >,
+    grok_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::grok::capabilities::GrokCapabilityCache>,
+    >,
     claude_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
@@ -3388,6 +3500,18 @@ pub async fn list_chat_provider_capabilities<R: Runtime>(
                 .await
                 .map_err(|error| error.to_command_string())
         }
+        ProviderKind::Grok => {
+            let binary_path = which::which("grok").map_err(|_| {
+                crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
+                    hint: "Install the official Grok CLI and ensure `grok` is on PATH.".into(),
+                }
+                .to_command_string()
+            })?;
+            grok_cache
+                .get_or_harvest(&binary_path)
+                .await
+                .map_err(|error| error.to_command_string())
+        }
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
                 opencode_manager.inner().as_ref(),
@@ -3419,13 +3543,10 @@ pub async fn agent_chat_provider_health(
 }
 
 /// List the provider-native slash commands available to a chat thread
-/// anchored at `cwd`. Claude is the only provider that reports a
-/// command vocabulary today (via the Agent SDK's `supportedCommands()`
-/// probe — built-ins like `/compact` / `/init` / `/review` plus custom
-/// `~/.claude/commands` and `<cwd>/.claude/commands` entries). Codex
-/// and OpenCode expose no discovery surface, so they resolve to an
-/// empty list — the composer then shows only Codemux's own built-ins,
-/// matching how reference multi-provider clients behave.
+/// anchored at `cwd`. Claude discovers them through the Agent SDK, while
+/// Grok reads the official ACP initialize catalogue and any newer full
+/// snapshot observed by a running session. Providers without a discovery
+/// surface resolve to an empty list.
 ///
 /// Selecting one of these in the UI inserts the literal `/name ` text
 /// into the draft; the text is forwarded verbatim to the provider,
@@ -3439,9 +3560,24 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
     >,
+    grok_slash_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::grok::slash_commands::GrokSlashCommandCache>,
+    >,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     match provider {
         ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
+        ProviderKind::Grok => {
+            let binary_path = which::which("grok").map_err(|_| {
+                crate::agent_provider::grok::capabilities::HarvestError::NotInstalled {
+                    hint: "Install the official Grok CLI and ensure `grok` is on PATH.".into(),
+                }
+                .to_command_string()
+            })?;
+            grok_slash_cache
+                .get_or_harvest(&binary_path, std::path::Path::new(&cwd))
+                .await
+        }
         // No discovery surface on these providers (yet) — empty list,
         // not an error, so the popup renders without a failure footer.
         ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::OpenCode => Ok(Vec::new()),
@@ -4055,6 +4191,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
         "claude" => ProviderKind::Claude,
         "codex" => ProviderKind::Codex,
         "cursor" => ProviderKind::Cursor,
+        "grok" => ProviderKind::Grok,
         "opencode" => ProviderKind::OpenCode,
         other => return Err(format!("unsupported_provider: {other}")),
     };
@@ -4558,6 +4695,103 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     }
 }
 
+/// Fold usage/lifecycle events into Grok's exact live-ledger bridge.
+///
+/// Returns `true` for every `UsageRecorded` event because accounting signals
+/// are never transcript/UI traffic. Non-Grok records are dropped exactly as
+/// before; Grok records are held until `TurnCompleted` gives them an
+/// idempotency key. Lifecycle settlement clears an orphaned pending record so
+/// an aborted turn can never be charged to the next one.
+fn bridge_grok_usage_event<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEvent) -> bool {
+    match event {
+        ProviderRuntimeEvent::UsageRecorded {
+            thread_id,
+            provider,
+            model,
+            subagent,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            cost_usd,
+            cost_source,
+        } => {
+            if *provider == ProviderKind::Grok {
+                if let Some(bridge) = app.try_state::<GrokUsageLedgerBridge>() {
+                    bridge.record(
+                        thread_id,
+                        model.clone(),
+                        *subagent,
+                        *input_tokens,
+                        *output_tokens,
+                        *cache_read_tokens,
+                        *cache_write_tokens,
+                        *reasoning_tokens,
+                        *cost_usd,
+                        *cost_source,
+                    );
+                }
+            }
+            true
+        }
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id, turn_id, ..
+        } => {
+            let Some(bridge) = app.try_state::<GrokUsageLedgerBridge>() else {
+                return false;
+            };
+            let Some(usage) = bridge.take(thread_id) else {
+                return false;
+            };
+            let Some(db) = app.try_state::<DatabaseStore>() else {
+                return false;
+            };
+            let created_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or(0);
+            let import_key = format!("grok:{}:{}", thread_id.0, turn_id.0);
+            let cost_source = usage.cost_usd.map(|_| CostSource::Provider.as_str());
+            if let Err(error) = db.upsert_grok_live_usage_row(
+                &import_key,
+                created_at,
+                &thread_id.0,
+                usage.model.as_deref(),
+                usage.subagent,
+                saturating_usage_i64(usage.input_tokens),
+                saturating_usage_i64(usage.output_tokens),
+                saturating_usage_i64(usage.cache_read_tokens),
+                saturating_usage_i64(usage.cache_write_tokens),
+                saturating_usage_i64(usage.reasoning_tokens),
+                usage.cost_usd,
+                cost_source,
+            ) {
+                eprintln!("[codemux::agent_chat] failed to persist Grok usage: {error}");
+            }
+            false
+        }
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id,
+            status:
+                SessionStatus::Running { .. }
+                | SessionStatus::Ready
+                | SessionStatus::Closed
+                | SessionStatus::Error { .. },
+        } => {
+            if let Some(bridge) = app.try_state::<GrokUsageLedgerBridge>() {
+                bridge.clear(thread_id);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn saturating_usage_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Forward a single provider event to the frontend.
 ///
 /// Routing:
@@ -4613,11 +4847,14 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         return;
     }
 
-    // Adapters still compute a per-turn usage delta, but it is intentionally
-    // discarded here: provider-owned history (the JSONL/SQLite scan) is the
-    // sole accounting source, and writing both streams would count every
-    // Codemux-launched turn twice.
-    if matches!(event, ProviderRuntimeEvent::UsageRecorded { .. }) {
+    // Claude, Codex, Cursor, and OpenCode have provider-owned history (or no
+    // exact bill), so their adapter deltas remain intentionally discarded to
+    // avoid double-counting the history importer. Grok is different: its
+    // PromptResponse usage is the authoritative bill and no local-history
+    // importer exists. Buffer that one exact record until the immediately
+    // following TurnCompleted supplies a stable turn id, then upsert it into
+    // the same durable ledger the Usage dashboard reads.
+    if bridge_grok_usage_event(app, &event) {
         return;
     }
 
@@ -6658,6 +6895,16 @@ mod tests {
     // ── start-path permission_mode heal ──
 
     #[test]
+    fn explicit_fresh_session_suppresses_persisted_cursor_recovery() {
+        assert!(should_recover_persisted_resume_cursor(false, &None));
+        assert!(!should_recover_persisted_resume_cursor(true, &None));
+        assert!(!should_recover_persisted_resume_cursor(
+            false,
+            &Some(json!({ "resume": "native-session" }))
+        ));
+    }
+
+    #[test]
     fn resolve_start_permission_mode_heals_null_to_provider_default() {
         // A null-passing caller (UI shows "Full access") gets the provider
         // default substituted so the launch matches the display.
@@ -6671,6 +6918,10 @@ mod tests {
         );
         assert_eq!(
             resolve_start_permission_mode(ProviderKind::Cursor, None),
+            Some("agent".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Grok, None),
             Some("agent".to_string())
         );
         // OpenCode has no permission modes, so None stays None.
@@ -6720,6 +6971,13 @@ mod tests {
             resolve_start_permission_mode(ProviderKind::Codex, Some("agent".to_string())),
             Some("danger-full-access".to_string())
         );
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Grok,
+                Some("danger-full-access".to_string())
+            ),
+            Some("agent".to_string())
+        );
     }
 
     #[test]
@@ -6740,6 +6998,23 @@ mod tests {
         for native in ["agent", "ask", "plan"] {
             assert_eq!(
                 resolve_start_permission_mode(ProviderKind::Cursor, Some(native.to_string())),
+                Some(native.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_degrades_foreign_grok_modes_to_ask() {
+        for foreign in ["default", "acceptEdits", "read-only", "workspace-write"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Grok, Some(foreign.to_string())),
+                Some("ask".to_string()),
+                "{foreign} should degrade to Grok's ask-first mode"
+            );
+        }
+        for native in ["agent", "ask"] {
+            assert_eq!(
+                resolve_start_permission_mode(ProviderKind::Grok, Some(native.to_string())),
                 Some(native.to_string())
             );
         }

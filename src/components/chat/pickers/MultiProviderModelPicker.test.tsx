@@ -8,6 +8,10 @@ import type {
   ProviderChatCapabilities,
 } from "@/tauri/types";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  emptyHealthSlot,
+  useProviderHealth,
+} from "@/stores/provider-health-store";
 import { usePickerFavorites } from "@/stores/picker-favorites-store";
 
 import { MultiProviderModelPicker } from "./MultiProviderModelPicker";
@@ -68,6 +72,26 @@ const CURSOR_CAPS = makeCaps([
   makeModel({ id: "cursor-fast", label: "Cursor Fast" }),
 ]);
 
+const GROK_CAPS = makeCaps([
+  makeModel({ id: "default", label: "Grok default" }),
+]);
+
+const originalHealthRefresh = useProviderHealth.getState().refresh;
+const originalCapabilitiesRefresh = useProviderCapabilities.getState().refresh;
+
+function resetHealthStore() {
+  useProviderHealth.setState({
+    refresh: originalHealthRefresh,
+    slots: {
+      claude: emptyHealthSlot(),
+      codex: emptyHealthSlot(),
+      cursor: emptyHealthSlot(),
+      grok: emptyHealthSlot(),
+      opencode: emptyHealthSlot(),
+    },
+  });
+}
+
 const OPENCODE_CAPS = makeCaps([
   makeModel({
     id: "openai/gpt-5",
@@ -90,32 +114,39 @@ function seedStore(opts: {
   claude?: ProviderChatCapabilities | null;
   codex?: ProviderChatCapabilities | null;
   cursor?: ProviderChatCapabilities | null;
+  grok?: ProviderChatCapabilities | null;
   opencode?: ProviderChatCapabilities | null;
   claudeError?: string | null;
   codexError?: string | null;
   cursorError?: string | null;
+  grokError?: string | null;
   opencodeError?: string | null;
 } = {}) {
   useProviderCapabilities.setState({
     claude: opts.claude ?? null,
     codex: opts.codex ?? null,
     cursor: opts.cursor ?? null,
+    grok: opts.grok ?? null,
     opencode: opts.opencode ?? null,
     claudeError: opts.claudeError ?? null,
     codexError: opts.codexError ?? null,
     cursorError: opts.cursorError ?? null,
+    grokError: opts.grokError ?? null,
     opencodeError: opts.opencodeError ?? null,
     loaded: false,
   });
 }
 
 beforeEach(() => {
+  resetHealthStore();
   seedStore({
     claude: CLAUDE_CAPS,
     codex: CODEX_CAPS,
     cursor: CURSOR_CAPS,
+    grok: GROK_CAPS,
     opencode: OPENCODE_CAPS,
   });
+  useProviderCapabilities.setState({ refresh: originalCapabilitiesRefresh });
   // Clear any favorites from a previous test so the search-boost
   // assertions start from a known sort order.
   localStorage.clear();
@@ -124,6 +155,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetHealthStore();
   localStorage.clear();
   usePickerFavorites.setState({ favorites: [] });
 });
@@ -269,13 +301,14 @@ describe("MultiProviderModelPicker — model descriptions", () => {
 });
 
 describe("MultiProviderModelPicker — provider rail", () => {
-  it("renders all four providers in the rail", async () => {
+  it("renders all five providers in the rail", async () => {
     const user = userEvent.setup();
     renderPicker();
     await openPicker(user);
     expect(screen.getByTestId("provider-rail-claude")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-codex")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-cursor")).toBeInTheDocument();
+    expect(screen.getByTestId("provider-rail-grok")).toBeInTheDocument();
     expect(screen.getByTestId("provider-rail-opencode")).toBeInTheDocument();
   });
 
@@ -484,6 +517,91 @@ describe("MultiProviderModelPicker — search", () => {
 });
 
 describe("MultiProviderModelPicker — empty + error states", () => {
+  it("uses live Grok health for sign-in guidance and force-retries on rail selection", async () => {
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    const refreshCapabilities = vi.fn().mockResolvedValue(undefined);
+    useProviderCapabilities.setState({ refresh: refreshCapabilities });
+    useProviderHealth.setState((state) => ({
+      refresh,
+      slots: {
+        ...state.slots,
+        grok: {
+          ...emptyHealthSlot(),
+          report: {
+            provider: "grok",
+            status: "error",
+            installed: true,
+            message:
+              "Grok CLI is not authenticated. Run `grok login --device-auth`.",
+            version: "1.0.4",
+          },
+        },
+      },
+    }));
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-grok"));
+
+    expect(await screen.findByText("Grok is not signed in")).toBeInTheDocument();
+    expect(refresh).toHaveBeenCalledWith("grok", { force: true });
+    expect(refreshCapabilities).toHaveBeenCalledWith("grok");
+  });
+
+  it("clears a stale Grok discovery error immediately after recovery", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: CODEX_CAPS,
+      grok: null,
+      grokError: "grok_not_authenticated: cached token expired",
+    });
+    let finishHealthRefresh!: () => void;
+    const refreshHealth = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishHealthRefresh = resolve;
+        }),
+    );
+    const refreshCapabilities = vi.fn().mockImplementation(async () => {
+      useProviderCapabilities.setState({
+        grok: GROK_CAPS,
+        grokError: null,
+      });
+    });
+    useProviderHealth.setState({ refresh: refreshHealth });
+    useProviderCapabilities.setState({ refresh: refreshCapabilities });
+
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-grok"));
+
+    expect(await screen.findByText("Grok is not signed in")).toBeInTheDocument();
+    finishHealthRefresh();
+    await waitFor(() => expect(refreshCapabilities).toHaveBeenCalledWith("grok"));
+    expect(await screen.findByText("Grok default")).toBeInTheDocument();
+    expect(screen.queryByText("Grok is not signed in")).not.toBeInTheDocument();
+  });
+
+  it("shows Grok sign-in guidance for a live discovery auth error", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: CODEX_CAPS,
+      grok: null,
+      grokError: "grok_not_authenticated: cached token expired",
+    });
+    useProviderCapabilities.setState({
+      refresh: vi.fn().mockResolvedValue(undefined),
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-grok"));
+
+    expect(await screen.findByText("Grok is not signed in")).toBeInTheDocument();
+    expect(screen.getByText("cached token expired")).toBeInTheDocument();
+  });
+
   it("shows 'OpenCode not detected' when opencode_not_installed", async () => {
     seedStore({
       claude: CLAUDE_CAPS,

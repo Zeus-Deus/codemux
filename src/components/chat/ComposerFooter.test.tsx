@@ -8,12 +8,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 vi.mock("./pickers/MultiProviderModelPicker", () => ({
   MultiProviderModelPicker: ({
     onProviderModelChange,
+    disabled,
   }: {
     onProviderModelChange: (provider: "codex", model: string) => void;
+    disabled?: boolean;
   }) => (
     <button
       data-testid="multi-provider-picker-stub"
       onClick={() => onProviderModelChange("codex", "gpt-5.4")}
+      disabled={disabled}
     />
   ),
 }));
@@ -155,6 +158,18 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     renderFooter({ controlsDisabled: true, onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");
     expect(attach).toBeDisabled();
+  });
+
+  it("can freeze configuration without disabling queued-turn attachments", () => {
+    renderFooter({
+      showProviderPicker: true,
+      configurationDisabled: true,
+      onAttachClick: vi.fn(),
+    });
+
+    expect(screen.getByTestId("multi-provider-picker-stub")).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Full access/i })).toBeDisabled();
+    expect(screen.getByTestId("composer-attach-button")).not.toBeDisabled();
   });
 
   it("forwards a cross-provider model pick as one atomic selection", () => {

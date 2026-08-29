@@ -30,6 +30,10 @@ import {
   materializeAndSend,
   type MaterializePhase,
 } from "@/lib/agent-chat/materialize";
+import {
+  isChatModeSupported,
+  normalizeChatModeForProvider,
+} from "@/lib/agent-chat/mode-compatibility";
 import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
 import {
   resolveSkillSelection,
@@ -121,6 +125,19 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const updateDraftTarget = useChatDraftStore((s) => s.updateDraftTarget);
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
+  const normalizedMode = normalizeChatModeForProvider(
+    draft.provider,
+    draft.mode,
+  );
+
+  // Persisted drafts can predate a provider switch or a capability change.
+  // Heal unsupported pills immediately so they neither render nor survive to
+  // the first-send materialization path.
+  useEffect(() => {
+    if (normalizedMode !== draft.mode) {
+      updateDraftConfig(draft.draftId, { mode: normalizedMode });
+    }
+  }, [draft.draftId, draft.mode, normalizedMode, updateDraftConfig]);
 
   // Step 8 Stage 2 — staged attachments live on the agent-chat slice
   // keyed by `draft.threadId` (pre-minted; survives materialize). The
@@ -960,6 +977,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       updateDraftConfig(draft.draftId, {
         provider: nextProvider,
         model: nextModel,
+        mode: normalizeChatModeForProvider(nextProvider, draft.mode),
         // Commit the next provider's native permission default (via
         // capabilityDefaults → defaultPermissionModeForProvider). The
         // picker can *display* a fallback for null/unknown values without
@@ -973,7 +991,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         fastMode: false,
       });
     },
-    [draft.draftId, draft.provider, updateDraftConfig],
+    [draft.draftId, draft.mode, draft.provider, updateDraftConfig],
   );
 
   const handleModelChange = useCallback(
@@ -1016,9 +1034,13 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // Stages 4 & 6.
   const handleModeActivate = useCallback(
     (newMode: ActivePillMode) => {
-      updateDraftConfig(draft.draftId, { mode: newMode });
+      updateDraftConfig(draft.draftId, {
+        mode: isChatModeSupported(draft.provider, newMode)
+          ? newMode
+          : "default",
+      });
     },
-    [draft.draftId, updateDraftConfig],
+    [draft.draftId, draft.provider, updateDraftConfig],
   );
   const handleModeRemove = useCallback(() => {
     updateDraftConfig(draft.draftId, { mode: "default" });
@@ -1110,7 +1132,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       // cwd string.
       zone1Override={null}
       belowComposerSlot={belowComposerSlot}
-      mode={draft.mode}
+      mode={normalizedMode}
       stagedAttachments={stagedAttachments}
       onRemoveAttachment={(id) => {
         // Best-effort delete of the backend staging file if this chip

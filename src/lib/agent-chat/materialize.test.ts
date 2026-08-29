@@ -1503,6 +1503,33 @@ describe("materializeWithPreset", () => {
   });
 
   describe("Stage 3 — mode pill propagation", () => {
+    it.each(["plan", "ask"] as const)(
+      "normalizes a stale Grok %s mode before session launch and slice seeding",
+      async (mode) => {
+        const actions = makeActions();
+        const draft = makeDraft({
+          target: { kind: "project", projectPath: "/projects/foo" },
+          provider: "grok",
+          permissionMode: "agent",
+          mode,
+        });
+
+        await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+        expect(agentChatStartSession).toHaveBeenCalledWith(
+          "pane-new",
+          "grok",
+          expect.objectContaining({ permission_mode: "agent" }),
+        );
+        expect(actions.setMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "default",
+        );
+        const sendInput = vi.mocked(agentChatSendTurn).mock.calls[0]![1];
+        expect(sendInput.text).not.toContain("You are in ASK mode");
+      },
+    );
+
     it("draft.mode='plan' overrides permission_mode to 'plan' on start_session", async () => {
       const actions = makeActions();
       const draft = makeDraft({

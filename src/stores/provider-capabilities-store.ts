@@ -22,6 +22,11 @@ export const CURSOR_CAPABILITY_TTL_MS = 5 * 60 * 1000;
 export const CURSOR_CAPABILITY_REFRESH_MS =
   CURSOR_CAPABILITY_TTL_MS + 60 * 1000;
 
+/** Grok's model and reasoning catalogue is owned by the installed CLI and
+ *  can change independently of Codemux. Re-discover it on the same bounded
+ *  cadence as Cursor's live ACP catalogue. */
+export const GROK_CAPABILITY_REFRESH_MS = CURSOR_CAPABILITY_REFRESH_MS;
+
 /** Whether a scheduled Cursor re-harvest is worth issuing.
  *
  *  A machine without the CLI has no catalog to refresh, and the probe
@@ -35,10 +40,18 @@ export function shouldRefreshCursorCapabilities(
   return health?.installed !== false;
 }
 
+/** Same installed-binary guard for Grok's scheduled live discovery. */
+export function shouldRefreshGrokCapabilities(
+  health: ProviderHealthReport | null,
+): boolean {
+  return health?.installed !== false;
+}
+
 interface ProviderCapabilitiesStore {
   claude: ProviderChatCapabilities | null;
   codex: ProviderChatCapabilities | null;
   cursor: ProviderChatCapabilities | null;
+  grok: ProviderChatCapabilities | null;
   /** Step 12 Stage 3 — slot for OpenCode's live model harvest. Stays
    *  `null` until `refresh("opencode")` resolves. Failure surfaces in
    *  `opencodeError`; the slot itself stays `null` so the picker can
@@ -47,6 +60,7 @@ interface ProviderCapabilitiesStore {
   claudeError: string | null;
   codexError: string | null;
   cursorError: string | null;
+  grokError: string | null;
   opencodeError: string | null;
   loaded: boolean;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
@@ -58,10 +72,12 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
     claude: null,
     codex: null,
     cursor: null,
+    grok: null,
     opencode: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
+    grokError: null,
     opencodeError: null,
     loaded: false,
     refresh: async (provider) => {
@@ -86,6 +102,7 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
         store.refresh("claude"),
         store.refresh("codex"),
         store.refresh("cursor"),
+        store.refresh("grok"),
         store.refresh("opencode"),
       ]);
       set({ loaded: true });
@@ -118,23 +135,30 @@ export function useProviderCapabilitiesInit(): void {
   const refreshAll = useProviderCapabilities((s) => s.refreshAll);
   const refresh = useProviderCapabilities((s) => s.refresh);
   useEffect(() => {
-    let timer: number | null = null;
+    let cursorTimer: number | null = null;
+    let grokTimer: number | null = null;
     let cancelled = false;
     void refreshAll().finally(() => {
       if (cancelled) return;
-      timer = window.setInterval(() => {
+      cursorTimer = window.setInterval(() => {
         const health = useProviderHealth.getState().slots.cursor.report;
         if (!shouldRefreshCursorCapabilities(health)) return;
         void refresh("cursor");
       }, CURSOR_CAPABILITY_REFRESH_MS);
+      grokTimer = window.setInterval(() => {
+        const health = useProviderHealth.getState().slots.grok.report;
+        if (!shouldRefreshGrokCapabilities(health)) return;
+        void refresh("grok");
+      }, GROK_CAPABILITY_REFRESH_MS);
     });
-    // Cursor's installed CLI is the catalog authority. Refresh on a bounded
-    // cadence so newly released/retired models appear without a Codemux
-    // release or app restart. Start the clock after the initial harvest so
-    // the matching Rust TTL has definitely elapsed on the first tick.
+    // The installed Cursor and Grok CLIs are their catalog authorities.
+    // Refresh on a bounded cadence so newly released/retired models and
+    // reasoning options appear without a Codemux release or app restart.
+    // Start the clocks after the initial harvest.
     return () => {
       cancelled = true;
-      if (timer !== null) window.clearInterval(timer);
+      if (cursorTimer !== null) window.clearInterval(cursorTimer);
+      if (grokTimer !== null) window.clearInterval(grokTimer);
     };
   }, [refreshAll, refresh]);
 }
@@ -154,6 +178,8 @@ export function selectCapabilities(
       return state.codex;
     case "cursor":
       return state.cursor;
+    case "grok":
+      return state.grok;
     case "opencode":
       return state.opencode;
   }
@@ -171,6 +197,8 @@ export function selectError(
       return state.codexError;
     case "cursor":
       return state.cursorError;
+    case "grok":
+      return state.grokError;
     case "opencode":
       return state.opencodeError;
   }
@@ -216,6 +244,8 @@ function storeOk(
       return { codex: caps, codexError: null };
     case "cursor":
       return { cursor: caps, cursorError: null };
+    case "grok":
+      return { grok: caps, grokError: null };
     case "opencode":
       return { opencode: caps, opencodeError: null };
   }
@@ -236,6 +266,8 @@ function storeErr(
       return { codexError: message };
     case "cursor":
       return { cursorError: message };
+    case "grok":
+      return { grokError: message };
     case "opencode":
       return { opencodeError: message };
   }

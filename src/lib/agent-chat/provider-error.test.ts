@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { formatProviderError } from "./provider-error";
+import {
+  formatProviderError,
+  grokModelChangeRequiresRestart,
+} from "./provider-error";
 
 describe("formatProviderError", () => {
   it("renders not_installed with the provider label and hint", () => {
@@ -23,6 +26,30 @@ describe("formatProviderError", () => {
     expect(formatProviderError(raw)).toBe(
       "Codex CLI is not authenticated. Run `codex login` and try again.",
     );
+  });
+
+  it("uses the Grok provider label", () => {
+    const raw = JSON.stringify({
+      kind: "not_authenticated",
+      provider: "grok",
+      hint: "Run `grok login` and try again.",
+    });
+    expect(formatProviderError(raw)).toBe(
+      "Grok CLI is not authenticated. Run `grok login` and try again.",
+    );
+  });
+
+  it("recognizes and formats Grok model-family restart errors", () => {
+    const raw = JSON.stringify({
+      kind: "validation_error",
+      message:
+        "grok_model_restart_required: Grok cannot switch model families in this session.",
+    });
+    expect(grokModelChangeRequiresRestart(raw)).toBe(true);
+    expect(formatProviderError(raw)).toBe(
+      "Grok cannot switch model families in this session.",
+    );
+    expect(grokModelChangeRequiresRestart("some other failure")).toBe(false);
   });
 
   it("renders process_error with its source detail", () => {

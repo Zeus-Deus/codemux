@@ -214,6 +214,24 @@ impl PendingMap {
     }
 }
 
+/// Removes a request from the routing table when its awaiting future is
+/// dropped. Most calls live until a response or timeout, but vendor ACP
+/// protocols can provide a notification-based completion fallback (xAI's
+/// prompt-complete extension does); abandoning the standard response future
+/// must not leak its sender for the lifetime of the subprocess.
+struct PendingRequestGuard {
+    pending: Arc<Mutex<PendingMap>>,
+    id: u64,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(self.id);
+        }
+    }
+}
+
 /// Bounded FIFO buffer of the last-N stderr bytes.
 #[derive(Default)]
 struct StderrTail {
@@ -500,6 +518,10 @@ impl JsonRpcChild {
                 .map_err(|_| RpcChildError::ProtocolError("pending map poisoned".into()))?;
             map.insert(id, tx);
         }
+        let _pending_guard = PendingRequestGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
 
         let request = serde_json::json!({
             "jsonrpc": "2.0",
