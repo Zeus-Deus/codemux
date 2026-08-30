@@ -4,7 +4,14 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { MarkdownRendered } from "@/components/editor/MarkdownRendered";
 import { updatePullRequest } from "@/tauri/commands";
-import { btnCard, btnEmberSolid, tzBody, tzEyebrow, tzMeta } from "./review-ui";
+import {
+  btnCard,
+  btnCardXs,
+  btnEmberSolid,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+} from "./review-ui";
 import {
   clearDescriptionDraft,
   getDescriptionDraft,
@@ -181,18 +188,33 @@ export function ReviewDescription({
           </div>
         </div>
       ) : text ? (
-        <div className={cn(folded && "relative max-h-40 overflow-hidden")}>
-          <MarkdownRendered content={text} inline />
-          {folded && (
+        <div className="flex flex-col items-start">
+          <div className={cn("w-full", folded && "relative max-h-40 overflow-hidden")}>
+            <MarkdownRendered content={text} inline />
+            {folded && (
+              // Scrim only — the last visible line fades out instead of
+              // being sliced through. The control below is the control.
+              <div
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-background via-background/80 to-transparent"
+              />
+            )}
+          </div>
+          {foldable && (
             <button
               type="button"
               onClick={toggleFold}
+              aria-expanded={!folded}
               className={cn(
-                "absolute inset-x-0 bottom-0 flex h-10 items-end justify-center bg-gradient-to-t from-background to-transparent text-muted-foreground hover:text-foreground",
-                tzMeta,
+                btnCardXs,
+                "mt-1.5 text-muted-foreground hover:text-foreground",
               )}
+              data-testid="description-fold"
             >
-              Show all {lineCount} lines
+              <ChevronDown
+                className={cn("size-3 transition-transform", !folded && "rotate-180")}
+              />
+              {folded ? `Show all ${lineCount} lines` : "Show less"}
             </button>
           )}
         </div>
