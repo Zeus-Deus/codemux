@@ -1,16 +1,18 @@
 import { useCallback, useState } from "react";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
+import {
+  launchAdoptedThread,
+  launchResumedRecord,
+} from "@/lib/agent-chat/adopt-external-session";
 import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import { toExternalAgentSession } from "@/lib/agent-chat/external-sessions";
-import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
   agentChatAdoptExternalSession,
   agentChatGetSession,
-  agentChatListMessagesAfter,
   agentChatStartSession,
   agentChatStopSession,
   type AdoptableAgentSession,
@@ -159,7 +161,8 @@ export function useAgentChatSessionActions(
         toast.error("Cannot resume: no working directory.");
         return;
       }
-      if (!record.sdk_session_id) {
+      const sdkSessionId = record.sdk_session_id;
+      if (!sdkSessionId) {
         toast.warning(
           "This chat hasn't finished its first turn yet — can't resume.",
         );
@@ -179,88 +182,14 @@ export function useAgentChatSessionActions(
           // previous chat's messages while the resumed session boots.
           useAgentChatStore.getState().resetThread(threadId);
         }
-        const newLocalThreadId = `chat-${target.paneId}-${Date.now()}`;
-        // Hydrate the new slice with the picked session's persisted
-        // transcript BEFORE we kick off the provider — that way the
-        // pane renders the full history immediately, instead of going
-        // blank for the second or two it takes the SDK to boot.
-        let transcriptVisible = false;
-        try {
-          // Cursor read, single replay: the rows carry their durable ids,
-          // so the new slice starts with a resume cursor instead of
-          // having to cold-replay again on its first remount. Row ids are
-          // table-wide monotonic, so every row this thread writes from
-          // here on sorts above the resumed history's head.
-          const rows = await agentChatListMessagesAfter(record.thread_id, null);
-          if (rows.length > 0) {
-            useAgentChatStore
-              .getState()
-              .hydrateThread(newLocalThreadId, rows, { provider });
-            transcriptVisible = true;
-          }
-        } catch (err) {
-          // Hydration failure is non-fatal — the SDK still has the
-          // server-side context, the user just won't see the
-          // historical transcript. Log so it's debuggable; the toast
-          // below is what tells the user.
-          console.warn("[agent-chat] hydrate on resume failed:", err);
-        }
-        // Resolve the launch config from the record's persisted per-thread
-        // columns (all nullable). A NULL `permission_mode` heals to the
-        // provider default: the footer pill renders that default for NULL
-        // rows, so the session MUST actually launch in it — otherwise the
-        // provider boots in `default` (prompt-for-every-tool) while the UI
-        // advertises "Full access", the exact drift this hook exists to
-        // prevent. Model falls back to the provider default the same way
-        // the pane's on-mount seed effect does; effort/context ride through
-        // as-is (null means "use the model default").
-        const resolvedModel = record.model ?? defaultModelForProvider(provider);
-        // OpenCode has no chat-side permission picker: launch with null even
-        // if the record carries a stale cross-provider token.
-        const resolvedMode =
-          provider === "opencode"
-            ? null
-            : (record.permission_mode ??
-              defaultPermissionModeForProvider(provider));
-        const newThreadId = await agentChatStartSession(target.paneId, provider, {
-          thread_id: newLocalThreadId,
-          cwd: target.cwd,
-          model: record.model,
-          resume_cursor: { resume: record.sdk_session_id },
-          permission_mode: resolvedMode,
-          effort: record.effort,
-          context_window: record.context_window,
-          fast_mode: record.fast_mode ?? false,
-          additional_directories: [],
-          env: null,
-        });
-        // Seed the store slice for the freshly-started thread so the footer
-        // pickers reflect the launched config. `permissionMode` and
-        // `sessionLaunchMode` MUST agree — a mismatch is read as "the user
-        // changed the mode" and triggers a spurious silent restart.
-        const store = useAgentChatStore.getState();
-        store.ensureThread(newThreadId);
-        store.setModel(newThreadId, resolvedModel);
-        store.setEffort(newThreadId, record.effort);
-        store.setContextWindow(newThreadId, record.context_window);
-        store.setFastMode(newThreadId, record.fast_mode ?? false);
-        if (resolvedMode !== null) {
-          store.setPermissionMode(newThreadId, resolvedMode);
-        }
-        store.setSessionLaunchMode(newThreadId, resolvedMode);
-        // Never a success toast over a blank transcript: when the
-        // history could not be read (or the row had none), the agent
-        // still holds the conversation but nothing above the composer
-        // shows it, and the user must be told which of the two they
-        // are looking at.
-        const title = sessionDisplayTitle(record);
-        if (transcriptVisible) {
-          toast.success(`Resumed "${title}" — agent has the full history`);
-        } else {
-          toast.warning(
-            `Resumed "${title}", but the earlier transcript isn't shown here — the agent still has it. This thread starts from your next message.`,
-          );
-        }
+        // Hydrate → start with the row's cursor → seed the slice → honest
+        // toast. Shared with the draft surface, which resumes without a
+        // pane of its own to stop first.
+        await launchResumedRecord(
+          provider,
+          { ...record, sdk_session_id: sdkSessionId },
+          { paneId: target.paneId, cwd: target.cwd },
+        );
       } catch (error) {
         toast.error(`Failed to reopen chat: ${error}`);
       }
@@ -294,8 +223,7 @@ export function useAgentChatSessionActions(
       // the thread to it and focused it. Starting here instead would
       // leave that tab blank and hide the thread from this pane's
       // history dropdown, which filters on the pane's own cwd.
-      const targetPaneId = result.pane_id;
-      const onThisPane = targetPaneId === paneId;
+      const onThisPane = result.pane_id === paneId;
       try {
         // The RUNNING pane's current permission mode wins — the external
         // session's own mode is deliberately never restored, so adopting
@@ -316,71 +244,24 @@ export function useAgentChatSessionActions(
           store.resetThread(threadId);
         }
 
-        // The backend already minted the thread and wrote the "resumed
-        // outside Codemux" divider into it, so hydrate from THAT thread
-        // id — there is no separate local id to invent.
-        let dividerVisible = false;
-        try {
-          const rows = await agentChatListMessagesAfter(result.thread_id, null);
-          if (rows.length > 0) {
-            useAgentChatStore
-              .getState()
-              .hydrateThread(result.thread_id, rows, { provider });
-            dividerVisible = true;
-          }
-        } catch (err) {
-          console.warn("[agent-chat] hydrate on adopt failed:", err);
-        }
-
-        const resolvedModel = defaultModelForProvider(provider);
-        // OpenCode has no chat-side permission picker.
-        const resolvedMode =
-          provider === "opencode"
-            ? null
-            : (currentMode ?? defaultPermissionModeForProvider(provider));
-        // `cwd` and `pane_id` both come from the RESULT and are always a
-        // matched pair: adoption attaches to the folder the conversation
-        // already lives in (never creating a worktree) and the backend
-        // hands back the pane rooted at that folder. When it belongs to
-        // another project the user has already agreed to the move — the
-        // gate upstream of this function is what asks.
-        const newThreadId = await agentChatStartSession(targetPaneId, provider, {
-          thread_id: result.thread_id,
-          cwd: result.cwd,
-          model: null,
-          resume_cursor: { resume: result.sdk_session_id },
-          permission_mode: resolvedMode,
-          fast_mode: false,
-          additional_directories: [],
-          env: null,
-        });
-        const seeded = useAgentChatStore.getState();
-        seeded.ensureThread(newThreadId);
-        seeded.setModel(newThreadId, resolvedModel);
-        seeded.setFastMode(newThreadId, false);
-        if (resolvedMode !== null) {
-          seeded.setPermissionMode(newThreadId, resolvedMode);
-        }
-        seeded.setSessionLaunchMode(newThreadId, resolvedMode);
-
         // Name the directory whenever the conversation did not land on
         // the pane the user clicked from — a tab appearing elsewhere
         // needs to say where it went, and so does the rare case where
         // re-homing failed and the backend fell back to this pane.
         const where =
           !onThisPane || result.foreign_project ? ` in ${result.cwd}` : "";
-        if (result.resume_divider_written && dividerVisible) {
-          toast.success(
-            `Resumed "${result.title}"${where} — the agent has the full history`,
-          );
-        } else {
-          // Never a success toast over a blank transcript: the agent
-          // still holds the conversation, but nothing above the
-          // composer says so, and the user must be told which it is.
-          toast.warning(
-            `Resumed "${result.title}"${where}, but the earlier transcript isn't shown here — the agent still has it. This thread starts from your next message.`,
-          );
-        }
+        // The backend already minted the thread, bound it to the pane
+        // rooted at the session's folder and wrote the "resumed outside
+        // Codemux" divider; the shared launcher hydrates from THAT id,
+        // starts with the session's cursor and toasts honestly. When the
+        // folder belongs to another project the user has already agreed
+        // to the move — the gate upstream of this function is what asks.
+        await launchAdoptedThread(
+          provider,
+          result,
+          { model: null, permissionMode: currentMode ?? null },
+          where,
+        );
       } catch (error) {
         toast.error(`Failed to resume "${session.title}": ${error}`);
       }

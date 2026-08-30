@@ -35,6 +35,10 @@ vi.mock("@/tauri/commands", () => ({
     .mockResolvedValue({ bytes: new Uint8Array(), media_type: "image/png" }),
   agentChatListSessionMentions: vi.fn().mockResolvedValue([]),
   agentChatGetSessionContext: vi.fn(),
+  // Mount-time discovery for the "continue a terminal session" row.
+  // Nothing found here, so the landing stays headline + composer; the
+  // row and the pick flow are covered in DraftChatSurface.resume.test.
+  agentChatListAdoptableSessions: vi.fn().mockResolvedValue([]),
   // Step 8 Stage 2 — Composer's mention popup useEffect calls
   // `listProjectFiles` whenever `@` is open; default to an empty
   // resolution so the popup-not-opened tests don't flap.

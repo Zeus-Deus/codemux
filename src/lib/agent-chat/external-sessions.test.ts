@@ -102,6 +102,19 @@ describe("buildAdoptableSessionItems", () => {
     });
     expect(item.command).toBe("other project");
     expect(item.description).toContain("/projects/ledger");
+    // A live pane confirms before it is re-pointed; the row says so.
+    expect(item.description).toMatch(/asks first/i);
+  });
+
+  it("drops the confirmation wording when the surface opens other projects in place", () => {
+    const [item] = buildAdoptableSessionItems({
+      sessions: [makeSession({ same_repo: false, cwd: "/projects/ledger" })],
+      foreignNeedsConfirm: false,
+    });
+    expect(item.command).toBe("other project");
+    expect(item.description).toBe("Opens in /projects/ledger");
+    // Grouping is unchanged — only the promise in the description is.
+    expect(item.group).toBe(RESUME_GROUP_OTHER);
   });
 
   it("renders a relative timestamp against an injected clock", () => {

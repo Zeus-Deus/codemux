@@ -541,6 +541,29 @@ pub(crate) struct CreatedWorktreeWorkspace {
 /// `.mcp.json` autoconfig, and the preset-launch-with-prompt-injection
 /// branch as one atomic operation.
 #[allow(clippy::too_many_arguments)]
+/// The layout a worktree-backed workspace is built with, from the string
+/// the frontend passes. Shared by the create (`git worktree add`) and
+/// import (adopt an on-disk worktree) paths so the two never drift.
+///
+/// `empty` yields no terminal/PTY, no tab, and no surface — the caller
+/// attaches its own pane afterward via `agent_chat_create_pane`. The
+/// inline "+ New worktree…" chat flow creates with it, and the draft's
+/// "continue a terminal session" flow imports with it when the session
+/// ran in a linked worktree, so the workspace carries worktree metadata
+/// without a terminal opening beside the chat.
+fn parse_worktree_layout(layout: &str) -> Result<WorkspacePresetLayout, String> {
+    match layout {
+        "single" => Ok(WorkspacePresetLayout::Single),
+        "pair" => Ok(WorkspacePresetLayout::Pair),
+        "quad" => Ok(WorkspacePresetLayout::Quad),
+        "six" => Ok(WorkspacePresetLayout::Six),
+        "eight" => Ok(WorkspacePresetLayout::Eight),
+        "shell_browser" => Ok(WorkspacePresetLayout::ShellBrowser),
+        "empty" => Ok(WorkspacePresetLayout::Empty),
+        _ => Err(format!("Unsupported layout: {layout}")),
+    }
+}
+
 pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
@@ -557,20 +580,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
 ) -> Result<CreatedWorktreeWorkspace, String> {
-    let layout = match layout.as_str() {
-        "single" => WorkspacePresetLayout::Single,
-        "pair" => WorkspacePresetLayout::Pair,
-        "quad" => WorkspacePresetLayout::Quad,
-        "six" => WorkspacePresetLayout::Six,
-        "eight" => WorkspacePresetLayout::Eight,
-        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
-        // The inline "+ New worktree…" chat flow uses `empty` so the
-        // resulting workspace has no terminal/PTY, no tab, and no
-        // surface — the chat pane is attached afterward by the
-        // frontend via `agent_chat_create_pane`.
-        "empty" => WorkspacePresetLayout::Empty,
-        _ => return Err(format!("Unsupported layout: {layout}")),
-    };
+    let layout = parse_worktree_layout(&layout)?;
 
     // Validate repo_path is a git repository before creating anything
     if crate::config::workspace_config::find_git_root(Path::new(&repo_path)).is_none() {
@@ -823,7 +833,9 @@ pub async fn import_worktree_workspace<R: tauri::Runtime>(
 /// running `git worktree add` — the directory is already a registered
 /// worktree, so we only build workspace state around it, spawn its
 /// sessions, run setup scripts, and register MCP. Shared by the
-/// "Import worktree" affordance and the unarchive restore path: an
+/// "Import worktree" affordance, the draft's "continue a terminal
+/// session" flow (with the `empty` layout — see
+/// [`parse_worktree_layout`]), and the unarchive restore path: an
 /// archived worktree recorded at a NON-conventional path still exists on
 /// disk (archiving touches nothing), so restore adopts it in place rather
 /// than routing through `create_worktree_workspace_impl`, whose
@@ -837,15 +849,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
     branch: String,
     layout: String,
 ) -> Result<String, String> {
-    let layout = match layout.as_str() {
-        "single" => WorkspacePresetLayout::Single,
-        "pair" => WorkspacePresetLayout::Pair,
-        "quad" => WorkspacePresetLayout::Quad,
-        "six" => WorkspacePresetLayout::Six,
-        "eight" => WorkspacePresetLayout::Eight,
-        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
-        _ => return Err(format!("Unsupported layout: {layout}")),
-    };
+    let layout = parse_worktree_layout(&layout)?;
 
     let wt_path_buf = PathBuf::from(&worktree_path);
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
@@ -859,6 +863,10 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
 
     populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 
+    // Same as the create path: an `empty` layout has no surfaces, so this
+    // collects nothing and no PTY is spawned. Setup scripts still run —
+    // they prepare the checkout (worktree includes, scripts), not a
+    // terminal, and the chat pane attached afterward relies on them.
     let snapshot = state.snapshot();
     let session_ids = snapshot
         .workspaces
@@ -3608,6 +3616,77 @@ mod archive_guard_tests {
         assert!(
             archive_refusal_reason(&ws).is_none(),
             "an ordinary local workspace must be archivable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_worktree_layout_tests {
+    //! Coverage for the `empty` layout on the import path
+    //! ([`import_worktree_workspace_impl`]).
+    //!
+    //! The impl takes an `AppHandle` (out of reach for a unit test — same
+    //! constraint the adopt-guard tests below document), so the two
+    //! decisions it makes are pinned here: the layout string parses through
+    //! the shared [`parse_worktree_layout`], and the workspace an `empty`
+    //! import builds carries worktree metadata while collecting NO terminal
+    //! sessions — which is exactly what the impl's spawn loop iterates, so
+    //! no PTY opens beside the chat pane attached afterward.
+
+    use super::*;
+    use crate::state::{collect_terminal_sessions, AppStateStore, WorkspacePresetLayout};
+    use tempfile::TempDir;
+
+    #[test]
+    fn empty_layout_is_accepted_by_both_worktree_paths() {
+        assert!(matches!(
+            parse_worktree_layout("empty"),
+            Ok(WorkspacePresetLayout::Empty)
+        ));
+        assert!(matches!(
+            parse_worktree_layout("single"),
+            Ok(WorkspacePresetLayout::Single)
+        ));
+        assert_eq!(
+            parse_worktree_layout("bogus").unwrap_err(),
+            "Unsupported layout: bogus"
+        );
+    }
+
+    #[test]
+    fn empty_import_stamps_worktree_metadata_without_terminal_sessions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        // The exact sequence `import_worktree_workspace_impl` runs before
+        // its spawn loop.
+        let store = AppStateStore::default();
+        let layout = parse_worktree_layout("empty").expect("empty parses");
+        let id = store.create_workspace_with_layout(wt.clone(), layout);
+        store.set_workspace_worktree(&id.0, wt.display().to_string(), "feature".to_string());
+
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == id.0)
+            .expect("imported workspace exists");
+
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(wt.display().to_string().as_str()),
+            "an empty import must still claim the worktree path — that is the \
+             whole reason to import instead of opening a plain workspace"
+        );
+        assert_eq!(ws.title, "feature", "titled after the branch like every worktree workspace");
+        assert!(
+            ws.surfaces.is_empty() && ws.tabs.is_empty(),
+            "empty layout: no surface and no tab for the chat pane to sit beside"
+        );
+        assert!(
+            collect_terminal_sessions(&ws.surfaces).is_empty(),
+            "nothing for the impl's spawn loop to open a PTY for"
         );
     }
 }

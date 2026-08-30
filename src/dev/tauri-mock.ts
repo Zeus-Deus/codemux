@@ -3070,6 +3070,27 @@ const handlers: Record<string, Handler> = {
   agent_chat_list_messages_after: (a) => {
     const threadId = a.threadId as string;
     const afterId = (a.afterId as number | null | undefined) ?? 0;
+    // An adopted terminal session opens on the "resumed from the
+    // terminal" divider the real adopt command persists — the only row
+    // the thread has until its first new turn.
+    if (threadId.startsWith("chat-adopted-")) {
+      return afterId >= 1
+        ? []
+        : [
+            {
+              id: 1,
+              payload: JSON.stringify({
+                type: "resume_divider",
+                source: "external_cli",
+                session_started_at: new Date(
+                  Date.now() - 95 * 60_000,
+                ).toISOString(),
+                branch: "main",
+              }),
+              created_at_ms: Date.now(),
+            },
+          ];
+    }
     return mockThreadRows(threadId).filter(
       (row) =>
         row.id > afterId &&
@@ -3125,16 +3146,24 @@ const handlers: Record<string, Handler> = {
     ];
   },
   // `/resume` fixture — conversations the agent CLI created outside
-  // Codemux. Two sit in the demo checkout (one of them already adopted,
-  // so the picker's "switch instead of adopt" row is reachable) and one
-  // lives in an unrelated project, which only shows once the user
+  // Codemux. Three belong to the demo repo: one in the checkout itself,
+  // one in a linked worktree that is already adopted (so the picker's
+  // "switch instead of adopt" row is reachable), and one in a linked
+  // worktree with no workspace yet (so the import-in-place path is). A
+  // fourth lives in an unrelated project, which only shows once the user
   // widens the scope past the current checkout.
   agent_chat_list_adoptable_sessions: (a) => {
     const scope = (a.scope ?? {}) as {
       current_cwd?: string;
       all_projects?: boolean;
     };
-    const cwd = scope.current_cwd ?? `${MOCK_HOME_DIR}/projects/codemux`;
+    const demoProject = `${MOCK_HOME_DIR}/projects/codemux`;
+    // A widened scope (the Home draft asks for every project) is not
+    // rooted anywhere in particular, so the demo checkout's sessions
+    // keep their real folder instead of adopting the reference cwd.
+    const cwd = scope.all_projects
+      ? demoProject
+      : (scope.current_cwd ?? demoProject);
     const local = [
       {
         session_id: "ext-2f9c1a70-terminal-refactor",
@@ -3158,7 +3187,19 @@ const handlers: Record<string, Handler> = {
         file_size: 92_160,
         title_source: "custom",
         existing_thread_id: MOCK_CHAT_THREAD_ID,
-        same_repo: true,
+        same_repo: cwd.startsWith(demoProject),
+      },
+      {
+        session_id: "ext-a58d3c09-perf-sweep",
+        title: "Move blocking file reads off the main thread",
+        cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/perf-sweep`,
+        git_branch: "perf-sweep",
+        last_modified: new Date(Date.now() - 9 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 11 * 3_600_000).toISOString(),
+        file_size: 63_488,
+        title_source: "summary",
+        existing_thread_id: null,
+        same_repo: cwd.startsWith(demoProject),
       },
     ];
     if (!scope.all_projects) return local;
@@ -3185,12 +3226,16 @@ const handlers: Record<string, Handler> = {
       cwd?: string;
     };
     const cwd = session.cwd ?? `${MOCK_HOME_DIR}/projects/codemux`;
+    const paneId = String(a.paneId ?? "");
     return {
       thread_id: `chat-adopted-${session.session_id ?? "unknown"}`,
-      workspace_id: "ws-codemux-chat",
+      // The workspace the requesting pane lives in — a draft resume
+      // opens one at the session's folder first — else the demo chat.
+      workspace_id:
+        findWorkspaceForPane(paneId)?.workspace_id ?? "ws-codemux-chat",
       // The mock never opens panes, so the conversation stays on the pane
       // that asked; the real backend re-homes it when `cwd` is elsewhere.
-      pane_id: String(a.paneId ?? ""),
+      pane_id: paneId,
       cwd,
       title: session.title ?? "Adopted conversation",
       sdk_session_id: session.session_id ?? "unknown",
@@ -4538,6 +4583,25 @@ const handlers: Record<string, Handler> = {
   // worktree workspaces (mock-fixtures.ts) so the picker's
   // All/Worktrees tabs and WORKTREE badges light up, plus a few
   // local-only and remote-only rows for the kind icons.
+  // `git worktree list` for the demo repo, asked from any of its
+  // checkouts: the main checkout first, then the linked worktrees the
+  // `/resume` fixture's sessions live in. Any other path is a plain
+  // repository whose only checkout is itself.
+  list_worktrees: (a) => {
+    const path = String(a.path ?? "");
+    const demoProject = `${MOCK_HOME_DIR}/projects/codemux`;
+    const worktreesDir = `${MOCK_HOME_DIR}/.codemux/worktrees/codemux`;
+    const inDemoRepo =
+      path === demoProject ||
+      path.startsWith(`${demoProject}/`) ||
+      path.startsWith(`${worktreesDir}/`);
+    if (!inDemoRepo) return [{ path, branch: "main", is_bare: false }];
+    return [
+      { path: demoProject, branch: "main", is_bare: false },
+      { path: `${worktreesDir}/search-index`, branch: "search-index", is_bare: false },
+      { path: `${worktreesDir}/perf-sweep`, branch: "perf-sweep", is_bare: false },
+    ];
+  },
   list_branches_detailed: () => {
     const now = Math.floor(Date.now() / 1000);
     const DAY = 86_400;
@@ -4853,6 +4917,17 @@ const handlers: Record<string, Handler> = {
   },
   generate_random_branch_name: () =>
     `mock-worktree-${Math.random().toString(36).slice(2, 8)}`,
+  // A workspace anchored at exactly `cwd` (repo root or an existing
+  // worktree — no `git worktree add`), carrying one empty chat pane so
+  // `agent_chat_create_pane` binds to it. Emits synchronously: the real
+  // command emits app state before it returns.
+  create_empty_workspace: (a) => {
+    const cwd = String(a.cwd ?? MOCK_HOME_DIR);
+    const ws = buildWorkspaceAtDirectory(cwd);
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
+    return { workspace_id: ws.workspace_id, cwd, adopted: false };
+  },
   create_worktree_workspace: (a) => {
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
@@ -4865,6 +4940,31 @@ const handlers: Record<string, Handler> = {
       appState = { ...appState, workspaces: [...appState.workspaces, ws] };
       emitAppState();
     }, 0);
+    return ws.workspace_id;
+  },
+  // An existing linked worktree adopted in place — no `git worktree add`.
+  // Carries worktree metadata and, with the `"empty"` layout the draft's
+  // "continue a terminal session" path uses, one empty chat pane for
+  // `agent_chat_create_pane` to bind to instead of a terminal. Emits
+  // synchronously: the real command emits app state before it returns.
+  import_worktree_workspace: (a) => {
+    const worktreePath = String(a.worktreePath ?? "");
+    const branch = String(a.branch ?? "worktree");
+    const repoName = /\/\.codemux\/worktrees\/([^/]+)\//.exec(worktreePath)?.[1];
+    const ws = buildEmptyChatWorkspace({
+      idPrefix: "imported-worktree",
+      paneIdPrefix: "pane-imported-wt",
+      title: branch,
+      cwd: worktreePath,
+      branch,
+      worktreePath,
+      projectRoot: repoName
+        ? `${MOCK_HOME_DIR}/projects/${repoName}`
+        : worktreePath,
+      workspaceKind: "worktree",
+    });
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
     return ws.workspace_id;
   },
   /**
@@ -5191,44 +5291,85 @@ function buildWorktreeWorkspace(
   repoPath: string,
   branch: string,
 ): WorkspaceSnapshot {
-  const n = ++deferredWorktreeSeq;
   const repoName = repoPath.split("/").filter(Boolean).pop() ?? "repo";
   // Sibling worktree path — NOT the repo root — so a caller can tell the
   // worktree cwd apart from the parent checkout.
   const cwd = `${MOCK_HOME_DIR}/.codemux/worktrees/${repoName}/${branch}`;
-  const paneId = `pane-deferred-wt-${n}`;
-  const surfaceId = `surface-deferred-wt-${n}`;
-  const tabId = `tab-deferred-wt-${n}`;
+  return buildEmptyChatWorkspace({
+    idPrefix: "deferred-worktree",
+    paneIdPrefix: "pane-deferred-wt",
+    title: branch,
+    cwd,
+    branch,
+    worktreePath: cwd,
+    projectRoot: repoPath,
+    workspaceKind: "worktree",
+  });
+}
+
+/** Build a plain workspace anchored at `cwd`, mirroring
+ *  `create_empty_workspace`: no worktree metadata, project root = the
+ *  folder itself. Used by the draft's "continue a terminal session"
+ *  path, which opens a workspace wherever the CLI session ran. */
+function buildWorkspaceAtDirectory(cwd: string): WorkspaceSnapshot {
+  const title = cwd.split("/").filter(Boolean).pop() ?? "workspace";
+  return buildEmptyChatWorkspace({
+    idPrefix: "at-directory",
+    paneIdPrefix: "pane-at-directory",
+    title,
+    cwd,
+    branch: "main",
+    worktreePath: null,
+    projectRoot: cwd,
+    workspaceKind: null,
+  });
+}
+
+function buildEmptyChatWorkspace(opts: {
+  idPrefix: string;
+  paneIdPrefix: string;
+  title: string;
+  cwd: string;
+  branch: string;
+  worktreePath: string | null;
+  projectRoot: string;
+  workspaceKind: string | null;
+}): WorkspaceSnapshot {
+  const n = ++deferredWorktreeSeq;
+  const { title, cwd } = opts;
+  const paneId = `${opts.paneIdPrefix}-${n}`;
+  const surfaceId = `surface-${opts.idPrefix}-${n}`;
+  const tabId = `tab-${opts.idPrefix}-${n}`;
 
   const pane: PaneNodeSnapshot = {
     kind: "agent_chat",
     pane_id: paneId,
-    title: branch,
+    title,
     thread_id: null,
     provider: "claude",
     cwd,
   };
   const surface: SurfaceSnapshot = {
     surface_id: surfaceId,
-    title: branch,
+    title,
     root: pane,
     active_pane_id: paneId,
   };
   const tab: TabSnapshot = {
     tab_id: tabId,
     kind: "terminal",
-    title: branch,
+    title,
     surface_id: surfaceId,
     browser_id: null,
     icon: null,
   };
 
   return {
-    workspace_id: `ws-deferred-worktree-${n}`,
-    title: branch,
+    workspace_id: `ws-${opts.idPrefix}-${n}`,
+    title,
     workspace_type: "standard",
     cwd,
-    git_branch: branch,
+    git_branch: opts.branch,
     git_ahead: 0,
     git_behind: 0,
     git_additions: 0,
@@ -5236,10 +5377,10 @@ function buildWorktreeWorkspace(
     git_changed_files: 0,
     notification_count: 0,
     latest_agent_state: null,
-    worktree_path: cwd,
-    project_root: repoPath,
+    worktree_path: opts.worktreePath,
+    project_root: opts.projectRoot,
     project_uid: null,
-    workspace_kind: "worktree",
+    workspace_kind: opts.workspaceKind,
     protected: false,
     divergent_copy: false,
     pr_number: null,
@@ -5255,6 +5396,18 @@ function buildWorktreeWorkspace(
     remote_cwd: null,
     attach_only: false,
   };
+}
+
+/** The workspace whose surfaces contain `paneId`, if any. */
+function findWorkspaceForPane(paneId: string): WorkspaceSnapshot | undefined {
+  const holds = (node: PaneNodeSnapshot | null): boolean => {
+    if (!node) return false;
+    if (node.kind === "split") return node.children.some(holds);
+    return node.pane_id === paneId;
+  };
+  return appState.workspaces.find((ws) =>
+    (ws.surfaces ?? []).some((surface) => holds(surface.root)),
+  );
 }
 
 /** Drop a workspace from the in-memory snapshot, reassigning the active

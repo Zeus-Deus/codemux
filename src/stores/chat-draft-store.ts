@@ -132,6 +132,16 @@ export interface ChatDraftStore {
 
   // Mutations
   updateDraftTarget: (draftId: DraftId, target: DraftTarget) => void;
+  /** Point the draft at `target` and pin it there for the rest of its
+   *  life: raises `lockedToHome` so neither the mount-time seed effect
+   *  nor the submit-time salvage in `DraftChatSurface` can re-point it
+   *  at the active sidebar workspace, and forces `checkoutMode` back to
+   *  `"current"` so nothing downstream can fork a worktree. Used when
+   *  the location is dictated by something outside the picker — a
+   *  terminal session being resumed already knows its folder. Leaves
+   *  `baseBranch` alone: the branch control re-seeds it from HEAD, and
+   *  writing a branch here could flip the checkout to a worktree. */
+  lockDraftTarget: (draftId: DraftId, target: DraftTarget) => void;
   updateDraftConfig: (
     draftId: DraftId,
     config: Partial<
@@ -168,6 +178,12 @@ export interface ChatDraftStore {
   ) => void;
   markSendFailed: (draftId: DraftId, error: string) => void;
   clearSendError: (draftId: DraftId) => void;
+  /** Release a draft that `markPromoting` put in flight WITHOUT recording
+   *  a send error: the composer's "Send failed … press Enter to retry"
+   *  banner would misdescribe a failure that had nothing to send (a
+   *  resume that could not attach). The caller reports the failure its
+   *  own way; this only re-enables the composer. */
+  abortPromotion: (draftId: DraftId) => void;
 
   // Removal
   /** Permanently discard an unsent draft and its in-memory attachment
@@ -497,6 +513,25 @@ export const useChatDraftStore = create<ChatDraftStore>()(
           };
         }),
 
+      lockDraftTarget: (draftId, target) => {
+        // Reuse the slot bookkeeping of a plain target change, then pin.
+        get().updateDraftTarget(draftId, target);
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: {
+                ...existing,
+                lockedToHome: true,
+                checkoutMode: "current",
+              },
+            },
+          };
+        });
+      },
+
       updateDraftInput: (draftId, input) =>
         set((s) => {
           const existing = s.draftsById[draftId];
@@ -587,6 +622,18 @@ export const useChatDraftStore = create<ChatDraftStore>()(
             draftsById: {
               ...s.draftsById,
               [draftId]: { ...existing, lastSendError: null },
+            },
+          };
+        }),
+
+      abortPromotion: (draftId) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing || !existing.promoting) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: { ...existing, promoting: false },
             },
           };
         }),

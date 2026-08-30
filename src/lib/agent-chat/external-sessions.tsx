@@ -96,6 +96,12 @@ interface BuildAdoptableSessionItemsArgs {
   sessions: AdoptableAgentSession[];
   /** Injected for deterministic relative-time assertions. */
   now?: Date;
+  /** Whether picking an unrelated project's session asks before
+   *  anything moves (a live pane would be re-pointed) — the default —
+   *  or opens straight away in that session's own folder (a workspace
+   *  draft has no committed location to protect). Only the row's
+   *  description changes; the caller enforces whichever it promised. */
+  foreignNeedsConfirm?: boolean;
 }
 
 /**
@@ -110,6 +116,7 @@ interface BuildAdoptableSessionItemsArgs {
 export function buildAdoptableSessionItems({
   sessions,
   now = new Date(),
+  foreignNeedsConfirm = true,
 }: BuildAdoptableSessionItemsArgs): SlashCommandItem[] {
   const sorted = [...sessions].sort((a, b) => {
     const groupDelta =
@@ -131,7 +138,9 @@ export function buildAdoptableSessionItems({
       description: existing
         ? "Already in Codemux — switches to that thread"
         : foreign
-          ? `Asks first, then opens in ${session.cwd}`
+          ? foreignNeedsConfirm
+            ? `Asks first, then opens in ${session.cwd}`
+            : `Opens in ${session.cwd}`
           : (session.git_branch ?? session.cwd),
       // No literal text ever reaches the draft, so the command slot is
       // free for a state word. `rightAdornment` overrides it anyway;

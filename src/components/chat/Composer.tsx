@@ -272,6 +272,23 @@ interface Props {
    *  them (an unmaterialised draft) — `/resume` then stays hidden
    *  rather than offering an action nothing can perform. */
   onResumeExternalSession?: (session: AdoptableAgentSession) => void | Promise<void>;
+  /** Where `/resume` discovery looks when this surface's own `cwd` is
+   *  not the right reference point — the workspace draft, whose Home
+   *  target has no directory at all and whose project target should be
+   *  searched by project root rather than a pane cwd. `allProjects`
+   *  seeds the picker's scope on open (the user can still widen a
+   *  narrow one); `foreignOpensInPlace` only changes the row wording
+   *  for unrelated projects, because a draft opens them without asking
+   *  where a live pane would confirm first. Omitted on panes. */
+  resumeScope?: {
+    cwd: string | null;
+    allProjects?: boolean;
+    foreignOpensInPlace?: boolean;
+  } | null;
+  /** Increment to open the `/resume` picker from outside the composer
+   *  (the draft's "Continue a terminal session" row). Same surface,
+   *  same rows, same pick handling as the typed slash command. */
+  resumeOpenSignal?: number;
   /** Step 8 Stage 6 — invoked when the user attaches an image via
    *  paste, drag-drop, or the `+ → Image…` picker. Composer just
    *  forwards the raw File; the parent runs the allowlist check and
@@ -379,6 +396,8 @@ export function Composer({
   onAttachPr,
   onAttachSession,
   onResumeExternalSession,
+  resumeScope = null,
+  resumeOpenSignal = 0,
   onAttachImage,
   modelSupportsImages = false,
   repoSupported = null,
@@ -587,17 +606,25 @@ export function Composer({
   // handling as `/model`). Only offered when the surface can actually
   // perform the adoption.
   const canResumeExternal = onResumeExternalSession !== undefined;
+  // Every open starts from the surface's default scope (the checkout
+  // for a pane, every project for a Home draft) so a widened picker
+  // never lingers past the pick that widened it.
+  const resumeScopeAllProjects = resumeScope?.allProjects ?? false;
+  const openResumePicker = useCallback(() => {
+    setResumeAllProjects(resumeScopeAllProjects);
+    setResumeQuery("");
+    setResumeOpen(true);
+  }, [resumeScopeAllProjects]);
   const resumeCommand = useMemo(
-    () =>
-      buildResumeCommand({
-        onOpen: () => {
-          setResumeAllProjects(false);
-          setResumeQuery("");
-          setResumeOpen(true);
-        },
-      }),
-    [],
+    () => buildResumeCommand({ onOpen: openResumePicker }),
+    [openResumePicker],
   );
+  // External open request (the draft's "Continue a terminal session"
+  // row). `0` is the idle value, so a mount never opens the picker.
+  useEffect(() => {
+    if (!resumeOpenSignal || !canResumeExternal) return;
+    openResumePicker();
+  }, [resumeOpenSignal, canResumeExternal, openResumePicker]);
 
   // `/workflow` — gated to the Claude provider (server-side runtime
   // support only exists there). Shared between the typed `/` popup and
@@ -1009,12 +1036,14 @@ export function Composer({
   }, []);
 
   // Discover adoptable sessions each time the picker opens, and again
-  // when the user widens the scope. Scoped to the pane's cwd: the
-  // backend resolves the checkout (worktrees included) from it and uses
-  // the same path to decide which results count as this repo.
+  // when the user widens the scope. Scoped to the pane's cwd (or the
+  // reference directory a draft supplies): the backend resolves the
+  // checkout (worktrees included) from it and uses the same path to
+  // decide which results count as this repo.
+  const resumeScopeCwd = resumeScope ? resumeScope.cwd : cwd;
   useEffect(() => {
     if (!resumeOpen) return;
-    if (!cwd) {
+    if (!resumeScopeCwd) {
       setResumeSessions(EMPTY_ADOPTABLE_SESSIONS);
       setResumeError("No working directory for this pane.");
       return;
@@ -1023,7 +1052,7 @@ export function Composer({
     setResumeLoading(true);
     setResumeError(null);
     agentChatListAdoptableSessions(provider, {
-      current_cwd: cwd,
+      current_cwd: resumeScopeCwd,
       all_projects: resumeAllProjects,
       include_worktrees: true,
       limit: RESUME_FETCH_LIMIT,
@@ -1045,15 +1074,19 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [resumeOpen, resumeAllProjects, cwd, provider]);
+  }, [resumeOpen, resumeAllProjects, resumeScopeCwd, provider]);
 
+  const resumeForeignOpensInPlace = resumeScope?.foreignOpensInPlace ?? false;
   const resumeItems = useMemo(() => {
-    const rows = buildAdoptableSessionItems({ sessions: resumeSessions });
+    const rows = buildAdoptableSessionItems({
+      sessions: resumeSessions,
+      foreignNeedsConfirm: !resumeForeignOpensInPlace,
+    });
     // The widening row is a scope control, not a result, so it survives
     // the search filter and always sits last.
     const filtered = filterCommandMenuItems(rows, resumeQuery);
     return resumeAllProjects ? filtered : [...filtered, buildWidenScopeItem()];
-  }, [resumeSessions, resumeQuery, resumeAllProjects]);
+  }, [resumeSessions, resumeQuery, resumeAllProjects, resumeForeignOpensInPlace]);
 
   const resumePopupFooter = useMemo(() => {
     if (resumeError) {

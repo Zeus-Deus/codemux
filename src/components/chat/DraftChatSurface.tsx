@@ -26,6 +26,7 @@ import {
   beginImageStaging,
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
+import { resumeExternalSessionFromDraft } from "@/lib/agent-chat/draft-resume";
 import {
   materializeAndSend,
   type MaterializePhase,
@@ -61,9 +62,11 @@ import {
   getGithubPrByPath,
   getGithubPrDiffByPath,
   agentChatGetSessionContext,
+  agentChatListAdoptableSessions,
   primeChatMcp,
   readFileForAttachment,
   readFolderForAttachment,
+  type AdoptableAgentSession,
 } from "@/tauri/commands";
 import { fetchProviderAuth } from "@/lib/provider-auth";
 import type {
@@ -74,6 +77,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
+import { ContinueTerminalSessionRow } from "./ContinueTerminalSessionRow";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
@@ -592,6 +596,96 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     updateDraftInput,
   ]);
 
+  // ── Continue a terminal session ──
+  //
+  // Conversations the agent's CLI started outside Codemux can be
+  // picked up from here, before any workspace exists. Discovery looks
+  // at the draft's selected project (its root, worktrees included) —
+  // or every project on the machine for a Home draft, which has no
+  // folder yet. The session brings its own directory, so the pick
+  // never consults the location picker at all.
+  const resumeScope = useMemo(() => {
+    if (draft.target.kind === "home") {
+      return {
+        cwd: appHomeDir,
+        allProjects: true,
+        foreignOpensInPlace: true,
+      };
+    }
+    return {
+      cwd: scopeProjectPath,
+      allProjects: false,
+      foreignOpensInPlace: true,
+    };
+  }, [draft.target.kind, appHomeDir, scopeProjectPath]);
+
+  // How many there are, so the affordance only renders when a pick is
+  // possible — an empty machine keeps the bare headline + composer.
+  const [adoptableCount, setAdoptableCount] = useState(0);
+  useEffect(() => {
+    const scopeCwd = resumeScope.cwd;
+    if (!scopeCwd) {
+      setAdoptableCount(0);
+      return;
+    }
+    let cancelled = false;
+    agentChatListAdoptableSessions(draft.provider, {
+      current_cwd: scopeCwd,
+      all_projects: resumeScope.allProjects,
+      include_worktrees: true,
+      limit: RESUME_DISCOVERY_LIMIT,
+    })
+      .then((rows) => {
+        if (!cancelled) setAdoptableCount(rows.length);
+      })
+      .catch(() => {
+        // Discovery is best-effort here; the picker itself reports a
+        // failure in its footer when the user actually opens it.
+        if (!cancelled) setAdoptableCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [draft.provider, resumeScope.cwd, resumeScope.allProjects]);
+
+  // The row opens the composer's own `/resume` picker.
+  const [resumeOpenSignal, setResumeOpenSignal] = useState(0);
+  const handleOpenResumePicker = useCallback(
+    () => setResumeOpenSignal((n) => n + 1),
+    [],
+  );
+
+  const handleResumeExternalSession = useCallback(
+    async (session: AdoptableAgentSession) => {
+      if (sendInFlightRef.current) return;
+      sendInFlightRef.current = true;
+      setFocusComposerAfterSubmit(true);
+      // Same instant feedback as a send: the landing gives way to a
+      // status line while the workspace and session come up.
+      setPending({
+        text: null,
+        images: [],
+        phase: "resuming",
+        title: session.title,
+      });
+      const result = await resumeExternalSessionFromDraft(
+        draft.draftId,
+        session,
+      );
+      if (result.success) {
+        void useProviderHealth.getState().noteProviderSuccess(draft.provider);
+      } else {
+        setPending(null);
+        toast.error(`Failed to resume "${session.title}": ${result.error}`);
+        void useProviderHealth
+          .getState()
+          .refresh(draft.provider, { force: true });
+      }
+      sendInFlightRef.current = false;
+    },
+    [draft.draftId, draft.provider],
+  );
+
   // Step 8 Stage 2 — chip lifecycle for the `@` mention popup.
   // Mirrors AgentChatPane's `handleAttachFile`: stage with
   // isLoading=true, fire `read_file_for_attachment`, patch the chip
@@ -1054,18 +1148,28 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   );
 
   const belowComposerSlot = (
-    <ThreadScopeRow
-      target={draft.target}
-      onChangeTarget={handleChangeTarget}
-      projectPath={scopeProjectPath}
-      checkoutMode={draft.checkoutMode ?? "current"}
-      worktreeName={draft.worktreeName ?? ""}
-      baseBranch={draft.baseBranch ?? ""}
-      disabled={draft.promoting}
-      onChangeCheckoutMode={handleChangeCheckoutMode}
-      onChangeWorktreeName={handleChangeWorktreeName}
-      onChangeBaseBranch={handleChangeBaseBranch}
-    />
+    <div className="flex w-full flex-col items-center gap-3">
+      <ThreadScopeRow
+        target={draft.target}
+        onChangeTarget={handleChangeTarget}
+        projectPath={scopeProjectPath}
+        checkoutMode={draft.checkoutMode ?? "current"}
+        worktreeName={draft.worktreeName ?? ""}
+        baseBranch={draft.baseBranch ?? ""}
+        disabled={draft.promoting}
+        onChangeCheckoutMode={handleChangeCheckoutMode}
+        onChangeWorktreeName={handleChangeWorktreeName}
+        onChangeBaseBranch={handleChangeBaseBranch}
+      />
+      {adoptableCount > 0 && (
+        <ContinueTerminalSessionRow
+          count={adoptableCount}
+          scope={draft.target.kind === "home" ? "machine" : "checkout"}
+          disabled={draft.promoting}
+          onOpen={handleOpenResumePicker}
+        />
+      )}
+    </div>
   );
 
   // Design D10/D12 → Thread Scope: home drafts read "Message the
@@ -1128,6 +1232,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
       onAttachSession={handleAttachSession}
+      onResumeExternalSession={handleResumeExternalSession}
+      resumeScope={resumeScope}
+      resumeOpenSignal={resumeOpenSignal}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
@@ -1174,19 +1281,30 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   );
 }
 
-/** Local instant-feedback state for a submit that's mid-materialise. */
+/** Local instant-feedback state for a submit that's mid-materialise, or
+ *  a terminal session mid-resume (no message of its own — `text` is
+ *  null and `title` names the conversation being picked up). */
 interface DraftPendingState {
-  text: string;
+  text: string | null;
   images: UserMessageImage[];
-  phase: MaterializePhase;
+  phase: DraftPendingPhase;
+  title?: string;
 }
 
-const PHASE_LABEL: Record<MaterializePhase, string> = {
+type DraftPendingPhase = MaterializePhase | "resuming";
+
+const PHASE_LABEL: Record<DraftPendingPhase, string> = {
   "creating-worktree": "Creating worktree…",
   "creating-workspace": "Setting up workspace…",
   "starting-session": "Starting session…",
   sending: "Sending…",
+  resuming: "Resuming session…",
 };
+
+/** Rows requested when checking whether the "continue a terminal
+ *  session" row has anything to offer. Only the count matters here, and
+ *  the picker fetches its own (larger) page on open. */
+const RESUME_DISCOVERY_LIMIT = 20;
 
 /**
  * The just-sent conversation, rendered the instant the user submits so
@@ -1204,20 +1322,27 @@ function DraftPendingConversation({
   pending: DraftPendingState;
   composer: ReactNode;
 }) {
-  const item: UserMessageItem = {
-    kind: "user_message",
-    id: "draft-pending",
-    seq: 0,
-    text: pending.text,
-    images: pending.images.length > 0 ? pending.images : undefined,
-  };
+  const item: UserMessageItem | null =
+    pending.text === null
+      ? null
+      : {
+          kind: "user_message",
+          id: "draft-pending",
+          seq: 0,
+          text: pending.text,
+          images: pending.images.length > 0 ? pending.images : undefined,
+        };
+  const label =
+    pending.phase === "resuming" && pending.title
+      ? `Resuming "${pending.title}"…`
+      : PHASE_LABEL[pending.phase];
   return (
     <div className="flex h-full w-full flex-col">
       {/* Both-edges gutter so the column stays concentric with the pane
           (and with the composer below) once this view can scroll. */}
       <div className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
         <div className={cn(CHAT_COLUMN, "flex flex-col gap-4 py-6")}>
-          <UserMessage item={item} />
+          {item && <UserMessage item={item} />}
           <div
             className="flex items-center gap-[13px] pt-0.5"
             role="status"
@@ -1230,9 +1355,7 @@ function DraftPendingConversation({
                 aria-hidden
               />
             </span>
-            <span className="shimmer text-[13px] font-semibold">
-              {PHASE_LABEL[pending.phase]}
-            </span>
+            <span className="shimmer text-[13px] font-semibold">{label}</span>
           </div>
         </div>
       </div>
