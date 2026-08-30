@@ -162,6 +162,9 @@ impl PtyManager {
         // host libraries rather than the AppImage's bundled ones. No-op
         // outside an AppImage.
         crate::execution::sanitize_appimage_env_pty(&mut builder);
+        // Same rule as the local spawn sites: renderer transport flags and
+        // the pinned sidecar path describe the host process, not the shell.
+        crate::terminal::strip_app_process_env(&mut builder);
 
         let child = pair
             .slave

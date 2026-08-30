@@ -204,10 +204,12 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // The WebKitGTK renderer transport vars configure the app's own webview;
-    // the daemon has no webview and every PTY child it spawns would inherit
-    // them. Strip here so the whole daemon subtree starts clean.
-    for key in crate::webview_tuning::RENDERER_ENV_VARS {
+    // The WebKitGTK renderer transport vars configure the app's own webview
+    // and the pinned sidecar path belongs to this install; the daemon needs
+    // neither, and every PTY child it spawns would inherit them. Strip here so
+    // the whole daemon subtree starts clean (the leaf spawn strips again for
+    // daemons adopted from an older app process).
+    for key in crate::terminal::app_process_only_env_vars() {
         cmd.env_remove(key);
     }
 

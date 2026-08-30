@@ -60,7 +60,7 @@ const APPDIR_ENV: &str = "APPDIR";
 /// Also the list the terminal/PTY layer strips from child environments:
 /// renderer transport is an app-process concern, and a shell that launches
 /// another GTK/WebKit app must not inherit our choice (see
-/// `terminal::strip_renderer_env`).
+/// `terminal::strip_app_process_env`).
 pub const RENDERER_ENV_VARS: [&str; 3] =
     [FORCE_SHM_ENV, DISABLE_DMABUF_ENV, DISABLE_COMPOSITING_ENV];
 

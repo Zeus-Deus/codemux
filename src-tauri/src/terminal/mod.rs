@@ -1255,18 +1255,44 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Remove the WebKitGTK renderer transport vars from a child's environment.
+/// Env vars that describe *this* app process and must never reach a
+/// user-facing shell. Shared by every PTY spawn site (in-process, daemon
+/// leaf, remote host) and by the daemon supervisor, so the list lives in
+/// exactly one place.
 ///
-/// Those vars configure how *this* process hands composited frames to the
-/// compositor; they are meaningless to a shell and actively harmful to any
-/// GTK/WebKit app launched from one (including another Codemux, which would
-/// read the inherited values as a user override and drop to CPU rendering).
-/// `GDK_BACKEND` and the `CODEMUX*` vars are deliberately left in place —
-/// children are expected to inherit those. (The AppImage layer separately drops
-/// a `GDK_BACKEND=x11` that came from `AppRun`, which is AppRun's value rather
-/// than ours or the user's; see `execution::appimage_env_fixups`.)
-pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
-    for key in crate::webview_tuning::RENDERER_ENV_VARS {
+/// - The WebKitGTK renderer transport vars configure how this process hands
+///   composited frames to the compositor. They are meaningless to a shell and
+///   actively harmful to any GTK/WebKit app launched from one (including
+///   another Codemux, which would read the inherited values as a user override
+///   and drop to CPU rendering).
+/// - `CODEMUX_CLAUDE_SIDECAR_PATH` is pinned at startup to the sidecar binary
+///   *this* install resolved (see `lib.rs` / `sidecar_path::resolve_sidecar`).
+///   It is the highest-priority override in sidecar resolution, so a dev build
+///   started from a shell inside an installed Codemux (`npm run tauri:dev`)
+///   would otherwise inherit it and spawn the installed release sidecar
+///   instead of its own freshly staged `src-tauri/binaries/` copy. The app's
+///   own sidecar spawns are unaffected: they resolve the path from the app
+///   process environment, not from the child's.
+///
+/// Everything else is inherited on purpose. The other `CODEMUX*` vars
+/// (`CODEMUX`, `CODEMUX_STARTUP_ID`, `CODEMUX_WORKSPACE_*`, `CODEMUX_PANE_ID`,
+/// `CODEMUX_HOOK_PORT`, ...) are the user-facing contract the shell and the
+/// CLI shim rely on, and `GDK_BACKEND` is left alone too. (The AppImage layer
+/// separately drops a `GDK_BACKEND=x11` that came from `AppRun`, which is
+/// AppRun's value rather than ours or the user's; see
+/// `execution::appimage_env_fixups`.)
+pub(crate) fn app_process_only_env_vars() -> impl Iterator<Item = &'static str> {
+    crate::webview_tuning::RENDERER_ENV_VARS
+        .into_iter()
+        .chain(std::iter::once(
+            crate::agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+        ))
+}
+
+/// Remove [`app_process_only_env_vars`] from a PTY child's environment.
+/// Call it last, after every explicit `cmd.env(...)`, so nothing re-adds one.
+pub(crate) fn strip_app_process_env(cmd: &mut CommandBuilder) {
+    for key in app_process_only_env_vars() {
         cmd.env_remove(key);
     }
 }
@@ -1612,8 +1638,9 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
 
-    // Renderer transport flags are an app-process concern only.
-    strip_renderer_env(&mut cmd);
+    // Renderer transport flags and the pinned sidecar path are an app-process
+    // concern only.
+    strip_app_process_env(&mut cmd);
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -3092,6 +3119,46 @@ mod tests {
         assert_eq!(strip_ansi_codes("\x1b[2J\x1b[Hhello"), "hello");
         assert_eq!(strip_ansi_codes("\x1b(Bplain"), "plain");
         assert_eq!(strip_ansi_codes("\x1bcreset"), "reset");
+    }
+
+    #[test]
+    fn strip_app_process_env_drops_sidecar_override_and_keeps_user_facing_vars() {
+        use crate::agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV;
+
+        // Model the app process having pinned the sidecar path at startup and
+        // the renderer layer having stamped its transport vars: both land in
+        // the builder's inherited base env exactly as they would via
+        // `std::env::set_var`, without touching the real process env (which
+        // leaks across parallel test threads).
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env(SIDECAR_PATH_ENV, "/usr/lib/codemux/binaries/installed-sidecar");
+        for key in crate::webview_tuning::RENDERER_ENV_VARS {
+            cmd.env(key, "1");
+        }
+        // The user-facing contract that a shell must keep.
+        cmd.env("CODEMUX", "1");
+        cmd.env("CODEMUX_STARTUP_ID", "startup-123");
+        cmd.env("CODEMUX_WORKSPACE_NAME", "demo");
+        cmd.env("CODEMUX_PANE_ID", "pane-1");
+
+        strip_app_process_env(&mut cmd);
+
+        assert!(
+            cmd.get_env(SIDECAR_PATH_ENV).is_none(),
+            "a spawned shell must not inherit the pinned sidecar path, or a dev \
+             build started from it would run the installed sidecar"
+        );
+        for key in crate::webview_tuning::RENDERER_ENV_VARS {
+            assert!(cmd.get_env(key).is_none(), "{key} must be stripped");
+        }
+        for key in [
+            "CODEMUX",
+            "CODEMUX_STARTUP_ID",
+            "CODEMUX_WORKSPACE_NAME",
+            "CODEMUX_PANE_ID",
+        ] {
+            assert!(cmd.get_env(key).is_some(), "{key} must survive the strip");
+        }
     }
 
     // ── Regression tests for the cross-machine push spawn bugs ────────

@@ -148,6 +148,8 @@ pub fn resolve_sidecar_path() -> Result<PathBuf, ProviderError> {
 /// `provider_not_configured` semantics.
 pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(explicit) = env_override() {
+        #[cfg(debug_assertions)]
+        warn_if_override_shadows_dev_copy(&explicit);
         return Some(explicit);
     }
 
@@ -169,6 +171,37 @@ pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Debug-build tripwire for an inherited override. Terminals spawned by
+/// Codemux strip [`SIDECAR_PATH_ENV`] (see
+/// `terminal::app_process_only_env_vars`), but a value can still arrive
+/// through other routes (an old daemon, a shell rc file, a stale export).
+/// If it points outside this checkout while a staged dev-tree copy exists,
+/// the dev build is almost certainly about to run someone else's sidecar —
+/// say so loudly, naming both paths. The override still wins; this only
+/// makes the mismatch visible instead of surfacing later as a baffling
+/// "unknown method" from a binary built from different sources.
+#[cfg(debug_assertions)]
+fn warn_if_override_shadows_dev_copy(explicit: &Path) {
+    let dev_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join(sidecar_binary_name());
+    if !dev_copy.exists() {
+        return;
+    }
+    let inside_dev_tree = explicit.starts_with(env!("CARGO_MANIFEST_DIR"));
+    if inside_dev_tree {
+        return;
+    }
+    eprintln!(
+        "[codemux::sidecar] WARNING: {SIDECAR_PATH_ENV} overrides the sidecar with \
+         {} but this dev tree has its own staged copy at {}. The override wins, so \
+         this build will run a sidecar compiled from different sources. Unset the \
+         variable unless that is intentional.",
+        explicit.display(),
+        dev_copy.display()
+    );
 }
 
 /// Assert the sidecar binary exists — used by the provider's health

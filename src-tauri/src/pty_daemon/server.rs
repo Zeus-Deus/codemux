@@ -749,11 +749,9 @@ async fn spawn_pty(
 
     // Belt-and-braces with the supervisor's own strip: a daemon adopted from
     // an older app process may still carry the WebKitGTK renderer transport
-    // vars, which are an app-process concern and must never reach a shell or
-    // any GTK/WebKit app launched from one.
-    for key in crate::webview_tuning::RENDERER_ENV_VARS {
-        cmd.env_remove(key);
-    }
+    // vars or the pinned sidecar path, which are an app-process concern and
+    // must never reach a shell or anything launched from one.
+    crate::terminal::strip_app_process_env(&mut cmd);
 
     let child = pair
         .slave
