@@ -425,15 +425,34 @@ pub(crate) fn normalize_custom_hosts(
 
 // ── Cache ───────────────────────────────────────────────────────
 
-/// 60s. Remotes change about as often as a user edits `.git/config`,
-/// and the pollers hit detection every 5s per active workspace, so a
-/// minute of reuse removes almost all of the subprocess cost while
-/// keeping a newly added remote within one poll cycle of being noticed.
+/// 60s for a positive detection. A recognised remote changes about as
+/// often as a user edits `.git/config`, and the pollers hit detection
+/// every 5s per active workspace, so a minute of reuse removes almost
+/// all of the subprocess cost.
 const DETECTION_TTL: Duration = Duration::from_secs(60);
+/// 5s for an authoritative `Unknown`. The most common way a checkout
+/// gains its first remote is a `git remote add origin ...` typed in a
+/// terminal pane, which no app-owned mutation hook can see — only the
+/// TTL notices it. One poll cycle of reuse still deduplicates the
+/// subprocess burst, while a newly added remote lights the provider and
+/// PR UI within seconds instead of a minute.
+const NEGATIVE_DETECTION_TTL: Duration = Duration::from_secs(5);
+const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct CacheEntry {
     value: DetectedProvider,
     fetched_at: Instant,
+}
+
+impl CacheEntry {
+    fn is_fresh(&self) -> bool {
+        let ttl = if self.value.kind == ProviderKind::Unknown {
+            NEGATIVE_DETECTION_TTL
+        } else {
+            DETECTION_TTL
+        };
+        self.fetched_at.elapsed() < ttl
+    }
 }
 
 static DETECTION_CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
@@ -451,43 +470,77 @@ pub fn invalidate_detection_cache(repo_path: Option<&Path>) {
     }
 }
 
+/// Test-only: age an existing cache entry so TTL expiry is observable
+/// without sleeping through it.
+#[cfg(test)]
+fn backdate_detection_cache(repo_path: &Path, age: Duration) {
+    if let Ok(mut cache) = DETECTION_CACHE.lock() {
+        if let Some(entry) = cache.get_mut(&repo_path.display().to_string()) {
+            entry.fetched_at = entry
+                .fetched_at
+                .checked_sub(age)
+                .expect("backdating past process start");
+        }
+    }
+}
+
 /// `git` in a checkout, reduced to trimmed stdout. `None` when git could
 /// not run, exited non-zero, or said nothing — the three cases every
 /// caller treats the same way ("no answer"). Shared with the provider
 /// adapters, which ask git the same kind of question.
 pub(crate) fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
+    run_git_allow_empty(repo_path, args)
+        .ok()
+        .filter(|output| !output.is_empty())
+}
+
+/// Deadline-bounded local git read that distinguishes a successful empty
+/// answer (for example, a repository with no remotes) from a subprocess
+/// failure. Provider refreshers use that distinction to cache authoritative
+/// negative detection while preserving last-known UI state on failures.
+fn run_git_allow_empty(repo_path: &Path, args: &[&str]) -> Result<String, ()> {
     let mut cmd = crate::execution::host_command("git");
     cmd.args(args).current_dir(repo_path);
     sanitize_gui_env_std(&mut cmd);
-    cmd.output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|output| !output.is_empty())
+    let output = super::exec::run_timed(cmd, LOCAL_GIT_TIMEOUT).map_err(|_| ())?;
+    if !output.success {
+        return Err(());
+    }
+    Ok(output.stdout.trim().to_string())
 }
 
 /// Classify the checkout at `repo_path`.
 ///
-/// Never fails: a directory that is not a repository, has no remotes, or
-/// sits on a host nothing recognises all resolve to `Unknown`. Only a
-/// positive classification is cached — an `Unknown` is re-probed every
-/// call, so a freshly cloned workspace, a `git remote add origin …`, or a
-/// newly saved custom-host mapping is picked up on the next render rather
-/// than a minute later.
+/// Never fails: a directory that is not a repository, has no remotes, or sits
+/// on a host nothing recognises all resolve to `Unknown`. Callers that need to
+/// preserve a last-known value across subprocess failures should use
+/// [`try_detect_provider`] instead.
 pub fn detect_provider(repo_path: &Path) -> DetectedProvider {
+    try_detect_provider(repo_path).unwrap_or_else(|_| DetectedProvider::unknown())
+}
+
+/// Classify a checkout while retaining the difference between an authoritative
+/// `Unknown` and a failed/timed-out git probe.
+///
+/// Successful negative results are cached only for the short negative TTL:
+/// a remote added from a terminal pane bypasses every app-owned invalidation
+/// hook, so `Unknown` must expire quickly, while a positive detection keeps
+/// the full TTL. App-owned remote/settings mutations still invalidate this
+/// cache explicitly, and a transient subprocess failure is never cached and
+/// never asks a poller to wipe its last-known provider pill.
+pub fn try_detect_provider(repo_path: &Path) -> Result<DetectedProvider, String> {
     let key = repo_path.display().to_string();
 
     if let Ok(cache) = DETECTION_CACHE.lock() {
         if let Some(entry) = cache.get(&key) {
-            if entry.fetched_at.elapsed() < DETECTION_TTL {
-                return entry.value.clone();
+            if entry.is_fresh() {
+                return Ok(entry.value.clone());
             }
         }
     }
 
-    let Some(remote_text) = run_git(repo_path, &["remote", "-v"]) else {
-        return DetectedProvider::unknown();
-    };
+    let remote_text = run_git_allow_empty(repo_path, &["remote", "-v"])
+        .map_err(|_| "git remote detection failed or timed out".to_string())?;
     let remotes = parse_remote_lines(&remote_text);
 
     // Only worth asking when there is more than one remote to choose
@@ -503,24 +556,17 @@ pub fn detect_provider(repo_path: &Path) -> DetectedProvider {
 
     let detected = detect_from_remotes(&remotes, upstream_remote, &custom_hosts_from_settings());
 
-    // Only a positive classification is remembered. `Unknown` is the
-    // answer for a checkout whose remote was just added, or one waiting
-    // on a custom-host mapping, and the UI deliberately never caches a
-    // negative repo check so `git remote add origin …` takes effect on
-    // the next render rather than a minute later.
-    if detected.kind != ProviderKind::Unknown {
-        if let Ok(mut cache) = DETECTION_CACHE.lock() {
-            cache.retain(|_, entry| entry.fetched_at.elapsed() < DETECTION_TTL);
-            cache.insert(
-                key,
-                CacheEntry {
-                    value: detected.clone(),
-                    fetched_at: Instant::now(),
-                },
-            );
-        }
+    if let Ok(mut cache) = DETECTION_CACHE.lock() {
+        cache.retain(|_, entry| entry.is_fresh());
+        cache.insert(
+            key,
+            CacheEntry {
+                value: detected.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
     }
-    detected
+    Ok(detected)
 }
 
 #[cfg(test)]
@@ -1012,12 +1058,13 @@ upstream\thttps://gitlab.com/g/p.git (push)
         invalidate_detection_cache(Some(&repo));
     }
 
-    /// An `Unknown` is "nothing classified *yet*" as often as it is a
-    /// final answer — a clone whose remote is about to be added, or a
-    /// self-hosted host waiting on a custom-host mapping. Caching it
-    /// would leave the PR UI dark for a full TTL after the fix.
+    /// An authoritative `Unknown` is cached — but only for the short
+    /// negative TTL, because remotes are routinely added from a terminal
+    /// pane where no app-owned mutation hook fires. Within that window it
+    /// is served from cache, and app-owned remote edits still invalidate
+    /// explicitly and become visible immediately.
     #[test]
-    fn an_unknown_classification_is_re_probed_rather_than_remembered() {
+    fn an_unknown_classification_is_cached_briefly_and_invalidatable() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = dir.path();
         git(repo, &["init"]);
@@ -1033,9 +1080,56 @@ upstream\thttps://gitlab.com/g/p.git (push)
         );
         assert_eq!(
             detect_provider(repo).kind,
-            ProviderKind::GitHub,
-            "the Unknown must not have been cached"
+            ProviderKind::Unknown,
+            "the successful negative probe must be cached within its short TTL"
         );
+
+        invalidate_detection_cache(Some(repo));
+        assert_eq!(detect_provider(repo).kind, ProviderKind::GitHub);
+        invalidate_detection_cache(Some(repo));
+    }
+
+    /// The two TTLs split: an `Unknown` entry expires quickly so a remote
+    /// added outside the app (no invalidation hook) is picked up within
+    /// seconds, while a positive detection keeps being served from cache
+    /// for the full minute.
+    #[test]
+    fn unknown_expires_on_the_short_ttl_while_positive_holds_for_the_long_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path();
+        git(repo, &["init"]);
+        assert_eq!(detect_provider(repo).kind, ProviderKind::Unknown);
+
+        // Remote added from a terminal: nothing invalidates the cache.
+        git(
+            repo,
+            &["remote", "add", "origin", "git@github.com:acme/app.git"],
+        );
+        assert_eq!(
+            detect_provider(repo).kind,
+            ProviderKind::Unknown,
+            "inside the short TTL the negative entry is still served"
+        );
+
+        backdate_detection_cache(repo, NEGATIVE_DETECTION_TTL);
+        assert_eq!(
+            detect_provider(repo).kind,
+            ProviderKind::GitHub,
+            "past the short TTL the new remote must be re-detected"
+        );
+
+        // The positive entry survives well past the negative TTL...
+        git(repo, &["remote", "set-url", "origin", "git@gitlab.com:g/p.git"]);
+        backdate_detection_cache(repo, DETECTION_TTL / 2);
+        assert_eq!(
+            detect_provider(repo).kind,
+            ProviderKind::GitHub,
+            "a positive detection is served from cache within its 60s TTL"
+        );
+
+        // ...but not past its own.
+        backdate_detection_cache(repo, DETECTION_TTL / 2);
+        assert_eq!(detect_provider(repo).kind, ProviderKind::GitLab);
 
         invalidate_detection_cache(Some(repo));
     }

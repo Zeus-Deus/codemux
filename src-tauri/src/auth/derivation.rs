@@ -212,8 +212,7 @@ impl std::fmt::Debug for AuthSecret {
 /// calling this.
 pub fn derive_auth_secret(password: &str, email: &str) -> Result<AuthSecret, String> {
     let master = derive_master_material(password, email)?;
-    let hk = Hkdf::<Sha256>::from_prk(&master)
-        .map_err(|e| format!("hkdf from_prk: {e}"))?;
+    let hk = Hkdf::<Sha256>::from_prk(&master).map_err(|e| format!("hkdf from_prk: {e}"))?;
     let mut bytes = [0u8; AUTH_SECRET_LEN];
     hk.expand(AUTH_SECRET_INFO, &mut bytes)
         .map_err(|e| format!("hkdf expand auth: {e}"))?;
@@ -246,15 +245,13 @@ pub fn derive_login_credentials(
     email: &str,
 ) -> Result<(AuthSecret, EncryptionKey), String> {
     let master = derive_master_material(password, email)?;
-    let hk = Hkdf::<Sha256>::from_prk(&master)
-        .map_err(|e| format!("hkdf from_prk: {e}"))?;
+    let hk = Hkdf::<Sha256>::from_prk(&master).map_err(|e| format!("hkdf from_prk: {e}"))?;
 
     let mut auth_bytes = [0u8; AUTH_SECRET_LEN];
     hk.expand(AUTH_SECRET_INFO, &mut auth_bytes)
         .map_err(|e| format!("hkdf expand auth: {e}"))?;
-    let auth_secret = AuthSecret(
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(auth_bytes),
-    );
+    let auth_secret =
+        AuthSecret(base64::engine::general_purpose::STANDARD_NO_PAD.encode(auth_bytes));
 
     let mut key_bytes = [0u8; ENCRYPTION_KEY_LEN];
     hk.expand(ENCRYPTION_KEY_INFO, &mut key_bytes)
@@ -574,11 +571,7 @@ mod tests {
     /// the same time.
     #[test]
     fn auth_secret_matches_vexis_for_known_input() {
-        let secret = derive_auth_secret(
-            "golden-test-password",
-            "golden-test@example.com",
-        )
-        .unwrap();
+        let secret = derive_auth_secret("golden-test-password", "golden-test@example.com").unwrap();
         assert_eq!(
             secret.as_str(),
             "9FxAbaiRLQfRmjpB6x4d3FuamAUojg9bh9dVfPYRfyI",
@@ -627,11 +620,7 @@ mod tests {
                 "  Mixed@Case.COM  ",
                 "RPEpsBQM4Y+q6CXLL34UF/R6Ul+8cM4+nwGznP1lDK0",
             ),
-            (
-                "p",
-                "a@b.co",
-                "XqzDeX5p6BZ8Ws8ykB67QRUFEppODc7fsl/ddjEMruU",
-            ),
+            ("p", "a@b.co", "XqzDeX5p6BZ8Ws8ykB67QRUFEppODc7fsl/ddjEMruU"),
         ];
 
         for (password, email, expected) in CASES {
@@ -718,11 +707,8 @@ mod tests {
     /// Codemux's and Vexis's encryption_key derivation.
     #[test]
     fn encryption_key_matches_vexis_for_known_input() {
-        let (_auth, key) = derive_login_credentials(
-            "golden-test-password",
-            "golden-test@example.com",
-        )
-        .unwrap();
+        let (_auth, key) =
+            derive_login_credentials("golden-test-password", "golden-test@example.com").unwrap();
         let hex_str: String = key
             .as_bytes()
             .iter()

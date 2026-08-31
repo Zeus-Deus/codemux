@@ -81,7 +81,11 @@ import {
   type LaunchModel,
   type ReasoningOption,
 } from "@/lib/launch-models";
-import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  refreshProviderCapabilitiesForIntent,
+  selectProviderCapabilitiesLoaded,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import {
   useLaunchGeminiModels,
   useLaunchGeminiModelsInit,
@@ -179,8 +183,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const claudeCaps = useProviderCapabilities((s) => s.claude);
   const codexCaps = useProviderCapabilities((s) => s.codex);
   const opencodeCaps = useProviderCapabilities((s) => s.opencode);
-  const capsLoaded = useProviderCapabilities((s) => s.loaded);
-  const refreshCaps = useProviderCapabilities((s) => s.refresh);
 
   // Gemini isn't a chat provider, so its launch list comes from the
   // backend hybrid harvest (`list_launch_gemini_models`) instead. The
@@ -491,6 +493,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const launchProviderKind = launchFamily
     ? familyToProviderKind(launchFamily)
     : null;
+  const launchCapabilitiesLoaded = useProviderCapabilities((state) =>
+    launchProviderKind
+      ? selectProviderCapabilitiesLoaded(state, launchProviderKind)
+      : true,
+  );
   // The capability bundle for the selected family (Gemini has none).
   const launchCaps =
     launchFamily === "claude"
@@ -521,7 +528,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const launchModelsLoading =
     launchFamily !== null &&
     launchFamily !== "gemini" &&
-    !capsLoaded &&
+    launchProviderKind !== null &&
+    !launchCapabilitiesLoaded &&
     launchModels.length === 0;
 
   // Reasoning + context options are read live from the *selected*
@@ -578,18 +586,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       ? modelSelection.context
       : null;
 
-  // Backstop the app-level capability harvest: if the dialog opens
-  // before a provider's slot has hydrated, kick a refresh for it.
+  // Opening the launch surface is explicit provider intent. Paint a persisted
+  // catalog immediately, but refresh it once in the background even when the
+  // cached slot is non-null so model additions/removals are not frozen for the
+  // renderer's lifetime.
   useEffect(() => {
     if (!open || !launchProviderKind) return;
-    const caps =
-      launchProviderKind === "claude"
-        ? claudeCaps
-        : launchProviderKind === "codex"
-          ? codexCaps
-          : opencodeCaps;
-    if (caps === null) void refreshCaps(launchProviderKind);
-  }, [open, launchProviderKind, claudeCaps, codexCaps, opencodeCaps, refreshCaps]);
+    void refreshProviderCapabilitiesForIntent(launchProviderKind);
+  }, [open, launchProviderKind]);
 
   // Resolve the model selection when the dialog opens, when the chosen
   // agent changes, or once the preset list first loads. Deliberately

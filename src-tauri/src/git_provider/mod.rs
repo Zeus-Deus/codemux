@@ -29,7 +29,10 @@ pub mod provider;
 pub mod registry;
 pub mod unsupported;
 
-pub use detect::{detect_provider, invalidate_detection_cache, DetectedProvider, ProviderKind};
+pub use detect::{
+    detect_provider, invalidate_detection_cache, try_detect_provider, DetectedProvider,
+    ProviderKind,
+};
 pub use gitlab::GitLabProvider;
 pub use provider::{Capabilities, Operation, OperationCapabilities, SourceControlProvider};
 pub use registry::{

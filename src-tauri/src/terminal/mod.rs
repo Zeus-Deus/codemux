@@ -399,6 +399,83 @@ fn try_reserve_session_spawn(
     true
 }
 
+/// RAII ownership for the daemon spawn reservation. Socket errors, RPC
+/// timeouts, task cancellation, and future early-return branches all clear the
+/// `is_spawning` marker automatically unless the successful runtime is
+/// committed. A newly-created placeholder is removed; an existing runtime is
+/// retained so migration output subscribers and the last visible status survive
+/// a failed retry.
+struct SessionSpawnReservation {
+    sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: String,
+    remove_on_drop: bool,
+    committed: bool,
+}
+
+impl SessionSpawnReservation {
+    fn try_new(
+        sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+        session_id: &str,
+    ) -> Option<Self> {
+        let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let remove_on_drop = !guard.contains_key(session_id);
+        let runtime = guard
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionRuntime::new(session_id));
+        if runtime.writer.is_some() || runtime.master.is_some() || runtime.is_spawning {
+            return None;
+        }
+        runtime.is_spawning = true;
+        drop(guard);
+        Some(Self {
+            sessions: sessions.clone(),
+            session_id: session_id.to_string(),
+            remove_on_drop,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionSpawnReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let remove_placeholder = guard
+                .get_mut(&self.session_id)
+                .map(|runtime| {
+                    // Re-check at drop time. A pane may have attached its output
+                    // channel, buffered output may have arrived, or a visible
+                    // status may have been emitted while the daemon RPC was in
+                    // flight. Removing the entry based only on its creation-time
+                    // shape would strand the later in-process fallback with no
+                    // frontend subscriber.
+                    runtime.is_spawning = false;
+                    self.remove_on_drop && !spawn_placeholder_is_observable(runtime)
+                })
+                .unwrap_or(false);
+            if remove_placeholder {
+                guard.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// Whether a spawn placeholder acquired user-visible state after reservation.
+/// The exact `SessionRuntime::new` Starting payload is still disposable; any
+/// newer status (including daemon-specific Starting text), subscriber, or
+/// buffered output must survive so failure/fallback can continue in place.
+fn spawn_placeholder_is_observable(runtime: &SessionRuntime) -> bool {
+    !runtime.output_subscribers.is_empty()
+        || !runtime.pending_output.is_empty()
+        || runtime.dropped_chunks > 0
+        || !matches!(&runtime.last_status.state, TerminalLifecycleState::Starting)
+        || runtime.last_status.message.as_deref() != Some("Starting shell...")
+}
+
 /// Check whether a spawn attempt is in flight or already complete for `session_id`.
 ///
 /// Used by tests and by `spawn_missing_ptys_for_workspace` to skip sessions
@@ -435,9 +512,7 @@ fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
 /// disk, so that CWD-scoped tools (`claude --resume`) find their sessions.
 /// Falls back to `fallback` otherwise.
 fn resolve_session_cwd(scrollback_working_dir: &str, fallback: &str) -> String {
-    if !scrollback_working_dir.is_empty()
-        && std::path::Path::new(scrollback_working_dir).is_dir()
-    {
+    if !scrollback_working_dir.is_empty() && std::path::Path::new(scrollback_working_dir).is_dir() {
         scrollback_working_dir.to_string()
     } else {
         fallback.to_string()
@@ -469,7 +544,16 @@ fn resolve_resume_command(
             .iter()
             .find(|session| session.session_id.0 == meta.session_id)
             .and_then(|session| session.original_command.clone())
-    })?;
+    });
+    resolve_resume_command_from_original(original_command, meta, adapter_state)
+}
+
+fn resolve_resume_command_from_original(
+    original_command: Option<String>,
+    meta: &crate::scrollback::ScrollbackMeta,
+    adapter_state: &crate::session_adapters::AdapterState,
+) -> Option<String> {
+    let original_command = original_command?;
 
     let adapter_id = meta
         .adapter_id
@@ -668,9 +752,7 @@ fn queue_or_send_output(
             // re-sum. `saturating_add` defends against the pathological case
             // of cumulative bytes wrapping `usize::MAX` — at the production
             // 256 MiB cap this is theoretical, but it's free insurance.
-            runtime.pending_output_bytes = runtime
-                .pending_output_bytes
-                .saturating_add(chunk.len());
+            runtime.pending_output_bytes = runtime.pending_output_bytes.saturating_add(chunk.len());
             runtime.pending_output.push_back(chunk.clone());
             while runtime.pending_output_bytes > OUTPUT_BUFFER_BYTE_LIMIT {
                 let Some(evicted) = runtime.pending_output.pop_front() else {
@@ -682,9 +764,8 @@ fn queue_or_send_output(
                     runtime.pending_output_bytes = 0;
                     break;
                 };
-                runtime.pending_output_bytes = runtime
-                    .pending_output_bytes
-                    .saturating_sub(evicted.len());
+                runtime.pending_output_bytes =
+                    runtime.pending_output_bytes.saturating_sub(evicted.len());
                 if runtime.output_subscribers.is_empty() {
                     let dropped = runtime.dropped_chunks.saturating_add(1);
                     runtime.dropped_chunks = dropped;
@@ -1280,30 +1361,61 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
 /// (see `crate::commands::agent_chat::workspace_env_overlay`), keeping the
 /// terminal and chat surfaces in lockstep.
 pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, String)> {
-    let root = ws.project_root.clone().unwrap_or_else(|| {
-        crate::scripts::resolve_root_path(std::path::Path::new(&ws.cwd))
+    workspace_pty_env_from_fields(
+        &ws.workspace_id.0,
+        &ws.title,
+        &ws.cwd,
+        ws.project_root.as_deref(),
+        ws.worktree_path.as_deref(),
+        ws.git_branch.as_deref(),
+    )
+}
+
+pub(crate) fn hydration_workspace_pty_env(
+    ws: &crate::state::PtyHydrationWorkspace,
+) -> Vec<(String, String)> {
+    workspace_pty_env_from_fields(
+        &ws.workspace_id,
+        &ws.title,
+        &ws.cwd,
+        ws.project_root.as_deref(),
+        ws.worktree_path.as_deref(),
+        ws.git_branch.as_deref(),
+    )
+}
+
+fn workspace_pty_env_from_fields(
+    workspace_id: &str,
+    title: &str,
+    cwd: &str,
+    project_root: Option<&str>,
+    worktree_path: Option<&str>,
+    git_branch: Option<&str>,
+) -> Vec<(String, String)> {
+    let root = project_root.map(str::to_string).unwrap_or_else(|| {
+        crate::scripts::resolve_root_path(std::path::Path::new(cwd))
             .to_string_lossy()
             .to_string()
     });
-    let port = crate::scripts::allocate_workspace_port(&ws.workspace_id.0);
+    let port = crate::scripts::allocate_workspace_port(workspace_id);
 
     let mut vars: Vec<(String, String)> = crate::scripts::script_env(
-        std::path::Path::new(&ws.cwd),
+        std::path::Path::new(cwd),
         std::path::Path::new(&root),
-        ws.git_branch.as_deref(),
+        git_branch,
         Some(port),
     )
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
 
-    vars.push(("CODEMUX_WORKSPACE_NAME".to_string(), ws.title.clone()));
+    vars.push(("CODEMUX_WORKSPACE_NAME".to_string(), title.to_string()));
     vars.push((
         "CODEMUX_AGENT_CONTEXT".to_string(),
         crate::agent_context::build_agent_context(
-            Some(&ws.title),
-            ws.worktree_path.as_deref(),
-            ws.git_branch.as_deref(),
+            Some(title),
+            worktree_path,
+            git_branch,
             Some(&root),
         ),
     ));
@@ -1319,95 +1431,31 @@ pub fn spawn_pty_for_session<R: Runtime>(app: AppHandle<R>, session_id: String) 
     // keeps running" work for the normal preset-driven flow (which
     // spawns a shell first and writes the agent command into it).
     //
-    // Fallback is silent and total: any daemon error — circuit breaker
-    // open, daemon binary missing, socket race, version mismatch,
-    // platform without IPC support — drops to the in-process spawn so
-    // the user always gets a working terminal.
+    // Failures known to happen before a Spawn frame is accepted can fall back
+    // to an in-process shell. A timeout/transport failure after Spawn or Attach
+    // is deliberately retry-only because the daemon may already own the shell;
+    // starting a fallback then would duplicate the process.
     #[cfg(unix)]
     {
         if daemon_path_viable() {
             let app_clone = app.clone();
             let session_id_clone = session_id.clone();
+            let is_remote = {
+                let state: State<'_, AppStateStore> = app.state();
+                state
+                    .pty_hydration_plan_for_session(&session_id)
+                    .and_then(|plan| plan.workspace.host_id)
+                    .is_some()
+            };
             tauri::async_runtime::spawn(async move {
-                match daemon_backed::spawn_pty_for_session_via_daemon(
+                if let Err(error) = daemon_backed::spawn_pty_for_session_via_daemon(
                     app_clone.clone(),
                     session_id_clone.clone(),
                 )
                 .await
                 {
-                    Ok(()) => {}
-                    Err(error) => {
-                        // Critical: do NOT fall back to in-process
-                        // spawn for REMOTE workspaces. A remote
-                        // workspace's host_id says "this lives on
-                        // pandora," and silently spawning a local
-                        // shell would lie about where the user's
-                        // sessions are running — leading to the
-                        // exact "Cloud icon but local pwd" bug we
-                        // shipped a fix for in the prior commit.
-                        // Surface the failure as Failed status; the
-                        // UI shows the error and the user can pull
-                        // back / retry. Local workspaces (host_id
-                        // == None) still get the in-process
-                        // fallback because for them it's correct.
-                        // "Already reserved" is benign — another spawn
-                        // task for the same session id is already in
-                        // flight (sibling pane spawn race, workspace
-                        // re-activation, etc.). Silently no-op instead
-                        // of clobbering the in-flight spawn with a
-                        // Failed status that the user sees as a
-                        // "Reconnecting" / "Couldn't reach the host"
-                        // popup over a session that's actually fine.
-                        if error.contains("already reserved") {
-                            eprintln!(
-                                "[codemux::terminal] suppressing benign 'already reserved' \
-                                 spawn-retry for session {session_id_clone} \
-                                 (sibling spawn in flight; no UI change)"
-                            );
-                            return;
-                        }
-                        let app_for_check = app_clone.clone();
-                        let is_remote_workspace = is_remote_workspace_for_session(
-                            &app_for_check,
-                            &session_id_clone,
-                        );
-                        if is_remote_workspace {
-                            eprintln!(
-                                "[codemux::terminal] remote-shell spawn failed for session \
-                                 {session_id_clone}: {error}; NOT falling back to local"
-                            );
-                            // Emit Failed so the terminal pane
-                            // surfaces a useful message instead of
-                            // hanging on "Starting…" forever.
-                            let pty_state: State<'_, PtyState> =
-                                app_clone.state();
-                            emit_terminal_status(
-                                &app_clone,
-                                &pty_state.sessions,
-                                TerminalStatusPayload {
-                                    session_id: session_id_clone.clone(),
-                                    state: TerminalLifecycleState::Failed,
-                                    message: Some(format!(
-                                        "Couldn't reach the remote host: {error}. \
-                                         Try Test Connection in Settings → Hosts, \
-                                         or right-click → Pull back."
-                                    )),
-                                    exit_code: None,
-                                },
-                            );
-                            remove_session_runtime(&pty_state.sessions, &session_id_clone);
-                            return;
-                        }
-                        eprintln!(
-                            "[codemux::terminal] persistent-shell path failed for session \
-                             {session_id_clone}: {error}; falling back to in-process spawn"
-                        );
-                        let sid = session_id_clone.clone();
-                        let app_fb = app_clone.clone();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            spawn_pty_for_session_in_process(app_fb, sid);
-                        });
-                    }
+                    handle_daemon_spawn_failure(app_clone, session_id_clone, error, is_remote)
+                        .await;
                 }
             });
             return;
@@ -1416,19 +1464,78 @@ pub fn spawn_pty_for_session<R: Runtime>(app: AppHandle<R>, session_id: String) 
     spawn_pty_for_session_in_process(app, session_id);
 }
 
-/// True if the session belongs to a workspace with `host_id` set.
-/// Used to gate the in-process fallback — local workspaces still
-/// fall back happily, remote ones must surface the real error.
 #[cfg(unix)]
-fn is_remote_workspace_for_session<R: Runtime>(
-    app: &AppHandle<R>,
-    session_id: &str,
-) -> bool {
-    let app_state: State<'_, AppStateStore> = app.state();
-    let snapshot = app_state.snapshot();
-    find_owning_workspace(&snapshot, session_id)
-        .and_then(|w| w.host_id)
-        .is_some()
+async fn handle_daemon_spawn_failure<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    error: daemon_backed::DaemonHydrationFailure,
+    is_remote: bool,
+) {
+    // Another caller owns this id. It is neither a failure nor permission to
+    // clear that caller's reservation/status.
+    if error.is_already_reserved() {
+        return;
+    }
+    {
+        let pty_state: State<'_, PtyState> = app.state();
+        if is_session_spawn_active(&pty_state.sessions, &session_id) {
+            // Hydration inventories are snapshots. If another activation/pane
+            // creation won the race after this one failed, its healthy runtime
+            // is authoritative and must not be overwritten by a stale Failed
+            // status or local fallback spawn.
+            return;
+        }
+    }
+    if is_remote || !error.allows_local_fallback() {
+        let pty_state: State<'_, PtyState> = app.state();
+        // Keep a status-only runtime so a pane that mounts after this event can
+        // replay Failed via `get_terminal_status`. It owns no PTY handles and
+        // `is_spawning` is false, so an explicit retry can reserve the same id
+        // immediately instead of being wedged behind a stale placeholder.
+        with_session_runtime(
+            &pty_state.sessions,
+            &session_id,
+            || SessionRuntime::new(&session_id),
+            |runtime| {
+                runtime.writer = None;
+                runtime.master = None;
+                runtime.child_pid = None;
+                runtime.persistent = false;
+                runtime.is_spawning = false;
+                runtime.skip_preset_launch = false;
+                runtime.resume_command = None;
+                runtime.daemon_client = None;
+            },
+        );
+        let message = if is_remote {
+            format!(
+                "Couldn't reach the remote host: {error}. Try Test Connection in \
+                 Settings → Hosts, or right-click → Pull back."
+            )
+        } else {
+            format!(
+                "Persistent shell outcome is uncertain: {error}. Retry to reattach \
+                 without starting a duplicate shell."
+            )
+        };
+        emit_terminal_status(
+            &app,
+            &pty_state.sessions,
+            TerminalStatusPayload {
+                session_id: session_id.clone(),
+                state: TerminalLifecycleState::Failed,
+                message: Some(message),
+                exit_code: None,
+            },
+        );
+        return;
+    }
+
+    eprintln!("[codemux::terminal] persistent-shell path failed; falling back to in-process spawn");
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        spawn_pty_for_session_in_process(app, session_id);
+    })
+    .await;
 }
 
 fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: String) {
@@ -1887,21 +1994,62 @@ fn collect_workspace_session_ids(
 /// `try_reserve_session_spawn`, so re-calling this for an already-active
 /// workspace is a cheap no-op.
 pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace_id: &str) {
+    let read_started = std::time::Instant::now();
     let app_state: State<'_, AppStateStore> = app.state();
-    let snapshot = app_state.snapshot();
-    let session_ids = collect_workspace_session_ids(&snapshot, workspace_id);
+    let plan = app_state.pty_hydration_plan_for_workspace(workspace_id);
+    crate::diagnostics::record_perf_timing("pty.hydration-state-read", read_started.elapsed());
+    let Some(mut plan) = plan else {
+        return;
+    };
 
-    if session_ids.len() > MAX_STARTUP_SESSIONS {
+    if plan.sessions.len() > MAX_STARTUP_SESSIONS {
         eprintln!(
             "[codemux::terminal] Workspace {workspace_id} has {} sessions; \
              spawning only the first {} to avoid blocking the IPC thread",
-            session_ids.len(),
+            plan.sessions.len(),
             MAX_STARTUP_SESSIONS
         );
+        plan.sessions.truncate(MAX_STARTUP_SESSIONS);
     }
 
-    for session_id in session_ids.into_iter().take(MAX_STARTUP_SESSIONS) {
-        spawn_pty_for_session(app.clone(), session_id);
+    #[cfg(unix)]
+    if daemon_path_viable() {
+        let is_remote = plan.workspace.host_id.is_some();
+        let pty_state: State<'_, PtyState> = app.state();
+        let missing_session_ids: Vec<String> = plan
+            .sessions
+            .iter()
+            .filter(|session| !is_session_spawn_active(&pty_state.sessions, &session.session_id))
+            .map(|session| session.session_id.clone())
+            .collect();
+        tauri::async_runtime::spawn(async move {
+            use futures_util::StreamExt as _;
+            let failures =
+                match daemon_backed::hydrate_workspace_via_daemon(app.clone(), plan).await {
+                    Ok(failures) => failures,
+                    // The workspace-level error arrives pre-classified: a
+                    // List timeout against a stalled-but-alive daemon stays
+                    // retry-only for every missing session, while a daemon
+                    // that provably isn't running still falls back locally.
+                    Err(error) => missing_session_ids
+                        .into_iter()
+                        .map(|session_id| (session_id, error.clone()))
+                        .collect(),
+                };
+            futures_util::stream::iter(failures)
+                .for_each_concurrent(4, |(session_id, error)| {
+                    let app = app.clone();
+                    async move {
+                        handle_daemon_spawn_failure(app, session_id, error, is_remote).await;
+                    }
+                })
+                .await;
+        });
+        return;
+    }
+
+    for session in plan.sessions {
+        spawn_pty_for_session(app.clone(), session.session_id);
     }
 }
 
@@ -1919,7 +2067,11 @@ pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace
 /// Rides the same `last_status` plumbing as every other lifecycle emit, so a
 /// mid-migration workspace switch + return still shows the overlay
 /// (`get_terminal_status` replays `last_status`).
-pub fn emit_migrating_for_workspace<R: Runtime>(app: &AppHandle<R>, workspace_id: &str, message: &str) {
+pub fn emit_migrating_for_workspace<R: Runtime>(
+    app: &AppHandle<R>,
+    workspace_id: &str,
+    message: &str,
+) {
     let app_state: State<'_, AppStateStore> = app.state();
     let pty_state: State<'_, PtyState> = app.state();
     let snapshot = app_state.snapshot();
@@ -1964,8 +2116,7 @@ pub fn emit_migrating_for_workspace<R: Runtime>(app: &AppHandle<R>, workspace_id
 /// them on workspace switch.
 pub fn spawn_missing_ptys<R: Runtime>(app: AppHandle<R>) {
     let app_state: State<'_, AppStateStore> = app.state();
-    let snapshot = app_state.snapshot();
-    let active_workspace_id = snapshot.active_workspace_id.0.clone();
+    let active_workspace_id = app_state.active_workspace_id();
 
     if active_workspace_id.is_empty() {
         // No workspace persisted yet (fresh install, or all workspaces deleted).
@@ -2273,11 +2424,9 @@ pub fn get_terminal_status(
     // session has no runtime, it's not coming back on its own. The
     // frontend's overlay handler already knows how to display Exited
     // cleanly.
-    let status = with_existing_session_runtime(
-        &terminal_state.sessions,
-        &session_id,
-        |runtime| runtime.last_status.clone(),
-    )
+    let status = with_existing_session_runtime(&terminal_state.sessions, &session_id, |runtime| {
+        runtime.last_status.clone()
+    })
     .unwrap_or_else(|| TerminalStatusPayload {
         session_id: session_id.clone(),
         state: TerminalLifecycleState::Exited,
@@ -2320,8 +2469,7 @@ pub fn attach_pty_output(
         &session_id,
         || SessionRuntime::new(&session_id),
         |runtime| {
-            runtime.next_output_generation =
-                runtime.next_output_generation.saturating_add(1);
+            runtime.next_output_generation = runtime.next_output_generation.saturating_add(1);
             let generation = runtime.next_output_generation;
             runtime.output_subscribers.push(OutputSubscriber {
                 generation,
@@ -2383,24 +2531,20 @@ pub fn detach_pty_output(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    with_existing_session_runtime(
-        &terminal_state.sessions,
-        &session_id,
-        |runtime| {
-            match generation {
-                Some(generation) => runtime
-                    .output_subscribers
-                    .retain(|s| s.generation != generation),
-                None => runtime.output_subscribers.clear(),
-            }
-            // Self-heal: the removed consumer's pause request dies with it, so
-            // recomputing may resume the reader — a backgrounded child (e.g. a
-            // daemon-less agent left running on tab switch) is not left blocked
-            // on `write()`. Removing the last subscriber also resumes (an empty
-            // set never parks).
-            recompute_flow_paused(runtime);
-        },
-    );
+    with_existing_session_runtime(&terminal_state.sessions, &session_id, |runtime| {
+        match generation {
+            Some(generation) => runtime
+                .output_subscribers
+                .retain(|s| s.generation != generation),
+            None => runtime.output_subscribers.clear(),
+        }
+        // Self-heal: the removed consumer's pause request dies with it, so
+        // recomputing may resume the reader — a backgrounded child (e.g. a
+        // daemon-less agent left running on tab switch) is not left blocked
+        // on `write()`. Removing the last subscriber also resumes (an empty
+        // set never parks).
+        recompute_flow_paused(runtime);
+    });
 
     // Push the recomputed verdict to the daemon (no-op for in-process sessions).
     forward_flow_control_to_daemon(&terminal_state.sessions, &session_id);
@@ -2846,9 +2990,7 @@ pub fn resize_pty<R: Runtime>(
             &terminal_state.sessions,
             &session_id,
             || SessionRuntime::new(&session_id),
-            |runtime| {
-                Ok::<_, String>((runtime.persistent, runtime.daemon_client.clone()))
-            },
+            |runtime| Ok::<_, String>((runtime.persistent, runtime.daemon_client.clone())),
         )?;
         if persistent {
             let session_id_clone = session_id.clone();
@@ -2919,7 +3061,11 @@ pub fn resize_pty<R: Runtime>(
 /// where an agent was processing — the agent stops but stays alive,
 /// so the PTY exit cleanup never fires.
 #[tauri::command]
-pub fn clear_agent_status<R: Runtime>(session_id: String, app_state: State<'_, AppStateStore>, app: AppHandle<R>) {
+pub fn clear_agent_status<R: Runtime>(
+    session_id: String,
+    app_state: State<'_, AppStateStore>,
+    app: AppHandle<R>,
+) {
     // Nothing else moves on this path, so the clear ships as a `PaneStatus`
     // delta — the sidebar drops one dot without re-parsing the app state.
     if let Some(delta) = app_state.clear_transient_pane_status_by_session_delta(&session_id) {
@@ -2985,8 +3131,7 @@ mod tests {
             session_id,
             || SessionRuntime::new(session_id),
             |runtime| {
-                runtime.next_output_generation =
-                    runtime.next_output_generation.saturating_add(1);
+                runtime.next_output_generation = runtime.next_output_generation.saturating_add(1);
                 let generation = runtime.next_output_generation;
                 runtime.output_subscribers.push(OutputSubscriber {
                     generation,
@@ -3109,147 +3254,145 @@ mod tests {
     mod cross_machine_push {
         use super::*;
 
-    /// `is_runtime_owned_by_client` returns true when the runtime's
-    /// `daemon_client` is the SAME Arc allocation as the caller's
-    /// — that's a current read task and Exited should fire.
-    #[tokio::test]
-    async fn is_runtime_owned_by_client_matching_arc_returns_true() {
-        let sessions = make_sessions();
-        let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        {
-            let mut guard = sessions.lock().unwrap();
-            let mut rt = SessionRuntime::new("session-X");
-            rt.daemon_client = Some(client.clone());
-            guard.insert("session-X".into(), rt);
+        /// `is_runtime_owned_by_client` returns true when the runtime's
+        /// `daemon_client` is the SAME Arc allocation as the caller's
+        /// — that's a current read task and Exited should fire.
+        #[tokio::test]
+        async fn is_runtime_owned_by_client_matching_arc_returns_true() {
+            let sessions = make_sessions();
+            let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            {
+                let mut guard = sessions.lock().unwrap();
+                let mut rt = SessionRuntime::new("session-X");
+                rt.daemon_client = Some(client.clone());
+                guard.insert("session-X".into(), rt);
+            }
+            assert!(
+                is_runtime_owned_by_client(&sessions, "session-X", &client),
+                "same Arc allocation must be detected as owner"
+            );
         }
-        assert!(
-            is_runtime_owned_by_client(&sessions, "session-X", &client),
-            "same Arc allocation must be detected as owner"
-        );
-    }
 
-    /// `is_runtime_owned_by_client` returns false when the runtime's
-    /// `daemon_client` is a DIFFERENT Arc allocation (the session was
-    /// respawned with a fresh client). The caller is a stale read
-    /// task whose Exited would clobber the new spawn's Ready.
-    #[tokio::test]
-    async fn is_runtime_owned_by_client_different_arc_returns_false() {
-        let sessions = make_sessions();
-        let old_client =
-            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        let new_client =
-            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        {
-            let mut guard = sessions.lock().unwrap();
-            let mut rt = SessionRuntime::new("session-X");
-            rt.daemon_client = Some(new_client.clone());
-            guard.insert("session-X".into(), rt);
-        }
-        assert!(
-            !is_runtime_owned_by_client(&sessions, "session-X", &old_client),
-            "old read task's stale Arc must be detected as no-longer-owner — \
+        /// `is_runtime_owned_by_client` returns false when the runtime's
+        /// `daemon_client` is a DIFFERENT Arc allocation (the session was
+        /// respawned with a fresh client). The caller is a stale read
+        /// task whose Exited would clobber the new spawn's Ready.
+        #[tokio::test]
+        async fn is_runtime_owned_by_client_different_arc_returns_false() {
+            let sessions = make_sessions();
+            let old_client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            let new_client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            {
+                let mut guard = sessions.lock().unwrap();
+                let mut rt = SessionRuntime::new("session-X");
+                rt.daemon_client = Some(new_client.clone());
+                guard.insert("session-X".into(), rt);
+            }
+            assert!(
+                !is_runtime_owned_by_client(&sessions, "session-X", &old_client),
+                "old read task's stale Arc must be detected as no-longer-owner — \
              without this check, the stale Exited overrides the new spawn's Ready"
-        );
-    }
-
-    /// `is_runtime_owned_by_client` returns false when the runtime
-    /// has no daemon_client yet — covers the window between
-    /// `terminate_pty_session_keep_channel` clearing the client and
-    /// the new spawn populating it. A stale read task whose mpsc
-    /// returns None during this window must NOT emit Exited.
-    #[tokio::test]
-    async fn is_runtime_owned_by_client_none_client_returns_false() {
-        let sessions = make_sessions();
-        let client =
-            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        {
-            let mut guard = sessions.lock().unwrap();
-            let mut rt = SessionRuntime::new("session-X");
-            rt.daemon_client = None;
-            guard.insert("session-X".into(), rt);
+            );
         }
-        assert!(
-            !is_runtime_owned_by_client(&sessions, "session-X", &client),
-            "runtime with no daemon_client (between terminate and respawn) \
+
+        /// `is_runtime_owned_by_client` returns false when the runtime
+        /// has no daemon_client yet — covers the window between
+        /// `terminate_pty_session_keep_channel` clearing the client and
+        /// the new spawn populating it. A stale read task whose mpsc
+        /// returns None during this window must NOT emit Exited.
+        #[tokio::test]
+        async fn is_runtime_owned_by_client_none_client_returns_false() {
+            let sessions = make_sessions();
+            let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            {
+                let mut guard = sessions.lock().unwrap();
+                let mut rt = SessionRuntime::new("session-X");
+                rt.daemon_client = None;
+                guard.insert("session-X".into(), rt);
+            }
+            assert!(
+                !is_runtime_owned_by_client(&sessions, "session-X", &client),
+                "runtime with no daemon_client (between terminate and respawn) \
              must not be claimed by a stale read task"
-        );
-    }
-
-    /// `is_runtime_owned_by_client` returns false when no runtime
-    /// exists for the session id — covers the "session was fully
-    /// removed" case. No Exited should fire for nonexistent sessions.
-    #[tokio::test]
-    async fn is_runtime_owned_by_client_missing_runtime_returns_false() {
-        let sessions = make_sessions();
-        let client =
-            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        assert!(
-            !is_runtime_owned_by_client(&sessions, "session-missing", &client),
-            "no runtime → no owner → must return false"
-        );
-    }
-
-    /// `terminate_pty_session_keep_channel` for a daemon-backed
-    /// (persistent) session must PRESERVE `output_subscribers` and
-    /// `pending_output` so the frontend's xterm stays attached
-    /// across the kill-and-respawn that happens on workspace push.
-    /// Without this, the respawned PTY's output buffers in
-    /// `pending_output` until a tab-switch forces re-attach.
-    #[tokio::test]
-    async fn terminate_keep_channel_preserves_channel_for_persistent_session() {
-        let sessions = make_sessions();
-        let client =
-            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
-        let starting_payload = TerminalStatusPayload {
-            session_id: "session-X".into(),
-            state: TerminalLifecycleState::Ready,
-            message: Some("ready".into()),
-            exit_code: None,
-        };
-        {
-            let mut guard = sessions.lock().unwrap();
-            let mut rt = SessionRuntime::new("session-X");
-            rt.persistent = true;
-            rt.daemon_client = Some(client.clone());
-            rt.child_pid = Some(12345);
-            rt.last_status = starting_payload.clone();
-            // Stash some pending output to verify it survives.
-            rt.pending_output.push_back(b"prior\n".to_vec());
-            rt.pending_output_bytes = 6;
-            guard.insert("session-X".into(), rt);
+            );
         }
 
-        terminate_pty_session_keep_channel(&sessions, "session-X");
-        // Give the spawned tokio task a tick to run, even though
-        // we're not asserting on its side-effects.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        /// `is_runtime_owned_by_client` returns false when no runtime
+        /// exists for the session id — covers the "session was fully
+        /// removed" case. No Exited should fire for nonexistent sessions.
+        #[tokio::test]
+        async fn is_runtime_owned_by_client_missing_runtime_returns_false() {
+            let sessions = make_sessions();
+            let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            assert!(
+                !is_runtime_owned_by_client(&sessions, "session-missing", &client),
+                "no runtime → no owner → must return false"
+            );
+        }
 
-        let guard = sessions.lock().unwrap();
-        let rt = guard
-            .get("session-X")
-            .expect("runtime must still exist (the whole point of keep_channel)");
-        assert!(
-            rt.daemon_client.is_none(),
-            "daemon_client must be taken (old client is dead)"
-        );
-        assert!(rt.writer.is_none(), "writer must be cleared");
-        assert!(rt.child_pid.is_none(), "child_pid must be cleared");
-        assert!(!rt.persistent, "persistent flag must flip false so try_reserve sees idle");
-        assert!(!rt.is_spawning, "is_spawning must be false");
-        // The critical preservation property:
-        assert_eq!(
-            rt.pending_output.len(),
-            1,
-            "pending_output must be preserved — clearing it loses any output \
+        /// `terminate_pty_session_keep_channel` for a daemon-backed
+        /// (persistent) session must PRESERVE `output_subscribers` and
+        /// `pending_output` so the frontend's xterm stays attached
+        /// across the kill-and-respawn that happens on workspace push.
+        /// Without this, the respawned PTY's output buffers in
+        /// `pending_output` until a tab-switch forces re-attach.
+        #[tokio::test]
+        async fn terminate_keep_channel_preserves_channel_for_persistent_session() {
+            let sessions = make_sessions();
+            let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+            let starting_payload = TerminalStatusPayload {
+                session_id: "session-X".into(),
+                state: TerminalLifecycleState::Ready,
+                message: Some("ready".into()),
+                exit_code: None,
+            };
+            {
+                let mut guard = sessions.lock().unwrap();
+                let mut rt = SessionRuntime::new("session-X");
+                rt.persistent = true;
+                rt.daemon_client = Some(client.clone());
+                rt.child_pid = Some(12345);
+                rt.last_status = starting_payload.clone();
+                // Stash some pending output to verify it survives.
+                rt.pending_output.push_back(b"prior\n".to_vec());
+                rt.pending_output_bytes = 6;
+                guard.insert("session-X".into(), rt);
+            }
+
+            terminate_pty_session_keep_channel(&sessions, "session-X");
+            // Give the spawned tokio task a tick to run, even though
+            // we're not asserting on its side-effects.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+            let guard = sessions.lock().unwrap();
+            let rt = guard
+                .get("session-X")
+                .expect("runtime must still exist (the whole point of keep_channel)");
+            assert!(
+                rt.daemon_client.is_none(),
+                "daemon_client must be taken (old client is dead)"
+            );
+            assert!(rt.writer.is_none(), "writer must be cleared");
+            assert!(rt.child_pid.is_none(), "child_pid must be cleared");
+            assert!(
+                !rt.persistent,
+                "persistent flag must flip false so try_reserve sees idle"
+            );
+            assert!(!rt.is_spawning, "is_spawning must be false");
+            // The critical preservation property:
+            assert_eq!(
+                rt.pending_output.len(),
+                1,
+                "pending_output must be preserved — clearing it loses any output \
              that arrived between terminate and the frontend's next attach"
-        );
-        assert!(
-            matches!(rt.last_status.state, TerminalLifecycleState::Ready),
-            "last_status must be preserved (don't overwrite the existing \
+            );
+            assert!(
+                matches!(rt.last_status.state, TerminalLifecycleState::Ready),
+                "last_status must be preserved (don't overwrite the existing \
              lifecycle state with a synthetic Exited; the respawn will emit \
              its own Starting → Ready)"
-        );
-    }
+            );
+        }
     } // mod cross_machine_push
 
     // ── Shell + PATH tests ───────────────────────────────────────────
@@ -3360,7 +3503,8 @@ mod tests {
         // is the codemux shim dir (from prepend_shim_to_path). The
         // remainder is the caller-supplied current_path.
         let result = build_child_path(r"C:\codemux\shims", r"C:\Windows\System32");
-        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let user_profile =
+            std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
         let expected_local_bin = format!(r"{}\.local\bin", user_profile);
         assert!(
             result.starts_with(&expected_local_bin),
@@ -3383,7 +3527,8 @@ mod tests {
         // `.local\bin` verbatim — no normalization, no extra logic,
         // just a composed path. We reconstruct what we expect and
         // verify the helper matches.
-        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let user_profile =
+            std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
         let expected = format!(r"{}\.local\bin", user_profile);
         let actual = windows_user_local_bin().expect("USERPROFILE is set so this must return Some");
         assert_eq!(actual, expected);
@@ -3428,9 +3573,9 @@ mod tests {
         let result = resolve_windows_shell(
             |cmd| match cmd {
                 "pwsh" => Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
-                "powershell" => Some(
-                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
-                ),
+                "powershell" => {
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string())
+                }
                 _ => None,
             },
             Some(r"C:\Windows\System32\cmd.exe".to_string()),
@@ -3444,9 +3589,9 @@ mod tests {
         // (Windows PowerShell 5.1 is always present on modern Windows).
         let result = resolve_windows_shell(
             |cmd| match cmd {
-                "powershell" => Some(
-                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
-                ),
+                "powershell" => {
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string())
+                }
                 _ => None,
             },
             Some(r"C:\Windows\System32\cmd.exe".to_string()),
@@ -3461,10 +3606,8 @@ mod tests {
     fn test_resolve_windows_shell_falls_back_to_comspec_when_no_powershell() {
         // Hypothetical: neither PowerShell nor pwsh on PATH (e.g. a
         // stripped-down Windows container). Fall back to COMSPEC.
-        let result = resolve_windows_shell(
-            |_| None,
-            Some(r"C:\Windows\System32\cmd.exe".to_string()),
-        );
+        let result =
+            resolve_windows_shell(|_| None, Some(r"C:\Windows\System32\cmd.exe".to_string()));
         assert_eq!(result, r"C:\Windows\System32\cmd.exe");
     }
 
@@ -3772,8 +3915,7 @@ mod tests {
             "replay",
             || SessionRuntime::new("replay"),
             |runtime| {
-                runtime.next_output_generation =
-                    runtime.next_output_generation.saturating_add(1);
+                runtime.next_output_generation = runtime.next_output_generation.saturating_add(1);
                 let generation = runtime.next_output_generation;
                 runtime.output_subscribers.push(OutputSubscriber {
                     generation,
@@ -3809,12 +3951,7 @@ mod tests {
         use std::sync::Mutex as StdMutex;
 
         let sessions = make_sessions();
-        with_session_runtime(
-            &sessions,
-            "live",
-            || SessionRuntime::new("live"),
-            |_| {},
-        );
+        with_session_runtime(&sessions, "live", || SessionRuntime::new("live"), |_| {});
 
         let captured: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::new(StdMutex::new(Vec::new()));
         let captured_handler = captured.clone();
@@ -3984,8 +4121,7 @@ mod tests {
             "join",
             || SessionRuntime::new("join"),
             |runtime| {
-                runtime.next_output_generation =
-                    runtime.next_output_generation.saturating_add(1);
+                runtime.next_output_generation = runtime.next_output_generation.saturating_add(1);
                 let generation = runtime.next_output_generation;
                 runtime.output_subscribers.push(OutputSubscriber {
                     generation,
@@ -4044,7 +4180,10 @@ mod tests {
         // The matching generation does remove it.
         detach_subscriber(&sessions, "stale-detach", generation);
         with_existing_session_runtime(&sessions, "stale-detach", |runtime| {
-            assert!(runtime.output_subscribers.is_empty(), "matching detach removes");
+            assert!(
+                runtime.output_subscribers.is_empty(),
+                "matching detach removes"
+            );
         });
     }
 
@@ -4374,10 +4513,9 @@ mod tests {
         // Start unpaused; install the subscriber and grab the shared flow flag
         // (mirrors the spawn + attach paths).
         attach_subscriber(&sessions, "fire", channel);
-        let flow_paused = with_existing_session_runtime(&sessions, "fire", |runtime| {
-            runtime.flow_paused.clone()
-        })
-        .expect("runtime exists");
+        let flow_paused =
+            with_existing_session_runtime(&sessions, "fire", |runtime| runtime.flow_paused.clone())
+                .expect("runtime exists");
 
         let read_sessions = sessions.clone();
         let read_flow_paused = flow_paused.clone();
@@ -4411,9 +4549,7 @@ mod tests {
 
         // ── Phase A: running — the firehose reaches the consumer. ──
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while received.load(Ordering::SeqCst) < 64 * 1024
-            && std::time::Instant::now() < deadline
-        {
+        while received.load(Ordering::SeqCst) < 64 * 1024 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -4740,7 +4876,9 @@ mod tests {
         let ctx = &m["CODEMUX_AGENT_CONTEXT"];
 
         assert!(ctx.contains("Your workspace: analyze-db"));
-        assert!(ctx.contains("Your working directory: /home/zeus/.codemux/worktrees/proj/analyze-db"));
+        assert!(
+            ctx.contains("Your working directory: /home/zeus/.codemux/worktrees/proj/analyze-db")
+        );
         assert!(ctx.contains("Your branch: analyze-db"));
         assert!(ctx.contains("Original repo (reference only): /home/zeus/projects/proj"));
         assert!(ctx.contains("Do NOT create additional git worktrees"));
@@ -4848,11 +4986,15 @@ mod tests {
 
     #[test]
     fn find_owning_workspace_returns_correct_workspace() {
-        let ws_a = test_workspace_with_pane(
-            "ws-a", "ws-a", "/a", None, None, None, "sess-a",
-        );
+        let ws_a = test_workspace_with_pane("ws-a", "ws-a", "/a", None, None, None, "sess-a");
         let ws_b = test_workspace_with_pane(
-            "ws-b", "ws-b", "/b", Some("feat"), Some("/b"), Some("/repo"), "sess-b",
+            "ws-b",
+            "ws-b",
+            "/b",
+            Some("feat"),
+            Some("/b"),
+            Some("/repo"),
+            "sess-b",
         );
         let snapshot = test_snapshot("ws-a", vec![ws_a, ws_b]);
 
@@ -4869,9 +5011,7 @@ mod tests {
 
     #[test]
     fn find_owning_workspace_returns_none_for_orphan() {
-        let ws_a = test_workspace_with_pane(
-            "ws-a", "ws-a", "/a", None, None, None, "sess-a",
-        );
+        let ws_a = test_workspace_with_pane("ws-a", "ws-a", "/a", None, None, None, "sess-a");
         let snapshot = test_snapshot("ws-a", vec![ws_a]);
 
         assert!(find_owning_workspace(&snapshot, "sess-orphan").is_none());
@@ -4995,10 +5135,8 @@ mod tests {
 
     #[test]
     fn resolve_session_cwd_falls_back_when_dir_missing() {
-        let result = resolve_session_cwd(
-            "/nonexistent/worktree/that/was/deleted",
-            "/home/fallback",
-        );
+        let result =
+            resolve_session_cwd("/nonexistent/worktree/that/was/deleted", "/home/fallback");
         assert_eq!(result, "/home/fallback");
     }
 
@@ -5054,6 +5192,122 @@ mod tests {
             try_reserve_session_spawn(&sessions, "retry-id"),
             "post-cleanup retry must succeed"
         );
+    }
+
+    #[test]
+    fn daemon_spawn_reservation_drop_clears_placeholder_for_retry() {
+        let sessions = make_spawn_sessions();
+        {
+            let _reservation = SessionSpawnReservation::try_new(&sessions, "timeout-id")
+                .expect("first daemon spawn owns the reservation");
+            assert!(is_session_spawn_active(&sessions, "timeout-id"));
+            // A daemon RPC timeout/error/cancel returns through this scope.
+        }
+        assert!(
+            !is_session_spawn_active(&sessions, "timeout-id"),
+            "the failed attempt must not leave is_spawning reserved"
+        );
+        assert!(
+            SessionSpawnReservation::try_new(&sessions, "timeout-id").is_some(),
+            "an idempotent retry must be able to reserve immediately"
+        );
+    }
+
+    #[test]
+    fn daemon_timeout_retains_late_subscriber_for_fallback_output() {
+        let sessions = make_spawn_sessions();
+        let reservation = SessionSpawnReservation::try_new(&sessions, "late-attach")
+            .expect("daemon spawn owns the reservation");
+
+        // Model attach_pty_output racing a slow daemon RPC: the pane subscribes
+        // after the placeholder was created but before timeout drops the guard.
+        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_by_channel = received.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |body| {
+            received_by_channel
+                .lock()
+                .unwrap()
+                .push(body.deserialize::<Vec<u8>>().expect("decode channel body"));
+            Ok(())
+        });
+        attach_subscriber(&sessions, "late-attach", channel);
+
+        // Dropping represents daemon timeout/error. Cleanup must clear the
+        // reservation but retain the subscriber-bearing runtime in place.
+        drop(reservation);
+        assert!(!is_session_spawn_active(&sessions, "late-attach"));
+        assert_eq!(
+            with_existing_session_runtime(&sessions, "late-attach", |runtime| {
+                runtime.output_subscribers.len()
+            }),
+            Some(1),
+        );
+
+        // The local fallback can reserve the same id and its first output still
+        // reaches the pane that attached during the failed daemon attempt.
+        assert!(try_reserve_session_spawn(&sessions, "late-attach"));
+        queue_or_send_output(&sessions, "late-attach", b"fallback-ready".to_vec());
+        assert_eq!(*received.lock().unwrap(), vec![b"fallback-ready".to_vec()]);
+    }
+
+    #[test]
+    fn daemon_reservation_drop_retains_status_emitted_during_rpc() {
+        let sessions = make_spawn_sessions();
+        let reservation = SessionSpawnReservation::try_new(&sessions, "visible-status")
+            .expect("daemon spawn owns the reservation");
+        with_existing_session_runtime(&sessions, "visible-status", |runtime| {
+            runtime.last_status = TerminalStatusPayload {
+                session_id: "visible-status".into(),
+                state: TerminalLifecycleState::Failed,
+                message: Some("daemon RPC timed out".into()),
+                exit_code: None,
+            };
+        });
+
+        drop(reservation);
+        assert!(matches!(
+            with_existing_session_runtime(&sessions, "visible-status", |runtime| {
+                runtime.last_status.state.clone()
+            }),
+            Some(TerminalLifecycleState::Failed)
+        ));
+        assert!(
+            SessionSpawnReservation::try_new(&sessions, "visible-status").is_some(),
+            "retaining visible status must not retain is_spawning"
+        );
+    }
+
+    #[test]
+    fn status_only_failed_runtime_remains_visible_and_retryable() {
+        let sessions = make_spawn_sessions();
+        with_session_runtime(
+            &sessions,
+            "failed-id",
+            || SessionRuntime::new("failed-id"),
+            |runtime| {
+                runtime.last_status = TerminalStatusPayload {
+                    session_id: "failed-id".into(),
+                    state: TerminalLifecycleState::Failed,
+                    message: Some("daemon list timed out".into()),
+                    exit_code: None,
+                };
+                runtime.is_spawning = false;
+            },
+        );
+        let state = with_existing_session_runtime(&sessions, "failed-id", |runtime| {
+            runtime.last_status.state.clone()
+        });
+        assert!(matches!(state, Some(TerminalLifecycleState::Failed)));
+        {
+            let _retry = SessionSpawnReservation::try_new(&sessions, "failed-id")
+                .expect("a visible failure must not block an explicit retry");
+        }
+        assert!(matches!(
+            with_existing_session_runtime(&sessions, "failed-id", |runtime| {
+                runtime.last_status.state.clone()
+            }),
+            Some(TerminalLifecycleState::Failed)
+        ));
     }
 
     #[test]
@@ -5146,12 +5400,8 @@ mod tests {
 
     #[test]
     fn collect_workspace_session_ids_returns_only_target_workspace() {
-        let ws_a = test_workspace_with_pane(
-            "ws-a", "a", "/a", None, None, None, "sess-a",
-        );
-        let ws_b = test_workspace_with_pane(
-            "ws-b", "b", "/b", None, None, None, "sess-b",
-        );
+        let ws_a = test_workspace_with_pane("ws-a", "a", "/a", None, None, None, "sess-a");
+        let ws_b = test_workspace_with_pane("ws-b", "b", "/b", None, None, None, "sess-b");
         let snapshot = test_snapshot("ws-a", vec![ws_a, ws_b]);
 
         let a_ids = collect_workspace_session_ids(&snapshot, "ws-a");
@@ -5163,9 +5413,7 @@ mod tests {
 
     #[test]
     fn collect_workspace_session_ids_returns_empty_for_unknown_workspace() {
-        let ws_a = test_workspace_with_pane(
-            "ws-a", "a", "/a", None, None, None, "sess-a",
-        );
+        let ws_a = test_workspace_with_pane("ws-a", "a", "/a", None, None, None, "sess-a");
         let snapshot = test_snapshot("ws-a", vec![ws_a]);
 
         // Misspelled / nonexistent workspace id is the realistic stale-state
@@ -5287,9 +5535,7 @@ mod tests {
         /// Dropping the returned `Child` does not kill the process — we
         /// keep it alive so the tests can call `wait()` themselves to avoid
         /// leaving zombies behind.
-        fn spawn_on_pty(
-            cmd: CommandBuilder,
-        ) -> (Box<dyn portable_pty::Child + Send + Sync>, u32) {
+        fn spawn_on_pty(cmd: CommandBuilder) -> (Box<dyn portable_pty::Child + Send + Sync>, u32) {
             let pty = native_pty_system()
                 .openpty(PtySize {
                     rows: 24,
@@ -5374,8 +5620,7 @@ mod tests {
                     Ok(n) => {
                         accumulated.extend_from_slice(&buf[..n]);
                         if let Ok(text) = std::str::from_utf8(&accumulated) {
-                            if let Some(line) =
-                                text.lines().find(|l| l.contains("GRANDCHILD_PID="))
+                            if let Some(line) = text.lines().find(|l| l.contains("GRANDCHILD_PID="))
                             {
                                 let pid_str = line
                                     .split("GRANDCHILD_PID=")
@@ -5630,9 +5875,7 @@ mod tests {
                     Ok(n) => {
                         accumulated.extend_from_slice(&buf[..n]);
                         if let Ok(text) = std::str::from_utf8(&accumulated) {
-                            if let Some(line) =
-                                text.lines().find(|l| l.contains("DETACHED_PID="))
-                            {
+                            if let Some(line) = text.lines().find(|l| l.contains("DETACHED_PID=")) {
                                 let pid_str = line
                                     .split("DETACHED_PID=")
                                     .nth(1)
@@ -5943,8 +6186,8 @@ mod tests {
         // calls `terminal_read` without a session_id when it wants the
         // focused pane, and we need a stable error if nothing is focused.
         app.clear_workspaces();
-        let err = read_terminal_output(&pty, &app, None, None)
-            .expect_err("no active session must error");
+        let err =
+            read_terminal_output(&pty, &app, None, None).expect_err("no active session must error");
         assert!(
             err.to_lowercase().contains("no active"),
             "unexpected error: {err}"
@@ -6002,13 +6245,15 @@ mod tests {
             },
         );
 
-        let out =
-            read_terminal_output(&pty, &app, None, Some("sess-default".to_string())).unwrap();
+        let out = read_terminal_output(&pty, &app, None, Some("sess-default".to_string())).unwrap();
         assert_eq!(
             out.lines_returned, READ_TERMINAL_DEFAULT_LINES,
             "default line count must be {READ_TERMINAL_DEFAULT_LINES}"
         );
-        assert!(out.truncated, "older lines beyond the default must be dropped");
+        assert!(
+            out.truncated,
+            "older lines beyond the default must be dropped"
+        );
         // 250 lines of "ln-N\n" + the trailing empty split = 251 total.
         assert_eq!(out.total_lines, 251);
     }
@@ -6039,9 +6284,8 @@ mod tests {
             },
         );
 
-        let out =
-            read_terminal_output(&pty, &app, Some(1_000_000), Some("sess-clamp".to_string()))
-                .unwrap();
+        let out = read_terminal_output(&pty, &app, Some(1_000_000), Some("sess-clamp".to_string()))
+            .unwrap();
         assert_eq!(
             out.lines_returned, READ_TERMINAL_MAX_LINES,
             "must clamp to READ_TERMINAL_MAX_LINES ({READ_TERMINAL_MAX_LINES})"
@@ -6067,8 +6311,7 @@ mod tests {
             },
         );
 
-        let out =
-            read_terminal_output(&pty, &app, Some(3), Some("sess-cap".to_string())).unwrap();
+        let out = read_terminal_output(&pty, &app, Some(3), Some("sess-cap".to_string())).unwrap();
         // Last 3 of "ln-1..ln-10\n" — the trailing empty line counts, so
         // the cap-3 window is "ln-9", "ln-10", "" → joined "ln-9\nln-10\n".
         // Truncated must be true so the caller knows older lines exist.

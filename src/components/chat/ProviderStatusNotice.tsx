@@ -3,7 +3,7 @@ import { TriangleAlert, X } from "lucide-react";
 import {
   selectVisibleHealthReport,
   useProviderHealth,
-  useProviderHealthProbe,
+  useProviderHealthRecoveryPoll,
 } from "@/stores/provider-health-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { cn } from "@/lib/utils";
@@ -23,8 +23,9 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
  * (or not yet probed); renders a dismissible red/amber banner when the
  * provider CANNOT run a session (CLI missing, broken install, not
  * authenticated) so the user learns before sending a message into a
- * spinner that can never answer. Mounting this component is also what
- * schedules the probe (TTL-cached in the provider-health store).
+ * spinner that can never answer. Mounting this component only schedules
+ * recovery polling for an already-known failure; provider intent and
+ * start/send outcomes own initial probes.
  *
  * Dismissal is per failure identity: closing the banner hides THIS
  * status+message; a different failure — or the same one after a
@@ -35,7 +36,7 @@ export function ProviderStatusNotice({
 }: {
   provider: AgentChatProviderKind;
 }) {
-  useProviderHealthProbe(provider);
+  useProviderHealthRecoveryPoll(provider);
   const report = useProviderHealth((s) =>
     selectVisibleHealthReport(s, provider),
   );

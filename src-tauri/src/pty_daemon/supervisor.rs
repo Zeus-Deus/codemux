@@ -9,8 +9,9 @@
 //!    (Unix: `setsid`; Windows: `DETACHED_PROCESS`), wait for it to write
 //!    its manifest, then dial.
 //!
-//! The supervisor caches the connected `PtyDaemonClient` in a `OnceCell`
-//! so all subsequent Tauri calls share one socket.
+//! The supervisor caches the connected `PtyDaemonClient` behind a small async
+//! mutex so all subsequent Tauri calls share one live socket and an EOF can
+//! evict that socket for reconnection.
 
 use crate::pty_daemon::client::{PtyDaemonClient, PtyDaemonError};
 use crate::pty_daemon::manifest::{manifest_path, read_manifest, socket_dir};
@@ -19,10 +20,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex as AsyncMutex;
 
-/// Globally-cached client. Initialized lazily by `ensure_daemon`.
-static CLIENT: OnceCell<Arc<PtyDaemonClient>> = OnceCell::const_new();
+/// Globally-cached live client. Holding the mutex across initialization also
+/// makes reconnect singleflight: a daemon restart cannot make every pane spawn
+/// its own replacement connection.
+static CLIENT: AsyncMutex<Option<Arc<PtyDaemonClient>>> = AsyncMutex::const_new(None);
 
 /// Crash circuit breaker state.
 ///
@@ -104,32 +107,53 @@ pub async fn ensure_daemon() -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
             "circuit breaker open: too many recent failures, using in-process fallback".into(),
         ));
     }
-    let result = CLIENT
-        .get_or_try_init(|| async {
-            // Try adoption first.
-            if let Some(client) = try_adopt().await {
-                return Ok(client);
-            }
-            // No usable daemon; spawn one.
-            let socket_path = spawn_daemon_detached().await?;
-            // Poll for the socket to appear (the daemon races against us).
-            wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
-            let client = PtyDaemonClient::connect(&socket_path).await?;
-            // Sanity-check the handshake.
-            let (_pid, _ver, proto) = client.hello().await?;
-            if proto != PROTOCOL_VERSION {
-                return Err(PtyDaemonError::Daemon(format!(
-                    "freshly spawned daemon speaks protocol {proto}, expected {PROTOCOL_VERSION}"
-                )));
-            }
-            Ok(client)
-        })
-        .await
-        .cloned();
+
+    let mut slot = CLIENT.lock().await;
+    if let Some(client) = live_cached_client(&mut slot) {
+        return Ok(client);
+    }
+
+    let result = connect_or_spawn_daemon().await;
+    if let Ok(client) = &result {
+        *slot = Some(client.clone());
+    }
+    drop(slot);
     if result.is_err() {
         record_failure();
     }
     result
+}
+
+/// Clone a cached client only while its reader is alive. `PtyDaemonClient`
+/// marks EOF before draining pending requests, so observing `is_closed` is a
+/// definitive eviction signal rather than a transient health guess.
+fn live_cached_client(slot: &mut Option<Arc<PtyDaemonClient>>) -> Option<Arc<PtyDaemonClient>> {
+    if slot.as_ref().is_some_and(|client| client.is_closed()) {
+        eprintln!("[codemux::pty_daemon::supervisor] cached client closed; reconnecting");
+        slot.take();
+    }
+    slot.clone()
+}
+
+async fn connect_or_spawn_daemon() -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
+    // Try adoption first. This also handles a daemon that merely closed our
+    // old connection: reconnect to the still-live process and re-handshake.
+    if let Some(client) = try_adopt().await {
+        return Ok(client);
+    }
+    // No usable daemon; spawn one.
+    let socket_path = spawn_daemon_detached().await?;
+    // Poll for the socket to appear (the daemon races against us).
+    wait_for_socket(&socket_path, Duration::from_secs(5)).await?;
+    let client = PtyDaemonClient::connect(&socket_path).await?;
+    // Sanity-check the handshake.
+    let (_pid, _ver, proto) = client.hello().await?;
+    if proto != PROTOCOL_VERSION {
+        return Err(PtyDaemonError::Daemon(format!(
+            "freshly spawned daemon speaks protocol {proto}, expected {PROTOCOL_VERSION}"
+        )));
+    }
+    Ok(client)
 }
 
 async fn try_adopt() -> Option<Arc<PtyDaemonClient>> {
@@ -151,9 +175,7 @@ async fn try_adopt() -> Option<Arc<PtyDaemonClient>> {
     let client = match PtyDaemonClient::connect(&manifest.socket_path).await {
         Ok(c) => c,
         Err(error) => {
-            eprintln!(
-                "[codemux::pty_daemon::supervisor] adopt connect failed: {error}"
-            );
+            eprintln!("[codemux::pty_daemon::supervisor] adopt connect failed: {error}");
             return None;
         }
     };
@@ -177,9 +199,7 @@ async fn try_adopt() -> Option<Arc<PtyDaemonClient>> {
             Some(client)
         }
         Err(error) => {
-            eprintln!(
-                "[codemux::pty_daemon::supervisor] adopt handshake failed: {error}"
-            );
+            eprintln!("[codemux::pty_daemon::supervisor] adopt handshake failed: {error}");
             None
         }
     }
@@ -251,9 +271,7 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
 
 fn choose_socket_path() -> Result<PathBuf, PtyDaemonError> {
     let dir = socket_dir().ok_or_else(|| {
-        PtyDaemonError::Daemon(
-            "could not determine socket dir (HOME unset?)".to_string(),
-        )
+        PtyDaemonError::Daemon("could not determine socket dir (HOME unset?)".to_string())
     })?;
     // Mirror superset's short-name strategy. macOS sun_path is 104 bytes;
     // we use a short fixed name under the per-build data dir so we stay
@@ -282,4 +300,44 @@ async fn wait_for_socket(path: &PathBuf, deadline: Duration) -> Result<(), PtyDa
 /// debug commands). Returns `None` if the data dir can't be located.
 pub fn diagnostics_manifest_path() -> Option<PathBuf> {
     manifest_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixStream;
+
+    #[tokio::test]
+    async fn disconnected_cache_entry_is_evicted_and_replacement_is_reused() {
+        let (client_stream, daemon_stream) = UnixStream::pair().unwrap();
+        let disconnected = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let mut slot = Some(disconnected.clone());
+        assert!(Arc::ptr_eq(
+            &live_cached_client(&mut slot).expect("initial live client"),
+            &disconnected,
+        ));
+
+        // Simulate the daemon/socket disappearing, then wait until the client
+        // reader has observed EOF and published its liveness flag.
+        drop(daemon_stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !disconnected.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client should observe disconnect");
+        assert!(live_cached_client(&mut slot).is_none());
+        assert!(slot.is_none(), "closed cache entry must be evicted");
+
+        // A subsequent initialization installs a connection to the new server,
+        // and later callers reuse that replacement rather than the dead Arc.
+        let (replacement_stream, _replacement_daemon) = UnixStream::pair().unwrap();
+        let replacement =
+            PtyDaemonClient::from_test_stream(replacement_stream, Duration::from_secs(1));
+        slot = Some(replacement.clone());
+        let cached = live_cached_client(&mut slot).expect("replacement client");
+        assert!(Arc::ptr_eq(&cached, &replacement));
+        assert!(!Arc::ptr_eq(&cached, &disconnected));
+    }
 }

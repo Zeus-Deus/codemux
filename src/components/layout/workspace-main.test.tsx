@@ -219,13 +219,13 @@ describe("WorkspaceMain chrome rows", () => {
 });
 
 describe("WorkspaceMain draft branch chrome", () => {
-  it("renders the legacy PresetBar above the draft surface when the Beta is OFF", () => {
+  it("renders the legacy PresetBar above the draft surface when the Beta is OFF", async () => {
     state.enableLazy = true;
     state.activeDraftId = "draft-1";
     state.enableAgentChat = false;
-    const { getByTestId } = render(<WorkspaceMain />);
+    const { getByTestId, findByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("preset-bar")).toBeInTheDocument();
-    expect(getByTestId("draft-surface")).toBeInTheDocument();
+    expect(await findByTestId("draft-surface")).toBeInTheDocument();
   });
 
   it("drops the legacy PresetBar for a draft when the Beta is ON (the GUI draft titlebar owns preset launch)", () => {
@@ -242,11 +242,11 @@ describe("WorkspaceMain draft branch chrome", () => {
 });
 
 describe("WorkspaceMain right-panel stale-tab guard", () => {
-  it("coerces a persisted 'orchestration' tab to 'files' when no workflow run exists", () => {
+  it("coerces a persisted 'orchestration' tab to 'files' when no workflow run exists", async () => {
     state.rightPanelTabs = { "ws-1": "orchestration" };
     state.workflowRun = null;
-    const { getByTestId } = render(<WorkspaceMain />);
-    expect(getByTestId("right-panel").dataset.activeTab).toBe("files");
+    const { findByTestId } = render(<WorkspaceMain />);
+    expect((await findByTestId("right-panel")).dataset.activeTab).toBe("files");
   });
 
   it("keeps 'orchestration' active when a workflow run exists", () => {

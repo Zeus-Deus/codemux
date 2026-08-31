@@ -20,6 +20,8 @@ import type {
   AppStateSnapshot,
   AuthResponse,
   AuthUser,
+  SessionBootstrap,
+  SessionRefresh,
   BaseBranchDiff,
   BranchDetail,
   CheckInfo,
@@ -74,7 +76,12 @@ import type {
   WebRemotePairingInfo,
   WebRemoteBindScope,
   WebRemoteRegistrationStatus,
+  NativePerformanceDiagnostics,
 } from "./types";
+
+/** Bounded, identifier-free native latency summaries for support reports. */
+export const getPerformanceDiagnostics = () =>
+  invoke<NativePerformanceDiagnostics>("get_performance_diagnostics");
 
 // ── Project files (Step 8 — attachments) ──
 
@@ -141,6 +148,14 @@ export const forgotPassword = (email: string) =>
 
 export const checkAuth = () =>
   invoke<AuthUser | null>("check_auth");
+
+/** Local-only auth/settings bootstrap; never waits on the network. */
+export const bootstrapSession = () =>
+  invoke<SessionBootstrap>("bootstrap_session");
+
+/** Bounded after-paint remote verification and settings reconciliation. */
+export const refreshSession = () =>
+  invoke<SessionRefresh>("refresh_session");
 
 export const signOut = () =>
   invoke<void>("sign_out");
@@ -356,6 +371,11 @@ export const listLaunchGeminiModels = () =>
 
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
+
+/** Repair deferred MCP config writes for inactive workspaces. This may touch
+ * disk and must be called only after the renderer's useful first paint. */
+export const repairInactiveMcpConfigs = () =>
+  invoke<number>("repair_inactive_mcp_configs");
 
 export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
   invoke("update_workspace_cwd", { workspaceId, cwd });

@@ -48,6 +48,26 @@ interface Props {
   children: React.ReactNode;
 }
 
+function WorkspaceProjectImageDialog({
+  repo,
+  onOpenChange,
+}: {
+  repo: { name: string; path: string };
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { imageUrl } = useProjectAppearance(repo.path);
+  const setProjectImage = useProjectAppearanceStore((state) => state.setImage);
+  return (
+    <ProjectImageDialog
+      open
+      onOpenChange={onOpenChange}
+      projectName={repo.name}
+      initialValue={imageUrl}
+      onSave={(value) => setProjectImage(repo.path, value)}
+    />
+  );
+}
+
 /** Shared right-click wrapper for both inbox row shapes (active card and
  *  settled one-liner): the standard workspace context menu plus the
  *  destructive-delete and push-confirm dialogs it can open. Owns the same
@@ -62,11 +82,10 @@ export function WorkspaceInboxMenu({
   unreadAction,
   children,
 }: Props) {
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(null);
   const [showImageDialog, setShowImageDialog] = useState(false);
-  const { imageUrl } = useProjectAppearance(repo.path);
-  const setProjectImage = useProjectAppearanceStore((s) => s.setImage);
 
   const isAttachOrRemote =
     workspace.attach_only === true || workspace.host_id != null;
@@ -140,54 +159,55 @@ export function WorkspaceInboxMenu({
 
   return (
     <>
-      <ContextMenu>
+      <ContextMenu onOpenChange={setContextMenuOpen}>
         <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-        <WorkspaceContextMenuItems
-          workspace={workspace}
-          project={repo}
-          settleAction={settleAction}
-          snoozeAction={snoozeAction}
-          unreadAction={unreadAction}
-          projectMenu={
-            <ProjectAppearanceMenu
-              projectName={repo.name}
-              projectPath={repo.path}
-              onRequestImageDialog={() => setShowImageDialog(true)}
-            />
-          }
-          onArchiveRequest={() => void handleArchiveOrClose()}
-          onDeleteRequest={() => setShowDeleteDialog(true)}
-          onRequestPushConfirm={(host) => setPendingPushHost(host)}
-        />
+        {contextMenuOpen && (
+          <WorkspaceContextMenuItems
+            workspace={workspace}
+            project={repo}
+            settleAction={settleAction}
+            snoozeAction={snoozeAction}
+            unreadAction={unreadAction}
+            projectMenu={
+              <ProjectAppearanceMenu
+                projectName={repo.name}
+                projectPath={repo.path}
+                onRequestImageDialog={() => setShowImageDialog(true)}
+              />
+            }
+            onArchiveRequest={() => void handleArchiveOrClose()}
+            onDeleteRequest={() => setShowDeleteDialog(true)}
+            onRequestPushConfirm={(host) => setPendingPushHost(host)}
+          />
+        )}
       </ContextMenu>
 
       {/* Sits outside the ContextMenu subtree: selecting the menu item
           unmounts the menu, which would tear the dialog down with it. */}
-      <ProjectImageDialog
-        open={showImageDialog}
-        onOpenChange={setShowImageDialog}
-        projectName={repo.name}
-        initialValue={imageUrl}
-        onSave={(value) => setProjectImage(repo.path, value)}
-      />
-      {canDelete && (
+      {showImageDialog && (
+        <WorkspaceProjectImageDialog
+          repo={repo}
+          onOpenChange={setShowImageDialog}
+        />
+      )}
+      {canDelete && showDeleteDialog && (
         <DeleteWorktreeDialog
           workspace={workspace}
-          open={showDeleteDialog}
+          open
           onOpenChange={setShowDeleteDialog}
         />
       )}
-      <ConfirmPushDialog
-        open={pendingPushHost !== null}
-        workspaceTitle={workspace.title}
-        host={pendingPushHost}
-        onConfirm={() => {
-          if (pendingPushHost) void performPushToHost(pendingPushHost);
-        }}
-        onOpenChange={(open) => {
-          if (!open) setPendingPushHost(null);
-        }}
-      />
+      {pendingPushHost && (
+        <ConfirmPushDialog
+          open
+          workspaceTitle={workspace.title}
+          host={pendingPushHost}
+          onConfirm={() => void performPushToHost(pendingPushHost)}
+          onOpenChange={(open) => {
+            if (!open) setPendingPushHost(null);
+          }}
+        />
+      )}
     </>
   );
 }

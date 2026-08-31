@@ -18,9 +18,13 @@ import { useSyntaxThemeColors } from "@/hooks/use-theme-colors";
 import { MarkdownRendered } from "./MarkdownRendered";
 import { ImageViewer } from "./ImageViewer";
 import { VideoViewer } from "./VideoViewer";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 
 interface Props {
   tabId: string;
+  /** Owning workspace for switch-trace attribution. Omitted in the right-panel
+   *  document deck, which is not itself the switched main pane. */
+  workspaceId?: string;
   /** Hosted inside the right-panel deck: the pane's own toolbar is
    *  suppressed because the deck's shared pane bar carries those controls
    *  (source toggle, wrap, copy, file tree) for every pane. */
@@ -41,7 +45,13 @@ export function isMarkdownFile(path: string): boolean {
   return ext === "md" || ext === "mdx" || ext === "markdown";
 }
 
-export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wrap = true }: Props) {
+export function EditorPane({
+  tabId,
+  workspaceId,
+  embedded = false,
+  viewMode: viewModeProp,
+  wrap = true,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const themeCompartment = useRef(new Compartment());
@@ -70,6 +80,18 @@ export function EditorPane({ tabId, embedded = false, viewMode: viewModeProp, wr
   const isVideo = filePath != null && isVideoExtension(filePath);
   const [localViewMode, setViewMode] = useState<ViewMode>("raw");
   const viewMode = viewModeProp ?? localViewMode;
+
+  useEffect(() => {
+    if (
+      filePath == null ||
+      isImage ||
+      isVideo ||
+      errorMsg != null ||
+      loadedFilePath === filePath
+    ) {
+      markPaneReady("editor", { target: workspaceId });
+    }
+  }, [errorMsg, filePath, isImage, isVideo, loadedFilePath, workspaceId]);
 
   // Default to rendered for markdown files when filePath changes
   useEffect(() => {

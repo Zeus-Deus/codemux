@@ -13,7 +13,11 @@ import {
   markOpenInteraction,
 } from "./interaction-trace";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
-import { useChatDraftStore, type DraftId } from "@/stores/chat-draft-store";
+import {
+  useChatDraftStore,
+  type ChatDraft,
+  type DraftId,
+} from "@/stores/chat-draft-store";
 import type { AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 const mockActivateWorkspace = vi.mocked(activateWorkspace);
@@ -84,6 +88,17 @@ function makeAppState(activeWorkspaceId: string): AppStateSnapshot {
   };
 }
 
+/** Seed a minimal draft body + active pointer, mirroring the state a user
+ *  has while composing on the draft surface. */
+function seedActiveDraft(draftId: string): void {
+  useChatDraftStore.setState({
+    draftsById: {
+      [draftId]: { draftId } as unknown as ChatDraft,
+    } as Record<DraftId, ChatDraft>,
+    activeDraftId: draftId as unknown as DraftId,
+  });
+}
+
 describe("activateWorkspaceInteraction", () => {
   beforeEach(() => {
     mockActivateWorkspace.mockReset();
@@ -96,6 +111,7 @@ describe("activateWorkspaceInteraction", () => {
       pendingActivationAt: null,
       lastSeenRevision: 0,
     });
+    useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
   });
 
   afterEach(() => {
@@ -107,6 +123,7 @@ describe("activateWorkspaceInteraction", () => {
       pendingActivationAt: null,
       lastSeenRevision: 0,
     });
+    useChatDraftStore.setState({ draftsById: {}, activeDraftId: null });
   });
 
   it("paints the selection before the invoke settles", async () => {
@@ -175,6 +192,73 @@ describe("activateWorkspaceInteraction", () => {
     void second;
 
     expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-A");
+  });
+
+  it("restores the dismissed draft view when the invoke rejects", async () => {
+    mockActivateWorkspace.mockRejectedValue(new Error("no such workspace"));
+    seedActiveDraft("draft-1");
+
+    const promise = activateWorkspaceInteraction("ws-B");
+    // The draft view is dismissed optimistically with the selection...
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+
+    await expect(promise).rejects.toThrow("no such workspace");
+
+    // ...and comes back with the rolled-back selection, so the user is not
+    // left on the old workspace with their composer gone.
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-A");
+    expect(useChatDraftStore.getState().activeDraftId).toBe("draft-1");
+  });
+
+  it("does not restore the draft when a newer activation superseded the rejection", async () => {
+    let rejectFirst!: (error: Error) => void;
+    mockActivateWorkspace.mockReturnValueOnce(
+      new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      }),
+    );
+    mockActivateWorkspace.mockReturnValueOnce(new Promise<void>(() => {}));
+    seedActiveDraft("draft-1");
+
+    const first = activateWorkspaceInteraction("ws-B");
+    void activateWorkspaceInteraction("ws-A").catch(() => {});
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-A");
+
+    rejectFirst(new Error("stale"));
+    await expect(first).rejects.toThrow("stale");
+
+    // The newer activation owns the pending selection and the (re-cleared)
+    // draft pointer; the stale rejection must not resurrect the old view.
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-A");
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+  });
+
+  it("does not roll back or restore the draft when a newer activation of the SAME id is in flight", async () => {
+    // Two rapid activations of one workspace: the pending-id check alone can't
+    // tell them apart, so without sequence scoping the first call's rejection
+    // would disarm the second call's timeout, clear its pending selection and
+    // resurrect the draft view over its still-in-flight switch.
+    let rejectFirst!: (error: Error) => void;
+    mockActivateWorkspace.mockReturnValueOnce(
+      new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      }),
+    );
+    mockActivateWorkspace.mockReturnValueOnce(new Promise<void>(() => {}));
+    seedActiveDraft("draft-1");
+
+    const first = activateWorkspaceInteraction("ws-B");
+    void activateWorkspaceInteraction("ws-B").catch(() => {});
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+
+    rejectFirst(new Error("stale"));
+    await expect(first).rejects.toThrow("stale");
+
+    // The newer same-id activation still owns the pending selection and the
+    // dismissed draft pointer.
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-B");
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
   });
 
   it("opens no trace when the target is already the rendered workspace", async () => {

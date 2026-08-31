@@ -18,6 +18,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
+import { refreshProviderCapabilitiesForIntent } from "@/stores/provider-capabilities-store";
 
 // The model list + default-model / label helpers moved to
 // `@/lib/agent-chat/capability-defaults` in the Stage C Effort-lock
@@ -92,6 +93,11 @@ export function ModelPicker({
       if (!disabled) setOpen(true);
     }
   }, [openSignal, disabled]);
+
+  useEffect(() => {
+    if (!open) return;
+    void refreshProviderCapabilitiesForIntent(provider);
+  }, [open, provider]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

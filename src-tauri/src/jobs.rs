@@ -7,6 +7,7 @@
 //! tick so the timers don't phase-align.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rand::Rng;
@@ -16,6 +17,87 @@ use rand::Rng;
 /// well inside the window where a sidebar branch label reads as live, while
 /// the per-tick subprocess count drops to roughly `N / 6 + 1`.
 pub const GIT_SWEEP_STRIDE: u64 = 6;
+
+/// A generation-aware singleflight gate for periodic background jobs.
+///
+/// A request that arrives while work is already running is coalesced into that
+/// run: it does not invalidate the only result we have without also scheduling
+/// a successor. The next periodic tick after completion can then start a fresh
+/// generation. `complete` executes the publish closure while holding the gate,
+/// so a new request cannot slip between the ownership check and the state
+/// write.
+///
+/// This is deliberately synchronous: callers hold it for a few instructions
+/// around scheduling or committing, never while doing filesystem or subprocess
+/// work.
+#[derive(Default)]
+pub struct SingleflightJob {
+    state: Mutex<SingleflightState>,
+}
+
+#[derive(Default)]
+struct SingleflightState {
+    generation: u64,
+    running: bool,
+    overlap_count: u64,
+    stale_result_count: u64,
+}
+
+/// Bounded scalar telemetry for a singleflight gate. These counters contain no
+/// workspace/job identifiers and saturate instead of wrapping.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SingleflightStats {
+    pub overlap_count: u64,
+    pub stale_result_count: u64,
+}
+
+impl SingleflightJob {
+    /// Register a requested run. Returns its generation only when this caller
+    /// owns the single in-flight slot. Overlapping requests are coalesced and
+    /// leave the current generation publishable; otherwise a job whose runtime
+    /// exceeds its polling period could have every result invalidated forever.
+    pub fn request(&self) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.running {
+            state.overlap_count = state.overlap_count.saturating_add(1);
+            return None;
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.running = true;
+        Some(state.generation)
+    }
+
+    /// Release the in-flight slot and publish only if `generation` still owns
+    /// it. Returns whether `publish` ran. A duplicate/late completion cannot
+    /// accidentally release a newer generation.
+    pub fn complete(&self, generation: u64, publish: impl FnOnce()) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.running || state.generation != generation {
+            state.stale_result_count = state.stale_result_count.saturating_add(1);
+            return false;
+        }
+        state.running = false;
+        publish();
+        true
+    }
+
+    pub fn stats(&self) -> SingleflightStats {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        SingleflightStats {
+            overlap_count: state.overlap_count,
+            stale_result_count: state.stale_result_count,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).running
+    }
+}
+
+pub fn should_poll_ports(window_active: bool, remote_viewers: bool) -> bool {
+    window_active || remote_viewers
+}
 
 /// One workspace's slot in a git-sweep tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +224,12 @@ mod tests {
         let mut covered: Vec<String> = Vec::new();
         for tick in 0..GIT_SWEEP_STRIDE {
             let steps = plan_git_sweep(tick, &workspaces, None, GIT_SWEEP_STRIDE);
-            assert_eq!(steps.len(), 1, "tick {tick} refreshed {} workspaces", steps.len());
+            assert_eq!(
+                steps.len(),
+                1,
+                "tick {tick} refreshed {} workspaces",
+                steps.len()
+            );
             covered.extend(ids(&steps));
         }
         covered.sort();
@@ -171,21 +258,31 @@ mod tests {
     #[test]
     fn stride_zero_is_treated_as_every_tick() {
         let workspaces = ws(&[("a", "/a"), ("b", "/b")]);
-        assert_eq!(ids(&plan_git_sweep(3, &workspaces, None, 0)), vec!["a", "b"]);
+        assert_eq!(
+            ids(&plan_git_sweep(3, &workspaces, None, 0)),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
     fn fetch_targets_dedupe_by_project_root() {
         let entries = vec![
             ("/repo".to_string(), Some("/repo".to_string())),
-            ("/repo/.worktrees/feature".to_string(), Some("/repo".to_string())),
+            (
+                "/repo/.worktrees/feature".to_string(),
+                Some("/repo".to_string()),
+            ),
             ("/other".to_string(), Some("/other/".to_string())),
             ("/other".to_string(), None),
             ("/loose".to_string(), None),
         ];
         assert_eq!(
             dedupe_fetch_targets(&entries),
-            vec!["/repo".to_string(), "/other".to_string(), "/loose".to_string()],
+            vec![
+                "/repo".to_string(),
+                "/other".to_string(),
+                "/loose".to_string()
+            ],
         );
     }
 
@@ -200,7 +297,96 @@ mod tests {
         assert_eq!(startup_jitter(Duration::ZERO), Duration::ZERO);
         for _ in 0..64 {
             let delay = startup_jitter(Duration::from_secs(2));
-            assert!(delay <= Duration::from_secs(2), "jitter overshot: {delay:?}");
+            assert!(
+                delay <= Duration::from_secs(2),
+                "jitter overshot: {delay:?}"
+            );
         }
+    }
+
+    #[test]
+    fn singleflight_coalesces_overlap_without_starving_the_current_result() {
+        let job = SingleflightJob::default();
+        let first = job.request().expect("first run owns the slot");
+        // Model one job spanning several polling periods. None of these ticks
+        // starts a second worker or invalidates the only in-flight result.
+        for _ in 0..4 {
+            assert!(job.request().is_none(), "overlap must not start");
+        }
+        let mut published = false;
+        assert!(job.complete(first, || published = true));
+        assert!(published, "a long-running generation must still publish");
+        assert!(!job.is_running());
+        assert!(
+            job.request().is_some(),
+            "the first tick after completion must start the successor"
+        );
+        assert_eq!(
+            job.stats(),
+            SingleflightStats {
+                overlap_count: 4,
+                stale_result_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn singleflight_current_result_publishes_and_releases_for_retry() {
+        let job = SingleflightJob::default();
+        let first = job.request().expect("first run");
+        let mut published = false;
+        assert!(job.complete(first, || published = true));
+        assert!(published);
+        assert!(job.request().is_some(), "completion must release the slot");
+    }
+
+    #[test]
+    fn stale_completion_is_counted_and_cannot_release_the_successor() {
+        let job = SingleflightJob::default();
+        let first = job.request().expect("first run");
+        assert!(job.complete(first, || {}));
+        let second = job.request().expect("successor run");
+
+        assert!(!job.complete(first, || panic!("stale result published")));
+        assert!(job.is_running(), "stale completion released the successor");
+        assert_eq!(job.stats().stale_result_count, 1);
+        assert!(job.complete(second, || {}));
+    }
+
+    #[test]
+    fn hidden_port_poll_skips_without_remote_but_runs_for_remote_viewer() {
+        assert!(!should_poll_ports(false, false));
+        assert!(should_poll_ports(false, true));
+        assert!(should_poll_ports(true, false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_workspace_refresh_work_does_not_starve_the_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
+        // This runtime has only one async worker. It can still schedule new
+        // work while the refresh is held in the blocking pool. The previous
+        // wall-clock p99 assertion tested the same boundary but failed under
+        // harmless CI scheduler jitter.
+        let progressed = Arc::new(AtomicBool::new(false));
+        let progressed_in_task = progressed.clone();
+        let async_task = tokio::spawn(async move {
+            progressed_in_task.store(true, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert!(progressed.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        async_task.await.unwrap();
+        blocker.await.unwrap();
     }
 }

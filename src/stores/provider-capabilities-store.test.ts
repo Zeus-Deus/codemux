@@ -19,22 +19,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockList = vi.fn();
+const mockHealth = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   listChatProviderCapabilities: (...args: unknown[]) => mockList(...args),
+  agentChatProviderHealth: (...args: unknown[]) => mockHealth(...args),
 }));
 
 import {
+  _resetProviderCapabilityIntentForTests,
   CURSOR_CAPABILITY_REFRESH_MS,
   CURSOR_CAPABILITY_TTL_MS,
   GROK_CAPABILITY_REFRESH_MS,
+  PROVIDER_CAPABILITIES_STORAGE_KEY,
+  refreshProviderCapabilitiesForIntent,
+  resetProviderCapabilities,
   selectCapabilities,
   selectError,
   selectModel,
+  selectProviderCapabilitiesLoaded,
   shouldRefreshCursorCapabilities,
   shouldRefreshGrokCapabilities,
   useProviderCapabilities,
 } from "./provider-capabilities-store";
+import {
+  emptyHealthSlot,
+  useProviderHealth,
+} from "./provider-health-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -69,6 +80,7 @@ function makeCaps(modelId: string): ProviderChatCapabilities {
 }
 
 function resetStore() {
+  _resetProviderCapabilityIntentForTests();
   useProviderCapabilities.setState({
     claude: null,
     codex: null,
@@ -80,9 +92,28 @@ function resetStore() {
     cursorError: null,
     grokError: null,
     opencodeError: null,
+    loadedProviders: {},
     loaded: false,
   });
+  localStorage.removeItem(PROVIDER_CAPABILITIES_STORAGE_KEY);
   mockList.mockReset();
+  mockHealth.mockReset();
+  mockHealth.mockImplementation(async (provider: AgentChatProviderKind) => ({
+    provider,
+    status: "ready",
+    installed: true,
+    message: null,
+    version: null,
+  }));
+  useProviderHealth.setState({
+    slots: {
+      claude: emptyHealthSlot(),
+      codex: emptyHealthSlot(),
+      cursor: emptyHealthSlot(),
+      grok: emptyHealthSlot(),
+      opencode: emptyHealthSlot(),
+    },
+  });
 }
 
 beforeEach(resetStore);
@@ -103,6 +134,100 @@ describe("provider-capabilities-store", () => {
     expect(state.opencodeError).toBeNull();
   });
 
+  it("single-flights concurrent refreshes for one provider", async () => {
+    let resolve!: (caps: ProviderChatCapabilities) => void;
+    mockList.mockReturnValue(
+      new Promise<ProviderChatCapabilities>((done) => {
+        resolve = done;
+      }),
+    );
+
+    const first = useProviderCapabilities.getState().refresh("claude");
+    const second = useProviderCapabilities.getState().refresh("claude");
+
+    expect(first).toBe(second);
+    expect(mockList).toHaveBeenCalledTimes(1);
+    resolve(makeCaps("claude-opus"));
+    await Promise.all([first, second]);
+  });
+
+  it("shows cached capabilities then refreshes them once on first intent", async () => {
+    useProviderCapabilities.setState({ claude: makeCaps("claude-cached") });
+    mockList.mockResolvedValue(makeCaps("claude-live"));
+
+    await refreshProviderCapabilitiesForIntent("claude");
+    await refreshProviderCapabilitiesForIntent("claude");
+
+    expect(mockList).toHaveBeenCalledTimes(1);
+    expect(mockHealth).toHaveBeenCalledTimes(1);
+    expect(useProviderCapabilities.getState().claude?.models[0]?.id).toBe(
+      "claude-live",
+    );
+  });
+
+  it("retries a transient capability failure on the next explicit intent", async () => {
+    mockList
+      .mockRejectedValueOnce(new Error("temporary provider failure"))
+      .mockResolvedValueOnce(makeCaps("claude-recovered"));
+
+    await refreshProviderCapabilitiesForIntent("claude");
+    expect(useProviderCapabilities.getState().claudeError).toBe(
+      "temporary provider failure",
+    );
+
+    await refreshProviderCapabilitiesForIntent("claude");
+
+    expect(mockList).toHaveBeenCalledTimes(2);
+    expect(useProviderCapabilities.getState().claudeError).toBeNull();
+    expect(useProviderCapabilities.getState().claude?.models[0]?.id).toBe(
+      "claude-recovered",
+    );
+  });
+
+  it("reharvests Cursor on a later intent after its refresh cadence", async () => {
+    let now = 10_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    mockList
+      .mockResolvedValueOnce(makeCaps("cursor-cached-refresh"))
+      .mockResolvedValueOnce(makeCaps("cursor-live-refresh"));
+
+    try {
+      await refreshProviderCapabilitiesForIntent("cursor");
+      await refreshProviderCapabilitiesForIntent("cursor");
+      expect(mockList).toHaveBeenCalledTimes(1);
+
+      now += CURSOR_CAPABILITY_REFRESH_MS;
+      await refreshProviderCapabilitiesForIntent("cursor");
+
+      expect(mockList).toHaveBeenCalledTimes(2);
+      expect(useProviderCapabilities.getState().cursor?.models[0]?.id).toBe(
+        "cursor-live-refresh",
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("persists only last-known capability metadata", () => {
+    const claude = makeCaps("claude-cached");
+    useProviderCapabilities.setState({
+      claude,
+      claudeError: "transient failure",
+      loaded: true,
+    });
+
+    const persisted = JSON.parse(
+      localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY) ?? "null",
+    ) as { state?: Record<string, unknown> } | null;
+    expect(persisted?.state).toEqual({
+      claude,
+      codex: null,
+      cursor: null,
+      grok: null,
+      opencode: null,
+    });
+  });
+
   it("refresh on failure populates the right error slot only", async () => {
     mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
       if (provider === "opencode") throw new Error("opencode_not_installed");
@@ -116,16 +241,36 @@ describe("provider-capabilities-store", () => {
     // Other providers untouched.
     expect(state.claudeError).toBeNull();
     expect(state.codexError).toBeNull();
+    expect(selectProviderCapabilitiesLoaded(state, "opencode")).toBe(true);
   });
 
-  it("refreshAll fires all five providers in parallel", async () => {
+  it("marks a successful empty catalog loaded for that provider", async () => {
+    mockList.mockResolvedValue({ ...makeCaps("unused"), models: [] });
+
+    await useProviderCapabilities.getState().refresh("claude");
+
+    const state = useProviderCapabilities.getState();
+    expect(state.claude?.models).toEqual([]);
+    expect(selectProviderCapabilitiesLoaded(state, "claude")).toBe(true);
+    expect(selectProviderCapabilitiesLoaded(state, "codex")).toBe(false);
+    expect(state.loaded).toBe(false);
+  });
+
+  it("parallel per-provider refreshes settle every slot and derive loaded", async () => {
     const calls: AgentChatProviderKind[] = [];
     mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
       calls.push(provider);
       return makeCaps(`model-${provider}`);
     });
 
-    await useProviderCapabilities.getState().refreshAll();
+    const store = useProviderCapabilities.getState();
+    await Promise.all([
+      store.refresh("claude"),
+      store.refresh("codex"),
+      store.refresh("cursor"),
+      store.refresh("grok"),
+      store.refresh("opencode"),
+    ]);
     // Order is not guaranteed, but every provider must have been
     // called exactly once.
     expect(calls.sort()).toEqual([
@@ -136,6 +281,7 @@ describe("provider-capabilities-store", () => {
       "opencode",
     ]);
     const state = useProviderCapabilities.getState();
+    // `loaded` is derived from loadedProviders once all five settle.
     expect(state.loaded).toBe(true);
     expect(state.claude).not.toBeNull();
     expect(state.codex).not.toBeNull();
@@ -144,7 +290,7 @@ describe("provider-capabilities-store", () => {
     expect(state.opencode).not.toBeNull();
   });
 
-  it("refreshAll continues when one provider fails", async () => {
+  it("one provider's failure does not block the others from settling", async () => {
     // Critical Stage 3 invariant: an OpenCode-not-installed failure
     // must not block Claude/Codex from loading. `Promise.all` is
     // safe here because each `refresh()` swallows its own error.
@@ -153,8 +299,16 @@ describe("provider-capabilities-store", () => {
       return makeCaps(`model-${provider}`);
     });
 
-    await useProviderCapabilities.getState().refreshAll();
+    const store = useProviderCapabilities.getState();
+    await Promise.all([
+      store.refresh("claude"),
+      store.refresh("codex"),
+      store.refresh("cursor"),
+      store.refresh("grok"),
+      store.refresh("opencode"),
+    ]);
     const state = useProviderCapabilities.getState();
+    // A failed harvest still counts as settled, so `loaded` derives true.
     expect(state.loaded).toBe(true);
     expect(state.claude?.models[0]?.id).toBe("model-claude");
     expect(state.codex?.models[0]?.id).toBe("model-codex");
@@ -162,6 +316,114 @@ describe("provider-capabilities-store", () => {
     expect(state.grok?.models[0]?.id).toBe("model-grok");
     expect(state.opencode).toBeNull();
     expect(state.opencodeError).toBe("opencode_not_installed");
+  });
+
+  it("resetProviderCapabilities clears memory and the persisted catalog", () => {
+    useProviderCapabilities.setState({
+      claude: makeCaps("claude-cached"),
+      claudeError: "stale error",
+      loadedProviders: { claude: true },
+    });
+    expect(
+      localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY),
+    ).not.toBeNull();
+
+    resetProviderCapabilities();
+
+    const state = useProviderCapabilities.getState();
+    expect(state.claude).toBeNull();
+    expect(state.claudeError).toBeNull();
+    expect(state.loadedProviders).toEqual({});
+    expect(state.loaded).toBe(false);
+    expect(localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY)).toBeNull();
+  });
+
+  it("discards a refresh that resolves after resetProviderCapabilities", async () => {
+    // A model-picker harvest can spend seconds in a CLI. If the user signs
+    // out mid-flight, the late result must not be written back — neither to
+    // memory nor (via the persist middleware) to localStorage, which reset
+    // just cleared.
+    let resolveHarvest!: (caps: ProviderChatCapabilities) => void;
+    mockList.mockReturnValue(
+      new Promise<ProviderChatCapabilities>((done) => {
+        resolveHarvest = done;
+      }),
+    );
+
+    const flight = useProviderCapabilities.getState().refresh("claude");
+    resetProviderCapabilities();
+    resolveHarvest(makeCaps("claude-stale"));
+    await flight;
+
+    const state = useProviderCapabilities.getState();
+    expect(state.claude).toBeNull();
+    expect(state.claudeError).toBeNull();
+    // The doomed flight must not mark its slot settled either.
+    expect(state.loadedProviders).toEqual({});
+    expect(state.loaded).toBe(false);
+    expect(localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY)).toBeNull();
+  });
+
+  it("discards a refresh that fails after resetProviderCapabilities", async () => {
+    let rejectHarvest!: (err: Error) => void;
+    mockList.mockReturnValue(
+      new Promise<ProviderChatCapabilities>((_done, fail) => {
+        rejectHarvest = fail;
+      }),
+    );
+
+    const flight = useProviderCapabilities.getState().refresh("claude");
+    resetProviderCapabilities();
+    rejectHarvest(new Error("late harvest failure"));
+    await flight;
+
+    const state = useProviderCapabilities.getState();
+    expect(state.claudeError).toBeNull();
+    expect(state.claude).toBeNull();
+    expect(state.loadedProviders).toEqual({});
+    expect(state.loaded).toBe(false);
+  });
+
+  it("a refresh started after reset is not deduped against the doomed flight", async () => {
+    let resolveStale!: (caps: ProviderChatCapabilities) => void;
+    mockList
+      .mockReturnValueOnce(
+        new Promise<ProviderChatCapabilities>((done) => {
+          resolveStale = done;
+        }),
+      )
+      .mockResolvedValueOnce(makeCaps("claude-fresh"));
+
+    const stale = useProviderCapabilities.getState().refresh("claude");
+    resetProviderCapabilities();
+    const fresh = useProviderCapabilities.getState().refresh("claude");
+
+    // The post-reset (post-sign-in) refresh must be a new flight with a new
+    // invoke, not a join on the pre-reset one.
+    expect(fresh).not.toBe(stale);
+    expect(mockList).toHaveBeenCalledTimes(2);
+
+    await fresh;
+    resolveStale(makeCaps("claude-stale"));
+    await stale;
+
+    const state = useProviderCapabilities.getState();
+    // The stale flight settles last but must not clobber the fresh result
+    // or the fresh flight's lifecycle bookkeeping.
+    expect(state.claude?.models[0]?.id).toBe("claude-fresh");
+    expect(selectProviderCapabilitiesLoaded(state, "claude")).toBe(true);
+  });
+
+  it("resetProviderCapabilities forgets completed intents so the next intent re-harvests", async () => {
+    mockList.mockResolvedValue(makeCaps("claude-live"));
+
+    await refreshProviderCapabilitiesForIntent("claude");
+    expect(mockList).toHaveBeenCalledTimes(1);
+
+    resetProviderCapabilities();
+    await refreshProviderCapabilitiesForIntent("claude");
+
+    expect(mockList).toHaveBeenCalledTimes(2);
   });
 
   it("selectCapabilities returns the matching provider's slot", () => {
@@ -285,7 +547,7 @@ describe("cursor capability polling", () => {
     );
   });
 
-  it("skips the poll only when Cursor is known to be missing", () => {
+  it("skips a re-harvest only when Cursor is known to be missing", () => {
     const report = (installed: boolean) => ({
       provider: "cursor" as const,
       status: "ready" as const,
@@ -306,7 +568,7 @@ describe("grok capability polling", () => {
     expect(GROK_CAPABILITY_REFRESH_MS).toBe(CURSOR_CAPABILITY_REFRESH_MS);
   });
 
-  it("skips the poll only when Grok is known to be missing", () => {
+  it("skips a re-harvest only when Grok is known to be missing", () => {
     const report = (installed: boolean) => ({
       provider: "grok" as const,
       status: "ready" as const,

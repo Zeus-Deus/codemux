@@ -5,7 +5,10 @@ import { NewWorkspaceDialog } from "./new-workspace-dialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
-import type { AppStateSnapshot } from "@/tauri/types";
+import type {
+  AppStateSnapshot,
+  ProviderChatCapabilities,
+} from "@/tauri/types";
 
 // ── Mock Tauri commands ──
 
@@ -89,6 +92,21 @@ vi.mock("@/tauri/commands", () => ({
   // but the dialog (using GEMINI_MODELS as a paper backstop) is
   // unaffected for tests that don't exercise the Gemini path.
   listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
+  listChatProviderCapabilities: vi.fn().mockResolvedValue({
+    models: [],
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: null,
+    permission_granularity: "per_session",
+  }),
+  agentChatProviderHealth: vi.fn().mockResolvedValue({
+    provider: "claude",
+    status: "ready",
+    installed: true,
+    message: null,
+    version: null,
+  }),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -113,12 +131,47 @@ import {
   pasteClipboardImageToFile,
   getDefaultBranch,
   getPresets,
+  listChatProviderCapabilities,
 } from "@/tauri/commands";
 import {
   _defaultBranchCache,
   _defaultBranchInFlight,
 } from "@/components/layout/default-branch-cache";
 import { toast } from "@/lib/toast";
+import {
+  _resetProviderCapabilityIntentForTests,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
+
+function makeCaps(
+  modelId: string,
+  effortLevels: string[] = [],
+): ProviderChatCapabilities {
+  return {
+    models: [
+      {
+        id: modelId,
+        label: modelId,
+        description: null,
+        effort_levels: effortLevels,
+        default_effort: null,
+        prompt_injected_effort_levels: [],
+        context_window_options: [],
+        supports_adaptive_thinking: false,
+        supports_thinking_toggle: false,
+        supports_fast_mode: false,
+        supports_images: false,
+        sub_provider: null,
+        is_free: false,
+      },
+    ],
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: null,
+    permission_granularity: "per_session",
+  };
+}
 
 // ── Helpers ──
 
@@ -197,6 +250,22 @@ function renderDialog(open: boolean, onOpenChange = vi.fn()) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  (listChatProviderCapabilities as Mock).mockResolvedValue(
+    makeCaps("claude-sonnet-4-6", ["high"]),
+  );
+  _resetProviderCapabilityIntentForTests();
+  useProviderCapabilities.setState({
+    claude: null,
+    codex: null,
+    cursor: null,
+    opencode: null,
+    claudeError: null,
+    codexError: null,
+    cursorError: null,
+    opencodeError: null,
+    loadedProviders: {},
+    loaded: false,
+  });
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);
   // useDefaultBranch keeps a module-level cache so the same project_root
@@ -304,6 +373,68 @@ describe("NewWorkspaceDialog", () => {
     await waitFor(() => {
       expect(listBranches).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe("Provider capability intent", () => {
+  // This legacy suite retains Radix portals between cases, so select the most
+  // recently mounted dialog explicitly while exercising a deferred catalog.
+  it("paints a cached model catalog while refreshing it on launch intent", async () => {
+    (getPresets as Mock).mockResolvedValueOnce({
+      presets: [
+        {
+          id: "builtin-claude",
+          name: "Claude",
+          description: null,
+          commands: ["claude --dangerously-skip-permissions"],
+          working_directory: null,
+          launch_mode: "NewTab",
+          icon: null,
+          pinned: true,
+          is_builtin: true,
+          auto_run_on_workspace: false,
+          auto_run_on_new_tab: false,
+          kind: "cli",
+        },
+      ],
+    });
+    useProviderCapabilities.setState({ claude: makeCaps("claude-cached") });
+    useUIStore.setState({
+      lastModelSelections: {
+        claude: {
+          model: "claude-cached",
+          reasoning: null,
+          context: null,
+        },
+      },
+    });
+    let resolveRefresh!: (caps: ProviderChatCapabilities) => void;
+    (listChatProviderCapabilities as Mock).mockImplementationOnce(
+      () =>
+        new Promise<ProviderChatCapabilities>((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+    setAppState("/path/to/project");
+
+    renderDialog(true);
+
+    const dialogs = await screen.findAllByRole("dialog");
+    const dialog = dialogs[dialogs.length - 1]!;
+    const modelButton = await within(dialog).findByRole("button", {
+      name: "Select model",
+    });
+    expect(modelButton).toHaveTextContent("claude-cached");
+    await waitFor(() =>
+      expect(listChatProviderCapabilities).toHaveBeenCalledWith("claude"),
+    );
+
+    resolveRefresh(makeCaps("claude-live"));
+    await waitFor(() =>
+      expect(
+        useProviderCapabilities.getState().claude?.models[0]?.id,
+      ).toBe("claude-live"),
+    );
   });
 });
 
@@ -464,9 +595,7 @@ describe("Submit flow", () => {
       ],
     });
     // A remembered pick for the Claude family — including a reasoning
-    // level, which must survive even though the capability harvest
-    // never resolves in this test (regression guard for the
-    // caps-not-loaded data-loss path).
+    // level, which must survive capability refresh and launch resolution.
     useUIStore.setState({
       lastModelSelections: {
         claude: { model: "claude-sonnet-4-6", reasoning: "high", context: null },

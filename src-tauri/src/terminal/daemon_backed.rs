@@ -15,12 +15,14 @@
 //!     and forget tokio task) → client.write → socket → daemon → master fd.
 
 use super::{
-    emit_terminal_status, queue_or_send_output, remove_session_runtime, session_working_dir,
-    with_session_runtime, workspace_pty_env, PtyState, SessionRuntime,
-    TerminalLifecycleState, TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
+    emit_terminal_status, hydration_workspace_pty_env, queue_or_send_output, with_session_runtime,
+    PtyState, SessionRuntime, SessionSpawnReservation, TerminalLifecycleState,
+    TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
-use crate::pty_daemon::PtyDaemonClient;
-use crate::state::AppStateStore;
+use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
+use crate::state::{AppStateStore, PtyHydrationPlan, PtyHydrationSession, PtyHydrationWorkspace};
+use futures_util::stream::StreamExt as _;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime, State};
 
@@ -119,28 +121,336 @@ pub(crate) fn build_agent_relaunch_command(
 ///    (`~/.codemux/worktrees/<uid>-<project>/<branch>`) — where the push
 ///    flow lands a pushed workspace. Used for pushed workspaces (no
 ///    `remote_cwd`), and matches the path `workspace_push_to_host` chose.
+#[cfg(test)]
 pub(crate) fn remote_spawn_cwd(owning_ws: Option<&crate::state::WorkspaceSnapshot>) -> String {
-    if let Some(remote_cwd) = owning_ws.and_then(|w| w.remote_cwd.clone()) {
+    remote_spawn_cwd_from_fields(
+        owning_ws.and_then(|w| w.remote_cwd.as_deref()),
+        owning_ws.and_then(|w| w.project_root.as_deref()),
+        owning_ws.and_then(|w| w.git_branch.as_deref()),
+        owning_ws.and_then(|w| w.project_uid.as_deref()),
+    )
+}
+
+fn hydration_remote_spawn_cwd(owning_ws: &crate::state::PtyHydrationWorkspace) -> String {
+    remote_spawn_cwd_from_fields(
+        owning_ws.remote_cwd.as_deref(),
+        owning_ws.project_root.as_deref(),
+        owning_ws.git_branch.as_deref(),
+        owning_ws.project_uid.as_deref(),
+    )
+}
+
+fn remote_spawn_cwd_from_fields(
+    remote_cwd: Option<&str>,
+    project_root: Option<&str>,
+    git_branch: Option<&str>,
+    project_uid: Option<&str>,
+) -> String {
+    if let Some(remote_cwd) = remote_cwd {
         if !remote_cwd.trim().is_empty() {
-            return remote_cwd;
+            return remote_cwd.to_string();
         }
     }
-    let project_name = owning_ws
-        .and_then(|w| {
-            w.project_root
-                .as_deref()
-                .and_then(|p| std::path::Path::new(p).file_name())
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-        })
+    let project_name = project_root
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
         .unwrap_or_else(|| "workspace".to_string());
-    let branch = owning_ws
-        .and_then(|w| w.git_branch.clone())
-        .unwrap_or_else(|| "main".to_string());
-    let puid = owning_ws.and_then(|w| w.project_uid.clone());
-    crate::ssh::conventional_remote_path_keyed(puid.as_deref(), &project_name, &branch)
+    let branch = git_branch.unwrap_or("main");
+    crate::ssh::conventional_remote_path_keyed(project_uid, &project_name, branch)
         .to_string_lossy()
         .to_string()
+}
+
+const HYDRATION_CONCURRENCY: usize = 4;
+
+/// Whether a local in-process shell can safely replace a failed daemon RPC.
+/// A transport failure after sending Spawn or Attach has an unknown outcome:
+/// the daemon may already own the shell even though its acknowledgement was
+/// lost. Starting a local fallback in that case would duplicate the process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DaemonHydrationFailure {
+    AlreadyReserved,
+    SafeToFallback(String),
+    Ambiguous(String),
+}
+
+impl DaemonHydrationFailure {
+    pub(crate) fn allows_local_fallback(&self) -> bool {
+        matches!(self, Self::SafeToFallback(_))
+    }
+
+    pub(crate) fn is_already_reserved(&self) -> bool {
+        matches!(self, Self::AlreadyReserved)
+    }
+}
+
+impl std::fmt::Display for DaemonHydrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyReserved => f.write_str("session already reserved by another spawn"),
+            Self::SafeToFallback(message) | Self::Ambiguous(message) => f.write_str(message),
+        }
+    }
+}
+
+fn classify_spawn_rpc_failure(error: PtyDaemonError) -> DaemonHydrationFailure {
+    let message = format!("daemon spawn: {error}");
+    match error {
+        // Serialization happens before the frame is written. These daemon
+        // errors are also produced before `spawn_command` returns a child.
+        PtyDaemonError::Serde(_) => DaemonHydrationFailure::SafeToFallback(message),
+        PtyDaemonError::Daemon(ref daemon_message)
+            if daemon_message == "argv is empty"
+                || daemon_message.starts_with("openpty: ")
+                || daemon_message.starts_with("spawn: ") => {
+            DaemonHydrationFailure::SafeToFallback(message)
+        }
+        // A transport failure can happen after acceptance. A generic daemon
+        // error is uncertain too: reader/writer setup happens after the child
+        // is spawned, and "already exists" proves a daemon session is live.
+        // Treat every other variant as retry-only rather than duplicating it.
+        _ => DaemonHydrationFailure::Ambiguous(message),
+    }
+}
+
+fn classify_attach_rpc_failure(error: PtyDaemonError) -> DaemonHydrationFailure {
+    // Attach follows either a successful Spawn or a List result proving the
+    // session already exists, so no attach error permits a replacement spawn.
+    DaemonHydrationFailure::Ambiguous(format!("daemon attach: {error}"))
+}
+
+/// Classify a failure to acquire the workspace's daemon client. At this stage
+/// errors that mean "nothing usable is listening" — connection refused,
+/// missing socket, daemon spawn failure, circuit breaker open — safely permit
+/// a local in-process shell, which keeps normal cold-start working when the
+/// daemon is absent or disabled. A timeout or an accept-then-EOF, however,
+/// means something answered the dial: possibly a stalled daemon that still
+/// owns live shells, so those stay retry-only.
+fn classify_client_acquisition_failure(error: PtyDaemonError) -> DaemonHydrationFailure {
+    let message = format!("daemon client: {error}");
+    match error {
+        PtyDaemonError::Timeout | PtyDaemonError::Closed => {
+            DaemonHydrationFailure::Ambiguous(message)
+        }
+        _ => DaemonHydrationFailure::SafeToFallback(message),
+    }
+}
+
+/// Classify a failure of the workspace-level List RPC. List only runs on a
+/// client whose connection already succeeded, so a daemon process exists; no
+/// List error — least of all a timeout against a stalled-but-alive daemon —
+/// proves the sessions are absent. Spawning local replacements here would
+/// duplicate live shells and orphan their agents, so every variant is
+/// retry-only, matching the spawn/attach classifiers above.
+fn classify_list_rpc_failure(error: PtyDaemonError) -> DaemonHydrationFailure {
+    DaemonHydrationFailure::Ambiguous(format!("daemon list: {error}"))
+}
+
+async fn list_daemon_session_map(
+    client: &PtyDaemonClient,
+) -> Result<HashMap<String, DaemonSessionInfo>, crate::pty_daemon::PtyDaemonError> {
+    Ok(client
+        .list()
+        .await?
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect())
+}
+
+/// Compatibility entry point for a newly-created single pane. Restored
+/// workspaces call [`hydrate_workspace_via_daemon`] with all descriptors at
+/// once, which is what enables the one-List invariant.
+pub(crate) async fn spawn_pty_for_session_via_daemon<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+) -> Result<(), DaemonHydrationFailure> {
+    let state: State<'_, AppStateStore> = app.state();
+    let plan = state
+        .pty_hydration_plan_for_session(&session_id)
+        .ok_or_else(|| {
+            DaemonHydrationFailure::SafeToFallback(
+                "terminal session has no owning workspace".to_string(),
+            )
+        })?;
+    let failures = hydrate_workspace_via_daemon(app, plan).await?;
+    failures
+        .into_iter()
+        .next()
+        .map(|(_, error)| Err(error))
+        .unwrap_or(Ok(()))
+}
+
+/// Hydrate every missing terminal in one workspace using a single narrow state
+/// plan, one daemon client, and exactly one daemon List. Attach/spawn RPCs fan
+/// out only after that map exists and are capped to a small concurrency.
+///
+/// The outer caller decides local fallback vs remote Failed UI for returned
+/// per-session failures. A setup/List error happens before any reservation;
+/// failures after reservation are cleaned by `SessionSpawnReservation`.
+/// Workspace-level errors come back pre-classified: only client-acquisition
+/// errors proving the daemon is absent allow a local fallback, while List
+/// failures (including timeouts) are always retry-only because the daemon
+/// may still own every listed shell.
+pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
+    app: AppHandle<R>,
+    plan: PtyHydrationPlan,
+) -> Result<Vec<(String, DaemonHydrationFailure)>, DaemonHydrationFailure> {
+    let hydration_started = std::time::Instant::now();
+    let terminal_state: State<'_, PtyState> = app.state();
+    let sessions = terminal_state.sessions.clone();
+    let pending: Vec<PtyHydrationSession> = plan
+        .sessions
+        .into_iter()
+        .filter(|session| !super::is_session_spawn_active(&sessions, &session.session_id))
+        .collect();
+    if pending.is_empty() {
+        crate::diagnostics::record_perf_timing(
+            "pty.workspace-hydration",
+            hydration_started.elapsed(),
+        );
+        return Ok(Vec::new());
+    }
+
+    let workspace = Arc::new(plan.workspace);
+    let is_remote = workspace.host_id.is_some();
+    if is_remote {
+        for session in &pending {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id: session.session_id.clone(),
+                    state: TerminalLifecycleState::Starting,
+                    message: Some(
+                        "Connecting to remote host (this can take up to 20s on first connect)…"
+                            .into(),
+                    ),
+                    exit_code: None,
+                },
+            );
+        }
+    }
+
+    let client =
+        match crate::ssh::client_for_workspace(&app, &workspace.workspace_id, workspace.host_id)
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => {
+                crate::diagnostics::record_perf_timing(
+                    "pty.workspace-hydration",
+                    hydration_started.elapsed(),
+                );
+                return Err(classify_client_acquisition_failure(error));
+            }
+        };
+
+    let list_started = std::time::Instant::now();
+    let listed = list_daemon_session_map(&client).await;
+    crate::diagnostics::record_perf_timing("pty.daemon-list", list_started.elapsed());
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(error) => {
+            crate::diagnostics::record_perf_timing(
+                "pty.workspace-hydration",
+                hydration_started.elapsed(),
+            );
+            return Err(classify_list_rpc_failure(error));
+        }
+    };
+    let mut existing = listed;
+
+    // Filesystem-backed scrollback lookup, CLI-shim creation, and workspace
+    // env derivation stay off the async worker. One preparation task serves
+    // every pane in the workspace.
+    let prep_workspace = workspace.clone();
+    let prep_sessions = pending.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let mut workspace_env = hydration_workspace_pty_env(&prep_workspace);
+        if !is_remote {
+            if let Some((shim_dir, current_exe)) = super::ensure_cli_shims() {
+                let current_path = crate::execution::sanitized_child_path();
+                let prefixed = super::build_child_path(&shim_dir, &current_path);
+                workspace_env.push(("PATH".into(), prefixed));
+                workspace_env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
+            }
+        }
+        let disk_meta: HashMap<_, _> = prep_sessions
+            .iter()
+            .filter_map(|session| {
+                crate::scrollback::find_scrollback_meta_for_session(&session.session_id)
+                    .map(|meta| (session.session_id.clone(), meta))
+            })
+            .collect();
+        let shell = if is_remote {
+            "bash".to_string()
+        } else {
+            super::default_shell()
+        };
+        let session_restore_enabled = crate::settings_sync::load_cache()
+            .map(|settings| settings.session_restore.enabled)
+            .unwrap_or(true);
+        (
+            Arc::new(workspace_env),
+            disk_meta,
+            shell,
+            session_restore_enabled,
+        )
+    })
+    .await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            crate::diagnostics::record_perf_timing(
+                "pty.workspace-hydration",
+                hydration_started.elapsed(),
+            );
+            // The daemon is alive (List just succeeded) and may own live
+            // shells, so this process-local failure is retry-only.
+            return Err(DaemonHydrationFailure::Ambiguous(
+                "PTY hydration preparation worker panicked".to_string(),
+            ));
+        }
+    };
+    let (workspace_env, mut disk_meta, shell, session_restore_enabled) = prepared;
+
+    let mut work = Vec::with_capacity(pending.len());
+    for session in pending {
+        let prior = existing.remove(&session.session_id);
+        let meta = disk_meta.remove(&session.session_id);
+        let session_id = session.session_id.clone();
+        let app = app.clone();
+        let workspace = workspace.clone();
+        let client = client.clone();
+        let workspace_env = workspace_env.clone();
+        let shell = shell.clone();
+        work.push(async move {
+            let result = spawn_prepared_session(
+                app,
+                workspace,
+                session,
+                client,
+                prior,
+                meta,
+                workspace_env,
+                shell,
+                session_restore_enabled,
+            )
+            .await;
+            (session_id, result)
+        });
+    }
+
+    let results: Vec<_> = futures_util::stream::iter(work)
+        .buffer_unordered(HYDRATION_CONCURRENCY)
+        .collect()
+        .await;
+    crate::diagnostics::record_perf_timing("pty.workspace-hydration", hydration_started.elapsed());
+    Ok(results
+        .into_iter()
+        .filter_map(|(session_id, result)| result.err().map(|error| (session_id, error)))
+        .collect())
 }
 
 /// Daemon-backed shell spawn — the persistent equivalent of
@@ -149,90 +459,35 @@ pub(crate) fn remote_spawn_cwd(owning_ws: Option<&crate::state::WorkspaceSnapsho
 /// so user-typed commands inside the shell get the same Codemux context
 /// AND reopening a previously-killed agent triggers the same
 /// `claude --continue` / adapter-driven resume the in-process path does.
-pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
+async fn spawn_prepared_session<R: Runtime>(
     app: AppHandle<R>,
-    session_id: String,
-) -> Result<(), String> {
+    workspace: Arc<PtyHydrationWorkspace>,
+    session: PtyHydrationSession,
+    client: Arc<PtyDaemonClient>,
+    existing: Option<DaemonSessionInfo>,
+    disk_meta: Option<(String, String, crate::scrollback::ScrollbackMeta)>,
+    workspace_env: Arc<Vec<(String, String)>>,
+    shell: String,
+    session_restore_enabled: bool,
+) -> Result<(), DaemonHydrationFailure> {
+    let session_id = session.session_id.clone();
     let entry_ts = std::time::Instant::now();
-    crate::trace_cloud_push!(
-        "[trace:{session_id}] spawn_via_daemon ENTRY t=0ms"
-    );
+    crate::trace_cloud_push!("[trace:{session_id}] spawn_via_daemon ENTRY t=0ms");
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
-    if !super::try_reserve_session_spawn(&sessions, &session_id) {
+    let Some(mut reservation) = SessionSpawnReservation::try_new(&sessions, &session_id) else {
         crate::trace_cloud_push!(
             "[trace:{session_id}] try_reserve FAILED at t={}ms",
             entry_ts.elapsed().as_millis()
         );
-        return Err("session already reserved by another spawn".into());
-    }
-
-    // Resolve the workspace + its host assignment BEFORE picking a
-    // daemon client. host_id=None → local daemon (this device).
-    // host_id=Some(...) → SSH-tunneled remote daemon. Either way
-    // `client_for_workspace` returns the right one (caching for
-    // perf so repeated spawns in the same workspace reuse the
-    // connection).
-    let snapshot = app_state.snapshot();
-    let owning_ws = super::find_owning_workspace(&snapshot, &session_id);
-    let workspace_id = owning_ws
-        .map(|w| w.workspace_id.0.clone())
-        .unwrap_or_default();
-    let host_id = owning_ws.and_then(|w| w.host_id);
+        return Err(DaemonHydrationFailure::AlreadyReserved);
+    };
+    let workspace_id = workspace.workspace_id.clone();
+    let host_id = workspace.host_id;
     let is_remote = host_id.is_some();
-
-    // Shell choice depends on local vs remote:
-    // - LOCAL: use `$SHELL` from the laptop (the user's preferred shell).
-    // - REMOTE: use bare `bash` — `$SHELL` on the laptop is an absolute
-    //   path to the laptop's shell binary (e.g. `/usr/bin/fish`) which
-    //   almost certainly doesn't exist at that path on the remote host.
-    //   Sending it as argv to the remote daemon makes the spawn fail
-    //   immediately, the daemon closes the session, and the read loop
-    //   ends without a single byte of output. Bare `bash` (resolved via
-    //   the remote daemon's PATH) is on every Linux distro and macOS.
-    let shell = if is_remote {
-        "bash".to_string()
-    } else {
-        super::default_shell()
-    };
     app_state.update_terminal_session_shell(&session_id, shell.clone());
-
-    // Emit an early "Connecting…" status for remote spawns so the
-    // overlay shows progress during the tunnel + daemon-handshake
-    // wait. Without this the user sees "Starting persistent shell"
-    // for up to 40s with no movement — looks like a hang.
-    if is_remote {
-        emit_terminal_status(
-            &app,
-            &sessions,
-            TerminalStatusPayload {
-                session_id: session_id.clone(),
-                state: TerminalLifecycleState::Starting,
-                message: Some(
-                    "Connecting to remote host (this can take up to 20s on \
-                     first connect)…"
-                        .into(),
-                ),
-                exit_code: None,
-            },
-        );
-    }
-
-    let client = match crate::ssh::client_for_workspace(
-        &app,
-        &workspace_id,
-        host_id,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(error) => {
-            remove_session_runtime(&sessions, &session_id);
-            return Err(format!("daemon client: {error}"));
-        }
-    };
 
     // ── Scrollback restore + adapter resume parity with in-process path.
     //
@@ -241,32 +496,28 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     // tools like `claude --resume` find their state, and (b) capture an
     // `auto_resume_command` that we'll write into the shell after spawn.
     // Mirrors `spawn_pty_for_session_in_process` lines around 1166-1200.
-    let session_restore_enabled = crate::settings_sync::load_cache()
-        .map(|s| s.session_restore.enabled)
-        .unwrap_or(true);
     // Remote workspaces spawn into the conventional remote path
     // (`~/.codemux/worktrees/<project>/<branch>`) rather than the
     // local cwd — the workspace's `cwd` field is a local-filesystem
     // path that doesn't exist on the remote host. Local workspaces
     // keep using the local cwd as before.
     let mut effective_cwd = if is_remote {
-        let computed = remote_spawn_cwd(owning_ws);
+        let computed = hydration_remote_spawn_cwd(&workspace);
         crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] remote cwd for {session_id}: \
-             {computed} (owning_ws={}, attach_only={}, remote_cwd={:?}, \
+             {computed} (attach_only={}, remote_cwd={:?}, \
              project_root={:?}, git_branch={:?})",
-            owning_ws.is_some(),
-            owning_ws.map(|w| w.attach_only).unwrap_or(false),
-            owning_ws.and_then(|w| w.remote_cwd.clone()),
-            owning_ws.and_then(|w| w.project_root.clone()),
-            owning_ws.and_then(|w| w.git_branch.clone()),
+            workspace.attach_only,
+            workspace.remote_cwd.as_deref(),
+            workspace.project_root.as_deref(),
+            workspace.git_branch.as_deref(),
         );
         computed
     } else {
-        session_working_dir(&app_state, &session_id)
+        session.cwd.clone()
     };
     let mut auto_resume_command: Option<String> = None;
-    let mut pane_id_for_env: Option<String> = None;
+    let mut pane_id_for_env = session.pane_id.clone();
 
     // Scrollback restore + adapter relaunch.
     //
@@ -292,7 +543,6 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     // (b) determine Claude's path-encoding rule from its source;
     // (c) rsync the per-project JSONLs with path translation.
     if session_restore_enabled {
-        let disk_meta = crate::scrollback::find_scrollback_meta_for_session(&session_id);
         if let Some((_, ref pane_id, _)) = disk_meta {
             pane_id_for_env = Some(pane_id.clone());
         }
@@ -305,11 +555,7 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
         // lookup returns None. The in-memory snapshot has the original
         // command from the moment the preset was applied
         // (update_terminal_session_command in commands/presets.rs).
-        let in_memory_original = snapshot
-            .terminal_sessions
-            .iter()
-            .find(|s| s.session_id.0 == session_id)
-            .and_then(|s| s.original_command.clone());
+        let in_memory_original = session.original_command.clone();
 
         if is_remote {
             // Remote: keep the conventional remote cwd; relaunch with a
@@ -325,23 +571,15 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
             //   - opencode → --session <id> when the push synced one (id in
             //     adapter_captures), else --continue (issue #16; the host's
             //     opencode.db received the session via export/import).
-            let full = in_memory_original
-                .clone()
-                .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
+            let full = in_memory_original.clone().or_else(|| {
+                disk_meta
+                    .as_ref()
+                    .and_then(|(_, _, m)| m.original_command.clone())
+            });
             // Resume identifiers captured in the in-memory snapshot:
             // claude's hook-captured UUID, opencode's push-synced session id.
-            let claude_uuid = snapshot
-                .terminal_sessions
-                .iter()
-                .find(|s| s.session_id.0 == session_id)
-                .and_then(|s| s.adapter_captures.get("claude_session_id"))
-                .cloned();
-            let opencode_session_id = snapshot
-                .terminal_sessions
-                .iter()
-                .find(|s| s.session_id.0 == session_id)
-                .and_then(|s| s.adapter_captures.get("opencode_session_id"))
-                .cloned();
+            let claude_uuid = session.adapter_captures.get("claude_session_id").cloned();
+            let opencode_session_id = session.adapter_captures.get("opencode_session_id").cloned();
             // GATE: only synthesize a relaunch command when there's evidence
             // this is genuinely a relaunch (persisted disk meta or a captured
             // agent session id). If neither is set we're racing a fresh
@@ -400,21 +638,13 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
             // before the user has interacted), we still fall back to
             // the disk path which uses the full resolve_resume_command
             // pipeline (more accurate, includes per-adapter args).
-            let full = in_memory_original
-                .clone()
-                .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
-            let claude_uuid = snapshot
-                .terminal_sessions
-                .iter()
-                .find(|s| s.session_id.0 == session_id)
-                .and_then(|s| s.adapter_captures.get("claude_session_id"))
-                .cloned();
-            let opencode_session_id = snapshot
-                .terminal_sessions
-                .iter()
-                .find(|s| s.session_id.0 == session_id)
-                .and_then(|s| s.adapter_captures.get("opencode_session_id"))
-                .cloned();
+            let full = in_memory_original.clone().or_else(|| {
+                disk_meta
+                    .as_ref()
+                    .and_then(|(_, _, m)| m.original_command.clone())
+            });
+            let claude_uuid = session.adapter_captures.get("claude_session_id").cloned();
+            let opencode_session_id = session.adapter_captures.get("opencode_session_id").cloned();
 
             // Prefer the existing scrollback+adapter pipeline when
             // BOTH disk_meta and adapter_state are available — it
@@ -425,12 +655,11 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
                 app.try_state::<crate::session_adapters::AdapterState>(),
                 disk_meta.as_ref(),
             ) {
-                effective_cwd = super::resolve_session_cwd(
-                    &meta.working_directory,
-                    &effective_cwd,
-                );
-                if let Some(resume_command) = super::resolve_resume_command(
-                    &snapshot,
+                effective_cwd = super::resolve_session_cwd(&meta.working_directory, &effective_cwd);
+                if let Some(resume_command) = super::resolve_resume_command_from_original(
+                    in_memory_original
+                        .clone()
+                        .or_else(|| meta.original_command.clone()),
                     meta,
                     &adapter_state,
                 ) {
@@ -504,22 +733,12 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
         ("CODEMUX_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
         ("CODEMUX_SURFACE_ID".into(), session_id.clone()),
         ("CODEMUX_SESSION_ID".into(), session_id.clone()),
-        (
-            "CODEMUX_BROWSER_CMD".into(),
-            "codemux browser".into(),
-        ),
+        ("CODEMUX_BROWSER_CMD".into(), "codemux browser".into()),
         ("BROWSER".into(), "codemux browser open".into()),
     ];
-    if let Some(ws) = owning_ws {
-        env.push(("CODEMUX_WORKSPACE_ID".into(), ws.workspace_id.0.clone()));
-        for kv in workspace_pty_env(ws) {
-            env.push(kv);
-        }
-    } else {
-        env.push((
-            "CODEMUX_AGENT_CONTEXT".into(),
-            crate::agent_context::build_agent_context(None, None, None, None),
-        ));
+    env.push(("CODEMUX_WORKSPACE_ID".into(), workspace_id.clone()));
+    for kv in workspace_env.iter() {
+        env.push(kv.clone());
     }
     if let Some(pane_id) = pane_id_for_env.as_ref() {
         env.push(("CODEMUX_PANE_ID".into(), pane_id.clone()));
@@ -527,24 +746,6 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     if let Some(port) = crate::hooks::hook_port() {
         env.push(("CODEMUX_HOOK_PORT".into(), port.to_string()));
     }
-    // PATH + CLI shim injection are local-machine concepts —
-    // injecting the laptop's PATH into a remote shell would be
-    // worse than nothing (paths to /home/zeus/... etc don't exist
-    // on the remote, and the shim dir lives in the laptop's
-    // filesystem). For remote workspaces the remote shell uses
-    // its own default PATH from the user's ~/.bashrc / ~/.zshrc.
-    if !is_remote {
-        if let Some((shim_dir, current_exe)) = super::ensure_cli_shims() {
-            // Sanitized rather than raw PATH: under an AppImage the process
-            // PATH is prefixed with AppDir bin dirs, and shipping those to the
-            // daemon would let the bundle's binaries shadow the user's own.
-            let current_path = crate::execution::sanitized_child_path();
-            let prefixed = super::build_child_path(&shim_dir, &current_path);
-            env.push(("PATH".into(), prefixed));
-            env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
-        }
-    }
-
     emit_terminal_status(
         &app,
         &sessions,
@@ -556,23 +757,9 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
         },
     );
 
-    // Idempotent reattach for shells (same logic as agents).
-    let list_result = client.list().await;
-    let list_snapshot = list_result.as_ref().ok().map(|v| {
-        v.iter()
-            .map(|s| format!("{}@pid{}", s.session_id, s.pid))
-            .collect::<Vec<_>>()
-            .join(",")
-    });
-    crate::trace_cloud_push!(
-        "[trace:{session_id}] daemon.list() at t={}ms returned: [{}]",
-        entry_ts.elapsed().as_millis(),
-        list_snapshot.unwrap_or_else(|| "ERR".to_string())
-    );
-    let existing = list_result
-        .ok()
-        .and_then(|list| list.into_iter().find(|s| s.session_id == session_id));
-
+    // Idempotent reattach decision comes from the workspace-level List. The
+    // caller performs exactly one List and maps it before any pane tasks fan
+    // out, so an eight-pane activation never sends eight identical RPCs.
     let reattached;
     let pid = if let Some(existing) = existing {
         reattached = true;
@@ -602,18 +789,7 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
         {
             Ok(pid) => pid,
             Err(error) => {
-                remove_session_runtime(&sessions, &session_id);
-                emit_terminal_status(
-                    &app,
-                    &sessions,
-                    TerminalStatusPayload {
-                        session_id: session_id.clone(),
-                        state: TerminalLifecycleState::Failed,
-                        message: Some(format!("daemon shell spawn failed: {error}")),
-                        exit_code: None,
-                    },
-                );
-                return Err(format!("daemon spawn: {error}"));
+                return Err(classify_spawn_rpc_failure(error));
             }
         }
     };
@@ -621,9 +797,12 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     let mut rx = match client.attach(session_id.clone()).await {
         Ok(rx) => rx,
         Err(error) => {
-            let _ = client.close(session_id.clone()).await;
-            remove_session_runtime(&sessions, &session_id);
-            return Err(format!("daemon attach: {error}"));
+            // Keep a successfully spawned daemon session alive. The reservation
+            // guard clears the local `is_spawning` marker on return, and a retry
+            // will discover this session through List and reattach idempotently.
+            // Sending a background Close here races that retry and can kill the
+            // shell immediately after the second attach succeeds.
+            return Err(classify_attach_rpc_failure(error));
         }
     };
 
@@ -663,6 +842,7 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
             runtime.daemon_client = Some(client_for_runtime);
         },
     );
+    reservation.commit();
 
     // Preflight: for remote workspaces, verify the agent binary
     // we're about to write actually exists on the remote host. If
@@ -673,11 +853,7 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     // reattach — if we're reattaching, the agent's already running).
     if is_remote && !reattached {
         if let Some(ref command) = auto_resume_clone {
-            let binary = command
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let binary = command.split_whitespace().next().unwrap_or("").to_string();
             if !binary.is_empty() {
                 if let Some(host_id_val) = host_id {
                     let host = app
@@ -700,9 +876,7 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
                             .output()
                             .await;
                         if let Ok(out) = check {
-                            let result = String::from_utf8_lossy(&out.stdout)
-                                .trim()
-                                .to_string();
+                            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
                             if result == "MISSING" {
                                 eprintln!(
                                     "[codemux::terminal::daemon_backed] preflight: \
@@ -778,14 +952,8 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     let adapter_clone: Option<crate::session_adapters::AdapterState> = app
         .try_state::<crate::session_adapters::AdapterState>()
         .map(|s| s.inner().clone());
-    let original_cmd = snapshot
-        .terminal_sessions
-        .iter()
-        .find(|s| s.session_id.0 == session_id)
-        .and_then(|s| s.original_command.clone());
-    let has_scanner = if let (Some(ref adapter), Some(ref cmd)) =
-        (&adapter_clone, &original_cmd)
-    {
+    let original_cmd = session.original_command.clone();
+    let has_scanner = if let (Some(ref adapter), Some(ref cmd)) = (&adapter_clone, &original_cmd) {
         adapter.start_scanner(&session_id, cmd).is_some()
     } else {
         false
@@ -880,7 +1048,142 @@ impl std::io::Write for DaemonWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_relaunch_command, should_synthesize_agent_relaunch};
+    use super::{
+        build_agent_relaunch_command, classify_attach_rpc_failure,
+        classify_client_acquisition_failure, classify_list_rpc_failure,
+        classify_spawn_rpc_failure, list_daemon_session_map, should_synthesize_agent_relaunch,
+        DaemonHydrationFailure,
+    };
+    use crate::pty_daemon::protocol::{ClientRequest, Frame, ServerResponse};
+    use crate::pty_daemon::{DaemonSessionInfo, PtyDaemonClient, PtyDaemonError};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn only_confirmed_spawn_rejections_allow_local_fallback() {
+        let rejected = classify_spawn_rpc_failure(PtyDaemonError::Daemon(
+            "spawn: executable not found".into(),
+        ));
+        assert!(rejected.allows_local_fallback());
+        assert!(matches!(
+            rejected,
+            DaemonHydrationFailure::SafeToFallback(_)
+        ));
+
+        let timed_out = classify_spawn_rpc_failure(PtyDaemonError::Timeout);
+        assert!(!timed_out.allows_local_fallback());
+        assert!(matches!(
+            timed_out,
+            DaemonHydrationFailure::Ambiguous(_)
+        ));
+
+        let daemon_session_exists = classify_spawn_rpc_failure(PtyDaemonError::Daemon(
+            "session shell-1 already exists in daemon".into(),
+        ));
+        assert!(!daemon_session_exists.allows_local_fallback());
+    }
+
+    #[test]
+    fn attach_failure_never_allows_a_replacement_shell() {
+        let failed =
+            classify_attach_rpc_failure(PtyDaemonError::Daemon("attach rejected".into()));
+        assert!(!failed.allows_local_fallback());
+        assert!(matches!(
+            failed,
+            DaemonHydrationFailure::Ambiguous(_)
+        ));
+    }
+
+    #[test]
+    fn list_failures_never_allow_local_fallback() {
+        // List runs on a connection that already succeeded, so a daemon
+        // process exists. A List timeout against a stalled-but-alive daemon
+        // proves nothing about session non-existence; spawning local
+        // replacements would duplicate live shells and orphan their agents.
+        for error in [
+            PtyDaemonError::Timeout,
+            PtyDaemonError::Closed,
+            PtyDaemonError::Daemon("daemon busy".into()),
+            PtyDaemonError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let classified = classify_list_rpc_failure(error);
+            assert!(
+                !classified.allows_local_fallback(),
+                "List errors must stay retry-only: {classified}"
+            );
+            assert!(matches!(classified, DaemonHydrationFailure::Ambiguous(_)));
+        }
+    }
+
+    #[test]
+    fn client_acquisition_refusals_allow_fallback_but_timeouts_do_not() {
+        // Nothing listening (cold start with the daemon absent/disabled,
+        // circuit breaker open, spawn failure) must keep falling back so the
+        // user still gets a working terminal.
+        let refused = classify_client_acquisition_failure(PtyDaemonError::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        ));
+        assert!(refused.allows_local_fallback());
+        let circuit_open = classify_client_acquisition_failure(PtyDaemonError::Daemon(
+            "circuit breaker open: too many recent failures".into(),
+        ));
+        assert!(circuit_open.allows_local_fallback());
+
+        // A timeout or accept-then-EOF means something answered the dial —
+        // possibly a stalled daemon that still owns live shells.
+        let timed_out = classify_client_acquisition_failure(PtyDaemonError::Timeout);
+        assert!(!timed_out.allows_local_fallback());
+        let eof = classify_client_acquisition_failure(PtyDaemonError::Closed);
+        assert!(!eof.allows_local_fallback());
+    }
+
+    #[tokio::test]
+    async fn eight_pane_hydration_inventory_uses_exactly_one_list_rpc() {
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let client = PtyDaemonClient::from_test_stream(client_stream, Duration::from_secs(1));
+        let (server_read, mut server_write) = server_stream.into_split();
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: ClientRequest = serde_json::from_str(line.trim()).unwrap();
+            let ClientRequest::List { request_id } = request else {
+                panic!("workspace inventory must start with List")
+            };
+            let sessions = (0..8)
+                .map(|index| DaemonSessionInfo {
+                    session_id: format!("session-{index}"),
+                    workspace_id: "workspace".into(),
+                    pid: 1000 + index,
+                    argv: vec!["bash".into()],
+                    cwd: "/workspace".into(),
+                    rows: 24,
+                    cols: 80,
+                    created_at: 0,
+                })
+                .collect();
+            let mut response = serde_json::to_vec(&Frame::Response(ServerResponse::Listed {
+                request_id,
+                sessions,
+            }))
+            .unwrap();
+            response.push(b'\n');
+            server_write.write_all(&response).await.unwrap();
+            server_write.flush().await.unwrap();
+
+            line.clear();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line))
+                    .await
+                    .is_err(),
+                "hydration inventory must not issue a second List"
+            );
+        });
+
+        let inventory = list_daemon_session_map(&client).await.unwrap();
+        assert_eq!(inventory.len(), 8);
+        server.await.unwrap();
+    }
 
     // ── build_agent_relaunch_command: per-agent resume synthesis ──
 
@@ -909,8 +1212,7 @@ mod tests {
     fn relaunch_opencode_with_session_id_uses_session_flag() {
         // The headline issue #16 case: a pushed/pulled opencode pane resumes
         // the exact synced session by id.
-        let cmd =
-            build_agent_relaunch_command(Some("opencode"), None, Some("ses_abc123"));
+        let cmd = build_agent_relaunch_command(Some("opencode"), None, Some("ses_abc123"));
         assert_eq!(cmd.as_deref(), Some("opencode --session ses_abc123"));
     }
 
@@ -938,8 +1240,7 @@ mod tests {
     fn relaunch_claude_does_not_leak_opencode_session_id() {
         // A stray opencode capture on a claude pane must not produce
         // `--session` (wrong flag for claude).
-        let cmd =
-            build_agent_relaunch_command(Some("claude"), None, Some("ses_should_ignore"));
+        let cmd = build_agent_relaunch_command(Some("claude"), None, Some("ses_should_ignore"));
         assert_eq!(cmd.as_deref(), Some("claude"));
     }
 

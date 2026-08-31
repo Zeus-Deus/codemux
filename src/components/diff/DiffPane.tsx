@@ -9,6 +9,7 @@ import { DiffUnifiedView, type DiffViewHandle } from "./DiffUnifiedView";
 import { DiffSplitView } from "./DiffSplitView";
 import type { DiffLine } from "@/lib/diff-parser";
 import type { WorkspaceSnapshot, GitFileStatus } from "@/tauri/types";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 
 interface Props {
   tabId: string;
@@ -84,6 +85,7 @@ export function DiffPane({ tabId, workspace, embedded = false }: Props) {
   useEffect(() => {
     if (!tab?.filePath) {
       setLines([]);
+      if (tab) markPaneReady("diff", { target: workspace.workspace_id });
       return;
     }
     setLoading(true);
@@ -94,8 +96,11 @@ export function DiffPane({ tabId, workspace, embedded = false }: Props) {
     fetchDiff
       .then((raw) => setLines(parseDiff(raw)))
       .catch(() => setLines([]))
-      .finally(() => setLoading(false));
-  }, [cwd, tab?.filePath, tab?.staged, tab?.section, tab?.baseBranch]);
+      .finally(() => {
+        setLoading(false);
+        markPaneReady("diff", { target: workspace.workspace_id });
+      });
+  }, [cwd, tab?.filePath, tab?.staged, tab?.section, tab?.baseBranch, workspace.workspace_id]);
 
   // Sync fileIndex when filePath changes
   useEffect(() => {

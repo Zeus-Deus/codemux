@@ -61,6 +61,12 @@ describe("ProviderStatusNotice", () => {
   beforeEach(resetStore);
   afterEach(cleanup);
 
+  it("does not probe provider health merely because a surface mounted", () => {
+    render(<ProviderStatusNotice provider="claude" />);
+
+    expect(mockProbe).not.toHaveBeenCalled();
+  });
+
   it("renders nothing while the provider is healthy or unprobed", () => {
     render(<ProviderStatusNotice provider="claude" />);
     expect(
@@ -155,6 +161,7 @@ describe("ProviderStatusNotice", () => {
     try {
       render(<ProviderStatusNotice provider="claude" />);
       const afterMount = mockProbe.mock.calls.length;
+      expect(afterMount).toBe(0);
 
       // Healthy/unprobed: nothing to recover from, so the poll must not
       // spawn a CLI check every few minutes for every mounted pane.

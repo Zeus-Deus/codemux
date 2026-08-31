@@ -17,19 +17,34 @@ import type { AuthStatePayload, UserSettings } from "@/tauri/types";
  */
 export function useAuthEvents() {
   const setUser = useAuthStore((s) => s.setUser);
-  const checkAuth = useAuthStore((s) => s.checkAuth);
+  const refreshSession = useAuthStore((s) => s.refreshSession);
   const applySettings = useSyncedSettingsStore((s) => s.applySettingsFromEvent);
   const lastCheckRef = useRef(0);
 
   // Handle auth-state-changed events from the Rust backend
   const handleAuthEvent = useCallback(
     (payload: AuthStatePayload) => {
+      const oauthWasPending = useAuthStore.getState().isSigningIn;
       if (payload.authenticated && payload.user) {
+        if (useAuthStore.getState().user?.id !== payload.user.id) {
+          useSyncedSettingsStore
+            .getState()
+            .replaceSessionSettings(DEFAULT_SETTINGS);
+        }
         setUser(payload.user);
-        useSyncedSettingsStore.getState().loadSettings();
+        void useAuthStore.getState().refreshSession();
       } else {
         setUser(null);
-        useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS, isLoading: true });
+        useSyncedSettingsStore
+          .getState()
+          .replaceSessionSettings(DEFAULT_SETTINGS);
+        // A callback can persist a valid OAuth token while its immediate user
+        // lookup times out. Re-read local state so it becomes
+        // `pending-verification`; App will retry verification only after the
+        // login frame has painted. Definitive sign-out events skip this path.
+        if (oauthWasPending) {
+          void useAuthStore.getState().bootstrapSession();
+        }
       }
       // Also clear the signing-in state since the flow completed
       useAuthStore.setState({ isSigningIn: false });
@@ -68,11 +83,11 @@ export function useAuthEvents() {
       if (now - lastCheckRef.current < RECHECK_INTERVAL) return;
       lastCheckRef.current = now;
 
-      checkAuth();
+      void refreshSession();
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
     return () =>
       document.removeEventListener("visibilitychange", handleVisibility);
-  }, [checkAuth]);
+  }, [refreshSession]);
 }

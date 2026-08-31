@@ -29,6 +29,23 @@ export const onAppStateDelta = (cb: EventCallback<RevisionedDelta>): Promise<Unl
 export const onAppStateRevision = (cb: EventCallback<RevisionHeartbeat>): Promise<UnlistenFn> =>
   listen<RevisionHeartbeat>("app-state-revision", (e) => cb(e.payload));
 
+export interface ActiveWorkspacePersistFailure {
+  generation: number;
+  error: string;
+}
+
+/** The selection changed in memory but its ordered SQLite commit failed.
+ *  This is intentionally a separate signal from app state: retry remains
+ *  automatic on a later emit, while the current renderer can make the loss
+ *  of restart durability visible instead of silently discarding it. */
+export const onActiveWorkspacePersistFailed = (
+  cb: EventCallback<ActiveWorkspacePersistFailure>,
+): Promise<UnlistenFn> =>
+  listen<ActiveWorkspacePersistFailure>(
+    "active-workspace-persist-failed",
+    (e) => cb(e.payload),
+  );
+
 export const onPresetsChanged = (cb: EventCallback<PresetStoreSnapshot>): Promise<UnlistenFn> =>
   listen<PresetStoreSnapshot>("presets-changed", (e) => cb(e.payload));
 

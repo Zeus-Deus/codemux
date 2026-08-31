@@ -225,6 +225,8 @@ vi.mock("./Composer", () => ({
     focusOnMount,
     configurationReady,
     sessionReady,
+    draft,
+    onDraftChange,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -248,6 +250,8 @@ vi.mock("./Composer", () => ({
     focusOnMount?: boolean;
     configurationReady?: boolean;
     sessionReady?: boolean;
+    draft: string;
+    onDraftChange: (draft: string) => void;
   }) => (
     <div
       data-testid="composer"
@@ -258,6 +262,11 @@ vi.mock("./Composer", () => ({
       data-configuration-ready={configurationReady ? "true" : "false"}
       data-session-ready={sessionReady ? "true" : "false"}
     >
+      <input
+        data-testid="composer-draft"
+        value={draft}
+        onChange={(event) => onDraftChange(event.currentTarget.value)}
+      />
       {/* The running-subagents strip is welded inside the real composer's
           top edge, so the mock has to render the slot for the pane's
           drill-in visibility rule to be observable. */}
@@ -409,9 +418,9 @@ vi.mock("@/tauri/events", () => ({
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
-  // Provider-health probe (ProviderStatusNotice mount). Never resolves
-  // so no banner state churns mid-test; banner tests drive the store
-  // directly (see ProviderStatusNotice.test.tsx).
+  // Provider health is probed only on picker intent or start/send failure.
+  // Keep any explicit failure-path probe pending so no banner state churns
+  // mid-test; banner tests drive the store directly.
   agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
   // The pane's mount-seed effect (design F) fetches the persisted
   // session row to restore picker config + resume cursor. Default to
@@ -690,6 +699,7 @@ import {
 } from "@/tauri/commands";
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import type { ChatModelInfo } from "@/tauri/types";
 
 const pane = {
@@ -700,6 +710,64 @@ const pane = {
   provider: "claude" as const,
   cwd: "/home/user",
 };
+
+// Most component tests exercise behavior after a chat pane has been chosen.
+// Keep that explicit while individual startup tests can reset the gate.
+beforeEach(() => {
+  useProviderRuntimeIntent.getState().reset();
+  useProviderRuntimeIntent.getState().observe("claude");
+});
+
+afterEach(() => {
+  useProviderRuntimeIntent.getState().reset();
+});
+
+describe("AgentChatPane provider runtime intent", () => {
+  const paneWithoutThread = { ...pane, thread_id: null };
+
+  it("does not launch a provider until its restored pane is interacted with", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStartSession).mockResolvedValue("thread-started");
+
+    const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => Promise.resolve());
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(container.firstElementChild!);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
+  });
+
+  it("preserves text typed while the intent-started session is resolving", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    setInputDraftMock.mockClear();
+    let resolveStart!: (threadId: string) => void;
+    vi.mocked(agentChatStartSession).mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+
+    const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    fireEvent.pointerDown(container.firstElementChild!);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
+
+    const draft = container.querySelector('[data-testid="composer-draft"]')!;
+    fireEvent.change(draft, { target: { value: "keep my first keystrokes" } });
+    expect(draft).toHaveValue("keep my first keystrokes");
+    expect(setInputDraftMock).not.toHaveBeenCalled();
+
+    await act(async () => resolveStart("thread-started"));
+    await waitFor(() =>
+      expect(setInputDraftMock).toHaveBeenCalledWith(
+        "thread-started",
+        "keep my first keystrokes",
+      ),
+    );
+  });
+});
 
 describe("AgentChatPane empty-state branch", () => {
   beforeEach(() => {

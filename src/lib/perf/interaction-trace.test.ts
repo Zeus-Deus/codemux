@@ -65,6 +65,8 @@ function runSwitch(target: string, timings: SwitchTimings = {}): void {
   markOpenInteraction("state-committed", { target });
   vi.advanceTimersByTime(mount);
   markOpenInteraction("pane-mounted", { target });
+  markOpenInteraction("pane-content-ready", { target, meta: { paneKind: 1 } });
+  markOpenInteraction("pane-interactive", { target, meta: { paneKind: 1 } });
   vi.advanceTimersByTime(TWO_FRAMES_MS);
 }
 
@@ -89,11 +91,12 @@ describe("interaction trace — lifecycle", () => {
     const trace = traces[0];
     expect(trace.kind).toBe("workspace-switch");
     expect(trace.abandoned).toBe(false);
+    expect(trace.complete).toBe(true);
     expect(trace.spans).toMatchObject({
       invoke: 3,
-      delivery: 20,
+      "state-event": 23,
       commit: 9,
-      mount: 50,
+      mount: 82,
     });
     // Paint lands on the second rAF, i.e. two 16 ms frames after the mount.
     expect(trace.spans.paint).toBeGreaterThan(0);
@@ -114,6 +117,8 @@ describe("interaction trace — lifecycle", () => {
     markOpenInteraction("snapshot-received", { target: "ws-1" });
     markOpenInteraction("state-committed", { target: "ws-1" });
     markOpenInteraction("pane-mounted", { target: "ws-1" });
+    markOpenInteraction("pane-content-ready", { target: "ws-1" });
+    markOpenInteraction("pane-interactive", { target: "ws-1" });
     vi.advanceTimersByTime(TWO_FRAMES_MS);
 
     const trace = getTraces()[0];
@@ -124,6 +129,8 @@ describe("interaction trace — lifecycle", () => {
       "snapshot-received",
       "state-committed",
       "pane-mounted",
+      "pane-content-ready",
+      "pane-interactive",
       "painted",
     ]);
     expect(trace.marks[0].atMs).toBe(0);
@@ -137,6 +144,8 @@ describe("interaction trace — lifecycle", () => {
     markOpenInteraction("snapshot-received", { target: "ws-1" });
     markOpenInteraction("state-committed", { target: "ws-1" });
     markOpenInteraction("pane-mounted", { target: "ws-1" });
+    markOpenInteraction("pane-content-ready", { target: "ws-1" });
+    markOpenInteraction("pane-interactive", { target: "ws-1" });
     vi.advanceTimersByTime(TWO_FRAMES_MS);
 
     const trace = getTraces()[0];
@@ -185,6 +194,8 @@ describe("interaction trace — lifecycle", () => {
     mark(id, "click");
     mark(id, "invoke-start");
     markOpenInteraction("pane-mounted", { target: "ws-2" });
+    markOpenInteraction("pane-content-ready", { target: "ws-2" });
+    markOpenInteraction("pane-interactive", { target: "ws-2" });
     vi.advanceTimersByTime(TWO_FRAMES_MS);
 
     // Painted, but the round-trip is still out — nothing may be closed yet.
@@ -205,14 +216,17 @@ describe("interaction trace — lifecycle", () => {
       "click",
       "invoke-start",
       "pane-mounted",
+      "pane-content-ready",
+      "pane-interactive",
       "painted",
       "invoke-returned",
       "snapshot-received",
       "state-committed",
     ]);
     expect(traces[0].spans.invoke).toBe(70);
-    expect(traces[0].spans.delivery).toBe(20);
+    expect(traces[0].spans["state-event"]).toBe(90);
     expect(traces[0].spans.commit).toBe(9);
+    expect(Object.values(traces[0].spans).every((duration) => duration >= 0)).toBe(true);
   });
 
   it("closes a painted trace on the grace when the commit never arrives", () => {
@@ -227,6 +241,7 @@ describe("interaction trace — lifecycle", () => {
     expect(traces).toHaveLength(1);
     // It painted, so it is a real measurement — not an abandoned one.
     expect(traces[0].abandoned).toBe(false);
+    expect(traces[0].complete).toBe(false);
     expect(traces[0].marks.map((m) => m.phase)).toContain("painted");
 
     // The grace must not leave the 10 s abandon timeout behind it.
@@ -246,7 +261,10 @@ describe("interaction trace — open-trace targeting", () => {
     vi.advanceTimersByTime(30);
     markOpenInteraction("snapshot-received", { target: "ws-target" });
     markOpenInteraction("state-committed", { target: "ws-target" });
+    mark(id, "invoke-returned");
     markOpenInteraction("pane-mounted", { target: "ws-target" });
+    markOpenInteraction("pane-content-ready", { target: "ws-target" });
+    markOpenInteraction("pane-interactive", { target: "ws-target" });
     vi.advanceTimersByTime(TWO_FRAMES_MS);
 
     const trace = getTraces()[0];
@@ -355,7 +373,7 @@ describe("interaction trace — aggregation", () => {
     expect(nearestRankPercentile([], 95)).toBe(0);
   });
 
-  it("summarizes p50/p95/max per interaction kind", () => {
+  it("summarizes p50/p95/p99/max and failure rate per interaction kind", () => {
     for (const mount of [10, 20, 30, 40, 200]) {
       runSwitch("ws-1", { invoke: 1, delivery: 1, commit: 1, mount });
     }
@@ -363,7 +381,14 @@ describe("interaction trace — aggregation", () => {
     expect(summary.kind).toBe("workspace-switch");
     expect(summary.count).toBe(5);
     expect(summary.abandoned).toBe(0);
-    expect(summary.spans.mount).toMatchObject({ count: 5, p50: 30, p95: 200, max: 200 });
+    expect(summary.spans.mount).toMatchObject({
+      count: 5,
+      p50: 33,
+      p95: 203,
+      p99: 203,
+      max: 203,
+    });
+    expect(summary.failureRate).toBe(0);
     expect(summary.total.max).toBeGreaterThanOrEqual(200);
   });
 
@@ -376,6 +401,68 @@ describe("interaction trace — aggregation", () => {
     const [summary] = summarizeTraces();
     expect(summary.count).toBe(2);
     expect(summary.abandoned).toBe(1);
+    expect(summary.incomplete).toBe(1);
+    expect(summary.failureRate).toBe(0.5);
+    // Incomplete/abandoned samples are visible as counts but cannot skew the
+    // release-gate percentiles.
+    expect(summary.total.count).toBe(1);
+  });
+
+  it("never exports a negative span when snapshot and optimistic paint beat invoke return", () => {
+    const id = beginInteraction("workspace-switch", { target: "ws-race" });
+    mark(id, "click");
+    mark(id, "invoke-start");
+    markOpenInteraction("pane-mounted", { target: "ws-race" });
+    markOpenInteraction("pane-content-ready", { target: "ws-race" });
+    markOpenInteraction("pane-interactive", { target: "ws-race" });
+    vi.advanceTimersByTime(TWO_FRAMES_MS);
+    markOpenInteraction("snapshot-received", { target: "ws-race" });
+    vi.advanceTimersByTime(2);
+    markOpenInteraction("state-committed", { target: "ws-race" });
+    vi.advanceTimersByTime(20);
+    mark(id, "invoke-returned");
+
+    const trace = getTraces()[0];
+    expect(trace.complete).toBe(true);
+    expect(trace.spans.delivery).toBeUndefined();
+    expect(trace.spans["state-event"]).toBeGreaterThanOrEqual(0);
+    expect(Object.values(trace.spans).every((duration) => duration >= 0)).toBe(true);
+  });
+
+  it("excludes a trace with a reversed causal pair from release percentiles", () => {
+    const id = beginInteraction("workspace-switch", { target: "ws-reversed" });
+    mark(id, "click");
+    mark(id, "invoke-start");
+    mark(id, "invoke-returned");
+    // Deliberately impossible causal ordering: committing before receipt must
+    // make the evidence incomplete even though every named phase arrives.
+    markOpenInteraction("state-committed", { target: "ws-reversed" });
+    vi.advanceTimersByTime(5);
+    markOpenInteraction("snapshot-received", { target: "ws-reversed" });
+    markOpenInteraction("pane-mounted", { target: "ws-reversed" });
+    markOpenInteraction("pane-content-ready", { target: "ws-reversed" });
+    markOpenInteraction("pane-interactive", { target: "ws-reversed" });
+    vi.advanceTimersByTime(TWO_FRAMES_MS);
+
+    const trace = getTraces()[0];
+    expect(trace.marks).toHaveLength(9);
+    expect(trace.spans.commit).toBeUndefined();
+    expect(trace.complete).toBe(false);
+    expect(summarizeTraces()[0]).toMatchObject({
+      count: 1,
+      incomplete: 1,
+      total: { count: 0 },
+    });
+  });
+
+  it("retains summary evidence for a full 500-switch sweep", () => {
+    for (let index = 0; index < 500; index += 1) {
+      runSwitch(`ws-${index}`, { mount: index % 7 });
+    }
+
+    expect(getTraces()).toHaveLength(100);
+    expect(summarizeTraces()[0]).toMatchObject({ count: 500, incomplete: 0 });
+    expect(exportDiagnostics().traceCount).toBe(500);
   });
 });
 
@@ -440,10 +527,10 @@ describe("interaction trace — diagnostics export", () => {
     const diagnostics = exportDiagnostics();
     const serialized = JSON.stringify(diagnostics);
 
-    expect(diagnostics.version).toBe(2);
+    expect(diagnostics.version).toBe(3);
     expect(diagnostics.traceCount).toBe(1);
     expect(diagnostics.summaries).toHaveLength(1);
-    expect(diagnostics.traces[0].spans.mount).toBe(50);
+    expect(diagnostics.traces[0].spans.mount).toBe(82);
     expect(serialized).not.toContain("ws-super-secret-client-name");
     expect(serialized).not.toContain("secret");
   });

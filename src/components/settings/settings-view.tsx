@@ -82,7 +82,6 @@ import { CommandPalette } from "@/components/overlays/command-palette";
 import { AgentOrb } from "@/components/ui/agent-orb";
 import type { OrbActivity } from "@/lib/orb-state";
 import {
-  detectEditors,
   setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
   setAiCommitMessageCli,
@@ -98,7 +97,8 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, ModelSelection } from "@/tauri/types";
+import type { PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, ModelSelection } from "@/tauri/types";
+import { useDetectedEditors } from "@/stores/editor-discovery-store";
 import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -121,7 +121,11 @@ import {
 } from "@/lib/launch-models";
 import { LaunchModelPicker } from "@/components/overlays/launch-model-picker";
 import { LaunchReasoningPicker } from "@/components/overlays/launch-reasoning-picker";
-import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  refreshProviderCapabilitiesForIntent,
+  selectProviderCapabilitiesLoaded,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import {
   useLaunchGeminiModels,
   useLaunchGeminiModelsInit,
@@ -613,8 +617,6 @@ function PresetEditorSheet({
   const claudeCaps = useProviderCapabilities((s) => s.claude);
   const codexCaps = useProviderCapabilities((s) => s.codex);
   const opencodeCaps = useProviderCapabilities((s) => s.opencode);
-  const capsLoaded = useProviderCapabilities((s) => s.loaded);
-  const refreshCaps = useProviderCapabilities((s) => s.refresh);
   const geminiModels = useLaunchGeminiModels((s) => s.models);
   useLaunchGeminiModelsInit();
 
@@ -659,6 +661,11 @@ function PresetEditorSheet({
   // ── Launch model/reasoning sourcing (mirrors new-workspace-dialog) ──
   const launchFamily = detectLaunchFamily(agentCommand);
   const launchProviderKind = launchFamily ? familyToProviderKind(launchFamily) : null;
+  const launchCapabilitiesLoaded = useProviderCapabilities((state) =>
+    launchProviderKind
+      ? selectProviderCapabilitiesLoaded(state, launchProviderKind)
+      : true,
+  );
   const launchCaps =
     launchFamily === "claude"
       ? claudeCaps
@@ -680,7 +687,8 @@ function PresetEditorSheet({
   const launchModelsLoading =
     launchFamily !== null &&
     launchFamily !== "gemini" &&
-    !capsLoaded &&
+    launchProviderKind !== null &&
+    !launchCapabilitiesLoaded &&
     launchModels.length === 0;
   const launchCapsModel = useMemo(
     () => launchCaps?.models.find((m) => m.id === modelSelection.model) ?? null,
@@ -713,17 +721,13 @@ function PresetEditorSheet({
       ? modelSelection.context
       : null;
 
-  // Backstop the app-level capability harvest if a slot hasn't hydrated.
+  // Preset editing is explicit provider intent. Keep a persisted catalog on
+  // screen while its first live refresh for this renderer runs in the
+  // background, including when the cached slot is already non-null.
   useEffect(() => {
     if (!open || !launchProviderKind) return;
-    const caps =
-      launchProviderKind === "claude"
-        ? claudeCaps
-        : launchProviderKind === "codex"
-          ? codexCaps
-          : opencodeCaps;
-    if (caps === null) void refreshCaps(launchProviderKind);
-  }, [open, launchProviderKind, claudeCaps, codexCaps, opencodeCaps, refreshCaps]);
+    void refreshProviderCapabilitiesForIntent(launchProviderKind);
+  }, [open, launchProviderKind]);
 
   if (!preset) return null;
 
@@ -1366,7 +1370,7 @@ export function SettingsView() {
       ? (settingsSection as Section)
       : "account";
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
-  const [editors, setEditors] = useState<EditorInfo[]>([]);
+  const editors = useDetectedEditors();
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
   // An unsaved new preset being edited; persisted only on "Create preset".
@@ -1540,15 +1544,16 @@ export function SettingsView() {
   }, [pendingPresetCreate, handleNewPreset]);
 
   useEffect(() => {
-    detectEditors()
-      .then((eds) => {
-        setEditors(eds);
-        if (eds.length > 0 && !defaultEditor && !useSyncedSettingsStore.getState().isLoading) {
-          updateSyncedSetting("editor", "default_ide", eds[0].id).catch(console.error);
-        }
-      })
-      .catch(() => {});
-  }, [defaultEditor, updateSyncedSetting]);
+    if (
+      editors.length > 0 &&
+      !defaultEditor &&
+      !useSyncedSettingsStore.getState().isLoading
+    ) {
+      updateSyncedSetting("editor", "default_ide", editors[0].id).catch(
+        console.error,
+      );
+    }
+  }, [defaultEditor, editors, updateSyncedSetting]);
 
   const renderSection = () => {
     switch (activeSection) {

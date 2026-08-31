@@ -74,7 +74,6 @@ import {
   unarchiveWorkspace,
   setWorkspaceMuted,
   setWorkspacePinned,
-  detectEditors,
   openInEditor,
   runWorkspaceSetup,
   workspacePullBack,
@@ -87,7 +86,7 @@ import {
   ConfirmPushDialog,
   shouldSkipPushConfirm,
 } from "@/components/overlays/confirm-push-dialog";
-import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
+import type { WorkspaceSnapshot, ActivePaneStatus } from "@/tauri/types";
 import {
   providerForWorkspace,
   providerRef,
@@ -121,6 +120,7 @@ import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
 import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
+import { useDetectedEditors } from "@/stores/editor-discovery-store";
 import { computeSnoozePresets } from "./sidebar-snooze";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -520,7 +520,7 @@ export function WorkspaceContextMenuItems({
   const isActiveWorkspace = useAppStore(
     (s) => s.appState?.active_workspace_id === workspace.workspace_id,
   );
-  const [editors, setEditors] = useState<EditorInfo[]>([]);
+  const editors = useDetectedEditors();
   // Const alias so the discriminant narrowing survives into the preset map's
   // callbacks — TypeScript drops narrowing on a (mutable) parameter binding
   // the moment it is read inside a closure.
@@ -538,10 +538,6 @@ export function WorkspaceContextMenuItems({
   );
 
   const hosts = useHosts();
-
-  useEffect(() => {
-    detectEditors().then(setEditors).catch(console.error);
-  }, []);
 
   const isRemote =
     workspace.host_id !== null && workspace.host_id !== undefined;
@@ -947,6 +943,7 @@ export function WorkspaceContextMenuItems({
 }
 
 export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props) {
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   // Phase-4 push confirmation: holds the host the user just picked
   // from the "Move to host…" submenu, so the dialog can render its
@@ -1276,7 +1273,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
 
   return (
     <>
-      <ContextMenu>
+      <ContextMenu onOpenChange={setContextMenuOpen}>
         <ContextMenuTrigger asChild>
           <div
             role="button"
@@ -1681,31 +1678,33 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
             </Button>
           </div>
         </ContextMenuTrigger>
-        <WorkspaceContextMenuItems
-          workspace={workspace}
-          onArchiveRequest={() => void handleArchiveOrClose()}
-          onDeleteRequest={() => setShowDeleteDialog(true)}
-          onRequestPushConfirm={(host) => setPendingPushHost(host)}
-        />
+        {contextMenuOpen && (
+          <WorkspaceContextMenuItems
+            workspace={workspace}
+            onArchiveRequest={() => void handleArchiveOrClose()}
+            onDeleteRequest={() => setShowDeleteDialog(true)}
+            onRequestPushConfirm={(host) => setPendingPushHost(host)}
+          />
+        )}
       </ContextMenu>
-      <DeleteWorktreeDialog
-        workspace={workspace}
-        open={showDeleteDialog}
-        onOpenChange={setShowDeleteDialog}
-      />
-      <ConfirmPushDialog
-        open={pendingPushHost !== null}
-        workspaceTitle={workspace.title}
-        host={pendingPushHost}
-        onConfirm={() => {
-          if (pendingPushHost) {
-            void performPushToHost(pendingPushHost);
-          }
-        }}
-        onOpenChange={(open) => {
-          if (!open) setPendingPushHost(null);
-        }}
-      />
+      {showDeleteDialog && (
+        <DeleteWorktreeDialog
+          workspace={workspace}
+          open
+          onOpenChange={setShowDeleteDialog}
+        />
+      )}
+      {pendingPushHost && (
+        <ConfirmPushDialog
+          open
+          workspaceTitle={workspace.title}
+          host={pendingPushHost}
+          onConfirm={() => void performPushToHost(pendingPushHost)}
+          onOpenChange={(open) => {
+            if (!open) setPendingPushHost(null);
+          }}
+        />
+      )}
     </>
   );
 }

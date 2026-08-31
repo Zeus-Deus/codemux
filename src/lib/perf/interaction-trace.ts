@@ -28,7 +28,23 @@ export type InteractionPhase =
   | "snapshot-received"
   | "state-committed"
   | "pane-mounted"
+  | "pane-content-ready"
+  | "pane-interactive"
   | "painted";
+
+export type StartupPhase =
+  | "module-loaded"
+  | "runtime-shim-ready"
+  | "react-mounted"
+  | "local-session-start"
+  | "local-session-ready"
+  | "initial-snapshot-ready"
+  | "shell-ready"
+  | "shell-first-paint"
+  | "active-pane-ready"
+  | "remote-session-start"
+  | "remote-session-ready"
+  | "first-paint";
 
 /** Mark metadata is numeric/boolean only so nothing identifying can reach the
  *  diagnostics export by accident. */
@@ -61,6 +77,8 @@ export interface CompletedTrace {
   /** True when the trace hit the abandon timeout without reaching its final
    *  phase (e.g. the target pane never mounted). */
   abandoned: boolean;
+  /** Whether every phase required for the release-gate measurement arrived. */
+  complete: boolean;
   marks: TraceMark[];
   /** Consecutive phase deltas, keyed by span label. Missing phases drop the
    *  span rather than reporting a bogus zero. */
@@ -73,6 +91,7 @@ export interface PhaseStats {
   count: number;
   p50: number;
   p95: number;
+  p99: number;
   max: number;
 }
 
@@ -80,6 +99,9 @@ export interface KindSummary {
   kind: InteractionKind;
   count: number;
   abandoned: number;
+  incomplete: number;
+  /** Fraction of traces excluded from release-gate timing statistics. */
+  failureRate: number;
   total: PhaseStats;
   spans: Record<string, PhaseStats>;
   longTasksPerTrace: PhaseStats;
@@ -91,15 +113,38 @@ interface SpanDef {
   to: InteractionPhase;
 }
 
-/** Non-overlapping decomposition: the spans sum to `total` minus the
- *  click→invoke-start gap, so one slow number always names one owner. */
+/**
+ * The invoke and state-event paths are parallel arms from the same origin.
+ * Tauri can emit the confirming snapshot before the invoke promise resolves,
+ * so subtracting invoke-returned from snapshot-received creates a fictitious
+ * negative "delivery" duration. Likewise, optimistic React mounting can
+ * precede the backend commit. Every span below therefore uses a causal origin
+ * that is guaranteed to precede its destination; the arms deliberately do not
+ * add up to total interaction time.
+ */
 const SPAN_DEFS: Record<InteractionKind, SpanDef[]> = {
   "workspace-switch": [
     { label: "invoke", from: "invoke-start", to: "invoke-returned" },
-    { label: "delivery", from: "invoke-returned", to: "snapshot-received" },
+    { label: "state-event", from: "invoke-start", to: "snapshot-received" },
     { label: "commit", from: "snapshot-received", to: "state-committed" },
-    { label: "mount", from: "state-committed", to: "pane-mounted" },
-    { label: "paint", from: "pane-mounted", to: "painted" },
+    { label: "mount", from: "click", to: "pane-mounted" },
+    { label: "paint", from: "click", to: "painted" },
+    { label: "content-ready", from: "click", to: "pane-content-ready" },
+    { label: "interactive", from: "click", to: "pane-interactive" },
+  ],
+};
+
+const REQUIRED_PHASES: Record<InteractionKind, InteractionPhase[]> = {
+  "workspace-switch": [
+    "click",
+    "invoke-start",
+    "invoke-returned",
+    "snapshot-received",
+    "state-committed",
+    "pane-mounted",
+    "pane-content-ready",
+    "pane-interactive",
+    "painted",
   ],
 };
 
@@ -117,6 +162,9 @@ const CLOSING_PHASE: Record<InteractionKind, InteractionPhase> = {
 };
 
 const RING_CAPACITY = 100;
+/** Summary evidence covers the complete 500-switch release sweep while raw
+ * phase records stay deliberately smaller for diagnostics payload size. */
+const SUMMARY_RING_CAPACITY = 512;
 const ABANDON_TIMEOUT_MS = 10_000;
 /** How long a painted trace waits for its closing phase. Long enough for a slow
  *  backend round-trip to be attributed, short enough that the trace is not
@@ -126,6 +174,23 @@ const POST_PAINT_GRACE_MS = 3_000;
  *  completed trace. */
 const LONGTASK_LOOKBACK_MS = 1_000;
 const STORAGE_KEY = "codemux:perf-trace";
+
+export interface StartupMark {
+  phase: StartupPhase;
+  atMs: number;
+  meta?: TraceMeta;
+}
+
+// `performance.now()` is navigation-relative in the browser. Keeping that
+// origin (instead of subtracting an origin created after this module's static
+// import graph evaluated) includes download/parse/evaluation of eager chunks.
+const startupStartedAt =
+  typeof performance !== "undefined" && typeof performance.now === "function"
+    ? 0
+    : now();
+const startupMarks: StartupMark[] = [
+  { phase: "module-loaded", atMs: roundMs(now() - startupStartedAt) },
+];
 
 interface OpenTrace {
   id: number;
@@ -146,11 +211,13 @@ interface OpenTrace {
 
 const openTraces = new Map<number, OpenTrace>();
 const ring: CompletedTrace[] = [];
+const summaryRing: CompletedTrace[] = [];
 /** Parallel to `ring`: absolute end timestamps, kept out of the exported
  *  record because a wall-clock-ish origin is not needed downstream. */
 const ringEndedAt: number[] = [];
 const ringStartedAt: number[] = [];
 let nextId = 0;
+let completedTraceCount = 0;
 
 function now(): number {
   return typeof performance !== "undefined" && typeof performance.now === "function"
@@ -366,6 +433,49 @@ export function markOpenInteraction(
   recordMark(trace, phase, options.meta);
 }
 
+export type PaneTraceKind = "terminal" | "browser" | "agent-chat" | "editor" | "diff" | "empty";
+
+const PANE_KIND_CODE: Record<PaneTraceKind, number> = {
+  terminal: 1,
+  browser: 2,
+  "agent-chat": 3,
+  editor: 4,
+  diff: 5,
+  empty: 6,
+};
+
+/** Pane readiness helpers intentionally retain only a numeric kind code. */
+export function markPaneContentReady(
+  paneKind: PaneTraceKind,
+  options: { target?: string } = {},
+): void {
+  markOpenInteraction("pane-content-ready", {
+    target: options.target,
+    meta: { paneKind: PANE_KIND_CODE[paneKind] },
+  });
+}
+
+export function markPaneInteractive(
+  paneKind: PaneTraceKind,
+  options: { target?: string } = {},
+): void {
+  markOpenInteraction("pane-interactive", {
+    target: options.target,
+    meta: { paneKind: PANE_KIND_CODE[paneKind] },
+  });
+}
+
+export function markPaneReady(
+  paneKind: PaneTraceKind,
+  options: { target?: string } = {},
+): void {
+  markStartup("active-pane-ready", {
+    paneKind: PANE_KIND_CODE[paneKind],
+  });
+  markPaneContentReady(paneKind, options);
+  markPaneInteractive(paneKind, options);
+}
+
 function findOpenTrace(options: { kind?: InteractionKind; target?: string }): OpenTrace | null {
   let found: OpenTrace | null = null;
   // Map iteration is insertion-ordered; the last match is the newest trace.
@@ -403,7 +513,13 @@ function recordMark(trace: OpenTrace, phase: InteractionPhase, meta?: TraceMeta)
   // The trace closes on the later of "the user saw it" and "the backend
   // agreed" — in that order for a normal switch, but a slow round-trip
   // reverses them and both orders have to produce the same decomposition.
-  if (phase === "painted" || phase === CLOSING_PHASE[trace.kind]) {
+  if (
+    phase === "painted" ||
+    phase === "invoke-returned" ||
+    phase === "pane-content-ready" ||
+    phase === "pane-interactive" ||
+    phase === CLOSING_PHASE[trace.kind]
+  ) {
     settleTrace(trace);
   }
 }
@@ -413,7 +529,12 @@ function recordMark(trace: OpenTrace, phase: InteractionPhase, meta?: TraceMeta)
  *  other can still attach. */
 function settleTrace(trace: OpenTrace): void {
   if (!hasMark(trace, "painted")) return;
-  if (hasMark(trace, CLOSING_PHASE[trace.kind])) {
+  if (
+    hasMark(trace, CLOSING_PHASE[trace.kind]) &&
+    (!hasMark(trace, "invoke-start") || hasMark(trace, "invoke-returned")) &&
+    hasMark(trace, "pane-content-ready") &&
+    hasMark(trace, "pane-interactive")
+  ) {
     completeTrace(trace, false);
     return;
   }
@@ -445,6 +566,9 @@ function computeSpans(trace: OpenTrace): Record<string, number> {
     const from = at.get(def.from);
     const to = at.get(def.to);
     if (from === undefined || to === undefined) continue;
+    // A reordered or manually injected phase is incomplete evidence, not a
+    // negative duration. Omitting it keeps percentile math honest.
+    if (to < from) continue;
     spans[def.label] = roundMs(to - from);
   }
   return spans;
@@ -467,12 +591,18 @@ function completeTrace(trace: OpenTrace, abandoned: boolean): void {
     kind: trace.kind,
     totalMs: roundMs(endedAt - trace.startedAt),
     abandoned,
+    complete:
+      !abandoned &&
+      REQUIRED_PHASES[trace.kind].every((phase) => hasMark(trace, phase)) &&
+      SPAN_DEFS[trace.kind].every((definition) => spans[definition.label] !== undefined),
     marks: trace.marks,
     spans,
     subMeasures: trace.subMeasures,
     longTasks: trace.longTasks,
   };
   ring.push(completed);
+  summaryRing.push(completed);
+  completedTraceCount += 1;
   ringEndedAt.push(endedAt);
   ringStartedAt.push(trace.startedAt);
   while (ring.length > RING_CAPACITY) {
@@ -480,6 +610,7 @@ function completeTrace(trace: OpenTrace, abandoned: boolean): void {
     ringEndedAt.shift();
     ringStartedAt.shift();
   }
+  while (summaryRing.length > SUMMARY_RING_CAPACITY) summaryRing.shift();
   emitUserTimingMeasures(trace, spans);
   if (openTraces.size === 0) stopObservers();
   if (consoleEnabled) logSummary(completed);
@@ -531,8 +662,20 @@ export function getTraces(): CompletedTrace[] {
 
 export function clearTraces(): void {
   ring.length = 0;
+  summaryRing.length = 0;
+  completedTraceCount = 0;
   ringEndedAt.length = 0;
   ringStartedAt.length = 0;
+}
+
+/** Stamp a startup milestone once. Metadata is numeric/boolean only. */
+export function markStartup(phase: StartupPhase, meta?: TraceMeta): void {
+  if (!traceEnabled || startupMarks.some((mark) => mark.phase === phase)) return;
+  startupMarks.push({ phase, atMs: roundMs(now() - startupStartedAt), meta });
+}
+
+export function getStartupMarks(): StartupMark[] {
+  return startupMarks.map((mark) => ({ ...mark, meta: mark.meta ? { ...mark.meta } : undefined }));
 }
 
 /** Nearest-rank percentile over an unsorted sample. */
@@ -548,11 +691,12 @@ function statsOf(values: number[]): PhaseStats {
     count: values.length,
     p50: roundMs(nearestRankPercentile(values, 50)),
     p95: roundMs(nearestRankPercentile(values, 95)),
+    p99: roundMs(nearestRankPercentile(values, 99)),
     max: values.length === 0 ? 0 : roundMs(Math.max(...values)),
   };
 }
 
-export function summarizeTraces(traces: CompletedTrace[] = ring): KindSummary[] {
+export function summarizeTraces(traces: CompletedTrace[] = summaryRing): KindSummary[] {
   const byKind = new Map<InteractionKind, CompletedTrace[]>();
   for (const trace of traces) {
     const bucket = byKind.get(trace.kind);
@@ -561,9 +705,10 @@ export function summarizeTraces(traces: CompletedTrace[] = ring): KindSummary[] 
   }
   const summaries: KindSummary[] = [];
   for (const [kind, bucket] of byKind) {
+    const complete = bucket.filter((trace) => trace.complete);
     const spans: Record<string, PhaseStats> = {};
     for (const def of SPAN_DEFS[kind]) {
-      const values = bucket
+      const values = complete
         .map((t) => t.spans[def.label])
         .filter((v): v is number => v !== undefined);
       if (values.length > 0) spans[def.label] = statsOf(values);
@@ -572,9 +717,14 @@ export function summarizeTraces(traces: CompletedTrace[] = ring): KindSummary[] 
       kind,
       count: bucket.length,
       abandoned: bucket.filter((t) => t.abandoned).length,
-      total: statsOf(bucket.map((t) => t.totalMs)),
+      incomplete: bucket.filter((t) => !t.complete).length,
+      failureRate:
+        bucket.length === 0
+          ? 0
+          : roundMs(bucket.filter((t) => !t.complete).length / bucket.length),
+      total: statsOf(complete.map((t) => t.totalMs)),
       spans,
-      longTasksPerTrace: statsOf(bucket.map((t) => t.longTasks.length)),
+      longTasksPerTrace: statsOf(complete.map((t) => t.longTasks.length)),
     });
   }
   return summaries;
@@ -638,10 +788,11 @@ export function rendererDiagnostics(): RendererDiagnostics {
 }
 
 export interface PerfDiagnostics {
-  version: 2;
+  version: 3;
   enabled: boolean;
   observedEntryTypes: string[];
   renderer: RendererDiagnostics;
+  startup: StartupMark[];
   traceCount: number;
   summaries: KindSummary[];
   traces: CompletedTrace[];
@@ -654,11 +805,12 @@ export interface PerfDiagnostics {
  */
 export function exportDiagnostics(): PerfDiagnostics {
   return {
-    version: 2,
+    version: 3,
     enabled: traceEnabled,
     observedEntryTypes: observableEntryTypes(),
     renderer: rendererDiagnostics(),
-    traceCount: ring.length,
+    startup: getStartupMarks(),
+    traceCount: completedTraceCount,
     summaries: summarizeTraces(),
     traces: getTraces(),
   };

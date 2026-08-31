@@ -3,7 +3,11 @@ import { getAppState } from "@/tauri/commands";
 import { onAppStateChanged, onAppStateDelta, onAppStateRevision } from "@/tauri/events";
 import { useAppStore, DELTA_REORDER_WINDOW_MS } from "@/stores/app-store";
 import { useTauriEvent } from "./use-tauri-event";
-import { markOpenInteraction } from "@/lib/perf/interaction-trace";
+import {
+  isInteractionTraceEnabled,
+  markOpenInteraction,
+  markStartup,
+} from "@/lib/perf/interaction-trace";
 import type {
   AppStateSnapshot,
   RevisionedDelta,
@@ -22,6 +26,14 @@ export function confirmsPendingActivation(
     pendingActiveWorkspaceId !== null &&
     payload.active_workspace_id === pendingActiveWorkspaceId
   );
+}
+
+/** Cheap cardinality only. Full payload bytes are computed on demand by the
+ * copy-diagnostics report; serializing here would add a full-snapshot
+ * JSON.stringify to the exact state-event/commit hot path being measured. */
+function tracedPayloadMeta(payload: AppStateSnapshot): Record<string, number> | undefined {
+  if (!isInteractionTraceEnabled()) return undefined;
+  return { workspaceCount: payload.workspaces.length };
 }
 
 export function useAppStateInit(skip = false) {
@@ -54,6 +66,7 @@ export function useAppStateInit(skip = false) {
     getAppState()
       .then((snapshot) => {
         setAppState(snapshot);
+        markStartup("initial-snapshot-ready", tracedPayloadMeta(snapshot));
       })
       .catch((err) => console.error("Failed to fetch app state:", err));
   }, [setAppState, skip]);
@@ -90,7 +103,10 @@ export function useAppStateInit(skip = false) {
   const handleStateChanged = useCallback(
     (payload: AppStateSnapshot) => {
       const target = payload.active_workspace_id ?? undefined;
-      markOpenInteraction("snapshot-received", { target });
+      markOpenInteraction("snapshot-received", {
+        target,
+        meta: tracedPayloadMeta(payload),
+      });
       const commit = () => {
         debounceRef.current = null;
         pendingCommitRef.current = null;

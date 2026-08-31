@@ -77,7 +77,17 @@ pub(crate) fn run_timed(
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(e) => return Err(TimedFailure::Wait(e)),
+            Err(e) => {
+                // A wait failure does not imply the child exited. Apply the
+                // same ownership rule as the deadline path: kill and reap
+                // before returning so a background poll can never leak a child
+                // or zombie on an exceptional OS error.
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(stdout);
+                drop(stderr);
+                return Err(TimedFailure::Wait(e));
+            }
         }
     }
 }

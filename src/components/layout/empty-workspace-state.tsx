@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useLayoutEffect } from "react";
 import {
   Terminal,
   Globe,
@@ -12,13 +12,14 @@ import {
   createTab,
   createBrowserPane,
   openInEditor,
-  detectEditors,
   closeWorkspace,
   closeWorkspaceWithWorktree,
 } from "@/tauri/commands";
+import { ensureEditorsDetected } from "@/stores/editor-discovery-store";
 import { toast } from "@/lib/toast";
 import { runDeleteWithForceToast } from "@/hooks/use-force-delete";
 import logomark from "@/assets/codemux-logomark.svg";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
@@ -64,6 +65,13 @@ export function EmptyWorkspaceState() {
 
   const workspaceId = ws?.workspace_id;
 
+  // This is a real, immediately usable pane state: the action buttons are the
+  // content. Stamp it separately from WorkspaceMain's shell mount so a switch
+  // to a workspace with no surface still produces a complete trace.
+  useLayoutEffect(() => {
+    if (workspaceId) markPaneReady("empty", { target: workspaceId });
+  }, [workspaceId]);
+
   const handleOpenTerminal = useCallback(() => {
     if (workspaceId) createTab(workspaceId, "terminal").catch(console.error);
   }, [workspaceId]);
@@ -80,7 +88,7 @@ export function EmptyWorkspaceState() {
 
   const handleOpenInEditor = useCallback(async () => {
     if (!ws) return;
-    const editors = await detectEditors().catch(() => []);
+    const editors = await ensureEditorsDetected();
     if (editors.length > 0) {
       openInEditor(editors[0].id, ws.cwd).catch(console.error);
     }

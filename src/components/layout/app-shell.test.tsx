@@ -18,7 +18,17 @@ let commandPaletteOpenFlag = false;
 // and the two writes the shell can make in response to them.
 let localSettings: Record<string, string> = {};
 let syncedThemeId = "default";
-const { applyThemeSpy } = vi.hoisted(() => ({ applyThemeSpy: vi.fn() }));
+const {
+  applyThemeSpy,
+  markStartupSpy,
+  schedulePrefetchSpy,
+  cancelPrefetchSpy,
+} = vi.hoisted(() => ({
+  applyThemeSpy: vi.fn(),
+  markStartupSpy: vi.fn((..._args: unknown[]) => {}),
+  schedulePrefetchSpy: vi.fn((..._args: unknown[]) => {}),
+  cancelPrefetchSpy: vi.fn(),
+}));
 const setLocalSetting = vi.fn((key: string, value: string) => {
   localSettings = { ...localSettings, [key]: value };
 });
@@ -173,9 +183,23 @@ vi.mock("@/lib/themes", async (importOriginal) => ({
   applyTheme: applyThemeSpy,
 }));
 
+vi.mock("@/lib/perf/interaction-trace", () => ({
+  markStartup: (...args: unknown[]) => markStartupSpy(...args),
+}));
+
+vi.mock("@/lib/idle-prefetch", () => ({
+  scheduleSequentialIdlePrefetch: (...args: unknown[]) => {
+    schedulePrefetchSpy(...args);
+    return cancelPrefetchSpy;
+  },
+}));
+
 import { AppShell } from "./app-shell";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function resetMockState() {
   hasWorkspacesFlag = false;
@@ -192,6 +216,9 @@ function resetMockState() {
   localSettings = {};
   syncedThemeId = "default";
   applyThemeSpy.mockClear();
+  markStartupSpy.mockClear();
+  schedulePrefetchSpy.mockClear();
+  cancelPrefetchSpy.mockClear();
   setLocalSetting.mockClear();
   updateSyncedSetting.mockClear();
 }
@@ -237,23 +264,49 @@ describe("AppShell rendering gates", () => {
     expect(queryByTestId("empty-state")).toBeNull();
   });
 
-  it("renders the Devices page when its UI-store flag is set", () => {
+  it("renders the Devices page when its UI-store flag is set", async () => {
     hasWorkspacesFlag = true;
     showDevicesFlag = true;
-    const { getByTestId, queryByTestId } = render(<AppShell />);
-    expect(getByTestId("devices-view")).toBeInTheDocument();
+    const { findByTestId, queryByTestId } = render(<AppShell />);
+    // The page is a lazy route, so it resolves after a microtask tick.
+    expect(await findByTestId("devices-view")).toBeInTheDocument();
     // The shell early-returns the overlay so neither the regular
     // workspace pane nor the empty state should render alongside it.
     expect(queryByTestId("workspace-main")).toBeNull();
     expect(queryByTestId("empty-state")).toBeNull();
   });
 
-  it("prefers Settings over the Devices page when both flags are set", () => {
+  it("prefers Settings over the Devices page when both flags are set", async () => {
     showSettingsFlag = true;
     showDevicesFlag = true;
-    const { getByTestId, queryByTestId } = render(<AppShell />);
-    expect(getByTestId("settings-view")).toBeInTheDocument();
+    const { findByTestId, queryByTestId } = render(<AppShell />);
+    expect(await findByTestId("settings-view")).toBeInTheDocument();
     expect(queryByTestId("devices-view")).toBeNull();
+  });
+
+  it("marks shell ready, paints twice, then schedules idle prefetch", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    syncedLoading = true;
+    const { rerender } = render(<AppShell />);
+    expect(markStartupSpy).not.toHaveBeenCalled();
+    expect(schedulePrefetchSpy).not.toHaveBeenCalled();
+
+    syncedLoading = false;
+    rerender(<AppShell />);
+    expect(markStartupSpy).toHaveBeenCalledWith("shell-ready");
+    expect(schedulePrefetchSpy).not.toHaveBeenCalled();
+
+    frames.shift()?.(1);
+    expect(schedulePrefetchSpy).not.toHaveBeenCalled();
+    frames.shift()?.(2);
+    expect(markStartupSpy).toHaveBeenCalledWith("shell-first-paint");
+    expect(schedulePrefetchSpy).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
   });
 });
 

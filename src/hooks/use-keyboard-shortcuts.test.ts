@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
-  cycleWorkspace: vi.fn().mockResolvedValue(undefined),
   splitPane: vi.fn().mockResolvedValue(undefined),
   closePane: vi.fn().mockResolvedValue(undefined),
   createTab: vi.fn().mockResolvedValue(undefined),
@@ -18,6 +17,7 @@ import { dispatch } from "./use-keyboard-shortcuts";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { activateWorkspace, undockBrowserFromRightPanel } from "@/tauri/commands";
 import {
   setJumpTargets,
@@ -29,7 +29,8 @@ import {
 const FAKE_EVENT = new KeyboardEvent("keydown", { key: "Escape" });
 
 beforeEach(() => {
-  useAppStore.setState({ appState: null });
+  vi.clearAllMocks();
+  useAppStore.setState({ appState: null, pendingActiveWorkspaceId: null });
   useUIStore.setState({
     onboardingProjectDir: null,
     hasSeenOnboarding: false,
@@ -39,6 +40,7 @@ beforeEach(() => {
     showCommandPalette: false,
     showNewWorkspaceDialog: false,
     renameWorkspaceId: null,
+    themeStudio: null,
   });
   // Restore the store's boot state (GUI on) so a case that opts out
   // doesn't leak into the next one.
@@ -47,7 +49,93 @@ beforeEach(() => {
     enableAgentChat: initialFlags.enableAgentChat,
     enableLazyWorkspaceCreation: initialFlags.enableLazyWorkspaceCreation,
   });
+  useChatDraftStore.setState({
+    draftsById: {},
+    activeHomeDraftId: null,
+    projectDraftIdByPath: {},
+    activeDraftId: null,
+  });
   window.localStorage.clear();
+});
+
+describe("use-keyboard-shortcuts dispatch — workspace cycling", () => {
+  function seedWorkspaces(activeWorkspaceId = "ws-a") {
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: activeWorkspaceId,
+        workspaces: ["ws-a", "ws-b", "ws-c"].map((workspace_id) => ({
+          workspace_id,
+          surfaces: [],
+        })),
+      } as unknown as NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>,
+      pendingActiveWorkspaceId: null,
+    });
+  }
+
+  it("routes next and previous through renderer activation in snapshot order", () => {
+    seedWorkspaces("ws-b");
+
+    expect(dispatch("nextWorkspace", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-c");
+
+    useAppStore.setState({ pendingActiveWorkspaceId: null });
+    expect(dispatch("prevWorkspace", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-a");
+  });
+
+  it("wraps around the first and last workspace", () => {
+    seedWorkspaces("ws-c");
+    dispatch("nextWorkspace", FAKE_EVENT);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-a");
+
+    seedWorkspaces("ws-a");
+    dispatch("prevWorkspace", FAKE_EVENT);
+    expect(activateWorkspace).toHaveBeenLastCalledWith("ws-c");
+  });
+
+  it("advances rapid presses from the optimistic pending selection", () => {
+    seedWorkspaces("ws-a");
+
+    dispatch("nextWorkspace", FAKE_EVENT);
+    dispatch("nextWorkspace", FAKE_EVENT);
+
+    expect(activateWorkspace).toHaveBeenNthCalledWith(1, "ws-b");
+    expect(activateWorkspace).toHaveBeenNthCalledWith(2, "ws-c");
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-c");
+  });
+
+  it("consumes the action without invoking when no target exists", () => {
+    expect(dispatch("nextWorkspace", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).not.toHaveBeenCalled();
+
+    seedWorkspaces("ws-missing");
+    expect(dispatch("prevWorkspace", FAKE_EVENT)).toBe(true);
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("skips activation entirely when the cycle resolves to the current workspace", () => {
+    // Single workspace: next/prev wrap back onto the active id. Running the
+    // activation anyway would clear an open draft composer (and fire an IPC)
+    // for a switch that never happens.
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: "ws-only",
+        workspaces: [{ workspace_id: "ws-only", surfaces: [] }],
+      } as unknown as NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>,
+      pendingActiveWorkspaceId: null,
+    });
+    const draftStore = useChatDraftStore.getState();
+    const draft = draftStore.getOrCreateHomeDraft();
+    draftStore.setActiveDraft(draft.draftId);
+
+    expect(dispatch("nextWorkspace", FAKE_EVENT)).toBe(true);
+    expect(dispatch("prevWorkspace", FAKE_EVENT)).toBe(true);
+
+    expect(activateWorkspace).not.toHaveBeenCalled();
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBeNull();
+    // The open draft view is untouched — no optimistic clear ever ran.
+    expect(useChatDraftStore.getState().activeDraftId).toBe(draft.draftId);
+  });
 });
 
 describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
@@ -115,6 +203,20 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
   });
 
   describe("other overlays — ordering preserved", () => {
+    it("closes Theme Studio before the settings surface underneath it", () => {
+      useUIStore.setState({
+        themeStudio: { mode: "generate" },
+        showSettings: true,
+      });
+
+      const handled = dispatch("closeOverlay", FAKE_EVENT);
+
+      expect(handled).toBe(true);
+      const s = useUIStore.getState();
+      expect(s.themeStudio).toBeNull();
+      expect(s.showSettings).toBe(true);
+    });
+
     it("closes the rename dialog before settings", () => {
       // The rename dialog opts out of Radix's own Escape dismissal so this
       // ladder is the single closer: one press must take exactly one layer.

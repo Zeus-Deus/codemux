@@ -18,12 +18,12 @@ import {
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
 import {
-  detectEditors,
   openInEditor,
   SKILLS_CHANGED_EVENT,
   startSkillsWatcher,
   type Skill,
 } from "@/tauri/commands";
+import { ensureEditorsDetected } from "@/stores/editor-discovery-store";
 import { listen } from "@tauri-apps/api/event";
 
 import { SkillRow } from "./skill-row";
@@ -125,8 +125,8 @@ export function SkillsSection({ projectRoot }: Props) {
         preferredEditorId,
       });
       try {
-        const editors = await detectEditors();
-        console.info("[skills] detectEditors →", editors);
+        const editors = await ensureEditorsDetected();
+        console.info("[skills] editor discovery →", editors);
         if (editors.length === 0) {
           toast.error("No editor detected", {
             description:

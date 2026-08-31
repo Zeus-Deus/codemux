@@ -60,11 +60,7 @@ pub(crate) fn build_signin_body(email: &str, secret: &AuthSecret) -> serde_json:
     })
 }
 
-pub(crate) fn build_signup_body(
-    email: &str,
-    secret: &AuthSecret,
-    name: &str,
-) -> serde_json::Value {
+pub(crate) fn build_signup_body(email: &str, secret: &AuthSecret, name: &str) -> serde_json::Value {
     serde_json::json!({
         "email": email,
         "password": secret.as_str(),
@@ -94,9 +90,7 @@ pub(crate) async fn login_email_api(
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Authentication failed");
+        let msg = body["error"].as_str().unwrap_or("Authentication failed");
         return Err(msg.to_string());
     }
 
@@ -125,9 +119,7 @@ pub(crate) async fn signup_email_api(
 
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Sign-up failed");
+        let msg = body["error"].as_str().unwrap_or("Sign-up failed");
         return Err(msg.to_string());
     }
 

@@ -100,6 +100,7 @@ import type {
   CheckInfo,
   ChatModelInfo,
   FeatureFlags,
+  PaneStatus,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
   PrReviewThread,
@@ -131,9 +132,54 @@ console.log(
 // ── Mutable seed state ──────────────────────────────────────────────
 
 let appState: AppStateSnapshot = createSeedAppState();
+let stressDeltaTimer: number | null = null;
+let stressDeltaRevision = 0;
+let stressDeltaCount = 0;
+let providerRuntimeCommandCount = 0;
+
+const PROVIDER_RUNTIME_COMMANDS = new Set([
+  "agent_chat_provider_health",
+  "list_chat_provider_capabilities",
+  "agent_chat_start_session",
+]);
 
 function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
   return appState.workspaces.find((w) => w.workspace_id === id);
+}
+
+function firstLeafPaneId(node: PaneNodeSnapshot): string | null {
+  if (node.kind !== "split") return node.pane_id;
+  for (const child of node.children) {
+    const paneId = firstLeafPaneId(child);
+    if (paneId) return paneId;
+  }
+  return null;
+}
+
+/** Begin the fixture's sustained state-delta stream after the initial snapshot
+ * has been requested. Starting earlier would manufacture a revision gap before
+ * the renderer has a baseline. */
+function startStressDeltaDriver(): void {
+  const fixture = getStressFixture();
+  if (!fixture || fixture.deltasPerSec <= 0 || stressDeltaTimer !== null) return;
+  const active = findWorkspace(appState.active_workspace_id);
+  const surface = active?.surfaces.find(
+    (candidate) => candidate.surface_id === active.active_surface_id,
+  );
+  const paneId = surface ? firstLeafPaneId(surface.root) : null;
+  if (!paneId) return;
+
+  const statuses: Array<PaneStatus | null> = ["working", "review", null];
+  const periodMs = Math.max(1, 1_000 / fixture.deltasPerSec);
+  stressDeltaTimer = window.setInterval(() => {
+    const status = statuses[stressDeltaCount % statuses.length];
+    stressDeltaCount += 1;
+    stressDeltaRevision += 1;
+    emitEvent("app-state-delta", {
+      revision: stressDeltaRevision,
+      delta: { domain: "pane_status", pane_id: paneId, status },
+    });
+  }, periodMs);
 }
 
 // ── Pull request mock state ──
@@ -2828,6 +2874,21 @@ const MOCK_PROVIDER_OPERATIONS: Record<string, ProviderOperations> = {
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
+  bootstrap_session: () => ({
+    authenticated: true,
+    user: MOCK_USER,
+    settings: structuredClone(SYNCED_SETTINGS),
+    authMethod: "github",
+    status: "local",
+  }),
+  refresh_session: () => ({
+    authenticated: true,
+    user: MOCK_USER,
+    settings: structuredClone(SYNCED_SETTINGS),
+    authMethod: "github",
+    status: "verified",
+  }),
+  repair_inactive_mcp_configs: () => 0,
   get_auth_token: () => "mock-token",
   get_sync_status: () => ({ syncAvailable: true, authMethod: "github" }),
   sign_out: () => undefined,
@@ -2921,7 +2982,16 @@ const handlers: Record<string, Handler> = {
   },
 
   // ── Core state ──
-  get_app_state: () => appState,
+  get_app_state: () => {
+    queueMicrotask(startStressDeltaDriver);
+    return appState;
+  },
+  get_performance_diagnostics: () => ({
+    version: 1,
+    capacity: 256,
+    sample_count: 0,
+    timings: [],
+  }),
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
   get_package_format: () => "AppImage",
@@ -5632,6 +5702,7 @@ async function invoke(
   args: Args | Uint8Array | ArrayBuffer = {},
   options?: unknown,
 ): Promise<unknown> {
+  if (PROVIDER_RUNTIME_COMMANDS.has(cmd)) providerRuntimeCommandCount += 1;
   // Raw-body invoke: `agent_chat_stage_image` sends the image bytes as
   // the payload (not an args object), with the MIME on an `x-media-type`
   // header. Stash the bytes under a fake absolute staging path and return
@@ -5703,6 +5774,24 @@ const internals: TauriInternals = {
     };
   }
 ).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener };
+
+// Release-gate visibility for the in-app browser harness. Counts only; no
+// workspace, pane, path, or transcript identifiers leave the mock.
+(
+  window as unknown as {
+    __codemuxStressStats: () => {
+      active: boolean;
+      emitted: number;
+      configuredPerSec: number;
+      providerRuntimeCommands: number;
+    };
+  }
+).__codemuxStressStats = () => ({
+  active: stressDeltaTimer !== null,
+  emitted: stressDeltaCount,
+  configuredPerSec: getStressFixture()?.deltasPerSec ?? 0,
+  providerRuntimeCommands: providerRuntimeCommandCount,
+});
 
 // Dev affordance: fire a backend-style global `notification` event from the
 // browser console to exercise the web-remote notification bridge
