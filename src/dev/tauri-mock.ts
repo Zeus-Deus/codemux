@@ -3685,6 +3685,7 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_set_model: () => undefined,
+  agent_chat_set_fast_mode: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
   agent_chat_stop_session: () => undefined,
   agent_chat_rename_session: () => undefined,

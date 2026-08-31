@@ -125,6 +125,10 @@ pub(crate) struct CodexSessionState {
     /// — mirrors the reference's `collaborationMode.settings.reasoning_effort`
     /// session default.
     pub default_effort: Option<String>,
+    /// Service-speed tier applied to subsequent `turn/start` requests.
+    /// Codex accepts this per turn, so changing Fast mode does not require
+    /// rebuilding or resuming the provider thread.
+    pub fast_mode: bool,
     /// Follow-up turns queued while a turn was in flight, in FIFO
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`CodexSession::drain_queue`]).
@@ -516,6 +520,7 @@ impl CodexSession {
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
+            fast_mode,
             queued_turns: VecDeque::new(),
         });
         let session = Arc::new(Self {
@@ -833,12 +838,13 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
-        let (codex_thread_id, model_default, effort_default) = {
+        let (codex_thread_id, model_default, effort_default, fast_mode) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
                 state.default_effort.clone(),
+                state.fast_mode,
             )
         };
 
@@ -893,7 +899,11 @@ impl CodexSession {
             thread_id: codex_thread_id,
             input: input_items,
             model,
-            service_tier: None,
+            // `serviceTier` is a turn override that also becomes the thread's
+            // default for later turns. Send an explicit `default` when Fast
+            // is off; omission would inherit a thread that was previously
+            // launched in the Fast tier.
+            service_tier: Some(if fast_mode { "fast" } else { "default" }.into()),
             effort,
             collaboration_mode,
         };
@@ -1032,6 +1042,13 @@ impl CodexSession {
     pub async fn set_model(&self, model: String) {
         let mut state = self.state.lock().await;
         state.model = Some(model);
+    }
+
+    /// Update the service tier used by subsequent turns without replacing
+    /// the Codex app-server or its loaded thread.
+    pub async fn set_fast_mode(&self, fast_mode: bool) {
+        let mut state = self.state.lock().await;
+        state.fast_mode = fast_mode;
     }
 
     /// Gracefully shut the session down: close the JSON-RPC child
@@ -1552,7 +1569,11 @@ mod tests {
 
     #[test]
     fn recoverable_resume_error_matches_snippets() {
+        assert!(is_recoverable_resume_error(
+            "rpc error -32600: no rollout found for thread id 019db5ad"
+        ));
         assert!(is_recoverable_resume_error("rpc error: Thread not found (code 42)"));
+        assert!(is_recoverable_resume_error("missing thread"));
         assert!(is_recoverable_resume_error("unknown thread"));
         assert!(is_recoverable_resume_error("NO SUCH THREAD"));
         assert!(!is_recoverable_resume_error("network is unreachable"));

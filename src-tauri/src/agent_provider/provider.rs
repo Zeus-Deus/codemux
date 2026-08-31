@@ -110,6 +110,19 @@ pub trait AgentProvider: Send + Sync {
     /// [`ProviderError::ValidationError`](super::errors::ProviderError::ValidationError).
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError>;
 
+    /// Swap the session's service-speed tier at runtime. Providers that
+    /// advertise Fast mode should override this and apply the choice to the
+    /// existing provider session rather than forcing a stop/resume cycle.
+    async fn set_fast_mode(
+        &self,
+        _thread_id: ThreadId,
+        _fast_mode: bool,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::ValidationError {
+            message: "provider does not support mid-session Fast mode changes".into(),
+        })
+    }
+
     /// Swap the session's permission mode at runtime.
     async fn set_permission_mode(
         &self,

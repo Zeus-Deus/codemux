@@ -1427,6 +1427,13 @@ impl AcpSession {
         Ok(())
     }
 
+    /// Apply the Fast session option without replacing the ACP session.
+    /// Dialects that never advertise a Fast config option resolve to a
+    /// no-op inside [`Self::set_boolean_config`].
+    pub async fn set_fast_mode(&self, fast_mode: bool) -> Result<(), ProviderError> {
+        self.set_boolean_config(ConfigKind::Fast, fast_mode).await
+    }
+
     pub async fn set_permission_mode(&self, mode: String) -> Result<(), ProviderError> {
         if !matches!(mode.as_str(), "agent" | "ask" | "plan") {
             return Err(ProviderError::ValidationError {

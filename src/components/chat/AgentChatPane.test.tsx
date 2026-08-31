@@ -214,6 +214,7 @@ vi.mock("./Composer", () => ({
     onModelChange,
     onProviderModelChange,
     onContextWindowChange,
+    onFastModeChange,
     onPermissionModeChange,
     provider,
     providerCliInstalled,
@@ -236,6 +237,7 @@ vi.mock("./Composer", () => ({
       model: string,
     ) => void;
     onContextWindowChange: (contextWindow: string) => void;
+    onFastModeChange: (fastMode: boolean) => void;
     onPermissionModeChange: (mode: string) => void;
     provider: "claude" | "codex" | "cursor" | "grok" | "opencode";
     providerCliInstalled?: boolean | null;
@@ -304,6 +306,10 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="context-window-change"
         onClick={() => onContextWindowChange("1m")}
+      />
+      <button
+        data-testid="fast-mode-change"
+        onClick={() => onFastModeChange(true)}
       />
       {/* Permission-mode picker selection. Per-turn providers have to
           push the choice onto the LIVE session; per-session ones
@@ -433,6 +439,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSendQueuedTurnNow: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
+  agentChatSetFastMode: vi.fn().mockResolvedValue(undefined),
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
@@ -668,6 +675,7 @@ import {
   agentChatListSessions,
   agentChatRespondToRequest,
   agentChatSendTurn,
+  agentChatSetFastMode,
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -2069,7 +2077,10 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
     vi.mocked(agentChatUpdateSessionConfig).mockClear();
     mockAppState.appState = HOME_APP_STATE.appState;
   });
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    useProviderCapabilities.setState({ codex: null, codexError: null });
+  });
 
   it("persists the model on a picker change (fire-and-forget)", async () => {
     const existingPane = { ...pane, thread_id: "thread-x" };
@@ -2099,6 +2110,65 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
         context_window: "1m",
       }),
     );
+  });
+
+  it("applies Codex Fast mode live without stopping or restarting the session", async () => {
+    useProviderCapabilities.setState({
+      codex: {
+        models: [
+          {
+            id: "gpt-5.4",
+            label: "GPT-5.4",
+            description: null,
+            effort_levels: ["medium", "high"],
+            default_effort: "medium",
+            effort_descriptions: {},
+            prompt_injected_effort_levels: [],
+            context_window_options: [],
+            supports_adaptive_thinking: false,
+            supports_thinking_toggle: false,
+            supports_fast_mode: true,
+            supports_images: true,
+            sub_provider: null,
+            is_free: false,
+          },
+        ],
+        effort_granularity: "per_turn",
+        effort_label_map: {},
+        permission_modes: [],
+        default_permission_mode: "danger-full-access",
+        permission_granularity: "per_session",
+      },
+      codexError: null,
+    });
+    currentSliceOverrides = {
+      "thread-x": { model: "gpt-5.4", fastMode: false },
+    };
+    const codexPane = {
+      ...pane,
+      provider: "codex" as const,
+      thread_id: "thread-x",
+    };
+    const { container } = render(<AgentChatPane pane={codexPane} />);
+    vi.mocked(agentChatSetFastMode).mockClear();
+    vi.mocked(agentChatStopSession).mockClear();
+    vi.mocked(agentChatStartSession).mockClear();
+
+    const button = container.querySelector(
+      '[data-testid="fast-mode-change"]',
+    ) as HTMLButtonElement;
+    button.click();
+
+    await waitFor(() =>
+      expect(agentChatSetFastMode).toHaveBeenCalledWith(
+        "codex",
+        "thread-x",
+        true,
+      ),
+    );
+    expect(setFastModeMock).toHaveBeenCalledWith("thread-x", true);
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
   });
 });
 

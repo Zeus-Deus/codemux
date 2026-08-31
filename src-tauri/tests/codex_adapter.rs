@@ -432,6 +432,51 @@ async fn send_turn_emits_structured_skill_item_on_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_mode_changes_apply_to_turns_without_restarting_the_thread() {
+    async fn captured_tier(initial_fast: bool, next_fast: bool, thread: &str) -> String {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture_path = capture_dir.path().join("turn.json");
+        let capture_path_string = capture_path.to_string_lossy().to_string();
+        let wrapper = wrapper_with_env(&[("FAKE_CODEX_CAPTURE_TURN", &capture_path_string)]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        let mut input = start_input(thread);
+        input.fast_mode = initial_fast;
+        start_session_resilient(&provider, input).await.unwrap();
+
+        provider
+            .set_fast_mode(ThreadId(thread.into()), next_fast)
+            .await
+            .unwrap();
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: ThreadId(thread.into()),
+                text: "continue".into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+                display_text: None,
+                skill_invocations: vec![],
+                turn_checkpoint: None,
+            })
+            .await
+            .unwrap();
+
+        let captured: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        provider.stop_session(ThreadId(thread.into())).await.ok();
+        captured["serviceTier"].as_str().unwrap().to_string()
+    }
+
+    assert_eq!(captured_tier(false, true, "t-fast-on").await, "fast");
+    assert_eq!(
+        captured_tier(true, false, "t-fast-off").await,
+        "default"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollback_conversation_uses_codex_thread_rollback_contract() {
     let capture_dir = tempfile::tempdir().unwrap();
     let capture_path = capture_dir.path().join("rollback.json");

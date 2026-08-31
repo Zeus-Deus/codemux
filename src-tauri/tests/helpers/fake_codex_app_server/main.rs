@@ -27,7 +27,7 @@
 //!
 //! * `FAKE_CODEX_SCRIPT` — path to a script JSON file.
 //! * `FAKE_CODEX_FAIL_RESUME=1` — make `thread/resume` fail with a
-//!   recoverable "thread not found" error.
+//!   recoverable real-world "no rollout found" error.
 //! * `FAKE_CODEX_THREAD_ID` — override the id returned from
 //!   `thread/start` (default `"c-1"`).
 //! * `FAKE_CODEX_EXIT_AFTER=<method>` — exit the fixture 0 after
@@ -270,7 +270,7 @@ fn main() {
                         write_line(&json!({
                             "jsonrpc":"2.0",
                             "id": id,
-                            "error": {"code":-32000,"message":"thread not found"},
+                            "error": {"code":-32600,"message":"no rollout found for thread id old-thread"},
                         }));
                     }
                 } else if let Some(id) = id {

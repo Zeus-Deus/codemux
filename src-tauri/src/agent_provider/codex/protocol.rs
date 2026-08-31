@@ -42,21 +42,22 @@ use crate::agent_provider::ApprovalDecision;
 /// `thread/resume` JSON-RPC call, triggering an automatic fallback to
 /// `thread/start`.
 ///
-/// Inferred list. The upstream reference that prompted this adapter
-/// mentions a `RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS` constant but the
-/// exact string set was not cited, so these are the reasonable
-/// candidates. Matching is case-insensitive against whatever error
-/// message the RPC call surfaces.
+/// Matching is case-insensitive against whatever error message the RPC call
+/// surfaces. `no rollout found` is pinned from a real desktop-restart failure;
+/// the remaining phrases cover older/provider-equivalent wording.
 ///
 /// An incomplete list is safe: a resume error that does not match falls
 /// through to a plain [`ProviderError::RpcError`](crate::agent_provider::ProviderError::RpcError)
 /// instead of being auto-recovered. The session ends up broken, but
 /// nothing misbehaves silently.
 ///
-// TODO: verify against real codex app-server error messages once the
-// adapter is exercised in real failure scenarios.
 pub const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS: &[&str] = &[
+    // Current app-server wording when the persisted rollout is absent. This
+    // is the real-world desktop-restart case that originally exposed the
+    // incomplete inferred list below.
+    "no rollout found",
     "thread not found",
+    "missing thread",
     "unknown thread",
     "no such thread",
     "thread does not exist",

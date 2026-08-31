@@ -86,6 +86,7 @@ import {
   agentChatRevertTurnCheckpoint,
   agentChatRespondToRequest,
   agentChatSendTurn,
+  agentChatSetFastMode,
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -2247,14 +2248,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 
   /**
-   * Shared silent-restart helper. Permission-mode, effort, and
-   * context-window all trigger the same flow on Claude: stop the
+   * Shared silent-restart helper for settings a provider genuinely binds at
+   * session creation. Permission-mode, effort, and context-window trigger
+   * this flow on Claude: stop the
    * current provider process, then rebuild it under the SAME durable
    * CodeMux thread id with the updated launch params. The resume cursor
    * carries provider-native state when available; the stable thread id
    * keeps the visible transcript authoritative even if native resume
-   * ultimately has to fall back. Codex-side callers only route through
-   * here for launch-scoped features such as Fast mode.
+   * ultimately has to fall back.
    *
    * Declared above the mode handlers so `handleModeRemove` can use
    * it for the silent-restart restore path (the SDK rejects live
@@ -2267,7 +2268,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       effort?: string | null;
       contextWindow?: string | null;
       model?: string | null;
-      fastMode?: boolean;
       /** Drop provider-native continuity. Required when Grok reports that
        * the chosen model belongs to an incompatible agent family. */
       freshSession?: boolean;
@@ -2309,10 +2309,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           : currentSlice.contextWindow;
       const nextModel =
         updates.model !== undefined ? updates.model : currentSlice.model;
-      const nextFastMode =
-        updates.fastMode !== undefined
-          ? updates.fastMode
-          : currentSlice.fastMode;
+      const nextFastMode = currentSlice.fastMode;
       void (async () => {
         try {
           await agentChatStopSession(provider, threadId);
@@ -2764,36 +2761,36 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         configPatch.fast_mode = plan.resetFastMode;
       }
       persistSessionConfig(configPatch);
-      if (plan.resetFastMode !== undefined) {
-        restartSessionWith({
-          model: next,
-          fastMode: plan.resetFastMode,
-          onFailure: rollback,
-        });
-      } else {
-        agentChatSetModel(provider, threadId, next).catch((err) => {
-          if (provider === "grok" && grokModelChangeRequiresRestart(err)) {
-            // This request may have failed after a newer picker choice was
-            // already accepted. Never rebuild the native session around the
-            // stale model in that case.
-            if (
-              useAgentChatStore.getState().threads[threadId]?.model !== next
-            ) {
-              return;
-            }
-            // Grok locks the underlying agent family after the first turn.
-            // Keep the durable Codemux transcript, but create a fresh native
-            // Grok session so the newly selected family can start cleanly.
-            restartSessionWith({
-              model: next,
-              freshSession: true,
-              onFailure: rollback,
-            });
+      agentChatSetModel(provider, threadId, next).catch((err) => {
+        if (provider === "grok" && grokModelChangeRequiresRestart(err)) {
+          // This request may have failed after a newer picker choice was
+          // already accepted. Never rebuild the native session around the
+          // stale model in that case.
+          if (useAgentChatStore.getState().threads[threadId]?.model !== next) {
             return;
           }
-          rollback();
-          toast.error(`Failed to set model: ${formatProviderError(err)}`);
-        });
+          // Grok locks the underlying agent family after the first turn.
+          // Keep the durable Codemux transcript, but create a fresh native
+          // Grok session so the newly selected family can start cleanly.
+          restartSessionWith({
+            model: next,
+            freshSession: true,
+            onFailure: rollback,
+          });
+          return;
+        }
+        rollback();
+        toast.error(`Failed to set model: ${formatProviderError(err)}`);
+      });
+      // A compat-driven Fast reset rides the live session too: both
+      // Fast-capable providers apply the tier without a relaunch, so the
+      // model swap above stays the only reason to touch the session.
+      if (plan.resetFastMode !== undefined) {
+        agentChatSetFastMode(provider, threadId, plan.resetFastMode).catch(
+          (err) => {
+            toast.error(`Failed to set service tier: ${err}`);
+          },
+        );
       }
     },
     [
@@ -2935,19 +2932,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const current = useAgentChatStore.getState().threads[threadId];
       if (!current || current.fastMode === next) return;
       setStoreFastMode(threadId, next);
-      persistSessionConfig({ fast_mode: next });
-      // Both providers bind speed to the session/thread launch. A silent
-      // restart keeps transcript + resume state while making the choice take
-      // effect before the next turn.
-      restartSessionWith({ fastMode: next });
+      // Codex carries the service tier on `turn/start`; Cursor exposes a live
+      // ACP Fast config option. Neither requires replacing the conversation.
+      agentChatSetFastMode(provider, threadId, next).catch((err) => {
+        toast.error(`Failed to set service tier: ${err}`);
+      });
     },
     [
       threadId,
+      provider,
       activeModel,
       grokConfigurationBusy,
       setStoreFastMode,
-      persistSessionConfig,
-      restartSessionWith,
     ],
   );
 

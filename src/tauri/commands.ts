@@ -1734,6 +1734,12 @@ export const agentChatSetModel = (
   model: string | null,
 ) => invoke<void>("agent_chat_set_model", { provider, threadId, model });
 
+export const agentChatSetFastMode = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  fastMode: boolean,
+) => invoke<void>("agent_chat_set_fast_mode", { provider, threadId, fastMode });
+
 export const agentChatSetPermissionMode = (
   provider: AgentChatProviderKind,
   threadId: string,
