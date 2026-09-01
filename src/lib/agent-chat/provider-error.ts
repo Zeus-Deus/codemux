@@ -15,8 +15,11 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
   cursor: "Cursor",
+  grok: "Grok",
   opencode: "OpenCode",
 };
+
+const GROK_MODEL_RESTART_PREFIX = "grok_model_restart_required:";
 
 interface WireProviderError {
   kind?: unknown;
@@ -39,18 +42,40 @@ function str(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function errorText(raw: unknown): string {
+  return typeof raw === "string"
+    ? raw
+    : raw instanceof Error
+      ? raw.message
+      : String(raw);
+}
+
+/** Whether Grok rejected a live model switch because the selected model uses
+ * a different agent family and therefore needs a fresh ACP session. */
+export function grokModelChangeRequiresRestart(raw: unknown): boolean {
+  const text = errorText(raw);
+  if (text.includes(GROK_MODEL_RESTART_PREFIX)) return true;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return (
+      !!parsed &&
+      typeof parsed === "object" &&
+      str((parsed as WireProviderError).message)?.includes(
+        GROK_MODEL_RESTART_PREFIX,
+      ) === true
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Best-effort: turn a rejected provider-command error into a sentence.
  * Never throws; unparseable input comes back verbatim (trimmed to a
  * string) so no information is lost.
  */
 export function formatProviderError(raw: unknown): string {
-  const text =
-    typeof raw === "string"
-      ? raw
-      : raw instanceof Error
-        ? raw.message
-        : String(raw);
+  const text = errorText(raw);
   let wire: WireProviderError;
   try {
     const parsed: unknown = JSON.parse(text);
@@ -68,8 +93,12 @@ export function formatProviderError(raw: unknown): string {
       return "The chat session is no longer live. Try sending again to restart it.";
     case "session_closed":
       return "The chat session has been closed. Try sending again to restart it.";
-    case "validation_error":
-      return str(wire.message) ?? text;
+    case "validation_error": {
+      const message = str(wire.message) ?? text;
+      return message.startsWith(GROK_MODEL_RESTART_PREFIX)
+        ? message.slice(GROK_MODEL_RESTART_PREFIX.length).trim()
+        : message;
+    }
     case "process_error": {
       const message = str(wire.message) ?? "The provider process failed.";
       const source = str(wire.source);

@@ -527,9 +527,11 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
               );
         END;
 
-        -- Usage ledger behind Settings → Usage. This is a materialized
-        -- local cache of provider-owned history (Claude/Codex transcripts
-        -- and OpenCode storage), not a second runtime accounting stream.
+        -- Usage ledger behind Settings → Usage. Most rows are a
+        -- materialized local cache of provider-owned history (Claude/Codex
+        -- transcripts and OpenCode storage). Grok is the exception: its ACP
+        -- PromptResponse is the durable provider-owned bill, so exact
+        -- per-turn rows are recorded live with a stable import key.
         --
         -- Deliberately carries NO foreign key to `agent_chat_sessions`.
         -- Every other chat-adjacent table cascades on session delete,
@@ -563,8 +565,9 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             -- price list) | NULL (unpriced). Lets the UI show how much of
             -- a total is measured rather than estimated.
             cost_source TEXT,
-            -- `provider_history`: derived from the provider's durable local
-            -- history and safe to rebuild whenever parsing or prices change.
+            -- `provider_history`: derived from durable local history and safe
+            -- to rebuild; `live`: an exact provider bill with no separate
+            -- history importer (currently Grok).
             source TEXT NOT NULL DEFAULT 'provider_history',
             -- Provider-native idempotency key. Every history row has one.
             import_key TEXT
@@ -2886,8 +2889,8 @@ pub struct UsageLedgerRow {
     /// `"provider"` | `"table"` | `None`.
     #[serde(default)]
     pub cost_source: Option<String>,
-    /// `"provider_history"` for current rows; older installs may contain
-    /// legacy `"live"` / `"cli_import"` values until importer v3 rebuilds.
+    /// `"provider_history"` for rebuildable imported rows, or `"live"` for
+    /// exact provider bills that have no separate local-history importer.
     #[serde(default)]
     pub source: String,
 }
@@ -3144,6 +3147,85 @@ impl DatabaseStore {
         Ok(changed > 0)
     }
 
+    /// Persist one exact Grok ACP turn bill.
+    ///
+    /// Grok does not expose a separate local history source for the usage
+    /// importer, so its authoritative `PromptResponse._meta.usage` must enter
+    /// the ledger at runtime. `import_key` is derived from the durable Codemux
+    /// thread id plus its unique turn id; replaying the same terminal event is
+    /// therefore an upsert, never a second charge. No table-price fallback is
+    /// performed here: an absent provider cost remains unknown.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_grok_live_usage_row(
+        &self,
+        import_key: &str,
+        created_at: i64,
+        thread_id: &str,
+        model: Option<&str>,
+        subagent: bool,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        reasoning_tokens: i64,
+        cost_usd: Option<f64>,
+        cost_source: Option<&str>,
+    ) -> Result<bool, String> {
+        // A cost label without a cost would claim precision the provider did
+        // not supply. Keep the two nullable fields coupled at the sink too.
+        let cost_source = cost_usd.and(cost_source);
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "INSERT INTO agent_usage_ledger (
+                     created_at, thread_id, workspace_id, provider, model, subagent,
+                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, cost_usd, cost_source, source, import_key
+                 ) VALUES (
+                     ?1, ?2,
+                     (SELECT workspace_id FROM agent_chat_sessions WHERE thread_id = ?2),
+                     'grok', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'live', ?12
+                 )
+                 ON CONFLICT(import_key) WHERE import_key IS NOT NULL DO UPDATE SET
+                     created_at = MIN(agent_usage_ledger.created_at, excluded.created_at),
+                     workspace_id = COALESCE(agent_usage_ledger.workspace_id, excluded.workspace_id),
+                     model = COALESCE(excluded.model, agent_usage_ledger.model),
+                     subagent = MAX(agent_usage_ledger.subagent, excluded.subagent),
+                     input_tokens = MAX(agent_usage_ledger.input_tokens, excluded.input_tokens),
+                     output_tokens = MAX(agent_usage_ledger.output_tokens, excluded.output_tokens),
+                     cache_read_tokens = MAX(agent_usage_ledger.cache_read_tokens, excluded.cache_read_tokens),
+                     cache_write_tokens = MAX(agent_usage_ledger.cache_write_tokens, excluded.cache_write_tokens),
+                     reasoning_tokens = MAX(agent_usage_ledger.reasoning_tokens, excluded.reasoning_tokens),
+                     cost_usd = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_usd
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_usd
+                         ELSE COALESCE(excluded.cost_usd, agent_usage_ledger.cost_usd)
+                     END,
+                     cost_source = CASE
+                         WHEN excluded.cost_source = 'provider' THEN excluded.cost_source
+                         WHEN agent_usage_ledger.cost_source = 'provider' THEN agent_usage_ledger.cost_source
+                         ELSE COALESCE(excluded.cost_source, agent_usage_ledger.cost_source)
+                     END,
+                     source = 'live'",
+                params![
+                    created_at,
+                    thread_id,
+                    model,
+                    subagent as i64,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    cost_usd,
+                    cost_source,
+                    import_key,
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert Grok live usage row: {e}"))?;
+        Ok(changed > 0)
+    }
+
     /// Materialize many provider records in one transaction. The first scan
     /// can contain tens of thousands of OpenCode messages, so one fsync per
     /// row would make an otherwise read-only history scan unreasonably slow.
@@ -3250,16 +3332,21 @@ impl DatabaseStore {
         Ok(())
     }
 
-    /// Drop the materialized usage cache and its source signatures.
+    /// Drop the rebuildable usage cache and its source signatures.
     /// Provider history remains authoritative, so the next scan can rebuild
-    /// every row after a parser or pricing change. This intentionally also
-    /// removes legacy runtime-ledger rows from older app versions; retaining
-    /// them beside provider history would double-count Codemux-launched work.
+    /// every imported row after a parser or pricing change. Exact Grok live
+    /// rows have no second history source and must survive that rebuild. Other
+    /// legacy live rows are removed because their providers *do* have history
+    /// importers and retaining them would double-count Codemux-launched work.
     pub fn reset_usage_history(&self) -> Result<usize, String> {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let removed = tx
-            .execute("DELETE FROM agent_usage_ledger", [])
+            .execute(
+                "DELETE FROM agent_usage_ledger
+                 WHERE provider != 'grok' OR source != 'live'",
+                [],
+            )
             .map_err(|e| format!("Failed to clear usage cache: {e}"))?;
         tx.execute("DELETE FROM usage_import_state", [])
             .map_err(|e| format!("Failed to clear import state: {e}"))?;
@@ -5469,10 +5556,79 @@ mod tests {
         assert_eq!(db.usage_rows_since(0).unwrap().len(), 2);
     }
 
-    /// A corrected importer rebuilds the entire derived cache, including
-    /// legacy runtime rows that would otherwise double-count.
     #[test]
-    fn resetting_usage_history_clears_all_rows_and_state() {
+    fn grok_live_usage_is_idempotent_and_preserves_exact_or_unknown_cost() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("grok-thread", "ws-grok", Some("/repo"), "grok")
+            .unwrap();
+
+        assert!(db
+            .upsert_grok_live_usage_row(
+                "grok:grok-thread:turn-1",
+                1_800_000_000_000,
+                "grok-thread",
+                Some("grok-future"),
+                false,
+                100,
+                10,
+                20,
+                5,
+                3,
+                Some(0.25),
+                Some("provider"),
+            )
+            .unwrap());
+        // A replay of the same terminal turn upserts its stable key rather
+        // than creating a second charge.
+        db.upsert_grok_live_usage_row(
+            "grok:grok-thread:turn-1",
+            1_800_000_000_000,
+            "grok-thread",
+            Some("grok-future"),
+            false,
+            100,
+            10,
+            20,
+            5,
+            3,
+            Some(0.25),
+            Some("provider"),
+        )
+        .unwrap();
+        // Missing cost is authoritative too: do not invent a table estimate.
+        db.upsert_grok_live_usage_row(
+            "grok:grok-thread:turn-2",
+            1_800_000_000_001,
+            "grok-thread",
+            Some("grok-future"),
+            false,
+            7,
+            2,
+            0,
+            0,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rows = db.usage_rows_since(0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].workspace_id.as_deref(), Some("ws-grok"));
+        assert_eq!(rows[0].provider, "grok");
+        assert_eq!(rows[0].source, "live");
+        assert_eq!(rows[0].total_tokens(), 135);
+        assert_eq!(rows[0].reasoning_tokens, 3);
+        assert_eq!(rows[0].cost_usd, Some(0.25));
+        assert_eq!(rows[0].cost_source.as_deref(), Some("provider"));
+        assert_eq!(rows[1].cost_usd, None);
+        assert_eq!(rows[1].cost_source, None);
+    }
+
+    /// A corrected importer rebuilds only its derived cache. Exact Grok live
+    /// rows have no provider-history replacement and must survive.
+    #[test]
+    fn resetting_usage_history_preserves_exact_grok_live_rows() {
         let db = init_test_database();
         db.upsert_provider_usage_row(
             "claude:msg_A:req_1",
@@ -5490,12 +5646,11 @@ mod tests {
             Some("table"),
         )
         .unwrap();
-        db.insert_usage_row(
+        db.upsert_grok_live_usage_row(
+            "grok:thread-live:turn-1",
             1_800_000_000_000,
             "thread-live",
-            None,
-            "claude",
-            Some("claude-opus-4-5"),
+            Some("grok-future"),
             false,
             10,
             40,
@@ -5503,7 +5658,7 @@ mod tests {
             0,
             0,
             Some(2.0),
-            Some("table"),
+            Some("provider"),
         )
         .unwrap();
         db.set_usage_import_state("/logs/a.jsonl", 1, 2, 2, 3)
@@ -5512,12 +5667,14 @@ mod tests {
 
         assert_eq!(
             db.reset_usage_history().unwrap(),
-            2,
-            "both cache generations"
+            1,
+            "only the rebuildable provider-history row"
         );
 
         let rows = db.usage_rows_since(0).unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "grok");
+        assert_eq!(rows[0].source, "live");
         // The per-file state must go with it, or the rebuild scan would
         // skip every unchanged file and import nothing.
         assert!(db.usage_import_state("/logs/a.jsonl").unwrap().is_none());

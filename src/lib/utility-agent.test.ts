@@ -62,10 +62,12 @@ afterEach(() => {
     claude: null,
     codex: null,
     cursor: null,
+    grok: null,
     opencode: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
+    grokError: null,
     opencodeError: null,
   });
   useSettingsStore.setState({ settings: {} });

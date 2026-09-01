@@ -289,6 +289,36 @@ describe("UsageSection", () => {
     expect(screen.getAllByText("API equivalent").length).toBe(2);
   });
 
+  it("recognizes Grok usage as a first-class provider", async () => {
+    const base = summary();
+    const baseProvider = base.providers[0]!;
+    vi.mocked(usageSummary).mockResolvedValue(
+      summary({
+        providers: [
+          {
+            ...baseProvider,
+            provider: "grok",
+            models: [
+              {
+                model: "default",
+                tokens: baseProvider.tokens,
+                cost_usd: baseProvider.cost_usd,
+                subagent_tokens: 0,
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    render(<UsageSection />);
+    expect((await screen.findAllByText("Grok")).length).toBeGreaterThan(0);
+    expect(screen.getByAltText("Grok")).toHaveAttribute(
+      "data-provider",
+      "grok",
+    );
+  });
+
   it("reveals per-model rows only when a lane is expanded", async () => {
     render(<UsageSection />);
     // "Claude Code" appears in both the legend and the lane header.

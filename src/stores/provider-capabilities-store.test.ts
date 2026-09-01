@@ -27,10 +27,12 @@ vi.mock("@/tauri/commands", () => ({
 import {
   CURSOR_CAPABILITY_REFRESH_MS,
   CURSOR_CAPABILITY_TTL_MS,
+  GROK_CAPABILITY_REFRESH_MS,
   selectCapabilities,
   selectError,
   selectModel,
   shouldRefreshCursorCapabilities,
+  shouldRefreshGrokCapabilities,
   useProviderCapabilities,
 } from "./provider-capabilities-store";
 import type {
@@ -71,10 +73,12 @@ function resetStore() {
     claude: null,
     codex: null,
     cursor: null,
+    grok: null,
     opencode: null,
     claudeError: null,
     codexError: null,
     cursorError: null,
+    grokError: null,
     opencodeError: null,
     loaded: false,
   });
@@ -114,7 +118,7 @@ describe("provider-capabilities-store", () => {
     expect(state.codexError).toBeNull();
   });
 
-  it("refreshAll fires all four providers in parallel", async () => {
+  it("refreshAll fires all five providers in parallel", async () => {
     const calls: AgentChatProviderKind[] = [];
     mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
       calls.push(provider);
@@ -124,12 +128,19 @@ describe("provider-capabilities-store", () => {
     await useProviderCapabilities.getState().refreshAll();
     // Order is not guaranteed, but every provider must have been
     // called exactly once.
-    expect(calls.sort()).toEqual(["claude", "codex", "cursor", "opencode"]);
+    expect(calls.sort()).toEqual([
+      "claude",
+      "codex",
+      "cursor",
+      "grok",
+      "opencode",
+    ]);
     const state = useProviderCapabilities.getState();
     expect(state.loaded).toBe(true);
     expect(state.claude).not.toBeNull();
     expect(state.codex).not.toBeNull();
     expect(state.cursor).not.toBeNull();
+    expect(state.grok).not.toBeNull();
     expect(state.opencode).not.toBeNull();
   });
 
@@ -148,6 +159,7 @@ describe("provider-capabilities-store", () => {
     expect(state.claude?.models[0]?.id).toBe("model-claude");
     expect(state.codex?.models[0]?.id).toBe("model-codex");
     expect(state.cursor?.models[0]?.id).toBe("model-cursor");
+    expect(state.grok?.models[0]?.id).toBe("model-grok");
     expect(state.opencode).toBeNull();
     expect(state.opencodeError).toBe("opencode_not_installed");
   });
@@ -157,11 +169,13 @@ describe("provider-capabilities-store", () => {
     const claudeCaps = makeCaps("claude-opus-4-7");
     const codexCaps = makeCaps("gpt-5.4");
     const cursorCaps = makeCaps("auto");
+    const grokCaps = makeCaps("default");
     const opencodeCaps = makeCaps("openai/gpt-5");
     useProviderCapabilities.setState({
       claude: claudeCaps,
       codex: codexCaps,
       cursor: cursorCaps,
+      grok: grokCaps,
       opencode: opencodeCaps,
     });
 
@@ -169,6 +183,7 @@ describe("provider-capabilities-store", () => {
     expect(selectCapabilities(updated, "claude")).toBe(claudeCaps);
     expect(selectCapabilities(updated, "codex")).toBe(codexCaps);
     expect(selectCapabilities(updated, "cursor")).toBe(cursorCaps);
+    expect(selectCapabilities(updated, "grok")).toBe(grokCaps);
     // The Stage 2 bug: a non-exhaustive ternary returned `state.codex`
     // for any non-claude provider. Pin the fix here so a regression
     // can't reintroduce it silently.
@@ -184,12 +199,14 @@ describe("provider-capabilities-store", () => {
       claudeError: "claude broke",
       codexError: "codex broke",
       cursorError: "cursor_not_authenticated",
+      grokError: "grok_not_authenticated",
       opencodeError: "opencode_not_installed",
     });
     const state = useProviderCapabilities.getState();
     expect(selectError(state, "claude")).toBe("claude broke");
     expect(selectError(state, "codex")).toBe("codex broke");
     expect(selectError(state, "cursor")).toBe("cursor_not_authenticated");
+    expect(selectError(state, "grok")).toBe("grok_not_authenticated");
     expect(selectError(state, "opencode")).toBe("opencode_not_installed");
   });
 
@@ -281,6 +298,25 @@ describe("cursor capability polling", () => {
     // Never probed yet — the harvest is how the picker learns Cursor
     // exists, so an unknown slot must still refresh.
     expect(shouldRefreshCursorCapabilities(null)).toBe(true);
+  });
+});
+
+describe("grok capability polling", () => {
+  it("uses the bounded live-discovery cadence", () => {
+    expect(GROK_CAPABILITY_REFRESH_MS).toBe(CURSOR_CAPABILITY_REFRESH_MS);
+  });
+
+  it("skips the poll only when Grok is known to be missing", () => {
+    const report = (installed: boolean) => ({
+      provider: "grok" as const,
+      status: "ready" as const,
+      installed,
+      message: null,
+      version: null,
+    });
+    expect(shouldRefreshGrokCapabilities(report(false))).toBe(false);
+    expect(shouldRefreshGrokCapabilities(report(true))).toBe(true);
+    expect(shouldRefreshGrokCapabilities(null)).toBe(true);
   });
 });
 

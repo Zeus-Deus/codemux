@@ -23,6 +23,7 @@ import {
 } from "./derive-title";
 import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { applyAllPrefixes } from "./mode-prefix";
+import { normalizeChatModeForProvider } from "./mode-compatibility";
 import { formatProviderError } from "./provider-error";
 import type { UserMessageImage } from "./types";
 import type { ResolvedSkillSelection } from "./skill-tokens";
@@ -360,7 +361,7 @@ export async function materializeAndSend(
       thread_id: draft.threadId,
       text: applyAllPrefixes(
         exactSkillSelection?.text ?? text,
-        draft.mode,
+        normalizeChatModeForProvider(draft.provider, draft.mode),
         draft.effort,
         typeof skillBodies === "string" ? skillBodies : null,
         attachmentBlock,
@@ -559,7 +560,7 @@ export async function materializeWithPreset(
           thread_id: draft.threadId,
           text: applyAllPrefixes(
             exactSkills?.text ?? prompt,
-            draft.mode,
+            normalizeChatModeForProvider(draft.provider, draft.mode),
             draft.effort,
             typeof skillBodies === "string" ? skillBodies : null,
           ),
@@ -658,7 +659,10 @@ function seedSliceFromDraft(
     actions.setContextWindow(draft.threadId, draft.contextWindow);
   }
   actions.setFastMode(draft.threadId, draft.fastMode ?? false);
-  actions.setMode(draft.threadId, draft.mode);
+  actions.setMode(
+    draft.threadId,
+    normalizeChatModeForProvider(draft.provider, draft.mode),
+  );
 }
 
 /** Resolve the permission_mode the SDK session should launch with.
@@ -669,7 +673,8 @@ function seedSliceFromDraft(
  *  ExitPlanMode). The picker is hidden behind the pill while either
  *  is active. Debug remains a state-only flip until Stage 6. */
 export function effectivePermissionMode(draft: ChatDraft): string | null {
-  if (draft.mode === "plan" || draft.mode === "ask") return "plan";
+  const mode = normalizeChatModeForProvider(draft.provider, draft.mode);
+  if (mode === "plan" || mode === "ask") return "plan";
   return (
     draft.permissionMode ?? defaultPermissionModeForProvider(draft.provider)
   );

@@ -1469,6 +1469,8 @@ export interface AgentChatStartSessionInput {
   cwd: string;
   model: string | null;
   resume_cursor: unknown | null;
+  /** Do not recover a persisted provider-native cursor for this start. */
+  fresh_session?: boolean;
   permission_mode: string | null;
   /** Claude only — session-scoped reasoning effort. */
   effort?: string | null;
@@ -1755,7 +1757,7 @@ export interface AgentChatSessionRecord {
   sdk_session_id: string | null;
   workspace_id: string;
   cwd: string | null;
-  provider: string;
+  provider: AgentChatProviderKind;
   title: string | null;
   created_at: string;
   last_active_at: string;
@@ -2375,8 +2377,8 @@ export interface ProviderSlashCommand {
 
 /** List the provider-native slash commands for a thread anchored at
  *  `cwd`. Claude harvests via the Agent SDK's `supportedCommands()`
- *  (cached per cwd backend-side); Codex/OpenCode currently resolve to
- *  an empty list because they expose no discovery surface. */
+ *  and Grok uses its ACP initialize/live command snapshot (both cached per
+ *  cwd backend-side). Providers without discovery resolve to an empty list. */
 export const listChatSlashCommands = (
   provider: AgentChatProviderKind,
   cwd: string,

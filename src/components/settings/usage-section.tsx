@@ -54,6 +54,7 @@ const SERIES_FILL: Record<string, string> = {
   claude: "bg-accent-ember",
   codex: "bg-foreground/45",
   cursor: "bg-accent-violet",
+  grok: "bg-foreground/70",
   opencode: "bg-status-open",
 };
 
@@ -64,6 +65,7 @@ const SERIES_COLOR: Record<string, { color: string; opacity: number }> = {
   claude: { color: "var(--accent-ember)", opacity: 1 },
   codex: { color: "var(--foreground)", opacity: 0.55 },
   cursor: { color: "var(--accent-violet)", opacity: 1 },
+  grok: { color: "var(--foreground)", opacity: 0.8 },
   opencode: { color: "var(--status-open)", opacity: 1 },
 };
 
@@ -77,6 +79,7 @@ const SERIES_LABEL: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
   cursor: "Cursor",
+  grok: "Grok",
   opencode: "OpenCode",
 };
 
@@ -98,6 +101,7 @@ function isKnownProvider(provider: string): provider is AgentChatProviderKind {
     provider === "claude" ||
     provider === "codex" ||
     provider === "cursor" ||
+    provider === "grok" ||
     provider === "opencode"
   );
 }

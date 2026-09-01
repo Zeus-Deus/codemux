@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cwd,
             model: Some(model.clone()),
             resume_cursor: None,
+            fresh_session: false,
             permission_mode: None,
             effort: None,
             context_window: None,

@@ -10,6 +10,8 @@ export function sessionProviderLabel(provider: string): string {
       return "Codex";
     case "cursor":
       return "Cursor";
+    case "grok":
+      return "Grok";
     case "opencode":
       return "OpenCode";
     default:

@@ -4,12 +4,14 @@
 //! integration (Claude Code, Codex, …). It is currently scaffolding — no
 //! user-visible behaviour is wired to it yet.
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
 pub mod context_usage;
 pub mod cursor;
 pub mod errors;
 pub mod events;
+pub mod grok;
 pub mod health;
 pub mod instance;
 pub mod opencode;

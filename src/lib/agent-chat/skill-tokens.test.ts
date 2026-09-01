@@ -383,3 +383,54 @@ describe("resolveSkillSelection", () => {
     ).toEqual({ skillIds: [target.id], text: "check it" });
   });
 });
+
+describe("skillsForProvider", () => {
+  function withProjection(
+    skill: Skill,
+    targetProvider: "claude" | "codex" | "opencode",
+    availability: "native" | "explicit-portable" | "native-only" | "unavailable",
+  ): Skill {
+    return {
+      ...skill,
+      projections: [
+        {
+          targetProvider,
+          availability,
+          compatibility: "compatible",
+          reasons: [],
+          invocation:
+            availability === "unavailable" || availability === "native-only"
+              ? "none"
+              : "prompt-prefix",
+        },
+      ],
+    };
+  }
+
+  it("uses the Codex-portable projection for Grok", () => {
+    const portable = withProjection(
+      makeSkill("portable"),
+      "codex",
+      "explicit-portable",
+    );
+    const unavailable = withProjection(
+      makeSkill("unavailable"),
+      "codex",
+      "unavailable",
+    );
+
+    expect(skillsForProvider([portable, unavailable], "grok")).toEqual([
+      portable,
+    ]);
+  });
+
+  it("fails closed when a projection-aware skill omits Grok's Codex target", () => {
+    const claudeOnly = withProjection(
+      makeSkill("claude-only"),
+      "claude",
+      "native",
+    );
+
+    expect(skillsForProvider([claudeOnly], "grok")).toEqual([]);
+  });
+});

@@ -313,7 +313,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   };
 
   // The official mark of each agent provider chatting in this workspace
-  // (Claude / Codex / OpenCode), shown on the meta line's right cluster.
+  // shown on the meta line's right cluster.
   const providers = getWorkspaceProviders(workspace.surfaces);
 
   // With the Snooze menu open the swap can no longer be driven by hover/focus

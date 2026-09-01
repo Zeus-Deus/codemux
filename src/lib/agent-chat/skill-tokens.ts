@@ -2,7 +2,7 @@
 // resolve to stable ids; the backend revalidates those ids at turn time and
 // chooses the provider-specific invocation mechanism.
 
-import type { Skill } from "@/tauri/commands";
+import type { Skill, SkillProvider } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 export interface SkillTokenMatch {
@@ -25,6 +25,23 @@ export interface SkillTokenMatch {
 const SKILL_TOKEN_RE =
   /(?<=^|\s)\/([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3})(?=[^A-Za-z0-9_:-]|$)/g;
 
+/** Match chat adapters to the projection the backend invokes for them. */
+function projectionProviderForChat(
+  provider: AgentChatProviderKind,
+): SkillProvider {
+  switch (provider) {
+    case "claude":
+    case "codex":
+    case "opencode":
+      return provider;
+    // Cursor and Grok have no native SKILL.md inventory. The backend feeds
+    // both the portable `.agents/skills` / Codex projection.
+    case "cursor":
+    case "grok":
+      return "codex";
+  }
+}
+
 /** Keep popup tokens, highlighting, and send-time resolution on the same
  * target-provider inventory. An unavailable name collision must not change
  * the token address after the user selects it. */
@@ -32,14 +49,19 @@ export function skillsForProvider(
   skills: Skill[],
   provider: AgentChatProviderKind,
 ): Skill[] {
+  const targetProvider = projectionProviderForChat(provider);
   return skills.filter((skill) => {
-    const projection = skill.projections?.find(
-      (candidate) => candidate.targetProvider === provider,
+    // Old cached/test records can predate projections entirely. Keep their
+    // legacy availability, but once a record supplies a projection table an
+    // absent target is fail-closed so popup and backend validation agree.
+    if (!skill.projections) return true;
+    const projection = skill.projections.find(
+      (candidate) => candidate.targetProvider === targetProvider,
     );
     return (
-      !projection ||
-      (projection.availability !== "unavailable" &&
-        projection.availability !== "native-only")
+      projection !== undefined &&
+      projection.availability !== "unavailable" &&
+      projection.availability !== "native-only"
     );
   });
 }

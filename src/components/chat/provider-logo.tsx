@@ -8,12 +8,14 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import claudeIcon from "@/assets/preset-icons/claude.svg";
 import codexIcon from "@/assets/preset-icons/codex.svg";
 import cursorIcon from "@/assets/preset-icons/cursor-agent.svg";
+import grokIcon from "@/assets/preset-icons/grok.svg";
 import opencodeIcon from "@/assets/preset-icons/opencode.svg";
 
 const PROVIDER_ICON_MAP: Record<AgentChatProviderKind, string> = {
   claude: claudeIcon,
   codex: codexIcon,
   cursor: cursorIcon,
+  grok: grokIcon,
   opencode: opencodeIcon,
 };
 
@@ -21,6 +23,7 @@ const PROVIDER_LABEL: Record<AgentChatProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
   cursor: "Cursor",
+  grok: "Grok",
   opencode: "OpenCode",
 };
 

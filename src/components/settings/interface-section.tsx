@@ -111,7 +111,10 @@ export function InterfaceSection() {
 
         {showDetails && (
           <ul className="text-xs text-muted-foreground space-y-1 pt-2 border-t border-border">
-            <li>• Chat-based agent interface (Claude, Codex, OpenCode)</li>
+            <li>
+              • Chat-based agent interface (Claude, Codex, Cursor, Grok,
+              OpenCode)
+            </li>
             <li>• MCP server runtime and management</li>
             <li>• Cross-provider skills system with cross-device sync</li>
             <li>• Mode pills (Plan, Debug, Ask) and Shift+Tab cycling</li>

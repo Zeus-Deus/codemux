@@ -160,8 +160,9 @@ export function planModelChange(
  *
  * - `text`: the user's draft, possibly with the ultrathink prefix
  *   re-applied as a belt-and-braces defense for Claude.
- * - `effortOverride`: the per-turn effort to pass to Codex's RPC.
- *   `null` for Claude (which applies effort at session init).
+ * - `effortOverride`: the per-turn effort to pass to providers whose
+ *   runtime applies reasoning dynamically. `null` for Claude (which applies
+ *   effort at session init).
  */
 export interface SubmitPlan {
   text: string;
@@ -183,7 +184,9 @@ export function planSubmit(input: PlanSubmitInput): SubmitPlan {
   return {
     text,
     effortOverride:
-      provider === "codex" || provider === "cursor" ? effort : null,
+      provider === "codex" || provider === "cursor" || provider === "grok"
+        ? effort
+        : null,
   };
 }
 

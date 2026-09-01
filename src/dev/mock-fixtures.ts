@@ -2364,13 +2364,14 @@ function usageRnd(seed: number): number {
   return x - Math.floor(x);
 }
 
-const USAGE_PROVIDERS = ["claude", "codex", "opencode"] as const;
+const USAGE_PROVIDERS = ["claude", "codex", "grok", "opencode"] as const;
 
 /** Rough $/Mtok blend per provider, used to derive a plausible cost
  *  from a token count. */
 const USAGE_RATE: Record<string, number> = {
   claude: 9.4,
   codex: 7.1,
+  grok: 5.8,
   opencode: 4.6,
 };
 
@@ -2384,6 +2385,9 @@ const USAGE_MODELS: Record<string, { model: string; weight: number; subagent?: b
     { model: "gpt-5-codex", weight: 0.64 },
     { model: "gpt-5-codex-mini", weight: 0.36 },
   ],
+  // Keep the runtime-owned sentinel here too: browser-dev must not pin the
+  // frontend to a concrete Grok release name.
+  grok: [{ model: "default", weight: 1 }],
   opencode: [
     { model: "anthropic/claude-sonnet-4-5", weight: 0.48 },
     { model: "openrouter/kimi-k2", weight: 0.31 },
@@ -2399,7 +2403,7 @@ const USAGE_MONTHS = [
 /** Realistic fixture for `usage_summary`.
  *
  *  Mirrors the shapes the real aggregation produces: Claude dominates,
- *  Codex is second, OpenCode is third, weekends dip,
+ *  Codex is second, Grok/OpenCode follow, weekends dip,
  *  and one Claude model carries all the subagent tokens. */
 export function mockUsageSummary(period: string): unknown {
   const hourly = period === "today";
@@ -2418,7 +2422,12 @@ export function mockUsageSummary(period: string): unknown {
   const buckets = [];
   // Per-provider running totals, accumulated from the same numbers the
   // buckets render so the lanes and the chart always agree.
-  const totals: Record<string, number> = { claude: 0, codex: 0, opencode: 0 };
+  const totals: Record<string, number> = {
+    claude: 0,
+    codex: 0,
+    grok: 0,
+    opencode: 0,
+  };
 
   for (let i = 0; i < count; i++) {
     const start = startMs + i * bucketMs;
@@ -2445,8 +2454,20 @@ export function mockUsageSummary(period: string): unknown {
     const providers: Record<string, { tokens: number; cost_usd: number }> = {};
     USAGE_PROVIDERS.forEach((provider, index) => {
       const base = hourly
-        ? provider === "claude" ? 90e3 : provider === "codex" ? 34e3 : 22e3
-        : provider === "claude" ? 620e3 : provider === "codex" ? 300e3 : 190e3;
+        ? provider === "claude"
+          ? 90e3
+          : provider === "codex"
+            ? 34e3
+            : provider === "grok"
+              ? 26e3
+              : 22e3
+        : provider === "claude"
+          ? 620e3
+          : provider === "codex"
+            ? 300e3
+            : provider === "grok"
+              ? 230e3
+              : 190e3;
       const span = hourly ? base * 1.5 : base * 1.4;
       const seed = Math.floor(start / bucketMs) * 3 + index * 97;
       const tokens = Math.round((base + usageRnd(seed) * span) * shape);

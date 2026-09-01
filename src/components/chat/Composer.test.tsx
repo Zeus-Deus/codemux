@@ -84,6 +84,27 @@ function renderComposer(props: Partial<ComposerProps> = {}) {
 }
 
 describe("Composer", () => {
+  it("keeps Enter-to-queue enabled while native configuration is frozen", () => {
+    const onSubmit = vi.fn();
+    const onModeActivate = vi.fn();
+    const { container, getByText } = renderComposer({
+      provider: "grok",
+      draft: "queued follow-up",
+      streaming: true,
+      configurationReady: false,
+      onSubmit,
+      onModeActivate,
+    });
+
+    const textarea = container.querySelector("textarea")!;
+    expect(getByText("Enter to queue")).toBeInTheDocument();
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
+    expect(onModeActivate).not.toHaveBeenCalled();
+  });
+
   describe("focus handoff", () => {
     it("focuses the textarea when a layout transition requests it", () => {
       const { container } = renderComposer({ focusOnMount: true });
@@ -572,6 +593,58 @@ describe("Composer", () => {
       expect(queryByTestId("slash-item-mode:debug")).not.toBeNull();
     });
 
+    it("keeps Grok Plan and Ask slash commands non-selectable", () => {
+      const onModeActivate = vi.fn();
+      const { container, getByTestId } = renderComposer({
+        provider: "grok",
+        mode: "default",
+        onModeActivate,
+      });
+      const textarea = getTextarea(container);
+
+      type(textarea, "/");
+
+      expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
+        "data-disabled",
+        "true",
+      );
+      expect(getByTestId("slash-item-mode:ask")).toHaveAttribute(
+        "data-disabled",
+        "true",
+      );
+      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
+        "data-disabled",
+        "false",
+      );
+
+      type(textarea, "/plan");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onModeActivate).not.toHaveBeenCalled();
+    });
+
+    it("refetches Grok's live command snapshot when the popup reopens", async () => {
+      const { container, queryByTestId } = renderComposer({
+        provider: "grok",
+      });
+      const textarea = getTextarea(container);
+
+      type(textarea, "/");
+      await waitFor(() =>
+        expect(listChatSlashCommandsMock).toHaveBeenCalledTimes(1),
+      );
+      type(textarea, "plain text");
+      expect(queryByTestId("slash-command-popup")).toBeNull();
+      type(textarea, "/");
+
+      await waitFor(() =>
+        expect(listChatSlashCommandsMock).toHaveBeenCalledTimes(2),
+      );
+      expect(listChatSlashCommandsMock).toHaveBeenLastCalledWith(
+        "grok",
+        "/home/user",
+      );
+    });
+
     it("filters items as the user types (/pl → only Plan)", () => {
       const { container, queryByTestId } = renderComposer({ mode: "default" });
       const textarea = getTextarea(container);
@@ -825,6 +898,33 @@ describe("Composer", () => {
       fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
       expect(onModeRemove).toHaveBeenCalled();
       expect(onModeActivate).not.toHaveBeenCalled();
+    });
+
+    it("skips unsupported Plan and Ask modes when cycling Grok", () => {
+      const onModeActivate = vi.fn();
+      const onModeRemove = vi.fn();
+      const { container, rerender } = renderComposer({
+        provider: "grok",
+        mode: "default",
+        onModeActivate,
+        onModeRemove,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
+      expect(onModeActivate).toHaveBeenCalledWith("debug");
+
+      rerender(
+        <TooltipProvider>
+          <Composer
+            {...baseProps()}
+            provider="grok"
+            mode="debug"
+            onModeActivate={onModeActivate}
+            onModeRemove={onModeRemove}
+          />
+        </TooltipProvider>,
+      );
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
+      expect(onModeRemove).toHaveBeenCalledTimes(1);
     });
 
     it("preventDefault is called on the keydown so native focus-tab nav doesn't run", () => {

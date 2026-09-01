@@ -368,6 +368,16 @@ describe("planSubmit", () => {
     expect(plan.effortOverride).toBeNull();
   });
 
+  it("Grok passes dynamically advertised effort per turn", () => {
+    const plan = planSubmit({
+      rawText: "build it",
+      provider: "grok",
+      effort: "future-effort",
+    });
+    expect(plan.text).toBe("build it");
+    expect(plan.effortOverride).toBe("future-effort");
+  });
+
   it("Codex never prepends ultrathink even when effort is 'ultrathink'", () => {
     // Shouldn't happen in practice (Codex has no ultrathink), but the
     // submit plan should NOT mutate text for the Codex branch.

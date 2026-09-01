@@ -110,6 +110,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         cwd: std::env::temp_dir(),
         model: None,
         resume_cursor: None,
+        fresh_session: false,
         permission_mode: None,
         effort: None,
         context_window: None,

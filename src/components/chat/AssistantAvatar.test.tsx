@@ -16,13 +16,25 @@ vi.mock("@/assets/preset-icons/claude.svg", () => ({
 vi.mock("@/assets/preset-icons/codex.svg", () => ({
   default: "/mock/codex.svg",
 }));
+vi.mock("@/assets/preset-icons/cursor-agent.svg", () => ({
+  default: "/mock/cursor.svg",
+}));
+vi.mock("@/assets/preset-icons/grok.svg", () => ({
+  default: "/mock/grok.svg",
+}));
 vi.mock("@/assets/preset-icons/opencode.svg", () => ({
   default: "/mock/opencode.svg",
 }));
 
 afterEach(() => cleanup());
 
-const PROVIDERS: AgentChatProviderKind[] = ["claude", "codex", "opencode"];
+const PROVIDERS: AgentChatProviderKind[] = [
+  "claude",
+  "codex",
+  "cursor",
+  "grok",
+  "opencode",
+];
 
 describe("AssistantAvatar", () => {
   it.each(PROVIDERS)(
@@ -45,7 +57,7 @@ describe("AssistantAvatar", () => {
     expect(box.className).not.toContain("bg-foreground/8");
   });
 
-  it.each(["codex", "opencode"] as const)(
+  it.each(["codex", "cursor", "grok", "opencode"] as const)(
     "uses a neutral wash for the neutral %s mark",
     (provider) => {
       const { container } = render(<AssistantAvatar provider={provider} />);

@@ -58,6 +58,10 @@ interface Props {
   onSubmit: () => void;
   onStop: () => void;
   controlsDisabled: boolean;
+  /** Disables provider/model/runtime configuration without disabling the
+   *  attachment affordance. This lets an active provider turn keep accepting
+   *  queued follow-ups while its native session configuration is frozen. */
+  configurationDisabled?: boolean;
   /** Step 8 Stage 3 — toggles the attach popup. Optional so existing
    *  call sites keep compiling; when omitted the `+` button is hidden. */
   onAttachClick?: () => void;
@@ -108,6 +112,7 @@ export function ComposerFooter({
   onSubmit,
   onStop,
   controlsDisabled,
+  configurationDisabled = controlsDisabled,
   onAttachClick,
   attachOpen = false,
   modelPickerOpenSignal,
@@ -166,7 +171,7 @@ export function ComposerFooter({
             provider={provider}
             model={model}
             onProviderModelChange={onProviderModelChange}
-            disabled={controlsDisabled}
+            disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
           />
         ) : (
@@ -174,7 +179,7 @@ export function ComposerFooter({
             provider={provider}
             value={model}
             onChange={onModelChange}
-            disabled={controlsDisabled}
+            disabled={configurationDisabled}
             openSignal={modelPickerOpenSignal}
           />
         )}
@@ -188,7 +193,7 @@ export function ComposerFooter({
           onEffortChange={onEffortChange}
           onContextWindowChange={onContextWindowChange}
           onFastModeChange={onFastModeChange}
-          disabled={controlsDisabled}
+          disabled={configurationDisabled}
           withSeparator
         />
         {/* Permission picker stays visible when a mode pill is
@@ -201,7 +206,7 @@ export function ComposerFooter({
           modes={permissionModes}
           value={permissionMode}
           onChange={onPermissionModeChange}
-          disabled={controlsDisabled || modeIsActive}
+          disabled={configurationDisabled || modeIsActive}
           withSeparator
         />
         {tasks && tasks.total > 0 && onTasksClick && (

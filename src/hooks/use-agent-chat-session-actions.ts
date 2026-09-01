@@ -78,6 +78,11 @@ export function useAgentChatSessionActions(
         );
         return;
       }
+      // Session history is intentionally provider-neutral. The selected
+      // record is therefore authoritative for the adapter that owns its
+      // model and native resume cursor; `provider` only identifies the
+      // currently-running adapter that must be stopped first.
+      const targetProvider = record.provider;
       try {
         if (threadId) {
           await agentChatStopSession(provider, threadId).catch(() => {
@@ -103,7 +108,9 @@ export function useAgentChatSessionActions(
           if (rows.length > 0) {
             useAgentChatStore
               .getState()
-              .hydrateThread(newLocalThreadId, rows, { provider });
+              .hydrateThread(newLocalThreadId, rows, {
+                provider: targetProvider,
+              });
           }
         } catch (err) {
           // Hydration failure is non-fatal — the SDK still has the
@@ -120,26 +127,31 @@ export function useAgentChatSessionActions(
         // prevent. Model falls back to the provider default the same way
         // the pane's on-mount seed effect does; effort/context ride through
         // as-is (null means "use the model default").
-        const resolvedModel = record.model ?? defaultModelForProvider(provider);
+        const resolvedModel =
+          record.model ?? defaultModelForProvider(targetProvider);
         // OpenCode has no chat-side permission picker: launch with null even
         // if the record carries a stale cross-provider token.
         const resolvedMode =
-          provider === "opencode"
+          targetProvider === "opencode"
             ? null
             : (record.permission_mode ??
-              defaultPermissionModeForProvider(provider));
-        const newThreadId = await agentChatStartSession(paneId, provider, {
-          thread_id: newLocalThreadId,
-          cwd,
-          model: record.model,
-          resume_cursor: { resume: record.sdk_session_id },
-          permission_mode: resolvedMode,
-          effort: record.effort,
-          context_window: record.context_window,
-          fast_mode: record.fast_mode ?? false,
-          additional_directories: [],
-          env: null,
-        });
+              defaultPermissionModeForProvider(targetProvider));
+        const newThreadId = await agentChatStartSession(
+          paneId,
+          targetProvider,
+          {
+            thread_id: newLocalThreadId,
+            cwd,
+            model: record.model,
+            resume_cursor: { resume: record.sdk_session_id },
+            permission_mode: resolvedMode,
+            effort: record.effort,
+            context_window: record.context_window,
+            fast_mode: record.fast_mode ?? false,
+            additional_directories: [],
+            env: null,
+          },
+        );
         // Seed the store slice for the freshly-started thread so the footer
         // pickers reflect the launched config. `permissionMode` and
         // `sessionLaunchMode` MUST agree — a mismatch is read as "the user

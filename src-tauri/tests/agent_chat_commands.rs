@@ -30,13 +30,13 @@ use tauri::{Listener, State};
 use tokio::time::timeout;
 
 use codemux_lib::agent_provider::{
-    ApprovalDecision, CompletedItem, ProviderKind, ProviderRuntimeEvent, RequestId,
-    SendTurnInput, StartSessionInput, ThreadId, TurnId,
+    ApprovalDecision, CompletedItem, CostSource, ProviderKind, ProviderRuntimeEvent, RequestId,
+    SendTurnInput, StartSessionInput, ThreadId, TurnId, TurnStatus,
 };
 use codemux_lib::commands::agent_chat::{
     agent_chat_respond_to_request, feature_flag_on, forward_event, thread_id_for_event,
-    AgentChatChannelRegistry, AgentChatEventPayload, ProviderRegistry, RunActivityTracker,
-    SubagentTracker, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
+    AgentChatChannelRegistry, AgentChatEventPayload, GrokUsageLedgerBridge, ProviderRegistry,
+    RunActivityTracker, SubagentTracker, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
@@ -64,6 +64,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         cwd: std::path::PathBuf::from("/tmp/codemux-test"),
         model: None,
         resume_cursor: None,
+        fresh_session: false,
         permission_mode: None,
         effort: None,
         context_window: None,
@@ -408,10 +409,59 @@ fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_app();
     app.manage(DatabaseStore::new_in_memory());
     app.manage(AgentChatChannelRegistry::default());
+    app.manage(GrokUsageLedgerBridge::default());
     app.manage(SubagentTracker::default());
     app.manage(RunActivityTracker::default());
     app.manage(AppStateStore::default());
     app
+}
+
+#[test]
+fn event_bridge_persists_exact_grok_usage_once_per_turn() {
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("thread-grok-usage", "workspace-grok", Some("/repo"), "grok")
+        .unwrap();
+
+    let usage = || ProviderRuntimeEvent::UsageRecorded {
+        thread_id: ThreadId("thread-grok-usage".into()),
+        provider: ProviderKind::Grok,
+        model: Some("grok-future".into()),
+        subagent: false,
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_read_tokens: 20,
+        cache_write_tokens: 5,
+        reasoning_tokens: 3,
+        cost_usd: Some(0.25),
+        cost_source: Some(CostSource::Provider),
+    };
+    let completed = || ProviderRuntimeEvent::TurnCompleted {
+        thread_id: ThreadId("thread-grok-usage".into()),
+        turn_id: TurnId("turn-usage-1".into()),
+        status: TurnStatus::Success,
+        usage: None,
+    };
+
+    forward_event(&handle, usage());
+    assert!(db.usage_rows_since(0).unwrap().is_empty());
+    forward_event(&handle, completed());
+    // Replaying the same terminal pair upserts `thread + turn`; it does not
+    // charge the same provider turn twice.
+    forward_event(&handle, usage());
+    forward_event(&handle, completed());
+
+    let rows = db.usage_rows_since(0).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.provider, "grok");
+    assert_eq!(row.source, "live");
+    assert_eq!(row.workspace_id.as_deref(), Some("workspace-grok"));
+    assert_eq!(row.total_tokens(), 135);
+    assert_eq!(row.reasoning_tokens, 3);
+    assert_eq!(row.cost_usd, Some(0.25));
+    assert_eq!(row.cost_source.as_deref(), Some("provider"));
 }
 
 /// Real `tauri::ipc::Channel` whose handler decodes and captures every
@@ -1131,6 +1181,7 @@ mod auto_resume {
                 cwd: cwd.clone(),
                 model: None,
                 resume_cursor: None,
+                fresh_session: false,
                 permission_mode: None,
                 effort: None,
                 context_window: None,

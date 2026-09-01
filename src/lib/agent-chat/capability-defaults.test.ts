@@ -49,9 +49,13 @@ function resetCaps() {
   useProviderCapabilities.setState({
     claude: null,
     codex: null,
+    cursor: null,
+    grok: null,
     opencode: null,
     claudeError: null,
     codexError: null,
+    cursorError: null,
+    grokError: null,
     opencodeError: null,
     loaded: false,
   });
@@ -80,6 +84,17 @@ describe("capability-defaults", () => {
     it("falls back to the hardcoded Codex default when caps are unhydrated", () => {
       expect(defaultModelId("codex")).toBe("gpt-5.4");
     });
+
+    it("uses the provider-native Grok default until live caps hydrate", () => {
+      expect(defaultModelId("grok")).toBe("default");
+    });
+
+    it("adopts the first live Grok model without a frontend model table", () => {
+      useProviderCapabilities.setState({
+        grok: makeClaudeCaps([makeModel({ id: "future-model-from-cli" })]),
+      });
+      expect(defaultModelId("grok")).toBe("future-model-from-cli");
+    });
   });
 
   describe("defaultPermissionModeForProvider", () => {
@@ -90,6 +105,7 @@ describe("capability-defaults", () => {
       expect(defaultPermissionModeForProvider("codex")).toBe(
         "danger-full-access",
       );
+      expect(defaultPermissionModeForProvider("grok")).toBe("agent");
       expect(defaultPermissionModeForProvider("opencode")).toBeNull();
     });
 

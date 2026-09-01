@@ -1279,6 +1279,41 @@ const CURSOR_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_turn",
 };
 
+/** Grok's ACP catalogue is discovered at runtime. The mock intentionally uses
+ * the provider-native `default` sentinel rather than pinning a released Grok
+ * model id, while still exercising dynamically advertised effort levels. */
+const GROK_CAPABILITIES: ProviderChatCapabilities = {
+  models: [
+    {
+      ...MOCK_CHAT_MODEL,
+      id: "default",
+      label: "Grok default",
+      description: "Selected by the installed Grok CLI",
+      effort_levels: ["low", "medium", "high"],
+      default_effort: "medium",
+      supports_images: true,
+    },
+  ],
+  effort_granularity: "per_turn",
+  effort_label_map: { low: "Low", medium: "Medium", high: "High" },
+  permission_modes: [
+    {
+      value: "ask",
+      label: "Ask first",
+      description: "Ask before commands or edits that need approval.",
+      is_default: false,
+    },
+    {
+      value: "agent",
+      label: "Full access",
+      description: "Allow Grok to work without approval prompts.",
+      is_default: true,
+    },
+  ],
+  default_permission_mode: "agent",
+  permission_granularity: "per_session",
+};
+
 /** Number of simulated turns in the seeded transcript. Every 5th turn
  * includes an 8-call tool burst (exercises run folding). At 520 turns the
  * derived transcript still has more than 1,100 independently virtualized
@@ -2330,7 +2365,12 @@ function streamMockRunStalled(
 
 /** Provider-health QA: per-provider override served by the
  *  `agent_chat_provider_health` mock handler. Absent → healthy. */
-type MockProviderKind = "claude" | "codex" | "cursor" | "opencode";
+type MockProviderKind =
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "grok"
+  | "opencode";
 const mockProviderHealth: Partial<
   Record<MockProviderKind, ProviderHealthReport>
 > = {};
@@ -3022,7 +3062,9 @@ const handlers: Record<string, Handler> = {
         ? CODEX_UTILITY_CAPABILITIES
         : a.provider === "cursor"
           ? CURSOR_CAPABILITIES
-        : EMPTY_CAPABILITIES,
+          : a.provider === "grok"
+            ? GROK_CAPABILITIES
+            : EMPTY_CAPABILITIES,
   // Provider slash commands — in production these are harvested live
   // from the deployed Claude Code CLI (SDK `supportedCommands()`),
   // including custom `.claude/commands` entries. The mock serves a

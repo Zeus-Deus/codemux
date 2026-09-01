@@ -1,8 +1,6 @@
 //! Cursor Agent provider using Cursor's official ACP stdio server.
 
 pub mod capabilities;
-mod protocol;
-mod session;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,7 +17,7 @@ use crate::agent_provider::{
     SessionStatus, StartSessionInput, ThreadId, TurnId, TurnStartResult,
 };
 
-use self::session::{CursorSession, CursorSpawnConfig};
+use crate::agent_provider::acp::session::{AcpDialect, AcpSession, AcpSpawnConfig};
 
 #[derive(Debug, Clone)]
 pub struct CursorProviderConfig {
@@ -38,7 +36,7 @@ impl Default for CursorProviderConfig {
 
 pub struct CursorAgentProvider {
     config: CursorProviderConfig,
-    sessions: Arc<RwLock<HashMap<ThreadId, Arc<CursorSession>>>>,
+    sessions: Arc<RwLock<HashMap<ThreadId, Arc<AcpSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
 
@@ -52,7 +50,7 @@ impl CursorAgentProvider {
         }
     }
 
-    async fn session(&self, thread_id: &ThreadId) -> Result<Arc<CursorSession>, ProviderError> {
+    async fn session(&self, thread_id: &ThreadId) -> Result<Arc<AcpSession>, ProviderError> {
         self.sessions
             .read()
             .await
@@ -123,7 +121,7 @@ impl AgentProvider for CursorAgentProvider {
         if let Some(dead) = dead_evicted {
             dead.shutdown().await;
         }
-        let session = CursorSession::spawn_and_initialize(
+        let session = AcpSession::spawn_and_initialize(
             thread_id.clone(),
             input.cwd,
             input.model,
@@ -133,8 +131,10 @@ impl AgentProvider for CursorAgentProvider {
             input.fast_mode,
             input.resume_cursor,
             input.env,
-            CursorSpawnConfig {
+            AcpSpawnConfig {
                 binary: self.config.binary.clone(),
+                dialect: AcpDialect::Cursor,
+                grok_slash_command_cache: None,
             },
             self.event_tx.clone(),
         )

@@ -1503,6 +1503,45 @@ describe("materializeWithPreset", () => {
   });
 
   describe("Stage 3 — mode pill propagation", () => {
+    it.each(["plan", "ask"] as const)(
+      "normalizes a stale Grok %s mode before session launch and slice seeding",
+      async (mode) => {
+        const actions = makeActions();
+        const draft = makeDraft({
+          target: { kind: "project", projectPath: "/projects/foo" },
+          provider: "grok",
+          permissionMode: "agent",
+          mode,
+        });
+
+        await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+        expect(agentChatStartSession).toHaveBeenCalledWith(
+          "pane-new",
+          "grok",
+          expect.objectContaining({ permission_mode: "agent" }),
+        );
+        expect(actions.setMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "default",
+        );
+        // The stale pill must not reach the wire in any form. `ask` would
+        // prepend its wrapper to the payload, and `plan` would seed the
+        // slice as a plan session — asserting the exact payload plus the
+        // seeded mode keeps both parameterizations honest.
+        const sendInput = vi.mocked(agentChatSendTurn).mock.calls[0]![1];
+        expect(sendInput.text).toBe("hi");
+        expect(actions.setPermissionMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "agent",
+        );
+        expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "agent",
+        );
+      },
+    );
+
     it("draft.mode='plan' overrides permission_mode to 'plan' on start_session", async () => {
       const actions = makeActions();
       const draft = makeDraft({

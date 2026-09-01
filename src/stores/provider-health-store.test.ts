@@ -70,6 +70,7 @@ describe("provider-health-store", () => {
         claude: emptyHealthSlot(),
         codex: emptyHealthSlot(),
         cursor: emptyHealthSlot(),
+        grok: emptyHealthSlot(),
         opencode: emptyHealthSlot(),
       },
     });
