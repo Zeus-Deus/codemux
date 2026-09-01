@@ -108,6 +108,7 @@ export function mergeSnapshot(
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
+  if (snap.description != null) next.description = snap.description;
   // Sticky like every other merged field: `task_progress` ticks carry no
   // `task_kind`, so a null must never un-classify a known watch loop.
   if (snap.task_kind != null) next.taskKind = snap.task_kind;
@@ -660,9 +661,12 @@ export function interruptRunningSubagents(
 export interface SubagentWave {
   /** The card id — stable React key and fold-state key. */
   id: string;
-  /** First line of the user prompt that spawned the wave, or null when
-   *  no user message precedes the card (a workflow-only or partially
-   *  hydrated transcript). See {@link subagentWaveTitle} for the fallback. */
+  /** Id of the user message that spawned the wave, or null when none
+   *  precedes the card (a workflow-only or partially hydrated
+   *  transcript). Consecutive waves sharing it came from one turn. */
+  promptId: string | null;
+  /** First line of that prompt, or null. The pane shows it once as a
+   *  divider per turn; the wave's own title is {@link subagentWaveTitle}. */
   prompt: string | null;
   subagents: SubagentView[];
 }
@@ -685,6 +689,7 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
   const waves: SubagentWave[] = [];
   const home = new Map<string, SubagentView[]>();
   let prompt: string | null = null;
+  let promptId: string | null = null;
   const ordered = messages.slice();
   ordered.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   for (const item of ordered) {
@@ -692,6 +697,7 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
       if (item.queued) continue;
       const line = firstLine(item.text);
       prompt = line.length > 0 ? line : null;
+      promptId = prompt == null ? null : item.id;
       continue;
     }
     if (item.kind !== "subagent_run") continue;
@@ -706,16 +712,36 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
       subagents.push(subagent);
       home.set(subagent.id, subagents);
     }
-    if (subagents.length > 0) waves.push({ id: item.id, prompt, subagents });
+    if (subagents.length > 0) {
+      waves.push({ id: item.id, promptId, prompt, subagents });
+    }
   }
   return waves;
 }
 
-/** Wave header title: the spawning prompt, else "Ran N subagents". */
+/**
+ * Wave header title: what the agents were asked to do. Each agent
+ * contributes its spawn description (the "3-5 word" task label), else
+ * its name / type; repeats collapse to a count, so a wave reads
+ * "Locate host inventory rows" or "Explore ×3 · Verify". Not the user
+ * prompt: one orchestrating turn can spawn a dozen waves, and the prompt
+ * would title every one of them identically.
+ *
+ * "Ran N subagents" only when no agent reported a label at all.
+ */
 export function subagentWaveTitle(wave: SubagentWave): string {
-  if (wave.prompt) return wave.prompt;
-  const n = wave.subagents.length;
-  return `Ran ${n} subagent${n === 1 ? "" : "s"}`;
+  const counts = new Map<string, number>();
+  for (const s of wave.subagents) {
+    const label = firstLine(s.description ?? s.name ?? s.agentType ?? "");
+    if (label.length === 0) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  if (counts.size === 0) {
+    const n = wave.subagents.length;
+    return `Ran ${n} subagent${n === 1 ? "" : "s"}`;
+  }
+  return Array.from(counts, ([label, n]) => (n > 1 ? `${label} ×${n}` : label))
+    .join(" · ");
 }
 
 /**

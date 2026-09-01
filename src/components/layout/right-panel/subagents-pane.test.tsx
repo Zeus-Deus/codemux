@@ -49,7 +49,7 @@ function twoWaves(): ChatViewItem[] {
     run("run-1", 1, [
       subagent({
         id: "impl",
-        name: "Subagent",
+        name: undefined,
         model: "haiku",
         status: "completed",
         resultText: "Patched session.ts, all 14 tests green",
@@ -58,7 +58,7 @@ function twoWaves(): ChatViewItem[] {
       }),
       subagent({
         id: "verify",
-        name: "Subagent",
+        name: undefined,
         model: "haiku",
         status: "stopped",
         resultText: "Stopped — superseded by wave 2 findings",
@@ -94,7 +94,7 @@ afterEach(() => {
 });
 
 describe("SubagentsPane — grouped waves with result-first rows", () => {
-  it("shows aggregate progress and titles the wave with its prompt", () => {
+  it("shows aggregate progress and titles the wave by its agents' work", () => {
     render(
       <SubagentsPane
         threadId="thread-1"
@@ -123,10 +123,14 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
       "1",
     );
     const wave = screen.getByRole("region", {
-      name: "Implement clipboard-paste fallback",
+      name: "Pricing audit · Verification pass",
     });
     expect(wave).toHaveAttribute("data-wave-status", "running");
     expect(screen.getByText("2 agents · 1 running")).toBeInTheDocument();
+    // The prompt is context above the wave, not its title.
+    expect(screen.getByTestId("wave-prompt")).toHaveTextContent(
+      "Implement clipboard-paste fallback",
+    );
     // Both rows: name, model capsule, and the excerpt line.
     expect(screen.getByText("Pricing audit")).toBeInTheDocument();
     expect(screen.getByText("Verification pass")).toBeInTheDocument();
@@ -140,14 +144,14 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
     expect(screen.getByText("All checks pass")).toBeInTheDocument();
   });
 
-  it("falls back to 'Ran N subagents' when no prompt precedes the wave", () => {
+  it("falls back to 'Ran N subagents' for unlabeled agents and omits the divider without a prompt", () => {
     render(
       <SubagentsPane
         threadId="thread-1"
         messages={[
           run("run-1", 0, [
-            subagent({ id: "a", status: "completed" }),
-            subagent({ id: "b", name: "Verify", status: "completed" }),
+            subagent({ id: "a", name: undefined, status: "completed" }),
+            subagent({ id: "b", name: undefined, status: "completed" }),
           ]),
         ]}
       />,
@@ -155,13 +159,48 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
     expect(
       screen.getByRole("region", { name: "Ran 2 subagents" }),
     ).toBeInTheDocument();
+    expect(screen.queryByTestId("wave-prompt")).toBeNull();
+  });
+
+  it("shows the prompt once per turn, titling each of its waves by description", () => {
+    render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={[
+          prompt("u-1", 0, "Ship the footer button"),
+          run("run-1", 1, [
+            subagent({
+              id: "shots",
+              description: "Capture before screenshots",
+              status: "completed",
+            }),
+          ]),
+          run("run-2", 2, [
+            subagent({ id: "rust", description: "Update host status" }),
+            subagent({ id: "ts", description: "Wire the footer command" }),
+          ]),
+          prompt("u-2", 3, "Now review it"),
+          run("run-3", 4, [subagent({ id: "rev", name: "Review" })]),
+        ]}
+      />,
+    );
+    expect(
+      screen.getAllByTestId("wave-prompt").map((n) => n.textContent),
+    ).toEqual(["›Ship the footer button", "›Now review it"]);
+    expect(
+      screen.getAllByRole("region").map((r) => r.getAttribute("aria-label")),
+    ).toEqual([
+      "Capture before screenshots",
+      "Update host status · Wire the footer command",
+      "Review",
+    ]);
   });
 
   it("keeps the latest wave open, folds older ones, and toggles on click", () => {
     render(<SubagentsPane threadId="thread-1" messages={twoWaves()} />);
 
-    const older = screen.getByRole("button", { name: /^Implement \+ verify/ });
-    const newer = screen.getByRole("button", { name: /^Issue analysis/ });
+    const older = screen.getByRole("button", { name: /^Ran 2 subagents/ });
+    const newer = screen.getByRole("button", { name: /^Explore ×2/ });
     expect(older).toHaveAttribute("aria-expanded", "false");
     expect(newer).toHaveAttribute("aria-expanded", "true");
     expect(
@@ -191,12 +230,12 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
   it("surfaces a failure on the wave header and numbers repeated names", () => {
     render(<SubagentsPane threadId="thread-1" messages={twoWaves()} />);
 
-    const failedWave = screen.getByRole("region", { name: "Issue analysis" });
+    const failedWave = screen.getByRole("region", { name: "Explore ×2" });
     expect(failedWave).toHaveAttribute("data-wave-status", "failed");
     expect(screen.getByText("2 agents · 1 failed")).toBeInTheDocument();
     // Folded wave still reports its rollup, including tokens and a halt.
     const olderWave = screen.getByRole("region", {
-      name: "Implement + verify",
+      name: "Ran 2 subagents",
     });
     expect(olderWave).toHaveAttribute("data-wave-status", "stopped");
     expect(
@@ -235,9 +274,7 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
       />,
     );
 
-    const wave = screen.getByRole("region", {
-      name: "Implement clipboard-paste fallback",
-    });
+    const wave = screen.getByRole("region", { name: "Explore ×2" });
     // The failure still wins the header glyph...
     expect(wave).toHaveAttribute("data-wave-status", "failed");
     // ...but the elapsed label follows the agent that is still running.

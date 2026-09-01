@@ -610,6 +610,7 @@ fn translate_task_part(
                     parent_item_id: Some(tool.call_id),
                     name: task_name(title.as_deref(), &input),
                     agent_type: string_field(&input, "subagent_type"),
+                    description: string_field(&input, "description"),
                     model: md.model_id(),
                     status: SubagentStatus::Running,
                     provider_ref: Some(child),
@@ -645,6 +646,7 @@ fn translate_task_part(
                     parent_item_id: Some(tool.call_id),
                     name: task_name(title.as_deref(), &input),
                     agent_type: string_field(&input, "subagent_type"),
+                    description: string_field(&input, "description"),
                     model: md.model_id(),
                     status,
                     result_text: Some(envelope.text),
@@ -675,6 +677,7 @@ fn translate_task_part(
                     subagent_id: child.clone(),
                     parent_item_id: Some(tool.call_id),
                     agent_type: string_field(&input, "subagent_type"),
+                    description: string_field(&input, "description"),
                     model: md.model_id(),
                     status: SubagentStatus::Failed,
                     result_text: Some(error),
@@ -754,6 +757,7 @@ fn empty_snapshot(id: &str) -> SubagentSnapshot {
         parent_item_id: None,
         name: None,
         agent_type: None,
+        description: None,
         // Neither provider reports a watch-loop-vs-agent distinction yet;
         // `None` reads as ordinary agent work everywhere downstream.
         task_kind: None,

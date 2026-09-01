@@ -701,7 +701,7 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
     subagents,
   });
 
-  it("titles each wave with the first line of the nearest preceding prompt", () => {
+  it("attributes each wave to the nearest preceding prompt (id + first line)", () => {
     const waves = subagentWaves([
       user("u1", 0, "  Implement + verify\nwith detail"),
       card("c1", 1, [sub("a")]),
@@ -715,22 +715,65 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
       } as ChatViewItem,
       card("c2", 4, [sub("b"), sub("c")]),
     ]);
-    expect(waves.map((w) => [w.id, w.prompt, w.subagents.length])).toEqual([
-      ["c1", "Implement + verify", 1],
-      ["c2", "Issue analysis", 2],
-    ]);
-    expect(waves.map(subagentWaveTitle)).toEqual([
-      "Implement + verify",
-      "Issue analysis",
+    expect(
+      waves.map((w) => [w.id, w.promptId, w.prompt, w.subagents.length]),
+    ).toEqual([
+      ["c1", "u1", "Implement + verify", 1],
+      ["c2", "u2", "Issue analysis", 2],
     ]);
   });
 
-  it("falls back to 'Ran N subagents' without a prompt, and skips empty cards", () => {
+  it("keeps one prompt across every wave an orchestrating turn spawns", () => {
+    // The shape that motivated description titles: one prompt, many
+    // cards. Each wave still knows its turn; the pane draws the prompt
+    // once and titles the waves by their work.
+    const waves = subagentWaves([
+      user("u1", 0, "Ship the footer button"),
+      card("c1", 1, [sub("a", { description: "Capture before screenshots" })]),
+      card("c2", 2, [sub("b", { description: "Update host status" })]),
+      card("c3", 3, [sub("c"), sub("d"), sub("e", { name: "Verify" })]),
+    ]);
+    expect(waves.map((w) => w.promptId)).toEqual(["u1", "u1", "u1"]);
+    expect(waves.map(subagentWaveTitle)).toEqual([
+      "Capture before screenshots",
+      "Update host status",
+      "Explore ×2 · Verify",
+    ]);
+  });
+
+  it("titles a wave by description, then name, then type; unlabeled waves fall back to a count", () => {
+    expect(
+      subagentWaveTitle({
+        id: "w",
+        promptId: null,
+        prompt: null,
+        subagents: [
+          sub("a", { description: "Find flaky tests\nsecond line" }),
+          sub("b", { name: undefined, agentType: "general-purpose" }),
+          sub("c", { name: undefined }),
+        ],
+      }),
+    ).toBe("Find flaky tests · general-purpose");
+    expect(
+      subagentWaveTitle({
+        id: "w",
+        promptId: null,
+        prompt: null,
+        subagents: [sub("a", { name: undefined })],
+      }),
+    ).toBe("Ran 1 subagent");
+  });
+
+  it("blank prompts and empty cards are skipped", () => {
     const waves = subagentWaves([
       card("empty", 0, []),
-      card("c1", 1, [sub("a")]),
+      card("c1", 1, [sub("a", { name: undefined })]),
       user("blank", 2, "   \n  "),
-      card("c2", 3, [sub("b"), sub("c")]),
+      card("c2", 3, [sub("b", { name: undefined }), sub("c", { name: undefined })]),
+    ]);
+    expect(waves.map((w) => [w.promptId, w.prompt])).toEqual([
+      [null, null],
+      [null, null],
     ]);
     expect(waves.map(subagentWaveTitle)).toEqual([
       "Ran 1 subagent",

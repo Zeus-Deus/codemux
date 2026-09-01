@@ -3,14 +3,16 @@
  * 32px work-log row; live detail, progress, and thread drill-in live here.
  *
  * Rows group by spawn wave (one `subagent_run` card each). A wave folds to
- * a single header — prompt, rollup, longest duration — so tens of finished
- * agents become a few groups. The latest wave and any wave still running
- * stay open; older ones fold. Each child row is two lines: name / model /
- * duration, then the first line of the agent's report, so a finished row
- * reads as a receipt rather than a tombstone.
+ * a single header — what the agents were asked to do, rollup, longest
+ * duration — so tens of finished agents become a few groups. The user
+ * prompt that started a turn appears once as a divider above that turn's
+ * waves (an orchestrating turn can spawn a dozen). The latest wave and any
+ * wave still running stay open; older ones fold. Each child row is two
+ * lines: name / model / duration, then the first line of the agent's
+ * report, so a finished row reads as a receipt rather than a tombstone.
  */
 import { Ban, Check, ChevronRight, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 
 import { TickingText } from "@/components/chat/TickingText";
 import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
@@ -108,24 +110,44 @@ export function SubagentsPane({
       />
 
       <div className="mt-3 flex flex-col gap-1.5">
-        {waves.map((wave) => {
+        {waves.map((wave, i) => {
           const running = wave.subagents.some(isRunning);
           const open = folds[wave.id] ?? (running || wave.id === latestWaveId);
+          const newTurn =
+            wave.prompt != null && wave.promptId !== waves[i - 1]?.promptId;
           return (
-            <WaveGroup
-              key={wave.id}
-              wave={wave}
-              open={open}
-              onToggle={() =>
-                setFolds((prev) => ({ ...prev, [wave.id]: !open }))
-              }
-              onOpen={openThread}
-              canOpen={threadId != null}
-            />
+            <Fragment key={wave.id}>
+              {newTurn && <PromptDivider text={wave.prompt ?? ""} />}
+              <WaveGroup
+                wave={wave}
+                open={open}
+                onToggle={() =>
+                  setFolds((prev) => ({ ...prev, [wave.id]: !open }))
+                }
+                onOpen={openThread}
+                canOpen={threadId != null}
+              />
+            </Fragment>
           );
         })}
       </div>
     </div>
+  );
+}
+
+/** The user prompt that started a turn, shown once above its waves. */
+function PromptDivider({ text }: { text: string }) {
+  return (
+    <p
+      data-testid="wave-prompt"
+      title={text}
+      className="mt-2 truncate px-1 text-[10px] text-muted-foreground/80 first:mt-0"
+    >
+      <span className="mr-1 text-muted-foreground/50" aria-hidden>
+        ›
+      </span>
+      {text}
+    </p>
   );
 }
 
