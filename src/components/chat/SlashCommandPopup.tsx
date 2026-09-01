@@ -1,5 +1,5 @@
 import { Command as CommandPrimitive } from "cmdk";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type SyntheticEvent } from "react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -7,6 +7,9 @@ import {
   groupSlashItems,
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
+
+/** Where a highlight change came from — see `onHighlightChange`. */
+export type HighlightSource = "pointer" | "list";
 
 /**
  * Optional muted footer row appended below all items. Used by Step 7
@@ -27,8 +30,14 @@ interface Props {
    *  Controlled so the parent can keep the textarea focused while the
    *  popup advances on Up/Down. */
   highlightedId: string | null;
-  /** Reports user-driven highlight changes (mouse hover). */
-  onHighlightChange: (id: string) => void;
+  /** Reports highlight changes. `source` says where one came from:
+   *  `"pointer"` when the cursor moved onto a row (a deliberate user
+   *  action, exactly like ArrowUp/ArrowDown), `"list"` when cmdk
+   *  re-selected on its own because the item list churned. Parents
+   *  that correct the auto-highlight need the difference — treating
+   *  churn as intent freezes the auto-pick on whichever row happened
+   *  to arrive first. */
+  onHighlightChange: (id: string, source: HighlightSource) => void;
   /** Activated when the user clicks an item. The parent also calls
    *  `item.onSelect` directly when the textarea Enter handler resolves
    *  the highlighted item — this prop is for mouse-driven selection. */
@@ -38,6 +47,10 @@ interface Props {
   /** Optional muted/error annotation rendered after the items list. */
   footerNote?: SlashCommandFooterNote | null;
 }
+
+/** Shared handler so the three interactive-adornment listeners stay
+ *  identical. */
+const stopRowSelection = (event: SyntheticEvent) => event.stopPropagation();
 
 /**
  * Slash-command popup. Anchored above the composer textarea, this
@@ -64,6 +77,14 @@ export function SlashCommandPopup({
   footerNote = null,
 }: Props) {
   const listRef = useRef<HTMLDivElement | null>(null);
+  // Raised only for the span of a pointermove being dispatched through
+  // the popup. cmdk selects a row from its own `onPointerMove` and
+  // calls `onValueChange` synchronously from there, so a highlight
+  // change seen while this is up is hover-driven. The capture handler
+  // below raises it before cmdk's row handler runs; the bubble handler
+  // lowers it once the event is done, leaving cmdk's own list-churn
+  // re-selection unmarked.
+  const pointerMoveActiveRef = useRef(false);
 
   // cmdk's built-in scrollIntoView only fires when cmdk itself handles
   // the keyboard event. Because the textarea keeps focus and the parent
@@ -92,6 +113,12 @@ export function SlashCommandPopup({
         "rounded-lg border border-border/60 bg-popover shadow-md",
         "overflow-hidden",
       )}
+      onPointerMoveCapture={() => {
+        pointerMoveActiveRef.current = true;
+      }}
+      onPointerMove={() => {
+        pointerMoveActiveRef.current = false;
+      }}
       // Pointer events live on the popup itself; the textarea keeps
       // focus, so cmdk never gets keyboard input — the parent drives
       // highlight via the `value` prop.
@@ -122,7 +149,12 @@ export function SlashCommandPopup({
         shouldFilter={false}
         value={highlightedId ?? ""}
         onValueChange={(id) => {
-          if (id) onHighlightChange(id);
+          if (id) {
+            onHighlightChange(
+              id,
+              pointerMoveActiveRef.current ? "pointer" : "list",
+            );
+          }
         }}
         className="text-popover-foreground"
       >
@@ -277,9 +309,16 @@ export function SlashCommandPopup({
                           // Stop the trailing control's clicks from
                           // bubbling up and triggering row selection
                           // (e.g. inline Switch in the MCP submenu).
-                          onClick={(e) => e.stopPropagation()}
-                          onMouseDown={(e) => e.stopPropagation()}
-                          onPointerDown={(e) => e.stopPropagation()}
+                          // Only for adornments that really are
+                          // interactive — guarding a decorative one
+                          // makes its slice of the row unclickable.
+                          {...(item.rightAdornmentInteractive
+                            ? {
+                                onClick: stopRowSelection,
+                                onMouseDown: stopRowSelection,
+                                onPointerDown: stopRowSelection,
+                              }
+                            : null)}
                         >
                           {item.rightAdornment}
                         </span>

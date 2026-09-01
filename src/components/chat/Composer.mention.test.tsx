@@ -509,7 +509,7 @@ describe("bare @ chats group", () => {
     typeIntoTextarea("@harden");
 
     const chatRow = await findByTestId("slash-item-session:thread-aaa111");
-    expect(chatRow).toHaveAttribute("data-selected", "true");
+    expect(chatRow).toHaveAttribute("data-selected", "false");
 
     resolveFiles([makeMatch()]);
     const fileRow = await findByTestId(
@@ -542,6 +542,67 @@ describe("bare @ chats group", () => {
     resolveFiles([makeMatch()]);
     await findByTestId("slash-item-file:/repo/src/components/chat/Composer.tsx");
     expect(chatRow).toHaveAttribute("data-selected", "true");
+  });
+
+  it("keeps the highlight on a chat row the pointer moved onto", async () => {
+    // Hover is a deliberate move, exactly like ArrowUp/ArrowDown. The
+    // auto-pick that steers the default highlight off chat rows must
+    // not fight it, or the row under the cursor never lights up.
+    listProjectFilesMock.mockResolvedValue([makeMatch()]);
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { findByTestId } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@harden");
+
+    const fileRow = await findByTestId(
+      "slash-item-file:/repo/src/components/chat/Composer.tsx",
+    );
+    const chatRow = await findByTestId("slash-item-session:thread-aaa111");
+    await waitFor(() => {
+      expect(fileRow).toHaveAttribute("data-selected", "true");
+    });
+
+    fireEvent.pointerMove(chatRow);
+    await waitFor(() => {
+      expect(chatRow).toHaveAttribute("data-selected", "true");
+    });
+    expect(fileRow).toHaveAttribute("data-selected", "false");
+  });
+
+  it("selects the chat row when its provider/timestamp corner is clicked", async () => {
+    // The trailing adornment on a chat row is plain text, so it must
+    // stay click-through — guarding it turns the right-hand slice of
+    // the row into a dead zone.
+    listProjectFilesMock.mockResolvedValue([]);
+    const session = makeSession();
+    listSessionMentionsMock.mockResolvedValue([session]);
+    const onAttachSession = vi.fn();
+    const { findByTestId, findByText } = renderControlled({
+      ...WORKSPACE,
+      onAttachSession,
+    });
+    typeIntoTextarea("@");
+    await findByTestId("slash-item-session:thread-aaa111");
+
+    fireEvent.click(await findByText("Codex"));
+    expect(onAttachSession).toHaveBeenCalledWith(session);
+  });
+
+  it("does not auto-highlight a chat row under a non-chat prefix", async () => {
+    // `@folder:` builds no rows of its own, so it falls through to the
+    // same builder that prepends CHATS — and it never fetches files,
+    // so a chat left highlighted there stays highlighted and Enter
+    // silently attaches a whole conversation. Only `@session:`, where
+    // the chat rows ARE the list, may auto-land on one.
+    listProjectFilesMock.mockReturnValue(new Promise<FileMatch[]>(() => {}));
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { findByTestId } = renderComposer(WORKSPACE);
+    typeIntoTextarea("@");
+    const chatRow = await findByTestId("slash-item-session:thread-aaa111");
+
+    typeIntoTextarea("@folder:");
+    await waitFor(() => {
+      expect(chatRow).toHaveAttribute("data-selected", "false");
+    });
   });
 
   it("inserts the session token when a bare-@ chat row is picked", async () => {

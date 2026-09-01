@@ -1628,6 +1628,9 @@ export function Composer({
           // own onSelect is intentionally a no-op so users don't
           // accidentally toggle by hitting Enter on the highlighted row.
           onSelect: () => {},
+          // The Switch owns its own clicks — see
+          // `rightAdornmentInteractive` on SlashCommandItem.
+          rightAdornmentInteractive: true,
           rightAdornment: isCodemuxSelf ? null : (
             <Switch
               checked={!isOff}
@@ -1936,28 +1939,35 @@ export function Composer({
   // discoverable), but the default highlight deliberately skips it:
   // `@foo` + Enter has always meant "the top file match", and silently
   // attaching a whole conversation instead would be a nasty surprise.
-  // Under `@session:` the chat rows ARE the list, so the first row wins
-  // as usual.
+  // The rule is "never auto-land on a chat unless the user asked for
+  // chats", so only `@session:` — where the chat rows ARE the list —
+  // lets the first row win. Everywhere else a chat is skipped
+  // outright rather than used as a fallback: `@folder:` builds no
+  // rows of its own and falls through to the same builder, so a
+  // fallback would leave a chat highlighted with nothing to displace
+  // it and Enter would attach a whole conversation. No highlight at
+  // all is the honest answer — Enter then sends the prose, exactly as
+  // it did before chats appeared here.
+  const mentionAutoPicksChats = parsedMention.category === "session";
   useEffect(() => {
     if (!mentionOpen) return;
     const ids = mentionItems.map((item) => item.id);
-    const autoPick =
-      parsedMention.category === "file"
-        ? (ids.find((id) => !id.startsWith("session:")) ?? ids[0] ?? null)
-        : (ids[0] ?? null);
+    const autoPick = mentionAutoPicksChats
+      ? (ids[0] ?? null)
+      : (ids.find((id) => !id.startsWith("session:")) ?? null);
     if (mentionHighlighted && ids.includes(mentionHighlighted)) {
       // The highlight is still valid. Re-pick it anyway in exactly one
       // case: we auto-landed on a chat row because chat results (a
       // local query) beat the file scan, and files have since arrived.
       const strandedOnChat =
         !mentionHighlightPinnedRef.current &&
-        parsedMention.category === "file" &&
+        !mentionAutoPicksChats &&
         mentionHighlighted.startsWith("session:") &&
         autoPick !== mentionHighlighted;
       if (!strandedOnChat) return;
     }
     setMentionHighlighted(autoPick);
-  }, [mentionOpen, mentionItems, mentionHighlighted, parsedMention.category]);
+  }, [mentionOpen, mentionItems, mentionHighlighted, mentionAutoPicksChats]);
 
   /** Replace the typed `@<query>` with the picked token + trailing
    *  space and keep the cursor right after the insertion. Shared
@@ -2433,6 +2443,13 @@ export function Composer({
         mentionHit.start !== mentionAnchor.start ||
         mentionHit.query !== mentionAnchor.query
       ) {
+        // Moving to a different `@` in the same draft re-anchors
+        // without ever closing the popup, so drop the pin from the
+        // previous mention — it was intent about that list, not this
+        // one.
+        if (mentionAnchor && mentionHit.start !== mentionAnchor.start) {
+          mentionHighlightPinnedRef.current = false;
+        }
         setMentionAnchor(mentionHit);
       }
       if (slashAnchor) closeSlash();
@@ -2523,11 +2540,19 @@ export function Composer({
           <SlashCommandPopup
             items={mentionItems}
             highlightedId={mentionHighlighted}
-            // NOT a pin: cmdk fires `onValueChange` for its own
-            // internal re-selection (list churn), not just hover, so
-            // treating it as user intent would freeze the auto-pick
-            // below on whichever row happened to arrive first.
-            onHighlightChange={setMentionHighlighted}
+            // Hover is a deliberate move, so it pins exactly like
+            // ArrowUp/ArrowDown — without that, the correction below
+            // yanks the highlight straight back off the row the
+            // cursor is sitting on. cmdk also fires `onValueChange`
+            // for its own internal re-selection (list churn); that
+            // arrives as `"list"` and must NOT pin, or the auto-pick
+            // freezes on whichever row happened to land first.
+            onHighlightChange={(id, source) => {
+              if (source === "pointer") {
+                mentionHighlightPinnedRef.current = true;
+              }
+              setMentionHighlighted(id);
+            }}
             onSelect={handleMentionPopupSelect}
             open={mentionOpen}
             footerNote={mentionPopupFooter}

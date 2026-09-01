@@ -780,6 +780,25 @@ describe("+ menu → Chat…", () => {
     );
   });
 
+  it("picks a chat when its provider/timestamp corner is clicked", async () => {
+    // The trailing adornment on a chat row is plain text, so it must
+    // stay click-through — guarding it turns the right-hand slice of
+    // the row into a dead zone.
+    const session = makeSession();
+    listSessionMentionsMock.mockResolvedValue([session]);
+    const onAttachSession = vi.fn();
+    const { getByTestId, findByTestId, findByText } = renderControlled({
+      ...WORKSPACE,
+      onAttachSession,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:session"));
+    await findByTestId("slash-item-attach-session:thread-aaa111");
+
+    fireEvent.click(await findByText("Codex"));
+    expect(onAttachSession).toHaveBeenCalledWith(session);
+  });
+
   it("disables the row (and skips the query) without a workspace", () => {
     const { getByTestId } = renderControlled({ workspaceId: null });
     fireEvent.click(getByTestId("composer-attach-button"));
