@@ -2123,7 +2123,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // new conversation whenever the in-memory resume cursor was missing.
   const handleStop = useCallback(() => {
     if (!threadId) return;
-    if (restarting) return;
+    // Stop and restart must stay mutually exclusive in both directions:
+    // the ref is what every restart path checks, and it flips
+    // synchronously so a restart queued in the same tick cannot slip in
+    // and clear `restarting` while the teardown is still running.
+    if (restarting || restartInFlightRef.current) return;
+    restartInFlightRef.current = true;
     setRestarting(true);
     void (async () => {
       try {
@@ -2131,6 +2136,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       } catch (err) {
         toast.error(`Failed to stop turn: ${err}`);
       } finally {
+        restartInFlightRef.current = false;
         setRestarting(false);
         // The provider's interrupted settlement clears the durable turn state;
         // release the pane-local guard even if that event is still in flight.
@@ -2268,10 +2274,24 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       /** Restore optimistic picker state if rebuilding the provider fails. */
       onFailure?: () => void;
     }) => {
-      if (!threadId) return;
+      // Every bail-out has to roll back the caller's optimistic picker
+      // state, otherwise the UI keeps showing a selection the native
+      // session never received.
+      if (!threadId) {
+        updates.onFailure?.();
+        return;
+      }
       const currentSlice = useAgentChatStore.getState().threads[threadId];
-      if (!currentSlice) return;
-      if (restartInFlightRef.current) return;
+      if (!currentSlice) {
+        updates.onFailure?.();
+        return;
+      }
+      // `restartInFlightRef` also covers an in-flight Stop, so a restart
+      // can never interleave with a teardown.
+      if (restartInFlightRef.current) {
+        updates.onFailure?.();
+        return;
+      }
       restartInFlightRef.current = true;
       setRestarting(true);
       const resumeCursor = updates.freshSession

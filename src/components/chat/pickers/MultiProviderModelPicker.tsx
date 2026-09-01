@@ -262,6 +262,13 @@ export function MultiProviderModelPicker({
   const grokCaps = allCaps.grok;
   const opencodeCaps = allCaps.opencode;
   const grokHealthReport = useProviderHealth((state) => state.slots.grok.report);
+  // Grok is the one provider with a live health probe feeding the picker,
+  // so a probe failure can describe WHY discovery is empty (not installed /
+  // not signed in) more precisely than the cached capability error. It only
+  // changes the message shown next to an empty rail — it never withdraws
+  // models we already harvested: an unhealthy probe is often transient (a
+  // slow ACP handshake re-probed after any failed send) and blanking the
+  // rail would also hide the model the session is currently running.
   const grokAvailabilityError =
     allCaps.grokError ?? grokHealthCapabilityError(grokHealthReport);
 
@@ -301,17 +308,10 @@ export function MultiProviderModelPicker({
       claude: rowsFromCaps("claude", claudeCaps),
       codex: rowsFromCaps("codex", codexCaps),
       cursor: rowsFromCaps("cursor", cursorCaps),
-      grok: grokAvailabilityError ? [] : rowsFromCaps("grok", grokCaps),
+      grok: rowsFromCaps("grok", grokCaps),
       opencode: rowsFromCaps("opencode", opencodeCaps),
     };
-  }, [
-    claudeCaps,
-    codexCaps,
-    cursorCaps,
-    grokCaps,
-    grokAvailabilityError,
-    opencodeCaps,
-  ]);
+  }, [claudeCaps, codexCaps, cursorCaps, grokCaps, opencodeCaps]);
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();

@@ -220,6 +220,7 @@ vi.mock("./Composer", () => ({
     providerAuthenticated,
     focusOnMount,
     configurationReady,
+    sessionReady,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -241,6 +242,7 @@ vi.mock("./Composer", () => ({
     providerAuthenticated?: boolean | null;
     focusOnMount?: boolean;
     configurationReady?: boolean;
+    sessionReady?: boolean;
   }) => (
     <div
       data-testid="composer"
@@ -249,6 +251,7 @@ vi.mock("./Composer", () => ({
       data-provider-authenticated={String(providerAuthenticated)}
       data-focus-on-mount={focusOnMount ? "true" : "false"}
       data-configuration-ready={configurationReady ? "true" : "false"}
+      data-session-ready={sessionReady ? "true" : "false"}
     >
       {/* The running-subagents strip is welded inside the real composer's
           top edge, so the mock has to render the slot for the pane's
@@ -2503,6 +2506,66 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
     );
   });
 
+  it("rolls the picker back when the restart-required recovery cannot run", async () => {
+    // `grok_model_restart_required` recovery depends on the restart helper
+    // to make the pick real. When the helper declines — another restart
+    // owns the session — the optimistic pick must not be left showing a
+    // model the native session never accepted.
+    currentSliceOverrides = {
+      "thread-x": { model: "grok-4.6", effort: "low" },
+    };
+    seedGrokCapabilities([grokModel("grok-4.6"), grokModel("grok-future")]);
+    setModelMock.mockImplementation((threadId: string, value: string | null) => {
+      currentSliceOverrides[threadId] = {
+        ...currentSliceOverrides[threadId],
+        model: value,
+      };
+    });
+    let rejectSetModel!: (reason?: unknown) => void;
+    vi.mocked(agentChatSetModel).mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSetModel = reject;
+        }),
+    );
+    // Hold the provider switch open so its restart guard is still owned
+    // when the stale model change reports back.
+    vi.mocked(agentChatStopSession).mockImplementationOnce(
+      () => new Promise<void>(() => {}),
+    );
+
+    const { getByTestId } = render(<AgentChatPane pane={grokPane} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.click(getByTestId("grok-model-change"));
+    expect(currentSliceOverrides["thread-x"]?.model).toBe("grok-future");
+    fireEvent.click(getByTestId("provider-model-change"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      rejectSetModel(
+        new Error("grok_model_restart_required: incompatible agent family"),
+      );
+      await Promise.resolve();
+    });
+
+    expect(setModelMock).toHaveBeenLastCalledWith("thread-x", "grok-4.6");
+    expect(agentChatUpdateSessionConfig).toHaveBeenLastCalledWith("thread-x", {
+      model: "grok-4.6",
+      effort: "low",
+      context_window: null,
+      fast_mode: false,
+    });
+    expect(agentChatStartSession).not.toHaveBeenCalledWith(
+      "pane-1",
+      "grok",
+      expect.objectContaining({ fresh_session: true }),
+    );
+  });
+
   it("does not expose Plan or Ask as client-controlled Grok modes", () => {
     currentSliceOverrides = {
       "thread-x": { model: "grok-4.6", permissionMode: "agent" },
@@ -2592,6 +2655,56 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
       );
     },
   );
+
+  it("blocks a silent restart while the interrupt is still in flight, and allows one once it settles", async () => {
+    // The auto-heal effects (stale Fast mode, retired Grok model) call the
+    // restart helper from a capability tick, not from a click — so nothing
+    // upstream guarantees the user isn't mid-Stop. If a restart slipped
+    // through here, Stop's own `finally` would clear `restarting` and hand
+    // the composer back a "ready" session that is still being rebuilt.
+    let releaseInterrupt!: () => void;
+    vi.mocked(agentChatInterruptTurn).mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseInterrupt = () => resolve();
+        }),
+    );
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+
+    fireEvent.click(getByTestId("composer-stop"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(getByTestId("composer")).toHaveAttribute(
+      "data-session-ready",
+      "false",
+    );
+
+    fireEvent.click(getByTestId("context-window-change"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(agentChatStopSession).not.toHaveBeenCalled();
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+
+    await act(async () => {
+      releaseInterrupt();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(getByTestId("composer")).toHaveAttribute(
+        "data-session-ready",
+        "true",
+      ),
+    );
+
+    // The guard is released, not leaked: the same picker change works
+    // normally once the interrupt has settled.
+    fireEvent.click(getByTestId("context-window-change"));
+    await waitFor(() =>
+      expect(agentChatStopSession).toHaveBeenCalledWith("claude", "thread-x"),
+    );
+  });
 });
 
 describe("AgentChatPane provider handoff", () => {

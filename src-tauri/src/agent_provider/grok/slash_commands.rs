@@ -39,14 +39,18 @@ impl GrokSlashCommandCache {
         binary_path: &Path,
         cwd: &Path,
     ) -> Result<Vec<ProviderSlashCommand>, String> {
-        // Keep the lock through the short initialize probe. Besides avoiding
-        // duplicate subprocesses, this orders a concurrent live update after
-        // the probe so the newer full snapshot always wins.
-        let mut entries = self.inner.lock().await;
-        if let Some(commands) = entries.get(cwd) {
-            return Ok(commands.clone());
+        // Scoped so the guard is dropped before the probe below.
+        {
+            let entries = self.inner.lock().await;
+            if let Some(commands) = entries.get(cwd) {
+                return Ok(commands.clone());
+            }
         }
 
+        // The probe spawns a child process and can take seconds, so the lock
+        // must NOT be held across it: live `available_commands_update`
+        // notifications take the same lock on the session's notification task,
+        // and stalling those stalls the whole Grok stream for that session.
         let initialized = harvest_grok_initialize(
             binary_path,
             Some(cwd.to_path_buf()),
@@ -55,6 +59,14 @@ impl GrokSlashCommandCache {
         .await
         .map_err(|error| error.to_command_string())?;
         let commands = available_commands_from_value(&initialized).unwrap_or_default();
+
+        // Anything that landed while the probe ran is newer than the probe's
+        // snapshot — a live session update, or another probe that finished
+        // later — so it wins and our result is discarded.
+        let mut entries = self.inner.lock().await;
+        if let Some(existing) = entries.get(cwd) {
+            return Ok(existing.clone());
+        }
         entries.insert(cwd.to_path_buf(), commands.clone());
         Ok(commands)
     }

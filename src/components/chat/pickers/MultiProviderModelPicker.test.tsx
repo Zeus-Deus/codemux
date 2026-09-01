@@ -520,6 +520,7 @@ describe("MultiProviderModelPicker — empty + error states", () => {
   it("uses live Grok health for sign-in guidance and force-retries on rail selection", async () => {
     const refresh = vi.fn().mockResolvedValue(undefined);
     const refreshCapabilities = vi.fn().mockResolvedValue(undefined);
+    seedStore({ claude: CLAUDE_CAPS, codex: CODEX_CAPS, grok: null });
     useProviderCapabilities.setState({ refresh: refreshCapabilities });
     useProviderHealth.setState((state) => ({
       refresh,
@@ -546,6 +547,34 @@ describe("MultiProviderModelPicker — empty + error states", () => {
     expect(await screen.findByText("Grok is not signed in")).toBeInTheDocument();
     expect(refresh).toHaveBeenCalledWith("grok", { force: true });
     expect(refreshCapabilities).toHaveBeenCalledWith("grok");
+  });
+
+  it("keeps harvested Grok models visible when the health probe is failing", async () => {
+    // Every failed send force-re-probes health, so a transient probe error
+    // must not blank the rail — the running session's own model is in there.
+    useProviderHealth.setState((state) => ({
+      slots: {
+        ...state.slots,
+        grok: {
+          ...emptyHealthSlot(),
+          report: {
+            provider: "grok",
+            status: "error",
+            installed: true,
+            message:
+              "Grok CLI is installed but its ACP server failed to initialize. (timed out)",
+            version: "1.0.4",
+          },
+        },
+      },
+    }));
+    const user = userEvent.setup();
+    renderPicker({ provider: "grok", model: "default" });
+    await openPicker(user);
+
+    const rows = await screen.findAllByTestId("multi-provider-model-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent("Grok default");
   });
 
   it("clears a stale Grok discovery error immediately after recovery", async () => {

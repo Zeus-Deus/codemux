@@ -1525,8 +1525,20 @@ describe("materializeWithPreset", () => {
           draft.threadId,
           "default",
         );
+        // The stale pill must not reach the wire in any form. `ask` would
+        // prepend its wrapper to the payload, and `plan` would seed the
+        // slice as a plan session — asserting the exact payload plus the
+        // seeded mode keeps both parameterizations honest.
         const sendInput = vi.mocked(agentChatSendTurn).mock.calls[0]![1];
-        expect(sendInput.text).not.toContain("You are in ASK mode");
+        expect(sendInput.text).toBe("hi");
+        expect(actions.setPermissionMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "agent",
+        );
+        expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+          draft.threadId,
+          "agent",
+        );
       },
     );
 
