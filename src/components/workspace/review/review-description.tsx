@@ -4,7 +4,14 @@ import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
 import { MarkdownRendered } from "@/components/editor/MarkdownRendered";
 import { updatePullRequest } from "@/tauri/commands";
-import { btnCard, btnEmberSolid, tzBody, tzEyebrow, tzMeta } from "./review-ui";
+import {
+  btnCard,
+  btnCardXs,
+  btnEmberSolid,
+  tzBody,
+  tzEyebrow,
+  tzMeta,
+} from "./review-ui";
 import {
   clearDescriptionDraft,
   getDescriptionDraft,
@@ -66,6 +73,11 @@ export function ReviewDescription({
   }, [draftKey, foldable]);
 
   const editing = draft !== undefined;
+  // Fold state is remembered per PR, but whether a description is long
+  // enough to fold is a property of the text in front of us right now.
+  // Only clip when both agree, so clipped content always has a control
+  // beside it to open it back up.
+  const isFolded = folded && foldable;
 
   const startEdit = () => {
     const initial = getDescriptionDraft(draftKey) ?? text;
@@ -127,12 +139,12 @@ export function ReviewDescription({
           <button
             type="button"
             onClick={toggleFold}
-            aria-expanded={!folded}
-            aria-label={folded ? "Unfold description" : "Fold description"}
+            aria-expanded={!isFolded}
+            aria-label={isFolded ? "Unfold description" : "Fold description"}
             className="text-muted-foreground transition-colors hover:text-foreground"
           >
             <ChevronDown
-              className={cn("size-3 transition-transform", folded && "-rotate-90")}
+              className={cn("size-3 transition-transform", isFolded && "-rotate-90")}
             />
           </button>
         )}
@@ -181,18 +193,33 @@ export function ReviewDescription({
           </div>
         </div>
       ) : text ? (
-        <div className={cn(folded && "relative max-h-40 overflow-hidden")}>
-          <MarkdownRendered content={text} inline />
-          {folded && (
+        <div className="flex flex-col items-start">
+          <div className={cn("w-full", isFolded && "relative max-h-40 overflow-hidden")}>
+            <MarkdownRendered content={text} inline />
+            {isFolded && (
+              // Scrim only — the last visible line fades out instead of
+              // being sliced through. The control below is the control.
+              <div
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-background via-background/80 to-transparent"
+              />
+            )}
+          </div>
+          {foldable && (
             <button
               type="button"
               onClick={toggleFold}
+              aria-expanded={!isFolded}
               className={cn(
-                "absolute inset-x-0 bottom-0 flex h-10 items-end justify-center bg-gradient-to-t from-background to-transparent text-muted-foreground hover:text-foreground",
-                tzMeta,
+                btnCardXs,
+                "mt-1.5 text-muted-foreground hover:text-foreground",
               )}
+              data-testid="description-fold"
             >
-              Show all {lineCount} lines
+              <ChevronDown
+                className={cn("size-3 transition-transform", !isFolded && "rotate-180")}
+              />
+              {isFolded ? `Show all ${lineCount} lines` : "Show less"}
             </button>
           )}
         </div>
