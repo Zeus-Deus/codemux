@@ -122,17 +122,62 @@ async function probeRunLive(
 }
 
 /**
+ * How many CONSECUTIVE unanswered probes a thread may carry its own
+ * `streaming` forward through before the fallback gives up and settles.
+ *
+ * The fallback is a fixpoint without a bound: hydrate writes `streaming:
+ * runLive`, so a slice that is already streaming re-derives `true` from
+ * itself on every hydrate and can never settle while the probe keeps
+ * rejecting — which it does for as long as the feature flag stays off or
+ * the provider stays out of the registry. Three is chosen to cover the
+ * startup window the probe's rejection modes actually live in (a couple of
+ * remounts while the registry fills) without letting a permanently broken
+ * probe pin a pane at "streaming" for the rest of the session.
+ */
+const MAX_UNANSWERED_PROBE_FALLBACKS = 3;
+
+/** Consecutive unanswered probes per thread. Cleared by any definite
+ *  answer, so a single transient rejection costs nothing. */
+const unansweredProbes = new Map<string, number>();
+
+/**
  * Resolve the probe's answer against the slice's own run state.
  *
  * Only an unanswered probe defers to the slice; a definite `false` is still
  * honoured, because that is how a genuinely-dead run earns its divider.
+ *
+ * The deferral is bounded — see {@link MAX_UNANSWERED_PROBE_FALLBACKS}.
+ * Past the bound "no information" resolves to `false`, which is the
+ * recoverable direction: the divider is wrong until the next real event,
+ * whereas a stuck `streaming` hides the Continue chip indefinitely.
  */
 function resolveRunLive(
   probed: boolean | null,
   threadId: string,
 ): boolean {
-  if (probed !== null) return probed;
+  if (probed !== null) {
+    unansweredProbes.delete(threadId);
+    return probed;
+  }
+  const seen = (unansweredProbes.get(threadId) ?? 0) + 1;
+  unansweredProbes.set(threadId, seen);
+  if (seen > MAX_UNANSWERED_PROBE_FALLBACKS) return false;
   return useAgentChatStore.getState().threads[threadId]?.streaming ?? false;
+}
+
+/**
+ * Probe a thread's run liveness with the same "a rejection is no
+ * information, not death" semantics hydrate uses.
+ *
+ * Exported for the turn-revert path, which rebuilds the transcript through
+ * the same replay and so must not read a gating failure as a dead run.
+ */
+export async function resolveThreadRunLive(
+  provider: AgentChatProviderKind,
+  threadId: string,
+  deps: CursorHydrateDeps = defaultDeps,
+): Promise<boolean> {
+  return resolveRunLive(await probeRunLive(deps, provider, threadId), threadId);
 }
 
 /**
@@ -246,10 +291,7 @@ async function hydratePass(
       // reducer moments later, which settles the thread. Both orderings
       // self-heal the same way; this one is kept only because it takes the
       // liveness reading as late as possible.
-      const runLive = resolveRunLive(
-        await probeRunLive(deps, provider, threadId),
-        threadId,
-      );
+      const runLive = await resolveThreadRunLive(provider, threadId, deps);
       if (isCancelled()) return false;
       useAgentChatStore
         .getState()
@@ -273,10 +315,7 @@ async function hydratePass(
       retry = allowRetry;
       return retry;
     }
-    const runLive = resolveRunLive(
-      await probeRunLive(deps, provider, threadId),
-      threadId,
-    );
+    const runLive = await resolveThreadRunLive(provider, threadId, deps);
     if (isCancelled()) return false;
     useAgentChatStore
       .getState()

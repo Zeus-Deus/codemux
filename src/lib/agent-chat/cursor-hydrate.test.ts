@@ -759,6 +759,55 @@ describe("cursor hydrate — the turn-active probe", () => {
     expect(slice.interrupted).toBe(true);
   });
 
+  it("bounds the no-information fallback so a permanently broken probe settles", async () => {
+    // The fallback is a fixpoint if it is unbounded: hydrate writes
+    // `streaming: runLive`, so a streaming slice re-derives `true` from
+    // itself on every hydrate and can never settle while the probe keeps
+    // rejecting — which it does for as long as the flag stays off or the
+    // provider stays out of the registry. Own thread id: the fallback
+    // counter is per-thread, and this drives several hydrates over one.
+    const THREAD_2 = "thread-probe-fixpoint";
+    const store = useAgentChatStore.getState();
+    store.ensureThread(THREAD_2);
+    store.applyEvent(THREAD_2, {
+      type: "user_message",
+      thread_id: THREAD_2,
+      text: "go",
+    } as ProviderRuntimeEvent);
+    store.applyEvent(THREAD_2, {
+      type: "session_state_changed",
+      thread_id: THREAD_2,
+      status: { status: "running" },
+    } as ProviderRuntimeEvent);
+
+    const hydrateOnce = async (cursor: number) => {
+      useAgentChatStore.setState((state) => ({
+        threads: {
+          ...state.threads,
+          [THREAD_2]: { ...state.threads[THREAD_2], lastPersistedEventId: cursor },
+        },
+      }));
+      await hydrateThreadByCursor(THREAD_2, PROVIDER, () => false, {
+        listAfter: async (_t, afterId) =>
+          afterId === null ? [] : [row(cursor + 1, assistantEvent("tick"))],
+        headId: async () => cursor + 1,
+        turnActive: async () => {
+          throw new Error("provider_not_configured: Claude");
+        },
+      });
+      return useAgentChatStore.getState().threads[THREAD_2];
+    };
+
+    // The first few unanswered probes still defer to the slice — that is
+    // the startup window the "no information" rule exists for.
+    expect((await hydrateOnce(10)).streaming).toBe(true);
+    expect((await hydrateOnce(11)).streaming).toBe(true);
+    expect((await hydrateOnce(12)).streaming).toBe(true);
+    // Past the bound, "no information" settles instead of carrying a
+    // stuck spinner (and a suppressed Continue chip) for the session.
+    expect((await hydrateOnce(13)).streaming).toBe(false);
+  });
+
   it("a probe reporting a delegated-work hold keeps the run live", async () => {
     // The backend fix: `agent_chat_turn_active` now ORs in "the parent turn
     // settled but delegated agents are still working", so the probe answers

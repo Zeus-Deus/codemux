@@ -3095,27 +3095,45 @@ fn first_line_title(text: &str) -> Option<String> {
 
 /// Interrupt the currently running turn on a thread.
 ///
-/// A `SessionNotFound` is swallowed into `Ok`: there is nothing to
-/// interrupt on a dead session (e.g. after a restart, before any turn
-/// has re-hydrated it), so a stale stop-click must not surface an error.
+/// Returns whether the interrupt actually reached a **live session**.
+/// `SessionNotFound` / `SessionClosed` is reported as `Ok(false)` rather than
+/// an error: there is nothing to interrupt on a dead session (e.g. after a
+/// restart, before any turn has re-hydrated it), so a stale stop-click must
+/// not surface an error — but the caller still has to tell that case apart
+/// from a delivered interrupt, because a dead session emits no settlement
+/// event and the pane would otherwise sit at `streaming` forever.
 /// Interrupt deliberately does NOT auto-resume — restarting a session
 /// just to immediately interrupt it would be pointless.
+///
+/// Either way the thread's delegated-work hold is released (see
+/// [`SubagentTracker::settle_interrupted_turn`]): the interrupt cancels the
+/// parent turn and the tasks it spawned, and an aborted task never reports a
+/// terminal snapshot of its own. Without this, `agent_chat_turn_active` keeps
+/// answering "live" for a run the user just stopped and the next hydrate
+/// re-animates it. A *rejected* interrupt is deliberately left alone — the
+/// turn may well still be running, and claiming otherwise is the expensive
+/// direction.
 #[tauri::command]
 pub async fn agent_chat_interrupt_turn<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     turn_id: Option<TurnId>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    match impl_.interrupt_turn(thread_id, turn_id).await {
-        Ok(()) => Ok(()),
-        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
-        Err(err) => Err(provider_err(err)),
-    }
+    let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
+        Ok(()) => true,
+        Err(ProviderError::SessionNotFound { .. }) | Err(ProviderError::SessionClosed { .. }) => {
+            false
+        }
+        Err(err) => return Err(provider_err(err)),
+    };
+    let tracker: State<'_, SubagentTracker> = app.state();
+    tracker.settle_interrupted_turn(&thread_id.0);
+    Ok(reached)
 }
 
 /// Stop the background watch loops a pane is monitoring with.
@@ -5467,6 +5485,30 @@ impl ThreadSubagentState {
         self.stopped_monitors.clear();
     }
 
+    /// Release the delegated work an explicit interrupt just cancelled.
+    ///
+    /// Stop kills the parent turn and the tasks it spawned with it, but an
+    /// aborted task emits no terminal `SubagentUpdated`, so its entry would
+    /// stay in [`Self::tasks`] and keep [`Self::review_pending`] — and with
+    /// it [`SubagentTracker::delegated_work_holding_turn`] — true until the
+    /// next turn boundary, a session teardown, or the stall watchdog ten
+    /// minutes later. A hydrate anywhere in that window probes the stopped
+    /// run as live and re-animates it: spinner, armed Stop button, running
+    /// subagent cards.
+    ///
+    /// Unlike [`Self::begin_turn`] this is not a new turn, so `turn_settled`
+    /// is left exactly as the provider's own events set it — the point is
+    /// only that nothing is left holding the run open.
+    ///
+    /// Watch loops are deliberately retained: they are explicitly allowed to
+    /// outlive the parent turn (they never held it open in the first place)
+    /// and `agent_chat_stop_monitoring` is the verb that ends them. The Stop
+    /// blocklist is retained for the same reason.
+    fn interrupted(&mut self) {
+        self.tasks.retain(|_, class| *class == TaskClass::Monitor);
+        self.review_owed_since = None;
+    }
+
     /// Forget everything (session close / error or explicit pane teardown).
     fn reset(&mut self) {
         self.tasks.clear();
@@ -5676,6 +5718,27 @@ impl SubagentTracker {
         }
     }
 
+    /// Release `thread_id`'s delegated-work hold after an explicit interrupt,
+    /// keeping any confirmed watch loop. Idempotent, and a no-op for a thread
+    /// that is not tracked.
+    ///
+    /// Backs `agent_chat_interrupt_turn`. Nothing else on the Stop path
+    /// touches this tracker — `SessionStatus::Ready` is a no-op in
+    /// [`map_event_to_pane_status`] (and has to stay one: Claude emits it on
+    /// every interim yield too, which is exactly the live case this whole
+    /// mechanism exists to protect) — so without this call a stopped run
+    /// keeps probing as live.
+    pub fn settle_interrupted_turn(&self, thread_id: &str) {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        let Some(state) = threads.get_mut(thread_id) else {
+            return;
+        };
+        state.interrupted();
+        if state.is_clear() {
+            threads.remove(thread_id);
+        }
+    }
+
     /// Whether real delegated agent work is still holding `thread_id`'s run
     /// open after its parent turn settled.
     ///
@@ -5713,6 +5776,9 @@ impl SubagentTracker {
     ///   unbounded case and the correct case are the same case.
     /// * `begin_turn` / `reset` clear the entry on the next send, a
     ///   `Running` snapshot, and session `Closed`/`Error`.
+    /// * [`Self::settle_interrupted_turn`] releases it the moment the user
+    ///   presses Stop — the one case where the run is genuinely dead with no
+    ///   terminal snapshot ever coming.
     ///
     /// Note that Codex and OpenCode report no `task_kind`, so every row they
     /// emit classifies as `Unreported` and defaults to `TaskClass::Agent`
@@ -8950,6 +9016,66 @@ mod tests {
 
         tracker.begin_turn("t");
         assert!(!tracker.delegated_work_holding_turn("t"));
+    }
+
+    // Stop is a hard terminal signal for delegated work, and nothing else on
+    // the interrupt path says so: `SessionStatus::Ready` is a no-op in the
+    // decision table and an aborted task emits no terminal snapshot. Without
+    // the explicit release the stopped run keeps probing live until the
+    // watchdog fires ten minutes later, and every hydrate in that window
+    // re-animates it (spinner, armed Stop, running subagent cards).
+    #[test]
+    fn an_interrupt_releases_the_delegated_work_hold() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(
+            tracker.delegated_work_holding_turn("t"),
+            "precondition: the interim yield holds the run open"
+        );
+
+        tracker.settle_interrupted_turn("t");
+        assert!(
+            !tracker.delegated_work_holding_turn("t"),
+            "a stopped run must probe as dead, or hydrate re-animates it"
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+        // Idempotent, and harmless on a thread that was never tracked.
+        tracker.settle_interrupted_turn("t");
+        tracker.settle_interrupted_turn("unknown");
+        assert!(!tracker.delegated_work_holding_turn("t"));
+    }
+
+    // The other half of the same invariant: the release is scoped to the
+    // interrupt. A NORMAL turn that yields on delegated work must still hold
+    // the run open — that is the false "Run interrupted" this whole mechanism
+    // exists to prevent — and a watch loop must survive Stop, because
+    // `agent_chat_stop_monitoring` is the verb that ends those.
+    #[test]
+    fn an_interrupt_keeps_watch_loops_and_does_not_settle_a_later_turn() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+
+        tracker.settle_interrupted_turn("t");
+        assert!(!tracker.delegated_work_holding_turn("t"));
+        assert_eq!(
+            tracker.stop_monitoring("t"),
+            Some(PaneStatus::Review),
+            "the watch loop is still tracked and still the monitoring bar's to stop"
+        );
+
+        // A fresh turn with fresh delegated work holds the run open again.
+        tracker.begin_turn("t");
+        tracker.decide("t", &subagent_event("s2", SubagentStatus::Running), now);
+        tracker.decide("t", &turn_completed(), now);
+        assert!(
+            tracker.delegated_work_holding_turn("t"),
+            "the interrupt must not settle anything beyond the run it stopped"
+        );
     }
 
     // Watch loops deliberately do NOT hold a run open — they can outlive the

@@ -991,6 +991,89 @@ describe("interim yield — a remount while delegated agents keep working", () =
     expect(merged.streaming).toBe(false);
   });
 
+  it("marks a dispatched queued turn unsettled, live and on replay alike", () => {
+    // A queued follow-up never goes through `appendUserMessageLocal`, the
+    // only other writer of `turnUnsettled`: its bubble is reconciled by
+    // `turn_queued` and promoted by `queued_turn_dispatched` (or, for a pane
+    // that missed the live event, by the persisted `user_message` envelope
+    // written at dispatch and matched on the nonce). Leaving the flag false
+    // there made the live slice disagree with a scan of the very same
+    // persisted rows — and because the dispatch row advances the store's
+    // cursor it never returns in a tail, so the wrong value seeds
+    // `previousUnsettled` for the whole of turn B.
+    const nonce = "nonce-b";
+    let slice = createEmptyThreadState();
+    slice = applyEvent(slice, {
+      type: "user_message",
+      thread_id: "t",
+      text: "A",
+    } as ProviderRuntimeEvent);
+    slice = applyEvent(slice, {
+      type: "turn_queued",
+      thread_id: "t",
+      queued_id: "q-1",
+      text: "B",
+      client_nonce: nonce,
+    } as ProviderRuntimeEvent);
+    slice = applyEvent(slice, resultEvent);
+    expect(slice.turnUnsettled).toBe(false); // turn A is genuinely settled
+    slice = applyEvent(slice, {
+      type: "queued_turn_dispatched",
+      thread_id: "t",
+      queued_id: "q-1",
+      turn_id: "turn-2",
+    } as ProviderRuntimeEvent);
+
+    // The same history, as the backend persisted it: B's envelope is
+    // written at dispatch and nothing has completed it yet.
+    const persisted = parseReplayPayloads([
+      user("A"),
+      event(resultEvent),
+      JSON.stringify({
+        type: "user_message",
+        thread_id: "t",
+        text: "B",
+        client_nonce: nonce,
+      }),
+    ]);
+
+    expect(lastTurnUnsettled(persisted, false)).toBe(true);
+    expect(slice.turnUnsettled).toBe(true);
+
+    // The consequence the seed drives: a warm merge over turn B keeps the
+    // divider and the Continue chip when the run really did die.
+    const merged = applyReplayTail(slice, parseReplayPayloads([]), {
+      runLive: false,
+      previousUnsettled: slice.turnUnsettled,
+      provider: "claude",
+    });
+    expect(merged.interrupted).toBe(true);
+
+    // And the durable envelope path (a pane that missed the live
+    // `queued_turn_dispatched`) reaches the same place.
+    let missed = createEmptyThreadState();
+    missed = applyEvent(missed, {
+      type: "user_message",
+      thread_id: "t",
+      text: "A",
+    } as ProviderRuntimeEvent);
+    missed = applyEvent(missed, {
+      type: "turn_queued",
+      thread_id: "t",
+      queued_id: "q-1",
+      text: "B",
+      client_nonce: nonce,
+    } as ProviderRuntimeEvent);
+    missed = applyEvent(missed, resultEvent);
+    missed = applyEvent(missed, {
+      type: "user_message",
+      thread_id: "t",
+      text: "B",
+      client_nonce: nonce,
+    } as ProviderRuntimeEvent);
+    expect(missed.turnUnsettled).toBe(true);
+  });
+
   it("keeps turnUnsettled independent of the runLive override", () => {
     // `turnUnsettled` describes the HISTORY, so a live probe must not edit
     // it — otherwise the next tail merge seeds from a liveness verdict and

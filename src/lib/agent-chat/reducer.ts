@@ -1199,6 +1199,18 @@ function promoteQueuedUserMessage(
     // A dispatched follow-up means a live turn is starting — clear any
     // interrupted flag so the Continue chip / divider drop.
     interrupted: false,
+    // ...and it is an unsettled tail until that turn completes, exactly
+    // like a directly-sent one. `appendUserMessageLocal` sets this for the
+    // ordinary path but a queued turn never goes through it: its persisted
+    // `user_message` envelope (written at dispatch, carrying the nonce)
+    // reconciles here instead, as does the live `queued_turn_dispatched`.
+    // Leaving it false made the live slice disagree with a scan of the same
+    // persisted rows — and since the dispatch row advances the store cursor
+    // it never comes back in a tail, so that wrong value seeds
+    // `previousUnsettled` for the whole turn and a warm merge over a
+    // genuinely unsettled queued turn shows neither divider nor Continue
+    // chip.
+    turnUnsettled: true,
     messages: replaceItem(next.messages, index, promoted),
   };
 }
