@@ -899,11 +899,11 @@ impl CodexSession {
             thread_id: codex_thread_id,
             input: input_items,
             model,
-            // `serviceTier` is a turn override that also becomes the thread's
-            // default for later turns. Send an explicit `default` when Fast
-            // is off; omission would inherit a thread that was previously
-            // launched in the Fast tier.
-            service_tier: Some(if fast_mode { "fast" } else { "default" }.into()),
+            // `serviceTierForTurn` scopes the choice to this turn only, so the
+            // thread keeps whatever tier the user configured. Send an explicit
+            // `default` when Fast is off: omission would inherit the thread's
+            // tier and silently keep a previous Fast turn's speed.
+            service_tier_for_turn: Some(if fast_mode { "fast" } else { "default" }.into()),
             effort,
             collaboration_mode,
         };

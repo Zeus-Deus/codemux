@@ -466,14 +466,21 @@ async fn fast_mode_changes_apply_to_turns_without_restarting_the_thread() {
         let captured: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
         provider.stop_session(ThreadId(thread.into())).await.ok();
-        captured["serviceTier"].as_str().unwrap().to_string()
+        // The per-turn field is the only tier key allowed on `turn/start`.
+        // `serviceTier` would rewrite the thread's tier for every later turn
+        // and clobber a user's configured `service_tier`.
+        assert!(
+            captured.get("serviceTier").is_none(),
+            "turn/start must not send the persistent serviceTier: {captured}"
+        );
+        captured["serviceTierForTurn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("turn/start must send serviceTierForTurn: {captured}"))
+            .to_string()
     }
 
     assert_eq!(captured_tier(false, true, "t-fast-on").await, "fast");
-    assert_eq!(
-        captured_tier(true, false, "t-fast-off").await,
-        "default"
-    );
+    assert_eq!(captured_tier(true, false, "t-fast-off").await, "default");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

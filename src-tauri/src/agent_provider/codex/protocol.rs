@@ -248,9 +248,13 @@ pub struct TurnStartParams {
     /// Per-turn model override. Falls through to the session default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Service tier override.
+    /// Per-turn service-tier override. Codex applies it to the turn this
+    /// request starts and leaves the thread's own tier untouched, so a user's
+    /// configured `service_tier` survives the composer's Fast/Standard toggle.
+    /// Never send `serviceTier` here: that one rewrites the thread's tier for
+    /// every later turn as well.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    pub service_tier_for_turn: Option<String>,
     /// Reasoning-effort hint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -1403,6 +1407,23 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_tier_uses_the_per_turn_field_only() {
+        let params = TurnStartParams {
+            thread_id: "t-codex".into(),
+            input: vec![],
+            model: None,
+            service_tier_for_turn: Some("default".into()),
+            effort: None,
+            collaboration_mode: None,
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["serviceTierForTurn"], "default");
+        // `serviceTier` would persist onto the thread and override whatever
+        // tier the user configured for every later turn.
+        assert!(value.get("serviceTier").is_none());
+    }
+
+    #[test]
     fn turn_input_text_serializes_with_type_tag() {
         let item = TurnInputItem::Text {
             text: "hello".into(),
@@ -1457,7 +1478,7 @@ mod tests {
                 },
             ],
             model: Some("gpt-5.4".into()),
-            service_tier: None,
+            service_tier_for_turn: None,
             effort: None,
             collaboration_mode: None,
         };
@@ -1485,7 +1506,7 @@ mod tests {
                 text_elements: vec![],
             }],
             model: None,
-            service_tier: None,
+            service_tier_for_turn: None,
             effort: None,
             collaboration_mode: None,
         };
@@ -1501,7 +1522,7 @@ mod tests {
             thread_id: "t-codex".into(),
             input: vec![],
             model: Some("gpt-5.6-sol".into()),
-            service_tier: None,
+            service_tier_for_turn: None,
             effort: Some("high".into()),
             collaboration_mode: Some(CollaborationMode {
                 mode: "default".into(),
