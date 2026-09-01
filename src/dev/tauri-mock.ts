@@ -3630,7 +3630,14 @@ const handlers: Record<string, Handler> = {
     drainChatQueue(threadId);
     return undefined;
   },
-  agent_chat_interrupt_turn: () => undefined,
+  // Returns whether the interrupt reached a LIVE turn, matching the real
+  // command: `true` emits the provider's own `ready` settlement (which
+  // `interruptMockChatTurn` does), `false` tells the pane nothing was
+  // running so it has to settle itself.
+  agent_chat_interrupt_turn: (a) => {
+    const { threadId } = a as { threadId: string };
+    return interruptMockChatTurn(threadId);
+  },
   // The docked MonitoringBar's Stop. Mirrors the real backend closely
   // enough to be demoable: clear the pane's `monitoring` status + its
   // manual-monitor reason, then re-emit so the bar unmounts and the
@@ -3662,6 +3669,11 @@ const handlers: Record<string, Handler> = {
   // (whose terminal event simply hasn't persisted yet) apart from a
   // genuinely-interrupted one. The mock tracks in-flight turns in
   // `chatActiveTurns`, so mirror that directly.
+  //
+  // The real command also ORs in "the parent turn settled but delegated
+  // agents are still working" (see `agent_chat_turn_active`). The mock has
+  // no subagent tracker, so it models only the first signal — a mock
+  // scenario that yields mid-delegation would read as not-live here.
   agent_chat_turn_active: (a) => {
     const { threadId } = a as { threadId: string };
     return chatActiveTurns.has(threadId);

@@ -30,7 +30,10 @@ import {
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
-import { hydrateThreadByCursor } from "@/lib/agent-chat/cursor-hydrate";
+import {
+  hydrateThreadByCursor,
+  resolveThreadRunLive,
+} from "@/lib/agent-chat/cursor-hydrate";
 import {
   enqueueAgentChatEvent,
   flushAgentChatEvents,
@@ -735,8 +738,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const promise = (async () => {
         flushAgentChatEvents(payload.thread_id);
         const rows = await agentChatListMessagesAfter(payload.thread_id, null);
+        // A revert is normally driven from this pane while nothing is
+        // streaming, but the trigger is a backend event that another window
+        // (or a remote client) can raise mid-run. Hardcoding `runLive: false`
+        // told the cold replay "this run is dead", which paints a live thread
+        // with the Run-interrupted divider and settles its in-flight subagent
+        // cards. Ask instead — through the same helper hydrate uses, so a
+        // rejected probe means "no information" here too rather than "dead".
+        const runLive = await resolveThreadRunLive(provider, payload.thread_id);
         useAgentChatStore.getState().hydrateThread(payload.thread_id, rows, {
-          runLive: false,
+          runLive,
           provider,
         });
         setSendAnchor(null);
@@ -2133,8 +2144,37 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setRestarting(true);
     void (async () => {
       try {
-        await agentChatInterruptTurn(provider, threadId, null);
+        const reachedLiveSession = await agentChatInterruptTurn(
+          provider,
+          threadId,
+          null,
+        );
+        // The interrupt found no live session to stop, so NO settlement
+        // event is coming — and without one the pane is trapped:
+        // `streaming` stays true, which hides the Continue chip and keeps
+        // re-rendering a Stop button that can never do anything. Stop has
+        // to be an escape hatch there.
+        //
+        // `ready` is exactly the event a provider sends when it stops
+        // during a background wait: the reducer clears `streaming` and
+        // folds an interim turn boundary, so a run that had yielded on
+        // delegated work settles the same way it would have live.
+        if (!reachedLiveSession) {
+          useAgentChatStore.getState().applyEvent(threadId, {
+            type: "session_state_changed",
+            thread_id: threadId,
+            status: { status: "ready" },
+          });
+        }
       } catch (err) {
+        // Deliberately NO local settle here. A rejection is a transport or
+        // gating failure — a busy sidecar answering `interrupt RPC failed`,
+        // a registry miss — and none of those prove the turn stopped; the
+        // provider may still be streaming into this transcript. Settling on
+        // one clears `streaming` for good (only a fresh `running` re-arms
+        // it), leaving text arriving under no spinner and no Stop button.
+        // "Nothing was running" is reported as `false` above instead, which
+        // is the only answer that means it.
         toast.error(`Failed to stop turn: ${err}`);
       } finally {
         restartInFlightRef.current = false;

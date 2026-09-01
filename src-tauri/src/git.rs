@@ -565,6 +565,18 @@ fn run_git_with_index(
     Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
 
+/// Stamp `dest` with `src`'s modification time. Returns whether it worked.
+fn copy_mtime(src: &Path, dest: &Path) -> bool {
+    let Ok(mtime) = std::fs::metadata(src).and_then(|m| m.modified()) else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .and_then(|f| f.set_modified(mtime))
+        .is_ok()
+}
+
 /// Snapshot the full working-tree state (staged + unstaged + untracked,
 /// `.gitignore` respected) into a commit anchored at `full_ref`,
 /// without touching the user's index, worktree, or stash list.
@@ -630,6 +642,21 @@ pub fn git_checkpoint_create(
         if real_index.exists() {
             std::fs::copy(&real_index, &tmp_index)
                 .map_err(|e| format!("Failed to copy index for checkpoint: {e}"))?;
+            // Carry the real index's mtime onto the copy. Git only trusts a
+            // cached stat when the entry is older than the index that
+            // recorded it; an entry at or after the index mtime is "racily
+            // clean" and gets rehashed. `fs::copy` stamps the copy with
+            // *now*, which silently promotes every racily-clean entry to
+            // trusted — so a file rewritten in the same second as the real
+            // index write, at the same size, would stat as unchanged and the
+            // checkpoint would snapshot its stale content. A revert would
+            // then restore the wrong bytes.
+            if !copy_mtime(&real_index, &tmp_index) {
+                // Can't reproduce the mtime, so the stat cache can't be
+                // trusted: start from a cache-less index and rehash instead.
+                let _ = std::fs::remove_file(&tmp_index);
+                run_git_with_index(repo, &tmp_index, &["read-tree", "HEAD"])?;
+            }
         } else {
             run_git_with_index(repo, &tmp_index, &["read-tree", "HEAD"])?;
         }
@@ -6158,6 +6185,52 @@ C  source.txt -> copy.txt";
         // assert against whatever the repo actually reports.
         let current_branch = run_git(&repo, &["branch", "--show-current"]).unwrap();
         assert_eq!(cp.branch.as_deref(), Some(current_branch.as_str()), "branch recorded");
+    }
+
+    /// Block until just past the next wall-clock second, so what follows
+    /// cannot share a one-second stat timestamp with what came before.
+    fn sleep_past_second_boundary() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch");
+        std::thread::sleep(
+            std::time::Duration::from_nanos(1_000_000_000 - u64::from(now.subsec_nanos()))
+                + std::time::Duration::from_millis(20),
+        );
+    }
+
+    // Git index entries carry second-granularity timestamps, so a file
+    // rewritten to the same size within the same second as the index that
+    // recorded it stats as unchanged. Git covers that with the "racily
+    // clean" rule — an entry at or after the index's own mtime is rehashed
+    // — which only works while the index keeps the mtime it was written
+    // with. Seeding the checkpoint's private index by copying the real one
+    // used to stamp it with *now*, defeating the rule and snapshotting
+    // stale content that a later revert would restore over the user's work.
+    #[test]
+    fn checkpoint_captures_a_same_second_same_size_rewrite() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Commit and rewrite inside one second, same byte count.
+        sleep_past_second_boundary();
+        std::fs::write(repo.join("code.txt"), "v1").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+        std::fs::write(repo.join("code.txt"), "v2").unwrap();
+        // Take the checkpoint in a later second, where a freshly stamped
+        // copy of the index would look newer than the rewrite.
+        sleep_past_second_boundary();
+
+        let cp = git_checkpoint_create(&repo, "refs/codemux/checkpoints/racy", "msg")
+            .unwrap()
+            .expect("checkpoint should be created");
+        let content = run_git(
+            &repo,
+            &["show", &format!("{}:code.txt", cp.snapshot_commit)],
+        )
+        .unwrap();
+        assert_eq!(content, "v2", "checkpoint must capture the rewritten bytes");
     }
 
     #[test]

@@ -1630,12 +1630,20 @@ export const readLocalChatImage = async (
  *  Returns immediately; safe to fire-and-forget. */
 export const primeChatMcp = () => invoke<void>("agent_chat_prime_mcp");
 
+/** Interrupt the thread's running turn.
+ *
+ *  Resolves to whether the interrupt actually reached a LIVE session.
+ *  `false` — a dead or already-closed session — is a success, not an error
+ *  (a stale Stop click must not toast), but it is the caller's cue that no
+ *  settlement event is coming and the pane has to settle itself. A
+ *  REJECTION is the opposite signal: the turn may well still be running,
+ *  so the caller must not settle on it. */
 export const agentChatInterruptTurn = (
   provider: AgentChatProviderKind,
   threadId: string,
   turnId: string | null = null,
 ) =>
-  invoke<void>("agent_chat_interrupt_turn", {
+  invoke<boolean>("agent_chat_interrupt_turn", {
     provider,
     threadId,
     turnId,

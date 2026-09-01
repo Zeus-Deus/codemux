@@ -1094,6 +1094,12 @@ function appendUserMessageLocal(
   return {
     ...next,
     interrupted: false,
+    // A user turn with no completion after it is the definition of an
+    // unsettled tail. Set optimistically for the same reason the bubble is:
+    // a remount before the turn's first output must not read the thread as
+    // settled. The persisted `user_message` row folds through here too and
+    // is deduped by nonce, so live and replay agree.
+    turnUnsettled: true,
     messages: [...next.messages, item],
   };
 }
@@ -1193,6 +1199,18 @@ function promoteQueuedUserMessage(
     // A dispatched follow-up means a live turn is starting — clear any
     // interrupted flag so the Continue chip / divider drop.
     interrupted: false,
+    // ...and it is an unsettled tail until that turn completes, exactly
+    // like a directly-sent one. `appendUserMessageLocal` sets this for the
+    // ordinary path but a queued turn never goes through it: its persisted
+    // `user_message` envelope (written at dispatch, carrying the nonce)
+    // reconciles here instead, as does the live `queued_turn_dispatched`.
+    // Leaving it false made the live slice disagree with a scan of the same
+    // persisted rows — and since the dispatch row advances the store cursor
+    // it never comes back in a tail, so that wrong value seeds
+    // `previousUnsettled` for the whole turn and a warm merge over a
+    // genuinely unsettled queued turn shows neither divider nor Continue
+    // chip.
+    turnUnsettled: true,
     messages: replaceItem(next.messages, index, promoted),
   };
 }
@@ -1584,6 +1602,10 @@ function applyEventInner(
           ...seqBumped,
           streaming: false,
           interrupted,
+          // A terminal event settles the tail even when it failed — the run
+          // recorded an ending, which is all `lastTurnUnsettled` asks. The
+          // `interrupted` flag above carries the "it died" meaning.
+          turnUnsettled: false,
           messages: [
             ...seqBumped.messages,
             {
@@ -1624,6 +1646,10 @@ function applyEventInner(
         ...seqBumped,
         streaming: interim,
         interrupted: false,
+        // Settled even when the boundary is `interim`: a `turn_completed`
+        // row IS persisted, so a later hydrate scanning history finds it and
+        // must reach the same answer this live fold does.
+        turnUnsettled: false,
         messages: [
           ...seqBumped.messages,
           {

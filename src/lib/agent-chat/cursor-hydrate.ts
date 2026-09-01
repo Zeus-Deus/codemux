@@ -98,6 +98,89 @@ const defaultDeps: CursorHydrateDeps = {
 };
 
 /**
+ * Probe the backend for "is this thread's run still in flight", returning
+ * `null` — NOT `false` — when the question could not be answered.
+ *
+ * `agent_chat_turn_active` rejects for reasons that have nothing to do with
+ * liveness: the agent-chat feature flag being off, and a
+ * `provider_not_configured` registry miss that is reachable during startup.
+ * Collapsing those into `false` told hydrate "the run is dead", which is the
+ * one answer that flips a healthy transcript to "Run interrupted". `null`
+ * lets the caller fall back to what the slice already knows instead.
+ */
+async function probeRunLive(
+  deps: CursorHydrateDeps,
+  provider: AgentChatProviderKind,
+  threadId: string,
+): Promise<boolean | null> {
+  try {
+    return await deps.turnActive(provider, threadId);
+  } catch (err) {
+    console.warn("[agent-chat] turn-active probe failed:", err);
+    return null;
+  }
+}
+
+/**
+ * How many CONSECUTIVE unanswered probes a thread may carry its own
+ * `streaming` forward through before the fallback gives up and settles.
+ *
+ * The fallback is a fixpoint without a bound: hydrate writes `streaming:
+ * runLive`, so a slice that is already streaming re-derives `true` from
+ * itself on every hydrate and can never settle while the probe keeps
+ * rejecting — which it does for as long as the feature flag stays off or
+ * the provider stays out of the registry. Three is chosen to cover the
+ * startup window the probe's rejection modes actually live in (a couple of
+ * remounts while the registry fills) without letting a permanently broken
+ * probe pin a pane at "streaming" for the rest of the session.
+ */
+const MAX_UNANSWERED_PROBE_FALLBACKS = 3;
+
+/** Consecutive unanswered probes per thread. Cleared by any definite
+ *  answer, so a single transient rejection costs nothing. */
+const unansweredProbes = new Map<string, number>();
+
+/**
+ * Resolve the probe's answer against the slice's own run state.
+ *
+ * Only an unanswered probe defers to the slice; a definite `false` is still
+ * honoured, because that is how a genuinely-dead run earns its divider.
+ *
+ * The deferral is bounded — see {@link MAX_UNANSWERED_PROBE_FALLBACKS}.
+ * Past the bound "no information" resolves to `false`, which is the
+ * recoverable direction: the divider is wrong until the next real event,
+ * whereas a stuck `streaming` hides the Continue chip indefinitely.
+ */
+function resolveRunLive(
+  probed: boolean | null,
+  threadId: string,
+): boolean {
+  if (probed !== null) {
+    unansweredProbes.delete(threadId);
+    return probed;
+  }
+  const seen = (unansweredProbes.get(threadId) ?? 0) + 1;
+  unansweredProbes.set(threadId, seen);
+  if (seen > MAX_UNANSWERED_PROBE_FALLBACKS) return false;
+  return useAgentChatStore.getState().threads[threadId]?.streaming ?? false;
+}
+
+/**
+ * Probe a thread's run liveness with the same "a rejection is no
+ * information, not death" semantics hydrate uses.
+ *
+ * Exported for the turn-revert path, which rebuilds the transcript through
+ * the same replay and so must not read a gating failure as a dead run.
+ */
+export async function resolveThreadRunLive(
+  provider: AgentChatProviderKind,
+  threadId: string,
+  deps: CursorHydrateDeps = defaultDeps,
+): Promise<boolean> {
+  return resolveRunLive(await probeRunLive(deps, provider, threadId), threadId);
+}
+
+/**
  * Backoff for the one retry a cold read of zero rows over a NON-EMPTY
  * transcript earns. Long enough for a session collapse / thread re-home to
  * commit its row moves, short enough that the user does not notice.
@@ -194,15 +277,21 @@ async function hydratePass(
       warm && cursor !== 0 && (headId === null || headId < cursor);
     if (warm && !cursorAhead && rows.length <= MAX_WARM_TAIL_ROWS) {
       if (rows.length === 0) return false; // Warm and unchanged — zero work.
-      // Ask the backend whether this thread's turn is still in flight.
-      // Ordering matters: rows are fetched FIRST, liveness SECOND — if
-      // the turn settles between the two calls the `turn_completed` row
-      // is already in `rows`, so `runLive` can only ever be a
-      // conservative false, never a stale "alive". A live turn means the
+      // Ask the backend whether this thread's RUN is still in flight —
+      // which includes a parent turn that yielded while delegated agents
+      // keep working (see `agent_chat_turn_active`). A live run means the
       // tail's missing terminal event is expected, not an interrupt.
-      const runLive = await deps
-        .turnActive(provider, threadId)
-        .catch(() => false);
+      //
+      // Rows are fetched FIRST, liveness SECOND. That ordering is NOT
+      // free of races in either direction: a turn that settles inside the
+      // probe's IPC window persists its `turn_completed` after the row
+      // read, so the tail looks unsettled AND the probe says false. What
+      // makes it safe is the held-event buffer, not the ordering — that
+      // `turn_completed` is sitting in the hold and is released into the
+      // reducer moments later, which settles the thread. Both orderings
+      // self-heal the same way; this one is kept only because it takes the
+      // liveness reading as late as possible.
+      const runLive = await resolveThreadRunLive(provider, threadId, deps);
       if (isCancelled()) return false;
       useAgentChatStore
         .getState()
@@ -226,7 +315,7 @@ async function hydratePass(
       retry = allowRetry;
       return retry;
     }
-    const runLive = await deps.turnActive(provider, threadId).catch(() => false);
+    const runLive = await resolveThreadRunLive(provider, threadId, deps);
     if (isCancelled()) return false;
     useAgentChatStore
       .getState()

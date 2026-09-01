@@ -80,6 +80,9 @@ const registerMountedThreadMock = vi.fn(() => unregisterMountedThreadMock);
 // Hoisted so the deferred-worktree submit tests can assert the
 // optimistic user bubble was appended to the NEW worktree's thread.
 const appendUserMessageMock = vi.fn();
+/** Stable across `getState()` calls so a test can assert what the pane
+ *  imperatively folded into the slice (e.g. Stop's local settle). */
+const applyEventMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -631,7 +634,7 @@ vi.mock("@/stores/agent-chat-store", () => {
     {
       getState: () => ({
         threads: buildThreads(),
-        applyEvent: vi.fn(),
+        applyEvent: applyEventMock,
         // Session bring-up seeds the agent-chat slice through these
         // after start_session resolves.
         ensureThread: vi.fn(),
@@ -2694,7 +2697,7 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
       "thread-x": { streaming: true },
     };
     workspaceIdForPaneOverride = "ws-home";
-    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(undefined);
+    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(true);
     vi.mocked(agentChatStartSession).mockClear();
     vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
   });
@@ -2735,8 +2738,8 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     let releaseInterrupt!: () => void;
     vi.mocked(agentChatInterruptTurn).mockImplementationOnce(
       () =>
-        new Promise<void>((resolve) => {
-          releaseInterrupt = () => resolve();
+        new Promise<boolean>((resolve) => {
+          releaseInterrupt = () => resolve(true);
         }),
     );
     const { getByTestId } = render(<AgentChatPane pane={pane} />);
@@ -2773,6 +2776,72 @@ describe("AgentChatPane Stop preserves its durable thread", () => {
     fireEvent.click(getByTestId("context-window-change"));
     await waitFor(() =>
       expect(agentChatStopSession).toHaveBeenCalledWith("claude", "thread-x"),
+    );
+  });
+
+  // Stop has to be an escape hatch when there was no live session to stop.
+  // The command reports that as `false` — NOT a rejection: a dead session
+  // is swallowed into `Ok` so a stale Stop click cannot toast. Without a
+  // local settle the pane is trapped: no provider settlement event is
+  // coming, `streaming` stays true, which hides the Continue chip and
+  // re-renders a Stop button that can never do anything. This matters most
+  // for a run the liveness probe is holding open on a subagent that never
+  // reported a terminal snapshot.
+  it("settles the thread locally when the interrupt reaches no live session", async () => {
+    applyEventMock.mockClear();
+    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(false);
+
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(getByTestId("composer-stop"));
+
+    await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(applyEventMock).toHaveBeenCalledWith("thread-x", {
+        type: "session_state_changed",
+        thread_id: "thread-x",
+        status: { status: "ready" },
+      }),
+    );
+  });
+
+  // The other direction, and the one the escape hatch must NOT take. A
+  // rejection is a transport/gating failure — a busy sidecar answering
+  // `interrupt RPC failed`, a registry miss — and the turn may still be
+  // streaming. Settling on it clears `streaming` for the rest of the turn
+  // (only a fresh `running` re-arms it), so text keeps arriving into a
+  // transcript with no spinner and no Stop button.
+  it("does not settle the thread when the interrupt rejects", async () => {
+    applyEventMock.mockClear();
+    vi.mocked(agentChatInterruptTurn)
+      .mockClear()
+      .mockRejectedValue(new Error("rpc error: interrupt RPC failed"));
+
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(getByTestId("composer-stop"));
+
+    await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
+    // Flush the rejection's catch/finally so "never settled" is a real
+    // observation rather than an assertion that simply ran too early.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(applyEventMock).not.toHaveBeenCalledWith(
+      "thread-x",
+      expect.objectContaining({ type: "session_state_changed" }),
+    );
+  });
+
+  it("leaves settling to the provider when the interrupt succeeds", async () => {
+    applyEventMock.mockClear();
+    vi.mocked(agentChatInterruptTurn).mockClear().mockResolvedValue(true);
+
+    const { getByTestId } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(getByTestId("composer-stop"));
+
+    await waitFor(() => expect(agentChatInterruptTurn).toHaveBeenCalled());
+    expect(applyEventMock).not.toHaveBeenCalledWith(
+      "thread-x",
+      expect.objectContaining({ type: "session_state_changed" }),
     );
   });
 });
