@@ -19,6 +19,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
     listProjectFiles: vi.fn().mockResolvedValue([]),
     listProjectFolders: vi.fn().mockResolvedValue([]),
     listGithubIssuesByPath: vi.fn().mockResolvedValue([]),
+    agentChatListSessionMentions: vi.fn().mockResolvedValue([]),
     getGithubIssueByPath: vi.fn(),
     listSkills: vi.fn().mockResolvedValue([]),
   };
@@ -26,11 +27,13 @@ vi.mock("@/tauri/commands", async (importActual) => {
 
 import { Composer } from "./Composer";
 import {
+  agentChatListSessionMentions,
   getGithubIssueByPath,
   listGithubIssuesByPath,
   listProjectFiles,
   listProjectFolders,
 } from "@/tauri/commands";
+import type { AgentChatSessionMention } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 
 type ComposerProps = ComponentProps<typeof Composer>;
@@ -41,6 +44,24 @@ const listGithubIssuesMock =
   listGithubIssuesByPath as unknown as ReturnType<typeof vi.fn>;
 const getGithubIssueMock =
   getGithubIssueByPath as unknown as ReturnType<typeof vi.fn>;
+const listSessionMentionsMock =
+  agentChatListSessionMentions as unknown as ReturnType<typeof vi.fn>;
+
+function makeSession(
+  overrides: Partial<AgentChatSessionMention> = {},
+): AgentChatSessionMention {
+  return {
+    thread_id: "thread-aaa111",
+    workspace_id: "workspace-1",
+    cwd: "/repo",
+    provider: "codex",
+    title: "Harden authentication",
+    last_active_at: new Date().toISOString(),
+    preview: "Implemented refresh token rotation.",
+    message_count: 12,
+    ...overrides,
+  };
+}
 
 function makeIssue(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
   return {
@@ -709,5 +730,81 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
     // this test catches it.
     expect(getByPlaceholderText("Search issues...")).toBeInTheDocument();
     expect(getByTestId("composer-issue-picker")).toBeInTheDocument();
+  });
+});
+
+
+describe("+ menu → Chat…", () => {
+  const WORKSPACE = { workspaceId: "workspace-1", threadId: "current-thread" };
+
+  beforeEach(() => {
+    listSessionMentionsMock.mockReset();
+    listSessionMentionsMock.mockResolvedValue([]);
+  });
+
+  it("pivots to the chat submode and lists workspace conversations", async () => {
+    listSessionMentionsMock.mockResolvedValue([makeSession()]);
+    const { getByTestId, findByText } = renderControlled(WORKSPACE);
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:session"));
+
+    expect(await findByText("Harden authentication")).toBeInTheDocument();
+    expect(listSessionMentionsMock).toHaveBeenCalledWith(
+      "workspace-1",
+      "/repo",
+      "current-thread",
+      30,
+    );
+  });
+
+  it("picks a chat with the same token + callback contract as @session:", async () => {
+    const session = makeSession();
+    listSessionMentionsMock.mockResolvedValue([session]);
+    const onAttachSession = vi.fn();
+    const onDraftChange = vi.fn();
+    const { getByTestId, findByTestId } = renderControlled({
+      ...WORKSPACE,
+      onAttachSession,
+      onDraftChange,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:session"));
+    fireEvent.click(
+      await findByTestId("slash-item-attach-session:thread-aaa111"),
+    );
+
+    expect(onAttachSession).toHaveBeenCalledWith(session);
+    const calls = onDraftChange.mock.calls;
+    expect(calls[calls.length - 1]?.[0]).toBe(
+      "@session:harden-authentication-aaa111 ",
+    );
+  });
+
+  it("picks a chat when its provider/timestamp corner is clicked", async () => {
+    // The trailing adornment on a chat row is plain text, so it must
+    // stay click-through — guarding it turns the right-hand slice of
+    // the row into a dead zone.
+    const session = makeSession();
+    listSessionMentionsMock.mockResolvedValue([session]);
+    const onAttachSession = vi.fn();
+    const { getByTestId, findByTestId, findByText } = renderControlled({
+      ...WORKSPACE,
+      onAttachSession,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:session"));
+    await findByTestId("slash-item-attach-session:thread-aaa111");
+
+    fireEvent.click(await findByText("Codex"));
+    expect(onAttachSession).toHaveBeenCalledWith(session);
+  });
+
+  it("disables the row (and skips the query) without a workspace", () => {
+    const { getByTestId } = renderControlled({ workspaceId: null });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-attach:session");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    fireEvent.click(row);
+    expect(listSessionMentionsMock).not.toHaveBeenCalled();
   });
 });

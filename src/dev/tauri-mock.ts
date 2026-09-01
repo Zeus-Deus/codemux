@@ -3102,6 +3102,54 @@ const handlers: Record<string, Handler> = {
     );
     return rows.length > 0 ? rows[rows.length - 1].id : null;
   },
+  // The `@` mention popup and `+ → File…/Folder…` browse the project
+  // tree. Without these the dev mock's pickers render empty, which
+  // makes the mention menu impossible to exercise (and impossible to
+  // screenshot) outside a real Tauri build.
+  list_project_files: (a) => {
+    const query = String(a.query ?? "").toLowerCase();
+    const limit = Math.max(1, Math.min(50, Number(a.limit ?? 20)));
+    const paths = [
+      ".github/workflows/ci.yml",
+      "AGENTS.md",
+      "src/components/chat/AgentChatPane.tsx",
+      "src/components/chat/Composer.tsx",
+      "src/components/chat/SlashCommandPopup.tsx",
+      "src/lib/agent-chat/session-mentions.ts",
+      "src/lib/agent-chat/slash-commands.ts",
+      "src/stores/agent-chat-store.ts",
+      "src-tauri/src/commands/agent_chat.rs",
+      "src-tauri/src/lib.rs",
+    ];
+    return paths
+      .filter((path) => !query || path.toLowerCase().includes(query))
+      .slice(0, limit)
+      .map((path, index) => ({
+        path,
+        absolute_path: `${MOCK_HOME_DIR}/projects/codemux/${path}`,
+        score: query ? 200 - index : 0,
+      }));
+  },
+  list_project_folders: (a) => {
+    const query = String(a.query ?? "").toLowerCase();
+    const limit = Math.max(1, Math.min(50, Number(a.limit ?? 20)));
+    const folders: Array<[string, number]> = [
+      ["src/components/chat", 42],
+      ["src/hooks", 18],
+      ["src/lib/agent-chat", 57],
+      ["src/stores", 12],
+      ["src-tauri/src/commands", 24],
+    ];
+    return folders
+      .filter(([path]) => !query || path.toLowerCase().includes(query))
+      .slice(0, limit)
+      .map(([path, itemCount], index) => ({
+        path,
+        absolute_path: `${MOCK_HOME_DIR}/projects/codemux/${path}`,
+        score: query ? 200 - index : 0,
+        item_count: itemCount,
+      }));
+  },
   agent_chat_get_tool_result: (a) => {
     const payload = mockFullPayloadById.get(a.rowId as number);
     if (payload == null) throw new Error(`not_found: row ${a.rowId}`);
@@ -3158,6 +3206,18 @@ const handlers: Record<string, Handler> = {
         message_count: 18,
       },
       {
+        thread_id: "mock-session-cursor-rehydrate",
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "cursor",
+        title:
+          "Can you analyze the codebase and figure out when taking a screenshot the continue prompt flickers",
+        last_active_at: new Date(Date.now() - 14 * 60_000).toISOString(),
+        preview:
+          "Root-caused it to frontend state rehydration, not the agent run actually stopping.",
+        message_count: 9,
+      },
+      {
         thread_id: "mock-session-claude-index",
         workspace_id: "ws-codemux-chat",
         cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/search-index`,
@@ -3192,6 +3252,28 @@ const handlers: Record<string, Handler> = {
         summarizer_model: "gpt-5.6-luna",
         summarizer_effort: "low",
         revision_message_id: 118,
+        full_history_available: true,
+      },
+      "mock-session-cursor-rehydrate": {
+        thread_id: threadId,
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "cursor",
+        title:
+          "Can you analyze the codebase and figure out when taking a screenshot the continue prompt flickers",
+        last_active_at: new Date(Date.now() - 14 * 60_000).toISOString(),
+        content:
+          "## Goal\nExplain why the continue prompt flickers while a screenshot is taken.\n\n## Current state\nRoot-caused to frontend state rehydration, not the agent run stopping.\n\n## Next steps\nBound the interim turn hold to the current prompt.",
+        message_count: 9,
+        included_message_count: 9,
+        truncated: false,
+        handoff_kind: "summary",
+        summary_cached: true,
+        summary_error: null,
+        summarizer_provider: "codex",
+        summarizer_model: "gpt-5.6-luna",
+        summarizer_effort: "low",
+        revision_message_id: 91,
         full_history_available: true,
       },
       "mock-session-claude-index": {

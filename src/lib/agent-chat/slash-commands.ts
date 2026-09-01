@@ -66,9 +66,17 @@ export interface SlashCommandItem {
   disabled?: boolean;
   /** Step 9 Stage 4 — opt-in trailing element rendered right-aligned
    *  in the row, e.g. an inline Switch for the MCP servers submenu.
-   *  When present, the row's onSelect is suppressed because the
-   *  trailing control owns the click target. */
+   *  See `rightAdornmentInteractive` for whether it owns its own
+   *  clicks. */
   rightAdornment?: React.ReactNode;
+  /** Whether `rightAdornment` is something the user can click (a
+   *  Switch, a button). An interactive adornment swallows its own
+   *  pointer events so the row underneath is not selected by
+   *  accident; a purely decorative one (a provider label, a relative
+   *  timestamp) must stay transparent to clicks, or it turns the
+   *  right-hand slice of the row into a dead zone. Defaults to
+   *  false. */
+  rightAdornmentInteractive?: boolean;
   /** Opt into a roomier two-line row with the description below the
    *  label. Useful for entity results (such as conversations) whose
    *  names and previews need independent truncation. */

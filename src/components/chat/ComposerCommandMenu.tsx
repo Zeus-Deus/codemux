@@ -1,6 +1,6 @@
 import { Command as CommandPrimitive } from "cmdk";
 import { Search } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type SyntheticEvent } from "react";
 
 import { cn } from "@/lib/utils";
 import {
@@ -28,6 +28,10 @@ const TONE_CLASSES: Record<CommandTone, { chip: string; icon: string }> = {
   muted: { chip: "bg-muted-foreground/15", icon: "text-muted-foreground" },
   ember: { chip: "bg-accent-ember/15", icon: "text-accent-ember" },
 };
+
+/** Shared handler so the three interactive-adornment listeners stay
+ *  identical. */
+const stopRowSelection = (event: SyntheticEvent) => event.stopPropagation();
 
 interface Props {
   /** Hide / show. */
@@ -207,7 +211,7 @@ export function ComposerCommandMenu({
                         )}
                       </span>
                       <span className="flex min-w-0 flex-1 flex-col gap-px">
-                        <span className="text-[13px] font-semibold leading-tight text-foreground">
+                        <span className="truncate text-[13px] font-semibold leading-tight text-foreground">
                           {item.label}
                         </span>
                         {item.description && (
@@ -220,10 +224,18 @@ export function ComposerCommandMenu({
                         <span
                           className="ml-auto shrink-0"
                           // Keep the trailing control's clicks from
-                          // bubbling into row selection (inline Switch).
-                          onClick={(e) => e.stopPropagation()}
-                          onMouseDown={(e) => e.stopPropagation()}
-                          onPointerDown={(e) => e.stopPropagation()}
+                          // bubbling into row selection (inline
+                          // Switch). A decorative adornment — a chat
+                          // row's provider + timestamp — has to stay
+                          // click-through, or its slice of the row
+                          // becomes a dead zone.
+                          {...(item.rightAdornmentInteractive
+                            ? {
+                                onClick: stopRowSelection,
+                                onMouseDown: stopRowSelection,
+                                onPointerDown: stopRowSelection,
+                              }
+                            : null)}
                         >
                           {item.rightAdornment}
                         </span>

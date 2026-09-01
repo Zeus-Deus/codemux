@@ -149,6 +149,32 @@ describe("SlashCommandPopup", () => {
     );
   });
 
+  it("overrides Radix's shrink-to-fit viewport wrapper so rows truncate", () => {
+    // Radix renders the ScrollArea viewport's children inside a
+    // `display: table; min-width: 100%` div. A table box sizes to its
+    // content, so a row wider than the popup (long chat title + its
+    // provider/timestamp adornment) stretched the wrapper and got
+    // clipped by `overflow-hidden` instead of truncating. These
+    // overrides are the fix — losing them silently brings the clipping
+    // back, which is easy to miss in a screenshot of short rows.
+    const { container } = render(
+      <SlashCommandPopup
+        items={makeItems()}
+        highlightedId="mode:plan"
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+      />,
+    );
+    const scrollArea = container.querySelector("[data-slot=scroll-area]");
+    expect(scrollArea?.className).toContain(
+      "[&>[data-slot=scroll-area-viewport]>div]:!block",
+    );
+    expect(scrollArea?.className).toContain(
+      "[&>[data-slot=scroll-area-viewport]>div]:!w-full",
+    );
+  });
+
   it("renders footerNote in muted tone for loading state", () => {
     render(
       <SlashCommandPopup
