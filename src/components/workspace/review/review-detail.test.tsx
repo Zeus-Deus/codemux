@@ -554,6 +554,41 @@ describe("description editing", () => {
   });
 });
 
+// ── Description fold ──
+
+describe("description fold", () => {
+  const LONG = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n");
+
+  /** The clip is the thing that hides text; the control is the way back. */
+  const clipped = () =>
+    screen.getByTestId("review-description").querySelector(".max-h-40.overflow-hidden");
+
+  it("never clips a description without offering a way to open it", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderDetail({ pr: makePr({ body: LONG }) });
+    await flush();
+
+    expect(clipped()).not.toBeNull();
+    expect(screen.getByTestId("description-fold")).toBeInTheDocument();
+
+    // Open and re-fold, so "folded" is what this PR remembers.
+    await user.click(screen.getByTestId("description-fold"));
+    expect(clipped()).toBeNull();
+    await user.click(screen.getByTestId("description-fold"));
+    expect(clipped()).not.toBeNull();
+
+    // The body is edited down to a few lines. The remembered fold no
+    // longer applies: nothing may stay clipped with no control beside it.
+    rerender({
+      pr: makePr({ body: "Short enough to read in one go." }),
+    });
+    await flush();
+
+    expect(screen.queryByTestId("description-fold")).not.toBeInTheDocument();
+    expect(clipped()).toBeNull();
+  });
+});
+
 // ── Reviewers line ──
 
 describe("reviewers line", () => {
