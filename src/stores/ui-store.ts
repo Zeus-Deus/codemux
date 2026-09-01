@@ -119,7 +119,7 @@ interface UIStore {
    *  Presets settings view consumes and clears it. Not persisted. */
   pendingPresetCreate: boolean;
   showAutomations: boolean;
-  showWorkspacesOverview: boolean;
+  showDevices: boolean;
   showPullRequests: boolean;
   /** A pull request the page should select as it opens — set by the
    *  palette, consumed and cleared by the page. Not persisted. */
@@ -219,7 +219,7 @@ interface UIStore {
   /** Clear the pending-create request after the settings view handles it. */
   clearPendingPresetCreate: () => void;
   setShowAutomations: (show: boolean) => void;
-  setShowWorkspacesOverview: (show: boolean) => void;
+  setShowDevices: (show: boolean) => void;
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
@@ -278,7 +278,7 @@ export const useUIStore = create<UIStore>()(
       settingsSection: null,
       pendingPresetCreate: false,
       showAutomations: false,
-      showWorkspacesOverview: false,
+      showDevices: false,
       showPullRequests: false,
       pendingPrSelection: null,
       prBadgeSeen: [],
@@ -489,8 +489,8 @@ export const useUIStore = create<UIStore>()(
         }),
       clearPendingPresetCreate: () => set({ pendingPresetCreate: false }),
       setShowAutomations: (show) => set({ showAutomations: show }),
-      setShowWorkspacesOverview: (show) =>
-        set({ showWorkspacesOverview: show }),
+      setShowDevices: (show) =>
+        set({ showDevices: show }),
       setShowPullRequests: (show, select = null) =>
         set({
           showPullRequests: show,

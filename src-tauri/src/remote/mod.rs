@@ -35,6 +35,7 @@
 pub mod auth;
 pub mod config;
 pub mod git;
+pub mod host_status;
 pub mod identity;
 pub mod manifest;
 pub mod mcp;

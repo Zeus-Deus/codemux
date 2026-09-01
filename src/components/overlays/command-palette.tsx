@@ -9,6 +9,7 @@ import {
   FolderOpen,
   Globe,
   GitPullRequest,
+  MonitorSmartphone,
   Keyboard,
   LayoutGrid,
   LoaderCircle,
@@ -222,6 +223,13 @@ const COMMANDS: PaletteCommand[] = [
     icon: GitPullRequest,
     keywords: "pr prs review merge request incoming",
     run: () => useUIStore.getState().setShowPullRequests(true),
+  },
+  {
+    id: "devices",
+    label: "Devices",
+    icon: MonitorSmartphone,
+    keywords: "hosts remote machines sync pull push sweep",
+    run: () => useUIStore.getState().setShowDevices(true),
   },
   { id: "settings", label: "Settings", icon: Settings, actionId: "openSettings", keywords: "preferences config" },
   {

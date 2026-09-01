@@ -50,6 +50,7 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
       vi.fn((selector: (s: unknown) => unknown) =>
         selector({
           setWorkspacePushPullInFlight: vi.fn(),
+          setWorkspacePushPullError: vi.fn(),
         }),
       ),
       { getState: actual.useAppStore.getState },
@@ -60,7 +61,7 @@ vi.mock("@/stores/app-store", async (importOriginal) => {
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector: (s: unknown) => unknown) =>
     selector({
-      setShowWorkspacesOverview: vi.fn(),
+      setShowDevices: vi.fn(),
     }),
   ),
 }));

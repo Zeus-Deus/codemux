@@ -67,6 +67,8 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+pub mod hosts_status;
+pub mod fs_size;
 #[cfg(unix)]
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
@@ -300,6 +302,11 @@ fn build_core_app<R: tauri::Runtime>(
         // display-coupled behavior on it.
         .manage(mode)
         .manage(state::AppStateStore::default())
+        // Live per-host reachability for the Devices page. Filled by
+        // `hosts_inventory` (Unix only); on Windows every host reads as
+        // never probed. The persisted facts (last seen, disk) live on
+        // the `hosts` rows themselves, so nothing needs seeding here.
+        .manage(hosts_status::HostStatusStore::default())
         // Live plan-quota readings for Settings → Usage. In-memory only;
         // see `commands::usage::PlanQuotaStore`.
         .manage(commands::usage::PlanQuotaStore::default())
@@ -1998,6 +2005,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::create_worktree_workspace,
             commands::import_worktree_workspace,
             commands::close_workspace_with_worktree,
+            commands::workspaces_worktree_sizes,
             commands::archive_workspace,
             commands::unarchive_workspace,
             commands::delete_archived_workspace,
@@ -2280,6 +2288,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::hosts_add,
             commands::hosts_update,
             commands::hosts_delete,
+            commands::hosts_status_list,
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
             commands::hosts_reinstall_remote,

@@ -20,7 +20,7 @@ import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
 import { AutomationsView } from "@/components/automations/automations-view";
-import { WorkspacesOverviewView } from "@/components/workspaces-overview/workspaces-overview-view";
+import { DevicesView } from "@/components/devices/devices-view";
 import { PullRequestsView } from "@/components/pull-requests/pull-requests-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { NewProjectScreen } from "@/components/overlays/new-project-screen";
@@ -44,7 +44,7 @@ export function AppShell() {
   const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const showSettings = useUIStore((s) => s.showSettings);
   const showAutomations = useUIStore((s) => s.showAutomations);
-  const showWorkspacesOverview = useUIStore((s) => s.showWorkspacesOverview);
+  const showDevices = useUIStore((s) => s.showDevices);
   const showPullRequests = useUIStore((s) => s.showPullRequests);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
@@ -151,11 +151,10 @@ export function AppShell() {
     return <AutomationsView />;
   }
 
-  // Full-screen Workspaces overview — one pane to see every workspace
-  // this device knows about, across local + every remote host. Same
-  // overlay shape as Settings / Automations.
-  if (showWorkspacesOverview) {
-    return <WorkspacesOverviewView />;
+  // Full-screen Devices page — the account's other machines and the work
+  // that lives on them. Same overlay shape as Settings / Automations.
+  if (showDevices) {
+    return <DevicesView />;
   }
 
   // Full-screen Pull requests — the review surface for work that isn't

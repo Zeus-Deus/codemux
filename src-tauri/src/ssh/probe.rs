@@ -148,9 +148,13 @@ pub async fn probe_host(opts: ProbeOptions<'_>) -> ProbeOutcome {
     for arg in &argv {
         cmd.arg(arg);
     }
+    // Killed on drop so a probe that outlives the backstop timeout
+    // below does not leave an ssh process hanging around until its
+    // own ConnectTimeout fires.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     let result = timeout(opts.timeout + Duration::from_secs(2), async {
         cmd.output().await

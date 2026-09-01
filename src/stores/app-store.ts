@@ -24,11 +24,15 @@ interface AppStore {
    *  running. Set by the workspace context menu's Move/Pull handlers
    *  and cleared in the completion callback (success or failure). */
   workspacePushPullInFlight: string | null;
-  /** Timestamp (Date.now()) when the current push/pull started. Used
-   *  by the overview row to render an "elapsed Ns" label when an
-   *  operation takes longer than ~2 seconds (Phase-4d signal). Null
-   *  when no operation is in flight. */
+  /** Timestamp (Date.now()) when the current push/pull started. Drives
+   *  the "elapsed Ns" pill beside the spinner once an operation runs past
+   *  ~2 seconds. Null when no operation is in flight. */
   workspacePushPullStartedAt: number | null;
+  /** The most recent failed push or pull, remembered until the next
+   *  transfer starts. The failure itself lives in a toast that disappears;
+   *  this is what keeps it findable — the sidebar's Devices dot turns
+   *  amber and names it. */
+  workspacePushPullError: { title: string; at: number } | null;
   /** Workspace the user just selected, before the backend snapshot that
    *  confirms it has round-tripped. Written synchronously in the click's own
    *  task so the sidebar highlight and the target pane paint without waiting
@@ -95,6 +99,8 @@ interface AppStore {
   endResync: () => void;
   setHomeDir: (homeDir: string) => void;
   setWorkspacePushPullInFlight: (workspaceId: string | null) => void;
+  /** Record a failed transfer for the Devices indicator (null clears). */
+  setWorkspacePushPullError: (title: string | null) => void;
   beginPendingActivation: (workspaceId: string) => void;
   /** Drop the optimistic selection. Pass the id the caller opened to make the
    *  clear conditional — a late rollback or timeout must not cancel a newer
@@ -306,6 +312,7 @@ export const useAppStore = create<AppStore>((set) => ({
   homeDir: null,
   workspacePushPullInFlight: null,
   workspacePushPullStartedAt: null,
+  workspacePushPullError: null,
   pendingActiveWorkspaceId: null,
   pendingActivationAt: null,
   lastSeenRevision: 0,
@@ -505,11 +512,19 @@ export const useAppStore = create<AppStore>((set) => ({
       return { pendingActiveWorkspaceId: null, pendingActivationAt: null };
     }),
   // Pair the workspace id with a start timestamp so "elapsed" can
-  // be computed at render time. Null clears both.
+  // be computed at render time. Null clears both. Starting a transfer
+  // also forgets the last failure: the user is retrying, and a stale
+  // amber dot would outlive the problem it pointed at.
   setWorkspacePushPullInFlight: (workspaceId) =>
-    set({
+    set((state) => ({
       workspacePushPullInFlight: workspaceId,
       workspacePushPullStartedAt: workspaceId === null ? null : Date.now(),
+      workspacePushPullError:
+        workspaceId === null ? state.workspacePushPullError : null,
+    })),
+  setWorkspacePushPullError: (title) =>
+    set({
+      workspacePushPullError: title === null ? null : { title, at: Date.now() },
     }),
 }));
 

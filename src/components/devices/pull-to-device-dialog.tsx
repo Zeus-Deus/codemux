@@ -36,7 +36,7 @@ import {
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useHostsStore } from "@/stores/hosts-store";
 
-import { remoteProjectName } from "./use-overview-items";
+import { remoteProjectName } from "./use-device-cards";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -71,9 +71,8 @@ function markFirstPullSeen() {
 }
 
 /**
- * Pull-to-this-device dialog. The frontend opens this when the user
- * clicks "Pull to this device" on a sibling-device row in the
- * Workspaces overview.
+ * Pull-to-this-device dialog. The Devices page opens this when the user
+ * clicks "Pull here" on a row that lives on another device.
  *
  * Behaviour:
  *   1. On open, fetch the adoption preview via
@@ -94,12 +93,13 @@ function markFirstPullSeen() {
  * and the in-flight signalling pattern used by push-to-host.
  */
 export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
-  const setShowWorkspacesOverview = useUIStore(
-    (s) => s.setShowWorkspacesOverview,
+  const setShowDevices = useUIStore(
+    (s) => s.setShowDevices,
   );
   const setPushPullInFlight = useAppStore(
     (s) => s.setWorkspacePushPullInFlight,
   );
+  const setTransferError = useAppStore((s) => s.setWorkspacePushPullError);
   const refreshSync = useWorkspacesSyncStore((s) => s.refresh);
   const hosts = useHostsStore((s) => s.hosts);
 
@@ -145,7 +145,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     if (!syncRow || !serverId || !preview) return;
     setSubmitting(true);
     // Optimistic: signal the in-flight state immediately so the
-    // sidebar + overview show a spinner the moment the dialog
+    // sidebar + Devices page show a spinner the moment the dialog
     // closes. We don't have a local workspace id yet (the shell is
     // created inside the adopt command), so we key the in-flight
     // signal on the server id prefixed to avoid colliding with real
@@ -160,17 +160,21 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
       //   to that host (data-safety guardrail).
       // - clone: git clone + worktree-add; no Undo (independent
       //   copy is now its own thing).
+      const result = isCloneMode
+        ? await workspacesAdoptViaClone(serverId)
+        : await workspacesAdoptSynced(serverId);
+      markFirstPullSeen();
+      setTransferError(null);
+      void refreshSync();
+
       if (isCloneMode) {
-        const result = await workspacesAdoptViaClone(serverId);
-        markFirstPullSeen();
-        void refreshSync();
         toast.success(`Cloned ${syncRow.title} to this device`, {
           description:
             "Independent copy created. Commit and push to share changes with your other device.",
           action: {
             label: "Open",
             onClick: () => {
-              setShowWorkspacesOverview(false);
+              setShowDevices(false);
               void activateWorkspace(result.workspace_id);
             },
           },
@@ -178,15 +182,10 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
         return;
       }
 
-      // Host-backed branch ↓
-      const result = await workspacesAdoptSynced(serverId);
-      markFirstPullSeen();
-      void refreshSync();
-
       // Resolve the local hosts.id matching the host we just
       // pulled from — needed for the Undo = push-back flow. The
-      // hosts cache is populated by the overview before the dialog
-      // ever opens, so this lookup is synchronous.
+      // hosts cache is populated by the Devices page before the
+      // dialog ever opens, so this lookup is synchronous.
       const sourceHostServerId = syncRow.host_server_id;
       const sourceHost = sourceHostServerId
         ? hosts.find((h) => h.server_id === sourceHostServerId)
@@ -228,7 +227,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
           action: {
             label: "Open",
             onClick: () => {
-              setShowWorkspacesOverview(false);
+              setShowDevices(false);
               void activateWorkspace(result.workspace_id);
             },
           },
@@ -248,6 +247,9 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
         description = message.replace(/^path_in_use:\s*/, "");
       }
       toast.error(title, { description });
+      // The footer's device indicator turns amber until the next
+      // transfer — a failed pull is otherwise gone with the toast.
+      setTransferError(`Pull failed: ${syncRow.title}`);
     } finally {
       setSubmitting(false);
       setPushPullInFlight(null);
@@ -258,16 +260,17 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     preview,
     isCloneMode,
     setPushPullInFlight,
+    setTransferError,
     onOpenChange,
     refreshSync,
-    setShowWorkspacesOverview,
+    setShowDevices,
     hosts,
   ]);
 
   // ── Open-existing-on-already-adopted short-circuit ────────────
   //
   // The user clicked Pull on a row that's already been adopted on
-  // this device (rare, e.g. if the overview is stale). Open the
+  // this device (rare, e.g. if the page is stale). Open the
   // existing workspace instead of confusingly trying to "adopt
   // again".
   const alreadyAdopted = preview?.already_adopted_workspace_id ?? null;
@@ -275,9 +278,9 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
   const handleOpenExisting = useCallback(() => {
     if (!alreadyAdopted) return;
     onOpenChange(false);
-    setShowWorkspacesOverview(false);
+    setShowDevices(false);
     void activateWorkspaceInteraction(alreadyAdopted).catch(console.error);
-  }, [alreadyAdopted, onOpenChange, setShowWorkspacesOverview]);
+  }, [alreadyAdopted, onOpenChange, setShowDevices]);
 
   // ── Cross-machine same-branch-same-project guard ──────────────
   //
@@ -295,9 +298,9 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
   const handleOpenSameBranchConflict = useCallback(() => {
     if (!sameBranchConflict) return;
     onOpenChange(false);
-    setShowWorkspacesOverview(false);
+    setShowDevices(false);
     void activateWorkspaceInteraction(sameBranchConflict).catch(console.error);
-  }, [sameBranchConflict, onOpenChange, setShowWorkspacesOverview]);
+  }, [sameBranchConflict, onOpenChange, setShowDevices]);
 
   if (!syncRow) return null;
 

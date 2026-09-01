@@ -88,7 +88,7 @@ export function WorkspaceInboxMenu({
           await closeWorkspace(workspace.workspace_id, false);
         }
         toast.success(
-          `Closed "${workspace.title}" — it stays available on its host in the Workspaces Overview`,
+          `Closed "${workspace.title}" — it stays available on its host under Devices`,
         );
       } else {
         const archiveId = await archiveWorkspace(workspace.workspace_id);

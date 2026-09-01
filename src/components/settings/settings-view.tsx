@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
+import { formatBytes } from "@/lib/format-bytes";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { WindowChrome } from "@/components/layout/window-chrome";
@@ -425,14 +426,6 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       <span className="truncate">{label}</span>
     </button>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
-  return `${(bytes / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
 /** Options for the default agent-browser viewport. "default" maps to

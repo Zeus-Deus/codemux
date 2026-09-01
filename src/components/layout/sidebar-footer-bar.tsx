@@ -22,7 +22,6 @@ import {
   BookOpen,
   Bug,
   CalendarClock,
-  LayoutGrid,
   LogOut,
   ExternalLink,
 } from "lucide-react";
@@ -38,6 +37,7 @@ import {
 } from "@/components/ui/menu-chrome";
 import { SidebarPortsPopover } from "./sidebar-ports-popover";
 import { SidebarPullRequestsButton } from "./sidebar-pr-button";
+import { SidebarDevicesButton } from "./sidebar-devices-button";
 
 /**
  * The menu's bottom strip: which build is running, and whether it is the
@@ -222,9 +222,6 @@ function AppMenu({
 export function SidebarFooterBar() {
   const { state } = useSidebar();
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
-  const setShowWorkspacesOverview = useUIStore(
-    (s) => s.setShowWorkspacesOverview,
-  );
 
   if (state === "collapsed") {
     // Same destinations as the expanded row, restacked vertically as an
@@ -250,22 +247,7 @@ export function SidebarFooterBar() {
               Automations
             </TooltipContent>
           </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Workspaces"
-                onClick={() => setShowWorkspacesOverview(true)}
-                className="size-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
-              >
-                <LayoutGrid className="size-[18px]" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right" sideOffset={4} className="text-xs">
-              Workspaces
-            </TooltipContent>
-          </Tooltip>
+          <SidebarDevicesButton tooltipSide="right" />
           <SidebarPullRequestsButton tooltipSide="right" />
           <SidebarPortsPopover />
           <AppMenu tooltipSide="right" />
@@ -283,25 +265,20 @@ export function SidebarFooterBar() {
         type="button"
         aria-label="Automations"
         onClick={() => setShowAutomations(true)}
-        className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
+        className="flex h-7 items-center gap-1.5 rounded-[7px] bg-transparent px-2 text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
       >
         <CalendarClock className="size-[13px]" />
         <span className="text-[12px] font-medium">Automations</span>
       </button>
-      <button
-        type="button"
-        aria-label="Workspaces"
-        onClick={() => setShowWorkspacesOverview(true)}
-        className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
-      >
-        <LayoutGrid className="size-[13px]" />
-        <span className="text-[12px] font-medium">Workspaces</span>
-      </button>
-      {/* Icon-only, like Ports: three labelled destinations would not
-          fit this row, and the badge is what makes this one findable. */}
-      <SidebarPullRequestsButton />
-      <SidebarPortsPopover />
-      <AppMenu />
+      {/* Devices is a secondary surface, so it joins the icon cluster instead
+          of sharing top billing with Automations; it only appears once a
+          device exists, and its dot carries the cross-device status. */}
+      <div className="ml-auto flex items-center gap-0.5">
+        <SidebarDevicesButton />
+        <SidebarPullRequestsButton />
+        <SidebarPortsPopover />
+        <AppMenu />
+      </div>
     </div>
   );
 }

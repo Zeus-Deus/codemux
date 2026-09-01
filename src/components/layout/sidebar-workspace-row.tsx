@@ -12,6 +12,7 @@ import {
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { groupEditors } from "@/lib/editor-groups";
+import { useElapsedSeconds } from "@/hooks/use-elapsed-seconds";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import {
   Dialog,
@@ -78,6 +79,7 @@ import {
   runWorkspaceSetup,
   workspacePullBack,
   workspacePushToHost,
+  workspacesReconcileCopy,
   type HostView,
 } from "@/tauri/commands";
 import { useHosts } from "@/stores/hosts-store";
@@ -546,6 +548,7 @@ export function WorkspaceContextMenuItems({
   const setPushPullInFlight = useAppStore(
     (s) => s.setWorkspacePushPullInFlight,
   );
+  const setTransferError = useAppStore((s) => s.setWorkspacePushPullError);
 
   const handleMoveToHost = async (host: HostView) => {
     setPushPullInFlight(workspace.workspace_id);
@@ -579,12 +582,30 @@ export function WorkspaceContextMenuItems({
         toast.error(`Push to ${host.name} failed`, {
           description: result.message,
         });
+        setTransferError(`Push to ${host.name} failed: ${workspace.title}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error("Push failed", { description: message });
+      // The footer's Devices dot keeps pointing at this until the next
+      // transfer; the toast alone would be gone in seconds.
+      setTransferError(`Push to ${host.name} failed: ${workspace.title}`);
     } finally {
       setPushPullInFlight(null);
+    }
+  };
+
+  // A divergent standalone copy: this workspace's files were pulled from
+  // another device and both sides have moved since. Reconcile detaches the
+  // card (files stay on disk) when clean, or explains what's holding it.
+  const handleReconcileCopy = async () => {
+    try {
+      const message = await workspacesReconcileCopy(workspace.workspace_id);
+      toast.success("Copy reconciled", { description: message });
+    } catch (err) {
+      toast.error("Couldn't reconcile copy", {
+        description: err instanceof Error ? err.message : String(err),
+      });
     }
   };
 
@@ -866,6 +887,15 @@ export function WorkspaceContextMenuItems({
         Organize
       </ContextMenuLabel>
       {projectMenu}
+      {workspace.divergent_copy && (
+        <ContextMenuItem
+          className={MENU_ROW}
+          onClick={() => void handleReconcileCopy()}
+        >
+          <GitBranch />
+          <span className="flex-1">Reconcile copy…</span>
+        </ContextMenuItem>
+      )}
       {isRemote ? (
         <ContextMenuItem
           className={MENU_ROW}
@@ -1003,7 +1033,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   // refuses to archive them, so their removal affordance is the old
   // close — worktree rows keep the worktree (removeWorktree=false),
   // plain rows detach. Nothing on the host is torn down; the workspace
-  // stays reachable from the Workspaces Overview.
+  // stays reachable from the Devices page.
   const handleClose = async () => {
     try {
       if (workspace.worktree_path) {
@@ -1017,7 +1047,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
         await closeWorkspace(workspace.workspace_id, false);
       }
       toast.success(
-        `Closed "${workspace.title}" — it stays available on its host in the Workspaces Overview`,
+        `Closed "${workspace.title}" — it stays available on its host under Devices`,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1027,7 +1057,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
 
   const isPrimary = !workspace.worktree_path;
   // A protected repo root is never destructively deletable from the sidebar
-  // (close-only), aligning with the overview's `isRepoRoot` guard. Roots
+  // (close-only), aligning with the backend's repo-root guard. Roots
   // already have a null `worktree_path` (so `isPrimary` covers them), but
   // gating on `protected` too is belt-and-suspenders against a root that
   // somehow carries a worktree_path.
@@ -1068,32 +1098,16 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   const showWorkspaceIconAsPr =
     isWorktreeRow && !!workspace.pr_state && !prRetired;
 
-  // Phase-4d elapsed-time signal: when an in-flight push/pull
-  // crosses 2 seconds, show a small "12s" pill so the user knows
-  // the operation is still working. Identical math to the overview
-  // row — see workspace-overview-row.tsx LocalRow for the rationale.
+  // Once an in-flight push/pull crosses 2 seconds, a small "12s" pill
+  // tells the user the operation is still working. Same hook as the
+  // Devices page row so both count the same way.
   const inFlightStartedAt = useAppStore(
     (s) =>
       s.workspacePushPullInFlight === workspace.workspace_id
         ? s.workspacePushPullStartedAt
         : null,
   );
-  const [sidebarElapsedSec, setSidebarElapsedSec] = useState<number | null>(
-    null,
-  );
-  useEffect(() => {
-    if (inFlightStartedAt === null) {
-      setSidebarElapsedSec(null);
-      return;
-    }
-    const tick = () => {
-      const ms = Date.now() - inFlightStartedAt;
-      setSidebarElapsedSec(ms < 2_000 ? null : Math.floor(ms / 1_000));
-    };
-    tick();
-    const id = window.setInterval(tick, 1_000);
-    return () => window.clearInterval(id);
-  }, [inFlightStartedAt]);
+  const sidebarElapsedSec = useElapsedSeconds(inFlightStartedAt);
   const icon = isPushOrPullInFlight ? (
     <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
