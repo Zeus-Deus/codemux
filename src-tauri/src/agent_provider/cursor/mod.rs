@@ -230,6 +230,17 @@ impl AgentProvider for CursorAgentProvider {
         self.session(&thread_id).await?.set_model(model).await
     }
 
+    async fn set_fast_mode(
+        &self,
+        thread_id: ThreadId,
+        fast_mode: bool,
+    ) -> Result<(), ProviderError> {
+        self.session(&thread_id)
+            .await?
+            .set_fast_mode(fast_mode)
+            .await
+    }
+
     async fn set_permission_mode(
         &self,
         thread_id: ThreadId,

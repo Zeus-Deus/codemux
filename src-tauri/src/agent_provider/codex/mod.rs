@@ -337,6 +337,20 @@ impl AgentProvider for CodexAgentProvider {
         Ok(())
     }
 
+    async fn set_fast_mode(
+        &self,
+        thread_id: ThreadId,
+        fast_mode: bool,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
+        session.set_fast_mode(fast_mode).await;
+        Ok(())
+    }
+
     async fn set_permission_mode(
         &self,
         _thread_id: ThreadId,
