@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/popover";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { useProjectActions } from "@/hooks/use-project-actions";
+import { abbreviateHome } from "@/lib/agent-chat/external-sessions";
 import { fuzzyFilter, fuzzyMatch } from "@/lib/fuzzy";
 import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
@@ -97,6 +98,22 @@ function formatRelativeTime(unixSeconds: number): string {
   return `${years}y`;
 }
 
+/** Where a terminal-session pick has pointed the draft. The session
+ *  decides the folder, so while this is set the strip is read-only: it
+ *  names the project, the checkout the session ran in (an existing
+ *  linked worktree, or the main checkout) and the folder itself. */
+export interface PinnedCheckout {
+  /** Repository root, or null when the session ran outside any repo. */
+  projectPath: string | null;
+  /** The session's own folder — what the workspace is anchored at. */
+  cwd: string;
+  /** Basename of the linked worktree, when `cwd` is one. Never
+   *  created here: it already exists on disk. */
+  worktreeName: string | null;
+  /** Branch the session was last on, when known. */
+  branch: string | null;
+}
+
 export interface ThreadScopeRowProps {
   /** The draft's current target; the location popover retargets it
    *  (`updateDraftTarget`) — nothing is created until first send. */
@@ -114,6 +131,11 @@ export interface ThreadScopeRowProps {
   onChangeCheckoutMode: (mode: "current" | "worktree") => void;
   onChangeWorktreeName: (name: string) => void;
   onChangeBaseBranch: (branch: string) => void;
+  /** Set once a terminal session has been picked: the strip shows that
+   *  session's destination instead of the draft's choosable controls,
+   *  so a jump to another project (or into one of its worktrees) is
+   *  seen before anything runs. */
+  pinnedCheckout?: PinnedCheckout | null;
 }
 
 /**
@@ -142,6 +164,7 @@ export function ThreadScopeRow({
   onChangeCheckoutMode,
   onChangeWorktreeName,
   onChangeBaseBranch,
+  pinnedCheckout = null,
 }: ThreadScopeRowProps) {
   const isHome = target.kind === "home";
   const showProjectControls = !isHome && projectPath !== null;
@@ -216,6 +239,10 @@ export function ThreadScopeRow({
     }
   }, [projectIsGit, checkoutMode, onChangeCheckoutMode]);
 
+  if (pinnedCheckout) {
+    return <PinnedCheckoutStrip pinned={pinnedCheckout} />;
+  }
+
   return (
     <div className="rise-in flex w-full flex-col items-center gap-3">
       <div className={SCOPE_STRIP_INSET}>
@@ -252,6 +279,76 @@ export function ThreadScopeRow({
               />
             </div>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Pinned destination (terminal-session pick) ──
+
+/** Same footprint as `GHOST_BTN`, minus the affordances: nothing here
+ *  can be changed, because the session already decided it. */
+const READONLY_PILL =
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground";
+
+function PinnedCheckoutStrip({ pinned }: { pinned: PinnedCheckout }) {
+  const homeDir = useHomeDir();
+  const projectLabel = pinned.projectPath
+    ? basename(pinned.projectPath)
+    : "Home folder";
+  return (
+    <div className="rise-in flex w-full flex-col items-center gap-3">
+      <div className={SCOPE_STRIP_INSET}>
+        <div className={SCOPE_STRIP} data-testid="thread-scope-pinned">
+          <div className="flex min-w-0 items-center gap-0.5">
+            <span className={READONLY_PILL}>
+              <Folder className="size-3.5 text-muted-foreground" />
+              <span
+                className="max-w-[140px] truncate"
+                data-testid="thread-scope-pinned-project"
+              >
+                {projectLabel}
+              </span>
+            </span>
+            {pinned.projectPath && (
+              <>
+                <span className="select-none text-muted-foreground/50">·</span>
+                {pinned.worktreeName ? (
+                  <span
+                    className={READONLY_PILL}
+                    data-testid="thread-scope-pinned-worktree"
+                  >
+                    <GitFork className="size-3 text-muted-foreground" />
+                    Worktree{" "}
+                    <span className="font-mono text-foreground">
+                      {pinned.worktreeName}
+                    </span>
+                  </span>
+                ) : (
+                  <span
+                    className={READONLY_PILL}
+                    data-testid="thread-scope-pinned-checkout"
+                  >
+                    <Folder className="size-3 text-muted-foreground" />
+                    Current checkout
+                    {pinned.branch && (
+                      <span className="font-mono text-foreground">
+                        {pinned.branch}
+                      </span>
+                    )}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <span
+            className="min-w-0 truncate font-mono text-[10px] text-muted-foreground/70"
+            data-testid="thread-scope-pinned-path"
+            title={pinned.cwd}
+          >
+            {abbreviateHome(pinned.cwd, homeDir)}
+          </span>
         </div>
       </div>
     </div>

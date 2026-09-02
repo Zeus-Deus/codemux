@@ -879,3 +879,49 @@ describe("ThreadScopeRow", () => {
     });
   });
 });
+
+describe("ThreadScopeRow — pinned to a terminal session's destination", () => {
+  it("shows the project, the existing worktree and its folder, read-only", () => {
+    renderRow({
+      draftTarget: { kind: "home" },
+      projectPath: null,
+      pinnedCheckout: {
+        projectPath: "/home/user/projects/codemux",
+        cwd: "/home/user/codemux/worktrees/resolve-pr-conflicts",
+        worktreeName: "resolve-pr-conflicts",
+        branch: "resolve-pr-conflicts",
+      },
+    });
+    const strip = screen.getByTestId("thread-scope-pinned");
+    expect(screen.getByTestId("thread-scope-pinned-project").textContent).toBe(
+      "codemux",
+    );
+    expect(screen.getByTestId("thread-scope-pinned-worktree").textContent).toBe(
+      "Worktree resolve-pr-conflicts",
+    );
+    expect(screen.getByTestId("thread-scope-pinned-path").textContent).toBe(
+      "~/codemux/worktrees/resolve-pr-conflicts",
+    );
+    // Nothing to choose: no location / checkout / branch popovers.
+    expect(strip.querySelector("button")).toBeNull();
+    expect(screen.queryByText("New worktree")).toBeNull();
+  });
+
+  it("names the main checkout when the session did not run in a worktree", () => {
+    renderRow({
+      pinnedCheckout: {
+        projectPath: "/home/user/projects/web-snake",
+        cwd: "/home/user/projects/web-snake",
+        worktreeName: null,
+        branch: "master",
+      },
+    });
+    expect(screen.getByTestId("thread-scope-pinned-project").textContent).toBe(
+      "web-snake",
+    );
+    expect(screen.getByTestId("thread-scope-pinned-checkout").textContent).toBe(
+      "Current checkoutmaster",
+    );
+    expect(screen.queryByTestId("thread-scope-pinned-worktree")).toBeNull();
+  });
+});

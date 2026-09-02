@@ -77,14 +77,17 @@ import type {
 } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
-import { ContinueTerminalSessionRow } from "./ContinueTerminalSessionRow";
+import {
+  ContinueTerminalSessionRow,
+  type LandingScope,
+} from "./ContinueTerminalSessionRow";
 import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import { formatProviderError } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
 import type { ActivePillMode } from "./pickers/ModePill";
-import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
+import { ThreadScopeRow, type PinnedCheckout } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN } from "./chat-column";
@@ -599,54 +602,67 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // ── Continue a terminal session ──
   //
   // Conversations the agent's CLI started outside Codemux can be
-  // picked up from here, before any workspace exists. Discovery looks
-  // at the draft's selected project (its root, worktrees included) —
-  // or every project on the machine for a Home draft, which has no
-  // folder yet. The session brings its own directory, so the pick
-  // never consults the location picker at all.
+  // picked up from here, before any workspace exists. The session
+  // brings its own directory, so the pick never consults the location
+  // picker at all.
+  //
+  // Discovery always spans the whole machine; the picker groups rows by
+  // project and opens the selected one, so `projectRoot` is what tells
+  // it (and the landing row) which group is "this project". Null for a
+  // Home draft, which has none.
   const resumeScope = useMemo(() => {
     if (draft.target.kind === "home") {
-      return {
-        cwd: appHomeDir,
-        allProjects: true,
-        foreignOpensInPlace: true,
-      };
+      return { cwd: appHomeDir, projectRoot: null };
     }
-    return {
-      cwd: scopeProjectPath,
-      allProjects: false,
-      foreignOpensInPlace: true,
-    };
+    return { cwd: scopeProjectPath, projectRoot: scopeProjectPath };
   }, [draft.target.kind, appHomeDir, scopeProjectPath]);
 
-  // How many there are, so the affordance only renders when a pick is
-  // possible — an empty machine keeps the bare headline + composer.
-  const [adoptableCount, setAdoptableCount] = useState(0);
+  // What discovery found, so the landing row can name the freshest
+  // session in scope (or say nothing at all on an empty machine).
+  const [adoptableSessions, setAdoptableSessions] = useState<
+    AdoptableAgentSession[]
+  >(EMPTY_ADOPTABLE_SESSIONS);
   useEffect(() => {
     const scopeCwd = resumeScope.cwd;
     if (!scopeCwd) {
-      setAdoptableCount(0);
+      setAdoptableSessions(EMPTY_ADOPTABLE_SESSIONS);
       return;
     }
     let cancelled = false;
     agentChatListAdoptableSessions(draft.provider, {
       current_cwd: scopeCwd,
-      all_projects: resumeScope.allProjects,
+      all_projects: true,
       include_worktrees: true,
       limit: RESUME_DISCOVERY_LIMIT,
     })
       .then((rows) => {
-        if (!cancelled) setAdoptableCount(rows.length);
+        if (!cancelled) setAdoptableSessions(rows);
       })
       .catch(() => {
         // Discovery is best-effort here; the picker itself reports a
         // failure in its footer when the user actually opens it.
-        if (!cancelled) setAdoptableCount(0);
+        if (!cancelled) setAdoptableSessions(EMPTY_ADOPTABLE_SESSIONS);
       });
     return () => {
       cancelled = true;
     };
-  }, [draft.provider, resumeScope.cwd, resumeScope.allProjects]);
+  }, [draft.provider, resumeScope.cwd]);
+  const landingScope = useMemo<LandingScope>(
+    () =>
+      draft.target.kind === "home"
+        ? { kind: "home" }
+        : { kind: "project", projectRoot: scopeProjectPath },
+    [draft.target.kind, scopeProjectPath],
+  );
+
+  // The destination a picked session points the draft at, shown on the
+  // scope strip the instant the pick lands — before the workspace is
+  // resolved — so a jump to another project or into one of its
+  // worktrees is seen, not discovered later. Cleared if the resume
+  // fails and the draft is handed back.
+  const [pinnedCheckout, setPinnedCheckout] = useState<PinnedCheckout | null>(
+    null,
+  );
 
   // The row opens the composer's own `/resume` picker.
   const [resumeOpenSignal, setResumeOpenSignal] = useState(0);
@@ -668,6 +684,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         phase: "resuming",
         title: session.title,
       });
+      setPinnedCheckout({
+        projectPath: session.project_root,
+        cwd: session.cwd,
+        worktreeName: session.worktree_name,
+        branch: session.git_branch,
+      });
       const result = await resumeExternalSessionFromDraft(
         draft.draftId,
         session,
@@ -676,6 +698,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         void useProviderHealth.getState().noteProviderSuccess(draft.provider);
       } else {
         setPending(null);
+        setPinnedCheckout(null);
         toast.error(`Failed to resume "${session.title}": ${result.error}`);
         void useProviderHealth
           .getState()
@@ -1160,13 +1183,16 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         onChangeCheckoutMode={handleChangeCheckoutMode}
         onChangeWorktreeName={handleChangeWorktreeName}
         onChangeBaseBranch={handleChangeBaseBranch}
+        pinnedCheckout={pinnedCheckout}
       />
-      {adoptableCount > 0 && (
+      {!pending && (
         <ContinueTerminalSessionRow
-          count={adoptableCount}
-          scope={draft.target.kind === "home" ? "machine" : "checkout"}
+          sessions={adoptableSessions}
+          scope={landingScope}
+          provider={draft.provider}
           disabled={draft.promoting}
-          onOpen={handleOpenResumePicker}
+          onOpenPicker={handleOpenResumePicker}
+          onContinue={handleResumeExternalSession}
         />
       )}
     </div>
@@ -1301,10 +1327,15 @@ const PHASE_LABEL: Record<DraftPendingPhase, string> = {
   resuming: "Resuming session…",
 };
 
-/** Rows requested when checking whether the "continue a terminal
- *  session" row has anything to offer. Only the count matters here, and
- *  the picker fetches its own (larger) page on open. */
-const RESUME_DISCOVERY_LIMIT = 20;
+/** Rows requested for the landing row's decision. Discovery spans every
+ *  project, and the row needs the newest session in the SELECTED one,
+ *  which a short machine-wide page could miss — so this matches the
+ *  page the picker fetches on open. */
+const RESUME_DISCOVERY_LIMIT = 200;
+
+/** Stable empty list so the effect's reset never hands the row a fresh
+ *  reference to re-derive from. */
+const EMPTY_ADOPTABLE_SESSIONS: AdoptableAgentSession[] = [];
 
 /**
  * The just-sent conversation, rendered the instant the user submits so

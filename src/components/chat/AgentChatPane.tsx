@@ -143,7 +143,6 @@ import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
-import { AdoptForeignSessionDialog } from "./adopt-foreign-session-dialog";
 import { RevertTurnDialog } from "./revert-turn-dialog";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -218,12 +217,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // `/resume` — adopt a conversation the agent CLI created outside
   // Codemux. Shares the pane-header's session orchestration so both
   // entry points stop / hydrate / launch through one implementation.
-  const {
-    handleAdoptExternalSession,
-    foreignProjectPrompt,
-    confirmForeignProjectAdopt,
-    dismissForeignProjectAdopt,
-  } = useAgentChatSessionActions(pane);
+  const { handleAdoptExternalSession } = useAgentChatSessionActions(pane);
   const turnCheckpoints = useAgentChatTurnCheckpoints(threadId);
   const turnCheckpointByNonce = useMemo(() => {
     const byNonce = new Map<string, AgentChatTurnCheckpointRecord>();
@@ -3341,13 +3335,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           if (!open) setRevertTarget(null);
         }}
         onConfirm={() => void handleConfirmTurnRevert()}
-      />
-      <AdoptForeignSessionDialog
-        prompt={foreignProjectPrompt}
-        onOpenChange={(open) => {
-          if (!open) dismissForeignProjectAdopt();
-        }}
-        onConfirm={() => void confirmForeignProjectAdopt()}
       />
     </div>
   );

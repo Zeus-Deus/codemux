@@ -2,6 +2,7 @@ import {
   ArrowDown,
   ChevronDown,
   ChevronRight,
+  Terminal,
   TriangleAlert,
 } from "lucide-react";
 import {
@@ -30,6 +31,9 @@ import {
   assistantReferenceCwds,
   assistantReferencePaths,
 } from "@/lib/agent-chat/reference-cwd";
+import { adoptedSessionLastActiveAt } from "@/lib/agent-chat/adopt-external-session";
+import { agentDisplayName } from "@/lib/agent-chat/agent-display-name";
+import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -351,6 +355,17 @@ export const MessageList = memo(function MessageList({
   const showLiveMarker =
     (showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
     !tailIsWorkingActivity;
+
+  // An adopted terminal session opens on its divider and nothing else
+  // until the user writes; that is a connected thread, not an empty one,
+  // and the footer says so. Gone the moment a real row lands.
+  const resumedAwaitingFirstMessage =
+    !streaming &&
+    ordered.length > 0 &&
+    ordered.every((item) => item.kind === "resume_divider");
+  // When this app session adopted the thread, the divider can say how
+  // long ago the terminal last touched it (see adopt-external-session).
+  const resumeLastActiveAt = adoptedSessionLastActiveAt(threadKey);
 
   const listRef = useRef<LegendListRef | null>(null);
   const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
@@ -1162,6 +1177,8 @@ export const MessageList = memo(function MessageList({
           onRevertTurn={onRevertTurn}
           revertingTurnIndex={revertingTurnIndex}
           onToggleTurnFold={toggleTurnFold}
+          provider={provider}
+          resumeLastActiveAt={resumeLastActiveAt}
         />
       </div>
     ),
@@ -1181,6 +1198,8 @@ export const MessageList = memo(function MessageList({
       turnCheckpointByNonce,
       workspaceId,
       cwd,
+      provider,
+      resumeLastActiveAt,
     ],
   );
 
@@ -1222,12 +1241,18 @@ export const MessageList = memo(function MessageList({
             <RunInterruptedDivider />
           </div>
         )}
+        {resumedAwaitingFirstMessage && (
+          <div className="mt-[13px]">
+            <ResumeConnectedLine />
+          </div>
+        )}
       </div>
     ),
     [
       backgroundBrowserSession,
       interrupted,
       ordered,
+      resumedAwaitingFirstMessage,
       showBrowserChip,
       showLiveMarker,
       stalled,
@@ -1466,38 +1491,75 @@ function RunInterruptedDivider() {
   );
 }
 
-/** "Resumed from a session started outside Codemux" divider — the first
- *  row of an adopted thread. Shares the SessionStartMarker hairline
- *  pattern, with the branch and original start time when the provider
- *  reported them.
+/** "Resumed from the terminal" divider — the first row of an adopted
+ *  thread. Shares the SessionStartMarker hairline pattern, naming the
+ *  agent and, when this app session did the adopting, how long ago the
+ *  terminal last touched the conversation. The earlier turns stay with
+ *  the agent, which is what the status line beneath says.
  *
  *  It says the earlier turns are not here on purpose. There is no
  *  history backfill: the agent still holds the conversation, Codemux
  *  does not, and an empty transcript would read as a failed resume. */
-function ResumeDividerRow({ item }: { item: ResumeDividerItem }) {
-  const detail = [
-    item.branch,
-    item.startedAt != null ? formatSessionStart(item.startedAt) : null,
+function ResumeDividerRow({
+  item,
+  provider,
+  lastActiveAt,
+}: {
+  item: ResumeDividerItem;
+  provider?: AgentChatProviderKind | null;
+  /** Epoch ms of the terminal's last write, when known. */
+  lastActiveAt: number | null;
+}) {
+  // A turn count would go between the agent and the activity — but the
+  // payload does not carry one, and a guessed number is worse than none.
+  const label = [
+    "Resumed from the terminal",
+    provider ? agentDisplayName(provider) : null,
+    lastActiveAt != null
+      ? `last active ${relativeTime(new Date(lastActiveAt))}`
+      : null,
   ]
     .filter((part): part is string => !!part)
     .join(" · ");
   return (
     <div
       data-testid="resume-divider"
-      className="flex flex-col items-center gap-1 text-muted-foreground/70"
+      data-source={item.source}
+      className="flex w-full items-center gap-3 text-muted-foreground/70"
+      title={
+        lastActiveAt != null
+          ? `Last active ${new Date(lastActiveAt).toLocaleString()}`
+          : undefined
+      }
     >
-      <div className="flex w-full items-center gap-3">
-        <span className="h-px flex-1 bg-border/60" />
-        <span className="font-mono text-[11px] font-medium tracking-wide">
-          Resumed from a session started outside Codemux
-        </span>
-        <span className="h-px flex-1 bg-border/60" />
-      </div>
-      <span className="text-[11px] text-muted-foreground/60">
-        {detail
-          ? `${detail} — earlier turns stay with the agent`
-          : "Earlier turns stay with the agent"}
+      <span className="h-px flex-1 bg-border/60" />
+      <Terminal className="size-3 shrink-0 text-warning" aria-hidden />
+      <span className="font-mono text-[10px] font-medium uppercase tracking-[0.04em]">
+        {label}
       </span>
+      <span className="h-px flex-1 bg-border/60" />
+    </div>
+  );
+}
+
+/** Status line under a freshly adopted thread — the divider is its only
+ *  row until the user's first message, so say what that means instead
+ *  of looking like an empty transcript. */
+export const RESUME_CONNECTED_COPY =
+  "Connected — the agent has the full history. Send a message to continue.";
+
+function ResumeConnectedLine() {
+  return (
+    <div
+      data-testid="resume-connected"
+      role="status"
+      className="flex items-center gap-2 text-[11px] text-muted-foreground/70"
+    >
+      <span
+        className="size-1.5 shrink-0 rounded-full bg-success"
+        aria-hidden
+      />
+      <span>{RESUME_CONNECTED_COPY}</span>
     </div>
   );
 }
@@ -1580,10 +1642,14 @@ function ItemRow({
   cwd,
   referenceCwd,
   referencePaths,
+  provider,
+  resumeLastActiveAt,
 }: {
   item: ChatViewItem;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
+  provider?: AgentChatProviderKind | null;
+  resumeLastActiveAt?: number | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -1647,7 +1713,13 @@ function ItemRow({
   // Full-width hairline, no gutter: the adopted-session marker is a
   // divider across the transcript, not an assistant utterance.
   if (item.kind === "resume_divider") {
-    return <ResumeDividerRow item={item} />;
+    return (
+      <ResumeDividerRow
+        item={item}
+        provider={provider}
+        lastActiveAt={resumeLastActiveAt ?? null}
+      />
+    );
   }
 
   // Same full-width, no-gutter treatment for a Workflow tool run.
@@ -1877,10 +1949,14 @@ function SlotRow({
   onRevertTurn,
   revertingTurnIndex,
   onToggleTurnFold,
+  provider,
+  resumeLastActiveAt,
 }: {
   slot: TranscriptSlot;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
+  provider?: AgentChatProviderKind | null;
+  resumeLastActiveAt?: number | null;
   workspaceId?: string | null;
   cwd?: string | null;
   referenceCwd?: string | null;
@@ -1947,6 +2023,8 @@ function SlotRow({
           cwd={cwd}
           referenceCwd={referenceCwd}
           referencePaths={referencePaths}
+          provider={provider}
+          resumeLastActiveAt={resumeLastActiveAt}
         />
       )}
     </div>

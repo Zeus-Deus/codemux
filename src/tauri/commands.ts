@@ -1888,6 +1888,14 @@ export interface AdoptableAgentSession extends ExternalAgentSession {
    *  that as an explicit separate action instead of silently re-pointing
    *  the current pane. */
   same_repo: boolean;
+  /** Canonical root of the git repository the session's cwd belongs to.
+   *  A linked worktree resolves to its repository's main root, so the
+   *  picker can fold worktrees into one project group. Null when the
+   *  cwd is not inside a git repository (a "home folder" session). */
+  project_root: string | null;
+  /** Basename of the linked worktree when `cwd` is a linked worktree of
+   *  `project_root`; null for the main checkout and for non-git folders. */
+  worktree_name: string | null;
 }
 
 /** Which slice of local history to offer. `current_cwd` is required —

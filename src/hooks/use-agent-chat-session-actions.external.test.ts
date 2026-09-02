@@ -60,6 +60,7 @@ import {
   type AdoptExternalSessionResult,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import { adoptedSessionLastActiveAt } from "@/lib/agent-chat/adopt-external-session";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
@@ -89,6 +90,8 @@ function makeSession(
     title_source: "summary",
     existing_thread_id: null,
     same_repo: true,
+    project_root: "/projects/foo",
+    worktree_name: null,
     ...overrides,
   };
 }
@@ -462,8 +465,14 @@ describe("handleAdoptExternalSession — failure surfaces", () => {
 });
 
 describe("handleAdoptExternalSession — another project's directory", () => {
+  // The picker's footer already told the user where the pick goes;
+  // there is no dialog between the press and the move.
   const foreignSession = () =>
-    makeSession({ cwd: "/projects/ledger", same_repo: false });
+    makeSession({
+      cwd: "/projects/ledger",
+      project_root: "/projects/ledger",
+      same_repo: false,
+    });
 
   beforeEach(() => {
     vi.mocked(agentChatAdoptExternalSession).mockResolvedValue(
@@ -471,63 +480,48 @@ describe("handleAdoptExternalSession — another project's directory", () => {
     );
   });
 
-  it("asks first instead of re-pointing the pane on the click (R4)", async () => {
+  it("adopts in that directory on the click and names the destination", async () => {
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane()),
     );
     await act(async () => {
       await result.current.handleAdoptExternalSession(foreignSession());
-    });
-
-    // Nothing is minted and nothing moves until the user says yes.
-    expect(vi.mocked(agentChatAdoptExternalSession)).not.toHaveBeenCalled();
-    expect(vi.mocked(agentChatStartSession)).not.toHaveBeenCalled();
-    expect(vi.mocked(toast.success)).not.toHaveBeenCalled();
-    expect(result.current.foreignProjectPrompt).toMatchObject({
-      cwd: "/projects/ledger",
-    });
-  });
-
-  it("adopts in that directory once the user confirms", async () => {
-    const { result } = renderHook(() =>
-      useAgentChatSessionActions(makePane()),
-    );
-    await act(async () => {
-      await result.current.handleAdoptExternalSession(foreignSession());
-    });
-    await act(async () => {
-      await result.current.confirmForeignProjectAdopt();
     });
 
     expect(vi.mocked(agentChatAdoptExternalSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
     const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0]!;
+    // R1 — the session's own folder, never a worktree made for it.
     expect((input as { cwd: string }).cwd).toBe("/projects/ledger");
-    // The toast still names the directory the pane moved to.
+    expect(vi.mocked(toast.success)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(toast.success).mock.calls[0]![0]).toContain(
       "/projects/ledger",
     );
-    expect(result.current.foreignProjectPrompt).toBeNull();
+    // Nothing is parked waiting for a confirmation any more.
+    expect(result.current).not.toHaveProperty("foreignProjectPrompt");
+    expect(result.current).not.toHaveProperty("confirmForeignProjectAdopt");
   });
 
-  it("stays put when the confirmation is dismissed", async () => {
+  it("keeps the pane's permission mode across the jump (R2)", async () => {
+    const store = useAgentChatStore.getState();
+    store.ensureThread("thread-old");
+    store.setPermissionMode("thread-old", "plan");
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane()),
     );
     await act(async () => {
       await result.current.handleAdoptExternalSession(foreignSession());
     });
-    act(() => result.current.dismissForeignProjectAdopt());
-
-    expect(result.current.foreignProjectPrompt).toBeNull();
-    expect(vi.mocked(agentChatAdoptExternalSession)).not.toHaveBeenCalled();
-    expect(vi.mocked(agentChatStartSession)).not.toHaveBeenCalled();
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0]!;
+    expect((input as { permission_mode: string | null }).permission_mode).toBe(
+      "plan",
+    );
   });
 
-  it("gates too when only the adopt result knows the session is foreign", async () => {
+  it("proceeds too when only the adopt result knows the session is foreign", async () => {
     // Discovery said "this checkout", the backend disagrees. The thread
-    // exists by then, but starting it would still move the pane, so the
-    // confirmation runs before the launch — and confirming must not
-    // adopt the same conversation a second time.
+    // is minted either way; it launches where it lives, and the toast
+    // says where that is.
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane()),
     );
@@ -536,16 +530,23 @@ describe("handleAdoptExternalSession — another project's directory", () => {
     });
 
     expect(vi.mocked(agentChatAdoptExternalSession)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(agentChatStartSession)).not.toHaveBeenCalled();
-    expect(result.current.foreignProjectPrompt).toMatchObject({
-      cwd: "/projects/ledger",
-    });
-
-    await act(async () => {
-      await result.current.confirmForeignProjectAdopt();
-    });
-    expect(vi.mocked(agentChatAdoptExternalSession)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
     const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0]!;
     expect((input as { cwd: string }).cwd).toBe("/projects/ledger");
+    expect(vi.mocked(toast.success).mock.calls[0]![0]).toContain(
+      "/projects/ledger",
+    );
+  });
+
+  it("remembers when the terminal last touched the conversation, for the divider", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane()),
+    );
+    await act(async () => {
+      await result.current.handleAdoptExternalSession(foreignSession());
+    });
+    expect(adoptedSessionLastActiveAt("chat-adopted-1")).toBe(
+      Date.parse("2026-04-24T12:00:00.000Z"),
+    );
   });
 });

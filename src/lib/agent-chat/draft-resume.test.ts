@@ -50,6 +50,7 @@ vi.mock("@/lib/toast", () => ({
   },
 }));
 
+import { adoptedSessionLastActiveAt } from "./adopt-external-session";
 import {
   findWorkspaceAtDirectory,
   resumeExternalSessionFromDraft,
@@ -94,6 +95,8 @@ function makeSession(
     title_source: "summary",
     existing_thread_id: null,
     same_repo: true,
+    project_root: "/projects/foo",
+    worktree_name: null,
     ...overrides,
   };
 }
@@ -352,6 +355,10 @@ describe("resumeExternalSessionFromDraft", () => {
     expect(vi.mocked(toast.success)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(toast.success).mock.calls[0]![0]).toContain(
       "in /projects/foo",
+    );
+    // The divider can say when the terminal last touched it.
+    expect(adoptedSessionLastActiveAt("chat-adopted-1")).toBe(
+      Date.parse("2026-08-24T12:00:00.000Z"),
     );
   });
 

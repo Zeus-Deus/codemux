@@ -92,6 +92,7 @@ import type {
   ScrollbackMeta,
   ScrollbackPayload,
   ScrollbackRestore,
+  AdoptableAgentSession,
 } from "@/tauri/commands";
 import type {
   AgentBrowserSession,
@@ -3153,6 +3154,21 @@ const handlers: Record<string, Handler> = {
   // fourth lives in an unrelated project, which only shows once the user
   // widens the scope past the current checkout.
   agent_chat_list_adoptable_sessions: (a) => {
+    // Derive the grouping facts the real backend computes from git:
+    // a project's canonical root (linked worktrees fold into their
+    // repository) and the worktree name when the cwd is a linked one.
+    const withRoots = (row: Record<string, unknown> & { cwd: string }): AdoptableAgentSession => {
+      const home = MOCK_HOME_DIR;
+      const wt = row.cwd.match(new RegExp(`^${home}/\\.codemux/worktrees/([^/]+)/([^/]+)$`));
+      if (wt) {
+        return { ...row, project_root: `${home}/projects/${wt[1]}`, worktree_name: wt[2] } as unknown as AdoptableAgentSession;
+      }
+      const proj = row.cwd.match(new RegExp(`^${home}/projects/([^/]+)`));
+      if (proj) {
+        return { ...row, project_root: `${home}/projects/${proj[1]}`, worktree_name: null } as unknown as AdoptableAgentSession;
+      }
+      return { ...row, project_root: null, worktree_name: null } as unknown as AdoptableAgentSession;
+    };
     const scope = (a.scope ?? {}) as {
       current_cwd?: string;
       all_projects?: boolean;
@@ -3202,7 +3218,7 @@ const handlers: Record<string, Handler> = {
         same_repo: cwd.startsWith(demoProject),
       },
     ];
-    if (!scope.all_projects) return local;
+    if (!scope.all_projects) return local.flatMap((row) => (row ? [withRoots(row)] : []));
     return [
       ...local,
       {
@@ -3217,7 +3233,32 @@ const handlers: Record<string, Handler> = {
         existing_thread_id: null,
         same_repo: false,
       },
-    ];
+    ,
+      {
+        session_id: "ext-7d2e91aa-home-folder",
+        title: "/update-config",
+        cwd: MOCK_HOME_DIR,
+        git_branch: null,
+        last_modified: new Date(Date.now() - 8 * 86_400_000).toISOString(),
+        created_at: new Date(Date.now() - 8 * 86_400_000).toISOString(),
+        file_size: 12_288,
+        title_source: "prompt",
+        existing_thread_id: null,
+        same_repo: false,
+      },
+      {
+        session_id: "ext-51f0c3d2-hermes-agent",
+        title: "Hermes Agent cross-gateway bot switching",
+        cwd: `${MOCK_HOME_DIR}/projects/hermes-agent`,
+        git_branch: "main",
+        last_modified: new Date(Date.now() - 6 * 86_400_000).toISOString(),
+        created_at: new Date(Date.now() - 6 * 86_400_000).toISOString(),
+        file_size: 40_960,
+        title_source: "summary",
+        existing_thread_id: null,
+        same_repo: false,
+      },
+    ].flatMap((row) => (row ? [withRoots(row)] : []));
   },
   agent_chat_adopt_external_session: (a) => {
     const session = (a.session ?? {}) as {

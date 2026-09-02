@@ -385,6 +385,7 @@ export async function resumeExternalSessionFromDraft(
           effort: draft.effort,
           contextWindow: draft.contextWindow,
           fastMode: draft.fastMode ?? false,
+          sessionLastActiveAt: session.last_modified,
         },
         ` in ${result.cwd}`,
       );

@@ -29,7 +29,8 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
-import { MessageList } from "./MessageList";
+import { MessageList, RESUME_CONNECTED_COPY } from "./MessageList";
+import { noteAdoptedSessionActivity } from "@/lib/agent-chat/adopt-external-session";
 
 // The assistant-turn avatar renders the provider's branded mark via
 // ProviderLogo, which imports the SVG assets at module load. vitest's
@@ -2260,40 +2261,72 @@ describe("MessageList — live marker when the live tail row is not on screen", 
 });
 
 describe("MessageList adopted-session divider", () => {
-  it("states that the earlier turns stay with the agent", () => {
-    renderList([
-      {
-        kind: "resume_divider",
-        id: "divider-1",
-        seq: 0,
-        source: "external_cli",
-        startedAt: Date.parse("2026-04-24T10:00:00.000Z"),
-        branch: "feature-branch",
-      },
-    ]);
-    expect(screen.getByTestId("resume-divider")).toBeInTheDocument();
-    expect(
-      screen.getByText("Resumed from a session started outside Codemux"),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/feature-branch/)).toBeInTheDocument();
-    expect(
-      screen.getByText(/earlier turns stay with the agent/i),
-    ).toBeInTheDocument();
+  const divider = {
+    kind: "resume_divider" as const,
+    id: "divider-1",
+    seq: 0,
+    source: "external_cli",
+    startedAt: Date.parse("2026-04-24T10:00:00.000Z"),
+    branch: "feature-branch",
+  };
+
+  it("names the terminal, the agent and when it was last active", () => {
+    const sixDaysAgo = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000);
+    noteAdoptedSessionActivity("thread-adopted", sixDaysAgo.toISOString());
+    render(
+      <MessageList
+        messages={[divider]}
+        provider="claude"
+        threadKey="thread-adopted"
+        {...noopHandlers}
+      />,
+    );
+    const row = screen.getByTestId("resume-divider");
+    expect(row.textContent).toBe(
+      "Resumed from the terminal · Claude Code · last active 6 days ago",
+    );
+    // Small caps come from CSS, not from shouting in the string.
+    expect(row.querySelector(".uppercase")).not.toBeNull();
+    // No turn count: the payload does not carry one, so none is invented.
+    expect(row.textContent).not.toMatch(/turns/);
+    // Amber terminal glyph, hairlines either side.
+    expect(row.querySelector("svg")?.getAttribute("class")).toContain(
+      "text-warning",
+    );
+    expect(row.querySelectorAll(".h-px").length).toBe(2);
   });
 
-  it("still explains itself when the provider reported no branch or start time", () => {
-    renderList([
-      {
-        kind: "resume_divider",
-        id: "divider-1",
-        seq: 0,
-        source: "external_cli",
-        startedAt: null,
-        branch: null,
-      },
-    ]);
+  it("omits what it does not know", () => {
+    render(
+      <MessageList
+        messages={[divider]}
+        threadKey="thread-unknown"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.getByTestId("resume-divider").textContent).toBe(
+      "Resumed from the terminal",
+    );
+  });
+
+  it("says the thread is connected while the divider is its only row", () => {
+    renderList([divider]);
+    expect(screen.getByTestId("resume-connected").textContent).toBe(
+      RESUME_CONNECTED_COPY,
+    );
     expect(
-      screen.getByText("Earlier turns stay with the agent"),
-    ).toBeInTheDocument();
+      screen.getByTestId("resume-connected").querySelector(".bg-success"),
+    ).not.toBeNull();
+  });
+
+  it("drops the connected line once the conversation moves on", () => {
+    const { unmount } = renderList([
+      divider,
+      { kind: "user_message", id: "um-1", seq: 1, text: "continue" },
+    ]);
+    expect(screen.queryByTestId("resume-connected")).toBeNull();
+    unmount();
+    renderList([divider], { streaming: true });
+    expect(screen.queryByTestId("resume-connected")).toBeNull();
   });
 });

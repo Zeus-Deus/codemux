@@ -29,6 +29,7 @@ import {
   listChatSlashCommands,
   listSkills,
 } from "@/tauri/commands";
+import { useAppStore } from "@/stores/app-store";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useSkillsStore } from "@/stores/skills-store";
 
@@ -54,8 +55,24 @@ function makeSession(
     title_source: "summary",
     existing_thread_id: null,
     same_repo: true,
+    project_root: "/home/user/project",
+    worktree_name: null,
     ...overrides,
   };
+}
+
+/** A session from an unrelated project, as discovery returns it. */
+function otherProjectSession(
+  overrides: Partial<AdoptableAgentSession> = {},
+): AdoptableAgentSession {
+  return makeSession({
+    session_id: "sess-other",
+    title: "Unrelated project",
+    cwd: "/projects/ledger",
+    project_root: "/projects/ledger",
+    same_repo: false,
+    ...overrides,
+  });
 }
 
 function baseProps(): ComposerProps {
@@ -147,6 +164,7 @@ async function openResumePicker(container: HTMLElement) {
 
 beforeEach(() => {
   resetSkillsStore();
+  useAppStore.setState({ homeDir: "/home/user" });
   useProviderCommandsStore.getState().invalidate();
   listSkillsMock.mockClear();
   listSkillsMock.mockResolvedValue([]);
@@ -201,7 +219,7 @@ describe("Composer · /resume command", () => {
 });
 
 describe("Composer · /resume picker", () => {
-  it("scopes discovery to the current checkout and its worktrees", async () => {
+  it("discovers every project from the pane's cwd, worktrees included", async () => {
     const { container } = renderComposer();
     await openResumePicker(container);
     await waitFor(() => expect(listAdoptableMock).toHaveBeenCalled());
@@ -209,12 +227,12 @@ describe("Composer · /resume picker", () => {
     expect(provider).toBe("claude");
     expect(scope).toMatchObject({
       current_cwd: "/home/user/project",
-      all_projects: false,
+      all_projects: true,
       include_worktrees: true,
     });
   });
 
-  it("groups discovered sessions and marks the adopted one as a switch", async () => {
+  it("opens the pane's project and marks the adopted row as a switch", async () => {
     listAdoptableMock.mockResolvedValue([
       makeSession({ session_id: "sess-here", title: "In this checkout" }),
       makeSession({
@@ -222,17 +240,26 @@ describe("Composer · /resume picker", () => {
         title: "Already here",
         existing_thread_id: "thread-9",
       }),
+      otherProjectSession(),
     ]);
-    const { container, findByText, queryByTestId } = renderComposer();
+    const { container, findByText, findByTestId, queryByTestId } =
+      renderComposer();
     await openResumePicker(container);
 
     expect(await findByText("In this checkout")).toBeInTheDocument();
     expect(await findByText("Already here")).toBeInTheDocument();
-    expect(await findByText("THIS CHECKOUT")).toBeInTheDocument();
-    expect(await findByText("ALREADY IN CODEMUX")).toBeInTheDocument();
+    const project = await findByTestId("resume-folder-/home/user/project");
+    expect(project).toHaveAttribute("data-expanded");
+    expect(project.textContent).toContain("Selected project");
     expect(
-      queryByTestId("slash-item-external-session:sess-adopted"),
-    ).not.toBeNull();
+      queryByTestId("slash-item-external-session:sess-adopted")!.textContent,
+    ).toContain("already open in Codemux");
+    // Other projects are one collapsed line each, opened on demand.
+    const ledger = await findByTestId("resume-folder-/projects/ledger");
+    expect(ledger).not.toHaveAttribute("data-expanded");
+    expect(queryByTestId("slash-item-external-session:sess-other")).toBeNull();
+    fireEvent.click(ledger);
+    expect(await findByText("Unrelated project")).toBeInTheDocument();
   });
 
   it("hands the picked session to the pane", async () => {
@@ -255,35 +282,59 @@ describe("Composer · /resume picker", () => {
     });
   });
 
-  it("only reaches other projects when the user widens the scope", async () => {
-    listAdoptableMock.mockImplementation(
-      (_provider: unknown, scope: { all_projects?: boolean }) =>
-        Promise.resolve(
-          scope.all_projects
-            ? [
-                makeSession({
-                  session_id: "sess-other",
-                  title: "Unrelated project",
-                  cwd: "/projects/ledger",
-                  same_repo: false,
-                }),
-              ]
-            : [],
-        ),
-    );
-    const { container, findByTestId, findByText } = renderComposer();
+  it("hands another project's session over without a confirmation step", async () => {
+    const session = otherProjectSession();
+    listAdoptableMock.mockResolvedValue([makeSession(), session]);
+    const onResumeExternalSession = vi.fn();
+    const { container, findByTestId } = renderComposer({
+      onResumeExternalSession,
+    });
     await openResumePicker(container);
-    await waitFor(() => expect(listAdoptableMock).toHaveBeenCalledTimes(1));
+    fireEvent.click(await findByTestId("resume-folder-/projects/ledger"));
+    fireEvent.click(await findByTestId("slash-item-external-session:sess-other"));
+    expect(onResumeExternalSession).toHaveBeenCalledWith(session);
+  });
 
-    fireEvent.click(await findByTestId("slash-item-external-session:widen-scope"));
-
-    await waitFor(() => expect(listAdoptableMock).toHaveBeenCalledTimes(2));
-    expect(listAdoptableMock.mock.calls[1]![1]).toMatchObject({
+  it("searches from the home directory for a Home draft and leads with RECENT", async () => {
+    listAdoptableMock.mockResolvedValue([makeSession(), otherProjectSession()]);
+    const { container, findByTestId } = renderComposer({
+      cwd: null,
+      resumeScope: { cwd: null, projectRoot: null },
+    });
+    await openResumePicker(container);
+    await waitFor(() => expect(listAdoptableMock).toHaveBeenCalled());
+    expect(listAdoptableMock.mock.calls[0]![1]).toMatchObject({
+      current_cwd: "/home/user",
       all_projects: true,
     });
-    // Widened results group by project, not into one flat bucket.
-    expect(await findByText("ledger")).toBeInTheDocument();
-    expect(await findByText("Unrelated project")).toBeInTheDocument();
+    expect(await findByTestId("resume-recent")).toBeInTheDocument();
+    expect(
+      (await findByTestId("resume-folder-/home/user/project")).textContent,
+    ).not.toContain("Selected project");
+  });
+
+  it("opens the draft's selected project rather than the pane cwd's", async () => {
+    listAdoptableMock.mockResolvedValue([makeSession(), otherProjectSession()]);
+    const { container, findByTestId } = renderComposer({
+      resumeScope: { cwd: "/projects/ledger", projectRoot: "/projects/ledger" },
+    });
+    await openResumePicker(container);
+    expect(
+      (await findByTestId("resume-folder-/projects/ledger")),
+    ).toHaveAttribute("data-expanded");
+    expect(
+      await findByTestId("resume-folder-/home/user/project"),
+    ).not.toHaveAttribute("data-expanded");
+  });
+
+  it("says so when there is no directory to search from", async () => {
+    useAppStore.setState({ homeDir: null });
+    const { container, findByTestId } = renderComposer({ cwd: null });
+    await openResumePicker(container);
+    const footer = await findByTestId("slash-popup-footer");
+    expect(footer).toHaveAttribute("data-tone", "error");
+    expect(footer.textContent).toContain("No working directory to search from");
+    expect(listAdoptableMock).not.toHaveBeenCalled();
   });
 
   it("surfaces a discovery failure in the footer instead of an empty list", async () => {

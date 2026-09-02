@@ -3554,6 +3554,17 @@ pub struct AdoptableSession {
     /// project — surface that as an explicit separate action, never
     /// silently re-point the pane at it.
     pub same_repo: bool,
+    /// Canonical root of the git repository `cwd` belongs to. A linked
+    /// worktree resolves to its repository's MAIN checkout, so every
+    /// worktree of one repository shares a value and the picker can fold
+    /// them into one project group. `None` when `cwd` is not inside a git
+    /// repository (the home directory, a plain folder).
+    pub project_root: Option<String>,
+    /// Basename of the linked worktree `cwd` is inside, when it is one.
+    /// `None` for the main checkout and for non-git folders. A cwd in a
+    /// subdirectory of a linked worktree still names that worktree: the
+    /// session resumes inside it, and the picker's pill says where.
+    pub worktree_name: Option<String>,
 }
 
 /// Outcome of adopting an external session into a Codemux thread.
@@ -3633,24 +3644,73 @@ fn is_offerable_session(session: &ExternalSession, temp_dir: &Path) -> bool {
     true
 }
 
-/// Canonical git roots resolved once per directory.
+/// What the picker needs to know about the checkout a directory sits
+/// in, distilled from [`crate::git::RepoRoot`] so the classification
+/// below stays pure and testable without a git checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutIdentity {
+    /// Canonical root of the repository: the main checkout, also for a
+    /// directory inside one of its linked worktrees.
+    root: PathBuf,
+    /// Top level of the working tree the directory is in — the worktree
+    /// itself for a linked worktree, `root` for the main checkout. `None`
+    /// for a bare repository.
+    toplevel: Option<PathBuf>,
+    /// True when the working tree is a linked worktree rather than the
+    /// main checkout.
+    is_linked_worktree: bool,
+}
+
+impl CheckoutIdentity {
+    fn from_repo_root(repo: &crate::git::RepoRoot) -> Self {
+        Self {
+            root: repo.canonical_root_path(),
+            toplevel: repo.toplevel.clone(),
+            is_linked_worktree: repo.is_worktree,
+        }
+    }
+
+    /// Basename of the linked worktree, or `None` for the main checkout.
+    ///
+    /// Answers for every directory inside the worktree, not only its top
+    /// level: a session started in a subdirectory still resumes inside
+    /// that worktree, so it is labelled with the worktree it lands in
+    /// rather than with the subdirectory's name.
+    fn worktree_name(&self) -> Option<String> {
+        if !self.is_linked_worktree {
+            return None;
+        }
+        self.toplevel
+            .as_ref()
+            .and_then(|toplevel| toplevel.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+}
+
+/// Checkout identities resolved once per directory.
 ///
 /// [`crate::git::git_canonical_root`] shells out to `git`, and a long
 /// history collapses to a handful of distinct directories, so memoizing
 /// turns a per-session subprocess into a per-folder one.
 #[derive(Default)]
 struct RepoRootCache {
-    roots: HashMap<PathBuf, Option<PathBuf>>,
+    checkouts: HashMap<PathBuf, Option<CheckoutIdentity>>,
 }
 
 impl RepoRootCache {
-    fn root_of(&mut self, dir: &Path) -> Option<PathBuf> {
-        if let Some(hit) = self.roots.get(dir) {
+    fn checkout_of(&mut self, dir: &Path) -> Option<CheckoutIdentity> {
+        if let Some(hit) = self.checkouts.get(dir) {
             return hit.clone();
         }
-        let resolved = crate::git::git_canonical_root(dir).map(|repo| repo.canonical_root_path());
-        self.roots.insert(dir.to_path_buf(), resolved.clone());
+        let resolved =
+            crate::git::git_canonical_root(dir).map(|repo| CheckoutIdentity::from_repo_root(&repo));
+        self.checkouts.insert(dir.to_path_buf(), resolved.clone());
         resolved
+    }
+
+    /// The canonical root alone, for callers that only compare checkouts.
+    fn root_of(&mut self, dir: &Path) -> Option<PathBuf> {
+        self.checkout_of(dir).map(|checkout| checkout.root)
     }
 }
 
@@ -3678,28 +3738,35 @@ fn same_repo(
 
 /// Attach the Codemux-side facts to a page of discovered sessions.
 ///
-/// Pure given `repo_root_of`, so the dedupe marking and the same-repo
-/// classification are testable without a git checkout or a database.
+/// Pure given `checkout_of`, so the dedupe marking, the same-repo
+/// classification and the project grouping facts are testable without a
+/// git checkout or a database. A `reference_cwd` outside any repository
+/// (the home directory) is fine: nothing but an identical path is then
+/// `same_repo`, while `project_root` is still computed per session.
 fn decorate_adoptable_sessions(
     sessions: Vec<ExternalSession>,
     existing_threads: &HashMap<String, String>,
     reference_cwd: &Path,
-    mut repo_root_of: impl FnMut(&Path) -> Option<PathBuf>,
+    mut checkout_of: impl FnMut(&Path) -> Option<CheckoutIdentity>,
 ) -> Vec<AdoptableSession> {
-    let reference_root = repo_root_of(reference_cwd);
+    let reference_root = checkout_of(reference_cwd).map(|checkout| checkout.root);
     sessions
         .into_iter()
         .map(|session| {
             let session_cwd = PathBuf::from(&session.cwd);
-            let session_root = repo_root_of(&session_cwd);
+            let checkout = checkout_of(&session_cwd);
+            let worktree_name = checkout.as_ref().and_then(CheckoutIdentity::worktree_name);
+            let project_root = checkout.map(|checkout| checkout.root);
             AdoptableSession {
                 existing_thread_id: existing_threads.get(&session.session_id).cloned(),
                 same_repo: same_repo(
                     reference_cwd,
                     reference_root.as_deref(),
                     &session_cwd,
-                    session_root.as_deref(),
+                    project_root.as_deref(),
                 ),
+                project_root: project_root.map(|root| root.to_string_lossy().into_owned()),
+                worktree_name,
                 session,
             }
         })
@@ -3750,7 +3817,7 @@ pub async fn agent_chat_list_adoptable_sessions(
     tokio::task::spawn_blocking(move || {
         let mut cache = RepoRootCache::default();
         decorate_adoptable_sessions(offerable, &existing_threads, &reference_cwd, |dir| {
-            cache.root_of(dir)
+            cache.checkout_of(dir)
         })
     })
     .await
@@ -9922,6 +9989,26 @@ mod tests {
         PathBuf::from("/codemux-nonexistent-project-4f1c9a")
     }
 
+    /// Stand-in for the git resolver: `dir` is the main checkout of a
+    /// repository rooted at `root`.
+    fn main_checkout(root: &Path) -> Option<CheckoutIdentity> {
+        Some(CheckoutIdentity {
+            root: root.to_path_buf(),
+            toplevel: Some(root.to_path_buf()),
+            is_linked_worktree: false,
+        })
+    }
+
+    /// Stand-in for the git resolver: a linked worktree at `toplevel`
+    /// whose repository's main checkout is `root`.
+    fn linked_worktree(root: &Path, toplevel: &Path) -> Option<CheckoutIdentity> {
+        Some(CheckoutIdentity {
+            root: root.to_path_buf(),
+            toplevel: Some(toplevel.to_path_buf()),
+            is_linked_worktree: true,
+        })
+    }
+
     #[test]
     fn offerable_filter_keeps_a_real_session() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -10015,9 +10102,8 @@ mod tests {
         let mut existing = HashMap::new();
         existing.insert("already-here".to_string(), "thread-7".to_string());
 
-        let decorated = decorate_adoptable_sessions(sessions, &existing, &reference, |dir| {
-            Some(PathBuf::from(dir))
-        });
+        let decorated =
+            decorate_adoptable_sessions(sessions, &existing, &reference, main_checkout);
 
         assert_eq!(decorated.len(), 2, "a known session is marked, not hidden");
         assert_eq!(decorated[0].existing_thread_id.as_deref(), Some("thread-7"));
@@ -10035,14 +10121,122 @@ mod tests {
         // Both codemux worktrees canonicalize to the same main checkout.
         let decorated = decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
             if dir.starts_with("/worktrees/codemux") {
-                Some(PathBuf::from("/repos/codemux"))
+                linked_worktree(Path::new("/repos/codemux"), dir)
             } else {
-                Some(PathBuf::from(dir))
+                main_checkout(dir)
             }
         });
 
         assert!(decorated[0].same_repo, "a linked worktree is the same repo");
         assert!(!decorated[1].same_repo);
+    }
+
+    #[test]
+    fn decoration_reports_project_root_and_worktree_name() {
+        let main = Path::new("/repos/codemux");
+        let feature = Path::new("/worktrees/codemux/feature");
+        let reference = main.to_path_buf();
+        let sessions = vec![
+            external_session("main", "/repos/codemux"),
+            external_session("worktree", "/worktrees/codemux/feature"),
+            external_session("worktree-subdir", "/worktrees/codemux/feature/src"),
+            external_session("plain", "/home/zeus"),
+        ];
+        let decorated = decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
+            if dir.starts_with(feature) {
+                linked_worktree(main, feature)
+            } else if dir.starts_with(main) {
+                main_checkout(main)
+            } else {
+                None
+            }
+        });
+
+        // The main checkout is the project itself, never a worktree.
+        assert_eq!(decorated[0].project_root.as_deref(), Some("/repos/codemux"));
+        assert_eq!(decorated[0].worktree_name, None);
+        assert!(decorated[0].same_repo);
+
+        // A linked worktree groups under the MAIN root and wears its name.
+        assert_eq!(decorated[1].project_root.as_deref(), Some("/repos/codemux"));
+        assert_eq!(decorated[1].worktree_name.as_deref(), Some("feature"));
+        assert!(decorated[1].same_repo);
+
+        // A subdirectory of that worktree still resumes inside it, so it
+        // is named after the worktree, not after the subdirectory.
+        assert_eq!(decorated[2].project_root.as_deref(), Some("/repos/codemux"));
+        assert_eq!(decorated[2].worktree_name.as_deref(), Some("feature"));
+
+        // Outside git there is no project and no worktree.
+        assert_eq!(decorated[3].project_root, None);
+        assert_eq!(decorated[3].worktree_name, None);
+        assert!(!decorated[3].same_repo);
+    }
+
+    #[test]
+    fn decoration_from_a_non_git_reference_still_groups_by_project() {
+        // The Home draft scopes discovery from $HOME, which is not a
+        // repository: nothing may fail, only the identical path is
+        // "same repo", and every row still learns its project root.
+        let reference = PathBuf::from("/home/zeus");
+        let sessions = vec![
+            external_session("home", "/home/zeus"),
+            external_session("notes", "/home/zeus/notes"),
+            external_session("repo", "/repos/codemux"),
+        ];
+        let decorated = decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
+            if dir.starts_with("/repos/codemux") {
+                main_checkout(Path::new("/repos/codemux"))
+            } else {
+                None
+            }
+        });
+
+        assert!(decorated[0].same_repo, "the exact same folder still matches");
+        assert_eq!(decorated[0].project_root, None);
+        assert!(!decorated[1].same_repo);
+        assert_eq!(decorated[1].project_root, None);
+        assert!(!decorated[2].same_repo);
+        assert_eq!(decorated[2].project_root.as_deref(), Some("/repos/codemux"));
+        assert!(decorated.iter().all(|row| row.worktree_name.is_none()));
+    }
+
+    #[test]
+    fn checkout_identity_names_only_linked_worktrees() {
+        // Mirrors what `git rev-parse` reports for the three shapes the
+        // resolver can meet, without spawning git: the common dir is
+        // always the MAIN checkout's `.git`, so the root is the main
+        // checkout in every non-bare case.
+        let main = crate::git::RepoRoot {
+            toplevel: Some(PathBuf::from("/repos/codemux")),
+            common_dir: PathBuf::from("/repos/codemux/.git"),
+            is_worktree: false,
+            is_bare: false,
+        };
+        let identity = CheckoutIdentity::from_repo_root(&main);
+        assert_eq!(identity.root, PathBuf::from("/repos/codemux"));
+        assert_eq!(identity.worktree_name(), None);
+
+        let linked = crate::git::RepoRoot {
+            toplevel: Some(PathBuf::from("/worktrees/codemux/feature")),
+            common_dir: PathBuf::from("/repos/codemux/.git"),
+            is_worktree: true,
+            is_bare: false,
+        };
+        let identity = CheckoutIdentity::from_repo_root(&linked);
+        assert_eq!(identity.root, PathBuf::from("/repos/codemux"));
+        assert_eq!(identity.worktree_name().as_deref(), Some("feature"));
+
+        // A bare repository has no working tree to name.
+        let bare = crate::git::RepoRoot {
+            toplevel: None,
+            common_dir: PathBuf::from("/srv/codemux.git"),
+            is_worktree: false,
+            is_bare: true,
+        };
+        let identity = CheckoutIdentity::from_repo_root(&bare);
+        assert_eq!(identity.root, PathBuf::from("/srv/codemux.git"));
+        assert_eq!(identity.worktree_name(), None);
     }
 
     #[test]
@@ -10056,14 +10250,14 @@ mod tests {
         let mut cache = RepoRootCache::default();
         let mut resolved: Vec<PathBuf> = Vec::new();
         decorate_adoptable_sessions(sessions, &HashMap::new(), &reference, |dir| {
-            if !cache.roots.contains_key(dir) {
+            if !cache.checkouts.contains_key(dir) {
                 resolved.push(dir.to_path_buf());
             }
             // Stand in for `git_canonical_root` so the test stays offline.
             cache
-                .roots
+                .checkouts
                 .entry(dir.to_path_buf())
-                .or_insert_with(|| Some(dir.to_path_buf()))
+                .or_insert_with(|| main_checkout(dir))
                 .clone()
         });
 
@@ -10218,9 +10412,11 @@ mod tests {
     #[test]
     fn adoptable_session_serializes_flat_and_snake_case() {
         let decorated = AdoptableSession {
-            session: external_session("sdk-abc", "/repos/codemux"),
+            session: external_session("sdk-abc", "/worktrees/codemux/feature"),
             existing_thread_id: None,
             same_repo: true,
+            project_root: Some("/repos/codemux".to_string()),
+            worktree_name: Some("feature".to_string()),
         };
         let value = serde_json::to_value(&decorated).unwrap();
 
@@ -10230,6 +10426,9 @@ mod tests {
         assert_eq!(value["title_source"], json!("summary"));
         assert_eq!(value["existing_thread_id"], json!(null));
         assert_eq!(value["same_repo"], json!(true));
+        // The grouping facts keep their snake_case names on the wire.
+        assert_eq!(value["project_root"], json!("/repos/codemux"));
+        assert_eq!(value["worktree_name"], json!("feature"));
     }
 
     #[test]

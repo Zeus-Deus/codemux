@@ -23,8 +23,8 @@ import { sessionDisplayTitle } from "./session-history";
  * provider with the resume cursor, seed the store slice so the footer
  * pickers agree with the launch, and tell the user honestly whether the
  * transcript above the composer is real — so it lives here once. What
- * differs (stopping the pane's current session, asking before jumping
- * projects, clearing a draft) stays with the caller.
+ * differs (stopping the pane's current session, clearing a draft)
+ * stays with the caller.
  */
 
 /** Launch config for an adopted conversation. The external session's
@@ -41,6 +41,40 @@ export interface AdoptedLaunchConfig {
   effort?: string | null;
   contextWindow?: string | null;
   fastMode?: boolean;
+  /** When the terminal last wrote to the conversation (the discovery
+   *  row's `last_modified`), so the transcript divider can say "last
+   *  active 6 days ago". The persisted divider row does not carry it,
+   *  so it is remembered per thread for this app session only. */
+  sessionLastActiveAt?: string | null;
+}
+
+// ── Where a thread came from ──
+//
+// The backend's divider row records the source and the original start
+// time, not when the terminal last touched the conversation — and that
+// "last active" is exactly what the picker showed the user a moment
+// ago. Keep it per thread, in memory: after a reload the divider simply
+// omits the segment rather than guessing.
+const adoptedSessionActivity = new Map<string, number>();
+
+/** Remember the picked session's last write for `threadId`. Ignores
+ *  timestamps that do not parse rather than storing NaN. */
+export function noteAdoptedSessionActivity(
+  threadId: string,
+  lastModified: string | null | undefined,
+): void {
+  if (!lastModified) return;
+  const ms = Date.parse(lastModified);
+  if (Number.isFinite(ms)) adoptedSessionActivity.set(threadId, ms);
+}
+
+/** Epoch ms of the terminal's last write to the conversation behind
+ *  `threadId`, when this app session adopted it; null otherwise. */
+export function adoptedSessionLastActiveAt(
+  threadId: string | null | undefined,
+): number | null {
+  if (!threadId) return null;
+  return adoptedSessionActivity.get(threadId) ?? null;
 }
 
 /** Where the resumed session runs. `cwd` MUST be the thread's own
@@ -125,6 +159,8 @@ export async function launchAdoptedThread(
   launch: AdoptedLaunchConfig,
   where = "",
 ): Promise<string> {
+  // Before the hydrate, so the divider's first render already knows.
+  noteAdoptedSessionActivity(result.thread_id, launch.sessionLastActiveAt);
   const dividerVisible = await hydrateThreadFromRows(
     result.thread_id,
     result.thread_id,

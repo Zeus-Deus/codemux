@@ -35,12 +35,7 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
-import {
-  buildAdoptableSessionItems,
-  buildWidenScopeItem,
-  externalSessionRowId,
-  RESUME_WIDEN_SCOPE_ITEM_ID,
-} from "@/lib/agent-chat/external-sessions";
+import { findWorkspaceAtDirectory } from "@/lib/agent-chat/draft-resume";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -103,6 +98,7 @@ import type {
 
 import { AttachmentChip } from "./AttachmentChip";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
+import { ResumeSessionPicker } from "./ResumeSessionPicker";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
@@ -273,18 +269,16 @@ interface Props {
    *  them (an unmaterialised draft) — `/resume` then stays hidden
    *  rather than offering an action nothing can perform. */
   onResumeExternalSession?: (session: AdoptableAgentSession) => void | Promise<void>;
-  /** Where `/resume` discovery looks when this surface's own `cwd` is
-   *  not the right reference point — the workspace draft, whose Home
-   *  target has no directory at all and whose project target should be
-   *  searched by project root rather than a pane cwd. `allProjects`
-   *  seeds the picker's scope on open (the user can still widen a
-   *  narrow one); `foreignOpensInPlace` only changes the row wording
-   *  for unrelated projects, because a draft opens them without asking
-   *  where a live pane would confirm first. Omitted on panes. */
+  /** The `/resume` picker's frame of reference when this surface's own
+   *  `cwd` is not it — the workspace draft. `cwd` seeds discovery (null
+   *  for a Home draft, which falls back to the home directory) and
+   *  `projectRoot` is the SELECTED project's root: that folder opens
+   *  expanded in the picker; null (no project yet) shows a cross-project
+   *  RECENT block instead. Omitted on panes, which derive both from
+   *  their own cwd. */
   resumeScope?: {
     cwd: string | null;
-    allProjects?: boolean;
-    foreignOpensInPlace?: boolean;
+    projectRoot: string | null;
   } | null;
   /** Increment to open the `/resume` picker from outside the composer
    *  (the draft's "Continue a terminal session" row). Same surface,
@@ -547,9 +541,8 @@ export function Composer({
   );
   // ─── `/resume` picker state ──────────────────────────────────────
   // Conversations the agent's own CLI created outside Codemux. Opened
-  // from the `/resume` slash row (never from `@` or `+`), rendered on
-  // the same ComposerCommandMenu surface as the `+` menu so the search
-  // box, grouping, and keyboard nav are the ones users already know.
+  // from the `/resume` slash row (never from `@` or `+`), rendered by
+  // <ResumeSessionPicker /> — the same surface family as the `+` menu.
   // Refetched on every open: local history changes while the app runs,
   // and a stale picker is the whole problem this affordance solves.
   const [resumeOpen, setResumeOpen] = useState(false);
@@ -559,10 +552,6 @@ export function Composer({
   );
   const [resumeLoading, setResumeLoading] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
-  /** Opt-in widening past the current checkout (and its worktrees) to
-   *  every project on the machine. Reset on each open so the default
-   *  scope is always the checkout the user is looking at. */
-  const [resumeAllProjects, setResumeAllProjects] = useState(false);
 
   // (issue submode renders <IssuePickerPanel /> directly, which
   // owns its own list + loading + error state — no flat-row state
@@ -607,15 +596,10 @@ export function Composer({
   // handling as `/model`). Only offered when the surface can actually
   // perform the adoption.
   const canResumeExternal = onResumeExternalSession !== undefined;
-  // Every open starts from the surface's default scope (the checkout
-  // for a pane, every project for a Home draft) so a widened picker
-  // never lingers past the pick that widened it.
-  const resumeScopeAllProjects = resumeScope?.allProjects ?? false;
   const openResumePicker = useCallback(() => {
-    setResumeAllProjects(resumeScopeAllProjects);
     setResumeQuery("");
     setResumeOpen(true);
-  }, [resumeScopeAllProjects]);
+  }, []);
   const resumeCommand = useMemo(
     () => buildResumeCommand({ onOpen: openResumePicker }),
     [openResumePicker],
@@ -1036,25 +1020,28 @@ export function Composer({
     setResumeLoading(false);
   }, []);
 
-  // Discover adoptable sessions each time the picker opens, and again
-  // when the user widens the scope. Scoped to the pane's cwd (or the
-  // reference directory a draft supplies): the backend resolves the
-  // checkout (worktrees included) from it and uses the same path to
-  // decide which results count as this repo.
+  // Discover every session on the machine each time the picker opens.
+  // `current_cwd` is the reference point the backend uses to decide
+  // which rows count as this repo; the picker itself groups by project
+  // root, so a Home draft (no cwd) simply searches from the home
+  // directory.
+  const homeDir = useAppStore((state) => state.homeDir);
+  const appState = useAppStore((state) => state.appState);
   const resumeScopeCwd = resumeScope ? resumeScope.cwd : cwd;
+  const resumeDiscoveryCwd = resumeScopeCwd ?? homeDir;
   useEffect(() => {
     if (!resumeOpen) return;
-    if (!resumeScopeCwd) {
+    if (!resumeDiscoveryCwd) {
       setResumeSessions(EMPTY_ADOPTABLE_SESSIONS);
-      setResumeError("No working directory for this pane.");
+      setResumeError("No working directory to search from.");
       return;
     }
     let cancelled = false;
     setResumeLoading(true);
     setResumeError(null);
     agentChatListAdoptableSessions(provider, {
-      current_cwd: resumeScopeCwd,
-      all_projects: resumeAllProjects,
+      current_cwd: resumeDiscoveryCwd,
+      all_projects: true,
       include_worktrees: true,
       limit: RESUME_FETCH_LIMIT,
     })
@@ -1075,71 +1062,27 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [resumeOpen, resumeAllProjects, resumeScopeCwd, provider]);
+  }, [resumeOpen, resumeDiscoveryCwd, provider]);
 
-  const resumeForeignOpensInPlace = resumeScope?.foreignOpensInPlace ?? false;
-  const homeDir = useAppStore((state) => state.homeDir);
-  const resumeItems = useMemo(() => {
-    const rows = buildAdoptableSessionItems({
-      sessions: resumeSessions,
-      foreignNeedsConfirm: !resumeForeignOpensInPlace,
-      currentCwd: resumeScopeCwd,
-      homeDir,
-      groupByProject: resumeAllProjects,
-    });
-    // The widening row is a scope control, not a result, so it survives
-    // the search filter and always sits last.
-    const filtered = filterCommandMenuItems(rows, resumeQuery);
-    return resumeAllProjects ? filtered : [...filtered, buildWidenScopeItem()];
-  }, [
-    resumeSessions,
-    resumeQuery,
-    resumeAllProjects,
-    resumeForeignOpensInPlace,
-    resumeScopeCwd,
-    homeDir,
-  ]);
+  // The project the picker opens expanded. A draft says so outright; a
+  // live pane is on whichever project the backend matched its cwd to
+  // (falling back to the cwd itself while the rows are still loading).
+  const resumeSelectedProjectRoot = resumeScope
+    ? resumeScope.projectRoot
+    : (resumeSessions.find((row) => row.same_repo)?.project_root ?? cwd);
 
-  const resumePopupFooter = useMemo(() => {
-    if (resumeError) {
-      return { tone: "error" as const, message: `Resume: ${resumeError}` };
-    }
-    if (resumeLoading) {
-      return { tone: "muted" as const, message: "Reading local history…" };
-    }
-    if (resumeSessions.length === 0) {
-      return {
-        tone: "muted" as const,
-        message: resumeAllProjects
-          ? "No conversations found outside Codemux."
-          : "Nothing in this checkout yet — widen to every project below.",
-      };
-    }
-    // The conversation comes back with its history; the model and
-    // permission mode are the ones chosen here, not the terminal's.
-    return {
-      tone: "muted" as const,
-      message: "Continues with the model and permissions set here.",
-    };
-  }, [resumeError, resumeLoading, resumeSessions.length, resumeAllProjects]);
+  const isWorkspaceOpenAt = useCallback(
+    (dir: string) => findWorkspaceAtDirectory(appState, dir) !== null,
+    [appState],
+  );
 
   const handleResumeSelect = useCallback(
-    (item: SlashCommandItem) => {
-      if (item.id === RESUME_WIDEN_SCOPE_ITEM_ID) {
-        // Stay open — the effect refetches with the wider scope.
-        setResumeAllProjects(true);
-        setResumeQuery("");
-        return;
-      }
-      const picked = resumeSessions.find(
-        (session) => externalSessionRowId(session.session_id) === item.id,
-      );
+    (session: AdoptableAgentSession) => {
       closeResumePicker();
       requestAnimationFrame(() => textareaRef.current?.focus());
-      if (!picked) return;
-      void onResumeExternalSession?.(picked);
+      void onResumeExternalSession?.(session);
     },
-    [resumeSessions, closeResumePicker, onResumeExternalSession],
+    [closeResumePicker, onResumeExternalSession],
   );
 
   // Dismiss any open popup when the user clicks outside of it. Without
@@ -2614,25 +2557,27 @@ export function Composer({
               }
             />
           )}
-          {/* `/resume` picker — the same command-menu surface as the `+`
-              menu (search box, grouped rows, cmdk keyboard nav), listing
-              conversations the agent CLI created outside Codemux.
-              Mutually exclusive with the attach menu; both render null
-              while closed, so only one is ever in the tree. */}
-          <ComposerCommandMenu
+          {/* `/resume` picker — terminal sessions grouped by project, the
+              selected project open and the rest collapsed; the footer
+              names where a pick takes the chat. Mutually exclusive with
+              the attach menu; both render null while closed, so only
+              one is ever in the tree. */}
+          <ResumeSessionPicker
             open={resumeOpen}
-            items={resumeItems}
+            sessions={resumeSessions}
+            provider={provider}
+            selectedProjectRoot={resumeSelectedProjectRoot}
+            homeDir={homeDir}
+            isWorkspaceOpenAt={isWorkspaceOpenAt}
             query={resumeQuery}
             onQueryChange={setResumeQuery}
+            loading={resumeLoading}
+            error={resumeError}
             onSelect={handleResumeSelect}
             onEscape={() => {
               closeResumePicker();
               requestAnimationFrame(() => textareaRef.current?.focus());
             }}
-            footerNote={resumePopupFooter}
-            // Re-focuses the search box when widening swaps the list.
-            submode={resumeAllProjects ? "resume-all" : "resume"}
-            placeholder="Filter conversations"
           />
           {/* Flush top-edge strip (running subagents). First element in
               flow order — everything above it is either `hidden` or

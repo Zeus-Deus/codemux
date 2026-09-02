@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback } from "react";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
 import {
@@ -26,16 +26,6 @@ import type {
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
-/** A `/resume` pick that would run the pane in ANOTHER project's
- *  directory, parked until the user says so (R4). Rendered as a
- *  confirmation by whoever owns the pane's chrome. */
-export interface ForeignProjectAdoptPrompt {
-  /** The picked conversation, for its title. */
-  session: AdoptableAgentSession;
-  /** Directory the pane would be re-pointed at. */
-  cwd: string;
-}
-
 /** Where a resume actually runs.
  *
  *  A thread's directory and the directory of the pane running it may
@@ -52,14 +42,6 @@ interface ResumeTarget {
    *  persists this onto the row, so it MUST be the thread's own
    *  directory — passing the pane's would silently re-point the thread. */
   cwd: string | null;
-}
-
-interface PendingForeignAdopt extends ForeignProjectAdoptPrompt {
-  /** Set only when the backend had already minted the thread before we
-   *  learned the conversation was foreign (the discovery row disagreed
-   *  with the adopt result). Confirming then resumes from THAT result
-   *  rather than adopting the same conversation a second time. */
-  adopted: AdoptExternalSessionResult | null;
 }
 
 export interface AgentChatSessionActions {
@@ -88,7 +70,7 @@ export interface AgentChatSessionActions {
    *  to the session's OWN directory — no worktree is ever created), the
    *  external session's permission mode is deliberately NOT restored
    *  (the pane's current mode wins), and there is no local history to
-   *  hydrate beyond the "resumed outside Codemux" divider the backend
+   *  hydrate beyond the "resumed from the terminal" divider the backend
    *  writes. A session Codemux already owns switches to that thread
    *  instead of being adopted twice.
    *
@@ -98,21 +80,13 @@ export interface AgentChatSessionActions {
    *  pane rooted there and returns it as `pane_id`; the launch follows
    *  it, and this pane keeps the conversation it already had.
    *
-   *  A conversation from an UNRELATED project never adopts on the
-   *  click: it parks in {@link AgentChatSessionActions.foreignProjectPrompt}
-   *  and waits for an explicit confirm, because running it re-points
-   *  the pane (and the thread bound to it) at that project's
-   *  directory. Same-repo adoption stays a single click. */
+   *  A pick from another project is no different: the session decides
+   *  the folder, the picker's footer says so before the press, and the
+   *  toast names the destination afterwards. There is no confirmation
+   *  step. */
   handleAdoptExternalSession: (
     session: AdoptableAgentSession,
   ) => Promise<void>;
-  /** Non-null while a foreign-project `/resume` pick waits for the
-   *  user's explicit yes. */
-  foreignProjectPrompt: ForeignProjectAdoptPrompt | null;
-  /** Proceed with the parked foreign-project adoption. */
-  confirmForeignProjectAdopt: () => Promise<void>;
-  /** Drop the parked foreign-project adoption; the pane stays put. */
-  dismissForeignProjectAdopt: () => void;
   /** Stop the current session and start a fresh one on the same pane. */
   handleNewChat: () => Promise<void>;
 }
@@ -145,10 +119,6 @@ export function useAgentChatSessionActions(
 
   const paneId = pane.pane_id;
   const threadId = pane.thread_id;
-
-  // Foreign-project `/resume` picks wait here for an explicit yes.
-  const [foreignPrompt, setForeignPrompt] =
-    useState<PendingForeignAdopt | null>(null);
 
   // Resume a persisted row on a named pane. Split out of
   // {@link handleSelect} so a `/resume` switch to a conversation that
@@ -209,9 +179,7 @@ export function useAgentChatSessionActions(
   );
 
   // Run an adoption the backend has already completed: stop what the
-  // pane was doing, hydrate the minted thread, launch it. Split out of
-  // the click handler so a foreign-project confirmation can resume from
-  // here without adopting the same conversation twice.
+  // pane was doing, hydrate the minted thread, launch it.
   const launchAdoptedSession = useCallback(
     async (
       session: AdoptableAgentSession,
@@ -244,22 +212,25 @@ export function useAgentChatSessionActions(
           store.resetThread(threadId);
         }
 
-        // Name the directory whenever the conversation did not land on
+        // Name the destination whenever the conversation did not land on
         // the pane the user clicked from — a tab appearing elsewhere
-        // needs to say where it went, and so does the rare case where
-        // re-homing failed and the backend fell back to this pane.
+        // needs to say where it went — and whenever it belongs to
+        // another project, which the user agreed to by picking it but
+        // deserves to see confirmed.
         const where =
           !onThisPane || result.foreign_project ? ` in ${result.cwd}` : "";
         // The backend already minted the thread, bound it to the pane
-        // rooted at the session's folder and wrote the "resumed outside
-        // Codemux" divider; the shared launcher hydrates from THAT id,
-        // starts with the session's cursor and toasts honestly. When the
-        // folder belongs to another project the user has already agreed
-        // to the move — the gate upstream of this function is what asks.
+        // rooted at the session's folder and wrote the "resumed from the
+        // terminal" divider; the shared launcher hydrates from THAT id,
+        // starts with the session's cursor and toasts honestly.
         await launchAdoptedThread(
           provider,
           result,
-          { model: null, permissionMode: currentMode ?? null },
+          {
+            model: null,
+            permissionMode: currentMode ?? null,
+            sessionLastActiveAt: session.last_modified,
+          },
           where,
         );
       } catch (error) {
@@ -269,10 +240,11 @@ export function useAgentChatSessionActions(
     [paneId, provider, threadId],
   );
 
-  // Adopt, then either switch (already ours), park for confirmation
-  // (another project's directory), or launch.
-  const runAdoption = useCallback(
-    async (session: AdoptableAgentSession, allowForeignProject: boolean) => {
+  // Adopt, then either switch (already ours) or launch — wherever the
+  // session lives. The session decides the folder (R1: an existing
+  // checkout, never a new worktree); nothing here asks first.
+  const handleAdoptExternalSession = useCallback(
+    async (session: AdoptableAgentSession) => {
       let result;
       try {
         result = await agentChatAdoptExternalSession(
@@ -311,50 +283,9 @@ export function useAgentChatSessionActions(
         return;
       }
 
-      // R4, defence in depth: the discovery row said this lived in the
-      // pane's checkout but the backend disagrees. The thread exists
-      // now, yet starting it would re-point the pane at another
-      // project's directory — park it and let the user decide.
-      if (result.foreign_project && !allowForeignProject) {
-        setForeignPrompt({ session, cwd: result.cwd, adopted: result });
-        return;
-      }
-
       await launchAdoptedSession(session, result);
     },
     [paneId, provider, resumeRecord, launchAdoptedSession],
-  );
-
-  const handleAdoptExternalSession = useCallback(
-    async (session: AdoptableAgentSession) => {
-      // R4: a conversation from an unrelated project must never
-      // re-point the pane on a single click. Gate BEFORE the adopt call
-      // so nothing is minted until the user agrees. Rows Codemux
-      // already owns switch to their own thread and never move the
-      // pane, so they skip the gate.
-      if (!session.existing_thread_id && !session.same_repo) {
-        setForeignPrompt({ session, cwd: session.cwd, adopted: null });
-        return;
-      }
-      await runAdoption(session, false);
-    },
-    [runAdoption],
-  );
-
-  const confirmForeignProjectAdopt = useCallback(async () => {
-    const pending = foreignPrompt;
-    if (!pending) return;
-    setForeignPrompt(null);
-    if (pending.adopted) {
-      await launchAdoptedSession(pending.session, pending.adopted);
-      return;
-    }
-    await runAdoption(pending.session, true);
-  }, [foreignPrompt, launchAdoptedSession, runAdoption]);
-
-  const dismissForeignProjectAdopt = useCallback(
-    () => setForeignPrompt(null),
-    [],
   );
 
   const handleNewChat = useCallback(async () => {
@@ -409,11 +340,6 @@ export function useAgentChatSessionActions(
     provider,
     handleSelect,
     handleAdoptExternalSession,
-    foreignProjectPrompt: foreignPrompt
-      ? { session: foreignPrompt.session, cwd: foreignPrompt.cwd }
-      : null,
-    confirmForeignProjectAdopt,
-    dismissForeignProjectAdopt,
     handleNewChat,
   };
 }
