@@ -87,6 +87,10 @@ fn candidate_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(explicit) = env_override() {
+        #[cfg(debug_assertions)]
+        if let Some(dev_copy) = dev_copy_preferred_over(&explicit) {
+            candidates.push(dev_copy);
+        }
         candidates.push(explicit);
     }
 
@@ -149,7 +153,9 @@ pub fn resolve_sidecar_path() -> Result<PathBuf, ProviderError> {
 pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(explicit) = env_override() {
         #[cfg(debug_assertions)]
-        warn_if_override_shadows_dev_copy(&explicit);
+        if let Some(dev_copy) = dev_copy_preferred_over(&explicit) {
+            return Some(dev_copy);
+        }
         return Some(explicit);
     }
 
@@ -173,35 +179,55 @@ pub fn resolve_sidecar(resource_dir: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// Debug-build tripwire for an inherited override. Terminals spawned by
-/// Codemux strip [`SIDECAR_PATH_ENV`] (see
-/// `terminal::app_process_only_env_vars`), but a value can still arrive
-/// through other routes (an old daemon, a shell rc file, a stale export).
-/// If it points outside this checkout while a staged dev-tree copy exists,
-/// the dev build is almost certainly about to run someone else's sidecar —
-/// say so loudly, naming both paths. The override still wins; this only
-/// makes the mismatch visible instead of surfacing later as a baffling
-/// "unknown method" from a binary built from different sources.
+/// Debug-build defence against an *inherited* override.
+///
+/// Terminals spawned by this build strip [`SIDECAR_PATH_ENV`] (see
+/// `terminal::app_process_only_env_vars`), but a development build is
+/// routinely launched from a terminal that an *installed* Codemux opened,
+/// and installed builds that predate that change still export the
+/// variable. The dev build then inherits a path into someone else's
+/// install and runs a sidecar compiled from different sources, which
+/// surfaces later as a baffling "unknown method" for anything added since.
+///
+/// The inherited value is recognisable: installed builds always pin
+/// `<resource dir>/binaries/<sidecar_binary_name()>`. When the override
+/// has exactly that shape, lies outside this checkout, and a staged
+/// dev-tree copy exists, return the dev copy so it wins. Anything else --
+/// a path inside the tree, a differently named binary such as the test
+/// harness's fake sidecar, or a tree with no staged copy -- keeps the
+/// override verbatim, so deliberate overrides still work. Compiled out of
+/// release builds, which have no dev tree to prefer.
 #[cfg(debug_assertions)]
-fn warn_if_override_shadows_dev_copy(explicit: &Path) {
-    let dev_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries")
-        .join(sidecar_binary_name());
+fn dev_copy_preferred_over(explicit: &Path) -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if explicit.starts_with(manifest_dir) {
+        return None;
+    }
+    let name = sidecar_binary_name();
+    let release_layout = explicit.file_name().and_then(|f| f.to_str()) == Some(name.as_str())
+        && explicit
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|d| d.to_str())
+            == Some("binaries");
+    if !release_layout {
+        return None;
+    }
+    let dev_copy = manifest_dir.join("binaries").join(&name);
     if !dev_copy.exists() {
-        return;
+        return None;
     }
-    let inside_dev_tree = explicit.starts_with(env!("CARGO_MANIFEST_DIR"));
-    if inside_dev_tree {
-        return;
-    }
-    eprintln!(
-        "[codemux::sidecar] WARNING: {SIDECAR_PATH_ENV} overrides the sidecar with \
-         {} but this dev tree has its own staged copy at {}. The override wins, so \
-         this build will run a sidecar compiled from different sources. Unset the \
-         variable unless that is intentional.",
-        explicit.display(),
-        dev_copy.display()
-    );
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        eprintln!(
+            "[codemux::sidecar] {SIDECAR_PATH_ENV}={} points at another install's sidecar; \
+             this development build prefers its own staged copy at {}. Unset the variable \
+             or point it inside this checkout to override.",
+            explicit.display(),
+            dev_copy.display()
+        );
+    });
+    Some(dev_copy)
 }
 
 /// Assert the sidecar binary exists — used by the provider's health
@@ -351,5 +377,58 @@ mod tests {
         } else {
             assert_eq!(resolved, None);
         }
+    }
+
+    #[test]
+    fn debug_build_prefers_dev_copy_over_inherited_install_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Shape the override exactly like an installed build pins it --
+        // `<resource dir>/binaries/<sidecar_binary_name()>` -- outside
+        // this checkout. That is the value a dev build inherits when it
+        // is launched from a terminal an installed Codemux opened.
+        let tmp = unique_tmp_dir();
+        let foreign_dir = tmp.join("binaries");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join(sidecar_binary_name());
+        std::fs::write(&foreign, b"").unwrap();
+        std::env::set_var(SIDECAR_PATH_ENV, &foreign);
+
+        let dev_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join(sidecar_binary_name());
+        let resolved = resolve_sidecar(None);
+        let first_candidate = candidate_paths().into_iter().next();
+
+        std::env::remove_var(SIDECAR_PATH_ENV);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Only a debug build with a staged copy has anything to prefer;
+        // pin whichever branch this build and machine actually take.
+        if cfg!(debug_assertions) && dev_copy.exists() {
+            assert_eq!(resolved, Some(dev_copy.clone()));
+            assert_eq!(first_candidate, Some(dev_copy));
+        } else {
+            assert_eq!(resolved, Some(foreign.clone()));
+            assert_eq!(first_candidate, Some(foreign));
+        }
+    }
+
+    #[test]
+    fn override_outside_tree_with_another_name_still_wins() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The e2e harness pins its own fake sidecar. It is not the release
+        // layout, so it must be honoured verbatim even in a debug build
+        // that has a staged dev copy.
+        let tmp = unique_tmp_dir();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake = tmp.join("fake_claude_sidecar");
+        std::fs::write(&fake, b"").unwrap();
+        std::env::set_var(SIDECAR_PATH_ENV, &fake);
+
+        let resolved = resolve_sidecar(None);
+
+        std::env::remove_var(SIDECAR_PATH_ENV);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(resolved, Some(fake));
     }
 }
