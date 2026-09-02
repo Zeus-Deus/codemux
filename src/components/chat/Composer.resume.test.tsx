@@ -11,6 +11,7 @@ import type { ComponentProps } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { AdoptableAgentSession } from "@/tauri/commands";
+import type { AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 vi.mock("@/tauri/commands", async (importActual) => {
   const actual = (await importActual()) as Record<string, unknown>;
@@ -106,6 +107,39 @@ function baseProps(): ComposerProps {
   };
 }
 
+/** A local workspace anchored at `cwd`, as the sidebar would list it. */
+function workspaceAt(workspace_id: string, cwd: string): WorkspaceSnapshot {
+  return {
+    workspace_id,
+    title: cwd.split("/").pop(),
+    workspace_type: "standard",
+    cwd,
+    project_root: cwd,
+    worktree_path: null,
+    git_branch: "main",
+    tabs: [],
+    active_tab_id: "",
+    active_surface_id: "",
+    surfaces: [],
+    host_id: null,
+    remote_cwd: null,
+    attach_only: false,
+  } as unknown as WorkspaceSnapshot;
+}
+
+function seedAppState(
+  workspaces: WorkspaceSnapshot[],
+  activeWorkspaceId: string,
+) {
+  useAppStore.setState({
+    appState: {
+      schema_version: 1,
+      active_workspace_id: activeWorkspaceId,
+      workspaces,
+    } as unknown as AppStateSnapshot,
+  });
+}
+
 function renderComposer(props: Partial<ComposerProps> = {}): RenderResult {
   return render(
     <TooltipProvider>
@@ -164,7 +198,7 @@ async function openResumePicker(container: HTMLElement) {
 
 beforeEach(() => {
   resetSkillsStore();
-  useAppStore.setState({ homeDir: "/home/user" });
+  useAppStore.setState({ homeDir: "/home/user", appState: null });
   useProviderCommandsStore.getState().invalidate();
   listSkillsMock.mockClear();
   listSkillsMock.mockResolvedValue([]);
@@ -215,6 +249,78 @@ describe("Composer · /resume command", () => {
     fireEvent.click(row);
     const calls = onDraftChange.mock.calls;
     expect(calls[calls.length - 1]?.[0]).toBe("");
+  });
+});
+
+describe("Composer · /resume footer destination", () => {
+  const CONTINUES = "the workspace that's already open";
+  const OPENS = "Opens project · main and continues there";
+
+  async function footerText(props: Partial<ComposerProps>) {
+    listAdoptableMock.mockResolvedValue([makeSession()]);
+    const { container, findByTestId } = renderComposer(props);
+    await openResumePicker(container);
+    const destination = await findByTestId("resume-destination");
+    return destination.textContent ?? "";
+  }
+
+  // Two workspaces at the session's folder; the user is in a third.
+  function seedTwoAtProject(activeWorkspaceId = "ws-elsewhere") {
+    seedAppState(
+      [
+        workspaceAt("ws-settled", "/home/user/project"),
+        workspaceAt("ws-idle", "/home/user/project"),
+        workspaceAt("ws-elsewhere", "/projects/ledger"),
+      ],
+      activeWorkspaceId,
+    );
+  }
+
+  it("promises the draft's own target workspace when it is at the session's folder", async () => {
+    seedTwoAtProject();
+    const text = await footerText({
+      resumeScope: {
+        cwd: "/home/user/project",
+        projectRoot: "/home/user/project",
+        workspaceId: "ws-idle",
+      },
+    });
+    expect(text).toContain(CONTINUES);
+  });
+
+  it("says a fresh workspace opens when the matching ones are neither the draft's target nor active", async () => {
+    seedTwoAtProject();
+    const text = await footerText({
+      resumeScope: {
+        cwd: "/home/user/project",
+        projectRoot: "/home/user/project",
+        workspaceId: null,
+      },
+    });
+    expect(text).toContain(OPENS);
+    expect(text).not.toContain(CONTINUES);
+  });
+
+  it("promises the active workspace when it is at the session's folder", async () => {
+    seedTwoAtProject("ws-settled");
+    const text = await footerText({
+      resumeScope: {
+        cwd: "/home/user/project",
+        projectRoot: "/home/user/project",
+        workspaceId: null,
+      },
+    });
+    expect(text).toContain(CONTINUES);
+  });
+
+  it("a live pane counts only its own workspace as already open", async () => {
+    seedTwoAtProject();
+    expect(await footerText({ workspaceId: "ws-idle" })).toContain(CONTINUES);
+    cleanup();
+    seedTwoAtProject();
+    const text = await footerText({ workspaceId: null });
+    expect(text).toContain(OPENS);
+    expect(text).not.toContain(CONTINUES);
   });
 });
 

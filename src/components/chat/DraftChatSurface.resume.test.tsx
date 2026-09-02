@@ -141,7 +141,11 @@ vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
 // Wrap the real Composer so the props the draft hands it for `/resume`
 // are observable without reaching into the picker's own DOM.
 type ResumeProps = {
-  resumeScope?: { cwd: string | null; projectRoot: string | null } | null;
+  resumeScope?: {
+    cwd: string | null;
+    projectRoot: string | null;
+    workspaceId?: string | null;
+  } | null;
   resumeOpenSignal?: number;
 };
 const composerResumeProps: ResumeProps = {};
@@ -427,6 +431,7 @@ describe("DraftChatSurface · continue a terminal session", () => {
       expect(composerResumeProps.resumeScope).toEqual({
         cwd: "/projects/foo",
         projectRoot: "/projects/foo",
+        workspaceId: null,
       });
     });
     cleanup();
@@ -437,6 +442,27 @@ describe("DraftChatSurface · continue a terminal session", () => {
       expect(composerResumeProps.resumeScope).toEqual({
         cwd: "/home/user",
         projectRoot: null,
+        workspaceId: null,
+      });
+    });
+  });
+
+  it("names the workspace an existing-workspace draft is pointed at, so the footer promises only that one", async () => {
+    seedActiveSidebarWorkspace();
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/other");
+    useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+      kind: "existing_workspace",
+      workspaceId: "ws-other",
+    });
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+    renderSurface();
+    await waitFor(() => {
+      expect(composerResumeProps.resumeScope).toEqual({
+        cwd: "/projects/other",
+        projectRoot: "/projects/other",
+        workspaceId: "ws-other",
       });
     });
   });
@@ -554,6 +580,7 @@ describe("DraftChatSurface · continue a terminal session", () => {
       "ws-new",
       "claude",
       "/projects/foo",
+      "new_tab",
     );
     // Adopted on that pane, started from the session's cursor.
     expect(vi.mocked(agentChatAdoptExternalSession).mock.calls[0]![0]).toBe(

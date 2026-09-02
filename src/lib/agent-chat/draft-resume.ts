@@ -39,12 +39,13 @@ import { sessionDisplayTitle } from "./session-history";
  *
  * The session already knows its directory, so the draft's own location
  * picker is irrelevant here: the workspace is resolved from the
- * session's `cwd` (reused when one is already open there, otherwise
- * created AT that folder), a chat pane is opened in it, the session is
- * adopted into a thread bound to that pane, and the provider starts
- * with the session's resume cursor. No turn is sent; the transcript
- * opens on the "resumed from the terminal" divider and the user takes
- * it from there.
+ * session's `cwd` (reused only when the workspace open there is the one
+ * the draft points at or the one the user is in — see
+ * {@link chooseResumeWorkspace} — otherwise created AT that folder), a
+ * chat pane is opened in it as its own tab, the session is adopted into
+ * a thread bound to that pane, and the provider starts with the
+ * session's resume cursor. No turn is sent; the transcript opens on the
+ * "resumed from the terminal" divider and the user takes it from there.
  *
  * Rule R1 — never create a git worktree. A session that lives in a
  * linked worktree is attached where it is; a workspace is anchored at
@@ -67,27 +68,77 @@ function normalizeDirectory(path: string): string {
 }
 
 /**
- * The open, local workspace already anchored at `cwd`, if any. Matches
- * on the workspace's own directory or its worktree path. Remote and
+ * The open, local workspaces anchored at `cwd`. Matches on the
+ * workspace's own directory or its worktree path. Remote and
  * attach-in-place workspaces are skipped: a path string on another host
  * is not this folder, and an attached one is not ours to open panes in.
  */
-export function findWorkspaceAtDirectory(
+function workspacesAtDirectory(
+  appState: AppStateSnapshot,
+  cwd: string,
+): WorkspaceSnapshot[] {
+  const wanted = normalizeDirectory(cwd);
+  return appState.workspaces.filter((ws) => {
+    if (ws.host_id !== null && ws.host_id !== undefined) return false;
+    if (ws.attach_only) return false;
+    const candidates = [ws.cwd, ws.worktree_path].filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+    return candidates.some((value) => normalizeDirectory(value) === wanted);
+  });
+}
+
+/**
+ * The open workspace a session at `cwd` continues in, if any — one
+ * answer shared by the resume flow and by the picker footer that
+ * predicts it, so the footer never promises a workspace the flow
+ * would not pick.
+ *
+ * Of the workspaces open at that folder only two are ever reused, in
+ * this order: the one the draft is explicitly pointed at
+ * (`preferredWorkspaceId` — an `existing_workspace` target the user
+ * chose, or a live pane's own workspace), then the workspace the user
+ * is currently in. Any other match is left alone and null is returned,
+ * which means "open a fresh workspace at the session's folder": a
+ * settled workspace that merely sits at the same path holds someone
+ * else's context, and dropping a new conversation into it is the
+ * surprise this rule exists to prevent.
+ */
+export function chooseResumeWorkspace(
   appState: AppStateSnapshot | null,
   cwd: string,
+  { preferredWorkspaceId }: { preferredWorkspaceId: string | null },
 ): WorkspaceSnapshot | null {
   if (!appState) return null;
-  const wanted = normalizeDirectory(cwd);
+  const matches = workspacesAtDirectory(appState, cwd);
+  if (preferredWorkspaceId) {
+    const preferred = matches.find(
+      (ws) => ws.workspace_id === preferredWorkspaceId,
+    );
+    if (preferred) return preferred;
+  }
   return (
-    appState.workspaces.find((ws) => {
-      if (ws.host_id !== null && ws.host_id !== undefined) return false;
-      if (ws.attach_only) return false;
-      const candidates = [ws.cwd, ws.worktree_path].filter(
-        (value): value is string => typeof value === "string" && value.length > 0,
-      );
-      return candidates.some((value) => normalizeDirectory(value) === wanted);
-    }) ?? null
+    matches.find((ws) => ws.workspace_id === appState.active_workspace_id) ??
+    null
   );
+}
+
+/**
+ * The chat pane a resumed conversation lands in. Always its own tab:
+ * the backend splits the workspace's active pane by default when the
+ * workspace already has surfaces, which is right when the chat IS the
+ * workspace but wrong here — a reused workspace holds the user's other
+ * work, and a resumed session is a separate conversation, not a
+ * side-by-side companion to whatever pane happened to be focused. On a
+ * workspace with no surfaces yet (the fresh ones this module creates)
+ * `new_tab` and the default produce the same first surface.
+ */
+function createResumePane(
+  workspaceId: string,
+  provider: AgentChatProviderKind,
+  cwd: string,
+): Promise<string> {
+  return agentChatCreatePane(workspaceId, provider, cwd, "new_tab");
 }
 
 function findPaneInTree(
@@ -154,8 +205,9 @@ async function linkedWorktreeBranch(cwd: string): Promise<string | null> {
 }
 
 /**
- * The workspace a session at `cwd` should run in: the one already open
- * there, else a new one anchored at exactly that folder.
+ * The workspace a session at `cwd` should run in: the one
+ * {@link chooseResumeWorkspace} allows reusing, else a new one anchored
+ * at exactly that folder.
  *
  * A linked worktree is IMPORTED (`import_worktree_workspace` with the
  * "empty" layout): the workspace carries the worktree metadata, so the
@@ -173,11 +225,11 @@ async function linkedWorktreeBranch(cwd: string): Promise<string | null> {
  */
 export async function resolveWorkspaceForDirectory(
   cwd: string,
+  preferredWorkspaceId: string | null,
 ): Promise<{ workspaceId: string; cwd: string; reused: boolean }> {
-  const existing = findWorkspaceAtDirectory(
-    useAppStore.getState().appState,
-    cwd,
-  );
+  const existing = chooseResumeWorkspace(useAppStore.getState().appState, cwd, {
+    preferredWorkspaceId,
+  });
   if (existing) {
     return { workspaceId: existing.workspace_id, cwd, reused: true };
   }
@@ -238,13 +290,17 @@ async function activateWorkspaceQuietly(workspaceId: string): Promise<void> {
  * A session Codemux already owns a thread for: switch to it instead of
  * adopting a second copy. When a pane is still bound to the thread,
  * focusing it is the whole job — the pane brings its own session back.
- * Otherwise the thread gets a fresh pane in its own directory and the
- * ordinary record resume (hydrate, then start from its cursor).
+ * Otherwise the thread gets a fresh pane (its own tab) in the thread's
+ * own workspace when that is still open — that workspace IS the
+ * thread's home — else in whatever `resolveWorkspaceForDirectory`
+ * settles on for its directory, and the ordinary record resume
+ * (hydrate, then start from its cursor).
  */
 async function switchToOwnedThread(
   provider: AgentChatProviderKind,
   session: AdoptableAgentSession,
   record: AgentChatSessionRecord,
+  preferredWorkspaceId: string | null,
 ): Promise<{ workspaceId: string; paneId: string; threadId: string }> {
   const appState = useAppStore.getState().appState;
   const bound = findPaneForThread(appState, record.thread_id);
@@ -271,8 +327,9 @@ async function switchToOwnedThread(
   );
   const workspaceId = recordWorkspaceStillOpen
     ? record.workspace_id
-    : (await resolveWorkspaceForDirectory(cwd)).workspaceId;
-  const paneId = await agentChatCreatePane(workspaceId, provider, cwd);
+    : (await resolveWorkspaceForDirectory(cwd, preferredWorkspaceId))
+        .workspaceId;
+  const paneId = await createResumePane(workspaceId, provider, cwd);
   const threadId = await launchResumedRecord(
     provider,
     { ...record, sdk_session_id: sdkSessionId },
@@ -301,6 +358,13 @@ export async function resumeExternalSessionFromDraft(
     return { success: false, error: "The draft is already being started" };
   }
   const provider = draft.provider;
+  // The one workspace the user explicitly chose for this draft, if any.
+  // Home and project drafts have none; the chooser then only ever reuses
+  // the active workspace.
+  const preferredWorkspaceId =
+    draft.target.kind === "existing_workspace"
+      ? draft.target.workspaceId
+      : null;
   state.markPromoting(draftId);
 
   try {
@@ -314,15 +378,23 @@ export async function resumeExternalSessionFromDraft(
           `"${session.title}" is already in Codemux, but its thread could not be opened.`,
         );
       }
-      const switched = await switchToOwnedThread(provider, session, record);
+      const switched = await switchToOwnedThread(
+        provider,
+        session,
+        record,
+        preferredWorkspaceId,
+      );
       finishDraft(draftId, draft.threadId, switched);
       return { success: true, ...switched };
     }
 
-    // 1. The workspace at the session's OWN folder — reused, imported
-    //    (an existing linked worktree), or created there. Never a NEW
-    //    worktree (R1).
-    const workspace = await resolveWorkspaceForDirectory(session.cwd);
+    // 1. The workspace at the session's OWN folder — reused (only the
+    //    draft's target or the active one), imported (an existing linked
+    //    worktree), or created there. Never a NEW worktree (R1).
+    const workspace = await resolveWorkspaceForDirectory(
+      session.cwd,
+      preferredWorkspaceId,
+    );
     // Pin the draft to it immediately: from here on nothing may
     // re-point the draft at the sidebar's active workspace or flip it
     // to a worktree checkout while the adoption is in flight.
@@ -331,9 +403,10 @@ export async function resumeExternalSessionFromDraft(
       workspaceId: workspace.workspaceId,
     });
 
-    // 2. A chat pane rooted at that folder, so the backend attaches the
-    //    conversation to this pane instead of opening another one.
-    const paneId = await agentChatCreatePane(
+    // 2. A chat pane rooted at that folder, in its own tab, so the
+    //    backend attaches the conversation to this pane instead of
+    //    opening another one.
+    const paneId = await createResumePane(
       workspace.workspaceId,
       provider,
       workspace.cwd,

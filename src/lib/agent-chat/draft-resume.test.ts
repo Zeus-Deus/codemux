@@ -52,7 +52,7 @@ vi.mock("@/lib/toast", () => ({
 
 import { adoptedSessionLastActiveAt } from "./adopt-external-session";
 import {
-  findWorkspaceAtDirectory,
+  chooseResumeWorkspace,
   resumeExternalSessionFromDraft,
 } from "./draft-resume";
 import { toast } from "@/lib/toast";
@@ -260,13 +260,16 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("findWorkspaceAtDirectory", () => {
-  it("matches a workspace by its cwd, ignoring a trailing separator", () => {
+describe("chooseResumeWorkspace", () => {
+  const noPreference = { preferredWorkspaceId: null };
+  const appState = () => useAppStore.getState().appState;
+
+  it("matches the active workspace by its cwd, ignoring a trailing separator", () => {
     const ws = makeWorkspace({ workspace_id: "ws-foo", cwd: "/projects/foo" });
     seedAppState([ws]);
-    expect(
-      findWorkspaceAtDirectory(useAppStore.getState().appState, "/projects/foo/"),
-    ).toBe(ws);
+    expect(chooseResumeWorkspace(appState(), "/projects/foo/", noPreference)).toBe(
+      ws,
+    );
   });
 
   it("matches a worktree workspace by its worktree path", () => {
@@ -278,10 +281,7 @@ describe("findWorkspaceAtDirectory", () => {
     });
     seedAppState([ws]);
     expect(
-      findWorkspaceAtDirectory(
-        useAppStore.getState().appState,
-        "/worktrees/foo/feature",
-      ),
+      chooseResumeWorkspace(appState(), "/worktrees/foo/feature", noPreference),
     ).toBe(ws);
   });
 
@@ -292,11 +292,51 @@ describe("findWorkspaceAtDirectory", () => {
       host_id: 7,
     });
     seedAppState([ws]);
+    expect(chooseResumeWorkspace(appState(), "/projects/foo", noPreference)).toBeNull();
+  });
+
+  it("prefers the draft's own target over the active workspace at the same folder", () => {
+    const active = makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/foo" });
+    const chosen = makeWorkspace({ workspace_id: "ws-chosen", cwd: "/projects/foo" });
+    seedAppState([active, chosen], "ws-active");
     expect(
-      findWorkspaceAtDirectory(useAppStore.getState().appState, "/projects/foo"),
+      chooseResumeWorkspace(appState(), "/projects/foo", {
+        preferredWorkspaceId: "ws-chosen",
+      }),
+    ).toBe(chosen);
+  });
+
+  it("falls back to the active workspace when the preferred one is elsewhere", () => {
+    const other = makeWorkspace({ workspace_id: "ws-other", cwd: "/projects/other" });
+    const active = makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/foo" });
+    seedAppState([other, active], "ws-active");
+    expect(
+      chooseResumeWorkspace(appState(), "/projects/foo", {
+        preferredWorkspaceId: "ws-other",
+      }),
+    ).toBe(active);
+  });
+
+  it("returns null when the workspaces at the folder are neither preferred nor active", () => {
+    const stale = makeWorkspace({ workspace_id: "ws-stale", cwd: "/projects/foo" });
+    const fresh = makeWorkspace({ workspace_id: "ws-fresh", cwd: "/projects/foo" });
+    const active = makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/other" });
+    seedAppState([stale, fresh, active], "ws-active");
+    expect(chooseResumeWorkspace(appState(), "/projects/foo", noPreference)).toBeNull();
+    expect(
+      chooseResumeWorkspace(appState(), "/projects/foo", {
+        preferredWorkspaceId: "ws-active",
+      }),
     ).toBeNull();
   });
 });
+
+/** Every chat pane the flow opened asked for its own tab — none split. */
+function expectNoSplitPanes() {
+  const calls = vi.mocked(agentChatCreatePane).mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  for (const call of calls) expect(call[3]).toBe("new_tab");
+}
 
 describe("resumeExternalSessionFromDraft", () => {
   it("opens a workspace AT the session's folder, adopts, and starts with the resume cursor — no turn sent", async () => {
@@ -324,6 +364,7 @@ describe("resumeExternalSessionFromDraft", () => {
       "ws-new",
       "claude",
       "/projects/foo",
+      "new_tab",
     );
     const [adoptPane, adoptProvider, payload] = vi.mocked(
       agentChatAdoptExternalSession,
@@ -362,9 +403,29 @@ describe("resumeExternalSessionFromDraft", () => {
     );
   });
 
-  it("reuses the workspace already open at the session's folder", async () => {
+  it("reuses the ACTIVE workspace at the session's folder, in a tab of its own", async () => {
+    // The workspace already holds another chat: the resumed one must
+    // not be split in beside it.
     seedAppState([
-      makeWorkspace({ workspace_id: "ws-foo", cwd: "/projects/foo" }),
+      makeWorkspace({
+        workspace_id: "ws-foo",
+        cwd: "/projects/foo",
+        surfaces: [
+          {
+            surface_id: "surface-1",
+            title: "chat",
+            root: {
+              kind: "agent_chat",
+              pane_id: "pane-other",
+              title: "chat",
+              thread_id: "thread-other",
+              provider: "codex",
+              cwd: "/projects/foo",
+            },
+            active_pane_id: "pane-other",
+          },
+        ],
+      }),
     ]);
     const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
 
@@ -375,7 +436,87 @@ describe("resumeExternalSessionFromDraft", () => {
       "ws-foo",
       "claude",
       "/projects/foo",
+      "new_tab",
     );
+    expectNoSplitPanes();
+  });
+
+  it("opens a fresh workspace when the ones at the folder are neither the draft's target nor active", async () => {
+    // Two workspaces sit at the session's folder — a settled one with
+    // someone else's chat in it and an idle one — while the user is in
+    // a third. Neither is the user's choice, so neither is reused.
+    seedAppState(
+      [
+        makeWorkspace({
+          workspace_id: "ws-settled",
+          cwd: "/projects/foo",
+          surfaces: [
+            {
+              surface_id: "surface-1",
+              title: "chat",
+              root: {
+                kind: "agent_chat",
+                pane_id: "pane-other",
+                title: "chat",
+                thread_id: "thread-other",
+                provider: "codex",
+                cwd: "/projects/foo",
+              },
+              active_pane_id: "pane-other",
+            },
+          ],
+        }),
+        makeWorkspace({ workspace_id: "ws-idle", cwd: "/projects/foo" }),
+        makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/other" }),
+      ],
+      "ws-active",
+    );
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+
+    const result = await resumeExternalSessionFromDraft(
+      draft.draftId,
+      makeSession(),
+    );
+
+    expect(result).toMatchObject({ success: true, workspaceId: "ws-new" });
+    expect(vi.mocked(createEmptyWorkspaceResult)).toHaveBeenCalledWith(
+      "/projects/foo",
+    );
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
+      "ws-new",
+      "claude",
+      "/projects/foo",
+      "new_tab",
+    );
+  });
+
+  it("reuses the workspace the draft is pointed at over the active one at the same folder", async () => {
+    seedAppState(
+      [
+        makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/foo" }),
+        makeWorkspace({ workspace_id: "ws-chosen", cwd: "/projects/foo" }),
+      ],
+      "ws-active",
+    );
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/foo");
+    useChatDraftStore.getState().updateDraftTarget(draft.draftId, {
+      kind: "existing_workspace",
+      workspaceId: "ws-chosen",
+    });
+
+    await resumeExternalSessionFromDraft(draft.draftId, makeSession());
+
+    expect(vi.mocked(createEmptyWorkspaceResult)).not.toHaveBeenCalled();
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
+      "ws-chosen",
+      "claude",
+      "/projects/foo",
+      "new_tab",
+    );
+    expectNoSplitPanes();
   });
 
   it("imports an existing linked worktree in place — never creates one (R1)", async () => {
@@ -422,6 +563,7 @@ describe("resumeExternalSessionFromDraft", () => {
       "ws-wt",
       "claude",
       "/worktrees/foo/feature",
+      "new_tab",
     );
     expect(startInput().input.cwd).toBe("/worktrees/foo/feature");
     expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-wt");
@@ -515,6 +657,7 @@ describe("resumeExternalSessionFromDraft", () => {
     // Nothing ever ran against the sidebar's workspace.
     expect(vi.mocked(agentChatCreatePane)).not.toHaveBeenCalledWith(
       "ws-other",
+      expect.anything(),
       expect.anything(),
       expect.anything(),
     );
@@ -640,9 +783,64 @@ describe("resumeExternalSessionFromDraft", () => {
     expect(vi.mocked(createEmptyWorkspaceResult)).toHaveBeenCalledWith(
       "/projects/ledger",
     );
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
+      "ws-new",
+      "claude",
+      "/projects/ledger",
+      "new_tab",
+    );
     const { input } = startInput();
     expect(input.cwd).toBe("/projects/ledger");
     expect(input.resume_cursor).toEqual({ resume: "sdk-ext-1" });
     expect(input.thread_id).not.toBe("thread-existing");
+  });
+
+  it("reopens an owned thread in its still-open workspace as a new tab, never a split", async () => {
+    // The thread's home workspace is open (and not active) with another
+    // chat in it — that workspace IS the thread's home, so it is reused,
+    // but the pane gets its own tab.
+    const record = makeRecord({ workspace_id: "ws-home" });
+    vi.mocked(agentChatGetSession).mockResolvedValue(record);
+    seedAppState(
+      [
+        makeWorkspace({
+          workspace_id: "ws-home",
+          cwd: "/projects/foo",
+          surfaces: [
+            {
+              surface_id: "surface-1",
+              title: "chat",
+              root: {
+                kind: "agent_chat",
+                pane_id: "pane-other",
+                title: "chat",
+                thread_id: "thread-other",
+                provider: "codex",
+                cwd: "/projects/foo",
+              },
+              active_pane_id: "pane-other",
+            },
+          ],
+        }),
+        makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/other" }),
+      ],
+      "ws-active",
+    );
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+
+    const result = await resumeExternalSessionFromDraft(
+      draft.draftId,
+      makeSession({ existing_thread_id: "thread-existing" }),
+    );
+
+    expect(result).toMatchObject({ success: true, workspaceId: "ws-home" });
+    expect(vi.mocked(createEmptyWorkspaceResult)).not.toHaveBeenCalled();
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
+      "ws-home",
+      "claude",
+      "/projects/foo",
+      "new_tab",
+    );
+    expectNoSplitPanes();
   });
 });

@@ -35,7 +35,7 @@ import {
   sessionProviderLabel,
 } from "@/lib/agent-chat/session-mentions";
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
-import { findWorkspaceAtDirectory } from "@/lib/agent-chat/draft-resume";
+import { chooseResumeWorkspace } from "@/lib/agent-chat/draft-resume";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -274,11 +274,15 @@ interface Props {
    *  for a Home draft, which falls back to the home directory) and
    *  `projectRoot` is the SELECTED project's root: that folder opens
    *  expanded in the picker; null (no project yet) shows a cross-project
-   *  RECENT block instead. Omitted on panes, which derive both from
-   *  their own cwd. */
+   *  RECENT block instead. `workspaceId` is the workspace the draft is
+   *  explicitly pointed at (an `existing_workspace` target), the one
+   *  the footer may promise to continue in; null for Home and project
+   *  drafts. Omitted on panes, which derive all of it from their own
+   *  cwd and workspace. */
   resumeScope?: {
     cwd: string | null;
     projectRoot: string | null;
+    workspaceId?: string | null;
   } | null;
   /** Increment to open the `/resume` picker from outside the composer
    *  (the draft's "Continue a terminal session" row). Same surface,
@@ -1071,9 +1075,20 @@ export function Composer({
     ? resumeScope.projectRoot
     : (resumeSessions.find((row) => row.same_repo)?.project_root ?? cwd);
 
+  // The footer predicts where a pick lands with the SAME chooser the
+  // resume flow uses, keyed on the same workspace: the draft's own
+  // target, or this pane's workspace. A workspace that merely sits at
+  // the session's folder is not "already open" in the sense the footer
+  // means — the flow would open a fresh one, and the footer says so.
+  const resumePreferredWorkspaceId = resumeScope
+    ? (resumeScope.workspaceId ?? null)
+    : workspaceId;
   const isWorkspaceOpenAt = useCallback(
-    (dir: string) => findWorkspaceAtDirectory(appState, dir) !== null,
-    [appState],
+    (dir: string) =>
+      chooseResumeWorkspace(appState, dir, {
+        preferredWorkspaceId: resumePreferredWorkspaceId,
+      }) !== null,
+    [appState, resumePreferredWorkspaceId],
   );
 
   const handleResumeSelect = useCallback(

@@ -609,13 +609,20 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // Discovery always spans the whole machine; the picker groups rows by
   // project and opens the selected one, so `projectRoot` is what tells
   // it (and the landing row) which group is "this project". Null for a
-  // Home draft, which has none.
+  // Home draft, which has none. `workspaceId` is the workspace this
+  // draft is pointed at, so the picker footer predicts "continues in the
+  // workspace that's already open" for exactly the workspace the resume
+  // flow would reuse (see `chooseResumeWorkspace`), and no other.
   const resumeScope = useMemo(() => {
     if (draft.target.kind === "home") {
-      return { cwd: appHomeDir, projectRoot: null };
+      return { cwd: appHomeDir, projectRoot: null, workspaceId: null };
     }
-    return { cwd: scopeProjectPath, projectRoot: scopeProjectPath };
-  }, [draft.target.kind, appHomeDir, scopeProjectPath]);
+    return {
+      cwd: scopeProjectPath,
+      projectRoot: scopeProjectPath,
+      workspaceId: sessionWorkspaceId,
+    };
+  }, [draft.target.kind, appHomeDir, scopeProjectPath, sessionWorkspaceId]);
 
   // What discovery found, so the landing row can name the freshest
   // session in scope (or say nothing at all on an empty machine).
