@@ -207,7 +207,7 @@ export function ComposerCommandMenu({
                         )}
                       </span>
                       <span className="flex min-w-0 flex-1 flex-col gap-px">
-                        <span className="text-[13px] font-semibold leading-tight text-foreground">
+                        <span className="line-clamp-2 break-words text-[13px] font-semibold leading-tight text-foreground">
                           {item.label}
                         </span>
                         {item.description && (

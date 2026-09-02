@@ -86,6 +86,54 @@ export function externalSessionFolderLabel(cwd: string): string {
   return parts[parts.length - 1] ?? cwd;
 }
 
+/** `/home/me/projects/app` → `~/projects/app`. A row's description is
+ *  truncated from the right, so the useful tail survives only if the
+ *  head is short; the home prefix carries no information worth the
+ *  width. Paths outside the home directory come back unchanged. */
+export function abbreviateHome(path: string, homeDir?: string | null): string {
+  if (!homeDir) return path;
+  const home = homeDir.replace(/[\\/]+$/, "");
+  if (home.length === 0) return path;
+  if (path === home) return "~";
+  if (path.startsWith(`${home}/`) || path.startsWith(`${home}\\`)) {
+    return `~${path.slice(home.length)}`;
+  }
+  return path;
+}
+
+function normalizeDir(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+/** One heading per project when discovery spans the whole machine.
+ *  The folder name is the label; two projects that share a name are
+ *  told apart by their parent segment, so `api/app` and `web/app` do
+ *  not collapse into a single bucket. */
+export function projectGroupLabels(
+  sessions: AdoptableAgentSession[],
+): Map<string, string> {
+  const byName = new Map<string, Set<string>>();
+  for (const session of sessions) {
+    const dir = normalizeDir(session.cwd);
+    const name = externalSessionFolderLabel(dir);
+    if (!byName.has(name)) byName.set(name, new Set());
+    byName.get(name)!.add(dir);
+  }
+  const labels = new Map<string, string>();
+  for (const [name, dirs] of byName) {
+    for (const dir of dirs) {
+      if (dirs.size === 1) {
+        labels.set(dir, name);
+        continue;
+      }
+      const parts = dir.split(/[\\/]+/).filter((part) => part.length > 0);
+      const parent = parts[parts.length - 2];
+      labels.set(dir, parent ? `${parent}/${name}` : name);
+    }
+  }
+  return labels;
+}
+
 const GROUP_ORDER = [
   RESUME_GROUP_CHECKOUT,
   RESUME_GROUP_EXISTING,
@@ -102,6 +150,17 @@ interface BuildAdoptableSessionItemsArgs {
    *  draft has no committed location to protect). Only the row's
    *  description changes; the caller enforces whichever it promised. */
   foreignNeedsConfirm?: boolean;
+  /** The directory discovery was scoped from. A same-repo session that
+   *  lives elsewhere is a sibling worktree: it still counts as this
+   *  checkout, but adopting it opens that worktree's workspace, so the
+   *  row must say so. */
+  currentCwd?: string | null;
+  /** Home directory, so paths in descriptions read `~/…`. */
+  homeDir?: string | null;
+  /** When discovery spans every project, one flat "other projects"
+   *  bucket is a wall. Group unrelated sessions by project instead,
+   *  most recently active project first. */
+  groupByProject?: boolean;
 }
 
 /**
@@ -117,21 +176,62 @@ export function buildAdoptableSessionItems({
   sessions,
   now = new Date(),
   foreignNeedsConfirm = true,
+  currentCwd = null,
+  homeDir = null,
+  groupByProject = false,
 }: BuildAdoptableSessionItemsArgs): SlashCommandItem[] {
-  const sorted = [...sessions].sort((a, b) => {
-    const groupDelta =
-      GROUP_ORDER.indexOf(adoptableSessionGroup(a)) -
-      GROUP_ORDER.indexOf(adoptableSessionGroup(b));
-    if (groupDelta !== 0) return groupDelta;
-    return (
-      (Date.parse(b.last_modified) || 0) - (Date.parse(a.last_modified) || 0)
+  const when = (session: AdoptableAgentSession) =>
+    Date.parse(session.last_modified) || 0;
+  const projectLabels = groupByProject
+    ? projectGroupLabels(
+        sessions.filter(
+          (session) => adoptableSessionGroup(session) === RESUME_GROUP_OTHER,
+        ),
+      )
+    : new Map<string, string>();
+  const groupOf = (session: AdoptableAgentSession): string => {
+    const base = adoptableSessionGroup(session);
+    if (base !== RESUME_GROUP_OTHER || !groupByProject) return base;
+    return projectLabels.get(normalizeDir(session.cwd)) ?? RESUME_GROUP_OTHER;
+  };
+  // Project groups are ordered by their most recent conversation, so
+  // the project you were just working in sits at the top.
+  const projectRecency = new Map<string, number>();
+  for (const session of sessions) {
+    const group = groupOf(session);
+    if (GROUP_ORDER.includes(group)) continue;
+    projectRecency.set(
+      group,
+      Math.max(projectRecency.get(group) ?? 0, when(session)),
     );
+  }
+  const groupRank = (group: string): number => {
+    const fixed = GROUP_ORDER.indexOf(group);
+    return fixed === -1 ? GROUP_ORDER.length : fixed;
+  };
+  const sorted = [...sessions].sort((a, b) => {
+    const ga = groupOf(a);
+    const gb = groupOf(b);
+    const rankDelta = groupRank(ga) - groupRank(gb);
+    if (rankDelta !== 0) return rankDelta;
+    if (ga !== gb) {
+      return (projectRecency.get(gb) ?? 0) - (projectRecency.get(ga) ?? 0);
+    }
+    return when(b) - when(a);
   });
 
+  const here = currentCwd ? normalizeDir(currentCwd) : null;
   return sorted.map((session) => {
-    const group = adoptableSessionGroup(session);
-    const existing = group === RESUME_GROUP_EXISTING;
-    const foreign = group === RESUME_GROUP_OTHER;
+    const group = groupOf(session);
+    const base = adoptableSessionGroup(session);
+    const existing = base === RESUME_GROUP_EXISTING;
+    const foreign = base === RESUME_GROUP_OTHER;
+    const siblingWorktree =
+      !existing &&
+      !foreign &&
+      here !== null &&
+      normalizeDir(session.cwd) !== here;
+    const where = abbreviateHome(session.cwd, homeDir);
     return {
       id: externalSessionRowId(session.session_id),
       label: session.title,
@@ -139,13 +239,21 @@ export function buildAdoptableSessionItems({
         ? "Already in Codemux — switches to that thread"
         : foreign
           ? foreignNeedsConfirm
-            ? `Asks first, then opens in ${session.cwd}`
-            : `Opens in ${session.cwd}`
-          : (session.git_branch ?? session.cwd),
+            ? `Asks first, then opens in ${where}`
+            : `Opens in ${where}`
+          : siblingWorktree
+            ? `Worktree · ${where}`
+            : (session.git_branch ?? where),
       // No literal text ever reaches the draft, so the command slot is
       // free for a state word. `rightAdornment` overrides it anyway;
       // this is the fallback for surfaces that render `command` only.
-      command: existing ? "switch" : foreign ? "other project" : "adopt",
+      command: existing
+        ? "switch"
+        : foreign
+          ? "other project"
+          : siblingWorktree
+            ? "worktree"
+            : "adopt",
       icon: existing ? ArrowLeftRight : foreign ? FolderOpen : Terminal,
       iconClassName: existing
         ? "text-status-remote"

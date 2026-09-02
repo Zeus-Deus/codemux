@@ -107,6 +107,7 @@ import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { useAppStore } from "@/stores/app-store";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -1077,16 +1078,27 @@ export function Composer({
   }, [resumeOpen, resumeAllProjects, resumeScopeCwd, provider]);
 
   const resumeForeignOpensInPlace = resumeScope?.foreignOpensInPlace ?? false;
+  const homeDir = useAppStore((state) => state.homeDir);
   const resumeItems = useMemo(() => {
     const rows = buildAdoptableSessionItems({
       sessions: resumeSessions,
       foreignNeedsConfirm: !resumeForeignOpensInPlace,
+      currentCwd: resumeScopeCwd,
+      homeDir,
+      groupByProject: resumeAllProjects,
     });
     // The widening row is a scope control, not a result, so it survives
     // the search filter and always sits last.
     const filtered = filterCommandMenuItems(rows, resumeQuery);
     return resumeAllProjects ? filtered : [...filtered, buildWidenScopeItem()];
-  }, [resumeSessions, resumeQuery, resumeAllProjects, resumeForeignOpensInPlace]);
+  }, [
+    resumeSessions,
+    resumeQuery,
+    resumeAllProjects,
+    resumeForeignOpensInPlace,
+    resumeScopeCwd,
+    homeDir,
+  ]);
 
   const resumePopupFooter = useMemo(() => {
     if (resumeError) {
@@ -1103,7 +1115,12 @@ export function Composer({
           : "Nothing in this checkout yet — widen to every project below.",
       };
     }
-    return null;
+    // The conversation comes back with its history; the model and
+    // permission mode are the ones chosen here, not the terminal's.
+    return {
+      tone: "muted" as const,
+      message: "Continues with the model and permissions set here.",
+    };
   }, [resumeError, resumeLoading, resumeSessions.length, resumeAllProjects]);
 
   const handleResumeSelect = useCallback(

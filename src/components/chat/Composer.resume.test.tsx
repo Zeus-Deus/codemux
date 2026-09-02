@@ -281,7 +281,8 @@ describe("Composer · /resume picker", () => {
     expect(listAdoptableMock.mock.calls[1]![1]).toMatchObject({
       all_projects: true,
     });
-    expect(await findByText("OTHER PROJECTS")).toBeInTheDocument();
+    // Widened results group by project, not into one flat bucket.
+    expect(await findByText("ledger")).toBeInTheDocument();
     expect(await findByText("Unrelated project")).toBeInTheDocument();
   });
 
