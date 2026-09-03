@@ -113,6 +113,46 @@ pub struct AgentChatHistorySearchHit {
     pub created_at: String,
 }
 
+/// Result of [`DatabaseStore::list_agent_chat_messages_tail`]: the newest
+/// whole turns of a thread as `(id, payload, created_at_ms)` triples
+/// (ascending), plus what the caller needs to decide whether to backfill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentChatTail {
+    pub rows: Vec<(i64, String, i64)>,
+    /// Rows the thread holds in total, so the caller can size its backfill.
+    pub total_rows: i64,
+    /// `rows` is the entire thread; nothing older exists.
+    pub complete: bool,
+}
+
+/// `SELECT` every row of `thread_id` with `id > after_id`, ascending. Served
+/// entirely by `idx_agent_chat_messages_thread(thread_id, id)`.
+fn query_agent_chat_rows(
+    conn: &Connection,
+    thread_id: &str,
+    after_id: i64,
+) -> Vec<(i64, String, i64)> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, payload,
+                CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER)
+         FROM agent_chat_messages
+         WHERE thread_id = ?1 AND id > ?2
+         ORDER BY id ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map(params![thread_id, after_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })
+    .map(|iter| iter.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
 /// Versioned cache for the expensive model-written portion of a conversation
 /// handoff. Direct transcript fallback is deterministic and is never cached.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4468,25 +4508,120 @@ impl DatabaseStore {
         after_id: Option<i64>,
     ) -> Vec<(i64, String, i64)> {
         let conn = self.conn.lock().unwrap();
+        query_agent_chat_rows(&conn, thread_id, after_id.unwrap_or(0))
+    }
+
+    /// Tail read for a cold open: the newest rows of a thread, cut at a
+    /// user-turn boundary so the reducer never sees a turn's second half
+    /// without its first.
+    ///
+    /// `limit` is the MINIMUM number of rows wanted. The cut is the latest
+    /// `user_message` row at or below the oldest of the last `limit` rows,
+    /// and everything from that row up is returned ascending — a whole
+    /// number of turns, always ending at the head. A thread with at most
+    /// `limit` rows, or one with no `user_message` at or below the cut
+    /// (nothing to align to), returns every row.
+    ///
+    /// Why a turn boundary and not a plain row count: the transcript
+    /// reducer correlates rows across a turn — a `tool_result` looks up
+    /// its `tool_use`, a `subagent_updated` its card — and an orphaned
+    /// second half renders as `(pending)` placeholders and duplicate
+    /// cards. `user_message` rows persist at dispatch time and never
+    /// occur mid-turn, so they are the one safe seam.
+    ///
+    /// `complete` reports whether `rows` is the whole thread, so the
+    /// caller knows whether older rows still have to be backfilled.
+    pub fn list_agent_chat_messages_tail(&self, thread_id: &str, limit: i64) -> AgentChatTail {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.max(1);
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_chat_messages WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let all_rows = |conn: &Connection| AgentChatTail {
+            rows: query_agent_chat_rows(conn, thread_id, 0),
+            total_rows: total,
+            complete: true,
+        };
+        if total <= limit {
+            return all_rows(&conn);
+        }
+        // The oldest id among the newest `limit` rows.
+        let cut: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM agent_chat_messages
+                 WHERE thread_id = ?1
+                 ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                params![thread_id, limit - 1],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(cut) = cut else {
+            return all_rows(&conn);
+        };
+        // Latest user turn at or below the cut. The `instr` prefilter keeps
+        // the JSON parse off the thousands of tool rows the walk skips.
+        let boundary: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM agent_chat_messages
+                 WHERE thread_id = ?1 AND id <= ?2
+                   AND instr(payload, '\"user_message\"') > 0
+                   AND json_valid(payload)
+                   AND json_extract(payload, '$.type') = 'user_message'
+                 ORDER BY id DESC LIMIT 1",
+                params![thread_id, cut],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(boundary) = boundary else {
+            return all_rows(&conn);
+        };
+        let rows = query_agent_chat_rows(&conn, thread_id, boundary - 1);
+        let complete = rows.len() as i64 >= total;
+        AgentChatTail {
+            rows,
+            total_rows: total,
+            complete,
+        }
+    }
+
+    /// Backfill page: the newest `limit` rows STRICTLY OLDER than
+    /// `before_id`, ascending. Paired with [`Self::list_agent_chat_messages_tail`]:
+    /// the frontend walks `before_id` down from the tail's first row until
+    /// a page comes back short. Served by the same `(thread_id, id)` index
+    /// as the cursor read, walked backwards.
+    pub fn list_agent_chat_messages_before(
+        &self,
+        thread_id: &str,
+        before_id: i64,
+        limit: i64,
+    ) -> Vec<(i64, String, i64)> {
+        let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT id, payload,
                     CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER)
              FROM agent_chat_messages
-             WHERE thread_id = ?1 AND id > ?2
-             ORDER BY id ASC",
+             WHERE thread_id = ?1 AND id < ?2
+             ORDER BY id DESC LIMIT ?3",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map(params![thread_id, after_id.unwrap_or(0)], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        let mut rows: Vec<(i64, String, i64)> = stmt
+            .query_map(params![thread_id, before_id, limit.max(0)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows.reverse();
+        rows
     }
 
     /// Highest row id currently stored for a thread, or `None` when the
@@ -7839,6 +7974,150 @@ mod tests {
         assert_eq!(t1.len(), 2);
         assert_eq!(t1[1].1, r#"{"c":3}"#);
         assert_eq!(db.list_agent_chat_messages_after("unknown", None).len(), 0);
+    }
+
+    /// A thread of `turns` user turns, each followed by `per_turn` tool
+    /// rows. Returns the ids of the user rows in order.
+    fn seed_turns(db: &DatabaseStore, thread_id: &str, turns: usize, per_turn: usize) -> Vec<i64> {
+        let mut user_ids = Vec::new();
+        for t in 0..turns {
+            user_ids.push(
+                db.append_agent_chat_message(
+                    thread_id,
+                    &format!(r#"{{"type":"user_message","text":"turn {t}"}}"#),
+                )
+                .unwrap()
+                .unwrap(),
+            );
+            for i in 0..per_turn {
+                db.append_agent_chat_message(
+                    thread_id,
+                    &format!(
+                        r#"{{"type":"item_completed","item":{{"kind":"tool_use","tool_use_id":"t{t}-{i}"}}}}"#
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        user_ids
+    }
+
+    #[test]
+    fn agent_chat_messages_tail_cuts_at_a_user_turn_boundary() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        // 4 turns × 6 rows = 24 rows; ids are contiguous from the first.
+        let users = seed_turns(&db, "t", 4, 5);
+        let head = db.max_agent_chat_message_id("t").unwrap();
+
+        // Asking for 8 rows: the newest 8 span the last turn (6 rows) plus
+        // two rows of the turn before, so the cut aligns to that turn's
+        // `user_message` and the tail holds the last TWO whole turns.
+        let tail = db.list_agent_chat_messages_tail("t", 8);
+        assert_eq!(tail.total_rows, 24);
+        assert!(!tail.complete);
+        assert_eq!(tail.rows.len(), 12);
+        assert_eq!(tail.rows[0].0, users[2]);
+        assert_eq!(tail.rows.last().unwrap().0, head);
+        assert!(tail.rows.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(tail.rows[0].1.contains(r#""type":"user_message""#));
+
+        // Exactly on a boundary: the newest 6 rows ARE the last turn.
+        let exact = db.list_agent_chat_messages_tail("t", 6);
+        assert_eq!(exact.rows.len(), 6);
+        assert_eq!(exact.rows[0].0, users[3]);
+        assert!(!exact.complete);
+
+        // A limit that reaches the first turn returns the whole thread.
+        let all = db.list_agent_chat_messages_tail("t", 20);
+        assert_eq!(all.rows.len(), 24);
+        assert!(all.complete);
+        assert_eq!(all.rows[0].0, users[0]);
+    }
+
+    #[test]
+    fn agent_chat_messages_tail_short_thread_and_no_boundary_read_everything() {
+        let db = init_test_database();
+        seed_session(&db, "small");
+        seed_turns(&db, "small", 1, 3);
+        let small = db.list_agent_chat_messages_tail("small", 400);
+        assert_eq!(small.rows.len(), 4);
+        assert_eq!(small.total_rows, 4);
+        assert!(small.complete);
+
+        // No `user_message` at all (a thread of bare tool rows) — nothing
+        // to align to, so the tail is the whole thread rather than a
+        // fragment the reducer would render as orphans.
+        seed_session(&db, "bare");
+        for i in 0..10 {
+            db.append_agent_chat_message("bare", &format!(r#"{{"i":{i}}}"#))
+                .unwrap();
+        }
+        let bare = db.list_agent_chat_messages_tail("bare", 3);
+        assert_eq!(bare.rows.len(), 10);
+        assert!(bare.complete);
+
+        // A malformed row that merely CONTAINS the marker is skipped by
+        // the JSON check, not mistaken for a boundary.
+        seed_session(&db, "trap");
+        let first = db
+            .append_agent_chat_message("trap", r#"{"type":"user_message","text":"real"}"#)
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            db.append_agent_chat_message("trap", r#"{"i":"x"}"#).unwrap();
+        }
+        db.append_agent_chat_message("trap", r#"garbage "user_message" garbage"#)
+            .unwrap();
+        db.append_agent_chat_message("trap", r#"{"type":"item_completed","item":{"text":"\"user_message\""}}"#)
+            .unwrap();
+        let trap = db.list_agent_chat_messages_tail("trap", 2);
+        assert_eq!(trap.rows[0].0, first);
+        assert_eq!(trap.rows.len(), 6);
+        assert!(trap.complete);
+
+        let empty = db.list_agent_chat_messages_tail("nope", 5);
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.total_rows, 0);
+        assert!(empty.complete);
+    }
+
+    #[test]
+    fn agent_chat_messages_before_pages_backwards_in_ascending_order() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        seed_session(&db, "other");
+        let mut ids = Vec::new();
+        for i in 0..7 {
+            ids.push(
+                db.append_agent_chat_message("t", &format!(r#"{{"i":{i}}}"#))
+                    .unwrap()
+                    .unwrap(),
+            );
+            db.append_agent_chat_message("other", r#"{"o":1}"#).unwrap();
+        }
+
+        let page = db.list_agent_chat_messages_before("t", ids[5], 3);
+        assert_eq!(
+            page.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![ids[2], ids[3], ids[4]]
+        );
+        assert_eq!(page[0].1, r#"{"i":2}"#);
+        assert!(page[0].2 > 1_700_000_000_000);
+
+        // Walking down: the next page starts strictly below the last one.
+        let next = db.list_agent_chat_messages_before("t", page[0].0, 3);
+        assert_eq!(
+            next.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![ids[0], ids[1]]
+        );
+        // Short page == the beginning; one more read is empty.
+        assert!(db.list_agent_chat_messages_before("t", ids[0], 3).is_empty());
+        assert!(db.list_agent_chat_messages_before("t", ids[6], 0).is_empty());
+        // Thread-scoped: `other`'s interleaved rows never leak in.
+        let all = db.list_agent_chat_messages_before("t", i64::MAX, 100);
+        assert_eq!(all.len(), 7);
+        assert!(all.iter().all(|r| r.1.starts_with(r#"{"i""#)));
     }
 
     #[test]

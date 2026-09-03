@@ -1446,6 +1446,23 @@ function mockThreadRows(threadId: string): MockMessageRow[] {
   return rows;
 }
 
+/** `mockThreadRows` minus whatever a turn revert cut off the seeded thread —
+ *  the view every list read (cursor, tail, backfill, head) shares. */
+function mockVisibleThreadRows(threadId: string): MockMessageRow[] {
+  const rows = mockThreadRows(threadId);
+  if (threadId !== MOCK_CHAT_THREAD_ID || mockChatRevertCutoff === null) {
+    return rows;
+  }
+  const cutoff = mockChatRevertCutoff;
+  return rows.filter((row) => row.id <= cutoff);
+}
+
+/** Cheap turn-boundary test for the tail read: the `type` is the first key
+ *  of a user-turn envelope in the mock, but a regex keeps this agnostic. */
+function mockPayloadIsUserMessage(payload: string): boolean {
+  return /"type"\s*:\s*"user_message"/.test(payload);
+}
+
 /** Mirror of `shape_persisted_payload`: replace an oversized, non-image
  *  tool-result body with a stub. Exported so a test can pin the parity
  *  with the Rust twin on shapes the stress fixture never produces.
@@ -3212,23 +3229,44 @@ const handlers: Record<string, Handler> = {
   agent_chat_list_messages_after: (a) => {
     const threadId = a.threadId as string;
     const afterId = (a.afterId as number | null | undefined) ?? 0;
-    return mockThreadRows(threadId).filter(
-      (row) =>
-        row.id > afterId &&
-        (threadId !== MOCK_CHAT_THREAD_ID ||
-          mockChatRevertCutoff === null ||
-          row.id <= mockChatRevertCutoff),
-    );
+    return mockVisibleThreadRows(threadId).filter((row) => row.id > afterId);
   },
   agent_chat_thread_head_id: (a) => {
     const threadId = a.threadId as string;
-    const rows = mockThreadRows(threadId).filter(
-      (row) =>
-        threadId !== MOCK_CHAT_THREAD_ID ||
-        mockChatRevertCutoff === null ||
-        row.id <= mockChatRevertCutoff,
-    );
+    const rows = mockVisibleThreadRows(threadId);
     return rows.length > 0 ? rows[rows.length - 1].id : null;
+  },
+  // Tail-first cold open: at least the last `limit` rows, widened down to
+  // the nearest `user_message` row so the page is whole turns — same
+  // contract as `list_agent_chat_messages_tail` in database.rs.
+  agent_chat_list_messages_tail: (a) => {
+    const threadId = a.threadId as string;
+    const limit = Math.max(1, a.limit as number);
+    const rows = mockVisibleThreadRows(threadId);
+    const total = rows.length;
+    if (total <= limit) return { rows, total_rows: total, complete: true };
+    let start = -1;
+    for (let i = total - limit; i >= 0; i -= 1) {
+      if (mockPayloadIsUserMessage(rows[i].payload)) {
+        start = i;
+        break;
+      }
+    }
+    if (start < 0) return { rows, total_rows: total, complete: true };
+    return {
+      rows: rows.slice(start),
+      total_rows: total,
+      complete: start === 0,
+    };
+  },
+  agent_chat_list_messages_before: (a) => {
+    const threadId = a.threadId as string;
+    const beforeId = a.beforeId as number;
+    const limit = Math.max(0, a.limit as number);
+    const older = mockVisibleThreadRows(threadId).filter(
+      (row) => row.id < beforeId,
+    );
+    return older.slice(Math.max(0, older.length - limit));
   },
   // The `@` mention popup and `+ → File…/Folder…` browse the project
   // tree. Without these the dev mock's pickers render empty, which

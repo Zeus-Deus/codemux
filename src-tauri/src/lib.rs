@@ -2329,6 +2329,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
             commands::agent_chat_list_messages_after,
+            commands::agent_chat_list_messages_tail,
+            commands::agent_chat_list_messages_before,
             commands::agent_chat_thread_head_id,
             commands::agent_chat_get_tool_result,
             commands::agent_chat_get_checkpoint,
