@@ -16,6 +16,7 @@ import {
   type HeldEventFilter,
 } from "./event-batcher";
 import { MAX_WARM_TAIL_ROWS } from "./hydrate";
+import { endSubMeasure, startSubMeasure } from "@/lib/perf/interaction-trace";
 import type { LiveChatEvent } from "./types";
 
 /**
@@ -268,10 +269,12 @@ async function hydratePass(
     // The head probe rides alongside the tail read so a cursor from a
     // foreign id space (a merged / deleted thread whose rows were
     // re-homed) is caught without a full-history fetch.
+    const readStarted = startSubMeasure();
     const [rows, headId] = await Promise.all([
       deps.listAfter(threadId, warm ? cursor : null),
       warm ? deps.headId(threadId) : Promise.resolve(null),
     ]);
+    endSubMeasure(warm ? "hydrate:read-tail" : "hydrate:read-full", readStarted);
     if (isCancelled()) return false;
     const cursorAhead =
       warm && cursor !== 0 && (headId === null || headId < cursor);
@@ -315,11 +318,15 @@ async function hydratePass(
       retry = allowRetry;
       return retry;
     }
+    const liveStarted = startSubMeasure();
     const runLive = await resolveThreadRunLive(provider, threadId, deps);
+    endSubMeasure("hydrate:run-live-probe", liveStarted);
     if (isCancelled()) return false;
+    const applyStarted = startSubMeasure();
     useAgentChatStore
       .getState()
       .hydrateThread(threadId, full, { runLive, provider });
+    endSubMeasure(`hydrate:replay(${full.length})`, applyStarted);
     if (full.length > 0) {
       releaseFilter = dropDeltasSettledByRead(full[full.length - 1].id);
     }
