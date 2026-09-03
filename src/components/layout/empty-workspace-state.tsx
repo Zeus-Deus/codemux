@@ -57,9 +57,14 @@ function ActionRow({ icon, label, keys, onClick }: ActionRowProps) {
 }
 
 export function EmptyWorkspaceState() {
-  const appState = useAppStore((s) => s.appState);
-  const ws = appState?.workspaces.find(
-    (w) => w.workspace_id === appState.active_workspace_id,
+  // Select the workspace OBJECT, not the whole snapshot. Structural sharing
+  // keeps an unchanged workspace's reference across commits, so this only
+  // re-renders when the active workspace itself changes — subscribing to
+  // `appState` re-rendered on every snapshot / delta commit.
+  const ws = useAppStore((s) =>
+    s.appState?.workspaces.find(
+      (w) => w.workspace_id === s.appState?.active_workspace_id,
+    ) ?? null,
   );
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
 

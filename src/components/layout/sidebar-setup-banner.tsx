@@ -15,7 +15,12 @@ import {
 
 export function SidebarSetupBanner() {
   const { state } = useSidebar();
-  const appState = useAppStore((s) => s.appState);
+  // Narrow subscriptions, not the whole snapshot: the banner only needs the
+  // active workspace's project root and the workspace list, and `appState`
+  // itself moves on every commit — which meant re-running the project-root
+  // derivation (and its effects' dependency checks) on every backend tick.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const activeWorkspaceId = useAppStore((s) => s.appState?.active_workspace_id);
   const homeDir = useHomeDir();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
@@ -23,11 +28,9 @@ export function SidebarSetupBanner() {
   const [hasScripts, setHasScripts] = useState(true); // default hidden
 
   const activeWorkspace = useMemo(() => {
-    if (!appState) return null;
-    return appState.workspaces.find(
-      (w) => w.workspace_id === appState.active_workspace_id,
-    );
-  }, [appState]);
+    if (!workspaces) return null;
+    return workspaces.find((w) => w.workspace_id === activeWorkspaceId);
+  }, [workspaces, activeWorkspaceId]);
 
   // A home-rooted workspace (`project_root === $HOME`) is the
   // materialise target for a sidebar "New agent" chat that the user
@@ -44,11 +47,11 @@ export function SidebarSetupBanner() {
 
   // Check if there are any workspaces for this project
   const hasProjectWorkspaces = useMemo(() => {
-    if (!appState || !projectRoot) return false;
-    return appState.workspaces.some(
+    if (!workspaces || !projectRoot) return false;
+    return workspaces.some(
       (w) => w.project_root === projectRoot || w.cwd === projectRoot,
     );
-  }, [appState, projectRoot]);
+  }, [workspaces, projectRoot]);
 
   // Check dismiss state and scripts
   useEffect(() => {
