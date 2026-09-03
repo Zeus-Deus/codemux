@@ -1220,13 +1220,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (hydrateAttemptedRef.current === threadId) return;
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
-    void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
+    // Content-ready is stamped the moment the transcript has something to
+    // paint. On a tail-first cold open that is the tail preview, well
+    // before the backfill of older rows has finished; the `finally` below
+    // re-stamps for the other paths (first stamp wins).
+    const markReady = () => {
       if (!cancelled) {
         markPaneReady("agent-chat", {
           target: paneWorkspaceId ?? undefined,
         });
       }
-    });
+    };
+    void hydrateThreadByCursor(threadId, provider, () => cancelled, undefined, {
+      onContentReady: markReady,
+    }).finally(markReady);
     return () => {
       cancelled = true;
       // The hold belongs to the hydrate, which drops or releases it under

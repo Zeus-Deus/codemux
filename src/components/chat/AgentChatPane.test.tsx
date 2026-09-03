@@ -69,6 +69,8 @@ const setResumeCursorMock = vi.fn();
 // persisted transcript and overlay it onto the in-memory slice when
 // disk has more rendered messages than memory).
 const hydrateThreadMock = vi.fn();
+// Tail-first cold open: the preview replay that precedes the backfill.
+const hydrateThreadTailMock = vi.fn();
 // Warm cursor resume: the tail merge and the cursor-invalidate escape
 // hatch the mount effect uses when a read fails.
 const applyPayloadsTailMock = vi.fn();
@@ -442,6 +444,13 @@ vi.mock("@/tauri/commands", () => ({
   // head probe guards against a cursor from a foreign id space.
   agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
   agentChatThreadHeadId: vi.fn().mockResolvedValue(null),
+  // Tail-first cold open. The default tail is empty AND complete, so the
+  // cold path stays a single full replay unless a test opts into the
+  // preview + backfill flow.
+  agentChatListMessagesTail: vi
+    .fn()
+    .mockResolvedValue({ rows: [], total_rows: 0, complete: true }),
+  agentChatListMessagesBefore: vi.fn().mockResolvedValue([]),
   // Liveness probe fired right after the transcript read on the
   // hydrate path. Default to `false` (no live turn) so hydrate keeps its
   // resume-path behavior unless a test opts into the live-run case.
@@ -667,6 +676,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         // imperatively replace the slice (cold) or fold in a cursor
         // tail (warm).
         hydrateThread: hydrateThreadMock,
+        hydrateThreadTail: hydrateThreadTailMock,
         applyPayloadsTail: applyPayloadsTailMock,
         invalidateThreadCursor: invalidateThreadCursorMock,
         evictColdThreads: vi.fn(),
@@ -688,6 +698,8 @@ import {
   agentChatInterruptTurn,
   agentChatListMessages,
   agentChatListMessagesAfter,
+  agentChatListMessagesBefore,
+  agentChatListMessagesTail,
   agentChatThreadHeadId,
   agentChatTurnActive,
   agentChatListSessions,
@@ -1294,31 +1306,72 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     workspaceIdForPaneOverride = "ws-home";
     vi.mocked(agentChatListMessagesAfter).mockReset();
     vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
+    vi.mocked(agentChatListMessagesTail).mockReset();
+    vi.mocked(agentChatListMessagesTail).mockResolvedValue({
+      rows: [],
+      total_rows: 0,
+      complete: true,
+    });
     vi.mocked(agentChatThreadHeadId).mockReset();
     vi.mocked(agentChatThreadHeadId).mockResolvedValue(null);
     vi.mocked(agentChatTurnActive).mockReset();
     vi.mocked(agentChatTurnActive).mockResolvedValue(false);
+    vi.mocked(agentChatListMessagesBefore).mockReset();
+    vi.mocked(agentChatListMessagesBefore).mockResolvedValue([]);
     hydrateThreadMock.mockClear();
+    hydrateThreadTailMock.mockClear();
     applyPayloadsTailMock.mockClear();
     invalidateThreadCursorMock.mockClear();
   });
 
-  it("reads from the start of the thread when the slice has no cursor", async () => {
+  it("opens a cold thread tail-first: preview, backfill, then one full replay", async () => {
+    // No cursor → the tail read, never the from-zero cursor read or the
+    // head probe. Here the tail reports more rows below it, so the pane
+    // paints the preview through `hydrateThreadTail`, pages the rest with
+    // the before-read, and does ONE `hydrateThread` over the complete
+    // ascending set. (Exact phase ordering, cancellation and held-event
+    // behaviour belong to the cursor-hydrate unit suite.)
     currentMessages = [{ kind: "user_message", id: "m1" }];
+    const older = [{ id: 1, payload: userPayload }, { id: 2, payload: assistantPayload }];
+    vi.mocked(agentChatListMessagesTail).mockResolvedValue({
+      rows,
+      total_rows: 4,
+      complete: false,
+    });
+    vi.mocked(agentChatListMessagesBefore).mockResolvedValue(older);
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
+      expect(hydrateThreadMock).toHaveBeenCalledWith(
         "thread-x",
-        null,
+        [...older, ...rows],
+        { runLive: false, provider: "claude" },
       );
     });
-    // No cursor means no head probe — there is nothing to validate.
+    expect(vi.mocked(agentChatListMessagesTail)).toHaveBeenCalledWith(
+      "thread-x",
+      expect.any(Number),
+    );
+    expect(hydrateThreadTailMock).toHaveBeenCalledWith("thread-x", rows, {
+      runLive: false,
+      provider: "claude",
+    });
+    expect(vi.mocked(agentChatListMessagesBefore)).toHaveBeenCalledWith(
+      "thread-x",
+      rows[0].id,
+      expect.any(Number),
+    );
+    expect(vi.mocked(agentChatListMessagesAfter)).not.toHaveBeenCalled();
     expect(vi.mocked(agentChatThreadHeadId)).not.toHaveBeenCalled();
+    expect(applyPayloadsTailMock).not.toHaveBeenCalled();
   });
 
   it("hydrates the slice from a cold read", async () => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
+    vi.mocked(agentChatListMessagesTail).mockResolvedValue({
+      rows,
+      total_rows: rows.length,
+      complete: true,
+    });
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
       expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
@@ -1348,7 +1401,11 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     // hydrate must pass runLive so the streaming marker shows instead of
     // the Run-interrupted divider.
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
+    vi.mocked(agentChatListMessagesTail).mockResolvedValue({
+      rows,
+      total_rows: rows.length,
+      complete: true,
+    });
     vi.mocked(agentChatTurnActive).mockResolvedValue(true);
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
@@ -1363,7 +1420,11 @@ describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
     // A backend without the command, or a transient failure, must degrade
     // to today's heuristic behavior rather than blocking hydrate.
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
+    vi.mocked(agentChatListMessagesTail).mockResolvedValue({
+      rows,
+      total_rows: rows.length,
+      complete: true,
+    });
     vi.mocked(agentChatTurnActive).mockRejectedValue(
       new Error("command unavailable"),
     );
