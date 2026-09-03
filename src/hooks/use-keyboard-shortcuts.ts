@@ -7,9 +7,9 @@ import {
   activateTab,
   activateWorkspace,
   createEmptyWorkspace,
-  agentChatCreatePane,
   runProjectDevCommand,
 } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -271,7 +271,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       try {
         const wsId = await createEmptyWorkspace(projectPath);
         await activateWorkspace(wsId);
-        await agentChatCreatePane(wsId, null, projectPath);
+        await launchAgentChatPane(wsId, null, projectPath);
       } catch (err) {
         console.error("[shortcut] new workspace in project failed:", err);
         ui.setShowNewWorkspaceDialog(true, projectPath);

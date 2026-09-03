@@ -36,8 +36,8 @@ import {
   closeWorkspaceWithWorktree,
   revealInFileManager,
   createEmptyWorkspace,
-  agentChatCreatePane,
 } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -181,7 +181,7 @@ export function SidebarProjectGroup({
     try {
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspaceInteraction(wsId);
-      await agentChatCreatePane(wsId, null, projectPath);
+      await launchAgentChatPane(wsId, null, projectPath);
     } catch (err) {
       console.error("[sidebar] failed to open chat pane:", err);
       setShowNewWorkspaceDialog(true, projectPath);

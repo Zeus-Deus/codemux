@@ -3,7 +3,7 @@ import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { hasAnyPane } from "@/lib/pane-tree";
-import { agentChatCreatePane } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 
 /**
  * Primitive-summary selector for the bits of `appState` this hook
@@ -72,7 +72,7 @@ export function useEnsureDraftWhenEmpty() {
   const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
 
   // Tracks the workspace_id we most recently kicked off an
-  // `agentChatCreatePane` call for, so rapid state updates don't
+  // `launchAgentChatPane` call for, so rapid state updates don't
   // fan out into multiple pane-spawn requests for the same empty
   // workspace. Cleared on failure so a retry can fire.
   const inFlightSpawnRef = useRef<string | null>(null);
@@ -110,7 +110,7 @@ export function useEnsureDraftWhenEmpty() {
       if (isProjectWorkspace) {
         if (inFlightSpawnRef.current === activeWs.workspace_id) return;
         inFlightSpawnRef.current = activeWs.workspace_id;
-        agentChatCreatePane(activeWs.workspace_id, "claude", null).catch(
+        launchAgentChatPane(activeWs.workspace_id, "claude", null).catch(
           (err) => {
             console.error(
               "[ensure-draft] failed to auto-spawn agent_chat pane:",

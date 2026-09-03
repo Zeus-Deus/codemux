@@ -75,6 +75,7 @@ import { useConversationSearchStore } from "@/stores/conversation-search-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
+  refreshProviderCapabilitiesForIntent,
   selectCapabilities,
   selectModel,
   useProviderCapabilities,
@@ -222,6 +223,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const observeProviderRuntimeIntent = useProviderRuntimeIntent(
     (state) => state.observe,
   );
+  // Intent on this pane is also intent to know the provider's catalog: warm
+  // it here so the effort / permission / model controls are populated by the
+  // time the user reaches for them, instead of only after a picker opens.
+  // Persisted catalogs paint first; this is the background refresh behind
+  // them, and it shares the picker's singleflight so nothing runs twice.
+  useEffect(() => {
+    if (!providerRuntimeIntent) return;
+    void refreshProviderCapabilitiesForIntent(provider);
+  }, [providerRuntimeIntent, provider]);
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
   // A fresh pane intentionally waits for explicit user intent before it
   // starts a provider session. Keep text typed during that async startup
@@ -3275,6 +3285,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 
   const sessionReady = threadId != null && !starting && !restarting;
+  // A fresh pane parks on the runtime-intent gate until the user touches
+  // it (see the start-session effect). Nothing is starting yet, so the
+  // composer must not claim it is.
+  const sessionAwaitingIntent =
+    threadId == null &&
+    !starting &&
+    !providerRuntimeIntent &&
+    promotedDraftThreadId == null;
 
   // ── Thread Scope (new-thread empty state) ──
   //
@@ -3499,6 +3517,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
       contextUsageProviderLabel={contextUsageProviderLabel}
       sessionReady={sessionReady}
+      sessionAwaitingIntent={sessionAwaitingIntent}
       configurationReady={!grokConfigurationBusy}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}

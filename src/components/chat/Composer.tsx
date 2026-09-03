@@ -168,6 +168,13 @@ interface Props {
    *  render. */
   onContinueRun?: () => void;
   sessionReady: boolean;
+  /** True while a fresh pane is waiting for the user's first interaction
+   *  before it starts a provider session (runtime intent gate). The
+   *  composer stays typeable — the keystroke itself is the intent and the
+   *  text is carried into the session — so the copy must read as an
+   *  invitation rather than the "Starting session…" progress state that
+   *  `!sessionReady` otherwise implies. Defaults to false. */
+  sessionAwaitingIntent?: boolean;
   /** Whether provider/model/runtime controls may mutate the native session.
    *  Submit and attachments remain governed by `sessionReady`, so a provider
    *  can freeze configuration during a turn without disabling follow-ups. */
@@ -349,6 +356,7 @@ export function Composer({
   interrupted = false,
   onContinueRun,
   sessionReady,
+  sessionAwaitingIntent = false,
   configurationReady = true,
   showProviderPicker,
   isDraft = false,
@@ -2979,7 +2987,7 @@ export function Composer({
                 }
               }}
               placeholder={
-                sessionReady
+                sessionReady || sessionAwaitingIntent
                   ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
                   : "Starting session…"
               }

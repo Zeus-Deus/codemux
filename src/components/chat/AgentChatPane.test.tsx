@@ -225,6 +225,7 @@ vi.mock("./Composer", () => ({
     focusOnMount,
     configurationReady,
     sessionReady,
+    sessionAwaitingIntent,
     draft,
     onDraftChange,
   }: {
@@ -250,6 +251,7 @@ vi.mock("./Composer", () => ({
     focusOnMount?: boolean;
     configurationReady?: boolean;
     sessionReady?: boolean;
+    sessionAwaitingIntent?: boolean;
     draft: string;
     onDraftChange: (draft: string) => void;
   }) => (
@@ -261,6 +263,7 @@ vi.mock("./Composer", () => ({
       data-focus-on-mount={focusOnMount ? "true" : "false"}
       data-configuration-ready={configurationReady ? "true" : "false"}
       data-session-ready={sessionReady ? "true" : "false"}
+      data-session-awaiting-intent={sessionAwaitingIntent ? "true" : "false"}
     >
       <input
         data-testid="composer-draft"
@@ -422,6 +425,9 @@ vi.mock("@/tauri/commands", () => ({
   // Keep any explicit failure-path probe pending so no banner state churns
   // mid-test; banner tests drive the store directly.
   agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
+  // Runtime intent on a pane also warms the provider catalog. Keep that
+  // harvest pending too, so picker state never churns mid-test.
+  listChatProviderCapabilities: vi.fn(() => new Promise(() => {})),
   // The pane's mount-seed effect (design F) fetches the persisted
   // session row to restore picker config + resume cursor. Default to
   // `null` (no persisted row) so tests that don't seed a record fall
@@ -735,6 +741,41 @@ describe("AgentChatPane provider runtime intent", () => {
     expect(agentChatStartSession).not.toHaveBeenCalled();
 
     fireEvent.pointerDown(container.firstElementChild!);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
+  });
+
+  it("invites input instead of claiming a session is starting while gated", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStartSession).mockImplementationOnce(
+      () => new Promise<string>(() => {}),
+    );
+
+    const { container } = render(<AgentChatPane pane={paneWithoutThread} />);
+    await act(async () => Promise.resolve());
+    const composer = container.querySelector('[data-testid="composer"]')!;
+    // Nothing is starting yet: the composer is told so, and must not read
+    // as a progress state (the real Composer keys its placeholder on this).
+    expect(composer.getAttribute("data-session-ready")).toBe("false");
+    expect(composer.getAttribute("data-session-awaiting-intent")).toBe("true");
+
+    // Once intent is observed the start is in flight, and "Starting
+    // session…" becomes honest again.
+    fireEvent.pointerDown(container.firstElementChild!);
+    await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(composer.getAttribute("data-session-awaiting-intent")).toBe("false"),
+    );
+  });
+
+  it("starts immediately when the pane was launched with explicit intent", async () => {
+    useProviderRuntimeIntent.getState().reset();
+    vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatStartSession).mockResolvedValue("thread-started");
+
+    // What `launchAgentChatPane` records before the pane is created.
+    useProviderRuntimeIntent.getState().observe("claude");
+    render(<AgentChatPane pane={paneWithoutThread} />);
     await waitFor(() => expect(agentChatStartSession).toHaveBeenCalledTimes(1));
   });
 

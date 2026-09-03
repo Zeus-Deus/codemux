@@ -62,11 +62,8 @@ import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
-import {
-  agentChatCreatePane,
-  applyPreset,
-  openInEditor,
-} from "@/tauri/commands";
+import { applyPreset, openInEditor } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
 import {
   getTitlebarContentUnder,
@@ -410,7 +407,7 @@ function PinnedPresetTiles({ workspace }: { workspace: WorkspaceSnapshot }) {
   // chat_agent preset, matching the prior implementation) but kept in the
   // signature so each mapped tile still gets its own bound handler.
   const launchChat = (_preset: TerminalPreset) => () => {
-    agentChatCreatePane(workspaceId, "claude", null, "new_tab").catch((err) => {
+    launchAgentChatPane(workspaceId, "claude", null, "new_tab").catch((err) => {
       toast.error(`Chat Agent: ${errorMessage(err)}`);
       console.error("[title-bar] chat favorite launch failed:", err);
     });

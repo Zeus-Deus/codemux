@@ -557,6 +557,30 @@ describe("Composer", () => {
       ).toBeInTheDocument();
     });
 
+    it("shows the progress placeholder only while a session is really starting", () => {
+      const starting = renderComposer({
+        mode: "default",
+        sessionReady: false,
+        isDraft: true,
+      });
+      expect(
+        starting.getByPlaceholderText("Starting session…"),
+      ).toBeInTheDocument();
+      starting.unmount();
+
+      // Parked on the runtime-intent gate: nothing is starting, and the
+      // first keystroke is what starts it, so invite input instead.
+      const gated = renderComposer({
+        mode: "default",
+        sessionReady: false,
+        sessionAwaitingIntent: true,
+        isDraft: true,
+      });
+      expect(
+        gated.getByPlaceholderText("Describe what you want the agent to do…"),
+      ).toBeInTheDocument();
+    });
+
     // Stage 8 replaces the auto-activate-on-typing flow with a popup.
     // See the "Stage 8 — slash command popup" describe block below.
   });

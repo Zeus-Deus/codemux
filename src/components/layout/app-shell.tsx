@@ -183,6 +183,10 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
         // inside the startup gate.
         cancelPrefetch = scheduleSequentialIdlePrefetch([
           loadCommandPalette,
+          // The two pane kinds a workspace switch mounts. Without these
+          // warm, the first switch to a not-yet-seen pane kind pays chunk
+          // fetch + parse inside the switch itself.
+          () => import("@/components/chat/AgentChatPane"),
           () => import("@/components/terminal/TerminalPane"),
           loadFileSearchDialog,
           loadContentSearchDialog,
@@ -239,7 +243,7 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // that lives on them. Same overlay shape as Settings / Automations.
   if (showDevices) {
     return (
-      <LazyBoundary label="devices" className="h-screen">
+      <LazyBoundary label="Devices" className="h-screen">
         <DevicesView />
       </LazyBoundary>
     );
@@ -249,7 +253,7 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // in a workspace yet. Same overlay shape as the pages above it.
   if (showPullRequests) {
     return (
-      <LazyBoundary label="pull requests" className="h-screen">
+      <LazyBoundary label="Pull requests" className="h-screen">
         <PullRequestsView />
       </LazyBoundary>
     );
@@ -258,7 +262,7 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // Full-screen new project — replaces entire app including sidebar
   if (showNewProjectScreen) {
     return (
-      <LazyBoundary label="new project" className="h-screen">
+      <LazyBoundary label="New project" className="h-screen">
         <NewProjectScreen />
       </LazyBoundary>
     );
