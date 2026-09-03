@@ -173,6 +173,12 @@ const POST_PAINT_GRACE_MS = 3_000;
 /** How far back a late long-task entry may be attributed to an already
  *  completed trace. */
 const LONGTASK_LOOKBACK_MS = 1_000;
+/** How long after a trace closes a sub-measure that STARTED inside it (or
+ *  after it) may still be attributed to it. Sized for the tail-first chat
+ *  open, whose backfill of a 10k-row thread runs ~1.5 s past content-ready
+ *  and whose final replay starts only after that; bounded so a stray
+ *  block minutes later cannot land on an unrelated switch. */
+const LATE_SUBMEASURE_LOOKBACK_MS = 3_000;
 const STORAGE_KEY = "codemux:perf-trace";
 
 export interface StartupMark {
@@ -641,8 +647,14 @@ export function startSubMeasure(): number | null {
   return traceEnabled ? now() : null;
 }
 
-/** Attribute a timed block to the innermost open interaction. Dropped when no
- *  interaction is open — the point is attribution, not a second log channel. */
+/** Attribute a timed block to the innermost open interaction. With none
+ *  open, a block that STARTED while the most recent trace was still open
+ *  — or within {@link LATE_SUBMEASURE_LOOKBACK_MS} of its close — is filed
+ *  on that trace instead: work the interaction kicked off and which
+ *  deliberately outlives its content-ready mark (the backfill of a
+ *  tail-first chat open) would otherwise be invisible in diagnostics.
+ *  Dropped when neither applies — the point is attribution, not a second
+ *  log channel. */
 export function endSubMeasure(
   name: string,
   startedAt: number | null,
@@ -650,8 +662,15 @@ export function endSubMeasure(
 ): void {
   if (!traceEnabled || startedAt === null) return;
   const trace = findOpenTrace(options);
-  if (!trace) return;
-  trace.subMeasures.push({ name, ms: roundMs(now() - startedAt) });
+  if (trace) {
+    trace.subMeasures.push({ name, ms: roundMs(now() - startedAt) });
+    return;
+  }
+  const last = ring.length - 1;
+  if (last < 0) return;
+  if (options.kind && ring[last].kind !== options.kind) return;
+  if (startedAt > ringEndedAt[last] + LATE_SUBMEASURE_LOOKBACK_MS) return;
+  ring[last].subMeasures.push({ name, ms: roundMs(now() - startedAt) });
 }
 
 // ── Read-out ─────────────────────────────────────────────────────────────

@@ -312,6 +312,31 @@ describe("interaction trace — sub-measures", () => {
     expect(() => endSubMeasure("terminal-teardown", started)).not.toThrow();
     expect(getTraces()).toHaveLength(0);
   });
+
+  it("files a block that started inside a just-closed trace on that trace", () => {
+    // The tail-first chat open fires content-ready (closing the switch
+    // trace) and then keeps working — backfill + final replay. Those
+    // blocks began inside the interaction and belong to it.
+    // Earlier tests may leave traces open under a since-discarded fake
+    // clock (their abandon timers never fire). Toggling the gate drops
+    // them, so this test's closed trace is the only candidate.
+    configureInteractionTrace({ enabled: false, console: false });
+    configureInteractionTrace({ enabled: true, console: false });
+    clearTraces();
+    runSwitch("ws-1");
+    expect(getTraces()).toHaveLength(1);
+    const started = startSubMeasure(); // right after the close
+    vi.advanceTimersByTime(120);
+    endSubMeasure("hydrate:backfill", started);
+    expect(getTraces()[0].subMeasures).toEqual([{ name: "hydrate:backfill", ms: 120 }]);
+
+    // But not a block that started long after the trace closed.
+    vi.advanceTimersByTime(10_000);
+    const late = startSubMeasure();
+    vi.advanceTimersByTime(10);
+    endSubMeasure("unrelated", late);
+    expect(getTraces()[0].subMeasures).toHaveLength(1);
+  });
 });
 
 describe("interaction trace — disabled gate", () => {
