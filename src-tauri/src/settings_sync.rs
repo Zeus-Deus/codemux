@@ -342,17 +342,20 @@ pub fn set_cache_owner(user_id: Option<&str>) {
     CHECKPOINTS_ENABLED_CACHE.store(0, Ordering::Release);
     crate::git_provider::invalidate_detection_cache(None);
 
-    // Upgrade an old unscoped cache only when a concrete cached identity is
-    // known. Signed-out startup must never interpret legacy account settings
-    // as a local/public profile.
+    // Claim an old unscoped cache eagerly only for a concrete cached
+    // identity, rewriting it into that account's envelope. The unowned
+    // scope needs no rewrite: it can read the legacy blob in place (see
+    // `settings_from_cache_data`) and the first local write re-encodes it
+    // as a `user_id: None` envelope. Leaving the file untouched here keeps
+    // the sign-in claim above intact for a signed-out user who never edits.
     let Some(owner) = next else {
         return;
     };
     let path = cache_file_path();
     let Some(legacy) = fs::read_to_string(&path)
         .ok()
-        .filter(|data| serde_json::from_str::<ScopedSettingsCache>(data).is_err())
-        .and_then(|data| serde_json::from_str::<UserSettings>(&data).ok())
+        .as_deref()
+        .and_then(parse_legacy_cache_data)
     else {
         return;
     };
@@ -409,13 +412,42 @@ pub fn agent_chat_checkpoints_enabled() -> bool {
     }
 }
 
+/// Parse a pre-scoping cache file: a bare `UserSettings` blob written before
+/// the `ScopedSettingsCache` envelope existed.
+///
+/// `UserSettings` defaults every field, so almost any JSON object would
+/// "parse" as one — including a scoped envelope or a truncated one. Only an
+/// object that carries neither envelope key counts as legacy; anything
+/// mentioning `user_id` is an envelope (possibly damaged) and must go through
+/// the owner check instead of being read as ownerless data.
+fn parse_legacy_cache_data(data: &str) -> Option<UserSettings> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let object = value.as_object()?;
+    if object.contains_key("user_id") || object.contains_key("settings") {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+/// Decode the on-disk cache as seen by `owner`.
+///
+/// A scoped envelope is readable only by the exact account it was written
+/// for. A legacy unscoped blob predates account scoping, so it has no owner
+/// to compare against: it is readable through the unowned (signed-out /
+/// never-signed-in) scope so an upgrade keeps the user's local theme,
+/// keybinds, terminal and session-restore settings instead of reverting them
+/// to defaults — and, worse, letting the first signed-out edit overwrite the
+/// file with those defaults. Under a concrete owner the legacy blob is not
+/// read directly; `set_cache_owner(Some(identity))` claims it by rewriting it
+/// into that account's envelope.
 fn settings_from_cache_data(data: &str, owner: &Option<String>) -> Option<UserSettings> {
     if let Ok(scoped) = serde_json::from_str::<ScopedSettingsCache>(data) {
         return (scoped.user_id == *owner).then_some(scoped.settings);
     }
-    // Legacy data is migrated by `set_cache_owner(Some(identity))`. It is
-    // never readable through an unowned/signed-out scope.
-    None
+    if owner.is_some() {
+        return None;
+    }
+    parse_legacy_cache_data(data)
 }
 
 fn save_cache_as_owner(settings: &UserSettings, owner: &Option<String>) -> Result<(), String> {
@@ -1319,7 +1351,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn legacy_cache_is_migrated_only_with_a_concrete_identity() {
+    fn legacy_cache_is_claimed_by_a_concrete_identity_on_sign_in() {
         clear_cache();
         set_cache_owner(None);
         let mut legacy = UserSettings::default();
@@ -1327,8 +1359,19 @@ mod tests {
         std::fs::create_dir_all(cache_dir()).unwrap();
         std::fs::write(cache_file_path(), serde_json::to_string(&legacy).unwrap()).unwrap();
 
-        // Signed-out startup cannot see an unscoped pre-upgrade account blob.
-        assert!(load_cache().is_none());
+        // Signed-out startup reads the pre-upgrade blob in place without
+        // rewriting it, so a later sign-in can still claim it.
+        assert_eq!(
+            load_cache().unwrap().appearance.theme,
+            "legacy-private-theme"
+        );
+        assert!(
+            serde_json::from_str::<ScopedSettingsCache>(
+                &std::fs::read_to_string(cache_file_path()).unwrap()
+            )
+            .is_err(),
+            "reading under the unowned scope must not rewrite the legacy file"
+        );
 
         // A cached authenticated identity claims and rewrites it exactly once.
         set_cache_owner(Some("cached-user"));
@@ -1340,8 +1383,166 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(cache_file_path()).unwrap()).unwrap();
         assert_eq!(envelope.user_id.as_deref(), Some("cached-user"));
 
+        // Once claimed, the data belongs to that account only.
         set_cache_owner(None);
         assert!(load_cache().is_none());
+        clear_cache();
+    }
+
+    // ── Legacy (pre-scoping) cache files ────────────────────────
+
+    fn write_legacy_cache(settings: &UserSettings) {
+        std::fs::create_dir_all(cache_dir()).unwrap();
+        std::fs::write(cache_file_path(), serde_json::to_string(settings).unwrap()).unwrap();
+    }
+
+    fn customized_legacy_settings() -> UserSettings {
+        let mut legacy = UserSettings::default();
+        legacy.appearance.theme = "legacy-theme".into();
+        legacy.terminal.scrollback_limit = 4_321;
+        legacy
+            .keyboard
+            .shortcuts
+            .insert("ctrl+k".into(), "palette".into());
+        legacy
+            .source_control
+            .custom_hosts
+            .insert("git.acme.internal".into(), "gitlab".into());
+        legacy.session_restore.max_total_mb = 42;
+        legacy
+    }
+
+    /// Regression: a pre-scoping install that never signed in keeps its
+    /// locally edited settings after upgrading, instead of booting with
+    /// defaults.
+    #[test]
+    #[serial]
+    fn legacy_unscoped_cache_is_readable_when_signed_out() {
+        clear_cache();
+        set_cache_owner(None);
+        let legacy = customized_legacy_settings();
+        write_legacy_cache(&legacy);
+
+        assert_eq!(load_cache(), Some(legacy.clone()));
+        assert_eq!(
+            settings_from_cache_data(&serde_json::to_string(&legacy).unwrap(), &None),
+            Some(legacy)
+        );
+        clear_cache();
+    }
+
+    /// A concrete owner never reads a legacy blob directly — it only gets
+    /// it through the explicit `set_cache_owner(Some(..))` claim.
+    #[test]
+    #[serial]
+    fn legacy_unscoped_cache_is_not_readable_by_a_concrete_owner_without_claiming() {
+        let legacy = customized_legacy_settings();
+        let data = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(
+            settings_from_cache_data(&data, &Some("user-a".into())),
+            None
+        );
+    }
+
+    /// The security property is unchanged: a cache scoped to one account is
+    /// invisible to the unowned scope and to every other account.
+    #[test]
+    #[serial]
+    fn scoped_cache_is_invisible_outside_its_owner() {
+        clear_cache();
+        set_cache_owner(Some("a"));
+        let mut user_a = UserSettings::default();
+        user_a.appearance.theme = "user-a-secret-theme".into();
+        save_cache(&user_a).unwrap();
+        let data = std::fs::read_to_string(cache_file_path()).unwrap();
+
+        assert_eq!(
+            settings_from_cache_data(&data, &Some("a".into())),
+            Some(user_a)
+        );
+        assert_eq!(settings_from_cache_data(&data, &None), None);
+        assert_eq!(settings_from_cache_data(&data, &Some("b".into())), None);
+
+        set_cache_owner(None);
+        assert!(load_cache().is_none());
+        set_cache_owner(Some("b"));
+        assert!(load_cache().is_none());
+
+        set_cache_owner(None);
+        clear_cache();
+    }
+
+    /// Envelope-shaped JSON is never mistaken for a legacy blob, even when it
+    /// fails to decode as a `ScopedSettingsCache` (e.g. a damaged file):
+    /// `UserSettings` defaults every field, so it would otherwise "parse".
+    #[test]
+    fn envelope_shaped_data_is_never_read_as_legacy() {
+        assert_eq!(
+            parse_legacy_cache_data(r#"{"user_id":"a","settings":{"appearance":{"theme":"x"}}}"#),
+            None
+        );
+        assert_eq!(
+            parse_legacy_cache_data(r#"{"user_id":"a","settings":"corrupt"}"#),
+            None
+        );
+        assert_eq!(parse_legacy_cache_data(r#"{"user_id":"a"}"#), None);
+        assert_eq!(parse_legacy_cache_data(r#"{"settings":{}}"#), None);
+        assert_eq!(parse_legacy_cache_data("[]"), None);
+        assert_eq!(parse_legacy_cache_data("not json"), None);
+        assert_eq!(
+            settings_from_cache_data(r#"{"user_id":"a","settings":"corrupt"}"#, &None),
+            None
+        );
+        // A genuine legacy blob with no envelope keys still parses.
+        assert_eq!(
+            parse_legacy_cache_data(r#"{"appearance":{"theme":"legacy"}}"#)
+                .map(|s| s.appearance.theme),
+            Some("legacy".into())
+        );
+    }
+
+    /// Regression: the first signed-out edit after upgrading merges into the
+    /// legacy values rather than into defaults, and the rewrite keeps every
+    /// legacy field under the unowned envelope.
+    #[test]
+    #[serial]
+    fn signed_out_write_over_legacy_cache_preserves_legacy_values() {
+        clear_cache();
+        set_cache_owner(None);
+        let legacy = customized_legacy_settings();
+        write_legacy_cache(&legacy);
+
+        // Mirrors `update_setting`'s signed-out arm: load, patch one key, save.
+        let mut merged = load_cache().unwrap_or_default();
+        merged.appearance.theme = "edited-theme".into();
+        save_cache_dirty(&merged).unwrap();
+
+        let envelope: ScopedSettingsCache =
+            serde_json::from_str(&std::fs::read_to_string(cache_file_path()).unwrap()).unwrap();
+        assert_eq!(envelope.user_id, None);
+        let loaded = load_cache().unwrap();
+        assert_eq!(loaded.appearance.theme, "edited-theme");
+        assert_eq!(loaded.terminal.scrollback_limit, 4_321);
+        assert_eq!(
+            loaded.keyboard.shortcuts.get("ctrl+k").map(String::as_str),
+            Some("palette")
+        );
+        assert_eq!(
+            loaded.source_control.custom_hosts.get("git.acme.internal"),
+            Some(&"gitlab".to_string())
+        );
+        assert_eq!(loaded.session_restore.max_total_mb, 42);
+        assert!(is_dirty());
+
+        // The rewritten unowned envelope is still adopted by a later sign-in.
+        set_cache_owner(Some("later-user"));
+        let (_, dirty) = load_dirty_cache_for_scope(&cache_scope()).unwrap();
+        assert_eq!(
+            dirty.map(|s| s.appearance.theme),
+            Some("edited-theme".into())
+        );
+
+        set_cache_owner(None);
         clear_cache();
     }
 

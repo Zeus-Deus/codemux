@@ -38,8 +38,17 @@ pub async fn get_synced_settings<R: tauri::Runtime>(
     let (session_generation, session) = get_settings_session(&db, &auth_state);
     let (token, user_id) = match session {
         SettingsSession::Verified { token, user_id } => (token, user_id),
-        SettingsSession::PendingIdentity => return Ok(UserSettings::default()),
-        SettingsSession::SignedOut => return Ok(settings_sync::load_cache().unwrap_or_default()),
+        // No verified identity, so the server cannot be consulted. Both
+        // arms answer from the current cache scope — the same thing
+        // `bootstrap_session` returns and the same base the local edit
+        // commands merge into. Under a pending identity the owner is still
+        // `None`, so this only ever surfaces signed-out/pending local edits
+        // (or a pre-scoping legacy blob), never another account's cache.
+        // Returning bare defaults here would let a refresh silently revert
+        // edits the user just made in the UI.
+        SettingsSession::PendingIdentity | SettingsSession::SignedOut => {
+            return Ok(settings_sync::load_cache().unwrap_or_default())
+        }
     };
 
     // Server is the source of truth when reachable. sync_settings fetches first,
@@ -312,6 +321,26 @@ mod tests {
             Some("dark".into())
         );
         assert!(settings_sync::is_dirty());
+        settings_sync::clear_cache();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pending_identity_get_returns_cached_local_edits_not_defaults() {
+        settings_sync::set_cache_owner(None);
+        settings_sync::clear_cache();
+        let mut local = UserSettings::default();
+        local.appearance.theme = "pending-local-theme".into();
+        settings_sync::save_cache_dirty(&local).unwrap();
+        let app = pending_identity_app();
+        let handle = app.handle().clone();
+
+        // Same answer as `bootstrap_session` for this session state; a
+        // refresh must not revert the edit the user just made.
+        let result = get_synced_settings(handle.clone(), handle.state(), handle.state())
+            .await
+            .expect("pending-identity read must answer from the local cache");
+        assert_eq!(result, local);
         settings_sync::clear_cache();
     }
 

@@ -1250,10 +1250,25 @@ fn build_core_app<R: tauri::Runtime>(
                     //
                     // Everything that can touch git, the filesystem, or a
                     // provider trait runs in ONE blocking task. The generation
-                    // gate prevents overlap, and a task that crosses the 5s
-                    // deadline is allowed to finish (so its child can be
-                    // killed/reaped by the provider's own hard deadline) but
-                    // can no longer publish stale data.
+                    // gate prevents overlap: a task that outlives the 5s tick
+                    // keeps the singleflight slot until it really exits, so
+                    // the next tick cannot start a second one. Its result is
+                    // NOT discarded for being slow — the provider's own hard
+                    // deadline (`ISSUE_FETCH_TIMEOUT`, 10s) already bounds
+                    // the work, and a `gh issue view` that takes 6s on a slow
+                    // link is still the freshest answer we have. Throwing it
+                    // away meant the linked-issue pill never updated on such
+                    // a network, because every tick's result arrived "late".
+                    // Staleness is guarded by content instead: `complete`
+                    // publishes only for the owning generation, and the
+                    // issue is written only if the workspace still links
+                    // that number (the user may have unlinked it meanwhile).
+                    //
+                    // Soft budget, deliberately one polling period: past it
+                    // the run is logged and counted as slow, never dropped.
+                    // The hard bound is the provider's `ISSUE_FETCH_TIMEOUT`.
+                    const WORKSPACE_STATUS_SLOW_WARN_AFTER: std::time::Duration =
+                        std::time::Duration::from_secs(5);
                     if let Some((workspace_id, cwd)) = active {
                         let issue_number =
                             state.workspace_linked_issue_number(&workspace_id);
@@ -1291,22 +1306,28 @@ fn build_core_app<R: tauri::Runtime>(
                                     Ok((detected, issue))
                                 });
 
-                                let (timed_out, joined) = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                // Soft budget: one polling period. Crossing it
+                                // is logged so a chronically slow provider is
+                                // visible in the diagnostics, but the task is
+                                // awaited to completion either way — it cannot
+                                // be cancelled, and its result is still wanted.
+                                let joined = match tokio::time::timeout(
+                                    WORKSPACE_STATUS_SLOW_WARN_AFTER,
                                     &mut blocking,
                                 )
                                 .await
                                 {
-                                    Ok(joined) => (false, joined),
+                                    Ok(joined) => joined,
                                     Err(_) => {
                                         eprintln!(
-                                            "[codemux::job] active workspace provider refresh exceeded 5s"
+                                            "[codemux::job] active workspace provider refresh exceeded {:?}; still waiting for the provider's own deadline",
+                                            WORKSPACE_STATUS_SLOW_WARN_AFTER
                                         );
-                                        // `spawn_blocking` cannot be cancelled.
-                                        // Keep the singleflight reservation until
-                                        // it really exits so the next tick cannot
-                                        // overlap it, then discard the late result.
-                                        (true, blocking.await)
+                                        diagnostics::record_perf_timing(
+                                            "background.workspace-status.slow",
+                                            std::time::Duration::ZERO,
+                                        );
+                                        blocking.await
                                     }
                                 };
                                 let elapsed = started.elapsed();
@@ -1315,16 +1336,7 @@ fn build_core_app<R: tauri::Runtime>(
                                     elapsed,
                                 );
 
-                                if timed_out {
-                                    diagnostics::record_perf_timing(
-                                        "background.workspace-status.stale-result",
-                                        std::time::Duration::ZERO,
-                                    );
-                                }
                                 let completed = job.complete(generation, || {
-                                    if timed_out {
-                                        return;
-                                    }
                                     let Ok(Ok((detected, issue))) = joined else {
                                         // A failed/timed-out detector is not an
                                         // authoritative `Unknown`: preserve the
@@ -1338,13 +1350,30 @@ fn build_core_app<R: tauri::Runtime>(
                                         git_provider::provider_kind_field(&detected),
                                     );
                                     if let Some(Ok(issue)) = issue {
-                                        changed |= state.link_workspace_issue(&workspace_id, issue);
+                                        // Only publish while the workspace still
+                                        // links this issue; a fetch that outlived
+                                        // an unlink must not re-link it.
+                                        let still_linked = state
+                                            .workspace_linked_issue_number(&workspace_id)
+                                            == Some(issue.number);
+                                        if still_linked {
+                                            changed |=
+                                                state.link_workspace_issue(&workspace_id, issue);
+                                        } else {
+                                            diagnostics::record_perf_timing(
+                                                "background.workspace-status.stale-result",
+                                                std::time::Duration::ZERO,
+                                            );
+                                        }
                                     }
                                     if changed {
                                         state::schedule_emit_app_state(&result_handle);
                                     }
                                 });
                                 if !completed {
+                                    // Only reached when this generation no longer
+                                    // owns the singleflight slot — the one case
+                                    // where a result really is discarded.
                                     diagnostics::record_perf_timing(
                                         "background.workspace-status.stale-result",
                                         std::time::Duration::ZERO,
