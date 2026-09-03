@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,8 +15,12 @@ const PERF_RING_CAPACITY: usize = 256;
 const PERF_AGGREGATE_NAME_CAPACITY: usize = 64;
 const PERF_AGGREGATE_SAMPLE_CAPACITY: usize = 512;
 
-static PERF_SAMPLES: LazyLock<Mutex<VecDeque<()>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(PERF_RING_CAPACITY)));
+/// How many samples the (virtual) ring holds: the sample ring only ever
+/// reported its length, so it is a counter saturating at
+/// [`PERF_RING_CAPACITY`], not a buffer. `record_perf_timing` runs on every
+/// daemon RPC (every keystroke), so this stays a lock-free atomic and the
+/// only lock on that path is the one guarding the per-name aggregates.
+static PERF_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Default)]
 struct PerfAggregate {
     count: usize,
@@ -51,14 +56,12 @@ pub struct NativePerformanceDiagnostics {
 /// retain a workspace id, path, session id, hostname, or command payload.
 pub fn record_perf_timing(name: &'static str, elapsed: Duration) {
     let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
-    let Ok(mut samples) = PERF_SAMPLES.lock() else {
-        return;
-    };
-    if samples.len() == PERF_RING_CAPACITY {
-        samples.pop_front();
-    }
-    samples.push_back(());
-    drop(samples);
+    // Saturating increment: a full ring drops its oldest entry for each new
+    // one, so its length pins at the capacity. `Relaxed` is enough — the
+    // count is a standalone statistic, ordered against nothing.
+    let _ = PERF_SAMPLE_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        (count < PERF_RING_CAPACITY).then_some(count + 1)
+    });
 
     let Ok(mut aggregates) = PERF_AGGREGATES.lock() else {
         return;
@@ -88,7 +91,7 @@ fn percentile(sorted: &[f64], percentile: f64) -> f64 {
 }
 
 pub fn performance_diagnostics_snapshot() -> NativePerformanceDiagnostics {
-    let samples = PERF_SAMPLES.lock().map(|samples| samples.clone()).unwrap_or_default();
+    let sample_count = PERF_SAMPLE_COUNT.load(Ordering::Relaxed);
     let mut timings = PERF_AGGREGATES
         .lock()
         .map(|aggregates| {
@@ -113,7 +116,7 @@ pub fn performance_diagnostics_snapshot() -> NativePerformanceDiagnostics {
     NativePerformanceDiagnostics {
         version: 2,
         capacity: PERF_RING_CAPACITY,
-        sample_count: samples.len(),
+        sample_count,
         timings,
     }
 }
@@ -206,9 +209,7 @@ mod tests {
 
     #[test]
     fn diagnostic_names_are_static_and_samples_are_bounded() {
-        let mut samples = PERF_SAMPLES.lock().unwrap();
-        samples.clear();
-        drop(samples);
+        PERF_SAMPLE_COUNT.store(0, Ordering::Relaxed);
         PERF_AGGREGATES.lock().unwrap().clear();
         for i in 0..(PERF_RING_CAPACITY + 20) {
             record_perf_timing("test.static-operation", Duration::from_millis(i as u64));
