@@ -553,6 +553,157 @@ export function runningSubagentEntries(
   return entries;
 }
 
+// ── Transcript index ──
+//
+// The reducer treats `messages` as an immutable array: every change is a
+// copy (`replaceItem` / append) and the previous array is dropped. That
+// makes "does ANY row match X?" questions — is this tool_use_id already a
+// tool_call, is any subagent still running, is there a workflow at all —
+// a full scan per event, and a cold hydrate replays thousands of events,
+// so those scans dominated the profile (issue: workspace-switch hiccup on
+// 5k–11k row threads): `settleSubagentsForToolResult` mapped the whole
+// transcript for each of ~2,600 tool_results, `findToolCallByUseId`
+// walked it end-to-end for each NEW tool_use, `findWorkflow` for each
+// tool_result on threads with no workflow.
+//
+// This index answers exactly those "nothing matches" questions in O(1).
+// It is keyed by array IDENTITY in a WeakMap, so no state shape changes
+// and hand-built arrays (tests, fixtures) are simply computed on first
+// query. The index MOVES with the array: `replaceTranscriptItem` /
+// `appendTranscriptItem` transfer the previous array's index to the new
+// one and patch it for the one row that changed (counts, not booleans, so
+// removal is exact). An array whose index was handed on is unindexed
+// again — if it is ever queried again (a test applying two events to the
+// same base state) it is recomputed from scratch, never read stale.
+//
+// Invariant: an indexed array is never mutated in place. Every producer
+// in the reducer, hydrate, and store already copies; keep it that way.
+//
+// Lives here (not in reducer.ts) because `hydrate.ts` and the settle
+// helpers below need it too and this is the shared leaf module.
+
+export interface TranscriptIndex {
+  /** Number of `workflow_run` rows. Zero means every workflow lookup /
+   *  stop pass is a no-op. */
+  workflowCount: number;
+  /** Number of `permission_request` rows. Zero means a new tool_use has
+   *  no prior request to link. */
+  permissionRequestCount: number;
+  /** `tool_call.tool_use_id` → number of rows carrying it. */
+  toolUseIds: Map<string, number>;
+  /** Match keys of every running/pending subagent (in cards AND workflow
+   *  phases): the subagent `id` and, when set, its `parentItemId` — the
+   *  two keys `settleSubagentsForToolResult` matches a tool_result on.
+   *  Value is the number of running subagents contributing the key. */
+  runningSubagentKeys: Map<string, number>;
+}
+
+const transcriptIndexes = new WeakMap<ChatViewItem[], TranscriptIndex>();
+
+function bump(map: Map<string, number>, key: string, delta: number): void {
+  const next = (map.get(key) ?? 0) + delta;
+  if (next <= 0) map.delete(key);
+  else map.set(key, next);
+}
+
+function indexSubagentView(
+  index: TranscriptIndex,
+  sub: SubagentView,
+  delta: number,
+): void {
+  if (!isRunning(sub)) return;
+  bump(index.runningSubagentKeys, sub.id, delta);
+  if (sub.parentItemId != null) {
+    bump(index.runningSubagentKeys, sub.parentItemId, delta);
+  }
+}
+
+/** Add (`delta = 1`) or remove (`delta = -1`) one row's contribution. */
+function indexItem(index: TranscriptIndex, item: ChatViewItem, delta: number): void {
+  switch (item.kind) {
+    case "tool_call":
+      bump(index.toolUseIds, item.tool_use_id, delta);
+      return;
+    case "permission_request":
+      index.permissionRequestCount += delta;
+      return;
+    case "subagent_run":
+      for (const sub of item.subagents) indexSubagentView(index, sub, delta);
+      return;
+    case "workflow_run":
+      index.workflowCount += delta;
+      for (const phase of item.phases) {
+        for (const sub of phase.agents) indexSubagentView(index, sub, delta);
+      }
+      return;
+    default:
+      return;
+  }
+}
+
+function buildTranscriptIndex(messages: ChatViewItem[]): TranscriptIndex {
+  const index: TranscriptIndex = {
+    workflowCount: 0,
+    permissionRequestCount: 0,
+    toolUseIds: new Map(),
+    runningSubagentKeys: new Map(),
+  };
+  for (const item of messages) indexItem(index, item, 1);
+  return index;
+}
+
+/** The index for `messages`, computing (and caching) it on first use. */
+export function transcriptIndex(messages: ChatViewItem[]): TranscriptIndex {
+  let index = transcriptIndexes.get(messages);
+  if (!index) {
+    index = buildTranscriptIndex(messages);
+    transcriptIndexes.set(messages, index);
+  }
+  return index;
+}
+
+/** Hand `from`'s index (if any) to `to`, applying the row changes that
+ *  distinguish them. No-op when `from` was never indexed: `to` will be
+ *  computed lazily if anyone asks. */
+function moveTranscriptIndex(
+  from: ChatViewItem[],
+  to: ChatViewItem[],
+  removed: readonly ChatViewItem[],
+  added: readonly ChatViewItem[],
+): void {
+  const index = transcriptIndexes.get(from);
+  if (!index) return;
+  transcriptIndexes.delete(from);
+  for (const item of removed) if (item) indexItem(index, item, -1);
+  for (const item of added) indexItem(index, item, 1);
+  transcriptIndexes.set(to, index);
+}
+
+/** Copy-on-write replace of one row, carrying the index along. The one
+ *  array-producing primitive the reducer / hydrate use for in-place row
+ *  updates, so the index stays exact through streaming merges, tool
+ *  result attachment, and subagent snapshot merges alike. */
+export function replaceTranscriptItem(
+  messages: ChatViewItem[],
+  index: number,
+  next: ChatViewItem,
+): ChatViewItem[] {
+  const copy = messages.slice();
+  copy[index] = next;
+  moveTranscriptIndex(messages, copy, [messages[index]], [next]);
+  return copy;
+}
+
+/** Copy-on-write append of one row, carrying the index along. */
+export function appendTranscriptItem(
+  messages: ChatViewItem[],
+  item: ChatViewItem,
+): ChatViewItem[] {
+  const copy = [...messages, item];
+  moveTranscriptIndex(messages, copy, [], [item]);
+  return copy;
+}
+
 // ── Run-state settlement (issue #153) ──
 //
 // Force a stuck-running subagent to a terminal VIEW state when the only
@@ -603,13 +754,25 @@ function mapAllSubagents(
   messages: ChatViewItem[],
   fn: (sub: SubagentView) => SubagentView,
 ): ChatViewItem[] {
-  let changed = false;
+  const removed: ChatViewItem[] = [];
+  const added: ChatViewItem[] = [];
   const next = messages.map((m) => {
     const nm = mapItemSubagents(m, fn);
-    if (nm !== m) changed = true;
+    if (nm !== m) {
+      removed.push(m);
+      added.push(nm);
+    }
     return nm;
   });
-  return changed ? next : messages;
+  if (removed.length === 0) return messages;
+  moveTranscriptIndex(messages, next, removed, added);
+  return next;
+}
+
+/** True when at least one subagent anywhere in the transcript is still
+ *  running/pending — the O(1) precondition for every settle pass. */
+export function hasRunningSubagents(messages: ChatViewItem[]): boolean {
+  return transcriptIndex(messages).runningSubagentKeys.size > 0;
 }
 
 /**
@@ -625,6 +788,12 @@ export function settleSubagentsForToolResult(
   toolUseId: string,
   isError: boolean,
 ): ChatViewItem[] {
+  // Almost every parent tool_result belongs to an ordinary tool (Read,
+  // Bash, …) with no subagent keyed on it. The index answers that in
+  // O(1); only a genuine match pays for the container walk below.
+  if (!transcriptIndex(messages).runningSubagentKeys.has(toolUseId)) {
+    return messages;
+  }
   const target: SubagentViewStatus = isError ? "failed" : "completed";
   return mapAllSubagents(messages, (sub) => {
     if (!isRunning(sub)) return sub;
@@ -644,6 +813,9 @@ export function settleSubagentsForToolResult(
 export function interruptRunningSubagents(
   messages: ChatViewItem[],
 ): ChatViewItem[] {
+  // The common case on a long thread — every new user turn, session close
+  // and hydrate settle — is that nothing is running. Skip the map.
+  if (!hasRunningSubagents(messages)) return messages;
   return mapAllSubagents(messages, (sub) =>
     isRunning(sub)
       ? { ...sub, status: "interrupted", statusAssumed: true }

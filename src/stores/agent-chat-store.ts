@@ -17,6 +17,7 @@ import {
   markRequestResponding,
   removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
+import { replaceTranscriptItem } from "@/lib/agent-chat/subagents";
 import type {
   ChatThreadState,
   ChatViewItem,
@@ -768,10 +769,14 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         );
         if (index < 0) continue;
         const item = slice.messages[index] as ToolCallItem;
-        const messages = [...slice.messages];
         // A new item object is exactly right: the transcript's slot reuse
-        // keys off item identity, so precisely this row re-renders.
-        messages[index] = { ...item, result_content: content };
+        // keys off item identity, so precisely this row re-renders. The
+        // index-carrying replace keeps the reducer's O(1) lookups warm
+        // instead of forcing a full-transcript rebuild on the next event.
+        const messages = replaceTranscriptItem(slice.messages, index, {
+          ...item,
+          result_content: content,
+        });
         return {
           threads: {
             ...state.threads,
