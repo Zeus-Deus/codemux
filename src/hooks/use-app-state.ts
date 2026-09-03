@@ -111,7 +111,13 @@ export function useAppStateInit(skip = false) {
         debounceRef.current = null;
         pendingCommitRef.current = null;
         setAppState(payload);
-        markOpenInteraction("state-committed", { target });
+        // Stamp with what actually committed, not what the payload said: a
+        // buffered `active_workspace` delta drained on top of this snapshot
+        // moves the active id past the payload's own, and the trace waiting
+        // on that target closes here — there is no later message for it.
+        const committedTarget =
+          useAppStore.getState().appState?.active_workspace_id ?? target;
+        markOpenInteraction("state-committed", { target: committedTarget });
       };
       if (debounceRef.current) {
         clearTimeout(debounceRef.current);
@@ -135,10 +141,33 @@ export function useAppStateInit(skip = false) {
   // Deltas bypass the debounce: they are a few hundred bytes and touch one
   // domain, so the coalescing window would only add latency to a change the
   // renderer can absorb in a single targeted commit.
+  //
+  // An `active_workspace` delta is the activation's confirming message —
+  // the same role the full snapshot used to play — so it carries the same
+  // two trace marks. `snapshot-received` is the phase name the trace schema
+  // keys its `state-event` / `commit` spans on; it now means "the confirming
+  // state event", whatever its vehicle. `state-committed` is stamped only if
+  // the store actually advanced past this revision: a delta that had to be
+  // buffered behind a reorder gap has not committed yet, and whichever
+  // snapshot or delta later drains it stamps the close instead.
   const handleDelta = useCallback(
     (payload: RevisionedDelta) => {
       flushPendingSnapshot();
+      const activation =
+        payload.delta.domain === "active_workspace" ? payload.delta : null;
+      if (activation !== null) {
+        markOpenInteraction("snapshot-received", {
+          target: activation.workspace_id,
+          meta: isInteractionTraceEnabled() ? { delta: true } : undefined,
+        });
+      }
       applyAppStateDelta(payload.revision, payload.delta, payload.instance);
+      if (
+        activation !== null &&
+        useAppStore.getState().lastSeenRevision >= payload.revision
+      ) {
+        markOpenInteraction("state-committed", { target: activation.workspace_id });
+      }
     },
     [applyAppStateDelta, flushPendingSnapshot],
   );

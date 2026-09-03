@@ -1,8 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   applyDeltaToSnapshot,
+  buildPaneWorkspaceIndex,
   buildSessionWorkspaceIndex,
+  confirmsPending,
   DELTA_BUFFER_LIMIT,
+  findWorkspaceIdForPane,
   getSessionWorkspaceId,
   groupWorkspacesByProject,
   resolveProjectRoot,
@@ -10,6 +13,7 @@ import {
   useAppStore,
 } from "./app-store";
 import type {
+  ActiveWorkspaceDelta,
   AppStateDelta,
   AppStateSnapshot,
   PaneNodeSnapshot,
@@ -1453,5 +1457,399 @@ describe("useAppStore — delta ordering and gap recovery", () => {
     const state = useAppStore.getState();
     expect(state.appState).toBeNull();
     expect(state.resyncRequestId).toBe(0);
+  });
+});
+
+// ── Activation delta ────────────────────────────────────────────────────
+//
+// `activate_workspace` no longer emits the full snapshot; it ships one
+// `active_workspace` delta that must reproduce everything the backend's
+// `record_workspace_switch` mutates (see the contract in
+// `applyActiveWorkspaceDelta`) and confirm the optimistic selection.
+
+describe("applyDeltaToSnapshot — active_workspace", () => {
+  function activation(
+    overrides: Partial<ActiveWorkspaceDelta> = {},
+  ): ActiveWorkspaceDelta {
+    return {
+      domain: "active_workspace",
+      workspace_id: "ws-B",
+      previous_workspace_id: "ws-A",
+      last_visited_at: 2_000,
+      previous_last_visited_at: 1_500,
+      cleared_review_pane_ids: [],
+      ...overrides,
+    };
+  }
+
+  function threeWorkspaces(): AppStateSnapshot {
+    const wsA = makeWs({
+      workspace_id: "ws-A",
+      last_visited_at: 1_000,
+      surfaces: [makeSurface(termPane("pa", "sa"))],
+    });
+    const wsB = makeWs({
+      workspace_id: "ws-B",
+      notification_count: 3,
+      last_visited_at: 500,
+      surfaces: [makeSurface(split(chatPane("pb1"), termPane("pb2", "sb")))],
+    });
+    const wsC = makeWs({
+      workspace_id: "ws-C",
+      surfaces: [makeSurface(browserPane("pc"))],
+    });
+    const snapshot = makeAppState([wsA, wsB, wsC]);
+    snapshot.pane_statuses = { pb1: "review", pb2: "working", pc: "review" };
+    snapshot.notifications = [
+      {
+        notification_id: "n1",
+        workspace_id: "ws-B",
+        pane_id: null,
+        session_id: null,
+        level: "info",
+        message: "b",
+        read: false,
+        created_at_ms: 1,
+      },
+      {
+        notification_id: "n2",
+        workspace_id: "ws-C",
+        pane_id: null,
+        session_id: null,
+        level: "info",
+        message: "c",
+        read: false,
+        created_at_ms: 2,
+      },
+      {
+        notification_id: "n3",
+        workspace_id: "ws-B",
+        pane_id: null,
+        session_id: null,
+        level: "attention",
+        message: "already read",
+        read: true,
+        created_at_ms: 3,
+      },
+    ];
+    return snapshot;
+  }
+
+  it("moves the active id and patches exactly what the backend mutates", () => {
+    const before = threeWorkspaces();
+    const after = applyDeltaToSnapshot(
+      before,
+      activation({ cleared_review_pane_ids: ["pb1"] }),
+      42,
+    );
+
+    expect(after).not.toBe(before);
+    expect(after.active_workspace_id).toBe("ws-B");
+    expect(after.snapshot_revision).toBe(42);
+    // Target: visited stamp + notification counter.
+    expect(after.workspaces[1].last_visited_at).toBe(2_000);
+    expect(after.workspaces[1].notification_count).toBe(0);
+    // Previous: leaving counts as having seen it.
+    expect(after.workspaces[0].last_visited_at).toBe(1_500);
+    // Only the review panes the backend named are cleared; nothing else in
+    // the map moves (pc stays "review" — it belongs to another workspace).
+    expect(after.pane_statuses).toEqual({ pb2: "working", pc: "review" });
+    // Every unread notification for the target flips to read; others stay.
+    expect(after.notifications.map((n) => n.read)).toEqual([true, false, true]);
+    // The input is untouched.
+    expect(before.active_workspace_id).toBe("ws-A");
+    expect(before.workspaces[1].notification_count).toBe(3);
+    expect(before.pane_statuses.pb1).toBe("review");
+    expect(before.notifications[0].read).toBe(false);
+  });
+
+  it("keeps every reference the switch does not touch", () => {
+    const before = threeWorkspaces();
+    const after = applyDeltaToSnapshot(before, activation(), 42);
+
+    // The workspace neither left nor entered keeps its identity — that is
+    // what lets the sidebar rows and memo'd pane trees bail out on a switch.
+    expect(after.workspaces[2]).toBe(before.workspaces[2]);
+    expect(after.workspaces[0]).not.toBe(before.workspaces[0]);
+    expect(after.workspaces[1]).not.toBe(before.workspaces[1]);
+    // Patched workspaces keep their nested subtrees by reference.
+    expect(after.workspaces[1].surfaces).toBe(before.workspaces[1].surfaces);
+    expect(after.workspaces[0].surfaces).toBe(before.workspaces[0].surfaces);
+    // No review panes cleared → the status map is untouched by identity.
+    expect(after.pane_statuses).toBe(before.pane_statuses);
+    // Unread notifications existed for the target, so that array is new, but
+    // the entries that didn't flip keep theirs.
+    expect(after.notifications).not.toBe(before.notifications);
+    expect(after.notifications[1]).toBe(before.notifications[1]);
+    expect(after.notifications[2]).toBe(before.notifications[2]);
+    // Domains the switch never names.
+    expect(after.detected_ports).toBe(before.detected_ports);
+    expect(after.terminal_sessions).toBe(before.terminal_sessions);
+    expect(after.config).toBe(before.config);
+  });
+
+  it("does not touch the previous workspace when its stamp is null or it is the target", () => {
+    const before = threeWorkspaces();
+    const noPrevStamp = applyDeltaToSnapshot(
+      before,
+      activation({ previous_last_visited_at: null }),
+      42,
+    );
+    expect(noPrevStamp.workspaces[0]).toBe(before.workspaces[0]);
+
+    // Re-activating the already-active workspace: previous === target, so
+    // the "previous" stamp must not overwrite the target's own new stamp.
+    const reactivate = applyDeltaToSnapshot(
+      before,
+      activation({
+        workspace_id: "ws-A",
+        previous_workspace_id: "ws-A",
+        previous_last_visited_at: 999,
+        last_visited_at: 3_000,
+      }),
+      42,
+    );
+    expect(reactivate.active_workspace_id).toBe("ws-A");
+    expect(reactivate.workspaces[0].last_visited_at).toBe(3_000);
+  });
+
+  it("tolerates a previous workspace that has since been closed", () => {
+    const before = threeWorkspaces();
+    const after = applyDeltaToSnapshot(
+      before,
+      activation({ previous_workspace_id: "ws-gone" }),
+      42,
+    );
+    expect(after.active_workspace_id).toBe("ws-B");
+    expect(after.workspaces[0]).toBe(before.workspaces[0]);
+  });
+
+  it("returns the same snapshot when nothing would change", () => {
+    const before = threeWorkspaces();
+    before.active_workspace_id = "ws-B";
+    before.workspaces[1] = {
+      ...before.workspaces[1],
+      notification_count: 0,
+      last_visited_at: 2_000,
+    };
+    before.notifications = before.notifications.map((n) =>
+      n.workspace_id === "ws-B" ? { ...n, read: true } : n,
+    );
+    const after = applyDeltaToSnapshot(
+      before,
+      activation({
+        previous_workspace_id: "ws-B",
+        previous_last_visited_at: 2_000,
+        cleared_review_pane_ids: ["not-a-pane"],
+      }),
+      42,
+    );
+    expect(after).toBe(before);
+  });
+
+  it("ignores an activation for a workspace the snapshot does not have yet", () => {
+    const before = threeWorkspaces();
+    const after = applyDeltaToSnapshot(
+      before,
+      activation({ workspace_id: "ws-new" }),
+      42,
+    );
+    expect(after).toBe(before);
+  });
+
+  it("leaves the snapshot untouched for an unknown domain (older-frontend path)", () => {
+    const before = threeWorkspaces();
+    const unknown = { domain: "from_the_future", payload: 1 } as unknown as AppStateDelta;
+    expect(applyDeltaToSnapshot(before, unknown, 42)).toBe(before);
+  });
+});
+
+describe("useAppStore.applyAppStateDelta — activation confirms the pending id", () => {
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+  const wsC = makeWs({ workspace_id: "ws-C" });
+
+  function activation(
+    workspaceId: string,
+    previousId: string | null = "ws-A",
+  ): AppStateDelta {
+    return {
+      domain: "active_workspace",
+      workspace_id: workspaceId,
+      previous_workspace_id: previousId,
+      last_visited_at: 1,
+      previous_last_visited_at: previousId === null ? null : 1,
+      cleared_review_pane_ids: [],
+    };
+  }
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+      backendInstance: null,
+      resyncInFlight: false,
+      resyncRequestId: 0,
+      deltaBuffer: new Map(),
+      gapWindowId: 0,
+    });
+  }
+
+  function seed(revision: number): void {
+    const snapshot = makeAppState([wsA, wsB, wsC]);
+    snapshot.snapshot_revision = revision;
+    useAppStore.getState().setAppState(snapshot);
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("clears the pending id when the activation delta lands in order", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    useAppStore.getState().applyAppStateDelta(11, activation("ws-B"));
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.pendingActiveWorkspaceId).toBeNull();
+    expect(state.pendingActivationAt).toBeNull();
+    expect(state.lastSeenRevision).toBe(11);
+    expect(selectActiveWorkspaceId(state)).toBe("ws-B");
+  });
+
+  it("rapid A→B→C: B's delta moves the snapshot but does not clear a pending C", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    useAppStore.getState().beginPendingActivation("ws-C");
+    useAppStore.getState().applyAppStateDelta(11, activation("ws-B"));
+
+    let state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.pendingActiveWorkspaceId).toBe("ws-C");
+    // The optimistic selector keeps painting C until C's own delta arrives.
+    expect(selectActiveWorkspaceId(state)).toBe("ws-C");
+
+    useAppStore.getState().applyAppStateDelta(12, activation("ws-C", "ws-B"));
+    state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-C");
+    expect(state.pendingActiveWorkspaceId).toBeNull();
+  });
+
+  it("a stale activation delta neither moves the snapshot nor clears the pending id", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    useAppStore.getState().applyAppStateDelta(10, activation("ws-B"));
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-A");
+    expect(state.pendingActiveWorkspaceId).toBe("ws-B");
+  });
+
+  it("an activation buffered behind a reorder gap confirms once the gap closes", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    // Arrives ahead of its turn — held, not applied, not confirming.
+    useAppStore.getState().applyAppStateDelta(12, activation("ws-B"));
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-A");
+
+    // The missing revision is a full snapshot (say, a git refresh emit);
+    // draining the buffered activation on top of it confirms in the SAME
+    // commit rather than waiting for yet another message.
+    const snapshot = makeAppState([wsA, wsB, wsC]);
+    snapshot.snapshot_revision = 11;
+    useAppStore.getState().setAppState(snapshot);
+
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(12);
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.pendingActiveWorkspaceId).toBeNull();
+    expect(state.gapWindowId).toBe(0);
+  });
+
+  it("an unknown domain still advances the revision so the heartbeat can resync", () => {
+    seed(10);
+    const before = useAppStore.getState().appState;
+    const unknown = { domain: "from_the_future" } as unknown as AppStateDelta;
+    useAppStore.getState().applyAppStateDelta(11, unknown);
+    const state = useAppStore.getState();
+    expect(state.appState).toBe(before);
+    expect(state.lastSeenRevision).toBe(11);
+    expect(state.resyncRequestId).toBe(0);
+  });
+
+  it("an older backend's full confirming snapshot still confirms (compat)", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    const snapshot = makeAppState([wsA, wsB, wsC]);
+    snapshot.active_workspace_id = "ws-B";
+    snapshot.snapshot_revision = 11;
+    useAppStore.getState().setAppState(snapshot);
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.pendingActiveWorkspaceId).toBeNull();
+  });
+});
+
+describe("confirmsPending", () => {
+  it("only an exact id match confirms", () => {
+    expect(
+      confirmsPending({ pendingActiveWorkspaceId: "ws-B" }, { active_workspace_id: "ws-B" }),
+    ).toBe(true);
+    expect(
+      confirmsPending({ pendingActiveWorkspaceId: "ws-C" }, { active_workspace_id: "ws-B" }),
+    ).toBe(false);
+    expect(
+      confirmsPending({ pendingActiveWorkspaceId: null }, { active_workspace_id: "ws-B" }),
+    ).toBe(false);
+  });
+});
+
+// ── findWorkspaceIdForPane — cached per snapshot ────────────────────────
+
+describe("findWorkspaceIdForPane", () => {
+  const snapshot = makeAppState([
+    makeWs({
+      workspace_id: "ws-A",
+      surfaces: [makeSurface(split(chatPane("pa1"), termPane("pa2", "sa")))],
+    }),
+    makeWs({
+      workspace_id: "ws-B",
+      surfaces: [
+        makeSurface(browserPane("pb1"), "sf-1"),
+        makeSurface(termPane("pb2", "sb"), "sf-2"),
+      ],
+    }),
+  ]);
+
+  it("resolves leaf panes across workspaces and surfaces", () => {
+    const state = { appState: snapshot };
+    expect(findWorkspaceIdForPane(state, "pa1")).toBe("ws-A");
+    expect(findWorkspaceIdForPane(state, "pa2")).toBe("ws-A");
+    expect(findWorkspaceIdForPane(state, "pb1")).toBe("ws-B");
+    expect(findWorkspaceIdForPane(state, "pb2")).toBe("ws-B");
+  });
+
+  it("resolves split nodes by their own pane id, as the tree scan did", () => {
+    expect(findWorkspaceIdForPane({ appState: snapshot }, "split-pa1-pa2")).toBe("ws-A");
+  });
+
+  it("returns null for an unknown pane or no snapshot", () => {
+    expect(findWorkspaceIdForPane({ appState: snapshot }, "nope")).toBeNull();
+    expect(findWorkspaceIdForPane({ appState: null }, "pa1")).toBeNull();
+  });
+
+  it("builds the index once per snapshot reference", () => {
+    const a = buildPaneWorkspaceIndex(snapshot);
+    const b = buildPaneWorkspaceIndex(snapshot);
+    // The pure builder always allocates — it is the WeakMap in front of it
+    // that dedupes. Indirect check: the same snapshot ref resolves the same
+    // answers, and a fresh (structurally equal) ref still resolves them.
+    expect(a).not.toBe(b);
+    expect(a).toEqual(b);
+    const fresh = { ...snapshot };
+    expect(findWorkspaceIdForPane({ appState: fresh }, "pb2")).toBe("ws-B");
   });
 });

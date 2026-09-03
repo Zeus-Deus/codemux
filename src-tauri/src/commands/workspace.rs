@@ -1751,9 +1751,9 @@ pub fn activate_workspace<R: tauri::Runtime>(
 /// Keeping the body in one place guarantees both surfaces have identical
 /// side effects: the in-memory active id flip, the `populate_git_info`
 /// background refresh, lazy PTY hydration via
-/// `spawn_missing_ptys_for_workspace`, the synchronous `emit_app_state`
-/// to push the new snapshot to any open UI. That full-state emit also queues
-/// the active id on the shared ordered/coalesced persistence stream, so no
+/// `spawn_missing_ptys_for_workspace`, and the synchronous activation delta
+/// emit that pushes the switch to any open UI. That emit also queues the
+/// active id on the shared ordered/coalesced persistence stream, so no
 /// caller blocks on SQLite and every switch surface restores identically.
 pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1762,14 +1762,14 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let activate_started = std::time::Instant::now();
     // Section timings feed the attribution harness: a slow activate must name
-    // whether it was the locked state mutation or snapshot+serialise, rather
+    // whether it was the locked state mutation or the delta emit, rather
     // than reporting one opaque total. SQLite runs after return on the shared
     // persistence worker.
     let mutate_started = std::time::Instant::now();
-    let activated = state.activate_workspace(&workspace_id);
+    let activated = state.activate_workspace_delta(&workspace_id);
     let mutate_ms = mutate_started.elapsed().as_secs_f64() * 1000.0;
-    if activated {
-        let emit_ms = run_activation_side_effects(&app, state, &workspace_id);
+    if let Some(delta) = activated {
+        let emit_ms = run_activation_side_effects(&app, state, &workspace_id, delta);
         let elapsed_ms = activate_started.elapsed().as_millis();
         if elapsed_ms > 8 {
             eprintln!(
@@ -1790,12 +1790,20 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
 /// and never persisting the active workspace, so a cycled-to workspace was
 /// forgotten at restart.
 ///
+/// `delta` is the revision-stamped switch produced by
+/// [`AppStateStore::activate_workspace_delta`]; it is emitted here instead of
+/// a full snapshot. With 274 workspaces the snapshot was 581KB of JSON that
+/// crossed the IPC bridge and was parsed on the renderer main thread on every
+/// click, and the transcript-hydrate IPCs queued behind it — the delta is a
+/// few hundred bytes for the same rendered result.
+///
 /// Returns the synchronous emit duration for the activation attribution
 /// harness. Selection persistence is deliberately not part of this duration.
 fn run_activation_side_effects<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppStateStore,
     workspace_id: &str,
+    delta: crate::state::RevisionedDelta,
 ) -> f64 {
     // Kick off git refresh in a background thread — don't block the
     // activate click. `populate_git_info` runs 5-8 git subprocesses
@@ -1850,7 +1858,7 @@ fn run_activation_side_effects<R: tauri::Runtime>(
     });
 
     let emit_started = std::time::Instant::now();
-    crate::state::emit_app_state(app);
+    crate::state::emit_activation_delta(app, delta);
     emit_started.elapsed().as_secs_f64() * 1000.0
 }
 
@@ -2059,11 +2067,12 @@ pub fn cycle_workspace<R: tauri::Runtime>(
         .workspace_navigation_target(step)
         .ok_or_else(|| "No workspace navigation target available".to_string())?;
 
-    if state.activate_workspace(&workspace_id.0) {
-        run_activation_side_effects(&app, &state, &workspace_id.0);
-        Ok(workspace_id.0)
-    } else {
-        Err(format!("No workspace found for {}", workspace_id.0))
+    match state.activate_workspace_delta(&workspace_id.0) {
+        Some(delta) => {
+            run_activation_side_effects(&app, &state, &workspace_id.0, delta);
+            Ok(workspace_id.0)
+        }
+        None => Err(format!("No workspace found for {}", workspace_id.0)),
     }
 }
 

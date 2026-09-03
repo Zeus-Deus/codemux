@@ -778,8 +778,11 @@ pub struct WorkspaceGitDelta {
 /// Deltas ride the SAME revision counter as [`AppStateSnapshot`], so the
 /// renderer sees one totally ordered stream: a delta at revision N reflects the
 /// state at N, and a snapshot at N supersedes every delta at or below N.
-/// Deliberately narrow — no variant carries `active_workspace_id`, so a
-/// background delta can never clobber the optimistic selection.
+/// Deliberately narrow — no *background* variant carries `active_workspace_id`,
+/// so a background delta can never clobber the optimistic selection. The one
+/// variant that does move it, [`Self::ActiveWorkspace`], is only ever produced
+/// by a user-initiated activation, and it is the confirmation the optimistic
+/// selection is waiting for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "domain", rename_all = "snake_case")]
 pub enum AppStateDelta {
@@ -794,6 +797,28 @@ pub enum AppStateDelta {
         pane_id: String,
         /// `None` clears the pane's entry (the map only stores non-idle panes).
         status: Option<PaneStatus>,
+    },
+    /// A workspace switch. Carries exactly what
+    /// [`AppStateStore::record_workspace_switch`] mutates, so applying it
+    /// yields the same snapshot the full emit used to ship — minus the
+    /// ~600KB of workspaces the switch never touched. Wire shape is
+    /// documented for the renderer in `/tmp/pr338-activation-delta-contract.md`.
+    ActiveWorkspace {
+        /// The new `active_workspace_id`.
+        workspace_id: String,
+        /// The `active_workspace_id` before the switch; `None` when nothing
+        /// was active. Equal to `workspace_id` on a re-activation.
+        previous_workspace_id: Option<String>,
+        /// The incoming workspace's fresh `last_visited_at` stamp. Its
+        /// `notification_count` is also cleared and its notifications
+        /// marked read — implied by the domain, not carried.
+        last_visited_at: i64,
+        /// The outgoing workspace's `last_visited_at` stamp, when there was
+        /// one and it still exists (leaving counts as having seen it).
+        previous_last_visited_at: Option<i64>,
+        /// Panes whose `Review` status the switch removed from
+        /// `pane_statuses` (the incoming workspace's active surface).
+        cleared_review_pane_ids: Vec<String>,
     },
 }
 
@@ -1212,15 +1237,24 @@ impl AppStateStore {
     ///
     /// Callers must have verified that `workspace_id` names an existing
     /// workspace.
-    fn record_workspace_switch(snapshot: &mut AppStateSnapshot, workspace_id: &str) {
+    ///
+    /// Returns the [`AppStateDelta::ActiveWorkspace`] describing exactly the
+    /// writes made, so the activate path can ship it instead of a full
+    /// snapshot. Every field written here must be carried by (or implied
+    /// by) that delta — see its doc — or the renderer's copy diverges until
+    /// the next full snapshot.
+    fn record_workspace_switch(snapshot: &mut AppStateSnapshot, workspace_id: &str) -> AppStateDelta {
         let previous_id = snapshot.active_workspace_id.0.clone();
+        let mut previous_last_visited_at = None;
         if previous_id != workspace_id {
             if let Some(previous) = snapshot
                 .workspaces
                 .iter_mut()
                 .find(|workspace| workspace.workspace_id.0 == previous_id)
             {
-                previous.last_visited_at = Some(current_time_ms_signed());
+                let stamp = current_time_ms_signed();
+                previous.last_visited_at = Some(stamp);
+                previous_last_visited_at = Some(stamp);
             }
         }
         snapshot.active_workspace_id = WorkspaceId(workspace_id.to_string());
@@ -1230,6 +1264,7 @@ impl AppStateStore {
             }
         }
         // Clear review statuses only for the active tab's panes (not all tabs)
+        let mut cleared_review_pane_ids = Vec::new();
         if let Some(workspace) = snapshot
             .workspaces
             .iter()
@@ -1245,17 +1280,26 @@ impl AppStateStore {
                 for pid in pane_ids {
                     if snapshot.pane_statuses.get(&pid) == Some(&PaneStatus::Review) {
                         snapshot.pane_statuses.remove(&pid);
+                        cleared_review_pane_ids.push(pid);
                     }
                 }
             }
         }
+        let last_visited_at = current_time_ms_signed();
         if let Some(workspace) = snapshot
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
             workspace.notification_count = 0;
-            workspace.last_visited_at = Some(current_time_ms_signed());
+            workspace.last_visited_at = Some(last_visited_at);
+        }
+        AppStateDelta::ActiveWorkspace {
+            workspace_id: workspace_id.to_string(),
+            previous_workspace_id: (!previous_id.is_empty()).then_some(previous_id),
+            last_visited_at,
+            previous_last_visited_at,
+            cleared_review_pane_ids,
         }
     }
 
@@ -1304,6 +1348,22 @@ impl AppStateStore {
             return true;
         }
         false
+    }
+
+    /// [`Self::activate_workspace`], but returning the revision-stamped
+    /// delta to ship instead of a bare "switched" flag. The mutation and the
+    /// revision stamp happen under one lock acquisition, so the delta is
+    /// ordered exactly where the switch happened in the emit stream. `None`
+    /// when `workspace_id` names no workspace (nothing was mutated, no
+    /// revision consumed).
+    pub fn activate_workspace_delta(&self, workspace_id: &str) -> Option<RevisionedDelta> {
+        self.mutate_with_delta(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.workspace_id.0 == workspace_id)
+                .then(|| Self::record_workspace_switch(snapshot, workspace_id))
+        })
     }
 
     /// The cwd of one workspace, read under the lock without cloning the
@@ -4904,6 +4964,25 @@ pub fn emit_app_state_delta<R: tauri::Runtime>(app: &AppHandle<R>, delta: Revisi
     // disk write has to be scheduled separately. Lazily: the debouncer clones
     // the store once at flush time instead of once per delta.
     schedule_persist_current(app);
+}
+
+/// Ship the delta produced by [`AppStateStore::activate_workspace_delta`].
+///
+/// Activation used to go through [`emit_app_state`], whose full snapshot did
+/// two jobs beyond rendering: it queued the active id on the ordered
+/// selection-persistence stream and scheduled the debounced layout persist.
+/// A delta emit must keep both, or a switch made through this path would be
+/// forgotten at restart. The selection is queued with the delta's own
+/// revision so it orders correctly against any snapshot emit racing it —
+/// the same counter, the same comparison `active_workspace_persistence`
+/// already makes.
+pub fn emit_activation_delta<R: tauri::Runtime>(app: &AppHandle<R>, delta: RevisionedDelta) {
+    if let AppStateDelta::ActiveWorkspace { workspace_id, .. } = &delta.delta {
+        crate::active_workspace_persistence::schedule(app, workspace_id, delta.revision);
+    } else {
+        debug_assert!(false, "emit_activation_delta called with a non-activation delta");
+    }
+    emit_app_state_delta(app, delta);
 }
 
 pub fn emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
@@ -10114,6 +10193,168 @@ mod workspace_activity_tests {
                 .all(|w| w.last_visited_at.is_none()),
             "a same-workspace focus move must not write any visit stamp"
         );
+    }
+
+    // ── activation delta ──────────────────────────────────────────────
+    //
+    // The activate command ships an `ActiveWorkspace` delta instead of a
+    // full snapshot. The delta has to describe every write the switch made
+    // so the renderer's copy ends up identical to what the snapshot would
+    // have carried; these tests pin that equivalence.
+
+    fn unwrap_activation(delta: &RevisionedDelta) -> (&str, Option<&str>, i64, Option<i64>, &[String]) {
+        match &delta.delta {
+            AppStateDelta::ActiveWorkspace {
+                workspace_id,
+                previous_workspace_id,
+                last_visited_at,
+                previous_last_visited_at,
+                cleared_review_pane_ids,
+            } => (
+                workspace_id,
+                previous_workspace_id.as_deref(),
+                *last_visited_at,
+                *previous_last_visited_at,
+                cleared_review_pane_ids,
+            ),
+            other => panic!("expected an ActiveWorkspace delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_delta_mirrors_the_switch_writes() {
+        let (store, first, second) = store_with_two_terminal_workspaces();
+        clear_visit_stamps(&store);
+        // Seed the state the switch is expected to clear.
+        let (review_pane, other_pane) = {
+            let mut snapshot = store.snapshot();
+            let target = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id == second)
+                .unwrap();
+            target.notification_count = 3;
+            let review_pane = target.surfaces[0].active_pane_id.0.clone();
+            snapshot.notifications.push(NotificationSnapshot {
+                notification_id: "n-1".into(),
+                workspace_id: second.clone(),
+                pane_id: None,
+                session_id: None,
+                level: NotificationLevel::Info,
+                message: "done".into(),
+                read: false,
+                created_at_ms: 0,
+            });
+            let other_pane = "pane-elsewhere".to_string();
+            snapshot
+                .pane_statuses
+                .insert(review_pane.clone(), PaneStatus::Review);
+            // A Review pane outside the target's active surface must survive.
+            snapshot
+                .pane_statuses
+                .insert(other_pane.clone(), PaneStatus::Review);
+            store.replace_snapshot(snapshot);
+            (review_pane, other_pane)
+        };
+
+        let before = current_time_ms_signed();
+        let revision_before = current_revision();
+        let delta = store
+            .activate_workspace_delta(&second.0)
+            .expect("an existing workspace activates");
+        assert_eq!(delta.revision, revision_before + 1, "one revision per switch");
+        assert_eq!(delta.instance, instance_token());
+
+        let (workspace_id, previous, visited, previous_visited, cleared) =
+            unwrap_activation(&delta);
+        assert_eq!(workspace_id, second.0);
+        assert_eq!(previous, Some(first.0.as_str()));
+        assert_eq!(cleared, [review_pane.clone()]);
+
+        // The delta's stamps are the stamps the store actually wrote — the
+        // renderer applies them verbatim, so they must not be re-sampled.
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.active_workspace_id, second);
+        let incoming = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == second)
+            .unwrap();
+        assert_eq!(incoming.last_visited_at, Some(visited));
+        assert!(visited >= before);
+        assert_eq!(incoming.notification_count, 0);
+        let outgoing = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == first)
+            .unwrap();
+        assert_eq!(outgoing.last_visited_at, previous_visited);
+        assert!(previous_visited.is_some());
+        assert!(snapshot.notifications.iter().all(|n| n.read));
+        assert!(!snapshot.pane_statuses.contains_key(&review_pane));
+        assert_eq!(
+            snapshot.pane_statuses.get(&other_pane),
+            Some(&PaneStatus::Review)
+        );
+    }
+
+    #[test]
+    fn activation_delta_for_unknown_workspace_consumes_nothing() {
+        let store = AppStateStore::default();
+        let revision_before = current_revision();
+        let active_before = store.active_workspace_id();
+        assert!(store.activate_workspace_delta("ws-does-not-exist").is_none());
+        assert_eq!(current_revision(), revision_before, "a rejected switch must not punch a hole in the revision stream");
+        assert_eq!(store.active_workspace_id(), active_before);
+    }
+
+    #[test]
+    fn reactivating_the_active_workspace_reports_no_outgoing_stamp() {
+        let (store, first, _second) = store_with_two_terminal_workspaces();
+        clear_visit_stamps(&store);
+        let delta = store.activate_workspace_delta(&first.0).unwrap();
+        let (workspace_id, previous, _visited, previous_visited, cleared) =
+            unwrap_activation(&delta);
+        assert_eq!(workspace_id, first.0);
+        // Same id on both sides tells the renderer this is a re-activation.
+        assert_eq!(previous, Some(first.0.as_str()));
+        assert_eq!(previous_visited, None, "nothing was left, so nothing is stamped as left");
+        assert!(cleared.is_empty());
+    }
+
+    #[test]
+    fn activation_delta_wire_shape_matches_the_frontend_contract() {
+        // Pinned to /tmp/pr338-activation-delta-contract.md — the frontend
+        // switch on `domain` and the field names are what it reads.
+        let delta = RevisionedDelta {
+            revision: 7,
+            instance: "inst".into(),
+            delta: AppStateDelta::ActiveWorkspace {
+                workspace_id: "ws-B".into(),
+                previous_workspace_id: Some("ws-A".into()),
+                last_visited_at: 1_756_900_000_123,
+                previous_last_visited_at: None,
+                cleared_review_pane_ids: vec!["pane-1".into()],
+            },
+        };
+        let json = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "revision": 7,
+                "instance": "inst",
+                "delta": {
+                    "domain": "active_workspace",
+                    "workspace_id": "ws-B",
+                    "previous_workspace_id": "ws-A",
+                    "last_visited_at": 1_756_900_000_123_i64,
+                    "previous_last_visited_at": null,
+                    "cleared_review_pane_ids": ["pane-1"],
+                }
+            })
+        );
+        let round_tripped: RevisionedDelta = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, delta);
     }
 
     #[test]
