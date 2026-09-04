@@ -1,7 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { SidebarSeparator, useSidebar } from "@/components/ui/sidebar";
+import { useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -21,7 +21,9 @@ import {
   Keyboard,
   BookOpen,
   Bug,
-  CalendarClock,
+  SlidersHorizontal,
+  RotateCcw,
+  MoreHorizontal,
   LogOut,
   ExternalLink,
 } from "lucide-react";
@@ -38,6 +40,20 @@ import {
 import { SidebarPortsPopover } from "./sidebar-ports-popover";
 import { SidebarPullRequestsButton } from "./sidebar-pr-button";
 import { SidebarDevicesButton } from "./sidebar-devices-button";
+
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  FOOTER_ICONS,
+  getFooterAction,
+  isFooterActionAvailable,
+} from "@/lib/footer-actions";
+import { useFooterPinsStore, type FooterPin } from "@/stores/footer-pins-store";
+import { CustomizeFooterDialog } from "./customize-footer-dialog";
+import { useFooterAvailability } from "./footer-availability";
 
 /**
  * The menu's bottom strip: which build is running, and whether it is the
@@ -123,12 +139,16 @@ function AppMenuFooter({ version }: { version: string | null }) {
 
 function AppMenu({
   tooltipSide = "top",
+  onCustomize,
 }: {
   tooltipSide?: "top" | "right";
+  onCustomize: () => void;
 }) {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
-  const accountName = useAuthStore((s) => s.user?.name ?? s.user?.email ?? null);
+  const accountName = useAuthStore(
+    (s) => s.user?.name ?? s.user?.email ?? null,
+  );
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -156,17 +176,30 @@ function AppMenu({
       </Tooltip>
       {/* Bottom padding is zero so the version/update strip can sit flush in
           the container's bottom corners. */}
-      <DropdownMenuContent
-        side="top"
-        align="start"
-        className="w-[252px] pb-0"
-      >
-        <DropdownMenuItem className={MENU_ROW} onClick={() => setShowSettings(true)}>
+      <DropdownMenuContent side="top" align="start" className="w-[252px] pb-0">
+        <DropdownMenuItem
+          className={MENU_ROW}
+          onClick={() => setShowSettings(true)}
+        >
           <Settings />
           <span className="flex-1">Settings</span>
           <MenuKeycap actionId="openSettings" />
         </DropdownMenuItem>
-        <DropdownMenuItem className={MENU_ROW} onClick={() => toggleCommandPalette()}>
+        <DropdownMenuItem className={MENU_ROW} onClick={onCustomize}>
+          <SlidersHorizontal />
+          <span className="flex-1">Customize footer</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className={MENU_ROW}
+          onClick={() => useFooterPinsStore.getState().reset()}
+        >
+          <RotateCcw />
+          <span className="flex-1">Restore footer defaults</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className={MENU_ROW}
+          onClick={() => toggleCommandPalette()}
+        >
           <Search />
           <span className="flex-1">Command palette</span>
           <MenuKeycap actionId="commandPalette" />
@@ -219,66 +252,191 @@ function AppMenu({
   );
 }
 
+function FooterDestination({
+  pin,
+  labeled = false,
+  fullWidth = false,
+  tooltipSide,
+}: {
+  pin: FooterPin;
+  labeled?: boolean;
+  fullWidth?: boolean;
+  tooltipSide: "top" | "right";
+}) {
+  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const action = getFooterAction(pin.id)!;
+  const Icon = pin.iconId ? FOOTER_ICONS[pin.iconId] : action.icon;
+  if (pin.id === "codemux.devices.open")
+    return (
+      <SidebarDevicesButton
+        icon={Icon}
+        labeled={labeled}
+        tooltipSide={tooltipSide}
+      />
+    );
+  if (pin.id === "codemux.pull-requests.open")
+    return (
+      <SidebarPullRequestsButton
+        icon={Icon}
+        labeled={labeled}
+        tooltipSide={tooltipSide}
+      />
+    );
+  if (pin.id === "codemux.ports.open")
+    return (
+      <SidebarPortsPopover
+        icon={Icon}
+        labeled={labeled}
+        tooltipSide={tooltipSide}
+      />
+    );
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size={labeled ? "sm" : "icon-xs"}
+          aria-label={action.label}
+          className={cn(
+            "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+            labeled ? "gap-1.5 px-2 text-[12px]" : "w-7",
+            fullWidth && "w-full justify-start",
+          )}
+          onClick={() =>
+            action.section
+              ? setShowSettings(true, action.section)
+              : setShowAutomations(true)
+          }
+        >
+          <Icon className={labeled ? "size-[13px]" : "size-[18px]"} />
+          {labeled && action.label}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+        {action.label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 export function SidebarFooterBar() {
   const { state } = useSidebar();
-  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
+  const collapsed = state === "collapsed";
+  const pins = useFooterPinsStore((s) => s.pins);
+  const { agentChatEnabled, hasDevices } = useFooterAvailability();
+  const [customizing, setCustomizing] = useState(false);
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const container = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(300);
+  const [height, setHeight] = useState(() => window.innerHeight);
+  useEffect(() => {
+    const element = container.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setWidth(element.clientWidth));
+    observer.observe(element);
+    const resize = () => setHeight(window.innerHeight);
+    window.addEventListener("resize", resize);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", resize);
+    };
+  }, []);
+  const availablePins = pins.filter((pin) =>
+    isFooterActionAvailable(
+      getFooterAction(pin.id)!,
+      agentChatEnabled,
+      hasDevices,
+    ),
+  );
+  const showAutomationLabel =
+    !collapsed &&
+    width >= 250 &&
+    availablePins.some((pin) => pin.id === "codemux.automations.open");
+  // Reserve space for the permanent menu, then the overflow trigger if needed.
+  const capacity = collapsed
+    ? Math.max(1, Math.floor((height * 0.35) / 30) - 1)
+    : Math.max(
+        0,
+        Math.floor((width - 16 - 30 - (showAutomationLabel ? 82 : 0)) / 30),
+      );
+  const visibleCount =
+    availablePins.length > capacity ? Math.max(0, capacity - 1) : capacity;
+  const visible = availablePins.slice(0, visibleCount);
+  const overflow = availablePins.slice(visibleCount);
+  const tooltipSide = collapsed ? "right" : "top";
 
-  if (state === "collapsed") {
-    // Same destinations as the expanded row, restacked vertically as an
-    // icon rail. Order matches the expanded row left-to-right so the two
-    // layouts stay muscle-memory compatible.
-    return (
-      <>
-        <SidebarSeparator />
-        <div className="flex flex-col items-center gap-0.5 px-1 py-1.5">
-          <Tooltip>
-            <TooltipTrigger asChild>
+  return (
+    <>
+      <div
+        ref={container}
+        data-testid="sidebar-footer"
+        className={cn(
+          "flex shrink-0 gap-0.5 border-t border-sidebar-border",
+          collapsed
+            ? "flex-col items-center px-1 py-1.5"
+            : "h-[42px] items-center px-2",
+        )}
+      >
+        {visible.map((pin) => (
+          <FooterDestination
+            key={pin.id}
+            pin={pin}
+            labeled={
+              showAutomationLabel && pin.id === "codemux.automations.open"
+            }
+            tooltipSide={tooltipSide}
+          />
+        ))}
+        {overflow.length > 0 && (
+          <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
+            <PopoverTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Automations"
-                onClick={() => setShowAutomations(true)}
-                className="size-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+                aria-label="More footer destinations"
+                title="More footer destinations"
+                className="size-7 shrink-0 text-muted-foreground"
               >
-                <CalendarClock className="size-[18px]" />
+                <MoreHorizontal className="size-4" />
               </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right" sideOffset={4} className="text-xs">
-              Automations
-            </TooltipContent>
-          </Tooltip>
-          <SidebarDevicesButton tooltipSide="right" />
-          <SidebarPullRequestsButton tooltipSide="right" />
-          <SidebarPortsPopover />
-          <AppMenu tooltipSide="right" />
+            </PopoverTrigger>
+            <PopoverContent
+              side={collapsed ? "right" : "top"}
+              align="start"
+              className="w-64 p-2"
+            >
+              <p className="px-2 py-1 text-xs font-medium text-muted-foreground">
+                Footer destinations
+              </p>
+              <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">
+                {overflow.map((pin) => (
+                  <div key={pin.id} className="py-0.5">
+                    <FooterDestination
+                      pin={pin}
+                      labeled
+                      fullWidth
+                      tooltipSide="right"
+                    />
+                  </div>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+        )}
+        <div className={collapsed ? "" : "ml-auto"}>
+          <AppMenu
+            tooltipSide={tooltipSide}
+            onCustomize={() => setCustomizing(true)}
+          />
         </div>
-      </>
-    );
-  }
-
-  return (
-    // The sidebar keeps its compact destination footer after the workspace
-    // context bar's removal; it no longer dictates any work-surface height.
-    // 28px controls + 7px vertical padding.
-    <div className="flex h-[42px] items-center gap-0.5 border-t border-sidebar-border px-2">
-      <button
-        type="button"
-        aria-label="Automations"
-        onClick={() => setShowAutomations(true)}
-        className="flex h-7 items-center gap-1.5 rounded-[7px] bg-transparent px-2 text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
-      >
-        <CalendarClock className="size-[13px]" />
-        <span className="text-[12px] font-medium">Automations</span>
-      </button>
-      {/* Devices is a secondary surface, so it joins the icon cluster instead
-          of sharing top billing with Automations; it only appears once a
-          device exists, and its dot carries the cross-device status. */}
-      <div className="ml-auto flex items-center gap-0.5">
-        <SidebarDevicesButton />
-        <SidebarPullRequestsButton />
-        <SidebarPortsPopover />
-        <AppMenu />
       </div>
-    </div>
+      {customizing && (
+        <CustomizeFooterDialog
+          open={customizing}
+          onOpenChange={setCustomizing}
+        />
+      )}
+    </>
   );
 }

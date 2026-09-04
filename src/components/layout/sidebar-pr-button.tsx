@@ -1,5 +1,6 @@
+import { cn } from "@/lib/utils";
 import { useMemo } from "react";
-import { GitPullRequest } from "lucide-react";
+import { GitPullRequest, type LucideIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -22,8 +23,12 @@ import { badgeCount, badgeKeys, badgeLabel } from "@/lib/pr-overview";
  */
 export function SidebarPullRequestsButton({
   tooltipSide = "top",
+  labeled = false,
+  icon: Icon = GitPullRequest,
 }: {
   tooltipSide?: "top" | "right";
+  icon?: LucideIcon;
+  labeled?: boolean;
 }) {
   const setShowPullRequests = useUIStore((s) => s.setShowPullRequests);
   const seen = useUIStore((s) => s.prBadgeSeen);
@@ -43,9 +48,10 @@ export function SidebarPullRequestsButton({
           aria-label="Pull requests"
           data-testid="sidebar-pull-requests"
           onClick={() => setShowPullRequests(true)}
-          className="relative size-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground"
+          className={cn("relative h-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7")}
         >
-          <GitPullRequest className="size-[15px]" />
+          <Icon className="size-[15px]" />
+          {labeled && "Pull requests"}
           {count > 0 && (
             <span
               data-testid="sidebar-pull-requests-badge"

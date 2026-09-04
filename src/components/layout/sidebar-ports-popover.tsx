@@ -1,3 +1,4 @@
+import type { LucideIcon } from "lucide-react";
 import { useState, useMemo, useCallback } from "react";
 import {
   Popover,
@@ -88,7 +89,7 @@ export function groupPorts(
   );
 }
 
-export function SidebarPortsPopover() {
+export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, tooltipSide = "top" }: { icon?: LucideIcon; labeled?: boolean; tooltipSide?: "top" | "right" }) {
   const [open, setOpen] = useState(false);
   const appState = useAppStore((s) => s.appState);
 
@@ -151,11 +152,13 @@ export function SidebarPortsPopover() {
               size="icon-xs"
               aria-label="Ports"
               className={cn(
-                "relative h-7 w-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
+                "relative h-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
                 portCount > 0 && "text-foreground",
+                labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7",
               )}
             >
-              <Plug className="size-[18px]" />
+              <Icon className="size-[18px]" />
+              {labeled && "Ports"}
               {portCount > 0 && (
                 <span className="absolute -top-0.5 -right-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-[9px] leading-[15px] text-primary-foreground font-semibold tabular-nums">
                   {portCount}
@@ -164,7 +167,7 @@ export function SidebarPortsPopover() {
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
-        <TooltipContent side="top" sideOffset={4} className="text-xs">
+        <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
           {portCount > 0
             ? `${portCount} active port${portCount === 1 ? "" : "s"}`
             : "No active ports"}

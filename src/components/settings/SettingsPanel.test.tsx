@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent, within, cleanup } from "@testing-library/react";
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -15,6 +15,8 @@ beforeAll(() => {
 // ── Mocks ──
 
 const mockSetShowSettings = vi.fn();
+let requestedSection: string | null = null;
+let navigationVersion = 0;
 const mockSignOut = vi.fn();
 const mockSettingsSet = vi.fn();
 
@@ -22,7 +24,8 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
       setShowSettings: mockSetShowSettings,
-      settingsSection: null,
+      settingsSection: requestedSection,
+      settingsNavigationVersion: navigationVersion,
     }),
 }));
 
@@ -510,5 +513,54 @@ describe("SettingsPanel — Appearance Agents section", () => {
     ]) {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
+  });
+});
+
+
+describe("Settings footer navigation", () => {
+  beforeEach(() => { cleanup(); requestedSection = null; navigationVersion = 0; });
+
+  it("honors new and repeated requests while already mounted", () => {
+    const view = render(<SettingsView />);
+    requestedSection = "appearance";
+    navigationVersion++;
+    view.rerender(<SettingsView />);
+    expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(view.getByRole("button", { name: "Account" }));
+    navigationVersion++;
+    view.rerender(<SettingsView />);
+    expect(view.getByRole("button", { name: "Appearance" })).toHaveAttribute("aria-current", "page");
+    view.unmount();
+  });
+
+  it("shows an explicit unavailable page instead of an unrelated destination", () => {
+    requestedSection = "removed-section";
+    const view = render(<SettingsView />);
+    expect(view.getByRole("status")).toHaveTextContent("Settings section unavailable");
+    expect(view.queryByRole("button", { name: "Pin to footer" })).toBeNull();
+    view.unmount();
+  });
+
+  it("does not render a chat-only Settings section when the feature is disabled", async () => {
+    const { useFeatureFlags } = await import("@/stores/feature-flags");
+    useFeatureFlags.setState({ enableAgentChat: false });
+    requestedSection = "skills";
+    const view = render(<SettingsView />);
+    expect(view.getByRole("status")).toHaveTextContent("Settings section unavailable");
+    expect(view.queryByRole("button", { name: "Skills" })).toBeNull();
+    view.unmount();
+    useFeatureFlags.setState({ enableAgentChat: true });
+  });
+
+  it("pins the current Settings page from its header", async () => {
+    const { useFooterPinsStore } = await import("@/stores/footer-pins-store");
+    useFooterPinsStore.getState().reset();
+    requestedSection = "appearance";
+    const view = render(<SettingsView />);
+    fireEvent.click(view.getByRole("button", { name: "Pin to footer" }));
+    expect(useFooterPinsStore.getState().pins.slice(-1)[0]?.id).toBe("codemux.settings.appearance");
+    expect(view.getByRole("button", { name: "Unpin from footer" })).toHaveAttribute("aria-pressed", "true");
+    view.unmount();
+    requestedSection = null;
   });
 });

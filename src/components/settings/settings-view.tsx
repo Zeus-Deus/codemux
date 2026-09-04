@@ -27,31 +27,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  Archive,
   ArrowLeft,
-  Palette,
-  Code2,
-  TerminalSquare,
-  GitBranch,
-  Keyboard,
-  Bell,
-  Bot,
-  Zap,
-  FolderCog,
   Trash2,
   X,
   Plus,
-  UserCircle,
   LogOut,
-  Globe,
-  RotateCcw,
-  ShieldCheck,
-  BookOpen,
-  Server,
   Sparkles,
-  MonitorSmartphone,
-  GitPullRequest,
-  ChartColumn,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -150,7 +131,8 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "usage" | "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "source_control" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+import { buildNavGroups, isSettingsSectionAvailable, type Section } from "@/lib/settings-sections";
+import { SettingsFooterPin } from "./settings-footer-pin";
 
 /** Sections that render in the wide content column instead of the
  *  shared reading measure.
@@ -165,92 +147,6 @@ type Section = "usage" | "interface" | "account" | "appearance" | "editor" | "te
  *  windows simply behave as before, and capped rather than fluid so an
  *  ultrawide monitor doesn't stretch the bars into abstraction. */
 const WIDE_SECTIONS: ReadonlySet<Section> = new Set<Section>(["usage"]);
-
-interface NavItem { id: Section; label: string; icon: React.ElementType }
-interface NavGroup { label: string; items: NavItem[] }
-
-/** Build the Settings nav groups for the current flag state.
- *  - The "Interface" row (home of the Agent Chat GUI toggle, default
- *    on) lives in PERSONAL and stays visible regardless of the flag
- *    so users in either mode can find their way back.
- *  - The chat-only rows (Permissions, Skills, MCP Servers) are only
- *    surfaced when the GUI is on; they reach into chat-only data.
- *    Hiding them when off matches the "feature absent, no work
- *    performed" promise of the master toggle.
- *  - The pre-existing rows (Account, Appearance, …, Agent) stay
- *    visible regardless. The Account section's Skills-sync subsection
- *    is conditionally rendered separately below.
- */
-function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
-  const editorWorkflowItems: NavItem[] = [
-    { id: "editor", label: "Editor", icon: Code2 },
-    { id: "terminal", label: "Terminal", icon: TerminalSquare },
-    { id: "presets", label: "Presets", icon: Zap },
-    { id: "projects", label: "Projects", icon: FolderCog },
-    // Archived workspaces — the restore/delete surface for everything
-    // archived from the sidebar. Sits next to Projects because both
-    // manage the workspace lifecycle rather than personal preferences.
-    { id: "archive", label: "Archive", icon: Archive },
-    { id: "git", label: "Git", icon: GitBranch },
-    // Source Control — which hosting product each checkout talks to, and
-    // whether that product's CLI is installed and signed in. Sits next to
-    // Git because it is the hosting half of the same subject.
-    { id: "source_control", label: "Source Control", icon: GitPullRequest },
-    { id: "agent", label: "Agent", icon: Bot },
-    ...(agentChatEnabled
-      ? ([
-          // Usage sits with the other chat-only rows: it reads the
-          // agent-chat usage ledger, which only fills when the GUI is on.
-          { id: "usage", label: "Usage", icon: ChartColumn },
-          { id: "permissions", label: "Permissions", icon: ShieldCheck },
-          { id: "skills", label: "Skills", icon: BookOpen },
-          { id: "mcp", label: "MCP Servers", icon: Server },
-        ] as NavItem[])
-      : []),
-    { id: "browser", label: "Browser", icon: Globe },
-    // Hosts pane — Step 2 of cloud-push. Listed in Editor & Workflow
-    // because picking which machine to run on is a workflow decision,
-    // not a personal preference. Always visible (no flag gate) since
-    // the underlying daemon is now standard built-in behavior.
-    { id: "hosts", label: "Devices", icon: Server },
-    // Remote Access — expose this desktop to a browser on another device.
-    // Sits next to Devices: both are about reaching this machine (or its
-    // sessions) from somewhere else. Always visible; the feature itself is
-    // default-off behind the section's master toggle.
-    { id: "remote_access", label: "Remote Access", icon: MonitorSmartphone },
-    { id: "session_restore", label: "Session Restore", icon: RotateCcw },
-  ];
-
-  return [
-    {
-      label: "PERSONAL",
-      items: [
-        { id: "account", label: "Account", icon: UserCircle },
-        { id: "appearance", label: "Appearance", icon: Palette },
-        { id: "interface", label: "Interface", icon: Sparkles },
-        { id: "notifications", label: "Notifications", icon: Bell },
-        { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
-      ],
-    },
-    {
-      label: "EDITOR & WORKFLOW",
-      items: editorWorkflowItems,
-    },
-  ];
-}
-
-/** All sections that exist regardless of flag — used to validate the
- *  initial-section URL hash. The chat-only sections are
- *  intentionally included here too: a stale URL hash to `?settings=skills`
- *  from a flag-on session falls back to "account" via the validity
- *  check (see `initialSection` below) when the flag is off. */
-const ALL_SECTION_IDS: Section[] = [
-  "interface",
-  "account", "appearance", "editor", "terminal", "presets", "projects",
-  "archive", "git", "source_control", "agent", "usage", "permissions", "skills", "mcp",
-  "hosts", "remote_access", "browser", "shortcuts", "notifications",
-  "session_restore",
-];
 
 import { KeybindEditor } from "./keybind-editor";
 import { ArchiveSection } from "./archive-section";
@@ -412,6 +308,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={cn(
         "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-[13px] font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
@@ -1358,17 +1255,13 @@ export function SettingsView() {
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const navGroups = buildNavGroups(enableAgentChat);
-  const visibleSectionIds = new Set(navGroups.flatMap((g) => g.items.map((i) => i.id)));
-  // The hash from a previous flag-on session might point at a section
-  // that's now hidden — fall back to "account" so the user lands on a
-  // visible page instead of a blank panel. ALL_SECTION_IDS is used for
-  // type-narrowing the URL parameter; visibleSectionIds enforces the
-  // current-flag visibility.
-  const initialSection: Section =
-    settingsSection && (ALL_SECTION_IDS as string[]).includes(settingsSection) && visibleSectionIds.has(settingsSection as Section)
-      ? (settingsSection as Section)
-      : "account";
-  const [activeSection, setActiveSection] = useState<Section>(initialSection);
+  const settingsNavigationVersion = useUIStore((s) => s.settingsNavigationVersion);
+  const [activeSection, setActiveSection] = useState<string>(settingsSection ?? "account");
+  // Honor repeated requests too, even after local navigation within Settings.
+  useEffect(() => {
+    if (settingsSection !== null) setActiveSection(settingsSection);
+  }, [settingsSection, settingsNavigationVersion]);
+  const sectionAvailable = isSettingsSectionAvailable(activeSection, enableAgentChat);
   const editors = useDetectedEditors();
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
@@ -2478,6 +2371,7 @@ export function SettingsView() {
             </>
           )}
         </div>
+        {sectionAvailable && <SettingsFooterPin section={activeSection} />}
       </div>
 
       {/* Body */}
@@ -2515,10 +2409,15 @@ export function SettingsView() {
           <div
             className={cn(
               "mx-auto px-11 pt-8 pb-20",
-              WIDE_SECTIONS.has(activeSection) ? "max-w-[1400px]" : "max-w-3xl",
+              WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
             )}
           >
-            {renderSection()}
+            {sectionAvailable ? renderSection() : (
+              <div role="status" className="space-y-2">
+                <h2 className="text-lg font-semibold">Settings section unavailable</h2>
+                <p className="text-sm text-muted-foreground">This section is hidden or no longer available. Choose a section from Settings.</p>
+              </div>
+            )}
           </div>
         </ScrollArea>
       </div>

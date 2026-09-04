@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { MonitorSmartphone } from "lucide-react";
+import { MonitorSmartphone, type LucideIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -68,8 +68,12 @@ function divergedLabels(
  */
 export function SidebarDevicesButton({
   tooltipSide = "top",
+  labeled = false,
+  icon: Icon = MonitorSmartphone,
 }: {
   tooltipSide?: "top" | "right";
+  icon?: LucideIcon;
+  labeled?: boolean;
 }) {
   const setShowDevices = useUIStore((s) => s.setShowDevices);
   const hosts = useHosts();
@@ -107,9 +111,10 @@ export function SidebarDevicesButton({
           aria-label="Devices"
           data-testid="sidebar-devices"
           onClick={() => setShowDevices(true)}
-          className="relative size-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground"
+          className={cn("relative h-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7")}
         >
-          <MonitorSmartphone className="size-[15px]" />
+          <Icon className="size-[15px]" />
+          {labeled && "Devices"}
           {dot && (
             <span
               data-testid="sidebar-devices-dot"
