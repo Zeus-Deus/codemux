@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -338,6 +338,31 @@ describe("SidebarFooterBar — collapsed", () => {
 
 
 describe("footer customization", () => {
+  it("drops the Automations label before introducing overflow and restores it when space returns", () => {
+    hosts = [host(1, "test-device")];
+    const { container } = renderFooter(true);
+    const footer = within(container);
+    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+
+    act(() => {
+      for (const id of ["appearance", "terminal", "shortcuts"] as const) {
+        useFooterPinsStore.getState().togglePin(`codemux.settings.${id}`);
+      }
+    });
+    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
+    expect(footer.getByRole("button", { name: "Settings · Shortcuts" })).toBeInTheDocument();
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+
+    act(() => useFooterPinsStore.setState({ pins: FOOTER_ACTIONS.map((action) => ({ id: action.id })) }));
+    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
+    expect(footer.getByRole("button", { name: "More footer destinations" })).toBeInTheDocument();
+
+    act(() => useFooterPinsStore.getState().reset());
+    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+  });
+
   it("keeps Settings, customization and reset reachable with no pins", async () => {
     useFooterPinsStore.setState({ pins: [] });
     renderFooter(true);

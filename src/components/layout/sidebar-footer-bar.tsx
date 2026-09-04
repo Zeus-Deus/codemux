@@ -349,9 +349,12 @@ export function SidebarFooterBar() {
       hasDevices,
     ),
   );
+  // Keep every destination directly reachable before spending space on a
+  // label. Only introduce overflow once the icon-only row also runs out of room.
+  const labeledCapacity = Math.floor((width - 16 - 30 - 82) / 30);
   const showAutomationLabel =
     !collapsed &&
-    width >= 250 &&
+    availablePins.length <= labeledCapacity &&
     availablePins.some((pin) => pin.id === "codemux.automations.open");
   // Reserve space for the permanent menu, then the overflow trigger if needed.
   const capacity = collapsed
