@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import { useAsyncQuestionAttention } from "@/hooks/use-async-question-attention";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { useTunnelStatusEvents } from "@/hooks/use-tunnel-status-events";
 import { useSkillsSync } from "@/hooks/use-skills-sync";
@@ -46,6 +47,7 @@ function App() {
 
   // Listen for auth state changes from Tauri (OAuth callback, token expiry)
   useAuthEvents();
+  useAsyncQuestionAttention();
 
   // Bridge SSH tunnel health into the tunnel-status store so remote
   // workspaces can show a "Reconnecting…" / "Connection lost" pill.

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -1912,4 +1912,319 @@ async fn shutdown_during_event_streaming_does_not_panic() {
         .await
         .unwrap();
     // If we get here without panic, we're good.
+}
+
+fn async_question() -> codemux_lib::agent_provider::UserQuestionSet {
+    use codemux_lib::agent_provider::{UserQuestion, UserQuestionSet};
+    UserQuestionSet {
+        id: "codex:c-1:q-1".into(),
+        target: "c-1".into(),
+        source_item_id: "q-1".into(),
+        source_turn_id: "t-1".into(),
+        text: String::new(),
+        subagent_id: None,
+        questions: vec![UserQuestion {
+            title: "Which storage?".into(),
+            options: vec!["SQLite".into(), "PostgreSQL".into()],
+        }],
+    }
+}
+
+fn async_answer(thread: &str) -> codemux_lib::agent_provider::AnswerQuestionInput {
+    codemux_lib::agent_provider::AnswerQuestionInput {
+        thread_id: ThreadId(thread.into()),
+        question: async_question(),
+        answers: vec!["SQLite".into()],
+        submission_id: "answer-1".into(),
+        checkpoint: None,
+    }
+}
+
+#[tokio::test]
+async fn async_question_streams_before_answer_and_steers_same_turn() {
+    use codemux_lib::agent_provider::QuestionDelivery;
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let script = write_script(json!([
+        {"after":"turn/start","emit":"notification","method":"turn/started","params":{"threadId":"c-1","turnId":"t-1"}},
+        {"after":"turn/start","emit":"notification","method":"item/completed","params":{"threadId":"c-1","turnId":"t-1","item":{"type":"agentMessage","id":"q-1","delivery":"async","text":"","questions":[{"title":"Which storage?","options":["SQLite","PostgreSQL"]}]}}},
+        {"after":"turn/start","delay_ms":15,"emit":"notification","method":"item/agentMessage/delta","params":{"threadId":"c-1","turnId":"t-1","itemId":"working","delta":"Building independent components."}},
+        {"after":"turn/steer","emit":"notification","method":"item/agentMessage/delta","params":{"threadId":"c-1","turnId":"t-1","itemId":"after","delta":"Using SQLite."}}
+    ]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "running"),
+        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
+        ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let mut stream = provider.event_stream();
+    start_session_resilient(&provider, start_input("async-live"))
+        .await
+        .unwrap();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("async-live".into()),
+            text: "Build".into(),
+            display_text: None,
+            images: vec![],
+            skill_invocations: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+            turn_checkpoint: None,
+        })
+        .await
+        .unwrap();
+    let mut saw_question = false;
+    timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event {
+                ProviderRuntimeEvent::QuestionsAsked { question, .. } => {
+                    assert_eq!(question, async_question());
+                    saw_question = true;
+                }
+                ProviderRuntimeEvent::ContentDelta {
+                    delta: ContentDelta::Text { text },
+                    ..
+                } if text.contains("independent") => {
+                    assert!(saw_question);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let delivery = provider
+        .answer_question(async_answer("async-live"))
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery,
+        QuestionDelivery::Inflight {
+            turn_id: TurnId("t-1".into())
+        }
+    );
+    timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let ProviderRuntimeEvent::ContentDelta {
+                turn_id,
+                delta: ContentDelta::Text { text },
+                ..
+            } = event
+            {
+                if text == "Using SQLite." {
+                    assert_eq!(turn_id.0, "t-1");
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // A repeated submission is reconciled by client ID, not sent twice.
+    assert_eq!(
+        provider
+            .answer_question(async_answer("async-live"))
+            .await
+            .unwrap(),
+        delivery
+    );
+    let calls: Vec<serde_json::Value> = std::fs::read_to_string(trace.path())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        calls.iter().filter(|c| c["method"] == "turn/steer").count(),
+        1
+    );
+    assert_eq!(
+        calls.iter().filter(|c| c["method"] == "turn/start").count(),
+        1
+    );
+    assert!(!calls.iter().any(|c| c["method"] == "turn/interrupt"));
+    let steer = calls.iter().find(|c| c["method"] == "turn/steer").unwrap();
+    assert_eq!(steer["params"]["expectedTurnId"], "t-1");
+    assert!(steer["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Answer: SQLite"));
+    provider
+        .stop_session(ThreadId("async-live".into()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn async_question_idle_and_completion_race_start_followup() {
+    use codemux_lib::agent_provider::QuestionDelivery;
+    for mode in ["idle", "race"] {
+        let wrapper = wrapper_with_env(&[("FAKE_CODEX_ASYNC_MODE", mode)]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        start_session_resilient(&provider, start_input("async-race"))
+            .await
+            .unwrap();
+        if mode == "race" {
+            provider
+                .send_turn(SendTurnInput {
+                    thread_id: ThreadId("async-race".into()),
+                    text: "Build".into(),
+                    display_text: None,
+                    images: vec![],
+                    skill_invocations: vec![],
+                    model_override: None,
+                    effort_override: None,
+                    permission_mode_override: None,
+                    client_nonce: None,
+                    turn_checkpoint: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            provider
+                .answer_question(async_answer("async-race"))
+                .await
+                .unwrap(),
+            QuestionDelivery::NewTurn { .. }
+        ));
+        provider
+            .stop_session(ThreadId("async-race".into()))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn async_question_rejects_replacement_conversation() {
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "idle"),
+        ("FAKE_CODEX_THREAD_ID", "replacement"),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("async-target"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        provider.answer_question(async_answer("async-target")).await,
+        Err(codemux_lib::agent_provider::QuestionDeliveryError::Rejected(_))
+    ));
+    provider
+        .stop_session(ThreadId("async-target".into()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn async_question_rejections_never_fall_back_to_interrupt_or_start() {
+    use codemux_lib::agent_provider::QuestionDeliveryError;
+    for mode in ["unsupported", "reject"] {
+        let trace = tempfile::NamedTempFile::new().unwrap();
+        let wrapper = wrapper_with_env(&[
+            ("FAKE_CODEX_ASYNC_MODE", mode),
+            ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+        ]);
+        let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+        start_session_resilient(&provider, start_input("async-reject"))
+            .await
+            .unwrap();
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: ThreadId("async-reject".into()),
+                text: "Build".into(),
+                display_text: None,
+                images: vec![],
+                skill_invocations: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+                turn_checkpoint: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.answer_question(async_answer("async-reject")).await,
+            Err(QuestionDeliveryError::Rejected(_))
+        ));
+        let calls: Vec<Value> = std::fs::read_to_string(trace.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            calls.iter().filter(|c| c["method"] == "turn/start").count(),
+            1
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c["method"] == "turn/steer").count(),
+            1
+        );
+        assert!(!calls.iter().any(|c| c["method"] == "turn/interrupt"));
+        provider
+            .stop_session(ThreadId("async-reject".into()))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn async_question_lost_ack_is_uncertain_and_reconciles_after_reconnect() {
+    use codemux_lib::agent_provider::{QuestionDelivery, QuestionDeliveryError};
+    let history = tempfile::NamedTempFile::new().unwrap();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "lost-response"),
+        ("FAKE_CODEX_HISTORY", history.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("async-lost"))
+        .await
+        .unwrap();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("async-lost".into()),
+            text: "Build".into(),
+            display_text: None,
+            images: vec![],
+            skill_invocations: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+            turn_checkpoint: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        provider.answer_question(async_answer("async-lost")).await,
+        Err(QuestionDeliveryError::Unknown(_))
+    ));
+    let _ = provider.stop_session(ThreadId("async-lost".into())).await;
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "running"),
+        ("FAKE_CODEX_HISTORY", history.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("async-reconnect"))
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .find_question_answer(
+                ThreadId("async-reconnect".into()),
+                "c-1".into(),
+                "answer-1".into()
+            )
+            .await
+            .unwrap(),
+        Some(QuestionDelivery::Inflight {
+            turn_id: TurnId("t-1".into())
+        })
+    );
+    provider
+        .stop_session(ThreadId("async-reconnect".into()))
+        .await
+        .unwrap();
 }

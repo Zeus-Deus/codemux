@@ -87,6 +87,30 @@ pub trait AgentProvider: Send + Sync {
         Ok(())
     }
 
+    /// Adapter opt-in, independent of the selected model's tool catalog.
+    fn supports_async_questions(&self) -> bool {
+        false
+    }
+
+    async fn answer_question(
+        &self,
+        _input: super::AnswerQuestionInput,
+    ) -> Result<super::QuestionDelivery, super::QuestionDeliveryError> {
+        Err(super::QuestionDeliveryError::Rejected(
+            "This provider does not support asynchronous answers.".into(),
+        ))
+    }
+
+    /// Correlate an uncertain submission against provider-owned history.
+    async fn find_question_answer(
+        &self,
+        _thread_id: ThreadId,
+        _target: String,
+        _submission_id: String,
+    ) -> Result<Option<super::QuestionDelivery>, String> {
+        Err("This provider cannot reconcile asynchronous answers.".into())
+    }
+
     /// Respond to a pending approval request with the user's decision.
     async fn respond_to_request(
         &self,

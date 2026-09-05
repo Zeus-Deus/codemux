@@ -2128,6 +2128,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_stop_monitoring,
             commands::agent_chat_turn_active,
             commands::agent_chat_respond_to_request,
+            commands::agent_chat::async_questions::agent_chat_answer_question,
+            commands::agent_chat::async_questions::agent_chat_question_attention,
             commands::agent_chat_set_model,
             commands::agent_chat_set_fast_mode,
             commands::agent_chat_set_permission_mode,

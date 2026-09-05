@@ -163,6 +163,15 @@ fn main() {
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
     let unauthenticated = env_truthy("FAKE_CODEX_UNAUTHENTICATED");
     let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
+    let async_mode = std::env::var("FAKE_CODEX_ASYNC_MODE").ok();
+    let trace = std::env::var("FAKE_CODEX_TRACE").ok();
+    let history_file = std::env::var("FAKE_CODEX_HISTORY").ok();
+    let mut async_turns: Vec<Value> = history_file
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut steer_attempts = 0;
     let capture_rollback = std::env::var("FAKE_CODEX_CAPTURE_ROLLBACK").ok();
 
     let pending_server_requests: Arc<Mutex<HashMap<String, Value>>> =
@@ -202,6 +211,14 @@ fn main() {
         let method = msg.method.as_deref().unwrap_or("");
         let id = msg.id.clone();
 
+        if let Some(path) = &trace {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(file, "{}", json!({"method":method,"params":msg.params})).unwrap();
+        }
         match method {
             "initialize" => {
                 if let Some(id) = id {
@@ -292,6 +309,12 @@ fn main() {
                 }
                 let t = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let tid = format!("t-{t}");
+                if async_mode.is_some() {
+                    for turn in &mut async_turns {
+                        turn["status"] = json!("completed");
+                    }
+                    async_turns.push(json!({"id":tid,"status":"inProgress","items":[{"type":"userMessage","id":format!("u-{t}"),"clientId":msg.params.get("clientUserMessageId"),"content":msg.params["input"]}]}));
+                }
                 if let Some(id) = id {
                     write_line(&json!({
                         "jsonrpc":"2.0",
@@ -299,6 +322,54 @@ fn main() {
                         "result": {"turn": {"id": tid }},
                     }));
                 }
+                fire_script_entries_for(method, &script, &pending_server_requests);
+            }
+            "turn/steer" if async_mode.is_some() => {
+                steer_attempts += 1;
+                if async_mode.as_deref() == Some("unsupported") {
+                    write_line(
+                        &json!({"id":id,"error":{"code":-32601,"message":"Method not found"}}),
+                    );
+                    continue;
+                }
+                if async_mode.as_deref() == Some("reject") {
+                    write_line(&json!({"id":id,"error":{"code":-32602,"message":"Invalid input"}}));
+                    continue;
+                }
+                if async_mode.as_deref() == Some("race") && steer_attempts == 1 {
+                    for turn in &mut async_turns {
+                        turn["status"] = json!("completed");
+                    }
+                    write_line(
+                        &json!({"id":id,"error":{"code":-32600,"message":"No active turn"}}),
+                    );
+                    continue;
+                }
+                let active = async_turns
+                    .iter_mut()
+                    .rev()
+                    .find(|t| t["status"] == "inProgress");
+                let Some(active) = active else {
+                    write_line(
+                        &json!({"id":id,"error":{"code":-32600,"message":"No active turn"}}),
+                    );
+                    continue;
+                };
+                if msg.params["expectedTurnId"] != active["id"] {
+                    write_line(
+                        &json!({"id":id,"error":{"code":-32600,"message":"Turn id mismatch"}}),
+                    );
+                    continue;
+                }
+                let turn_id = active["id"].clone();
+                active["items"].as_array_mut().unwrap().push(json!({"type":"userMessage","id":"answer","clientId":msg.params["clientUserMessageId"],"content":msg.params["input"]}));
+                if let Some(path) = &history_file {
+                    std::fs::write(path, serde_json::to_string(&async_turns).unwrap()).unwrap();
+                }
+                if async_mode.as_deref() == Some("lost-response") {
+                    std::process::exit(0);
+                }
+                write_line(&json!({"id":id,"result":{"turnId":turn_id}}));
                 fire_script_entries_for(method, &script, &pending_server_requests);
             }
             "turn/interrupt" => {
@@ -316,7 +387,7 @@ fn main() {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"threadId": thread_id,"turns":[]},
+                        "result": if async_mode.is_some() { json!({"thread":{"id":thread_id,"turns":async_turns}}) } else { json!({"threadId":thread_id,"turns":[]}) },
                     }));
                 }
             }

@@ -1647,6 +1647,26 @@ function renderAssistantBody(
   },
 ) {
   switch (item.kind) {
+    case "async_question":
+      return (
+        <div className="space-y-1 py-1 text-sm">
+          {item.question.text && (
+            <p className="text-muted-foreground">{item.question.text}</p>
+          )}
+          {item.question.questions
+            .filter((question) => !item.question.text.includes(question.title))
+            .map((question, index) => (
+              <p key={index}>{question.title}</p>
+            ))}
+          <p className="text-xs text-muted-foreground">
+            {item.resolution.status === "answered"
+              ? "Answered"
+              : item.resolution.status === "dismissed"
+                ? "Dismissed"
+                : "Answer above the composer · work can continue"}
+          </p>
+        </div>
+      );
     case "assistant_message":
       return (
         <AssistantMessage

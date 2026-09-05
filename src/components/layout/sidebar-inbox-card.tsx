@@ -1,3 +1,4 @@
+import { AgentQuestionBadge } from "./agent-question-badge";
 import { memo, useEffect, useState } from "react";
 import {
   AlarmClock,
@@ -552,27 +553,28 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     the state readout, and it hides under the pointer: the
                     action cluster's own pin glyph occupies the same claim
                     while revealed, and showing both would read as two pins. */}
-                {pinned && (
-                  <Pin
-                    role="img"
-                    aria-label="Pinned workspace"
-                    className={cn(
-                      "size-[11px] shrink-0 transition-colors duration-150",
-                      // Recedes with the eyebrow it sits in. The restore pair
-                      // rides along for consistency with the other converted
-                      // elements; the marker also hides outright under the
-                      // pointer, one line down.
-                      visuallyReceded
-                        ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/75 group-focus-within/card:text-muted-foreground/75"
-                        : "text-muted-foreground/75",
-                      actionsPinned
-                        ? "hidden"
-                        : "group-hover/card:hidden group-focus-within/card:hidden",
-                    )}
-                  />
-                )}
-                <span className="flex-1" />
-                {/* "Woke": the list keeps a stable order, so a card returning
+              {pinned && (
+                <Pin
+                  role="img"
+                  aria-label="Pinned workspace"
+                  className={cn(
+                    "size-[11px] shrink-0 transition-colors duration-150",
+                    // Recedes with the eyebrow it sits in. The restore pair
+                    // rides along for consistency with the other converted
+                    // elements; the marker also hides outright under the
+                    // pointer, one line down.
+                    visuallyReceded
+                      ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/75 group-focus-within/card:text-muted-foreground/75"
+                      : "text-muted-foreground/75",
+                    actionsPinned
+                      ? "hidden"
+                      : "group-hover/card:hidden group-focus-within/card:hidden",
+                  )}
+                />
+              )}
+              <span className="flex-1" />
+              <AgentQuestionBadge workspaceId={workspace.workspace_id} />
+              {/* "Woke": the list keeps a stable order, so a card returning
                     from a snooze slots back where it was and nothing about its
                     position says it moved. This pill is the only signal. Green
                     rather than red — it came back on schedule, it is not a
