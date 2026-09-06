@@ -295,29 +295,19 @@ export function dropDeltasSettledByRead(cursor: number): HeldEventFilter {
   };
 }
 
-/** Per-call hooks for {@link hydrateThreadByCursor}. */
-export interface CursorHydrateHooks {
-  /** Optional data-ready signal after a tail-first preview, never for
-   *  the other paths (where the promise resolving is that moment).
-   *  This is NOT paint readiness: ChatTranscript observes visible rows
-   *  separately, after virtualizer layout and initial scrolling. */
-  onContentReady?: () => void;
-}
-
 export async function hydrateThreadByCursor(
   threadId: string,
   provider: AgentChatProviderKind,
   isCancelled: () => boolean,
   deps: CursorHydrateDeps = defaultDeps,
-  hooks: CursorHydrateHooks = {},
 ): Promise<void> {
-  const retry = await hydratePass(threadId, provider, isCancelled, deps, hooks);
+  const retry = await hydratePass(threadId, provider, isCancelled, deps);
   if (!retry || isCancelled()) return;
   await (deps.delay ?? defaultDelay)(EMPTY_COLD_RETRY_MS);
   if (isCancelled()) return;
   // One retry only: a second empty read means the rows really are gone,
   // and the slice keeps what it has either way.
-  await hydratePass(threadId, provider, isCancelled, deps, hooks, false);
+  await hydratePass(threadId, provider, isCancelled, deps, false);
 }
 
 /** One hold→read→apply→release cycle. Returns whether the caller should
@@ -327,10 +317,8 @@ async function hydratePass(
   provider: AgentChatProviderKind,
   isCancelled: () => boolean,
   deps: CursorHydrateDeps,
-  hooks: CursorHydrateHooks,
   allowRetry = true,
 ): Promise<boolean> {
-  const onContentReady = hooks.onContentReady;
   // Drain what the coalescer already holds — those events are state the
   // slice owns — then park everything that arrives from here on.
   flushAgentChatEvents(threadId);
@@ -411,7 +399,6 @@ async function hydratePass(
         isCancelled,
         deps,
         tail,
-        onContentReady,
         (filter) => { releaseFilter = filter; },
       );
       return false;
@@ -469,12 +456,12 @@ async function hydratePass(
  * The two-phase body of a tail-first cold open (module doc: "Tail-first
  * cold open"). Runs INSIDE `hydratePass`'s hold: the caller owns the
  * token and releases (or drops, on cancel) in its `finally`. Install a
- * preview release filter immediately after applying it: a later read or
- * content-ready callback can fail before this function returns. The
+ * preview release filter immediately after applying it: a later read
+ * can fail before this function returns. The
  * preview's null cursor cannot deduplicate persisted overlap itself.
  *
- * Phase 1 replays the tail as a preview and fires `onContentReady`.
- * Phase 2 pages the older rows down from the tail's first id until a
+ * Phase 1 replays the tail as a preview so the newest turn is on screen
+ * while the rest of the history is still being read. Phase 2 pages the older rows down from the tail's first id until a
  * page comes back short, then re-replays the WHOLE set once and syncs
  * the cursor to the head. A cancel anywhere in phase 2 leaves the slice
  * as the preview with a null cursor — cold, so the next mount starts
@@ -486,7 +473,6 @@ async function hydrateTailFirst(
   isCancelled: () => boolean,
   deps: CursorHydrateDeps,
   tail: AgentChatMessageTail,
-  onContentReady: (() => void) | undefined,
   setReleaseFilter: (filter: HeldEventFilter) => void,
 ): Promise<HeldEventFilter | undefined> {
   const liveStarted = startSubMeasure();
@@ -504,7 +490,6 @@ async function hydrateTailFirst(
     ({ persistedId }) => persistedId == null || !previewIds.has(persistedId),
   ));
   endSubMeasure(`hydrate:replay(${tail.rows.length})`, previewStarted);
-  onContentReady?.();
 
   // Newest page first, so the pages are collected in reverse and flipped
   // when assembled. Each page's first row is the next page's exclusive

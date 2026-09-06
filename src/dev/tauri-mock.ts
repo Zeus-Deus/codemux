@@ -5339,16 +5339,23 @@ const handlers: Record<string, Handler> = {
       }
     }
     // Apply to the mock's state exactly as the delta tells the renderer to.
-    target.last_visited_at = now;
-    target.notification_count = 0;
-    if (previous && previousLastVisited !== null) {
-      previous.last_visited_at = previousLastVisited;
-    }
+    // Patched workspaces are fresh objects, never mutated in place: the
+    // store receives the mock's own references, and memoised rows only
+    // re-render when the reference they hold changes.
     const pane_statuses = { ...appState.pane_statuses };
     for (const paneId of clearedReviewPaneIds) delete pane_statuses[paneId];
     appState = {
       ...appState,
       active_workspace_id: target.workspace_id,
+      workspaces: appState.workspaces.map((ws) => {
+        if (ws.workspace_id === target.workspace_id) {
+          return { ...ws, last_visited_at: now, notification_count: 0 };
+        }
+        if (previous && previousLastVisited !== null && ws.workspace_id === previousId) {
+          return { ...ws, last_visited_at: previousLastVisited };
+        }
+        return ws;
+      }),
       pane_statuses,
       notifications: appState.notifications.map((n) =>
         n.workspace_id === target.workspace_id && !n.read

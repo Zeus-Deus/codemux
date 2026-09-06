@@ -4495,13 +4495,17 @@ impl DatabaseStore {
     /// Served entirely by `idx_agent_chat_messages_thread(thread_id, id
     /// ASC)` — a warm revisit with nothing new touches only the index
     /// tail, which is the whole point of the cursor.
+    ///
+    /// Errors propagate rather than collapsing to an empty list: an empty
+    /// read is what a warm revisit with nothing new looks like, so
+    /// swallowing a failure here would leave the pane silently stale.
     pub fn list_agent_chat_messages_after(
         &self,
         thread_id: &str,
         after_id: Option<i64>,
-    ) -> Vec<(i64, String, i64)> {
+    ) -> rusqlite::Result<Vec<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        query_agent_chat_rows(&conn, thread_id, after_id.unwrap_or(0)).unwrap_or_default()
+        query_agent_chat_rows(&conn, thread_id, after_id.unwrap_or(0))
     }
 
     /// Tail read for a cold open: the newest rows of a thread, cut at a
@@ -7932,7 +7936,7 @@ mod tests {
         }
 
         // `None` == from the beginning.
-        let all = db.list_agent_chat_messages_after("t", None);
+        let all = db.list_agent_chat_messages_after("t", None).unwrap();
         assert_eq!(all.len(), 5);
         assert_eq!(all[0].0, ids[0]);
         assert_eq!(all[4].1, r#"{"i":4}"#);
@@ -7940,18 +7944,20 @@ mod tests {
         assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
 
         // A cursor is exclusive.
-        let tail = db.list_agent_chat_messages_after("t", Some(ids[2]));
+        let tail = db.list_agent_chat_messages_after("t", Some(ids[2])).unwrap();
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].1, r#"{"i":3}"#);
 
         // Warm revisit with nothing new.
         assert!(db
             .list_agent_chat_messages_after("t", Some(ids[4]))
+            .unwrap()
             .is_empty());
         // A cursor above the head reads as "nothing new" — the frontend
         // catches that case with `max_agent_chat_message_id`.
         assert!(db
             .list_agent_chat_messages_after("t", Some(ids[4] + 1000))
+            .unwrap()
             .is_empty());
     }
 
@@ -7964,10 +7970,15 @@ mod tests {
         db.append_agent_chat_message("t2", r#"{"b":2}"#).unwrap();
         db.append_agent_chat_message("t1", r#"{"c":3}"#).unwrap();
 
-        let t1 = db.list_agent_chat_messages_after("t1", None);
+        let t1 = db.list_agent_chat_messages_after("t1", None).unwrap();
         assert_eq!(t1.len(), 2);
         assert_eq!(t1[1].1, r#"{"c":3}"#);
-        assert_eq!(db.list_agent_chat_messages_after("unknown", None).len(), 0);
+        assert_eq!(
+            db.list_agent_chat_messages_after("unknown", None)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// A thread of `turns` user turns, each followed by `per_turn` tool
@@ -8122,6 +8133,8 @@ mod tests {
         assert!(before.starts_with("Err("), "read failure must reject, not EOF: {before}");
         let tail = format!("{:?}", db.list_agent_chat_messages_tail("t", 10));
         assert!(tail.starts_with("Err("), "read failure must reject, not complete: {tail}");
+        let after = format!("{:?}", db.list_agent_chat_messages_after("t", None));
+        assert!(after.starts_with("Err("), "read failure must reject, not read as empty: {after}");
     }
 
     #[test]
@@ -8140,6 +8153,11 @@ mod tests {
         assert!(before.starts_with("Err("), "row failure must reject the entire page: {before}");
         let tail = format!("{:?}", db.list_agent_chat_messages_tail("t", 10));
         assert!(tail.starts_with("Err("), "row failure must reject the entire tail: {tail}");
+        // The cursor read especially: an empty `Ok` here is exactly what a
+        // warm revisit with nothing new looks like, so the pane would stay
+        // stale without noticing.
+        let after = format!("{:?}", db.list_agent_chat_messages_after("t", None));
+        assert!(after.starts_with("Err("), "row failure must reject the cursor read: {after}");
     }
 
     #[test]

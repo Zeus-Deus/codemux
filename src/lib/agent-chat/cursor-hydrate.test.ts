@@ -908,7 +908,7 @@ describe("cursor hydrate — tail-first cold open", () => {
     },
   );
 
-  it.each(["preview callback", "first page", "later page"])(
+  it.each(["first page", "later page"])(
     "a failed %s releases only unseen events and stays cold",
     async (failure) => {
       useAgentChatStore.getState().ensureThread(THREAD);
@@ -946,10 +946,6 @@ describe("cursor hydrate — tail-first cold open", () => {
           pages += 1;
           if (failure === "later page" && pages === 1) return allRows.slice(2, 4);
           throw new Error("backfill read failed");
-        },
-      }, {
-        onContentReady: () => {
-          if (failure === "preview callback") throw new Error("preview callback failed");
         },
       });
       expect(warning).toHaveBeenCalled();
@@ -1036,23 +1032,18 @@ describe("cursor hydrate — tail-first cold open", () => {
     const hydrateThread = vi.spyOn(store, "hydrateThread");
     const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
     const { deps, calls, releasePage } = tailFirstDeps();
-    const onContentReady = vi.fn();
 
-    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps, {
-      onContentReady,
-    });
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
     await releasePage(); // lets the preview land and the first page resolve
     await running;
 
-    // Phase 1: the preview was applied as a PREVIEW — content-ready fired,
-    // no cursor. (Read back from the spy's call, since the final replay
+    // Phase 1: the preview was applied as a PREVIEW — no cursor. (Read back from the spy's call, since the final replay
     // has since replaced the slice.)
     expect(hydrateThreadTail).toHaveBeenCalledTimes(1);
     expect(hydrateThreadTail).toHaveBeenCalledWith(THREAD, tailRows, {
       runLive: false,
       provider: PROVIDER,
     });
-    expect(onContentReady).toHaveBeenCalledTimes(1);
     // Phase 2: one backfill page below the tail's first row, then ONE
     // replay of the complete ascending set.
     expect(calls.listBefore).toEqual([5]);
@@ -1195,25 +1186,17 @@ describe("cursor hydrate — tail-first cold open", () => {
     const hydrateThread = vi.spyOn(store, "hydrateThread");
     const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
     const listBefore = vi.fn<NonNullable<CursorHydrateDeps["listBefore"]>>();
-    const onContentReady = vi.fn();
-    await hydrateThreadByCursor(
-      THREAD,
-      PROVIDER,
-      () => false,
-      {
-        listAfter: async () => {
-          throw new Error("the cold path reads the tail, not the cursor");
-        },
-        headId: async () => 6,
-        turnActive: async () => false,
-        listTail: async () => ({ rows: allRows, total_rows: 6, complete: true }),
-        listBefore,
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async () => {
+        throw new Error("the cold path reads the tail, not the cursor");
       },
-      { onContentReady },
-    );
+      headId: async () => 6,
+      turnActive: async () => false,
+      listTail: async () => ({ rows: allRows, total_rows: 6, complete: true }),
+      listBefore,
+    });
     expect(hydrateThreadTail).not.toHaveBeenCalled();
     expect(listBefore).not.toHaveBeenCalled();
-    expect(onContentReady).not.toHaveBeenCalled();
     expect(hydrateThread).toHaveBeenCalledTimes(1);
     expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
     expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);

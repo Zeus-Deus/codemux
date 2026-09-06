@@ -221,12 +221,16 @@ fn join_relative(base: &Path, raw: &str) -> PathBuf {
 
 /// Walk up from `cwd` to the nearest `.git` and resolve its directories.
 /// Returns `None` for a directory that is not inside any repository.
+///
+/// A `.git` DIRECTORY only counts when it holds a `HEAD` file, which every
+/// real git dir does; a stray empty `.git` folder somewhere up the chain
+/// is skipped rather than mistaken for a repository root.
 pub fn locate_git_dirs(cwd: &Path) -> Option<GitDirs> {
     let mut current = cwd.to_path_buf();
     loop {
         let dot_git = current.join(".git");
         if let Ok(meta) = std::fs::metadata(&dot_git) {
-            if meta.is_dir() {
+            if meta.is_dir() && dot_git.join("HEAD").is_file() {
                 return Some(GitDirs {
                     worktree: current,
                     git_dir: dot_git.clone(),
@@ -973,12 +977,35 @@ mod fingerprint_tests {
 
     #[test]
     fn fingerprint_changes_when_a_folder_becomes_a_repo() {
+        // Deliberately does not assert the temp dir starts outside any
+        // repository: an ancestor may well be one on a developer machine.
+        // Either way, `git init` here must move the fingerprint.
         let tmp = TempDir::new().unwrap();
         let before = repo_fingerprint(tmp.path());
-        assert!(locate_git_dirs(tmp.path()).is_none());
         settle();
         run(tmp.path(), &["init"]);
-        assert_ne!(before, repo_fingerprint(tmp.path()));
+        let after = repo_fingerprint(tmp.path());
+        assert_ne!(before, after);
+        assert!(same_path(
+            &locate_git_dirs(tmp.path()).expect("initialised repo").worktree,
+            tmp.path()
+        ));
+    }
+
+    #[test]
+    fn an_empty_dot_git_directory_is_not_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+
+        // The stray empty `.git` is skipped; the walk continues to the
+        // real repository above it.
+        let dirs = locate_git_dirs(&sub).expect("enclosing repo");
+        assert!(same_path(&dirs.worktree, &repo));
+        assert!(same_path(&dirs.git_dir, &repo.join(".git")));
     }
 
     #[test]

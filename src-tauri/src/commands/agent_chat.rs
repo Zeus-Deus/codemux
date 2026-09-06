@@ -4548,7 +4548,10 @@ pub async fn agent_chat_list_messages_after(
     thread_id: String,
     after_id: Option<i64>,
 ) -> Result<Vec<AgentChatMessageRow>, String> {
-    Ok(shape_rows(db.list_agent_chat_messages_after(&thread_id, after_id)))
+    let rows = db
+        .list_agent_chat_messages_after(&thread_id, after_id)
+        .map_err(|err| format!("Failed to read chat messages: {err}"))?;
+    Ok(shape_rows(rows))
 }
 
 /// Highest persisted row id for a thread (`null` when it has none).
