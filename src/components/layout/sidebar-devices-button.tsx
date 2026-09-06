@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { MonitorSmartphone } from "lucide-react";
+import { MonitorSmartphone, type LucideIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -14,6 +14,7 @@ import {
   type DivergedRowLabel,
 } from "@/lib/devices-attention";
 import { cn } from "@/lib/utils";
+import { hasDevicesToShow } from "./footer-availability";
 import type { HostView, WorkspaceSyncView } from "@/tauri/commands";
 
 /**
@@ -68,8 +69,12 @@ function divergedLabels(
  */
 export function SidebarDevicesButton({
   tooltipSide = "top",
+  labeled = false,
+  icon: Icon = MonitorSmartphone,
 }: {
   tooltipSide?: "top" | "right";
+  icon?: LucideIcon;
+  labeled?: boolean;
 }) {
   const setShowDevices = useUIStore((s) => s.setShowDevices);
   const hosts = useHosts();
@@ -95,8 +100,7 @@ export function SidebarDevicesButton({
     [hosts, statuses, rows, transferError],
   );
 
-  const hasSiblingRows = rows.some((row) => row.workspace_id === null);
-  if (hosts.length === 0 && !hasSiblingRows) return null;
+  if (!hasDevicesToShow(hosts, rows)) return null;
 
   return (
     <Tooltip>
@@ -107,9 +111,10 @@ export function SidebarDevicesButton({
           aria-label="Devices"
           data-testid="sidebar-devices"
           onClick={() => setShowDevices(true)}
-          className="relative size-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground"
+          className={cn("relative h-7 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-xs" : "w-7")}
         >
-          <MonitorSmartphone className="size-[15px]" />
+          <Icon className="size-[15px]" />
+          {labeled && "Devices"}
           {dot && (
             <span
               data-testid="sidebar-devices-dot"

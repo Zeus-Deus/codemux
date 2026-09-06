@@ -28,6 +28,7 @@ beforeEach(() => {
     newWorkspaceProjectDir: null,
     showSettings: false,
     settingsSection: null,
+    settingsNavigationVersion: 0,
     showFileSearch: false,
     showContentSearch: false,
     pendingWorkspaces: [],
@@ -511,4 +512,16 @@ describe("ui-store — collapsing the right panel releases the agent browser", (
 
     expect(useUIStore.getState().rightPanelMaximized).toBe(false);
   });
+});
+
+
+it("distinguishes repeated requests for the same mounted Settings page", () => {
+  const open = useUIStore.getState().setShowSettings;
+  open(true, "appearance");
+  const first = useUIStore.getState().settingsNavigationVersion;
+  open(true, "appearance");
+  expect(useUIStore.getState().settingsNavigationVersion).toBe(first + 1);
+  expect(useUIStore.getState().settingsSection).toBe("appearance");
+  const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+  expect(persisted.state).not.toHaveProperty("settingsNavigationVersion");
 });

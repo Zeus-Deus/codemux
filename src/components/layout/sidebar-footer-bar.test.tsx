@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -85,6 +85,9 @@ vi.mock("@/hooks/use-resolved-keybinds", () => ({
   useResolvedKeybinds: () => ({ getKeysForAction: () => null }),
 }));
 
+import { useFooterPinsStore } from "@/stores/footer-pins-store";
+import { FOOTER_ACTIONS } from "@/lib/footer-actions";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { SidebarFooterBar } from "./sidebar-footer-bar";
 import {
   useUpdateStatusStore,
@@ -96,6 +99,10 @@ import {
 // unmounting between tests is what keeps one test's open menu out of the next
 // one's `document.querySelector('[role="menu"]')`.
 afterEach(cleanup);
+beforeEach(() => {
+  useFooterPinsStore.getState().reset();
+  useFeatureFlags.setState({ enableAgentChat: true });
+});
 
 function renderFooter(open: boolean) {
   // The Pull Requests entry carries a live count, so the footer now sits
@@ -326,5 +333,83 @@ describe("SidebarFooterBar — collapsed", () => {
       "Ports",
       "Menu",
     ]);
+  });
+});
+
+
+describe("footer customization", () => {
+  it("drops the Automations label before introducing overflow and restores it when space returns", () => {
+    hosts = [host(1, "test-device")];
+    const { container } = renderFooter(true);
+    const footer = within(container);
+    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+
+    act(() => {
+      for (const id of ["appearance", "terminal", "shortcuts"] as const) {
+        useFooterPinsStore.getState().togglePin(`codemux.settings.${id}`);
+      }
+    });
+    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
+    expect(footer.getByRole("button", { name: "Settings · Shortcuts" })).toBeInTheDocument();
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+
+    act(() => useFooterPinsStore.setState({ pins: FOOTER_ACTIONS.map((action) => ({ id: action.id })) }));
+    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
+    expect(footer.getByRole("button", { name: "More footer destinations" })).toBeInTheDocument();
+
+    act(() => useFooterPinsStore.getState().reset());
+    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
+    expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
+  });
+
+  it("keeps Settings, customization and reset reachable with no pins", async () => {
+    useFooterPinsStore.setState({ pins: [] });
+    renderFooter(true);
+    await userEvent.click(screen.getByRole("button", { name: "Menu" }));
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Restore footer defaults" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
+    expect(screen.getByRole("dialog", { name: "Customize footer" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Pin Settings · Appearance" }));
+    await userEvent.click(screen.getByRole("button", { name: "Choose icon for Settings · Appearance" }));
+    await userEvent.click(screen.getByRole("button", { name: "star icon" }));
+    expect(useFooterPinsStore.getState().pins).toEqual([{ id: "codemux.settings.appearance", iconId: "star" }]);
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Settings · Appearance" }));
+    expect(setShowSettingsMock).toHaveBeenCalledWith(true, "appearance");
+  });
+
+  it("reorders, removes and resets pins with accessible buttons", async () => {
+    renderFooter(true);
+    await userEvent.click(screen.getByRole("button", { name: "Menu" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
+    await userEvent.click(screen.getByRole("button", { name: "Move Ports up" }));
+    expect(useFooterPinsStore.getState().pins[2].id).toBe("codemux.ports.open");
+    await userEvent.click(screen.getByRole("button", { name: "Remove Automations" }));
+    expect(useFooterPinsStore.getState().pins.some((pin) => pin.id === "codemux.automations.open")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
+    expect(useFooterPinsStore.getState().pins[0].id).toBe("codemux.automations.open");
+  });
+
+  it.each([true, false])("keeps excess destinations accessible in overflow (expanded=%s)", async (expanded) => {
+    useFooterPinsStore.setState({ pins: FOOTER_ACTIONS.map((action) => ({ id: action.id })) });
+    const { container } = renderFooter(expanded);
+    expect(within(container).getByRole("button", { name: "Menu" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "More footer destinations" }));
+    await userEvent.click(screen.getByRole("button", { name: "Settings · Session Restore" }));
+    expect(setShowSettingsMock).toHaveBeenCalledWith(true, "session_restore");
+  });
+
+  it("hides gated pins without deleting their order or offering them in the picker", async () => {
+    useFooterPinsStore.setState({ pins: [{ id: "codemux.settings.skills" }, { id: "codemux.ports.open" }] });
+    useFeatureFlags.setState({ enableAgentChat: false });
+    renderFooter(true);
+    expect(screen.queryByRole("button", { name: "Settings · Skills" })).toBeNull();
+    expect(useFooterPinsStore.getState().pins[0].id).toBe("codemux.settings.skills");
+    await userEvent.click(screen.getByRole("button", { name: "Menu" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Customize footer" }));
+    expect(screen.getByText("Hidden until available")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pin Settings · Permissions" })).toBeNull();
   });
 });

@@ -115,6 +115,7 @@ interface UIStore {
   newWorkspaceProjectDir: string | null;
   showSettings: boolean;
   settingsSection: string | null;
+  settingsNavigationVersion: number;
   /** Set to request creating a new preset and opening its editor. The
    *  Presets settings view consumes and clears it. Not persisted. */
   pendingPresetCreate: boolean;
@@ -276,6 +277,7 @@ export const useUIStore = create<UIStore>()(
       newWorkspaceProjectDir: null,
       showSettings: false,
       settingsSection: null,
+      settingsNavigationVersion: 0,
       pendingPresetCreate: false,
       showAutomations: false,
       showDevices: false,
@@ -477,10 +479,11 @@ export const useUIStore = create<UIStore>()(
         }),
 
       setShowSettings: (show, section = null) =>
-        set({
+        set((state) => ({
           showSettings: show,
           settingsSection: show ? (section ?? null) : null,
-        }),
+          settingsNavigationVersion: state.settingsNavigationVersion + 1,
+        })),
       requestNewPreset: () =>
         set({
           showSettings: true,
