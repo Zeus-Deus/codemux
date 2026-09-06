@@ -24,6 +24,7 @@
 //! * Anything else surfaces as [`ProviderRuntimeEvent::RuntimeWarning`]
 //!   so adapter drift is observable instead of silent.
 
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::agent_provider::{
@@ -66,6 +67,7 @@ pub struct CodexSubagentDemux {
     /// This session's own (parent) Codex thread id. Notifications bearing
     /// this thread id drive the parent transcript / session state.
     parent_thread_id: String,
+    async_message_ids: HashSet<String>,
     /// Every thread id known to be a sub-agent of this session.
     subagents: HashSet<String>,
     /// child thread id → the thread that spawned it (parent thread or a
@@ -216,6 +218,7 @@ impl CodexSubagentDemux {
     pub fn new(parent_thread_id: impl Into<String>) -> Self {
         Self {
             parent_thread_id: parent_thread_id.into(),
+            async_message_ids: HashSet::new(),
             subagents: HashSet::new(),
             child_to_parent: HashMap::new(),
             context: ContextUsageTracker::default(),
@@ -306,6 +309,40 @@ pub fn translate_notification_with(
     thread_id: &ThreadId,
     msg: NotificationMessage,
 ) -> Vec<ProviderRuntimeEvent> {
+    // Async question messages are complete conversation items, not RPC requests.
+    if let NotificationMessage::ItemStarted(env) | NotificationMessage::ItemCompleted(env) = &msg {
+        if env.item.get("type").and_then(Value::as_str) == Some("agentMessage")
+            && (env.item.get("delivery").and_then(Value::as_str) == Some("async")
+                || env
+                    .item
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|q| !q.is_empty()))
+        {
+            if demux.async_message_ids.len() >= 1024 {
+                demux.async_message_ids.clear();
+            }
+            demux.async_message_ids.insert(
+                env.item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if matches!(&msg, NotificationMessage::ItemStarted(_)) {
+                return vec![];
+            }
+            let subagent_id = demux
+                .is_subagent(&env.thread_id)
+                .then(|| env.thread_id.clone());
+            return translate_async_questions(thread_id, env, subagent_id);
+        }
+    }
+    if let NotificationMessage::AgentMessageDelta(p) = &msg {
+        if demux.async_message_ids.contains(&p.item_id) {
+            return vec![];
+        }
+    }
     // 1. Sub-agent orchestration items (collabAgentToolCall /
     //    subAgentActivity) map to SubagentUpdated regardless of which
     //    thread carried them, and their raw tool rendering is suppressed.
@@ -1487,6 +1524,75 @@ pub fn translate_server_request(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn async_question_native_shape_suppresses_only_its_own_text() {
+        let mut demux = CodexSubagentDemux::default();
+        let payload = json!({"threadId":"native","turnId":"turn","completedAtMs":1000,
+            "item":{"type":"agentMessage","id":"question","text":"Which storage?\n- SQLite\n- PostgreSQL","phase":"final_answer","delivery":"async","questions":[{"title":"Which storage?","options":["SQLite","PostgreSQL"]}]}});
+        assert!(translate_notification_with(
+            &mut demux,
+            &tid(),
+            NotificationMessage::from_raw("item/started", payload.clone())
+        )
+        .is_empty());
+        assert!(translate_notification_with(&mut demux, &tid(), NotificationMessage::from_raw("item/agentMessage/delta", json!({"threadId":"native","turnId":"turn","itemId":"question","delta":"Which storage?"}))).is_empty());
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            NotificationMessage::from_raw("item/completed", payload),
+        );
+        assert!(
+            matches!(&events[0], ProviderRuntimeEvent::QuestionsAsked { question, .. } if question.target == "native" && question.questions.len() == 1)
+        );
+        let normal = translate_notification_with(
+            &mut demux,
+            &tid(),
+            NotificationMessage::from_raw(
+                "item/agentMessage/delta",
+                json!({"threadId":"native","turnId":"turn","itemId":"working","delta":"Still working"}),
+            ),
+        );
+        assert!(matches!(
+            &normal[0],
+            ProviderRuntimeEvent::ContentDelta { .. }
+        ));
+    }
+
+    #[test]
+    fn async_question_optional_fields_and_malformed_fallback_are_visible() {
+        for (questions, valid) in [
+            (json!([{"title":"Your preference?"}]), true),
+            (json!([{"options":[]}]), false),
+        ] {
+            let events = translate_notification(
+                &tid(),
+                NotificationMessage::from_raw(
+                    "item/completed",
+                    json!({"threadId":"native","turnId":"turn","completedAtMs":1000,"item":{"type":"agentMessage","id":"q","text":"","delivery":"async","questions":questions}}),
+                ),
+            );
+            if valid {
+                assert!(
+                    matches!(&events[0], ProviderRuntimeEvent::QuestionsAsked { question, .. } if question.questions[0].options.is_empty())
+                );
+            } else {
+                assert!(
+                    matches!(&events[0], ProviderRuntimeEvent::ItemCompleted { item: CompletedItem::AssistantText { text }, .. } if !text.is_empty())
+                );
+            }
+        }
+        let events = translate_notification(
+            &tid(),
+            NotificationMessage::from_raw(
+                "item/completed",
+                json!({"threadId":"native","turnId":"turn","completedAtMs":1000,"item":{"type":"agentMessage","id":"normal","text":"Ordinary text","questions":[]}}),
+            ),
+        );
+        assert!(
+            matches!(&events[0], ProviderRuntimeEvent::ItemCompleted { item: CompletedItem::AssistantText { text }, .. } if text == "Ordinary text")
+        );
+    }
 
     fn tid() -> ThreadId {
         ThreadId("thr-local".into())
@@ -3259,4 +3365,73 @@ mod plan_quota_tests {
             ProviderRuntimeEvent::PlanUsageUpdated { .. }
         ));
     }
+}
+
+fn translate_async_questions(
+    thread_id: &ThreadId,
+    env: &ItemEnvelope,
+    subagent_id: Option<String>,
+) -> Vec<ProviderRuntimeEvent> {
+    use crate::agent_provider::{UserQuestion, UserQuestionSet};
+    let text = env
+        .item
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let id = env
+        .item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let raw = env.item.get("questions").and_then(Value::as_array);
+    let questions: Vec<UserQuestion> = raw
+        .into_iter()
+        .flatten()
+        .filter_map(|q| {
+            let title = q.get("title")?.as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            Some(UserQuestion {
+                title: title.into(),
+                options: q
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            })
+        })
+        .collect();
+    if id.is_empty() || questions.is_empty() || raw.is_some_and(|r| r.len() != questions.len()) {
+        // Never silently discard a malformed question, including text-less ones.
+        let fallback = if text.is_empty() {
+            format!(
+                "Question could not be displayed: {}",
+                env.item.get("questions").unwrap_or(&Value::Null)
+            )
+        } else {
+            text.to_string()
+        };
+        return vec![ProviderRuntimeEvent::ItemCompleted {
+            thread_id: thread_id.clone(),
+            turn_id: TurnId(env.turn_id.clone()),
+            subagent_id,
+            item: CompletedItem::AssistantText { text: fallback },
+        }];
+    }
+    vec![ProviderRuntimeEvent::QuestionsAsked {
+        thread_id: thread_id.clone(),
+        question: UserQuestionSet {
+            id: format!("codex:{}:{}", env.thread_id, id),
+            target: env.thread_id.clone(),
+            source_item_id: id.into(),
+            source_turn_id: env.turn_id.clone(),
+            text: text.into(),
+            questions,
+            subagent_id,
+        },
+    }]
 }

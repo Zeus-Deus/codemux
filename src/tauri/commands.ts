@@ -3080,4 +3080,25 @@ export const searchMarketplaceThemes = (query: string) =>
   invoke<MarketplaceTheme[]>("vscode_marketplace_search", { query });
 
 export const fetchMarketplaceThemes = (vsixUrl: string) =>
-  invoke<MarketplaceThemeVariant[]>("vscode_marketplace_fetch_themes", { vsixUrl });
+  invoke<MarketplaceThemeVariant[]>("vscode_marketplace_fetch_themes", {
+    vsixUrl,
+  });
+
+export type QuestionAction =
+  | {
+      action: "answer";
+      answers: string[];
+      submission_id: string;
+      retry_unknown?: boolean;
+    }
+  | { action: "dismiss" | "reopen" | "reconcile" };
+export const agentChatAnswerQuestion = (
+  threadId: string,
+  questionId: string,
+  action: QuestionAction,
+) =>
+  invoke<import("./events").QuestionResolution>("agent_chat_answer_question", {
+    threadId,
+    questionId,
+    action,
+  });

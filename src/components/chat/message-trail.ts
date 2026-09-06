@@ -33,13 +33,18 @@ export function buildTrailEntries(slots: TranscriptSlot[]): TrailEntry[] {
   let turnIndex = 0;
   for (let i = 0; i < slots.length; i++) {
     const body = slots[i].body;
-    if (body.kind !== "item" || body.item.kind !== "user_message") continue;
+    if (
+      body.kind !== "item" ||
+      body.item.kind !== "user_message" ||
+      body.item.inflight
+    )
+      continue;
 
     let replySnippet = "";
     for (let j = i + 1; j < slots.length; j++) {
       const next = slots[j].body;
       if (next.kind !== "item") continue;
-      if (next.item.kind === "user_message") break;
+      if (next.item.kind === "user_message" && !next.item.inflight) break;
       if (next.item.kind === "assistant_message") {
         replySnippet = next.item.text.trim();
         break;

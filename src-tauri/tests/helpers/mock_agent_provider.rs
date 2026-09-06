@@ -32,6 +32,7 @@ pub enum MockCall {
     RollbackConversation(ThreadId, u32),
     StopSession(ThreadId),
     ListSessions,
+    AnswerQuestion(ThreadId, String),
 }
 
 /// Shared log of calls observed by one [`MockAgentProvider`].
@@ -60,6 +61,7 @@ impl MockAgentCalls {
 /// returns so the ProviderRegistry routes to the right mock.
 pub struct MockAgentProvider {
     kind: ProviderKind,
+    pub async_questions: bool,
     pub calls: MockAgentCalls,
     pub event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     /// Live-session registry so `has_session` mirrors a real adapter:
@@ -77,6 +79,7 @@ impl MockAgentProvider {
         let (event_tx, _rx) = broadcast::channel(64);
         Self {
             kind,
+            async_questions: false,
             calls: MockAgentCalls::new(),
             event_tx,
             live: Arc::new(Mutex::new(HashSet::new())),
@@ -107,6 +110,27 @@ impl MockAgentProvider {
 impl AgentProvider for MockAgentProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
+    }
+
+    fn supports_async_questions(&self) -> bool {
+        self.async_questions
+    }
+
+    async fn answer_question(
+        &self,
+        input: codemux_lib::agent_provider::AnswerQuestionInput,
+    ) -> Result<
+        codemux_lib::agent_provider::QuestionDelivery,
+        codemux_lib::agent_provider::QuestionDeliveryError,
+    > {
+        self.calls.push(MockCall::AnswerQuestion(
+            input.thread_id,
+            input.submission_id,
+        ));
+        tokio::task::yield_now().await;
+        Ok(codemux_lib::agent_provider::QuestionDelivery::Inflight {
+            turn_id: TurnId("native-turn".into()),
+        })
     }
 
     fn capabilities(&self) -> ProviderCapabilities {

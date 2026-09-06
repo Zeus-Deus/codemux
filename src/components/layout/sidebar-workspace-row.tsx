@@ -1,3 +1,4 @@
+import { AgentQuestionBadge } from "./agent-question-badge";
 import { useEffect, useState } from "react";
 import {
   ContextMenu,
@@ -1357,6 +1358,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               )}
             </div>
 
+            <AgentQuestionBadge workspaceId={workspace.workspace_id} />
             {/* Leading project chip — only in the LIVE section ("gather on
                 top"), where a lifted row needs its project origin shown.
                 Aligned to the icon row so it sits on line 1. */}
