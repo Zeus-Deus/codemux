@@ -6,7 +6,7 @@ import {
   applyEvent,
   createEmptyThreadState,
 } from "./reducer";
-import { interruptRunningSubagents } from "./subagents";
+import { interruptRunningSubagents, replaceTranscriptItem } from "./subagents";
 import type { ChatThreadState, ChatViewItem } from "./types";
 
 /**
@@ -271,9 +271,17 @@ export function stampSearchSourceId<T extends ChatThreadState>(
   ) {
     return next;
   }
-  const messages = next.messages.slice();
-  messages[targetIndex] = { ...target, source_event_id: persistedId };
-  return { ...next, messages };
+  // Through the index-carrying replace: a bare `slice()` + write would
+  // strand the transcript index on the previous array and force a full
+  // rebuild on the next reducer lookup — once per stamped row, which on a
+  // long replay is most of the user/assistant rows.
+  return {
+    ...next,
+    messages: replaceTranscriptItem(next.messages, targetIndex, {
+      ...target,
+      source_event_id: persistedId,
+    }),
+  };
 }
 
 /**

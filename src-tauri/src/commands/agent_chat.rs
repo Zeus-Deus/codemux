@@ -4567,15 +4567,10 @@ pub async fn agent_chat_list_messages_after(
     thread_id: String,
     after_id: Option<i64>,
 ) -> Result<Vec<AgentChatMessageRow>, String> {
-    Ok(db
+    let rows = db
         .list_agent_chat_messages_after(&thread_id, after_id)
-        .into_iter()
-        .map(|(id, payload, created_at_ms)| AgentChatMessageRow {
-            payload: shape_persisted_payload(id, &payload),
-            id,
-            created_at_ms,
-        })
-        .collect())
+        .map_err(|err| format!("Failed to read chat messages: {err}"))?;
+    Ok(shape_rows(rows))
 }
 
 /// Highest persisted row id for a thread (`null` when it has none).
@@ -4592,6 +4587,67 @@ pub async fn agent_chat_thread_head_id(
     thread_id: String,
 ) -> Result<Option<i64>, String> {
     Ok(db.max_agent_chat_message_id(&thread_id))
+}
+
+/// The newest whole turns of a thread, for a tail-first cold open.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentChatMessageTail {
+    /// Ascending; starts at a `user_message` row unless `complete`.
+    pub rows: Vec<AgentChatMessageRow>,
+    /// Rows the thread holds in total.
+    pub total_rows: i64,
+    /// `rows` is the whole thread — no backfill needed.
+    pub complete: bool,
+}
+
+/// Tail read for a COLD open: at least the last `limit` rows, widened
+/// down to the nearest `user_message` boundary so the page is a whole
+/// number of turns (see `DatabaseStore::list_agent_chat_messages_tail`
+/// for why an arbitrary cut is not safe to replay). The pane renders
+/// this immediately and backfills older rows through
+/// [`agent_chat_list_messages_before`] while the user is already reading.
+///
+/// Payloads are shaped exactly like [`agent_chat_list_messages_after`].
+#[tauri::command]
+pub async fn agent_chat_list_messages_tail(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    limit: i64,
+) -> Result<AgentChatMessageTail, String> {
+    let tail = db
+        .list_agent_chat_messages_tail(&thread_id, limit)
+        .map_err(|err| format!("Failed to read chat tail: {err}"))?;
+    Ok(AgentChatMessageTail {
+        rows: shape_rows(tail.rows),
+        total_rows: tail.total_rows,
+        complete: tail.complete,
+    })
+}
+
+/// Backfill page for a tail-first open: the newest `limit` rows strictly
+/// older than `before_id`, ascending. A page shorter than `limit` is the
+/// start of the thread. Payloads are shaped like the other list reads.
+#[tauri::command]
+pub async fn agent_chat_list_messages_before(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    before_id: i64,
+    limit: i64,
+) -> Result<Vec<AgentChatMessageRow>, String> {
+    let rows = db
+        .list_agent_chat_messages_before(&thread_id, before_id, limit)
+        .map_err(|err| format!("Failed to read chat backfill: {err}"))?;
+    Ok(shape_rows(rows))
+}
+
+fn shape_rows(rows: Vec<(i64, String, i64)>) -> Vec<AgentChatMessageRow> {
+    rows.into_iter()
+        .map(|(id, payload, created_at_ms)| AgentChatMessageRow {
+            payload: shape_persisted_payload(id, &payload),
+            id,
+            created_at_ms,
+        })
+        .collect()
 }
 
 /// Return one persisted row verbatim, by rowid — the full payload the

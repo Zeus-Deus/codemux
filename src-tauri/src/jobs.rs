@@ -6,9 +6,10 @@
 //! git subprocesses run for them, and how long a loop waits before its first
 //! tick so the timers don't phase-align.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 
@@ -17,6 +18,33 @@ use rand::Rng;
 /// well inside the window where a sidebar branch label reads as live, while
 /// the per-tick subprocess count drops to roughly `N / 6 + 1`.
 pub const GIT_SWEEP_STRIDE: u64 = 6;
+
+/// How many planned visits an inactive checkout may be skipped on its
+/// `.git` fingerprint alone before a full gather is forced regardless.
+///
+/// The fingerprint sees every change that goes through `.git` (commit,
+/// checkout, `git add`, fetch) but NOT an edit to a tracked file, which
+/// only moves the `changed_files` / diff-stat badge. A visit happens once
+/// per stride cycle (`GIT_SWEEP_STRIDE` × 5 s = 30 s), so 2 visits means a
+/// background row's dirty-file count can lag a plain editor save by at
+/// most ~60 s. The active workspace is never gated, so the row the user is
+/// looking at stays exact every tick.
+pub const GIT_SWEEP_FULL_GATHER_MIN_VISITS: u32 = 2;
+
+/// Upper bound for the forced-gather interval once a checkout has proven
+/// quiet. Every forced gather that finds nothing changed doubles the
+/// interval (2 → 4 → 8 visits, i.e. 60 s → 120 s → 240 s); any observed
+/// change — in the fingerprint or in the gathered values — snaps it back
+/// to `GIT_SWEEP_FULL_GATHER_MIN_VISITS`. An idle 200-checkout fleet thus
+/// converges to a handful of forks per tick instead of ~200, while a repo
+/// an agent is editing in the background stays on the 60 s cadence.
+pub const GIT_SWEEP_FULL_GATHER_MAX_VISITS: u32 = 8;
+
+/// Cap on the `refs/remotes` directory walk inside `repo_fingerprint`.
+/// Keeps the stat budget of one fingerprint bounded on repos with
+/// thousands of remote branches; anything past the cap is covered by the
+/// periodic forced gather.
+const FINGERPRINT_REF_DIR_BUDGET: usize = 256;
 
 /// A generation-aware singleflight gate for periodic background jobs.
 ///
@@ -143,6 +171,452 @@ pub fn plan_git_sweep(
         });
     }
     steps
+}
+
+// ---------------------------------------------------------------------------
+// Change gate for the git sweep
+// ---------------------------------------------------------------------------
+//
+// `gather_workspace_git_info` forks ~6 git subprocesses per checkout. On a
+// 200-checkout profile that was ~200 forks every 5 s tick (800-1000 ms of
+// blocking-pool time) while the user did nothing. Everything below exists
+// so an unchanged checkout costs a handful of `stat` calls instead.
+
+/// `(mtime, size)` of one path, or `None` when it does not exist. A path
+/// appearing or vanishing is itself a change worth noticing (`git init`,
+/// `packed-refs` being written for the first time, ...).
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
+/// The directories that make up one checkout, located without forking git.
+///
+/// Mirrors what `git rev-parse --git-dir` / `--git-common-dir` would say:
+/// for a main checkout all three are trivially related; for a linked
+/// worktree `.git` is a FILE holding `gitdir: <main>/.git/worktrees/<name>`
+/// and that directory's `commondir` file points back at the shared
+/// `<main>/.git`, which is where `refs/` and `packed-refs` live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirs {
+    /// Top of the working tree (the directory holding `.git`).
+    pub worktree: PathBuf,
+    /// Per-checkout metadata: `HEAD`, `index`, `logs/HEAD`.
+    pub git_dir: PathBuf,
+    /// Shared metadata: `refs/`, `packed-refs`, objects.
+    pub common_dir: PathBuf,
+}
+
+fn join_relative(base: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+/// Walk up from `cwd` to the nearest `.git` and resolve its directories.
+/// Returns `None` for a directory that is not inside any repository.
+///
+/// A `.git` DIRECTORY only counts when it holds a `HEAD` file, which every
+/// real git dir does; a stray empty `.git` folder somewhere up the chain
+/// is skipped rather than mistaken for a repository root.
+pub fn locate_git_dirs(cwd: &Path) -> Option<GitDirs> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        let dot_git = current.join(".git");
+        if let Ok(meta) = std::fs::metadata(&dot_git) {
+            if meta.is_dir() && dot_git.join("HEAD").is_file() {
+                return Some(GitDirs {
+                    worktree: current,
+                    git_dir: dot_git.clone(),
+                    common_dir: dot_git,
+                });
+            }
+            if meta.is_file() {
+                // Worktree or submodule pointer file. An unreadable or
+                // malformed one is still "a repo root as far as we can
+                // tell": the gather will report what git says, and the
+                // fingerprint falls back to the pointer file itself.
+                let git_dir = std::fs::read_to_string(&dot_git)
+                    .ok()
+                    .and_then(|content| {
+                        content
+                            .lines()
+                            .find_map(|line| line.strip_prefix("gitdir:"))
+                            .map(|rest| join_relative(&current, rest))
+                    })
+                    .unwrap_or_else(|| dot_git.clone());
+                let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+                    .ok()
+                    .map(|content| join_relative(&git_dir, &content))
+                    .unwrap_or_else(|| git_dir.clone());
+                return Some(GitDirs {
+                    worktree: current,
+                    git_dir,
+                    common_dir,
+                });
+            }
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Cheap filesystem identity of a checkout's git state.
+///
+/// Built purely from `stat` and one small file read; no subprocess. Two
+/// fingerprints compare equal exactly when none of the observed metadata
+/// moved. What it covers, and what each entry catches:
+///
+/// - `<git_dir>/HEAD` stamp + content — branch switch, detached HEAD.
+/// - `<git_dir>/index` — `git add`/`reset`/checkout and the stat-cache
+///   refresh git itself does after a tracked file changed.
+/// - `<git_dir>/logs/HEAD` — every commit, reset, checkout (the reflog
+///   only grows, so size alone is a reliable signal on coarse clocks).
+/// - `<common_dir>/refs/heads/<branch>` + its reflog — the current
+///   branch's tip moving, including from ANOTHER worktree of the repo.
+/// - `<common_dir>/refs`, `refs/heads`, `refs/remotes/**` dirs and
+///   `packed-refs` — fetches, `git gc`, branch creation/deletion, i.e. the
+///   upstream side of the ahead/behind count.
+/// - The worktree root directory and its `.git` entry — a new/removed
+///   top-level file, `git init` in a folder that was not a repo.
+///
+/// What it does NOT cover, on purpose: edits to tracked files below the
+/// root. Those only touch the file itself, and stat-walking a whole tree
+/// every 5 s is the cost this gate exists to avoid. `SweepGate` covers that
+/// gap with a periodic forced gather.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoFingerprint {
+    stamps: Vec<(PathBuf, Stamp)>,
+    head: Option<String>,
+    /// Indices into `stamps` that the gather itself may rewrite
+    /// (`<git_dir>/index` and the `<git_dir>` directory whose mtime moves
+    /// when `index.lock` is renamed over it). Full equality still counts
+    /// them — a `git add` from outside must be seen — but `gate_gather`
+    /// ignores them when deciding whether the gather absorbed a change.
+    gather_volatile: Vec<usize>,
+}
+
+impl RepoFingerprint {
+    fn push(&mut self, path: PathBuf) {
+        let stamp = stamp(&path);
+        self.stamps.push((path, stamp));
+    }
+
+    fn push_gather_volatile(&mut self, path: PathBuf) {
+        self.gather_volatile.push(self.stamps.len());
+        self.push(path);
+    }
+
+    /// Number of filesystem entries observed. Exposed for tests and
+    /// diagnostics only.
+    pub fn len(&self) -> usize {
+        self.stamps.len()
+    }
+
+    /// Paths whose stamp differs between the two fingerprints. Test-only
+    /// diagnostic so a failing assertion can say WHAT moved.
+    #[cfg(test)]
+    fn diff_paths(&self, other: &Self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .stamps
+            .iter()
+            .filter(|(path, stamp)| {
+                other
+                    .stamps
+                    .iter()
+                    .find(|(p, _)| p == path)
+                    .map(|(_, s)| s != stamp)
+                    .unwrap_or(true)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        if self.head != other.head {
+            out.push(PathBuf::from("<HEAD content>"));
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stamps.is_empty()
+    }
+
+    /// True when anything the gather does not itself write differs.
+    /// `git status` refreshes the index stat-cache and may rewrite
+    /// `<git_dir>/index` (moving the `<git_dir>` mtime with it); those
+    /// self-inflicted writes must not read as a change.
+    fn differs_beyond_gather_writes(&self, other: &Self) -> bool {
+        if self.head != other.head
+            || self.stamps.len() != other.stamps.len()
+            || self.gather_volatile != other.gather_volatile
+        {
+            return true;
+        }
+        self.stamps
+            .iter()
+            .zip(&other.stamps)
+            .enumerate()
+            .any(|(index, ((path_a, stamp_a), (path_b, stamp_b)))| {
+                path_a != path_b
+                    || (stamp_a != stamp_b && !self.gather_volatile.contains(&index))
+            })
+    }
+}
+
+/// Push every directory below `root` (and `root` itself), bounded by
+/// `budget`, in a deterministic order so two walks of an unchanged tree
+/// yield identical fingerprints.
+fn push_dir_tree(fp: &mut RepoFingerprint, root: PathBuf, budget: &mut usize) {
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        fp.push(dir.clone());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+        // Reverse-sort so the stack pops in ascending order.
+        children.sort_by(|a, b| b.cmp(a));
+        stack.extend(children);
+    }
+}
+
+pub fn repo_fingerprint(cwd: &Path) -> RepoFingerprint {
+    let mut fp = RepoFingerprint::default();
+    let Some(dirs) = locate_git_dirs(cwd) else {
+        // Not a repo: watch for one appearing (`git init`, or the folder
+        // being replaced by a clone). The root dir mtime moves when
+        // `.git` is created or any top-level entry changes.
+        fp.push(cwd.to_path_buf());
+        fp.push(cwd.join(".git"));
+        return fp;
+    };
+
+    fp.push(dirs.worktree.clone());
+    // For a main checkout `.git` IS the git dir, whose mtime moves when
+    // git renames `index.lock` into place; for a linked worktree it is a
+    // small pointer file nothing rewrites. Either way the gather may
+    // touch the git dir itself, so both are marked volatile.
+    fp.push_gather_volatile(dirs.worktree.join(".git"));
+    if dirs.git_dir != dirs.worktree.join(".git") {
+        fp.push_gather_volatile(dirs.git_dir.clone());
+    }
+    fp.push(dirs.git_dir.join("HEAD"));
+    fp.push_gather_volatile(dirs.git_dir.join("index"));
+    fp.push(dirs.git_dir.join("logs/HEAD"));
+    let head = std::fs::read_to_string(dirs.git_dir.join("HEAD"))
+        .ok()
+        .map(|content| content.trim().to_string());
+    let symbolic_ref = head
+        .as_deref()
+        .and_then(|head| head.strip_prefix("ref:"))
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    fp.head = head;
+    if let Some(reference) = symbolic_ref {
+        // The branch tip lives in the COMMON dir: another worktree
+        // committing to the same branch, or `git branch -f`, updates it
+        // without touching this checkout's own `.git`.
+        fp.push(dirs.common_dir.join(&reference));
+        fp.push(dirs.common_dir.join("logs").join(&reference));
+    }
+    fp.push(dirs.common_dir.join("packed-refs"));
+    fp.push(dirs.common_dir.join("refs"));
+    fp.push(dirs.common_dir.join("refs").join("heads"));
+    let mut budget = FINGERPRINT_REF_DIR_BUDGET;
+    push_dir_tree(
+        &mut fp,
+        dirs.common_dir.join("refs").join("remotes"),
+        &mut budget,
+    );
+    fp
+}
+
+/// Why a gated checkout was gathered this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatherReason {
+    /// The active workspace is never gated.
+    Active,
+    /// No fingerprint on record yet.
+    FirstSeen,
+    /// `.git` metadata moved since the last gather.
+    Changed,
+    /// Forced by the periodic cadence, to catch tracked-file edits.
+    Periodic,
+}
+
+/// Everything `gate_gather` needs to decide, captured on the async side
+/// so the decision and the gather run in ONE `spawn_blocking` hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatePlan {
+    previous: Option<RepoFingerprint>,
+    periodic_due: bool,
+    active: bool,
+}
+
+impl GatePlan {
+    /// The reason to gather given the fingerprint just taken, or `None`
+    /// to skip.
+    pub fn reason_for(&self, current: &RepoFingerprint) -> Option<GatherReason> {
+        if self.active {
+            return Some(GatherReason::Active);
+        }
+        let Some(previous) = &self.previous else {
+            return Some(GatherReason::FirstSeen);
+        };
+        if previous != current {
+            return Some(GatherReason::Changed);
+        }
+        if self.periodic_due {
+            return Some(GatherReason::Periodic);
+        }
+        None
+    }
+}
+
+/// Result of one gated visit. `gathered` is `None` when the visit was
+/// skipped on the fingerprint.
+#[derive(Debug)]
+pub struct GateOutcome<T> {
+    /// The fingerprint to remember for the next visit. See `gate_gather`
+    /// for how it is chosen when the gather itself moved `.git`.
+    pub fingerprint: RepoFingerprint,
+    pub gathered: Option<(GatherReason, T)>,
+}
+
+/// Blocking-pool half of the gate: stamp the checkout, and only when the
+/// plan says so run `gather`. `T` is opaque — this module does not need
+/// to know what a git snapshot looks like.
+///
+/// The fingerprint is taken again AFTER a gather because `git status`
+/// refreshes the index stat-cache and may rewrite `<git_dir>/index` as a
+/// side effect (moving the `<git_dir>` mtime with it). Remembering the
+/// post-gather stamp keeps that self-inflicted write from reading as a
+/// change on the next visit. Anything else that moved during the gather
+/// (a commit landing between two of the six git calls) is NOT absorbed:
+/// the pre-gather stamp is kept, so the next visit sees a diff and
+/// gathers again. An outside `git add` racing the gather is the one case
+/// that can be absorbed; the periodic forced gather covers it.
+pub fn gate_gather<T>(
+    plan: &GatePlan,
+    cwd: &Path,
+    gather: impl FnOnce(&Path) -> T,
+) -> GateOutcome<T> {
+    let before = repo_fingerprint(cwd);
+    let Some(reason) = plan.reason_for(&before) else {
+        return GateOutcome {
+            fingerprint: before,
+            gathered: None,
+        };
+    };
+    let info = gather(cwd);
+    let after = repo_fingerprint(cwd);
+    let fingerprint = if before.differs_beyond_gather_writes(&after) {
+        before
+    } else {
+        after
+    };
+    GateOutcome {
+        fingerprint,
+        gathered: Some((reason, info)),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GateEntry {
+    fingerprint: RepoFingerprint,
+    /// Skipped visits remaining before a forced gather.
+    visits_until_full: u32,
+    /// Current forced-gather interval, in visits; backs off while quiet.
+    full_every: u32,
+}
+
+/// Per-checkout memory of the git sweep. Owned by the sweep task in
+/// `lib.rs`; keyed by cwd string exactly as `GitSweepStep::cwd`.
+#[derive(Debug, Default)]
+pub struct SweepGate {
+    entries: HashMap<String, GateEntry>,
+}
+
+impl SweepGate {
+    /// Snapshot what `gate_gather` needs for `cwd`. Pure read — the
+    /// countdown only moves in `record`, so a plan that is never recorded
+    /// (gather task panicked) leaves the gate untouched and the next visit
+    /// simply retries.
+    pub fn plan(&self, cwd: &str, active: bool) -> GatePlan {
+        let entry = self.entries.get(cwd);
+        GatePlan {
+            previous: entry.map(|e| e.fingerprint.clone()),
+            periodic_due: entry.map(|e| e.visits_until_full == 0).unwrap_or(true),
+            active,
+        }
+    }
+
+    /// Fold one visit back in. `info_changed` is whether the gathered
+    /// values differed from what the sidebar already showed; it is the
+    /// signal that a tracked-file edit is happening without `.git`
+    /// noticing, and it keeps such a repo on the short cadence.
+    pub fn record<T>(&mut self, cwd: &str, outcome: &GateOutcome<T>, info_changed: bool) {
+        let Some((reason, _)) = &outcome.gathered else {
+            if let Some(entry) = self.entries.get_mut(cwd) {
+                entry.visits_until_full = entry.visits_until_full.saturating_sub(1);
+            }
+            return;
+        };
+        let min = GIT_SWEEP_FULL_GATHER_MIN_VISITS;
+        let max = GIT_SWEEP_FULL_GATHER_MAX_VISITS.max(min);
+        match self.entries.get_mut(cwd) {
+            Some(entry) => {
+                entry.fingerprint = outcome.fingerprint.clone();
+                entry.full_every = match reason {
+                    GatherReason::Periodic if !info_changed => (entry.full_every * 2).min(max),
+                    _ => min,
+                };
+                // The next forced gather is itself one visit in the interval.
+                entry.visits_until_full = entry.full_every.saturating_sub(1);
+            }
+            None => {
+                // Stagger first-seen checkouts across the cadence so a
+                // fleet opened at once does not force-gather in lockstep.
+                let stagger = (self.entries.len() as u32) % min.max(1);
+                self.entries.insert(
+                    cwd.to_string(),
+                    GateEntry {
+                        fingerprint: outcome.fingerprint.clone(),
+                        visits_until_full: min.saturating_sub(stagger).saturating_sub(1),
+                        full_every: min,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drop memory for checkouts no workspace points at any more.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.entries.retain(|cwd, _| keep(cwd));
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Collapse `(cwd, project_root)` pairs into one fetch per repository.
@@ -388,5 +862,512 @@ mod tests {
         release_tx.send(()).unwrap();
         async_task.await.unwrap();
         blocker.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    //! The change gate must (a) notice every `.git`-level change the
+    //! sidebar renders — branch, commit, staging, upstream — and (b) stay
+    //! stable when nothing happened, or the gate saves nothing.
+
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.invalid")
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-m", "init"]);
+    }
+
+    /// Filesystem mtimes are coarse on some platforms; two writes within
+    /// the same tick would otherwise be indistinguishable by mtime alone.
+    /// Sizes usually still differ, but sleep to make the tests robust.
+    fn settle() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    fn same_path(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_when_nothing_changed() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let a = repo_fingerprint(tmp.path());
+        settle();
+        let b = repo_fingerprint(tmp.path());
+        assert_eq!(a, b);
+        assert!(a.len() >= 8, "expected a handful of stamps, got {}", a.len());
+    }
+
+    #[test]
+    fn fingerprint_changes_on_commit() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let before = repo_fingerprint(tmp.path());
+        settle();
+        run(tmp.path(), &["commit", "--allow-empty", "-m", "two"]);
+        assert_ne!(before, repo_fingerprint(tmp.path()));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_branch_switch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let before = repo_fingerprint(tmp.path());
+        settle();
+        run(tmp.path(), &["checkout", "-b", "feature"]);
+        let after = repo_fingerprint(tmp.path());
+        assert_ne!(before, after);
+        assert_eq!(after.head.as_deref(), Some("ref: refs/heads/feature"));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_git_add() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("new.txt"), "x").unwrap();
+        // Untracked file below the root: the ROOT dir mtime moves, which
+        // is a change too, so take the baseline after creating it.
+        let before = repo_fingerprint(tmp.path());
+        settle();
+        run(tmp.path(), &["add", "new.txt"]);
+        assert_ne!(before, repo_fingerprint(tmp.path()));
+    }
+
+    #[test]
+    fn fingerprint_does_not_see_a_tracked_file_edit_in_a_subdirectory() {
+        // Documents the known gap the periodic forced gather covers.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "a").unwrap();
+        run(tmp.path(), &["add", "."]);
+        run(tmp.path(), &["commit", "-m", "src"]);
+        let before = repo_fingerprint(tmp.path());
+        settle();
+        std::fs::write(tmp.path().join("src/lib.rs"), "b").unwrap();
+        assert_eq!(before, repo_fingerprint(tmp.path()));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_folder_becomes_a_repo() {
+        // Deliberately does not assert the temp dir starts outside any
+        // repository: an ancestor may well be one on a developer machine.
+        // Either way, `git init` here must move the fingerprint.
+        let tmp = TempDir::new().unwrap();
+        let before = repo_fingerprint(tmp.path());
+        settle();
+        run(tmp.path(), &["init"]);
+        let after = repo_fingerprint(tmp.path());
+        assert_ne!(before, after);
+        assert!(same_path(
+            &locate_git_dirs(tmp.path()).expect("initialised repo").worktree,
+            tmp.path()
+        ));
+    }
+
+    #[test]
+    fn an_empty_dot_git_directory_is_not_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+
+        // The stray empty `.git` is skipped; the walk continues to the
+        // real repository above it.
+        let dirs = locate_git_dirs(&sub).expect("enclosing repo");
+        assert!(same_path(&dirs.worktree, &repo));
+        assert!(same_path(&dirs.git_dir, &repo.join(".git")));
+    }
+
+    #[test]
+    fn linked_worktree_resolves_gitdir_and_common_dir() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = tmp.path().join("wt");
+        run(&main, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+
+        let dirs = locate_git_dirs(&wt).expect("worktree is a repo");
+        assert!(same_path(&dirs.worktree, &wt));
+        assert!(same_path(
+            &dirs.git_dir,
+            &main.join(".git").join("worktrees").join("wt")
+        ));
+        assert!(same_path(&dirs.common_dir, &main.join(".git")));
+        assert!(dirs.git_dir.join("HEAD").is_file());
+        assert!(dirs.common_dir.join("refs").is_dir());
+
+        // A subdirectory of the worktree resolves to the same place.
+        std::fs::create_dir(wt.join("deep")).unwrap();
+        assert_eq!(locate_git_dirs(&wt.join("deep")), Some(dirs));
+    }
+
+    #[test]
+    fn worktree_fingerprint_sees_commits_made_in_that_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = tmp.path().join("wt");
+        run(&main, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+
+        let before = repo_fingerprint(&wt);
+        settle();
+        run(&wt, &["commit", "--allow-empty", "-m", "in worktree"]);
+        assert_ne!(before, repo_fingerprint(&wt));
+    }
+
+    #[test]
+    fn fingerprint_sees_the_current_branch_moving_from_another_worktree() {
+        // Two checkouts of one repo: a ref update from the main checkout
+        // moves `refs/heads/feature`, which lives in the common dir,
+        // without touching the worktree's own gitdir. (`branch -f`
+        // refuses on a checked-out branch; plumbing does not.)
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        init_repo(&main);
+        let wt = tmp.path().join("wt");
+        run(&main, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+        run(&main, &["commit", "--allow-empty", "-m", "ahead"]);
+
+        let before = repo_fingerprint(&wt);
+        settle();
+        run(&main, &["update-ref", "refs/heads/feature", "main"]);
+        assert_ne!(before, repo_fingerprint(&wt));
+    }
+
+    #[test]
+    fn fingerprint_sees_a_fetch_updating_remote_refs() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        init_repo(&origin);
+        let clone = tmp.path().join("clone");
+        run(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+
+        let before = repo_fingerprint(&clone);
+        settle();
+        run(&origin, &["commit", "--allow-empty", "-m", "upstream moved"]);
+        run(&clone, &["fetch", "-q"]);
+        assert_ne!(
+            before,
+            repo_fingerprint(&clone),
+            "a fetch changes ahead/behind and must not be skipped"
+        );
+    }
+
+    #[test]
+    fn real_gather_does_not_perturb_its_own_fingerprint() {
+        // `git status` refreshes the index stat-cache and may rewrite
+        // `.git/index`. If that read as a change, every inactive checkout
+        // would be gathered twice per visit and the gate would save
+        // nothing. Exercise the REAL gather, not a stub.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // A dirty tracked file forces the stat-cache refresh path.
+        std::fs::write(tmp.path().join("README.md"), "changed\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let mut gate = SweepGate::default();
+
+        let plan = gate.plan(&cwd, false);
+        let outcome = gate_gather(
+            &plan,
+            tmp.path(),
+            crate::commands::workspace::gather_workspace_git_info,
+        );
+        let (reason, info) = outcome.gathered.as_ref().expect("first visit gathers");
+        assert_eq!(*reason, GatherReason::FirstSeen);
+        assert_eq!(info.changed_files, 1);
+        gate.record(&cwd, &outcome, true);
+
+        settle();
+        let plan = gate.plan(&cwd, false);
+        let before = repo_fingerprint(tmp.path());
+        let outcome = gate_gather(
+            &plan,
+            tmp.path(),
+            crate::commands::workspace::gather_workspace_git_info,
+        );
+        assert!(
+            outcome.gathered.is_none(),
+            "second visit must skip: {:?}; moved: {:?}",
+            outcome.gathered.as_ref().map(|(r, _)| r),
+            plan.previous.as_ref().map(|p| p.diff_paths(&before))
+        );
+    }
+
+    #[test]
+    fn gate_gather_skips_an_unchanged_inactive_checkout_until_periodic_is_due() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let mut gate = SweepGate::default();
+        let mut forks = 0u32;
+
+        let visit = |gate: &mut SweepGate, forks: &mut u32, changed: bool| {
+            let plan = gate.plan(&cwd, false);
+            let outcome = gate_gather(&plan, tmp.path(), |_| {
+                *forks += 1;
+            });
+            let reason = outcome.gathered.as_ref().map(|(r, _)| *r);
+            gate.record(&cwd, &outcome, changed);
+            reason
+        };
+
+        // First visit always gathers.
+        assert_eq!(visit(&mut gate, &mut forks, true), Some(GatherReason::FirstSeen));
+        assert_eq!(forks, 1);
+        // The gather's own index refresh must not read as a change.
+        settle();
+        for _ in 1..GIT_SWEEP_FULL_GATHER_MIN_VISITS {
+            assert_eq!(visit(&mut gate, &mut forks, false), None);
+        }
+        assert_eq!(forks, 1, "unchanged repo must cost zero gathers");
+        // Countdown exhausted: forced gather.
+        assert_eq!(visit(&mut gate, &mut forks, false), Some(GatherReason::Periodic));
+        assert_eq!(forks, 2);
+        // Quiet periodic gather doubled the interval.
+        for _ in 1..(GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2) {
+            assert_eq!(visit(&mut gate, &mut forks, false), None);
+        }
+        assert_eq!(visit(&mut gate, &mut forks, false), Some(GatherReason::Periodic));
+        assert_eq!(forks, 3);
+    }
+
+    #[test]
+    fn gate_gather_runs_immediately_after_a_commit() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let mut gate = SweepGate::default();
+
+        let plan = gate.plan(&cwd, false);
+        let outcome = gate_gather(&plan, tmp.path(), |_| ());
+        gate.record(&cwd, &outcome, true);
+        settle();
+        let plan = gate.plan(&cwd, false);
+        let outcome = gate_gather(&plan, tmp.path(), |_| ());
+        assert!(outcome.gathered.is_none());
+        gate.record(&cwd, &outcome, false);
+
+        run(tmp.path(), &["commit", "--allow-empty", "-m", "two"]);
+        let plan = gate.plan(&cwd, false);
+        let outcome = gate_gather(&plan, tmp.path(), |_| ());
+        assert_eq!(
+            outcome.gathered.as_ref().map(|(r, _)| *r),
+            Some(GatherReason::Changed)
+        );
+        gate.record(&cwd, &outcome, true);
+
+        // ...and settles back to skipping.
+        settle();
+        let plan = gate.plan(&cwd, false);
+        let outcome = gate_gather(&plan, tmp.path(), |_| ());
+        assert!(outcome.gathered.is_none());
+    }
+
+    #[test]
+    fn active_checkout_is_never_gated() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_str().unwrap().to_string();
+        let mut gate = SweepGate::default();
+        for _ in 0..3 {
+            let plan = gate.plan(&cwd, true);
+            let outcome = gate_gather(&plan, tmp.path(), |_| ());
+            assert_eq!(
+                outcome.gathered.as_ref().map(|(r, _)| *r),
+                Some(GatherReason::Active)
+            );
+            gate.record(&cwd, &outcome, false);
+        }
+    }
+
+    #[test]
+    fn a_changed_result_on_a_periodic_gather_snaps_the_cadence_back() {
+        // Simulate a repo whose tracked files keep changing without any
+        // `.git` write: the fingerprint is constant, but the gathered
+        // values move. The interval must not back off for it.
+        let fp = RepoFingerprint::default();
+        let mut gate = SweepGate::default();
+        let outcome = GateOutcome {
+            fingerprint: fp.clone(),
+            gathered: Some((GatherReason::FirstSeen, ())),
+        };
+        gate.record("/r", &outcome, true);
+
+        let visits_until_forced = |gate: &mut SweepGate| {
+            let mut n = 0;
+            loop {
+                let plan = gate.plan("/r", false);
+                if let Some(reason) = plan.reason_for(&fp) {
+                    return (n, reason);
+                }
+                gate.record(
+                    "/r",
+                    &GateOutcome::<()> {
+                        fingerprint: fp.clone(),
+                        gathered: None,
+                    },
+                    false,
+                );
+                n += 1;
+            }
+        };
+
+        let (skipped, reason) = visits_until_forced(&mut gate);
+        assert_eq!(reason, GatherReason::Periodic);
+        assert_eq!(skipped + 1, GIT_SWEEP_FULL_GATHER_MIN_VISITS);
+        // Quiet: interval doubles.
+        gate.record(
+            "/r",
+            &GateOutcome {
+                fingerprint: fp.clone(),
+                gathered: Some((GatherReason::Periodic, ())),
+            },
+            false,
+        );
+        assert_eq!(
+            visits_until_forced(&mut gate).0 + 1,
+            GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2
+        );
+        // Busy: values moved on the forced gather, back to the minimum.
+        gate.record(
+            "/r",
+            &GateOutcome {
+                fingerprint: fp.clone(),
+                gathered: Some((GatherReason::Periodic, ())),
+            },
+            true,
+        );
+        assert_eq!(
+            visits_until_forced(&mut gate).0 + 1,
+            GIT_SWEEP_FULL_GATHER_MIN_VISITS
+        );
+    }
+
+    #[test]
+    fn periodic_interval_is_capped() {
+        let fp = RepoFingerprint::default();
+        let mut gate = SweepGate::default();
+        gate.record(
+            "/r",
+            &GateOutcome {
+                fingerprint: fp.clone(),
+                gathered: Some((GatherReason::FirstSeen, ())),
+            },
+            false,
+        );
+        for _ in 0..10 {
+            gate.record(
+                "/r",
+                &GateOutcome {
+                    fingerprint: fp.clone(),
+                    gathered: Some((GatherReason::Periodic, ())),
+                },
+                false,
+            );
+        }
+        let mut skipped = 0;
+        while gate.plan("/r", false).reason_for(&fp).is_none() {
+            gate.record(
+                "/r",
+                &GateOutcome::<()> {
+                    fingerprint: fp.clone(),
+                    gathered: None,
+                },
+                false,
+            );
+            skipped += 1;
+        }
+        assert_eq!(skipped + 1, GIT_SWEEP_FULL_GATHER_MAX_VISITS);
+    }
+
+    #[test]
+    fn first_periodic_gather_keeps_stagger_without_an_extra_visit() {
+        let mut gate = SweepGate::default();
+        let fp = RepoFingerprint::default();
+        let min = GIT_SWEEP_FULL_GATHER_MIN_VISITS;
+        for index in 0..(min * 2) {
+            let cwd = format!("/repo-{index}");
+            gate.record(
+                &cwd,
+                &GateOutcome {
+                    fingerprint: fp.clone(),
+                    gathered: Some((GatherReason::FirstSeen, ())),
+                },
+                false,
+            );
+            let interval = min - index % min;
+            for visit in 1..=interval {
+                let reason = gate.plan(&cwd, false).reason_for(&fp);
+                assert_eq!(
+                    reason,
+                    (visit == interval).then_some(GatherReason::Periodic),
+                    "checkout {index}, visit {visit}"
+                );
+                gate.record(
+                    &cwd,
+                    &GateOutcome {
+                        fingerprint: fp.clone(),
+                        gathered: reason.map(|reason| (reason, ())),
+                    },
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retain_drops_forgotten_checkouts() {
+        let mut gate = SweepGate::default();
+        for cwd in ["/a", "/b"] {
+            gate.record(
+                cwd,
+                &GateOutcome {
+                    fingerprint: RepoFingerprint::default(),
+                    gathered: Some((GatherReason::FirstSeen, ())),
+                },
+                false,
+            );
+        }
+        assert_eq!(gate.len(), 2);
+        gate.retain(|cwd| cwd == "/a");
+        assert_eq!(gate.len(), 1);
+        assert!(gate.plan("/b", false).previous.is_none());
     }
 }

@@ -7,6 +7,7 @@ import {
   stampSearchSourceId,
 } from "@/lib/agent-chat/hydrate";
 import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
+import { adoptItemIds } from "@/lib/agent-chat/adopt-item-ids";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
 import {
   applyEvent,
@@ -17,6 +18,7 @@ import {
   markRequestResponding,
   removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
+import { replaceTranscriptItem } from "@/lib/agent-chat/subagents";
 import type {
   ChatThreadState,
   ChatViewItem,
@@ -308,6 +310,16 @@ interface AgentChatStore {
     rows: AgentChatMessageRow[],
     opts?: ReplayOptions,
   ) => void;
+  /** Tail-first cold open: replay ONLY the newest turns so the pane is
+   *  content-ready before the rest of the history has crossed the IPC.
+   *  Identical to `hydrateThread` except that the cursor is left `null`
+   *  — the slice is a preview, not a synced copy, and only the
+   *  `hydrateThread` that follows the backfill may set it. */
+  hydrateThreadTail: (
+    threadId: string,
+    rows: AgentChatMessageRow[],
+    opts?: ReplayOptions,
+  ) => void;
   /** Warm resume: fold a CURSOR TAIL (rows after `lastPersistedEventId`)
    *  into the existing slice in ONE ordered reduction, then advance the
    *  cursor to the tail's last row id. Unlike `hydrateThread` this never
@@ -393,6 +405,50 @@ function updateSlice(
   if (next === existing) return {};
   touchThread(threadId);
   return { threads: { ...state.threads, [threadId]: next } };
+}
+
+/**
+ * Replace a slice's transcript with a replay of `rows`, keeping the
+ * user's UI-only fields (picker choices, draft, attachments).
+ *
+ * Shared by the full hydrate and the tail-first preview. The only thing
+ * the two disagree on is the cursor: a full replay syncs it to the head,
+ * a preview must leave it `null` (see `hydrateThreadTail`).
+ *
+ * When the slice already holds items, the replayed items ADOPT the ids
+ * of the ones they re-create (matched from the tail backwards). Ids are
+ * the transcript list's row keys, so this is what lets a full-history
+ * replay land under a tail preview — or a turn revert re-render the
+ * surviving prefix — without remounting the rows the user is looking at.
+ */
+function replayIntoSlice(
+  existing: ChatThreadSlice | undefined,
+  threadId: string,
+  rows: AgentChatMessageRow[],
+  opts: ReplayOptions | undefined,
+  cursor: { cursor: number | null },
+): ChatThreadSlice {
+  const replayed = replayTimed(parseTimedReplayPayloads(rows), opts);
+  const base = existing ?? emptySlice();
+  const messages =
+    base.messages.length > 0 && replayed.messages.length > 0
+      ? adoptItemIds(base.messages, replayed.messages)
+      : replayed.messages;
+  touchThread(threadId);
+  // Spread `replayed` last so its `messages`, `nextSeq`, `streaming`,
+  // `pendingRequestIds` overwrite the empty slice's defaults. UI-only
+  // fields (model, permissionMode, mode, …) come from `existing`
+  // because picker choices belong to the user, not to the historical
+  // conversation.
+  return {
+    ...base,
+    ...replayed,
+    messages,
+    // Hydration is a fresh-start scenario — drop ephemeral turn-state
+    // fields the live event stream owns.
+    activeTurnId: null,
+    lastPersistedEventId: cursor.cursor,
+  };
 }
 
 // ── Warm-slice retention ─────────────────────────────────────────────
@@ -692,28 +748,33 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
     }),
 
   hydrateThread: (threadId, rows, opts) =>
-    set((state) => {
-      const replayed = replayTimed(parseTimedReplayPayloads(rows), opts);
-      const existing = state.threads[threadId] ?? emptySlice();
-      // Spread `replayed` last so its `messages`, `nextSeq`,
-      // `streaming`, `pendingRequestIds` overwrite the empty slice's
-      // defaults. UI-only fields (model, permissionMode, mode, …)
-      // come from `existing` because picker choices belong to the
-      // user, not to the historical conversation.
-      const next: ChatThreadSlice = {
-        ...existing,
-        ...replayed,
-        // Hydration is a fresh-start scenario — drop ephemeral
-        // turn-state fields the live event stream owns.
-        activeTurnId: null,
-        // Rows arrive ascending, so the last one is the head. An empty
-        // hydrate still syncs the thread (cursor 0, not null): its
-        // history simply starts at the beginning of the id space.
-        lastPersistedEventId: rows.length > 0 ? rows[rows.length - 1].id : 0,
-      };
-      touchThread(threadId);
-      return { threads: { ...state.threads, [threadId]: next } };
-    }),
+    set((state) => ({
+      threads: {
+        ...state.threads,
+        [threadId]: replayIntoSlice(state.threads[threadId], threadId, rows, opts, {
+          // Rows arrive ascending, so the last one is the head. An empty
+          // hydrate still syncs the thread (cursor 0, not null): its
+          // history simply starts at the beginning of the id space.
+          cursor: rows.length > 0 ? rows[rows.length - 1].id : 0,
+        }),
+      },
+    })),
+
+  hydrateThreadTail: (threadId, rows, opts) =>
+    set((state) => ({
+      threads: {
+        ...state.threads,
+        // A tail is a PREVIEW of the thread, not a synced copy of it:
+        // rows below the tail are missing, so the cursor must stay null
+        // — a non-null cursor promises that everything at or below it is
+        // represented, and a warm revisit would trust that and never
+        // fetch the prefix. The full `hydrateThread` that follows the
+        // backfill sets it.
+        [threadId]: replayIntoSlice(state.threads[threadId], threadId, rows, opts, {
+          cursor: null,
+        }),
+      },
+    })),
 
   applyPayloadsTail: (threadId, rows, opts) =>
     set((state) => {
@@ -768,10 +829,14 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         );
         if (index < 0) continue;
         const item = slice.messages[index] as ToolCallItem;
-        const messages = [...slice.messages];
         // A new item object is exactly right: the transcript's slot reuse
-        // keys off item identity, so precisely this row re-renders.
-        messages[index] = { ...item, result_content: content };
+        // keys off item identity, so precisely this row re-renders. The
+        // index-carrying replace keeps the reducer's O(1) lookups warm
+        // instead of forcing a full-transcript rebuild on the next event.
+        const messages = replaceTranscriptItem(slice.messages, index, {
+          ...item,
+          result_content: content,
+        });
         return {
           threads: {
             ...state.threads,

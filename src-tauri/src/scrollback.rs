@@ -8,7 +8,7 @@
 //!   ~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.json  — pane metadata sidecar
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -189,9 +189,29 @@ pub fn load_scrollback(workspace_id: &str, pane_id: &str) -> Option<ScrollbackRe
 pub fn find_scrollback_meta_for_session(
     session_id: &str,
 ) -> Option<(String, String, ScrollbackMeta)> {
+    let mut wanted = HashSet::new();
+    wanted.insert(session_id);
+    find_scrollback_meta_for_sessions(&wanted).remove(session_id)
+}
+
+/// Batch form of [`find_scrollback_meta_for_session`]: one walk of the
+/// scrollback tree resolves every session in `session_ids`, keyed by session
+/// id. Hydrating a workspace with N panes used to walk (and parse) every
+/// meta file on disk N times — O(sessions × files) reads of the same JSON.
+///
+/// Same semantics per session as the single-id lookup: directory iteration
+/// order, first match wins, unreadable or unparsable files are skipped. The
+/// walk stops as soon as every requested id has been found.
+pub fn find_scrollback_meta_for_sessions(
+    session_ids: &HashSet<&str>,
+) -> HashMap<String, (String, String, ScrollbackMeta)> {
+    let mut found = HashMap::with_capacity(session_ids.len());
+    if session_ids.is_empty() {
+        return found;
+    }
     let base = scrollback_base();
     let Ok(workspace_entries) = fs::read_dir(&base) else {
-        return None;
+        return found;
     };
 
     for workspace_entry in workspace_entries.flatten() {
@@ -221,13 +241,21 @@ pub fn find_scrollback_meta_for_session(
                 continue;
             };
 
-            if meta.session_id == session_id {
-                return Some((workspace_id.clone(), meta.pane_id.clone(), meta));
+            if !session_ids.contains(meta.session_id.as_str())
+                || found.contains_key(&meta.session_id)
+            {
+                continue;
+            }
+            let session_id = meta.session_id.clone();
+            let pane_id = meta.pane_id.clone();
+            found.insert(session_id, (workspace_id.clone(), pane_id, meta));
+            if found.len() == session_ids.len() {
+                return found;
             }
         }
     }
 
-    None
+    found
 }
 
 /// List all pane IDs that have scrollback saved for a workspace.
@@ -721,6 +749,51 @@ mod tests {
         assert_eq!(found.2.session_id, sid);
 
         remove_workspace_scrollback(&ws);
+    }
+
+    #[test]
+    fn find_scrollback_meta_for_sessions_resolves_a_batch_in_one_walk() {
+        let pid = std::process::id();
+        let ws_a = format!("test-ws-batch-a-{pid}");
+        let ws_b = format!("test-ws-batch-b-{pid}");
+        let sid_a = format!("sess-batch-a-{pid}");
+        let sid_b = format!("sess-batch-b-{pid}");
+        let sid_missing = format!("sess-batch-missing-{pid}");
+        save_scrollback(&test_payload_with_session(&ws_a, "pane-a", &sid_a)).unwrap();
+        save_scrollback(&test_payload_with_session(&ws_b, "pane-b", &sid_b)).unwrap();
+        // A sibling that must not be returned: it was not asked for.
+        save_scrollback(&test_payload_with_session(
+            &ws_b,
+            "pane-other",
+            &format!("sess-batch-other-{pid}"),
+        ))
+        .unwrap();
+
+        let wanted: HashSet<&str> = [sid_a.as_str(), sid_b.as_str(), sid_missing.as_str()]
+            .into_iter()
+            .collect();
+        let found = find_scrollback_meta_for_sessions(&wanted);
+
+        assert_eq!(found.len(), 2);
+        let (ws, pane, meta) = &found[&sid_a];
+        assert_eq!((ws.as_str(), pane.as_str()), (ws_a.as_str(), "pane-a"));
+        assert_eq!(meta.session_id, sid_a);
+        let (ws, pane, _) = &found[&sid_b];
+        assert_eq!((ws.as_str(), pane.as_str()), (ws_b.as_str(), "pane-b"));
+        assert!(!found.contains_key(&sid_missing));
+
+        // Batch and single lookups agree, entry for entry.
+        for sid in [&sid_a, &sid_b] {
+            let single = find_scrollback_meta_for_session(sid).unwrap();
+            let batch = &found[sid.as_str()];
+            assert_eq!(single.0, batch.0);
+            assert_eq!(single.1, batch.1);
+            assert_eq!(single.2.session_id, batch.2.session_id);
+        }
+        assert!(find_scrollback_meta_for_sessions(&HashSet::new()).is_empty());
+
+        remove_workspace_scrollback(&ws_a);
+        remove_workspace_scrollback(&ws_b);
     }
 
     #[test]

@@ -95,6 +95,7 @@ import type {
 } from "@/tauri/commands";
 import type {
   AgentBrowserSession,
+  AppStateDelta,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   CheckInfo,
@@ -114,6 +115,7 @@ import type {
   ProviderChatCapabilities,
   ProviderHealthReport,
   ResourceMetricsSnapshot,
+  RevisionedDelta,
   ShellAppearance,
   ThemeColors,
   UserSettings,
@@ -133,7 +135,6 @@ console.log(
 
 let appState: AppStateSnapshot = createSeedAppState();
 let stressDeltaTimer: number | null = null;
-let stressDeltaRevision = 0;
 let stressDeltaCount = 0;
 let providerRuntimeCommandCount = 0;
 
@@ -174,11 +175,7 @@ function startStressDeltaDriver(): void {
   stressDeltaTimer = window.setInterval(() => {
     const status = statuses[stressDeltaCount % statuses.length];
     stressDeltaCount += 1;
-    stressDeltaRevision += 1;
-    emitEvent("app-state-delta", {
-      revision: stressDeltaRevision,
-      delta: { domain: "pane_status", pane_id: paneId, status },
-    });
+    emitAppStateDelta({ domain: "pane_status", pane_id: paneId, status });
   }, periodMs);
 }
 
@@ -484,6 +481,25 @@ function findChatPaneLocation(threadId: string): {
 
 function emitAppState(): void {
   emitEvent("app-state-changed", appState);
+}
+
+/** One revision counter for every mock delta (activation and the stress
+ *  driver alike), because the store requires deltas to be contiguous: two
+ *  independent counters would hand it the same revision twice. The mock's
+ *  full snapshots stay unrevisioned (revision 0 = "always apply", baseline
+ *  untouched), so they interleave with this stream without disturbing it. */
+let mockDeltaRevision = 0;
+
+function emitAppStateDelta(delta: AppStateDelta): void {
+  mockDeltaRevision += 1;
+  const payload: RevisionedDelta = { revision: mockDeltaRevision, delta };
+  emitEvent("app-state-delta", payload);
+}
+
+/** Every leaf pane id under `node`, in tree order. */
+function leafPaneIds(node: PaneNodeSnapshot): string[] {
+  if (node.kind !== "split") return [node.pane_id];
+  return node.children.flatMap(leafPaneIds);
 }
 
 // ── Event subsystem ─────────────────────────────────────────────────
@@ -1491,6 +1507,23 @@ function mockThreadRows(threadId: string): MockMessageRow[] {
   });
   mockThreadRowCache.set(threadId, rows);
   return rows;
+}
+
+/** `mockThreadRows` minus whatever a turn revert cut off the seeded thread —
+ *  the view every list read (cursor, tail, backfill, head) shares. */
+function mockVisibleThreadRows(threadId: string): MockMessageRow[] {
+  const rows = mockThreadRows(threadId);
+  if (threadId !== MOCK_CHAT_THREAD_ID || mockChatRevertCutoff === null) {
+    return rows;
+  }
+  const cutoff = mockChatRevertCutoff;
+  return rows.filter((row) => row.id <= cutoff);
+}
+
+/** Cheap turn-boundary test for the tail read: the `type` is the first key
+ *  of a user-turn envelope in the mock, but a regex keeps this agnostic. */
+function mockPayloadIsUserMessage(payload: string): boolean {
+  return /"type"\s*:\s*"user_message"/.test(payload);
 }
 
 /** Mirror of `shape_persisted_payload`: replace an oversized, non-image
@@ -3259,23 +3292,44 @@ const handlers: Record<string, Handler> = {
   agent_chat_list_messages_after: (a) => {
     const threadId = a.threadId as string;
     const afterId = (a.afterId as number | null | undefined) ?? 0;
-    return mockThreadRows(threadId).filter(
-      (row) =>
-        row.id > afterId &&
-        (threadId !== MOCK_CHAT_THREAD_ID ||
-          mockChatRevertCutoff === null ||
-          row.id <= mockChatRevertCutoff),
-    );
+    return mockVisibleThreadRows(threadId).filter((row) => row.id > afterId);
   },
   agent_chat_thread_head_id: (a) => {
     const threadId = a.threadId as string;
-    const rows = mockThreadRows(threadId).filter(
-      (row) =>
-        threadId !== MOCK_CHAT_THREAD_ID ||
-        mockChatRevertCutoff === null ||
-        row.id <= mockChatRevertCutoff,
-    );
+    const rows = mockVisibleThreadRows(threadId);
     return rows.length > 0 ? rows[rows.length - 1].id : null;
+  },
+  // Tail-first cold open: at least the last `limit` rows, widened down to
+  // the nearest `user_message` row so the page is whole turns — same
+  // contract as `list_agent_chat_messages_tail` in database.rs.
+  agent_chat_list_messages_tail: (a) => {
+    const threadId = a.threadId as string;
+    const limit = Math.max(1, a.limit as number);
+    const rows = mockVisibleThreadRows(threadId);
+    const total = rows.length;
+    if (total <= limit) return { rows, total_rows: total, complete: true };
+    let start = -1;
+    for (let i = total - limit; i >= 0; i -= 1) {
+      if (mockPayloadIsUserMessage(rows[i].payload)) {
+        start = i;
+        break;
+      }
+    }
+    if (start < 0) return { rows, total_rows: total, complete: true };
+    return {
+      rows: rows.slice(start),
+      total_rows: total,
+      complete: start === 0,
+    };
+  },
+  agent_chat_list_messages_before: (a) => {
+    const threadId = a.threadId as string;
+    const beforeId = a.beforeId as number;
+    const limit = Math.max(0, a.limit as number);
+    const older = mockVisibleThreadRows(threadId).filter(
+      (row) => row.id < beforeId,
+    );
+    return older.slice(Math.max(0, older.length - limit));
   },
   // The `@` mention popup and `+ → File…/Folder…` browse the project
   // tree. Without these the dev mock's pickers render empty, which
@@ -5365,11 +5419,64 @@ const handlers: Record<string, Handler> = {
   },
 
   // ── Mutators: patch in-memory state + re-emit ──
+  //
+  // Activation ships an `active_workspace` delta, not the full snapshot,
+  // mirroring the real backend so the mock sweep exercises the delta path
+  // (`applyDeltaToSnapshot` + pending confirmation). The mock's own copy is
+  // mutated identically so any later full emit (rename, close, …) agrees
+  // with what the renderer already derived from the delta.
   activate_workspace: (a) => {
-    if (findWorkspace(a.workspaceId)) {
-      appState = { ...appState, active_workspace_id: a.workspaceId as string };
-      emitAppState();
+    const target = findWorkspace(a.workspaceId);
+    if (!target) return undefined;
+    const now = Date.now();
+    const previousId = appState.active_workspace_id || null;
+    const previous = previousId ? findWorkspace(previousId) : undefined;
+    const previousLastVisited =
+      previous && previousId !== target.workspace_id ? now : null;
+    const surface = target.surfaces.find(
+      (candidate) => candidate.surface_id === target.active_surface_id,
+    );
+    const clearedReviewPaneIds: string[] = [];
+    if (surface) {
+      for (const paneId of leafPaneIds(surface.root)) {
+        if (appState.pane_statuses[paneId] === "review") {
+          clearedReviewPaneIds.push(paneId);
+        }
+      }
     }
+    // Apply to the mock's state exactly as the delta tells the renderer to.
+    // Patched workspaces are fresh objects, never mutated in place: the
+    // store receives the mock's own references, and memoised rows only
+    // re-render when the reference they hold changes.
+    const pane_statuses = { ...appState.pane_statuses };
+    for (const paneId of clearedReviewPaneIds) delete pane_statuses[paneId];
+    appState = {
+      ...appState,
+      active_workspace_id: target.workspace_id,
+      workspaces: appState.workspaces.map((ws) => {
+        if (ws.workspace_id === target.workspace_id) {
+          return { ...ws, last_visited_at: now, notification_count: 0 };
+        }
+        if (previous && previousLastVisited !== null && ws.workspace_id === previousId) {
+          return { ...ws, last_visited_at: previousLastVisited };
+        }
+        return ws;
+      }),
+      pane_statuses,
+      notifications: appState.notifications.map((n) =>
+        n.workspace_id === target.workspace_id && !n.read
+          ? { ...n, read: true }
+          : n,
+      ),
+    };
+    emitAppStateDelta({
+      domain: "active_workspace",
+      workspace_id: target.workspace_id,
+      previous_workspace_id: previousId,
+      last_visited_at: now,
+      previous_last_visited_at: previousLastVisited,
+      cleared_review_pane_ids: clearedReviewPaneIds,
+    });
     return undefined;
   },
   rename_workspace: (a) => {

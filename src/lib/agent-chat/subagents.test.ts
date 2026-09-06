@@ -3,10 +3,12 @@ import { describe, it, expect } from "vitest";
 import type { SubagentSnapshot } from "@/tauri/events";
 
 import {
+  appendTranscriptItem,
   countRunningSubagents,
   describeToolCall,
   findSubagentView,
   formatElapsed,
+  hasRunningSubagents,
   interruptRunningSubagents,
   isDone,
   isMonitorTask,
@@ -14,6 +16,7 @@ import {
   mergeStatus,
   newSubagentView,
   recentToolCalls,
+  replaceTranscriptItem,
   runningSubagentEntries,
   settleSubagentsForToolResult,
   subagentActivityLine,
@@ -29,6 +32,7 @@ import {
   subagentWaveTitle,
   subagentWaves,
   toneIndexForId,
+  transcriptIndex,
 } from "./subagents";
 import type {
   ChatViewItem,
@@ -296,6 +300,156 @@ describe("settleSubagentsForToolResult / interruptRunningSubagents", () => {
       card([view({ id: "a", status: "completed" })]),
     ];
     expect(interruptRunningSubagents(messages)).toBe(messages);
+  });
+});
+
+describe("transcriptIndex — O(1) lookups behind the settle / find helpers", () => {
+  function card(id: string, subs: SubagentView[]): SubagentRunItem {
+    return { kind: "subagent_run", id, seq: 0, turn_id: "t", subagents: subs };
+  }
+  function tool(useId: string): ToolCallItem {
+    return {
+      kind: "tool_call",
+      id: `tc-${useId}`,
+      seq: 0,
+      turn_id: "t",
+      tool_use_id: useId,
+      tool_name: "Read",
+      input: null,
+      status: "running",
+      result_content: null,
+      approval_request_id: null,
+    };
+  }
+  function workflow(id: string, agents: SubagentView[]): WorkflowRunItem {
+    return {
+      kind: "workflow_run",
+      id,
+      seq: 1,
+      workflowId: id,
+      status: "running",
+      name: null,
+      description: null,
+      script: null,
+      plannedPhases: [],
+      phases: [{ title: "P", detail: null, agents }],
+      resultText: null,
+      totalTokens: null,
+      agentCount: null,
+      startedAt: 0,
+      durationMs: null,
+      approvalRequestId: null,
+    };
+  }
+  /** What a from-scratch build over `messages` must equal — the oracle
+   *  every incrementally-maintained index is checked against. */
+  function expectIndexMatchesRebuild(messages: ChatViewItem[]) {
+    const live = transcriptIndex(messages);
+    // A fresh copy has no cached index, so this is a full rebuild.
+    const rebuilt = transcriptIndex(messages.slice());
+    expect(live.workflowCount).toBe(rebuilt.workflowCount);
+    expect(live.permissionRequestCount).toBe(rebuilt.permissionRequestCount);
+    expect([...live.toolUseIds].sort()).toEqual([...rebuilt.toolUseIds].sort());
+    expect([...live.runningSubagentKeys].sort()).toEqual(
+      [...rebuilt.runningSubagentKeys].sort(),
+    );
+  }
+
+  it("is computed lazily for a hand-built array and counts every key kind", () => {
+    const messages: ChatViewItem[] = [
+      tool("u1"),
+      tool("u2"),
+      card("c", [
+        view({ id: "s1", status: "running", parentItemId: "u1" }),
+        view({ id: "s2", status: "completed", parentItemId: "u2" }),
+      ]),
+      workflow("wf", [view({ id: "w1", status: "pending" })]),
+    ];
+    const idx = transcriptIndex(messages);
+    expect(idx.workflowCount).toBe(1);
+    expect(idx.permissionRequestCount).toBe(0);
+    expect([...idx.toolUseIds.keys()]).toEqual(["u1", "u2"]);
+    // Running keys: the running subagent's id AND its parentItemId; the
+    // completed one contributes nothing; pending counts as running.
+    expect([...idx.runningSubagentKeys.keys()].sort()).toEqual(
+      ["s1", "u1", "w1"].sort(),
+    );
+    expect(hasRunningSubagents(messages)).toBe(true);
+    // Same array → same cached index object.
+    expect(transcriptIndex(messages)).toBe(idx);
+  });
+
+  it("moves with replaceTranscriptItem / appendTranscriptItem and stays exact", () => {
+    let messages: ChatViewItem[] = [tool("u1")];
+    const first = transcriptIndex(messages);
+    messages = appendTranscriptItem(
+      messages,
+      card("c", [view({ id: "u1", status: "running" })]),
+    );
+    // Carried, not rebuilt: same index object, now holding the new row.
+    expect(transcriptIndex(messages)).toBe(first);
+    expect(first.runningSubagentKeys.has("u1")).toBe(true);
+    expectIndexMatchesRebuild(messages);
+
+    // Settle the subagent through the same replace primitive the reducer
+    // uses; the running key must drop out (count-based, exact).
+    const c = messages[1] as SubagentRunItem;
+    messages = replaceTranscriptItem(messages, 1, {
+      ...c,
+      subagents: [{ ...c.subagents[0], status: "completed" }],
+    });
+    expect(transcriptIndex(messages)).toBe(first);
+    expect(first.runningSubagentKeys.size).toBe(0);
+    expect(hasRunningSubagents(messages)).toBe(false);
+    expectIndexMatchesRebuild(messages);
+
+    // Duplicate tool_use_id rows are counted, so removing one keeps the key.
+    messages = appendTranscriptItem(messages, tool("u1"));
+    expect(first.toolUseIds.get("u1")).toBe(2);
+    messages = replaceTranscriptItem(messages, 0, tool("u9"));
+    expect(first.toolUseIds.get("u1")).toBe(1);
+    expect(first.toolUseIds.get("u9")).toBe(1);
+    expectIndexMatchesRebuild(messages);
+  });
+
+  it("never reads a handed-on index from the previous array (recomputes instead)", () => {
+    const base: ChatViewItem[] = [
+      card("c", [view({ id: "a", status: "running" })]),
+    ];
+    transcriptIndex(base); // cache it
+    // Two independent derivations from the same base — the pattern a test
+    // (or an optimistic + persisted race) produces.
+    const settled = settleSubagentsForToolResult(base, "a", false);
+    expect(settled).not.toBe(base);
+    expect(hasRunningSubagents(settled)).toBe(false);
+    // `base` is still the un-settled array: querying it again must rebuild
+    // from its rows, not reuse the index that moved to `settled`.
+    expect(hasRunningSubagents(base)).toBe(true);
+    expect(interruptRunningSubagents(base)).not.toBe(base);
+    expectIndexMatchesRebuild(base);
+    expectIndexMatchesRebuild(settled);
+  });
+
+  it("settle helpers keep the index exact across cards and workflow phases", () => {
+    let messages: ChatViewItem[] = [
+      card("c", [
+        view({ id: "a", status: "running", parentItemId: "spawn-a" }),
+        view({ id: "b", status: "running" }),
+      ]),
+      workflow("wf", [view({ id: "w", status: "running", parentItemId: "wf" })]),
+    ];
+    transcriptIndex(messages);
+    messages = settleSubagentsForToolResult(messages, "spawn-a", false);
+    expect([...transcriptIndex(messages).runningSubagentKeys.keys()].sort()).toEqual(
+      ["b", "w", "wf"].sort(),
+    );
+    expectIndexMatchesRebuild(messages);
+    messages = interruptRunningSubagents(messages);
+    expect(hasRunningSubagents(messages)).toBe(false);
+    expectIndexMatchesRebuild(messages);
+    // Nothing running → same ref, no work.
+    expect(interruptRunningSubagents(messages)).toBe(messages);
+    expect(settleSubagentsForToolResult(messages, "b", false)).toBe(messages);
   });
 });
 

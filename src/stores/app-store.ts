@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 import type {
+  ActiveWorkspaceDelta,
   AppStateDelta,
   AppStateSnapshot,
   PaneNodeSnapshot,
@@ -38,8 +39,9 @@ interface AppStore {
    *  task so the sidebar highlight and the target pane paint without waiting
    *  on IPC; the active-* selectors below prefer it over
    *  `appState.active_workspace_id` as long as the workspace exists in the
-   *  snapshot we already hold. Cleared on confirmation (`setAppState`), on a
-   *  rejected activate, or by the activation helper's safety timeout. */
+   *  snapshot we already hold. Cleared on confirmation (a snapshot or an
+   *  `active_workspace` delta whose active id matches), on a rejected
+   *  activate, or by the activation helper's safety timeout. */
   pendingActiveWorkspaceId: string | null;
   /** `Date.now()` when the pending selection was opened. Lets the activation
    *  helper age out a pending id the backend never confirmed. */
@@ -169,7 +171,122 @@ export function applyDeltaToSnapshot(
         snapshot_revision: revision,
       };
     }
+    case "active_workspace":
+      return applyActiveWorkspaceDelta(snapshot, delta, revision);
+    default:
+      // An older frontend meeting a domain it doesn't know (or vice versa).
+      // Return the snapshot untouched and let the caller advance
+      // `lastSeenRevision` anyway: the heartbeat / next snapshot will notice
+      // we are behind and resync. Opening a gap here would be worse — the
+      // revision DID arrive, it just carried nothing we could apply.
+      return snapshot;
   }
+}
+
+/**
+ * Reproduce everything `activate_workspace` mutates, from the small
+ * `active_workspace` delta instead of the full snapshot. This is the change
+ * that took the 500KB+ IPC + JSON.parse + reconcile off the switch path.
+ *
+ * Mirrors `AppStateStore::record_workspace_switch` in state_impl.rs, per
+ * the contract:
+ *   - `active_workspace_id` ← `workspace_id`
+ *   - target workspace: `last_visited_at` ← `last_visited_at`,
+ *     `notification_count` ← 0
+ *   - previous workspace (if distinct and `previous_last_visited_at` is
+ *     non-null): `last_visited_at` ← `previous_last_visited_at` — leaving
+ *     counts as having seen it, otherwise it goes bold-unread on switch-away
+ *   - `pane_statuses`: delete every `cleared_review_pane_ids` entry
+ *   - `notifications`: every entry for the target workspace becomes `read`
+ *
+ * Structural sharing is hand-rolled: only the one or two workspace objects
+ * that changed, the `workspaces` array, and the maps that actually moved get
+ * fresh references. Every other workspace (and its surfaces / pane tree)
+ * keeps its identity, so the sidebar rows, `React.memo` pane boundaries and
+ * the WeakMap-cached indexes all stay warm across a switch.
+ */
+function applyActiveWorkspaceDelta(
+  snapshot: AppStateSnapshot,
+  delta: ActiveWorkspaceDelta,
+  revision: number,
+): AppStateSnapshot {
+  const targetIndex = snapshot.workspaces.findIndex(
+    (w) => w.workspace_id === delta.workspace_id,
+  );
+  // The backend rejects activation of an unknown workspace, so this is a
+  // snapshot that predates the workspace's creation. Nothing to patch; the
+  // full emit for the creation will carry the activation too.
+  if (targetIndex === -1) return snapshot;
+
+  let workspaces: WorkspaceSnapshot[] | null = null;
+  const patchWorkspace = (
+    index: number,
+    patch: Partial<WorkspaceSnapshot>,
+  ): void => {
+    const current = (workspaces ?? snapshot.workspaces)[index];
+    let changed = false;
+    for (const key of Object.keys(patch) as (keyof WorkspaceSnapshot)[]) {
+      if (current[key] !== patch[key]) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) return;
+    workspaces ??= snapshot.workspaces.slice();
+    // Nested `surfaces`/`tabs` come along by reference — untouched.
+    workspaces[index] = { ...current, ...patch };
+  };
+
+  patchWorkspace(targetIndex, {
+    last_visited_at: delta.last_visited_at,
+    notification_count: 0,
+  });
+  if (
+    delta.previous_workspace_id !== null &&
+    delta.previous_workspace_id !== delta.workspace_id &&
+    delta.previous_last_visited_at !== null
+  ) {
+    const previousIndex = snapshot.workspaces.findIndex(
+      (w) => w.workspace_id === delta.previous_workspace_id,
+    );
+    if (previousIndex !== -1) {
+      patchWorkspace(previousIndex, {
+        last_visited_at: delta.previous_last_visited_at,
+      });
+    }
+  }
+
+  let pane_statuses: AppStateSnapshot["pane_statuses"] | null = null;
+  for (const paneId of delta.cleared_review_pane_ids) {
+    if ((pane_statuses ?? snapshot.pane_statuses)[paneId] === undefined) continue;
+    pane_statuses ??= { ...snapshot.pane_statuses };
+    delete pane_statuses[paneId];
+  }
+
+  let notifications: AppStateSnapshot["notifications"] | null = null;
+  snapshot.notifications.forEach((n, i) => {
+    if (n.workspace_id !== delta.workspace_id || n.read) return;
+    notifications ??= snapshot.notifications.slice();
+    notifications[i] = { ...n, read: true };
+  });
+
+  const activeChanged = snapshot.active_workspace_id !== delta.workspace_id;
+  if (
+    !activeChanged &&
+    workspaces === null &&
+    pane_statuses === null &&
+    notifications === null
+  ) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    active_workspace_id: delta.workspace_id,
+    ...(workspaces !== null ? { workspaces } : null),
+    ...(pane_statuses !== null ? { pane_statuses } : null),
+    ...(notifications !== null ? { notifications } : null),
+    snapshot_revision: revision,
+  };
 }
 
 /**
@@ -307,6 +424,28 @@ function hasStaleEntries(buffer: Map<number, AppStateDelta>, revision: number): 
   return false;
 }
 
+/** The store patch that retires an optimistic selection. */
+const CLEAR_PENDING_ACTIVATION = {
+  pendingActiveWorkspaceId: null,
+  pendingActivationAt: null,
+} as const;
+
+/**
+ * Whether `next` is the state that confirms the optimistic selection: the
+ * backend now agrees on `active_workspace_id`. Shared by the snapshot and
+ * delta paths so both retire the pending id by the same rule — an ID match,
+ * never "some activation landed". Pure — exported for unit tests.
+ */
+export function confirmsPending(
+  state: Pick<AppStore, "pendingActiveWorkspaceId">,
+  next: Pick<AppStateSnapshot, "active_workspace_id">,
+): boolean {
+  return (
+    state.pendingActiveWorkspaceId !== null &&
+    next.active_workspace_id === state.pendingActiveWorkspaceId
+  );
+}
+
 export const useAppStore = create<AppStore>((set) => ({
   appState: null,
   homeDir: null,
@@ -361,17 +500,16 @@ export const useAppStore = create<AppStore>((set) => ({
       const shared = state.appState
         ? shareStructural(state.appState, snapshot)
         : snapshot;
-      // Reconcile: the backend agrees with the optimistic selection, so the
-      // pending id has no further work to do.
-      const confirmed =
-        state.pendingActiveWorkspaceId !== null &&
-        shared.active_workspace_id === state.pendingActiveWorkspaceId;
-
       // This snapshot is a full baseline, so it closes any reorder gap it
       // covers: buffered deltas at or below its revision are superseded, and
       // the ones above it are replayed on top in order.
       const baseline = revision > 0 ? revision : state.lastSeenRevision;
       const drained = drainDeltaBuffer(shared, baseline, state.deltaBuffer);
+      // Reconcile: the backend agrees with the optimistic selection, so the
+      // pending id has no further work to do. Checked on the DRAINED state,
+      // so an `active_workspace` delta that was buffered behind this snapshot
+      // confirms in the same commit instead of waiting for another one.
+      const confirmed = confirmsPending(state, drained.appState);
 
       return {
         appState: drained.appState,
@@ -389,9 +527,7 @@ export const useAppStore = create<AppStore>((set) => ({
             : state.gapWindowId !== 0
               ? state.gapWindowId
               : ++gapWindowSeq,
-        ...(confirmed
-          ? { pendingActiveWorkspaceId: null, pendingActivationAt: null }
-          : null),
+        ...(confirmed ? CLEAR_PENDING_ACTIVATION : null),
       };
     }),
   // Deltas are small and already ordered, so they skip the emit-coalescing
@@ -433,16 +569,20 @@ export const useAppStore = create<AppStore>((set) => ({
         // one short window and let the missing revisions catch up.
         return bufferDelta(state, revision, delta);
       }
-      // No delta domain carries `active_workspace_id`, so an in-flight
-      // optimistic selection is untouched here by construction.
+      // Only the `active_workspace` domain moves `active_workspace_id`, and it
+      // is produced by the activation the pending id belongs to (or a newer
+      // one). Confirmation is by ID match, exactly as for a snapshot: on a
+      // rapid A→B→C the delta for B must not clear a pending C.
       const applied = applyDeltaToSnapshot(state.appState, delta, revision);
       const drained = drainDeltaBuffer(applied, revision, state.deltaBuffer);
+      const confirmed = confirmsPending(state, drained.appState);
       return {
         appState: drained.appState,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
         // The window only closes when nothing is left waiting on a revision.
         gapWindowId: drained.buffer.size === 0 ? 0 : state.gapWindowId,
+        ...(confirmed ? CLEAR_PENDING_ACTIVATION : null),
       };
     }),
   expireGapWindow: (windowId) =>
@@ -653,16 +793,6 @@ export function useHomeDir(): string | null {
   return useAppStore((s) => s.homeDir);
 }
 
-/** Recursively walk a pane tree checking whether the given pane id is
- *  present anywhere under the node. */
-function paneTreeContains(node: PaneNodeSnapshot, paneId: string): boolean {
-  if (node.pane_id === paneId) return true;
-  if (node.kind === "split") {
-    return node.children.some((child) => paneTreeContains(child, paneId));
-  }
-  return false;
-}
-
 /** Recursively collect every terminal pane's `session_id` under the given
  *  node into the supplied workspace map. Mutates `out` in place to avoid
  *  intermediate Map allocations during the walk. */
@@ -767,6 +897,56 @@ export function useWorkspaceCwdForSession(sessionId: string): string | null {
   });
 }
 
+/** Recursively record every pane id under `node` (leaves AND split nodes —
+ *  a split has a `pane_id` of its own) as belonging to `workspaceId`.
+ *  Mutates `out` in place, like `collectTerminalSessions`. */
+function collectPaneIds(
+  node: PaneNodeSnapshot,
+  workspaceId: string,
+  out: Map<string, string>,
+): void {
+  // First owner wins, matching the early-return of the scan this replaced.
+  if (!out.has(node.pane_id)) out.set(node.pane_id, workspaceId);
+  if (node.kind === "split") {
+    for (const child of node.children) collectPaneIds(child, workspaceId, out);
+  }
+}
+
+/** Build a reverse index from `pane_id` to the `workspace_id` whose surface
+ *  tree contains that pane. Pure function of the snapshot — exported for
+ *  unit testing. See `findWorkspaceIdForPane` for the cached lookup. */
+export function buildPaneWorkspaceIndex(
+  appState: AppStateSnapshot | null,
+): Map<string, string> {
+  const index = new Map<string, string>();
+  if (!appState) return index;
+  for (const ws of appState.workspaces) {
+    for (const surface of ws.surfaces) {
+      collectPaneIds(surface.root, ws.workspace_id, index);
+    }
+  }
+  return index;
+}
+
+// Same per-snapshot-reference caching as `sessionWorkspaceIndexCache`: the
+// snapshot wrapper is replaced on every commit (snapshot or delta), and an
+// unchanged reference means the pane tree cannot have moved.
+const paneWorkspaceIndexCache = new WeakMap<
+  AppStateSnapshot,
+  Map<string, string>
+>();
+
+function getCachedPaneWorkspaceIndex(
+  appState: AppStateSnapshot | null,
+): Map<string, string> {
+  if (!appState) return new Map();
+  const cached = paneWorkspaceIndexCache.get(appState);
+  if (cached) return cached;
+  const fresh = buildPaneWorkspaceIndex(appState);
+  paneWorkspaceIndexCache.set(appState, fresh);
+  return fresh;
+}
+
 /** Find the workspace id that owns a given pane, if any.
  *
  *  Used by `AgentChatPane`'s draft-aware mount guard: when the pane's
@@ -775,20 +955,21 @@ export function useWorkspaceCwdForSession(sessionId: string): string | null {
  *  need to know which workspace the pane belongs to so we can look up
  *  the promoted draft. Pure function of the snapshot — safe to call
  *  from inside a Zustand selector.
+ *
+ *  Zustand runs every subscribed selector on EVERY store commit, and this
+ *  is called from two or three selectors per mounted chat pane. The naive
+ *  workspaces × surfaces × tree walk was O(n) per selector per commit,
+ *  which at a few hundred workspaces and the delta stream's commit rate
+ *  became a visible slice of the switch path. The index is built once per
+ *  snapshot reference (WeakMap, like `getSessionWorkspaceId`) so every
+ *  subsequent lookup — including all the ones on the same commit — is O(1).
  */
 export function findWorkspaceIdForPane(
   state: { appState: AppStateSnapshot | null },
   paneId: string,
 ): string | null {
   if (!state.appState) return null;
-  for (const ws of state.appState.workspaces) {
-    for (const surface of ws.surfaces) {
-      if (paneTreeContains(surface.root, paneId)) {
-        return ws.workspace_id;
-      }
-    }
-  }
-  return null;
+  return getCachedPaneWorkspaceIndex(state.appState).get(paneId) ?? null;
 }
 
 export function useActiveSurface(): SurfaceSnapshot | null {

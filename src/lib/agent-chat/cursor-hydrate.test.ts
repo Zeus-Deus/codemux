@@ -824,3 +824,394 @@ describe("cursor hydrate — the turn-active probe", () => {
     expect(slice.streaming).toBe(true);
   });
 });
+
+/**
+ * The tail-first cold open: a long thread is previewed from its newest
+ * turns, then backfilled and re-replayed as a whole. What has to hold:
+ * the preview is content, not a synced slice (null cursor); the older
+ * rows are paged down to the start; exactly ONE `hydrateThread` closes
+ * the run with the cursor at the head; held events stay parked until
+ * that replay; a cancel between the phases leaves the slice cold.
+ */
+describe("cursor hydrate — tail-first cold open", () => {
+  beforeEach(() => {
+    useAgentChatStore.setState({ threads: {} });
+  });
+
+  /** 3 turns of user + assistant, ids 1..6. */
+  const allRows: AgentChatMessageRow[] = [
+    userRow(1, "q1"),
+    row(2, assistantEvent("a1", "turn-1")),
+    userRow(3, "q2"),
+    row(4, assistantEvent("a2", "turn-2")),
+    userRow(5, "q3"),
+    row(6, assistantEvent("a3", "turn-3")),
+  ];
+  const tailRows = allRows.slice(4); // the last turn, at a user boundary
+
+  it.each([false, true])("keeps live approval controls after backfill (failure=%s)", async (fail) => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async () => allRows,
+      headId: async () => 6,
+      turnActive: async () => true,
+      listTail: async () => ({ rows: tailRows, total_rows: 6, complete: false }),
+      listBefore: async () => {
+        enqueueAgentChatEvent(THREAD, {
+          type: "request_opened",
+          thread_id: THREAD,
+          turn_id: "turn-3",
+          request_id: "approval-live",
+          request_kind: "tool_approval",
+          tool_use_id: null,
+          payload: { tool_name: "Bash", input: { command: "pwd" } },
+        }, 7);
+        if (fail) throw new Error("backfill read failed");
+        return allRows.slice(0, 4);
+      },
+    });
+    warning.mockRestore();
+    const slice = useAgentChatStore.getState().threads[THREAD];
+    expect(slice.pendingRequestIds).toContain("approval-live");
+    expect(slice.streaming).toBe(true);
+    expect(slice.lastPersistedEventId).toBe(fail ? null : 7);
+    useAgentChatStore.getState().markRequestResponding(THREAD, "approval-live", { decision: "allow" });
+    enqueueAgentChatEvent(THREAD, {
+      type: "request_resolved",
+      thread_id: THREAD,
+      request_id: "approval-live",
+      decision: { decision: "allow" },
+    }, 8);
+    expect(useAgentChatStore.getState().threads[THREAD].pendingRequestIds).not.toContain("approval-live");
+  });
+
+  it.each(["empty preview", "short backfill", "incomplete full tail"])(
+    "never marks an %s warm",
+    async (failure) => {
+      useAgentChatStore.getState().ensureThread(THREAD);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+        listAfter: async () => allRows,
+        headId: async () => 6,
+        turnActive: async () => false,
+        listTail: async () => ({
+          rows: failure === "empty preview" ? [] : tailRows,
+          total_rows: 6,
+          complete: failure === "incomplete full tail",
+        }),
+        listBefore: async () => allRows.slice(2, 4),
+      });
+      warning.mockRestore();
+      expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBeNull();
+      if (failure === "short backfill") expect(transcript()).toEqual(["q3", "a3"]);
+    },
+  );
+
+  it.each(["first page", "later page"])(
+    "a failed %s releases only unseen events and stays cold",
+    async (failure) => {
+      useAgentChatStore.getState().ensureThread(THREAD);
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let pages = 0;
+      const delta = (text: string): ProviderRuntimeEvent => ({
+        type: "content_delta",
+        thread_id: THREAD,
+        turn_id: "turn-3",
+        delta: { kind: "text", text },
+      });
+      await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+        listAfter: async () => allRows,
+        headId: async () => 6,
+        turnActive: async () => true,
+        listTail: async () => {
+          // The read and live channel overlap, including unpersisted text.
+          enqueueAgentChatEvent(THREAD, JSON.parse(tailRows[0].payload), 5);
+          enqueueAgentChatEvent(THREAD, delta("a3"));
+          enqueueAgentChatEvent(THREAD, assistantEvent("a3", "turn-3"), 6);
+          // Newer text in the SAME turn must survive the failure release.
+          enqueueAgentChatEvent(THREAD, delta("new"));
+          enqueueAgentChatEvent(THREAD, assistantEvent("new", "turn-3"), 7);
+          enqueueAgentChatEvent(THREAD, {
+            type: "turn_completed",
+            thread_id: THREAD,
+            turn_id: "turn-3",
+            status: { kind: "success" },
+            usage: null,
+          }, 8);
+          return { rows: tailRows, total_rows: 6, complete: false };
+        },
+        backfillPageRows: 2,
+        listBefore: async () => {
+          pages += 1;
+          if (failure === "later page" && pages === 1) return allRows.slice(2, 4);
+          throw new Error("backfill read failed");
+        },
+      });
+      expect(warning).toHaveBeenCalled();
+      warning.mockRestore();
+      expect(transcript()).toEqual(["q3", "a3", "new"]);
+      const slice = useAgentChatStore.getState().threads[THREAD];
+      expect(slice.lastPersistedEventId).toBeNull();
+      expect(slice.streaming).toBe(false);
+      enqueueAgentChatEvent(THREAD, assistantEvent("after failure", "turn-4"), 9);
+      expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBeNull();
+
+      // A retry must still fetch the entire missing prefix, never warm-resume.
+      const retry = tailFirstDeps();
+      const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, retry.deps);
+      await retry.releasePage();
+      await running;
+      expect(retry.calls.listTail).toBe(1);
+      expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+    },
+  );
+
+  it("renders the newest turn before requesting older history", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const previews: string[][] = [];
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async () => allRows,
+      headId: async () => 6,
+      turnActive: async () => false,
+      listTail: async () => ({ rows: tailRows, total_rows: 6, complete: false }),
+      listBefore: async () => {
+        previews.push(transcript());
+        return allRows.slice(0, 4);
+      },
+    });
+    expect(previews).toEqual([["q3", "a3"]]);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+  });
+
+  /**
+   * Deps whose backfill read is gated per page: `awaitPageRequest()`
+   * resolves once the flow has ASKED for the next page (the preview is on
+   * screen and the backfill is in flight at that moment), and
+   * `releasePage()` lets that page resolve.
+   */
+  function tailFirstDeps() {
+    const calls = { listAfter: 0, listTail: 0, listBefore: [] as number[] };
+    const pending: Array<() => void> = [];
+    let requested: Array<() => void> = [];
+    const deps: CursorHydrateDeps = {
+      listAfter: async (_t, afterId) => {
+        calls.listAfter += 1;
+        return afterId === null ? allRows : allRows.filter((r) => r.id > afterId);
+      },
+      headId: async () => 6,
+      turnActive: async () => false,
+      listTail: async () => {
+        calls.listTail += 1;
+        return { rows: tailRows, total_rows: allRows.length, complete: false };
+      },
+      listBefore: async (_t, beforeId, limit) => {
+        calls.listBefore.push(beforeId);
+        const waiters = requested;
+        requested = [];
+        for (const w of waiters) w();
+        await new Promise<void>((resolve) => pending.push(resolve));
+        const older = allRows.filter((r) => r.id < beforeId);
+        return older.slice(Math.max(0, older.length - limit));
+      },
+    };
+    const awaitPageRequest = () =>
+      pending.length > 0
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => requested.push(resolve));
+    const releasePage = async () => {
+      await awaitPageRequest();
+      pending.shift()?.();
+    };
+    return { deps, calls, awaitPageRequest, releasePage };
+  }
+
+  it("previews the tail, backfills, then does one full replay with the cursor at the head", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const store = useAgentChatStore.getState();
+    const hydrateThread = vi.spyOn(store, "hydrateThread");
+    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
+    const { deps, calls, releasePage } = tailFirstDeps();
+
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
+    await releasePage(); // lets the preview land and the first page resolve
+    await running;
+
+    // Phase 1: the preview was applied as a PREVIEW — no cursor. (Read back from the spy's call, since the final replay
+    // has since replaced the slice.)
+    expect(hydrateThreadTail).toHaveBeenCalledTimes(1);
+    expect(hydrateThreadTail).toHaveBeenCalledWith(THREAD, tailRows, {
+      runLive: false,
+      provider: PROVIDER,
+    });
+    // Phase 2: one backfill page below the tail's first row, then ONE
+    // replay of the complete ascending set.
+    expect(calls.listBefore).toEqual([5]);
+    expect(calls.listAfter).toBe(0);
+    expect(hydrateThread).toHaveBeenCalledTimes(1);
+    expect(hydrateThread).toHaveBeenCalledWith(THREAD, allRows, {
+      runLive: false,
+      provider: PROVIDER,
+    });
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);
+  });
+
+  it("the preview slice carries a null cursor until the final replay", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const { deps, releasePage, awaitPageRequest } = tailFirstDeps();
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
+    // Wait until the backfill page has been REQUESTED — the preview is on
+    // screen at that point and the backfill is in flight.
+    await awaitPageRequest();
+    expect(transcript()).toEqual(["q3", "a3"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBeNull();
+
+    await releasePage();
+    await running;
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);
+  });
+
+  it("keeps the visible rows' item ids across the final replay", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const { deps, releasePage, awaitPageRequest } = tailFirstDeps();
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
+    await awaitPageRequest();
+    const previewIds = useAgentChatStore
+      .getState()
+      .threads[THREAD].messages.map((m) => m.id);
+    expect(previewIds).toHaveLength(2);
+
+    await releasePage();
+    await running;
+    const finalIds = useAgentChatStore.getState().threads[THREAD].messages.map((m) => m.id);
+    expect(finalIds).toHaveLength(6);
+    expect(finalIds.slice(-2)).toEqual(previewIds);
+  });
+
+  it("pages the backfill down to the start when a page comes back full", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    // Pages of 2 rows: 4 older rows → two FULL pages, then an empty one
+    // that ends the walk (a page equal to the limit cannot prove it was
+    // the last). Each page's first id bounds the next.
+    const { deps, calls, releasePage } = tailFirstDeps();
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      ...deps,
+      backfillPageRows: 2,
+    });
+    await releasePage();
+    await releasePage();
+    await releasePage();
+    await running;
+    // 5 → [3,4]; 3 → [1,2]; 1 → [].
+    expect(calls.listBefore).toEqual([5, 3, 1]);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);
+  });
+
+  it("holds live events through the backfill and releases them only after the final replay", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const { deps, releasePage, awaitPageRequest } = tailFirstDeps();
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, deps);
+    await awaitPageRequest();
+    // Preview is on screen; a live event for the thread arrives now.
+    expect(transcript()).toEqual(["q3", "a3"]);
+    enqueueAgentChatEvent(THREAD, assistantEvent("live-7", "turn-3"), 7);
+    // Still held — applying it now would be wiped by the full replay.
+    expect(transcript()).toEqual(["q3", "a3"]);
+
+    await releasePage();
+    await running;
+    flushAllAgentChatEvents();
+    // Released after the replay: it lands once, on top of the full set.
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3", "live-7"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(7);
+  });
+
+  it("a cancel mid-backfill drops the held events and leaves the slice cold", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const store = useAgentChatStore.getState();
+    const hydrateThread = vi.spyOn(store, "hydrateThread");
+    const { deps, releasePage, awaitPageRequest } = tailFirstDeps();
+    let cancelled = false;
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => cancelled, deps);
+    await awaitPageRequest();
+    enqueueAgentChatEvent(THREAD, assistantEvent("live-7", "turn-3"), 7);
+
+    cancelled = true;
+    await releasePage();
+    await running;
+    flushAllAgentChatEvents();
+
+    // No final replay, the held event was discarded (the cursor never
+    // covered it, so the next open's tail read brings it back), and the
+    // preview is NOT marked warm.
+    expect(hydrateThread).not.toHaveBeenCalled();
+    expect(transcript()).toEqual(["q3", "a3"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBeNull();
+
+    // The next mount opens cold again — tail-first, not a cursor read.
+    const again = tailFirstDeps();
+    const rerun = hydrateThreadByCursor(THREAD, PROVIDER, () => false, again.deps);
+    await again.releasePage();
+    await rerun;
+    expect(again.calls.listTail).toBe(1);
+    expect(again.calls.listAfter).toBe(0);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+  });
+
+  it("a warm revisit after a completed tail-first open uses the cursor path", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const first = tailFirstDeps();
+    const running = hydrateThreadByCursor(THREAD, PROVIDER, () => false, first.deps);
+    await first.releasePage();
+    await running;
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);
+
+    const second = tailFirstDeps();
+    const listAfter = vi.fn<CursorHydrateDeps["listAfter"]>().mockResolvedValue([]);
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      ...second.deps,
+      listAfter,
+    });
+    expect(listAfter).toHaveBeenCalledWith(THREAD, 6);
+    expect(second.calls.listTail).toBe(0);
+    expect(second.calls.listBefore).toEqual([]);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+  });
+
+  it("a complete tail is the plain full replay — no preview, no backfill", async () => {
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const store = useAgentChatStore.getState();
+    const hydrateThread = vi.spyOn(store, "hydrateThread");
+    const hydrateThreadTail = vi.spyOn(store, "hydrateThreadTail");
+    const listBefore = vi.fn<NonNullable<CursorHydrateDeps["listBefore"]>>();
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter: async () => {
+        throw new Error("the cold path reads the tail, not the cursor");
+      },
+      headId: async () => 6,
+      turnActive: async () => false,
+      listTail: async () => ({ rows: allRows, total_rows: 6, complete: true }),
+      listBefore,
+    });
+    expect(hydrateThreadTail).not.toHaveBeenCalled();
+    expect(listBefore).not.toHaveBeenCalled();
+    expect(hydrateThread).toHaveBeenCalledTimes(1);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+    expect(useAgentChatStore.getState().threads[THREAD].lastPersistedEventId).toBe(6);
+  });
+
+  it("falls back to the cursor read when the deps carry no tail read", async () => {
+    // Older callers / tests that only provide `listAfter` keep working.
+    useAgentChatStore.getState().ensureThread(THREAD);
+    const listAfter = vi.fn<CursorHydrateDeps["listAfter"]>().mockResolvedValue(allRows);
+    await hydrateThreadByCursor(THREAD, PROVIDER, () => false, {
+      listAfter,
+      headId: async () => 6,
+      turnActive: async () => false,
+    });
+    expect(listAfter).toHaveBeenCalledWith(THREAD, null);
+    expect(transcript()).toEqual(["q1", "a1", "q2", "a2", "q3", "a3"]);
+  });
+});

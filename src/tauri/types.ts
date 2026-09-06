@@ -1260,15 +1260,17 @@ export interface NativePerformanceDiagnostics {
 // ── Domain deltas ──
 //
 // Mirror of `AppStateDelta` / `RevisionedDelta` in
-// src-tauri/src/state/state_impl.rs. High-frequency metadata refreshes ship
-// one of these on `app-state-delta` instead of a full `AppStateSnapshot`;
-// the snapshot stays the boot / resync / activation vehicle.
+// src-tauri/src/state/state_impl.rs. High-frequency metadata refreshes AND
+// workspace activation ship one of these on `app-state-delta` instead of a
+// full `AppStateSnapshot`; the snapshot stays the boot / resync vehicle and
+// the carrier for structural mutations (create / close / split / tabs).
 //
 // Deltas and snapshots share ONE revision counter, so the renderer sees a
 // single totally ordered stream: a delta at revision N reflects the backend
-// state at N, and a snapshot at N supersedes every delta at or below N. No
-// variant carries `active_workspace_id` — deliberately, so a background
-// refresh can never clobber an optimistic selection.
+// state at N, and a snapshot at N supersedes every delta at or below N. Only
+// `active_workspace` moves `active_workspace_id` — and only because it is
+// produced by a user-initiated activation, never by a background refresh, so
+// it can't clobber an optimistic selection it didn't itself confirm.
 
 /** The git-metadata subset of `WorkspaceSnapshot` carried by a
  *  `workspace_git` delta. Field names match the snapshot's own, so applying
@@ -1283,6 +1285,27 @@ export interface WorkspaceGitDelta {
   git_changed_files: number;
 }
 
+/** Everything `activate_workspace` mutates, so the renderer can reproduce
+ *  the post-switch snapshot without the full 500KB+ emit. Mirrors
+ *  `AppStateStore::record_workspace_switch` — the contract is documented
+ *  field-by-field in `applyDeltaToSnapshot`. */
+export interface ActiveWorkspaceDelta {
+  domain: "active_workspace";
+  /** New `active_workspace_id`. Always a workspace the backend knows. */
+  workspace_id: string;
+  /** `active_workspace_id` before the switch; `null` when nothing was
+   *  active. Equal to `workspace_id` on a re-activation. */
+  previous_workspace_id: string | null;
+  /** ms since epoch: the target's new `last_visited_at`. */
+  last_visited_at: number;
+  /** The previous workspace's new `last_visited_at` (leaving counts as
+   *  having seen it); `null` when there was none or it no longer exists. */
+  previous_last_visited_at: number | null;
+  /** Panes whose `"review"` status the switch cleared — delete each from
+   *  `pane_statuses`. Usually empty. */
+  cleared_review_pane_ids: string[];
+}
+
 export type AppStateDelta =
   | { domain: "workspace_git"; workspace_id: string; git: WorkspaceGitDelta }
   | { domain: "detected_ports"; ports: PortInfoSnapshot[] }
@@ -1291,7 +1314,8 @@ export type AppStateDelta =
       pane_id: string;
       /** `null` clears the pane's entry — the map only stores non-idle panes. */
       status: PaneStatus | null;
-    };
+    }
+  | ActiveWorkspaceDelta;
 
 /** Payload of the `app-state-delta` event. */
 export interface RevisionedDelta {
