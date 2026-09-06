@@ -89,7 +89,6 @@ vi.mock("@/stores/auth-store", () => ({
     sel({
       user: { id: "u1", email: "test@codemux.org", name: "Test User", image: null },
       isAuthenticated: true,
-      devBypass: false,
       signOut: mockSignOut,
     }),
 }));

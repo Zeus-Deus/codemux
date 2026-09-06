@@ -62,6 +62,7 @@ import {
   renameWorkspace,
 } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 
 type SpyActions = {
   [K in keyof MaterializeActions]: ReturnType<typeof vi.fn>;
@@ -175,6 +176,27 @@ describe("materializeAndSend", () => {
         "/home/user",
       );
       expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
+    });
+
+    it("records provider runtime intent for the draft's provider before the pane is created", async () => {
+      useProviderRuntimeIntent.getState().reset();
+      let intentAtCreate: boolean | undefined;
+      vi.mocked(agentChatCreatePane).mockImplementationOnce(async () => {
+        intentAtCreate =
+          useProviderRuntimeIntent.getState().providers.codex === true;
+        return "pane-new";
+      });
+      const actions = makeActions();
+      const draft = makeDraft({ provider: "codex", permissionMode: null });
+
+      const result = await materializeAndSend(draft, "hello", "/home/user", actions);
+
+      expect(result.success).toBe(true);
+      // A draft submit is the user's intent for that provider; without it a
+      // failed start_session would leave the mounted pane gated until the
+      // user clicked it.
+      expect(intentAtCreate).toBe(true);
+      expect(useProviderRuntimeIntent.getState().providers.claude).toBeUndefined();
     });
 
     it("uses createEmptyWorkspace without skipSetup for a project target, and auto-names it via the AI namer", async () => {
@@ -1326,6 +1348,29 @@ describe("materializeWithPreset", () => {
           include_plugins: false,
         }),
       );
+    });
+
+    it("records provider runtime intent for the draft's provider before the pane is created", async () => {
+      useProviderRuntimeIntent.getState().reset();
+      let intentAtCreate: boolean | undefined;
+      vi.mocked(agentChatCreatePane).mockImplementationOnce(async () => {
+        intentAtCreate =
+          useProviderRuntimeIntent.getState().providers.codex === true;
+        return "pane-new";
+      });
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        provider: "codex",
+        permissionMode: null,
+      });
+      const preset = makePreset({ kind: "chat_agent", commands: [] });
+
+      const result = await materializeWithPreset(draft, preset, "first message", actions);
+
+      expect(result.success).toBe(true);
+      expect(intentAtCreate).toBe(true);
+      expect(useProviderRuntimeIntent.getState().providers.claude).toBeUndefined();
     });
 
     it("happy path with prompt: creates pane, seeds transcript, starts session, sends turn", async () => {

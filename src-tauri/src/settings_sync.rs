@@ -684,12 +684,6 @@ async fn fetch_settings_in_scope(
     Ok(settings)
 }
 
-pub async fn fetch_settings(token: &str) -> Result<UserSettings, String> {
-    let scope = cache_scope();
-    let observed_write_generation = CACHE_WRITE_GENERATION.load(Ordering::Acquire);
-    fetch_settings_in_scope(token, &scope, observed_write_generation).await
-}
-
 async fn push_settings_in_scope(
     token: &str,
     settings: &UserSettings,
@@ -734,11 +728,6 @@ async fn push_settings_in_scope(
     }
 }
 
-pub async fn push_settings(token: &str, settings: &UserSettings) -> Result<UserSettings, String> {
-    let scope = cache_scope();
-    push_settings_in_scope(token, settings, &scope, true).await
-}
-
 pub async fn push_settings_for_owner(
     token: &str,
     user_id: &str,
@@ -779,14 +768,6 @@ async fn patch_settings_in_scope(
     Ok(settings)
 }
 
-pub async fn patch_settings(
-    token: &str,
-    partial: serde_json::Value,
-) -> Result<UserSettings, String> {
-    let scope = cache_scope();
-    patch_settings_in_scope(token, partial, &scope).await
-}
-
 pub async fn patch_settings_for_owner(
     token: &str,
     user_id: &str,
@@ -818,11 +799,6 @@ async fn delete_settings_in_scope(token: &str, scope: &CacheScope) -> Result<Use
     }
     clear_dirty_for_scope(scope);
     Ok(defaults)
-}
-
-pub async fn delete_settings(token: &str) -> Result<UserSettings, String> {
-    let scope = cache_scope();
-    delete_settings_in_scope(token, &scope).await
 }
 
 pub async fn delete_settings_for_owner(token: &str, user_id: &str) -> Result<UserSettings, String> {

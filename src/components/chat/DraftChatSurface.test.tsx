@@ -97,7 +97,6 @@ const STUB_CAP_STATE = {
   cursorError: null,
   grokError: null,
   opencodeError: null,
-  loaded: false,
   refresh: vi.fn(),
 };
 vi.mock("@/stores/provider-capabilities-store", () => ({
