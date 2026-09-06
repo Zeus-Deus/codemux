@@ -16,7 +16,11 @@ import {
   kittyFlags,
 } from "@/lib/kitty-keyboard";
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
-import { endSubMeasure, startSubMeasure } from "@/lib/perf/interaction-trace";
+import {
+  endSubMeasure,
+  markPaneReady,
+  startSubMeasure,
+} from "@/lib/perf/interaction-trace";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
   getTerminalCursorStyle,
@@ -197,6 +201,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // visibility based on state.
   const updateStatusOverlay = useCallback((status: TerminalStatusPayload) => {
     statusRef.current = status;
+    if (status.state === "ready") {
+      const target = getSessionWorkspaceId(status.session_id) ?? undefined;
+      markPaneReady("terminal", { target });
+    }
     const el = statusOverlayRef.current;
     if (!el) return;
     if (status.state === "ready") {

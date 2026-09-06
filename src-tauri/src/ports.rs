@@ -5,7 +5,8 @@ use std::collections::HashMap;
 // also reads `.codemux/ports.json` on every platform, so the import must not
 // be gated to linux.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Ports that are always excluded from detection (system services, databases, Codemux internals).
 const IGNORED_PORTS: &[u16] = &[22, 80, 443, 5432, 3306, 6379, 27017];
@@ -134,15 +135,81 @@ pub struct PortInfo {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct StaticPortsConfig {
     ports: Vec<StaticPortEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct StaticPortEntry {
     port: u16,
     label: String,
+}
+
+/// Cross-tick cache owned by the blocking port-poll worker.
+///
+/// Static files are read on each scan, but only parsed when their bytes change.
+/// Reading these tiny files is necessary because some filesystems can report an
+/// unchanged mtime and length for a fast in-place rewrite. Docker output is
+/// refreshed on a slower cadence than the 3s OS scan; the last successful
+/// output survives a single transient daemon/socket failure, but repeated
+/// failures clear it so a stopped daemon doesn't leave stale ports behind.
+#[derive(Default)]
+pub struct PortScanCache {
+    static_ports: HashMap<PathBuf, StaticPortsCacheEntry>,
+    docker: DockerOutputCache,
+}
+
+struct StaticPortsCacheEntry {
+    contents: Vec<u8>,
+    config: Option<StaticPortsConfig>,
+}
+
+const DOCKER_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many consecutive failed refreshes we tolerate before dropping the
+/// cached output. One transient failure (e.g. a timeout under load) keeps the
+/// ports visible; a second consecutive failure is treated as authoritative
+/// (daemon stopped, socket gone) and clears them. Worst case, stale ports
+/// disappear within `DOCKER_MAX_CONSECUTIVE_FAILURES * DOCKER_REFRESH_INTERVAL`.
+const DOCKER_MAX_CONSECUTIVE_FAILURES: u32 = 2;
+
+#[derive(Default)]
+struct DockerOutputCache {
+    last_attempt: Option<Instant>,
+    last_success: Option<String>,
+    consecutive_failures: u32,
+}
+
+impl DockerOutputCache {
+    fn output_at(
+        &mut self,
+        now: Instant,
+        refresh: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let due = self
+            .last_attempt
+            .map(|last| now.saturating_duration_since(last) >= DOCKER_REFRESH_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.last_attempt = Some(now);
+            match refresh() {
+                Some(output) => {
+                    self.last_success = Some(output);
+                    self.consecutive_failures = 0;
+                }
+                None => {
+                    self.consecutive_failures =
+                        self.consecutive_failures.saturating_add(1);
+                    if self.consecutive_failures >= DOCKER_MAX_CONSECUTIVE_FAILURES {
+                        self.last_success = None;
+                    }
+                }
+            }
+        }
+        self.last_success.clone()
+    }
 }
 
 /// Detect all listening TCP ports owned by the current user.
@@ -608,20 +675,58 @@ pub fn load_static_ports(workspace_cwd: &str, workspace_id: &str) -> Option<Vec<
     let contents = fs::read_to_string(&config_path).ok()?;
     let config: StaticPortsConfig = serde_json::from_str(&contents).ok()?;
 
-    Some(
-        config
-            .ports
-            .into_iter()
-            .map(|entry| PortInfo {
-                port: entry.port,
-                pid: 0,
-                process_name: String::new(),
-                workspace_id: Some(workspace_id.to_string()),
-                label: Some(entry.label),
-                source: None,
-            })
-            .collect(),
-    )
+    Some(materialize_static_ports(config, workspace_id))
+}
+
+fn materialize_static_ports(config: StaticPortsConfig, workspace_id: &str) -> Vec<PortInfo> {
+    config
+        .ports
+        .into_iter()
+        .map(|entry| PortInfo {
+            port: entry.port,
+            pid: 0,
+            process_name: String::new(),
+            workspace_id: Some(workspace_id.to_string()),
+            label: Some(entry.label),
+            source: None,
+        })
+        .collect()
+}
+
+fn load_static_ports_cached(
+    cache: &mut PortScanCache,
+    workspace_cwd: &str,
+    workspace_id: &str,
+) -> Option<Vec<PortInfo>> {
+    let config_path = Path::new(workspace_cwd).join(".codemux").join("ports.json");
+    let contents = match fs::read(&config_path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            cache.static_ports.remove(&config_path);
+            return None;
+        }
+    };
+
+    if let Some(entry) = cache.static_ports.get(&config_path) {
+        if entry.contents == contents {
+            return entry
+                .config
+                .clone()
+                .map(|config| materialize_static_ports(config, workspace_id));
+        }
+    }
+
+    // Cache invalid JSON too. It is parsed again only once the bytes change,
+    // rather than wasting work on the same broken file every three seconds.
+    let config = serde_json::from_slice(&contents).ok();
+    cache.static_ports.insert(
+        config_path,
+        StaticPortsCacheEntry {
+            contents,
+            config: config.clone(),
+        },
+    );
+    config.map(|config| materialize_static_ports(config, workspace_id))
 }
 
 /// Go-template format passed to `docker ps`. Tab-separated so the pure
@@ -666,19 +771,22 @@ fn run_docker_ps() -> Option<String> {
         cmd.creation_flags(0x0800_0000);
     }
 
-    match cmd.output() {
-        Ok(output) if output.status.success() => {
+    match crate::git_provider::exec::run_timed(cmd, DOCKER_COMMAND_TIMEOUT) {
+        Ok(output) if output.success => {
             DOCKER_CLI_STATE.store(1, Ordering::Relaxed);
-            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            Some(output.stdout)
         }
-        // Daemon down or no socket permission — transient, don't cache.
+        // Daemon down or no socket permission — not cached; the output cache
+        // retains the previous success for one failed refresh, then clears.
         Ok(_) => None,
-        Err(e) => {
+        Err(crate::git_provider::exec::TimedFailure::Spawn(e)) => {
             if e.kind() == std::io::ErrorKind::NotFound {
                 DOCKER_CLI_STATE.store(2, Ordering::Relaxed);
             }
             None
         }
+        Err(crate::git_provider::exec::TimedFailure::Wait(_))
+        | Err(crate::git_provider::exec::TimedFailure::Timeout) => None,
     }
 }
 
@@ -697,12 +805,26 @@ fn run_docker_ps() -> Option<String> {
 /// its compose `working_dir` matches one of those paths — this is what
 /// scopes detection to codemux worktree containers and excludes unrelated
 /// stacks the user runs by hand.
+#[cfg(test)]
 fn detect_docker_ports(workspace_paths: &HashMap<String, String>) -> Vec<PortInfo> {
     // No open workspaces → nothing a container could match → skip the spawn.
     if workspace_paths.is_empty() {
         return Vec::new();
     }
     let Some(stdout) = run_docker_ps() else {
+        return Vec::new();
+    };
+    parse_docker_ps_output(&stdout, workspace_paths)
+}
+
+fn detect_docker_ports_cached(
+    cache: &mut DockerOutputCache,
+    workspace_paths: &HashMap<String, String>,
+) -> Vec<PortInfo> {
+    if workspace_paths.is_empty() {
+        return Vec::new();
+    }
+    let Some(stdout) = cache.output_at(Instant::now(), run_docker_ps) else {
         return Vec::new();
     };
     parse_docker_ps_output(&stdout, workspace_paths)
@@ -800,16 +922,40 @@ pub fn scan_ports(
     workspace_cwds: &HashMap<String, String>,
     workspace_paths: &HashMap<String, String>,
 ) -> Vec<PortInfo> {
+    scan_ports_with_cache(
+        &mut PortScanCache::default(),
+        session_pids,
+        session_workspaces,
+        workspace_cwds,
+        workspace_paths,
+    )
+}
+
+/// Cached full scan used by the periodic worker. All calls must stay on the
+/// blocking pool: metadata reads, `/proc` walks, and Docker are intentionally
+/// contained behind this one synchronous boundary.
+pub fn scan_ports_with_cache(
+    cache: &mut PortScanCache,
+    session_pids: &HashMap<String, u32>,
+    session_workspaces: &HashMap<String, String>,
+    workspace_cwds: &HashMap<String, String>,
+    workspace_paths: &HashMap<String, String>,
+) -> Vec<PortInfo> {
     // Check for static port configs first
     let mut static_workspace_ids = std::collections::HashSet::new();
     let mut all_ports = Vec::new();
+    let mut active_config_paths = std::collections::HashSet::new();
 
     for (ws_id, cwd) in workspace_cwds {
-        if let Some(static_ports) = load_static_ports(cwd, ws_id) {
+        active_config_paths.insert(Path::new(cwd).join(".codemux").join("ports.json"));
+        if let Some(static_ports) = load_static_ports_cached(cache, cwd, ws_id) {
             static_workspace_ids.insert(ws_id.clone());
             all_ports.extend(static_ports);
         }
     }
+    cache
+        .static_ports
+        .retain(|path, _| active_config_paths.contains(path));
 
     // Dynamic detection
     let mut detected = detect_listening_ports();
@@ -830,7 +976,7 @@ pub fn scan_ports(
     // Docker-published container ports. On Linux these are owned by the root
     // `docker-proxy` and so are invisible to the /proc scan above; the Docker
     // CLI recovers them, scoped to open codemux worktrees.
-    let docker_ports = detect_docker_ports(workspace_paths);
+    let docker_ports = detect_docker_ports_cached(&mut cache.docker, workspace_paths);
     if !docker_ports.is_empty() {
         let mut existing: std::collections::HashSet<u16> =
             all_ports.iter().map(|p| p.port).collect();
@@ -1610,6 +1756,157 @@ mod docker_parser_tests {
         let stdout = line("proj-web-1", WT, "web", "0.0.0.0:8099->8000/tcp");
         let ports: Vec<PortInfo> = parse_docker_ps_output(&stdout, &worktree_map());
         assert!(ports.iter().all(|p| p.source.as_deref() == Some("docker")));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn static_config_reloads_when_its_contents_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("ports.json");
+        fs::write(&config_path, r#"{"ports":[{"port":3000,"label":"web"}]}"#).unwrap();
+
+        let mut cache = PortScanCache::default();
+        let cwd = temp.path().to_string_lossy();
+        let first = load_static_ports_cached(&mut cache, &cwd, "ws").unwrap();
+        assert_eq!(first[0].port, 3000);
+
+        fs::write(
+            &config_path,
+            r#"{"ports":[{"port":3001,"label":"web-longer"}]}"#,
+        )
+        .unwrap();
+        let second = load_static_ports_cached(&mut cache, &cwd, "ws").unwrap();
+        assert_eq!(second[0].port, 3001);
+
+        fs::remove_file(config_path).unwrap();
+        assert!(load_static_ports_cached(&mut cache, &cwd, "ws").is_none());
+        assert!(cache.static_ports.is_empty());
+    }
+
+    #[test]
+    fn static_config_reloads_same_length_rewrite_with_unchanged_mtime() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("ports.json");
+        let original = br#"{"ports":[{"port":3000,"label":"web"}]}"#;
+        let rewritten = br#"{"ports":[{"port":3001,"label":"web"}]}"#;
+        assert_eq!(original.len(), rewritten.len());
+        fs::write(&config_path, original).unwrap();
+
+        let original_modified = fs::metadata(&config_path).unwrap().modified().unwrap();
+        let mut cache = PortScanCache::default();
+        let cwd = temp.path().to_string_lossy();
+        let first = load_static_ports_cached(&mut cache, &cwd, "ws").unwrap();
+        assert_eq!(first[0].port, 3000);
+
+        fs::write(&config_path, rewritten).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        let rewritten_metadata = fs::metadata(&config_path).unwrap();
+        assert_eq!(rewritten_metadata.len(), original.len() as u64);
+        assert_eq!(rewritten_metadata.modified().unwrap(), original_modified);
+
+        let second = load_static_ports_cached(&mut cache, &cwd, "ws").unwrap();
+        assert_eq!(second[0].port, 3001);
+    }
+
+    #[test]
+    fn docker_output_refreshes_slowly_and_keeps_last_success_on_failure() {
+        let mut cache = DockerOutputCache::default();
+        let calls = AtomicUsize::new(0);
+        let start = Instant::now();
+
+        let first = cache.output_at(start, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("first".to_string())
+        });
+        assert_eq!(first.as_deref(), Some("first"));
+
+        let cached = cache.output_at(start + Duration::from_secs(3), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some("too-early".to_string())
+        });
+        assert_eq!(cached.as_deref(), Some("first"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let retained = cache.output_at(start + DOCKER_REFRESH_INTERVAL, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        assert_eq!(retained.as_deref(), Some("first"));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn docker_output_clears_after_repeated_failures_when_daemon_stops() {
+        let mut cache = DockerOutputCache::default();
+        let start = Instant::now();
+
+        let first = cache.output_at(start, || Some("running".to_string()));
+        assert_eq!(first.as_deref(), Some("running"));
+
+        // Daemon stops: first failed refresh is tolerated as transient.
+        let after_one_failure = cache.output_at(start + DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(after_one_failure.as_deref(), Some("running"));
+
+        // Second consecutive failure is authoritative — ports clear.
+        let after_two_failures = cache.output_at(start + 2 * DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(after_two_failures, None);
+
+        // And stays cleared while the daemon remains down.
+        let still_down = cache.output_at(start + 3 * DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(still_down, None);
+    }
+
+    #[test]
+    fn docker_output_single_transient_failure_does_not_clear() {
+        let mut cache = DockerOutputCache::default();
+        let start = Instant::now();
+
+        cache.output_at(start, || Some("running".to_string()));
+
+        // One failure (e.g. a timeout under load) keeps the cached output.
+        let after_blip = cache.output_at(start + DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(after_blip.as_deref(), Some("running"));
+
+        // A success resets the failure count...
+        let recovered = cache.output_at(start + 2 * DOCKER_REFRESH_INTERVAL, || {
+            Some("running".to_string())
+        });
+        assert_eq!(recovered.as_deref(), Some("running"));
+
+        // ...so a later isolated failure is again tolerated.
+        let after_second_blip = cache.output_at(start + 3 * DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(after_second_blip.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn docker_output_returns_when_daemon_recovers() {
+        let mut cache = DockerOutputCache::default();
+        let start = Instant::now();
+
+        cache.output_at(start, || Some("old".to_string()));
+        cache.output_at(start + DOCKER_REFRESH_INTERVAL, || None);
+        let cleared = cache.output_at(start + 2 * DOCKER_REFRESH_INTERVAL, || None);
+        assert_eq!(cleared, None);
+
+        // Daemon comes back: next due refresh restores the output.
+        let recovered =
+            cache.output_at(start + 3 * DOCKER_REFRESH_INTERVAL, || Some("new".to_string()));
+        assert_eq!(recovered.as_deref(), Some("new"));
     }
 }
 

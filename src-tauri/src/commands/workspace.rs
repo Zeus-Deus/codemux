@@ -187,7 +187,7 @@ pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&repo_path);
     }
 
     crate::state::emit_app_state(&app);
@@ -241,7 +241,7 @@ pub fn regenerate_mcp_config(
         .iter()
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd), &workspace_id);
+    crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd));
     Ok(())
 }
 
@@ -312,7 +312,7 @@ pub async fn create_empty_workspace<R: tauri::Runtime>(
         spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
 
         if crate::mcp_server::is_auto_mcp_enabled(&app) {
-            crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+            crate::mcp_server::upsert_mcp_config(&repo_path);
         }
     }
 
@@ -654,7 +654,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
             // `cwd` from the snapshot afterwards, and the adopted workspace
             // is in that snapshot, so the wrapper's cwd lookup keeps working
             // unchanged.
-            activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
+            activate_workspace_impl(app.clone(), state, existing_id.clone())?;
             return Ok(CreatedWorktreeWorkspace {
                 workspace_id: existing_id,
                 adopted: true,
@@ -699,7 +699,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf);
     }
 
     // Auto-launch agent preset if requested
@@ -876,7 +876,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf);
     }
 
     crate::state::emit_app_state(&app);
@@ -964,6 +964,52 @@ pub(crate) fn reap_agent_browser_sessions<R: tauri::Runtime>(app: &tauri::AppHan
     });
 }
 
+/// The directory whose path-level `.mcp.json` a workspace owns. Worktree
+/// creation registers against `worktree_path`; plain workspaces register
+/// against `cwd`.
+fn workspace_mcp_config_dir(workspace: &crate::state::WorkspaceSnapshot) -> String {
+    workspace
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| workspace.cwd.clone())
+}
+
+fn workspace_owns_mcp_config_dir(
+    workspace: &crate::state::WorkspaceSnapshot,
+    config_dir: &Path,
+) -> bool {
+    paths_equal(Path::new(&workspace.cwd), config_dir)
+        || workspace
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| paths_equal(Path::new(path), config_dir))
+}
+
+/// Repair or remove a checkout's shared MCP entry against the post-close
+/// snapshot. The generated entry inherits the surviving agent session's id,
+/// so only whether any surviving workspace still owns the checkout matters.
+fn reconcile_mcp_config_after_close(
+    snapshot: &AppStateSnapshot,
+    config_dir: &Path,
+    auto_mcp_enabled: bool,
+) {
+    if snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| workspace_owns_mcp_config_dir(workspace, config_dir))
+    {
+        // Opt-out means "do not create or repair". In particular, closing one
+        // of two duplicate-CWD workspaces must not recreate a config the user
+        // disabled (or never had). The final owner close below may still
+        // remove an old Codemux entry left from before opt-out.
+        if auto_mcp_enabled {
+            crate::mcp_server::upsert_mcp_config(config_dir);
+        }
+    } else {
+        crate::mcp_server::remove_mcp_config(config_dir);
+    }
+}
+
 /// Shared close-workspace implementation backing both the Tauri command
 /// (in-app sidebar / branch picker close affordances) and the
 /// `close_workspace` control-socket command exposed via the Phase 1.6
@@ -1000,7 +1046,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
     // archiving/closing (remove_worktree=false) is the supported way to
     // make it disappear. Unknown workspace ids fall through so the
     // lookup error below stays identical to today.
-    let (worktree_path, branch, ws_title, ws_host_id) = {
+    let (worktree_path, mcp_config_dir, branch, ws_title, ws_host_id) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
@@ -1015,6 +1061,7 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         }
         (
             ws.and_then(|w| w.worktree_path.clone()),
+            ws.map(workspace_mcp_config_dir),
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
             ws.and_then(|w| w.host_id),
@@ -1062,14 +1109,20 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         }
     }
 
-    // Remove codemux entry from .mcp.json before closing
-    if let Some(ref wt_path) = worktree_path {
-        crate::mcp_server::remove_mcp_config(Path::new(wt_path));
-    }
-
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    // Reconcile only after the state mutation succeeds. A duplicate workspace
+    // at the same checkout still owns the shared path-level config; deleting
+    // it before close used to break every surviving agent at that CWD.
+    if let Some(ref config_dir) = mcp_config_dir {
+        reconcile_mcp_config_after_close(
+            &state.snapshot(),
+            Path::new(config_dir),
+            crate::mcp_server::is_auto_mcp_enabled(&app),
+        );
+    }
 
     // Reap the agent-browser CLI session(s) that belonged to this
     // workspace (issue #126). This path (worktree closes + the MCP
@@ -1447,7 +1500,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
         if entry.pinned_at.is_some() {
             state.restore_workspace_pinned_at(&existing_id, entry.pinned_at)?;
         }
-        activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
+        activate_workspace_impl(app.clone(), state, existing_id.clone())?;
         let _ = state.remove_archived_workspace(&archive_id);
         crate::state::emit_app_state(&app);
         return Ok(existing_id);
@@ -1575,7 +1628,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
     }
 
     let _ = state.remove_archived_workspace(&archive_id);
-    activate_workspace_impl(app.clone(), state, db, restored_id.clone())?;
+    activate_workspace_impl(app.clone(), state, restored_id.clone())?;
     crate::state::emit_app_state(&app);
     Ok(restored_id)
 }
@@ -1684,10 +1737,9 @@ pub async fn delete_archived_workspace<R: tauri::Runtime>(
 pub fn activate_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
-    db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
-    activate_workspace_impl(app, &state, &db, workspace_id)
+    activate_workspace_impl(app, &state, workspace_id)
 }
 
 /// Shared workspace-switch implementation used by both the Tauri command
@@ -1698,30 +1750,29 @@ pub fn activate_workspace<R: tauri::Runtime>(
 /// side effects: the in-memory active id flip, the `populate_git_info`
 /// background refresh, lazy PTY hydration via
 /// `spawn_missing_ptys_for_workspace`, the synchronous `emit_app_state`
-/// to push the new snapshot to any open UI, and the
-/// `db.set_ui_state("active_workspace", …)` write that restores the
-/// active workspace on next launch.
+/// to push the new snapshot to any open UI. That full-state emit also queues
+/// the active id on the shared ordered/coalesced persistence stream, so no
+/// caller blocks on SQLite and every switch surface restores identically.
 pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
     workspace_id: String,
 ) -> Result<(), String> {
     let activate_started = std::time::Instant::now();
     // Section timings feed the attribution harness: a slow activate must name
-    // whether it was the locked state mutation, the snapshot+serialise, or the
-    // SQLite write, rather than reporting one opaque total.
+    // whether it was the locked state mutation or snapshot+serialise, rather
+    // than reporting one opaque total. SQLite runs after return on the shared
+    // persistence worker.
     let mutate_started = std::time::Instant::now();
     let activated = state.activate_workspace(&workspace_id);
     let mutate_ms = mutate_started.elapsed().as_secs_f64() * 1000.0;
     if activated {
-        let (emit_ms, persist_ms) = run_activation_side_effects(&app, state, db, &workspace_id);
+        let emit_ms = run_activation_side_effects(&app, state, &workspace_id);
         let elapsed_ms = activate_started.elapsed().as_millis();
         if elapsed_ms > 8 {
             eprintln!(
                 "[codemux::workspace] activate_workspace({workspace_id}) returned in \
-                 {elapsed_ms}ms (mutate={mutate_ms:.1}ms emit={emit_ms:.1}ms \
-                 persist={persist_ms:.1}ms)"
+                 {elapsed_ms}ms (mutate={mutate_ms:.1}ms emit={emit_ms:.1}ms)"
             );
         }
         Ok(())
@@ -1737,13 +1788,13 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
 /// and never persisting the active workspace, so a cycled-to workspace was
 /// forgotten at restart.
 ///
-/// Returns `(emit_ms, persist_ms)` for the activation attribution harness.
+/// Returns the synchronous emit duration for the activation attribution
+/// harness. Selection persistence is deliberately not part of this duration.
 fn run_activation_side_effects<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppStateStore,
-    db: &crate::database::DatabaseStore,
     workspace_id: &str,
-) -> (f64, f64) {
+) -> f64 {
     // Kick off git refresh in a background thread — don't block the
     // activate click. `populate_git_info` runs 5-8 git subprocesses
     // (branch + upstream + ahead/behind + two diff-stat calls + status
@@ -1798,11 +1849,7 @@ fn run_activation_side_effects<R: tauri::Runtime>(
 
     let emit_started = std::time::Instant::now();
     crate::state::emit_app_state(app);
-    let emit_ms = emit_started.elapsed().as_secs_f64() * 1000.0;
-    let persist_started = std::time::Instant::now();
-    db.set_ui_state("active_workspace", workspace_id).ok();
-    let persist_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
-    (emit_ms, persist_ms)
+    emit_started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[tauri::command]
@@ -1911,12 +1958,18 @@ pub async fn close_workspace<R: tauri::Runtime>(
         }
     }
 
-    // Remove codemux entry from .mcp.json before closing
-    if let Some((ref cwd, _)) = workspace_cwd {
-        crate::mcp_server::remove_mcp_config(Path::new(cwd));
-    }
-
     let result = state.close_workspace(&workspace_id)?;
+
+    // `.mcp.json` belongs to the checkout, not to one workspace row. Preserve
+    // (and, if necessary, repair) it while another live workspace shares the
+    // same path; remove it only after the final owner closes.
+    if let Some((ref cwd, _)) = workspace_cwd {
+        reconcile_mcp_config_after_close(
+            &state.snapshot(),
+            Path::new(cwd),
+            crate::mcp_server::is_auto_mcp_enabled(&app),
+        );
+    }
 
     // Reap the agent-browser CLI session(s) that belonged to this
     // workspace (issue #126). `result.removed_agent_browser_sessions` is
@@ -1998,7 +2051,6 @@ pub async fn close_workspace<R: tauri::Runtime>(
 pub fn cycle_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
-    db: State<'_, crate::database::DatabaseStore>,
     step: isize,
 ) -> Result<String, String> {
     let workspace_id = state
@@ -2006,7 +2058,7 @@ pub fn cycle_workspace<R: tauri::Runtime>(
         .ok_or_else(|| "No workspace navigation target available".to_string())?;
 
     if state.activate_workspace(&workspace_id.0) {
-        run_activation_side_effects(&app, &state, &db, &workspace_id.0);
+        run_activation_side_effects(&app, &state, &workspace_id.0);
         Ok(workspace_id.0)
     } else {
         Err(format!("No workspace found for {}", workspace_id.0))
@@ -2864,7 +2916,7 @@ mod empty_workspace_skip_setup_tests {
         let tmp = TempDir::new().unwrap();
         let mcp_path = tmp.path().join(".mcp.json");
         assert!(!mcp_path.exists(), "pre-condition: no .mcp.json yet");
-        crate::mcp_server::upsert_mcp_config(tmp.path(), "ws-baseline");
+        crate::mcp_server::upsert_mcp_config(tmp.path());
         assert!(
             mcp_path.exists(),
             "upsert_mcp_config must create .mcp.json — the skip-setup test \
@@ -2988,6 +3040,7 @@ mod phase_1_6_close_tests {
     //! phases.
     use super::*;
     use crate::state::{AppStateStore, SplitDirection, WorkspacePresetLayout};
+    use tempfile::TempDir;
 
     #[test]
     fn close_workspace_removes_workspace_from_state() {
@@ -3031,6 +3084,61 @@ mod phase_1_6_close_tests {
                 || err.to_lowercase().contains("no workspace"),
             "unexpected error string: {err}"
         );
+    }
+
+    #[test]
+    fn closing_duplicate_cwd_preserves_config_until_last_workspace_closes() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let config_path = checkout.path().join(".mcp.json");
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let first = store.create_workspace_at_path(checkout.path().to_path_buf());
+        let second = store.create_workspace_at_path(checkout.path().to_path_buf());
+        crate::mcp_server::upsert_mcp_config(checkout.path());
+        let original = std::fs::read(&config_path).expect("created config");
+
+        store.close_workspace(&first.0).expect("close first duplicate");
+        reconcile_mcp_config_after_close(&store.snapshot(), checkout.path(), true);
+
+        assert!(config_path.exists(), "the surviving workspace still owns the config");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            original,
+            "survivor reconciliation should be a semantic no-op"
+        );
+        assert!(
+            store.snapshot().workspaces.iter().any(|workspace| workspace.workspace_id == second),
+            "the duplicate workspace must still be live"
+        );
+
+        store.close_workspace(&second.0).expect("close final duplicate");
+        reconcile_mcp_config_after_close(&store.snapshot(), checkout.path(), true);
+        assert!(
+            !config_path.exists(),
+            "the final workspace close should remove Codemux's config"
+        );
+    }
+
+    #[test]
+    fn closing_duplicate_cwd_respects_auto_mcp_opt_out() {
+        let checkout = TempDir::new().expect("checkout tempdir");
+        let store = AppStateStore::default();
+        store.clear_workspaces();
+        let first = store.create_workspace_at_path(checkout.path().to_path_buf());
+        let second = store.create_workspace_at_path(checkout.path().to_path_buf());
+
+        store.close_workspace(&first.0).expect("close first duplicate");
+        reconcile_mcp_config_after_close(&store.snapshot(), checkout.path(), false);
+
+        assert!(
+            !checkout.path().join(".mcp.json").exists(),
+            "closing one duplicate must not create config while auto-MCP is disabled"
+        );
+        assert!(store
+            .snapshot()
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.workspace_id == second));
     }
 
     #[test]

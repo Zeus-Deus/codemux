@@ -62,12 +62,8 @@ import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
-import {
-  agentChatCreatePane,
-  applyPreset,
-  detectEditors,
-  openInEditor,
-} from "@/tauri/commands";
+import { applyPreset, openInEditor } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { cn } from "@/lib/utils";
 import {
   getTitlebarContentUnder,
@@ -79,7 +75,8 @@ import {
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
-import type { EditorInfo, TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
+import type { TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
+import { useDetectedEditors } from "@/stores/editor-discovery-store";
 
 // ── IDE Launcher ──
 
@@ -92,7 +89,7 @@ interface IdeLauncherProps {
 }
 
 function IdeLauncher({ compact = false }: IdeLauncherProps) {
-  const [editors, setEditors] = useState<EditorInfo[]>([]);
+  const editors = useDetectedEditors();
   const [isLoading, setIsLoading] = useState(false);
   const persistedEditor = useSyncedSettingsStore(selectDefaultEditor);
   const activeWorkspace = useAppStore(
@@ -103,13 +100,16 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
   );
 
   useEffect(() => {
-    detectEditors().then((eds) => {
-      setEditors(eds);
-      if (eds.length > 0 && !persistedEditor && !useSyncedSettingsStore.getState().isLoading) {
-        useSyncedSettingsStore.getState().updateSetting("editor", "default_ide", eds[0].id);
-      }
-    });
-  }, [persistedEditor]);
+    if (
+      editors.length > 0 &&
+      !persistedEditor &&
+      !useSyncedSettingsStore.getState().isLoading
+    ) {
+      void useSyncedSettingsStore
+        .getState()
+        .updateSetting("editor", "default_ide", editors[0].id);
+    }
+  }, [editors, persistedEditor]);
 
   const workspacePath = activeWorkspace?.cwd;
   const defaultEditorId = persistedEditor || (editors.length > 0 ? editors[0].id : null);
@@ -407,7 +407,7 @@ function PinnedPresetTiles({ workspace }: { workspace: WorkspaceSnapshot }) {
   // chat_agent preset, matching the prior implementation) but kept in the
   // signature so each mapped tile still gets its own bound handler.
   const launchChat = (_preset: TerminalPreset) => () => {
-    agentChatCreatePane(workspaceId, "claude", null, "new_tab").catch((err) => {
+    launchAgentChatPane(workspaceId, "claude", null, "new_tab").catch((err) => {
       toast.error(`Chat Agent: ${errorMessage(err)}`);
       console.error("[title-bar] chat favorite launch failed:", err);
     });

@@ -56,6 +56,7 @@ beforeEach(() => {
     authMethod: null,
     user: { id: "u1", email: "user@example.com", name: "Test", image: null },
     isAuthenticated: true,
+    sessionStatus: "verified",
   });
 });
 
@@ -90,6 +91,15 @@ describe("SyncSection — render fork", () => {
     expect(screen.getByText(/sign in to sync your skills/i)).toBeInTheDocument();
     // No password inputs anywhere in the signed-out state.
     expect(screen.queryByLabelText(/password/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["offline", /offline.+cached settings/i],
+    ["degraded", /settings refresh failed/i],
+  ] as const)("surfaces the %s cached-sync state", async (sessionStatus, copy) => {
+    useAuthStore.setState({ syncAvailable: true, sessionStatus });
+    render(<SyncSection />);
+    expect(await screen.findByText(copy)).toBeInTheDocument();
   });
 });
 

@@ -4,6 +4,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import "./globals.css";
+import { markStartup } from "@/lib/perf/interaction-trace";
 
 // Single QueryClient for the whole app. Defaults are tuned for the
 // Review-tab use case where we want fresh-ish data on focus + a
@@ -36,6 +37,24 @@ function dismissSplash() {
   splash.addEventListener("transitionend", () => splash.remove());
 }
 
+function startDevPerformanceSweepAfterMount(): void {
+  if (!import.meta.env.DEV) return;
+  const params = new URLSearchParams(location.search);
+  if (params.get("fixture") !== "large" || params.get("perfSweep") !== "500") {
+    return;
+  }
+  void import("./dev/performance-sweep")
+    .then(({ startPerformanceSweep }) => {
+      // The harness renders its own visible failure state and logs the full
+      // developer error; consume the rejection here to avoid an unhandled
+      // promise while preserving that evidence.
+      void startPerformanceSweep().catch(() => undefined);
+    })
+    .catch((error) => {
+      console.error("[codemux::perf-sweep] failed to load acceptance harness", error);
+    });
+}
+
 function mountApp() {
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
@@ -46,8 +65,13 @@ function mountApp() {
       </QueryClientProvider>
     </React.StrictMode>,
   );
+  markStartup("react-mounted");
+  startDevPerformanceSweepAfterMount();
   // Dismiss after React has painted its first frame
-  requestAnimationFrame(() => requestAnimationFrame(dismissSplash));
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    markStartup("first-paint");
+    dismissSplash();
+  }));
 }
 
 // Runtime shim selection. The UI talks to its backend exclusively through
@@ -87,4 +111,7 @@ async function installRuntimeShim(): Promise<void> {
   }
 }
 
-void installRuntimeShim().then(mountApp);
+void installRuntimeShim().then(() => {
+  markStartup("runtime-shim-ready");
+  mountApp();
+});

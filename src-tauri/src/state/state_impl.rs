@@ -249,6 +249,39 @@ pub struct TerminalSessionSnapshot {
     pub adapter_captures: std::collections::HashMap<String, String>,
 }
 
+/// Minimal immutable workspace input for PTY hydration. This deliberately
+/// excludes surfaces, tabs, browser state, git counters, notifications, and
+/// every other domain that made the old per-pane `snapshot()` clone expensive.
+#[derive(Debug, Clone)]
+pub struct PtyHydrationWorkspace {
+    pub workspace_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub git_branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub project_root: Option<String>,
+    pub project_uid: Option<String>,
+    pub host_id: Option<i64>,
+    pub remote_cwd: Option<String>,
+    pub attach_only: bool,
+}
+
+/// Minimal immutable session input for one PTY spawn/reattach.
+#[derive(Debug, Clone)]
+pub struct PtyHydrationSession {
+    pub session_id: String,
+    pub pane_id: Option<String>,
+    pub cwd: String,
+    pub original_command: Option<String>,
+    pub adapter_captures: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PtyHydrationPlan {
+    pub workspace: PtyHydrationWorkspace,
+    pub sessions: Vec<PtyHydrationSession>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSessionSnapshot {
     pub browser_id: BrowserId,
@@ -1003,6 +1036,52 @@ fn apply_manual_monitors(snapshot: &mut AppStateSnapshot) {
     }
 }
 
+fn build_pty_hydration_plan(
+    snapshot: &AppStateSnapshot,
+    workspace: &WorkspaceSnapshot,
+) -> PtyHydrationPlan {
+    let workspace_input = PtyHydrationWorkspace {
+        workspace_id: workspace.workspace_id.0.clone(),
+        title: workspace.title.clone(),
+        cwd: workspace.cwd.clone(),
+        git_branch: workspace.git_branch.clone(),
+        worktree_path: workspace.worktree_path.clone(),
+        project_root: workspace.project_root.clone(),
+        project_uid: workspace.project_uid.clone(),
+        host_id: workspace.host_id,
+        remote_cwd: workspace.remote_cwd.clone(),
+        attach_only: workspace.attach_only,
+    };
+    let sessions = collect_terminal_sessions(&workspace.surfaces)
+        .into_iter()
+        .map(|session_id| {
+            let persisted = snapshot
+                .terminal_sessions
+                .iter()
+                .find(|session| session.session_id.0 == session_id);
+            let pane_id = workspace.surfaces.iter().find_map(|surface| {
+                find_terminal_pane_id(&surface.root, &session_id).map(|pane_id| pane_id.0)
+            });
+            PtyHydrationSession {
+                session_id,
+                pane_id,
+                cwd: persisted
+                    .map(|session| session.cwd.clone())
+                    .filter(|cwd| !cwd.is_empty())
+                    .unwrap_or_else(|| workspace.cwd.clone()),
+                original_command: persisted.and_then(|session| session.original_command.clone()),
+                adapter_captures: persisted
+                    .map(|session| session.adapter_captures.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    PtyHydrationPlan {
+        workspace: workspace_input,
+        sessions,
+    }
+}
+
 impl AppStateStore {
     pub fn snapshot(&self) -> AppStateSnapshot {
         let mut snapshot = self.inner.lock().unwrap().clone();
@@ -1238,6 +1317,62 @@ impl AppStateStore {
             .iter()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
             .map(|workspace| workspace.cwd.clone())
+    }
+
+    pub fn active_workspace_id(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .active_workspace_id
+            .0
+            .clone()
+    }
+
+    /// The only linked-issue input the active workspace background refresher
+    /// needs. Kept narrow so its five-second cadence never deep-clones pane
+    /// trees, terminal history, or unrelated workspaces.
+    pub fn workspace_linked_issue_number(&self, workspace_id: &str) -> Option<u64> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            .and_then(|workspace| workspace.linked_issue.as_ref().map(|issue| issue.number))
+    }
+
+    /// Read every descriptor needed to hydrate one workspace's PTYs under one
+    /// state lock. The returned value is intentionally narrow; in particular it
+    /// does not clone the workspace's pane tree after extracting session/pane
+    /// ids from it.
+    pub fn pty_hydration_plan_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Option<PtyHydrationPlan> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)?;
+        Some(build_pty_hydration_plan(&snapshot, workspace))
+    }
+
+    /// Narrow one-session form used by normal pane creation. Restored
+    /// workspace hydration uses [`Self::pty_hydration_plan_for_workspace`] so
+    /// eight panes still cost one state read.
+    pub fn pty_hydration_plan_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<PtyHydrationPlan> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot.workspaces.iter().find(|workspace| {
+            workspace.surfaces.iter().any(|surface| {
+                find_terminal_pane_id(&surface.root, session_id).is_some()
+            })
+        })?;
+        let mut plan = build_pty_hydration_plan(&snapshot, workspace);
+        plan.sessions
+            .retain(|session| session.session_id == session_id);
+        (!plan.sessions.is_empty()).then_some(plan)
     }
 
     pub fn activate_pane(&self, pane_id: &str) -> bool {
@@ -2670,6 +2805,27 @@ impl AppStateStore {
             .iter()
             .filter(|w| !w.attach_only)
             .map(|w| (w.cwd.clone(), w.project_root.clone()))
+            .collect()
+    }
+
+    /// `(workspace_id, checkout_path)` inputs for the provider PR poller.
+    /// Attach-in-place paths live on another machine and are not valid local
+    /// subprocess working directories.
+    pub fn workspace_provider_poll_targets(&self) -> Vec<(String, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| !workspace.attach_only)
+            .map(|workspace| {
+                (
+                    workspace.workspace_id.0.clone(),
+                    workspace
+                        .worktree_path
+                        .clone()
+                        .unwrap_or_else(|| workspace.cwd.clone()),
+                )
+            })
             .collect()
     }
 
@@ -4759,12 +4915,25 @@ pub fn emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     let snapshot_started = std::time::Instant::now();
     let snapshot = state.stamped_snapshot();
     let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+    crate::diagnostics::record_perf_timing(
+        "state.snapshot-clone",
+        snapshot_started.elapsed(),
+    );
     let workspace_count = snapshot.workspaces.len();
     let serialize_started = std::time::Instant::now();
     if let Err(error) = app.emit("app-state-changed", &snapshot) {
         eprintln!("[codemux::state] Failed to emit app state: {error}");
     }
+    crate::active_workspace_persistence::schedule(
+        app,
+        &snapshot.active_workspace_id.0,
+        snapshot.snapshot_revision,
+    );
     let serialize_ms = serialize_started.elapsed().as_secs_f64() * 1000.0;
+    crate::diagnostics::record_perf_timing(
+        "state.snapshot-emit",
+        serialize_started.elapsed(),
+    );
     if snapshot_ms + serialize_ms > 8.0 {
         eprintln!(
             "[codemux::perf::emit] snapshot={snapshot_ms:.1}ms \

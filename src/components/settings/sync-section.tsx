@@ -25,9 +25,32 @@ import { SyncStatusDisplay } from "./sync-status-display";
 
 export function SyncSection() {
   const syncAvailable = useAuthStore((s) => s.syncAvailable);
+  const sessionStatus = useAuthStore((s) => s.sessionStatus);
 
   if (syncAvailable) {
-    return <SyncReadyRow />;
+    return (
+      <div className="space-y-3">
+        {sessionStatus === "offline" && (
+          <p
+            role="status"
+            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-xs text-muted-foreground"
+          >
+            Offline — using your cached settings. Changes will sync when the
+            connection returns.
+          </p>
+        )}
+        {sessionStatus === "degraded" && (
+          <p
+            role="status"
+            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-xs text-muted-foreground"
+          >
+            Signed in, but settings refresh failed. Your cached settings are
+            still active.
+          </p>
+        )}
+        <SyncReadyRow />
+      </div>
+    );
   }
 
   return (

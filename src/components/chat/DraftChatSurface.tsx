@@ -45,6 +45,7 @@ import { basename } from "@/lib/path";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
@@ -322,6 +323,15 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       /* best-effort */
     });
   }, []);
+
+  // Pane readiness for interaction traces: a draft has no transcript to
+  // hydrate, so its composer is usable as soon as the surface mounts. Without
+  // this mark, a workspace switch that lands on the draft view settles its
+  // trace only via the post-paint grace timer. Scoped to the targeted
+  // workspace when the draft has one, mirroring the live pane's marks.
+  useEffect(() => {
+    markPaneReady("agent-chat", { target: sessionWorkspaceId ?? undefined });
+  }, [sessionWorkspaceId]);
 
   const handleSubmit = useCallback(() => {
     if (sendInFlightRef.current) return;

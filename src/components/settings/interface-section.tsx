@@ -1,11 +1,13 @@
 import { useState } from "react";
 
-import { MessageSquareText } from "lucide-react";
+import { Check, Copy, Gauge, MessageSquareText } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { Switch } from "@/components/ui/switch";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { toast } from "@/lib/toast";
+import { copyToClipboard, COPY_FAILED_MESSAGE } from "@/lib/clipboard";
+import { collectPerformanceDiagnostics } from "@/lib/perf/performance-diagnostics";
 
 /**
  * Settings → Interface. Home of the Agent Chat GUI master toggle —
@@ -33,6 +35,28 @@ export function InterfaceSection() {
   const setAgentChatEnabled = useFeatureFlags((s) => s.setAgentChatEnabled);
   const [showDetails, setShowDetails] = useState(false);
   const [pending, setPending] = useState(false);
+  const [copyingDiagnostics, setCopyingDiagnostics] = useState(false);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+
+  const copyDiagnostics = async () => {
+    if (copyingDiagnostics) return;
+    setCopyingDiagnostics(true);
+    try {
+      const report = await collectPerformanceDiagnostics();
+      const copied = await copyToClipboard(JSON.stringify(report, null, 2));
+      if (!copied) {
+        toast.error(COPY_FAILED_MESSAGE);
+        return;
+      }
+      setDiagnosticsCopied(true);
+      window.setTimeout(() => setDiagnosticsCopied(false), 1_400);
+      toast.success("Performance diagnostics copied");
+    } catch (error) {
+      toast.error(`Couldn't collect performance diagnostics: ${String(error)}`);
+    } finally {
+      setCopyingDiagnostics(false);
+    }
+  };
 
   const handleToggle = async (next: boolean) => {
     if (pending) return;
@@ -126,6 +150,30 @@ export function InterfaceSection() {
             <li>• Home-screen chat landing on empty workspaces</li>
           </ul>
         )}
+      </div>
+
+      <div className="mt-4 rounded-lg border border-border bg-card p-4">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 space-y-1">
+            <div className="flex items-center gap-2">
+              <Gauge className="size-4 text-muted-foreground" />
+              <h3 className="text-sm font-medium">Performance diagnostics</h3>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Copy bounded startup, workspace-switch, renderer, payload-size,
+              and native timing summaries. Paths, titles, messages, and IDs are excluded.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void copyDiagnostics()}
+            disabled={copyingDiagnostics}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium hover:bg-muted disabled:opacity-50"
+          >
+            {diagnosticsCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {diagnosticsCopied ? "Copied" : copyingDiagnostics ? "Collecting…" : "Copy performance diagnostics"}
+          </button>
+        </div>
       </div>
     </div>
   );

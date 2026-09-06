@@ -19,8 +19,8 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
-  // Provider-health probe (ProviderStatusNotice mount). Never resolves
-  // so no banner state churns mid-test.
+  // Provider health is probed only on picker intent or send failure. Keep any
+  // explicit failure-path probe pending so no banner state churns mid-test.
   agentChatProviderHealth: vi.fn(() => new Promise(() => {})),
   // MCP warmup fired on the draft surface mount; no-op in tests. Image
   // staging commands are imported by the image-staging helper but only
@@ -73,6 +73,14 @@ vi.mock("@/lib/toast", () => ({
   },
 }));
 
+// Interaction-trace pane markers — spy on markPaneReady so the draft
+// surface's readiness mark is assertable without a live trace harness.
+vi.mock("@/lib/perf/interaction-trace", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/perf/interaction-trace")>();
+  return { ...actual, markPaneReady: vi.fn() };
+});
+
 // Provider capabilities — minimal stub. Selectors pull null when the
 // store has no entry, which renders a disabled "unavailable" state on
 // the pickers; that's fine for these tests. The hook is invoked two
@@ -89,9 +97,7 @@ const STUB_CAP_STATE = {
   cursorError: null,
   grokError: null,
   opencodeError: null,
-  loaded: false,
   refresh: vi.fn(),
-  refreshAll: vi.fn(),
 };
 vi.mock("@/stores/provider-capabilities-store", () => ({
   useProviderCapabilities: Object.assign(
@@ -176,6 +182,7 @@ vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
 
 import { DraftChatSurface } from "./DraftChatSurface";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { toast } from "@/lib/toast";
 import { agentChatGetSessionContext } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -260,12 +267,40 @@ describe("DraftChatSurface", () => {
     vi.mocked(materializeAndSend).mockReset();
     vi.mocked(agentChatGetSessionContext).mockReset();
     vi.mocked(toast.error).mockReset();
+    vi.mocked(markPaneReady).mockReset();
   });
 
   describe("rendering", () => {
     it("renders nothing when no draft is active", () => {
       const { container } = renderSurface();
       expect(container.firstChild).toBeNull();
+    });
+
+    it("marks the pane ready on mount so a workspace-switch trace can settle", () => {
+      // The draft surface has no transcript to hydrate: it is ready as soon
+      // as it mounts. Without this mark a switch that lands on the draft view
+      // would close its trace only via the post-paint grace timer.
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      // Home draft: no workspace identity yet, so the mark is untargeted.
+      expect(markPaneReady).toHaveBeenCalledWith("agent-chat", {
+        target: undefined,
+      });
+    });
+
+    it("scopes the pane-ready mark to the targeted workspace for existing_workspace drafts", () => {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateProjectDraft("/repo");
+      store.updateDraftTarget(draft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: "ws-1",
+      });
+      store.setActiveDraft(draft.draftId);
+      renderSurface();
+      expect(markPaneReady).toHaveBeenCalledWith("agent-chat", {
+        target: "ws-1",
+      });
     });
 
     it("renders the home-landing wrapper + composer when a draft is active", () => {

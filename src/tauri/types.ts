@@ -338,6 +338,24 @@ export interface AuthResponse {
   expires_at: string;
 }
 
+export type AuthSessionStatus =
+  | "local"
+  | "pending-verification"
+  | "verified"
+  | "offline"
+  | "degraded"
+  | "signed-out";
+
+export interface SessionBootstrap {
+  authenticated: boolean;
+  user: AuthUser | null;
+  settings: UserSettings;
+  authMethod: "email" | "github" | null;
+  status: AuthSessionStatus;
+}
+
+export type SessionRefresh = SessionBootstrap;
+
 export interface AuthStatePayload {
   authenticated: boolean;
   user: AuthUser | null;
@@ -1220,6 +1238,23 @@ export interface AppStateSnapshot {
   archived_workspaces?: ArchivedWorkspaceSnapshot[];
   persistence: PersistenceSchema;
   config: CodemuxConfigSnapshot;
+}
+
+/** Sanitized bounded timing summaries from the native process. */
+export interface NativePerfTimingSummary {
+  name: string;
+  count: number;
+  p50_ms: number;
+  p95_ms: number;
+  p99_ms: number;
+  max_ms: number;
+}
+
+export interface NativePerformanceDiagnostics {
+  version: number;
+  capacity: number;
+  sample_count: number;
+  timings: NativePerfTimingSummary[];
 }
 
 // ── Domain deltas ──

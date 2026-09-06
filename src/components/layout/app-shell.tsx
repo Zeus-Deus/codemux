@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useMemo } from "react";
+import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -13,24 +13,56 @@ import {
 import { applyTheme, parseCustomThemes, resolveTheme } from "@/lib/themes";
 import { applyTypography, resolveTypographySettings } from "@/lib/typography";
 import { SidebarProvider, SidebarInset, useSidebar } from "@/components/ui/sidebar";
-import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
-import { SettingsView } from "@/components/settings/settings-view";
-import { AutomationsView } from "@/components/automations/automations-view";
-import { DevicesView } from "@/components/devices/devices-view";
-import { PullRequestsView } from "@/components/pull-requests/pull-requests-view";
-import { CommandPalette } from "@/components/overlays/command-palette";
-import { NewProjectScreen } from "@/components/overlays/new-project-screen";
-import { FileSearchDialog } from "@/components/search/file-search-dialog";
-import { ContentSearchDialog } from "@/components/search/content-search-dialog";
 import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
+import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { markStartup } from "@/lib/perf/interaction-trace";
+import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
+
+const loadSettingsView = () => import("@/components/settings/settings-view");
+const loadCommandPalette = () => import("@/components/overlays/command-palette");
+const loadFileSearchDialog = () => import("@/components/search/file-search-dialog");
+const loadContentSearchDialog = () => import("@/components/search/content-search-dialog");
+
+const SettingsView = lazy(() =>
+  loadSettingsView().then((module) => ({ default: module.SettingsView })),
+);
+const AutomationsView = lazy(() =>
+  import("@/components/automations/automations-view").then((module) => ({ default: module.AutomationsView })),
+);
+const DevicesView = lazy(() =>
+  import("@/components/devices/devices-view").then((module) => ({
+    default: module.DevicesView,
+  })),
+);
+const PullRequestsView = lazy(() =>
+  import("@/components/pull-requests/pull-requests-view").then((module) => ({
+    default: module.PullRequestsView,
+  })),
+);
+const CommandPalette = lazy(() =>
+  loadCommandPalette().then((module) => ({ default: module.CommandPalette })),
+);
+const NewProjectScreen = lazy(() =>
+  import("@/components/overlays/new-project-screen").then((module) => ({ default: module.NewProjectScreen })),
+);
+const FileSearchDialog = lazy(() =>
+  loadFileSearchDialog().then((module) => ({ default: module.FileSearchDialog })),
+);
+const ContentSearchDialog = lazy(() =>
+  loadContentSearchDialog().then((module) => ({ default: module.ContentSearchDialog })),
+);
+const BrowserPeekOverlay = lazy(() =>
+  import("@/components/browser/BrowserPeekOverlay").then((module) => ({ default: module.BrowserPeekOverlay })),
+);
 
 const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
-export function AppShell() {
+export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const syncedLoading = useSyncedSettingsStore((s) => s.isLoading);
@@ -48,6 +80,9 @@ export function AppShell() {
   const showPullRequests = useUIStore((s) => s.showPullRequests);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
+  const fileSearchOpen = useUIStore((s) => s.showFileSearch);
+  const contentSearchOpen = useUIStore((s) => s.showContentSearch);
+  const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -122,6 +157,51 @@ export function AppShell() {
 
   useWorktreeIncludeToast();
 
+  useEffect(() => {
+    if (isLoading || !settingsLoaded || syncedLoading) return;
+    markStartup("shell-ready");
+    const raf =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (callback: FrameRequestCallback) =>
+            setTimeout(() => callback(performance.now()), 0) as unknown as number;
+    const cancelRaf =
+      typeof cancelAnimationFrame === "function"
+        ? cancelAnimationFrame
+        : (handle: number) => clearTimeout(handle);
+    let secondFrame = 0;
+    let cancelled = false;
+    let cancelPrefetch = () => {};
+    const firstFrame = raf(() => {
+      secondFrame = raf(() => {
+        if (cancelled) return;
+        markStartup("shell-first-paint");
+        onFirstPaint?.();
+        // Warm the most common post-shell destinations only after the useful
+        // shell has painted. requestIdleCallback is allowed to run before a
+        // pending rAF, so arming this earlier could put chunk parse/eval back
+        // inside the startup gate.
+        cancelPrefetch = scheduleSequentialIdlePrefetch([
+          loadCommandPalette,
+          // The two pane kinds a workspace switch mounts. Without these
+          // warm, the first switch to a not-yet-seen pane kind pays chunk
+          // fetch + parse inside the switch itself.
+          () => import("@/components/chat/AgentChatPane"),
+          () => import("@/components/terminal/TerminalPane"),
+          loadFileSearchDialog,
+          loadContentSearchDialog,
+          loadSettingsView,
+        ]);
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelRaf(firstFrame);
+      cancelRaf(secondFrame);
+      cancelPrefetch();
+    };
+  }, [isLoading, settingsLoaded, syncedLoading, onFirstPaint]);
+
   // Baseline sidebar toggle for the central keyboard hook and the command
   // palette. `SidebarToggleBridge` (rendered inside `SidebarProvider` below)
   // replaces this with the provider's own `toggleSidebar` as soon as the
@@ -143,29 +223,49 @@ export function AppShell() {
 
   // Full-screen settings — replaces entire app including sidebar
   if (showSettings) {
-    return <SettingsView />;
+    return (
+      <LazyBoundary label="Settings" className="h-screen">
+        <SettingsView />
+      </LazyBoundary>
+    );
   }
 
   // Full-screen Automations — a first-class destination, like Settings
   if (showAutomations) {
-    return <AutomationsView />;
+    return (
+      <LazyBoundary label="Automations" className="h-screen">
+        <AutomationsView />
+      </LazyBoundary>
+    );
   }
 
   // Full-screen Devices page — the account's other machines and the work
   // that lives on them. Same overlay shape as Settings / Automations.
   if (showDevices) {
-    return <DevicesView />;
+    return (
+      <LazyBoundary label="Devices" className="h-screen">
+        <DevicesView />
+      </LazyBoundary>
+    );
   }
 
   // Full-screen Pull requests — the review surface for work that isn't
   // in a workspace yet. Same overlay shape as the pages above it.
   if (showPullRequests) {
-    return <PullRequestsView />;
+    return (
+      <LazyBoundary label="Pull requests" className="h-screen">
+        <PullRequestsView />
+      </LazyBoundary>
+    );
   }
 
   // Full-screen new project — replaces entire app including sidebar
   if (showNewProjectScreen) {
-    return <NewProjectScreen />;
+    return (
+      <LazyBoundary label="New project" className="h-screen">
+        <NewProjectScreen />
+      </LazyBoundary>
+    );
   }
 
   // Full-screen empty state — no sidebar, no title bar. Bypassed when
@@ -194,14 +294,45 @@ export function AppShell() {
               inside this `relative` SidebarInset, so it floats over
               WorkspaceMain without resizing it. Renders nothing unless
               GUI chrome applies and the peek is explicitly opened. */}
-          <BrowserPeekOverlay />
+          {browserPeekOpen && (
+            <LazyBoundary
+              label="browser peek"
+              className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-xl border border-border"
+            >
+              <BrowserPeekOverlay />
+            </LazyBoundary>
+          )}
         </SidebarInset>
-        <CommandPalette
-          open={commandPaletteOpen}
-          onOpenChange={setCommandPaletteOpen}
-        />
-        <FileSearchDialog />
-        <ContentSearchDialog />
+        {commandPaletteOpen && (
+          <LazyBoundary
+            label="command palette"
+            className="fixed inset-0 z-50 h-screen"
+            presentation="overlay"
+          >
+            <CommandPalette
+              open={commandPaletteOpen}
+              onOpenChange={setCommandPaletteOpen}
+            />
+          </LazyBoundary>
+        )}
+        {fileSearchOpen && (
+          <LazyBoundary
+            label="file search"
+            className="fixed inset-0 z-50 h-screen"
+            presentation="overlay"
+          >
+            <FileSearchDialog />
+          </LazyBoundary>
+        )}
+        {contentSearchOpen && (
+          <LazyBoundary
+            label="content search"
+            className="fixed inset-0 z-50 h-screen"
+            presentation="overlay"
+          >
+            <ContentSearchDialog />
+          </LazyBoundary>
+        )}
       </SidebarProvider>
     </div>
   );

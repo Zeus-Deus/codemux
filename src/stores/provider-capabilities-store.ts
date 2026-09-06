@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import { create } from "zustand";
+import { createJSONStorage, persist } from "zustand/middleware";
 
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { listChatProviderCapabilities } from "@/tauri/commands";
@@ -10,7 +10,7 @@ import type {
 } from "@/tauri/types";
 
 /** Server-side TTL on the Rust Cursor harvest cache, mirrored here so the
- *  poll below can be stated relative to it. Keep in lockstep with
+ *  intent freshness window below can be stated relative to it. Keep in lockstep with
  *  `CAPABILITY_CACHE_TTL` in `agent_provider/cursor/capabilities.rs`. */
 export const CURSOR_CAPABILITY_TTL_MS = 5 * 60 * 1000;
 
@@ -27,24 +27,36 @@ export const CURSOR_CAPABILITY_REFRESH_MS =
  *  cadence as Cursor's live ACP catalogue. */
 export const GROK_CAPABILITY_REFRESH_MS = CURSOR_CAPABILITY_REFRESH_MS;
 
-/** Whether a scheduled Cursor re-harvest is worth issuing.
+/** Whether a repeat Cursor re-harvest is worth issuing.
  *
  *  A machine without the CLI has no catalog to refresh, and the probe
- *  would try to spawn a missing binary once per tick forever. Only a
- *  definite "not installed" suppresses the poll — an unknown health slot
- *  (never probed) still refreshes, because the harvest is how the picker
- *  learns Cursor exists at all. */
+ *  would try to spawn a missing binary on every attempt forever. Only a
+ *  definite "not installed" suppresses it — an unknown health slot (never
+ *  probed) still refreshes, because the harvest is how the picker learns
+ *  Cursor exists at all. */
 export function shouldRefreshCursorCapabilities(
   health: ProviderHealthReport | null,
 ): boolean {
   return health?.installed !== false;
 }
 
-/** Same installed-binary guard for Grok's scheduled live discovery. */
+/** Same installed-binary guard for Grok's live discovery. */
 export function shouldRefreshGrokCapabilities(
   health: ProviderHealthReport | null,
 ): boolean {
   return health?.installed !== false;
+}
+
+/** Applies the installed-binary guard for the CLI-owned catalogs when a
+ *  picker reopens past its re-harvest window. Providers whose catalogs are
+ *  release-bundled have nothing to spawn, so they are always allowed. */
+function shouldReharvestCapabilities(
+  provider: AgentChatProviderKind,
+): boolean {
+  const health = useProviderHealth.getState().slots[provider]?.report ?? null;
+  if (provider === "cursor") return shouldRefreshCursorCapabilities(health);
+  if (provider === "grok") return shouldRefreshGrokCapabilities(health);
+  return true;
 }
 
 interface ProviderCapabilitiesStore {
@@ -62,13 +74,190 @@ interface ProviderCapabilitiesStore {
   cursorError: string | null;
   grokError: string | null;
   opencodeError: string | null;
-  loaded: boolean;
+  /** Per-provider request lifecycle. `true` means the latest refresh settled,
+   *  whether it returned models, an empty catalog, or an error. */
+  loadedProviders: Partial<Record<AgentChatProviderKind, boolean>>;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
-  refreshAll: () => Promise<void>;
 }
 
-export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
-  (set) => ({
+// Settings can render more than one model picker, and a provider harvest may
+// launch a CLI. Dedupe at the store boundary so concurrent explicit intents
+// never fan out into duplicate child processes.
+const providerRefreshInFlight = new Map<
+  AgentChatProviderKind,
+  Promise<void>
+>();
+const providerIntentRefreshedAt = new Map<AgentChatProviderKind, number>();
+// Sign-out generation counter. A harvest can spend seconds in a CLI while the
+// user signs out; `resetProviderCapabilities` bumps this, and every refresh
+// compares the epoch it captured at flight start before writing results. A
+// stale flight that loses the race is discarded instead of resurrecting the
+// just-cleared catalog in memory (and, via the persist middleware, back into
+// localStorage after `clearStorage()`).
+let providerResetEpoch = 0;
+// Providers whose catalogue lives in an installed CLI and can change without
+// a Codemux release. A later intent past this window re-harvests; every other
+// provider stays a once-per-renderer intent because its catalogue ships with
+// the release or has no matching server-side cache TTL.
+const INTENT_REHARVEST_INTERVAL_MS: Partial<
+  Record<AgentChatProviderKind, number>
+> = {
+  cursor: CURSOR_CAPABILITY_REFRESH_MS,
+  grok: GROK_CAPABILITY_REFRESH_MS,
+};
+export const PROVIDER_CAPABILITIES_STORAGE_KEY =
+  "codemux:provider-capabilities:v1";
+
+export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
+  persist(
+    (set) => ({
+      claude: null,
+      codex: null,
+      cursor: null,
+      grok: null,
+      opencode: null,
+      claudeError: null,
+      codexError: null,
+      cursorError: null,
+      grokError: null,
+      opencodeError: null,
+      loadedProviders: {},
+      refresh: (provider) => {
+        const existing = providerRefreshInFlight.get(provider);
+        if (existing) return existing;
+
+        set((state) => ({
+          loadedProviders: {
+            ...state.loadedProviders,
+            [provider]: false,
+          },
+        }));
+
+        const startedEpoch = providerResetEpoch;
+        const request = (async () => {
+          try {
+            const caps = await listChatProviderCapabilities(provider);
+            if (providerResetEpoch !== startedEpoch) return;
+            set((state) => storeOk(state, provider, caps));
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(
+              `[provider-capabilities] refresh(${provider}) failed:`,
+              err,
+            );
+            if (providerResetEpoch !== startedEpoch) return;
+            set((state) => storeErr(state, provider, message));
+          }
+        })().finally(() => {
+          // A flight that straddled a reset must not touch state: writing
+          // `loadedProviders` here would mark a wiped slot as settled (or
+          // clobber the lifecycle of a fresher post-reset flight).
+          if (providerResetEpoch === startedEpoch) {
+            set((state) => ({
+              loadedProviders: {
+                ...state.loadedProviders,
+                [provider]: true,
+              },
+            }));
+          }
+          // Only clear our own dedupe entry. After a reset the map is
+          // cleared and may already hold a newer flight for this provider;
+          // deleting that one would let concurrent intents fan out again.
+          if (providerRefreshInFlight.get(provider) === request) {
+            providerRefreshInFlight.delete(provider);
+          }
+        });
+        providerRefreshInFlight.set(provider, request);
+        return request;
+      },
+    }),
+    {
+      name: PROVIDER_CAPABILITIES_STORAGE_KEY,
+      storage: createJSONStorage(() => localStorage),
+      // Capability catalogs contain public model metadata only. Errors and
+      // lifecycle flags are deliberately session-local, so a missing CLI or
+      // transient failure is never replayed as current state on next launch.
+      partialize: (state) => ({
+        claude: state.claude,
+        codex: state.codex,
+        cursor: state.cursor,
+        grok: state.grok,
+        opencode: state.opencode,
+      }),
+    },
+  ),
+);
+
+/**
+ * Opening a model picker is the intent boundary for provider discovery.
+ * Mounting the app shell never calls this. A persisted catalog paints the
+ * picker immediately, then the first intent in this renderer refreshes it in
+ * the background. Re-renders and multiple picker surfaces share that attempt;
+ * a later Cursor intent refreshes again once its CLI catalog can be stale.
+ */
+export function refreshProviderCapabilitiesForIntent(
+  provider: AgentChatProviderKind,
+): Promise<void> {
+  // Health probes can launch provider runtimes too, so they share the exact
+  // same explicit-intent boundary. The health store's TTL handles later
+  // picker openings without another process spawn.
+  const healthRefresh = useProviderHealth.getState().refresh(provider);
+  const lastRefresh = providerIntentRefreshedAt.get(provider);
+  // The Cursor and Grok catalogs are owned by their installed CLIs and used
+  // to refresh on an app-level timer. Capability startup is now intent-driven,
+  // so reopening a picker after that cadence becomes the bounded reharvest
+  // trigger. Other providers retain their original once-per-renderer intent
+  // behavior; their catalogs are release-bundled or harvested without the
+  // matching server-side cache TTL.
+  const reharvestAfterMs = INTENT_REHARVEST_INTERVAL_MS[provider];
+  const refreshStillFresh =
+    lastRefresh !== undefined &&
+    (reharvestAfterMs === undefined ||
+      Date.now() - lastRefresh < reharvestAfterMs);
+  if (refreshStillFresh) return healthRefresh;
+  // A re-harvest (as opposed to the first intent) always follows an earlier
+  // probe, so the health slot is already populated and can gate the spawn
+  // synchronously — no extra await on the picker's critical path. A definite
+  // "not installed" has no CLI-owned catalog to harvest; an unknown slot
+  // still harvests, since that is how the picker learns the provider exists.
+  if (lastRefresh !== undefined && !shouldReharvestCapabilities(provider)) {
+    return healthRefresh;
+  }
+  return Promise.all([
+    healthRefresh,
+    useProviderCapabilities.getState().refresh(provider),
+  ]).then(() => {
+    // `refresh` deliberately absorbs IPC/provider failures so picker
+    // surfaces can render their per-provider error state. Only remember a
+    // completed intent after that state proves the live harvest succeeded;
+    // otherwise reopening the picker is the user's natural retry action.
+    const state = useProviderCapabilities.getState();
+    if (selectCapabilities(state, provider) && !selectError(state, provider)) {
+      providerIntentRefreshedAt.set(provider, Date.now());
+    } else {
+      providerIntentRefreshedAt.delete(provider);
+    }
+  });
+}
+
+/** Reset process-wide intent bookkeeping between isolated store tests. */
+export function _resetProviderCapabilityIntentForTests(): void {
+  providerIntentRefreshedAt.clear();
+}
+
+/** Sign-out hygiene, called by the auth store when the user transitions to
+ *  null: drop the persisted catalog and reset in-memory capability state so
+ *  a signed-out shell doesn't keep replaying the previous session's picker
+ *  cache. Catalogs are public model metadata, so this is tidiness rather
+ *  than secrecy — deliberately kept simple. */
+export function resetProviderCapabilities(): void {
+  // Invalidate every in-flight harvest and forget its dedupe entry: a
+  // doomed flight must neither write its result when it settles nor absorb
+  // the next post-sign-in refresh into itself.
+  providerResetEpoch += 1;
+  providerRefreshInFlight.clear();
+  providerIntentRefreshedAt.clear();
+  useProviderCapabilities.setState({
     claude: null,
     codex: null,
     cursor: null,
@@ -79,88 +268,9 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
     cursorError: null,
     grokError: null,
     opencodeError: null,
-    loaded: false,
-    refresh: async (provider) => {
-      try {
-        const caps = await listChatProviderCapabilities(provider);
-        set((state) => storeOk(state, provider, caps));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[provider-capabilities] refresh(${provider}) failed:`,
-          err,
-        );
-        set((state) => storeErr(state, provider, message));
-      }
-    },
-    refreshAll: async () => {
-      const store = useProviderCapabilities.getState();
-      // Promise.all is fine here — each `refresh` awaits its own
-      // try/catch so a single provider's failure (commonly OpenCode
-      // not installed) doesn't reject the whole barrier.
-      await Promise.all([
-        store.refresh("claude"),
-        store.refresh("codex"),
-        store.refresh("cursor"),
-        store.refresh("grok"),
-        store.refresh("opencode"),
-      ]);
-      set({ loaded: true });
-    },
-  }),
-);
-
-/**
- * Fetch chat-side provider capabilities once on mount. Mount exactly
- * once (e.g. in `App.tsx`). Subsequent refreshes happen implicitly when
- * the Rust side emits `provider_capabilities_updated` (live harvest
- * path, deferred — MVP ships fallback-only for Claude/Codex; OpenCode
- * already does a live harvest at refresh time, see Stage 3).
- *
- * Originally gated on `enableAgentChat` so the harvest only ran for
- * Beta users. That gate was lifted because the same picker is now
- * reused by the merge-resolver settings panel — a non-Beta consumer
- * that legitimately needs the model list. Per-provider failures
- * (`codex_not_installed`, `opencode_not_installed`) still surface
- * correctly via the per-provider error slot, so users who don't have
- * those CLIs installed see "Not installed" tooltips instead of broken
- * states. The capability call is read-only from the user's perspective:
- * Claude returns its static fallback, Codex/OpenCode harvest only if
- * their binaries are present on PATH.
- *
- * `enableAgentChat` is kept as a parameter for any future caller that
- * wants to opt out, but the default behavior is unconditional refresh.
- */
-export function useProviderCapabilitiesInit(): void {
-  const refreshAll = useProviderCapabilities((s) => s.refreshAll);
-  const refresh = useProviderCapabilities((s) => s.refresh);
-  useEffect(() => {
-    let cursorTimer: number | null = null;
-    let grokTimer: number | null = null;
-    let cancelled = false;
-    void refreshAll().finally(() => {
-      if (cancelled) return;
-      cursorTimer = window.setInterval(() => {
-        const health = useProviderHealth.getState().slots.cursor.report;
-        if (!shouldRefreshCursorCapabilities(health)) return;
-        void refresh("cursor");
-      }, CURSOR_CAPABILITY_REFRESH_MS);
-      grokTimer = window.setInterval(() => {
-        const health = useProviderHealth.getState().slots.grok.report;
-        if (!shouldRefreshGrokCapabilities(health)) return;
-        void refresh("grok");
-      }, GROK_CAPABILITY_REFRESH_MS);
-    });
-    // The installed Cursor and Grok CLIs are their catalog authorities.
-    // Refresh on a bounded cadence so newly released/retired models and
-    // reasoning options appear without a Codemux release or app restart.
-    // Start the clocks after the initial harvest.
-    return () => {
-      cancelled = true;
-      if (cursorTimer !== null) window.clearInterval(cursorTimer);
-      if (grokTimer !== null) window.clearInterval(grokTimer);
-    };
-  }, [refreshAll, refresh]);
+    loadedProviders: {},
+  });
+  useProviderCapabilities.persist.clearStorage();
 }
 
 /** Convenience selector: capabilities for the given provider, or null.
@@ -202,6 +312,16 @@ export function selectError(
     case "opencode":
       return state.opencodeError;
   }
+}
+
+/** Whether this provider's latest refresh attempt has settled. A failed or
+ *  empty harvest is still loaded: consumers should show their empty/error
+ *  state instead of an indefinite loading indicator. */
+export function selectProviderCapabilitiesLoaded(
+  state: ProviderCapabilitiesStore,
+  provider: AgentChatProviderKind,
+): boolean {
+  return state.loadedProviders[provider] === true;
 }
 
 /** Convenience selector: find a model by id within a provider's list.

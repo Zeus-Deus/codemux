@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import type { AuthUser } from "@/tauri/types";
 import {
-  checkAuth as checkAuthCmd,
+  bootstrapSession as bootstrapSessionCmd,
+  refreshSession as refreshSessionCmd,
   getSyncStatus as getSyncStatusCmd,
   startOauthFlow as startOauthFlowCmd,
   signinEmail as signinEmailCmd,
@@ -9,8 +10,58 @@ import {
   signOut as signOutCmd,
   type SyncStatus,
 } from "@/tauri/commands";
+import type { AuthSessionStatus } from "@/tauri/types";
+import {
+  DEFAULT_SETTINGS,
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
+import { resetProviderCapabilities } from "@/stores/provider-capabilities-store";
 
 export type AuthMethod = "email" | "github" | null;
+
+/** Provider intent is scoped to one authenticated shell, not to the renderer.
+ *  A sign-out/sign-in cycle remounts persisted chat panes in the same webview;
+ *  retaining the previous account's intent would let an untouched empty pane
+ *  launch its provider as soon as the new account's shell appears.
+ *
+ *  Sign-out (user → null) additionally drops the persisted provider capability
+ *  catalog. Catalogs are public model metadata, so this is hygiene — a
+ *  signed-out shell shouldn't keep replaying the previous session's picker
+ *  cache. Launch bootstrap (null → cached user) deliberately does NOT clear,
+ *  so pickers keep painting from the persisted catalog. */
+function resetProviderScopedStateOnIdentityChange(
+  currentUser: AuthUser | null,
+  nextUser: AuthUser | null,
+): void {
+  if (currentUser?.id !== nextUser?.id) {
+    useProviderRuntimeIntent.getState().reset();
+  }
+  if (currentUser !== null && nextUser === null) {
+    resetProviderCapabilities();
+  }
+}
+
+/** Singleflight for remote verification. Email sign-in awaits refreshSession
+ *  while the backend's auth-state-changed event fires a second one through
+ *  the event handler; without coalescing, two concurrent verifies (and
+ *  settings GETs) race and the later-arriving response overwrites the
+ *  earlier one. Concurrent callers share the same in-flight promise. */
+let refreshSessionInFlight: Promise<void> | null = null;
+
+/** Monotonic identity-transition counter. A verification flight belongs to
+ *  the identity it started under: every transition (sign-out, email sign-in,
+ *  auth-event user swap) bumps the epoch and drops the in-flight promise so
+ *  the next caller starts a fresh verify for the new identity instead of
+ *  joining a stale one. A stale flight that settles later compares its
+ *  captured epoch and discards its result instead of clobbering the new
+ *  identity's state. */
+let sessionEpoch = 0;
+
+function invalidateInFlightSessionRefresh(): void {
+  sessionEpoch += 1;
+  refreshSessionInFlight = null;
+}
 
 interface AuthStore {
   user: AuthUser | null;
@@ -18,7 +69,7 @@ interface AuthStore {
   isLoading: boolean;
   isSigningIn: boolean;
   error: string | null;
-  devBypass: boolean;
+  sessionStatus: AuthSessionStatus;
 
   // Skills sync. Stored server-side (no client-held key), so
   // `syncAvailable` is simply "the user is signed in." `authMethod`
@@ -29,6 +80,8 @@ interface AuthStore {
   authMethod: AuthMethod;
 
   checkAuth: () => Promise<void>;
+  bootstrapSession: () => Promise<void>;
+  refreshSession: () => Promise<void>;
   startOAuthFlow: () => Promise<void>;
   signInEmail: (email: string, password: string) => Promise<void>;
   signUpEmail: (
@@ -43,70 +96,111 @@ interface AuthStore {
   clearError: () => void;
 }
 
-const DEV_USER: AuthUser = {
-  id: "dev-local",
-  email: "dev@localhost",
-  name: "Dev Mode",
-  image: null,
-};
-
 export const useAuthStore = create<AuthStore>((set, get) => ({
   user: null,
   isAuthenticated: false,
   isLoading: true,
   isSigningIn: false,
   error: null,
-  devBypass: false,
+  sessionStatus: "signed-out",
   syncAvailable: false,
   authMethod: null,
 
-  checkAuth: async () => {
+  bootstrapSession: async () => {
     set({ isLoading: true, error: null });
-
-    const maxRetries = 3;
-    const retryDelay = 500;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const user = await checkAuthCmd();
-        if (user) {
-          set({ user, isAuthenticated: true, isLoading: false });
-          // Pull the cold-start sync state so we can mark the
-          // session sync-ready immediately rather than waiting for
-          // the `sync-state-changed` event.
-          try {
-            const status = await getSyncStatusCmd();
-            set({
-              syncAvailable: status.syncAvailable,
-              authMethod: status.authMethod,
-            });
-          } catch {
-            // Tauri command unavailable in dev/test harness — leave
-            // syncAvailable=false (already the default).
-          }
-        } else {
-          set({
-            user: null,
-            isAuthenticated: false,
-            isLoading: false,
-            syncAvailable: false,
-            authMethod: null,
-          });
-        }
-        return;
-      } catch (err) {
-        if (attempt < maxRetries) {
-          await new Promise((resolve) => setTimeout(resolve, retryDelay));
-        }
-      }
+    try {
+      const session = await bootstrapSessionCmd();
+      resetProviderScopedStateOnIdentityChange(get().user, session.user);
+      useSyncedSettingsStore.getState().replaceSessionSettings(session.settings);
+      set({
+        user: session.user,
+        isAuthenticated: session.authenticated,
+        isLoading: false,
+        syncAvailable: session.authenticated,
+        authMethod: session.authMethod,
+        sessionStatus: session.status,
+      });
+    } catch (error) {
+      resetProviderScopedStateOnIdentityChange(get().user, null);
+      useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
+      set({
+        user: null,
+        isAuthenticated: false,
+        isLoading: false,
+        syncAvailable: false,
+        authMethod: null,
+        sessionStatus: "signed-out",
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+  },
 
-    set({
-      user: DEV_USER,
-      isAuthenticated: true,
-      isLoading: false,
-      devBypass: true,
+  refreshSession: () => {
+    if (refreshSessionInFlight) return refreshSessionInFlight;
+    const request = (async () => {
+      const flightEpoch = sessionEpoch;
+      const startingUserId = get().user?.id ?? null;
+      const settingsToken = useSyncedSettingsStore
+        .getState()
+        .remoteReconcileToken();
+      try {
+        const session = await refreshSessionCmd();
+        // The identity changed while this flight was in the air; its result
+        // describes the abandoned session, not the current one.
+        if (flightEpoch !== sessionEpoch) return;
+        resetProviderScopedStateOnIdentityChange(get().user, session.user);
+        if ((session.user?.id ?? null) !== startingUserId) {
+          useSyncedSettingsStore
+            .getState()
+            .replaceSessionSettings(session.settings);
+        } else {
+          useSyncedSettingsStore
+            .getState()
+            .reconcileRemoteSettings(session.settings, settingsToken);
+        }
+        set({
+          user: session.user,
+          isAuthenticated: session.authenticated,
+          isLoading: false,
+          syncAvailable: session.authenticated,
+          authMethod: session.authMethod,
+          sessionStatus: session.status,
+        });
+      } catch (error) {
+        if (flightEpoch !== sessionEpoch) return;
+        // A rejection here is an invocation/transport failure, never a
+        // verdict on the token: the backend resolves authoritative outcomes
+        // (expired or rejected token) as a signed-out session instead of
+        // rejecting. Keep the painted local session and surface its state.
+        // A pending verification in particular must stay pending so the
+        // post-paint retry path can re-verify instead of flashing a login
+        // screen over a still-valid token.
+        set((state) => ({
+          isLoading: false,
+          sessionStatus:
+            state.sessionStatus === "pending-verification"
+              ? state.sessionStatus
+              : state.isAuthenticated
+                ? "offline"
+                : "signed-out",
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      } finally {
+        // Safe for a discarded flight too: the identity transition already
+        // replaced the settings session, which invalidated this token.
+        useSyncedSettingsStore
+          .getState()
+          .finishRemoteReconcile(settingsToken);
+      }
+    })().finally(() => {
+      if (refreshSessionInFlight === request) refreshSessionInFlight = null;
     });
+    refreshSessionInFlight = request;
+    return request;
+  },
+
+  checkAuth: async () => {
+    await get().refreshSession();
   },
 
   startOAuthFlow: async () => {
@@ -127,11 +221,22 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     set({ isSigningIn: true, error: null });
     try {
       const resp = await signinEmailCmd(email, password);
+      // The signed-in account must not join, or be clobbered by, a verify
+      // started under the previous identity/token.
+      invalidateInFlightSessionRefresh();
+      resetProviderScopedStateOnIdentityChange(get().user, resp.user);
+      if (get().user?.id !== resp.user.id) {
+        useSyncedSettingsStore
+          .getState()
+          .replaceSessionSettings(DEFAULT_SETTINGS);
+      }
       set({
         user: resp.user,
         isAuthenticated: true,
         isSigningIn: false,
+        sessionStatus: "local",
       });
+      await get().refreshSession();
     } catch (err) {
       set({
         isSigningIn: false,
@@ -159,21 +264,28 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     } catch {
       // Ignore errors — clear local state regardless
     }
+    invalidateInFlightSessionRefresh();
+    resetProviderScopedStateOnIdentityChange(get().user, null);
+    useSyncedSettingsStore.getState().replaceSessionSettings(DEFAULT_SETTINGS);
     set({
       user: null,
       isAuthenticated: false,
       isSigningIn: false,
-      devBypass: false,
       syncAvailable: false,
       authMethod: null,
+      sessionStatus: "signed-out",
     });
   },
 
   setUser: (user) => {
+    if (get().user?.id !== user?.id) {
+      invalidateInFlightSessionRefresh();
+    }
+    resetProviderScopedStateOnIdentityChange(get().user, user);
     if (user) {
-      set({ user, isAuthenticated: true, isSigningIn: false });
+      set({ user, isAuthenticated: true, isSigningIn: false, sessionStatus: "local" });
     } else {
-      set({ user: null, isAuthenticated: false });
+      set({ user: null, isAuthenticated: false, sessionStatus: "signed-out" });
     }
   },
 

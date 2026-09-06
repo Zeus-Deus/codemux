@@ -3,7 +3,7 @@
  *
  * The default seed is a *design* fixture: 18 hand-curated workspaces chosen to
  * exercise every sidebar and chat state. It is deliberately far below the
- * audited real profile (79 workspaces, 74k persisted events, 165 MB of chat
+ * audited real profile (270 workspaces, with a 300-workspace headroom case),
  * payload), so measuring against it flatters every number. These presets scale
  * the same seed up to that profile without touching the curated data: with no
  * fixture selected, `createSeedAppState()` and the seeded transcript are
@@ -15,11 +15,11 @@
  *
  * Both also accept an inline JSON object for one-off shapes, merged over the
  * `medium` preset:
- *   `?fixture={"workspaces":80,"chatEvents":5000}`
+ *   `?fixture={"workspaces":300,"chatEvents":5000}`
  */
 
 export interface StressFixture {
-  /** Total workspaces in the seeded snapshot (1–80). */
+  /** Total workspaces in the seeded snapshot (1–300). */
   workspaces: number;
   /** Persisted chat events per synthetic thread (50–5,000). */
   chatEvents: number;
@@ -32,8 +32,10 @@ export interface StressFixture {
 export const STRESS_PRESETS: Record<string, StressFixture> = {
   small: { workspaces: 8, chatEvents: 50, payloadMb: 1, deltasPerSec: 20 },
   medium: { workspaces: 30, chatEvents: 1_000, payloadMb: 5, deltasPerSec: 50 },
-  large: { workspaces: 60, chatEvents: 3_000, payloadMb: 10, deltasPerSec: 80 },
-  xl: { workspaces: 80, chatEvents: 5_000, payloadMb: 15, deltasPerSec: 100 },
+  /** Reproduces the audited production profile. */
+  large: { workspaces: 270, chatEvents: 5_000, payloadMb: 15, deltasPerSec: 100 },
+  /** Headroom fixture used by the release trace gate. */
+  xl: { workspaces: 300, chatEvents: 5_000, payloadMb: 15, deltasPerSec: 100 },
 };
 
 /** Thread ids handed to generated workspaces. `agent_chat_list_messages`
@@ -50,7 +52,7 @@ function clamp(value: number, min: number, max: number): number {
 function normalize(spec: Partial<StressFixture>): StressFixture {
   const base = STRESS_PRESETS.medium;
   return {
-    workspaces: clamp(spec.workspaces ?? base.workspaces, 1, 80),
+    workspaces: clamp(spec.workspaces ?? base.workspaces, 1, 300),
     chatEvents: clamp(spec.chatEvents ?? base.chatEvents, 50, 5_000),
     payloadMb: clamp(spec.payloadMb ?? base.payloadMb, 0, 64),
     deltasPerSec: clamp(spec.deltasPerSec ?? base.deltasPerSec, 0, 500),
@@ -129,6 +131,10 @@ function syntheticToolOutput(bytes: number, seed: number): string {
   return parts.join("\n");
 }
 
+/** Three 15 MB sources are enough for a realistic warm/back/forward path.
+ * Bounding this dev-only LRU prevents a 90-chat-workspace sweep from retaining
+ * more than a gigabyte of synthetic JSON strings. */
+export const STRESS_TRANSCRIPT_CACHE_CAPACITY = 3;
 const transcriptCache = new Map<string, string[]>();
 
 /**
@@ -138,7 +144,11 @@ const transcriptCache = new Map<string, string[]>();
  */
 export function stressChatTranscript(threadId: string, fixture: StressFixture): string[] {
   const cached = transcriptCache.get(threadId);
-  if (cached) return cached;
+  if (cached) {
+    transcriptCache.delete(threadId);
+    transcriptCache.set(threadId, cached);
+    return cached;
+  }
 
   const turns = Math.max(1, Math.ceil(fixture.chatEvents / EVENTS_PER_TURN));
   const totalPayloadBytes = fixture.payloadMb * 1024 * 1024;
@@ -197,5 +207,10 @@ export function stressChatTranscript(threadId: string, fixture: StressFixture): 
 
   const trimmed = out.slice(0, fixture.chatEvents);
   transcriptCache.set(threadId, trimmed);
+  while (transcriptCache.size > STRESS_TRANSCRIPT_CACHE_CAPACITY) {
+    const oldest = transcriptCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    transcriptCache.delete(oldest);
+  }
   return trimmed;
 }

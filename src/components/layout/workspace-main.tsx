@@ -1,4 +1,11 @@
-import { useCallback, useRef, useEffect, useState } from "react";
+import {
+  lazy,
+  useCallback,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { clampRightPanelWidth } from "@/lib/right-panel-width";
 import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -8,14 +15,31 @@ import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
 import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
-import { RightPanel } from "./right-panel";
-import { DiffPane } from "@/components/diff/DiffPane";
-import { DraftChatSurface } from "@/components/chat/DraftChatSurface";
-import { EditorPane } from "@/components/editor/EditorPane";
-import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { cn } from "@/lib/utils";
+import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { markOpenInteraction } from "@/lib/perf/interaction-trace";
+
+const RightPanel = lazy(() =>
+  import("./right-panel").then((module) => ({ default: module.RightPanel })),
+);
+const DiffPane = lazy(() =>
+  import("@/components/diff/DiffPane").then((module) => ({ default: module.DiffPane })),
+);
+const DraftChatSurface = lazy(() =>
+  import("@/components/chat/DraftChatSurface").then((module) => ({
+    default: module.DraftChatSurface,
+  })),
+);
+const EditorPane = lazy(() =>
+  import("@/components/editor/EditorPane").then((module) => ({ default: module.EditorPane })),
+);
+const ProjectOnboarding = lazy(() =>
+  import("@/components/overlays/project-onboarding").then((module) => ({
+    default: module.ProjectOnboarding,
+  })),
+);
 
 function RightPanelResizer() {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
@@ -200,6 +224,17 @@ export function WorkspaceMain() {
   const activeDraft = useChatDraftStore((s) =>
     s.activeDraftId ? s.draftsById[s.activeDraftId] ?? null : null,
   );
+
+  // This boundary owns every workspace content kind, including diff/editor
+  // tabs that bypass PaneContainer. Stamp the optimistic target once its
+  // content shell is in the DOM; the trace module turns this into a paint mark.
+  useLayoutEffect(() => {
+    if (!activeWorkspace) return;
+    markOpenInteraction("pane-mounted", {
+      target: activeWorkspace.workspace_id,
+    });
+  }, [activeWorkspace?.workspace_id]);
+
   if (lazyEnabled && activeDraftId && activeDraft) {
     return (
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
@@ -211,7 +246,9 @@ export function WorkspaceMain() {
           />
         )}
         <div className="flex-1 min-h-0 overflow-hidden">
-          <DraftChatSurface />
+          <LazyBoundary label="chat draft" className="h-full">
+            <DraftChatSurface />
+          </LazyBoundary>
         </div>
       </div>
     );
@@ -228,12 +265,14 @@ export function WorkspaceMain() {
   if (isOnboarding) {
     return (
       <div className={cn("flex flex-1 min-h-0", enableAgentChat && "pt-10")}>
-        <ProjectOnboarding
-          projectDir={onboardingProjectDir}
-          tempWorkspaceId={activeWorkspace.workspace_id}
-          onComplete={() => setOnboardingProjectDir(null)}
-          onCancel={() => setOnboardingProjectDir(null)}
-        />
+        <LazyBoundary label="project onboarding" className="h-full">
+          <ProjectOnboarding
+            projectDir={onboardingProjectDir}
+            tempWorkspaceId={activeWorkspace.workspace_id}
+            onComplete={() => setOnboardingProjectDir(null)}
+            onCancel={() => setOnboardingProjectDir(null)}
+          />
+        </LazyBoundary>
       </div>
     );
   }
@@ -291,9 +330,16 @@ export function WorkspaceMain() {
           )}
         >
           {activeTab?.kind === "diff" ? (
-            <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
+            <LazyBoundary label="diff" className="h-full">
+              <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
+            </LazyBoundary>
           ) : activeTab?.kind === "editor" ? (
-            <EditorPane tabId={activeTab.tab_id} />
+            <LazyBoundary label="editor" className="h-full">
+              <EditorPane
+                tabId={activeTab.tab_id}
+                workspaceId={activeWorkspace.workspace_id}
+              />
+            </LazyBoundary>
           ) : (
             <PaneContainer workspace={activeWorkspace} />
           )}
@@ -317,10 +363,12 @@ export function WorkspaceMain() {
             // previous-width bookkeeping.
             style={maximized ? undefined : { width: effectiveRightPanelWidth }}
           >
-            <RightPanel
-              workspace={activeWorkspace}
-              activeTab={rightPanelTab}
-            />
+            <LazyBoundary label="right panel" className="h-full">
+              <RightPanel
+                workspace={activeWorkspace}
+                activeTab={rightPanelTab}
+              />
+            </LazyBoundary>
           </div>
         </>
       )}

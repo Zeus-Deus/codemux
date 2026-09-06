@@ -1,8 +1,4 @@
 import React from "react";
-import { TerminalPane } from "@/components/terminal/TerminalPane";
-import { BrowserPane } from "@/components/browser/BrowserPane";
-import { AgentChatPane } from "@/components/chat/AgentChatPane";
-import { AgentChatPaneHeader } from "@/components/chat/AgentChatPaneHeader";
 import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature-placeholder";
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -20,6 +16,28 @@ import { formatCwdHint } from "@/lib/terminal-cwd";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
+import { LazyBoundary } from "@/components/ui/lazy-boundary";
+
+const TerminalPane = React.lazy(() =>
+  import("@/components/terminal/TerminalPane").then((module) => ({
+    default: module.TerminalPane,
+  })),
+);
+const BrowserPane = React.lazy(() =>
+  import("@/components/browser/BrowserPane").then((module) => ({
+    default: module.BrowserPane,
+  })),
+);
+const AgentChatPane = React.lazy(() =>
+  import("@/components/chat/AgentChatPane").then((module) => ({
+    default: module.AgentChatPane,
+  })),
+);
+const AgentChatPaneHeader = React.lazy(() =>
+  import("@/components/chat/AgentChatPaneHeader").then((module) => ({
+    default: module.AgentChatPaneHeader,
+  })),
+);
 
 // Map known preset names to their icon identifiers
 const PRESET_TITLE_TO_ICON: Record<string, string> = {
@@ -41,6 +59,9 @@ interface Props {
   node: PaneNodeSnapshot;
   activePaneId: string;
   visible: boolean;
+  /** Owning workspace, threaded down the pane tree without rescanning a
+   *  production-sized snapshot at every split node. */
+  workspaceId?: string;
   /** True only for the top-level pane of a surface (not split children).
    *  In GUI chrome a sole-root agent_chat pane drops its header — session
    *  history + close live on the title-bar tab instead. A sole-root terminal
@@ -210,7 +231,13 @@ function handleDragStart(
 
 // ── Component ──
 
-function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Props) {
+function PaneNodeImpl({
+  node,
+  activePaneId,
+  visible,
+  workspaceId,
+  isSurfaceRoot = false,
+}: Props) {
   // #127: hooks hoisted above the split branch so hook order stays stable if a
   // fiber flips between split↔leaf at the same position (the old code called
   // these AFTER an early `return` for split nodes — a conditional-hook bug that
@@ -246,7 +273,12 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
         {node.children.map((child, i) => (
           <div key={child.pane_id} className="relative min-w-0 min-h-0 overflow-hidden">
-            <PaneNode node={child} activePaneId={activePaneId} visible={visible} />
+            <PaneNode
+              node={child}
+              activePaneId={activePaneId}
+              visible={visible}
+              workspaceId={workspaceId}
+            />
             {i < node.children.length - 1 && (
               <div
                 className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity duration-100 ${
@@ -355,13 +387,15 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
-          <TerminalPane
-            sessionId={node.session_id}
-            paneId={node.pane_id}
-            focused={isActive}
-            visible={visible}
-            title={node.title}
-          />
+          <LazyBoundary label="terminal" className="h-full">
+            <TerminalPane
+              sessionId={node.session_id}
+              paneId={node.pane_id}
+              focused={isActive}
+              visible={visible}
+              title={node.title}
+            />
+          </LazyBoundary>
         </div>
       </div>
     );
@@ -397,11 +431,13 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
         onPointerDown={handleActivate}
       >
         {!hideChatHeader && (
-          <AgentChatPaneHeader
-            pane={node}
-            isActive={isActive}
-            onPointerDown={(e) => handleDragStart(e, node.pane_id)}
-          />
+          <LazyBoundary label="chat header" className="h-7 min-h-7">
+            <AgentChatPaneHeader
+              pane={node}
+              isActive={isActive}
+              onPointerDown={(e) => handleDragStart(e, node.pane_id)}
+            />
+          </LazyBoundary>
         )}
         <div className="flex-1 min-h-0 overflow-hidden">
           {/*
@@ -417,7 +453,9 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
             the same chat. Keying by pane_id forces a clean unmount/
             remount and matches CLI panes' per-session_id isolation.
           */}
-          <AgentChatPane key={node.pane_id} pane={node} />
+          <LazyBoundary label="agent chat" className="h-full">
+            <AgentChatPane key={node.pane_id} pane={node} />
+          </LazyBoundary>
         </div>
       </div>
     );
@@ -450,7 +488,14 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
-          <BrowserPane browserId={node.browser_id} focused={isActive} visible={visible} />
+          <LazyBoundary label="browser" className="h-full">
+            <BrowserPane
+              browserId={node.browser_id}
+              focused={isActive}
+              visible={visible}
+              traceWorkspaceId={workspaceId}
+            />
+          </LazyBoundary>
         </div>
       </div>
     );

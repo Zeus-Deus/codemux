@@ -47,6 +47,15 @@ interface SyncedSettingsActions {
   updateSetting: (section: string, key: string, value: unknown) => Promise<void>;
   resetSettings: () => Promise<void>;
   applySettingsFromEvent: (settings: UserSettings) => void;
+  /** Capture before a remote account refresh; its result only applies while
+   * no newer local write or session replacement has happened. */
+  remoteReconcileToken: () => SettingsOperationToken;
+  finishRemoteReconcile: (token: SettingsOperationToken) => void;
+  reconcileRemoteSettings: (
+    settings: UserSettings,
+    token: SettingsOperationToken,
+  ) => boolean;
+  replaceSessionSettings: (settings: UserSettings) => void;
 }
 
 type SyncedSettingsStore = SyncedSettingsState & SyncedSettingsActions;
@@ -61,10 +70,61 @@ const EMPTY_CUSTOM_HOSTS: Record<string, string> = {};
 // the generation matches, preventing stale backend responses from
 // reverting a newer optimistic update.
 let _settingsGen = 0;
-// How many writes are currently awaiting a backend response. While > 0,
-// applySettingsFromEvent skips incoming Tauri events because the async
-// response path already handles them with a gen-check.
-let _inflightWrites = 0;
+// Account/session replacements advance this independently of local writes.
+// In-flight counts are keyed by it so a slow request from the account that
+// just signed out cannot suppress the next account's settings response.
+let _sessionGen = 0;
+
+interface SettingsOperationToken {
+  sessionGeneration: number;
+  settingsGeneration: number;
+}
+
+const _inflightWrites = new Map<number, number>();
+const _inflightRemoteReconciles = new Map<number, number>();
+
+function incrementInflight(map: Map<number, number>, sessionGeneration: number) {
+  map.set(sessionGeneration, (map.get(sessionGeneration) ?? 0) + 1);
+}
+
+function decrementInflight(map: Map<number, number>, sessionGeneration: number) {
+  const remaining = (map.get(sessionGeneration) ?? 0) - 1;
+  if (remaining > 0) map.set(sessionGeneration, remaining);
+  else map.delete(sessionGeneration);
+}
+
+function currentInflight(map: Map<number, number>): number {
+  return map.get(_sessionGen) ?? 0;
+}
+
+function beginWrite(): SettingsOperationToken {
+  const token = {
+    sessionGeneration: _sessionGen,
+    settingsGeneration: ++_settingsGen,
+  };
+  incrementInflight(_inflightWrites, token.sessionGeneration);
+  return token;
+}
+
+function isCurrent(token: SettingsOperationToken): boolean {
+  return (
+    token.sessionGeneration === _sessionGen &&
+    token.settingsGeneration === _settingsGen
+  );
+}
+
+function finishWrite(
+  token: SettingsOperationToken,
+  set: (partial: Partial<SyncedSettingsState>) => void,
+) {
+  decrementInflight(_inflightWrites, token.sessionGeneration);
+  if (
+    token.sessionGeneration === _sessionGen &&
+    currentInflight(_inflightWrites) === 0
+  ) {
+    set({ isSyncing: false });
+  }
+}
 
 export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
   settings: DEFAULT_SETTINGS,
@@ -72,33 +132,34 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
   isSyncing: false,
 
   loadSettings: async () => {
+    const sessionGeneration = _sessionGen;
     set({ isLoading: true });
     try {
       const settings = await getSyncedSettings();
-      set({ settings, isLoading: false });
+      if (sessionGeneration === _sessionGen) {
+        set({ settings, isLoading: false });
+      }
     } catch {
-      set({ isLoading: false });
+      if (sessionGeneration === _sessionGen) set({ isLoading: false });
     }
   },
 
   updateSettings: async (settings) => {
-    const gen = ++_settingsGen;
-    _inflightWrites++;
+    const token = beginWrite();
     set({ settings, isSyncing: true });
     try {
       const saved = await updateSyncedSettings(settings);
-      if (_settingsGen === gen) set({ settings: saved, isSyncing: false });
-      else set({ isSyncing: false });
+      if (isCurrent(token)) set({ settings: saved });
     } catch {
-      set({ isSyncing: false });
+      // Keep the optimistic value. The backend owns offline persistence and
+      // the next explicit refresh will reconcile it.
     } finally {
-      _inflightWrites--;
+      finishWrite(token, set);
     }
   },
 
   updateSetting: async (section, key, value) => {
-    const gen = ++_settingsGen;
-    _inflightWrites++;
+    const token = beginWrite();
     // Optimistic update — apply locally first
     set((s) => {
       const json = JSON.parse(JSON.stringify(s.settings)) as Record<string, Record<string, unknown>>;
@@ -109,7 +170,7 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     });
     try {
       const saved = await updateSettingCmd(section, key, value);
-      if (_settingsGen === gen) {
+      if (isCurrent(token)) {
         // Re-apply our intended value on top of the server response.
         // The server PATCH deep-merges nested objects, so sending
         // e.g. { shortcuts: {} } is a no-op from the server's
@@ -117,7 +178,7 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
         const patched = JSON.parse(JSON.stringify(saved)) as Record<string, Record<string, unknown>>;
         if (patched[section]) patched[section][key] = value;
         const corrected = patched as unknown as UserSettings;
-        set({ settings: corrected, isSyncing: false });
+        set({ settings: corrected });
 
         // If the server response didn't match our intent (deep-merge
         // semantics), do a background full PUT to correct the server.
@@ -126,28 +187,26 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
         if (serverVal !== intendedVal) {
           updateSyncedSettings(corrected).catch(() => {});
         }
-      } else {
-        set({ isSyncing: false });
       }
     } catch {
-      set({ isSyncing: false });
+      // Keep the optimistic value. The backend owns offline persistence and
+      // the next explicit refresh will reconcile it.
     } finally {
-      _inflightWrites--;
+      finishWrite(token, set);
     }
   },
 
   resetSettings: async () => {
-    const gen = ++_settingsGen;
-    _inflightWrites++;
+    const token = beginWrite();
     set({ settings: DEFAULT_SETTINGS, isSyncing: true });
     try {
       const saved = await resetSyncedSettings();
-      if (_settingsGen === gen) set({ settings: saved, isSyncing: false });
-      else set({ isSyncing: false });
+      if (isCurrent(token)) set({ settings: saved });
     } catch {
-      set({ isSyncing: false });
+      // Keep the optimistic defaults. The backend owns offline persistence and
+      // the next explicit refresh will reconcile them.
     } finally {
-      _inflightWrites--;
+      finishWrite(token, set);
     }
   },
 
@@ -155,8 +214,50 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     // Skip events while local writes are in flight — the async response
     // path handles those with gen-checks. Only apply events from
     // external sources (other devices, server push).
-    if (_inflightWrites > 0) return;
+    if (
+      currentInflight(_inflightWrites) > 0 ||
+      currentInflight(_inflightRemoteReconciles) > 0
+    ) {
+      return;
+    }
     set({ settings });
+  },
+
+  remoteReconcileToken: () => {
+    const token = {
+      sessionGeneration: _sessionGen,
+      settingsGeneration: _settingsGen,
+    };
+    incrementInflight(
+      _inflightRemoteReconciles,
+      token.sessionGeneration,
+    );
+    return token;
+  },
+
+  finishRemoteReconcile: (token) => {
+    decrementInflight(
+      _inflightRemoteReconciles,
+      token.sessionGeneration,
+    );
+  },
+
+  reconcileRemoteSettings: (settings, token) => {
+    if (!isCurrent(token) || currentInflight(_inflightWrites) > 0) {
+      return false;
+    }
+    set({ settings, isLoading: false });
+    return true;
+  },
+
+  replaceSessionSettings: (settings) => {
+    // Invalidate responses belonging to the previous account even when its
+    // writes happened to finish before the replacement arrived.
+    _sessionGen += 1;
+    _settingsGen += 1;
+    _inflightWrites.clear();
+    _inflightRemoteReconciles.clear();
+    set({ settings, isLoading: false, isSyncing: false });
   },
 }));
 

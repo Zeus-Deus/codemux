@@ -10,6 +10,7 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 pub const APP_DIR_NAME: &str = "codemux";
 
 pub mod agent_capability;
+pub mod active_workspace_persistence;
 pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;
@@ -167,6 +168,7 @@ fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diagnostics::record_startup_milestone("startup.run-enter");
     // Set WebKitGTK env vars before any GTK/Tauri initialization.
     //
     // Renderer transport: `webview_tuning::configure_renderer_env` sets
@@ -245,8 +247,11 @@ pub fn run() {
     build_core_app(builder, AppMode::Gui)
         .build(app_context())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Err(error) = active_workspace_persistence::flush_latest(app) {
+                    eprintln!("[codemux::selection] shutdown flush failed: {error}");
+                }
                 // A graceful run-loop exit is not a renderer crash: disarm the
                 // renderer crash sentinel even when the main window never
                 // finished a page load (e.g. the app was quit mid-startup).
@@ -307,6 +312,7 @@ fn build_core_app<R: tauri::Runtime>(
         // never probed. The persisted facts (last seen, disk) live on
         // the `hosts` rows themselves, so nothing needs seeding here.
         .manage(hosts_status::HostStatusStore::default())
+        .manage(mcp_server::PendingMcpConfigRepairs::default())
         // Live plan-quota readings for Settings → Usage. In-memory only;
         // see `commands::usage::PlanQuotaStore`.
         .manage(commands::usage::PlanQuotaStore::default())
@@ -456,10 +462,12 @@ fn build_core_app<R: tauri::Runtime>(
             }
             webview_tuning::apply_to_webview(webview);
             if mode == AppMode::Gui && webview.label() == "main" {
+                diagnostics::record_startup_milestone("startup.main-page-loaded");
                 webview_tuning::mark_startup_successful();
             }
         })
         .setup(move |app| {
+            diagnostics::record_startup_milestone("startup.setup-enter");
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
             tauri::async_runtime::spawn(
@@ -491,6 +499,35 @@ fn build_core_app<R: tauri::Runtime>(
                     }
                     let _ = std::fs::remove_file(&old_path);
                 }
+
+                // Establish the account-scoped settings owner before any
+                // backend startup consumer reads settings (scrollback limits,
+                // provider classification, etc.). The renderer's local
+                // bootstrap happens later and must not be the first owner
+                // initialization point.
+                let auth_state: tauri::State<'_, auth::AuthState> = app.handle().state();
+                match auth::load_token(&db) {
+                    Some((_token, expires_at)) if auth::is_token_expired(&expires_at) => {
+                        auth_state.replace_session(|| {
+                            auth::clear_token(&db);
+                            settings_sync::clear_cache();
+                            settings_sync::set_cache_owner(None);
+                            auth_state.set_auth_method(None);
+                        });
+                    }
+                    Some(_) => {
+                        let user = auth::load_cached_user(&db);
+                        settings_sync::set_cache_owner(
+                            user.as_ref().map(|cached| cached.id.as_str()),
+                        );
+                        let method = auth::load_stored_auth_method(&db);
+                        auth_state.set_auth_method(method.as_deref());
+                    }
+                    None => {
+                        settings_sync::set_cache_owner(None);
+                        auth_state.set_auth_method(None);
+                    }
+                }
             }
 
             // Initialize presets from SQLite (must happen after database is managed)
@@ -507,7 +544,21 @@ fn build_core_app<R: tauri::Runtime>(
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
             if let Some(snapshot) = state::load_persisted_state() {
-                let stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
+                let mut stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
+                // The coalesced SQLite stream is authoritative for selection;
+                // layout.json remains authoritative for the pane/layout body.
+                // Ignore a stale id whose workspace was removed while closing.
+                let db: tauri::State<'_, database::DatabaseStore> = handle.state();
+                let persisted_active = db.get_ui_state("active_workspace");
+                let restored_active = active_workspace_persistence::apply_restored_selection(
+                    &mut stripped,
+                    persisted_active.as_deref(),
+                );
+                if restored_active {
+                    if let Some(workspace_id) = persisted_active.as_deref() {
+                        active_workspace_persistence::seed_persisted(workspace_id);
+                    }
+                }
                 state::restore_session_ids(&stripped);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
@@ -524,6 +575,7 @@ fn build_core_app<R: tauri::Runtime>(
                     state.backfill_workspace_protection();
                 });
                 layout_loaded = true;
+                diagnostics::record_startup_milestone("startup.layout-restored");
             } else if mode == AppMode::Gui {
                 // First launch — no persisted layout exists. Replace the
                 // default_app_state (which creates a CWD workspace) with an
@@ -541,15 +593,18 @@ fn build_core_app<R: tauri::Runtime>(
             // the desktop app. Serving the current directory is both the
             // useful default and what a fresh headless box has to offer.
 
-            // Ensure .mcp.json exists for all active workspaces
+            // Make the active checkout valid before restored agents start.
+            // Inactive unique checkouts are queued for the renderer's
+            // post-first-paint repair command so they do not extend boot.
             if mcp_server::is_auto_mcp_enabled(&handle) {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
-                for ws in state.snapshot().workspaces.iter() {
-                    mcp_server::upsert_mcp_config(
-                        std::path::Path::new(&ws.cwd),
-                        &ws.workspace_id.0,
-                    );
+                let plan = mcp_server::plan_boot_mcp_reconciliation(&state.snapshot());
+                if let Some(active) = plan.active {
+                    mcp_server::reconcile_mcp_config_targets(std::slice::from_ref(&active));
                 }
+                let pending: tauri::State<'_, mcp_server::PendingMcpConfigRepairs> =
+                    handle.state();
+                pending.replace(plan.inactive);
             }
 
             // Clean up orphan scrollback dirs and enforce disk limit
@@ -773,6 +828,9 @@ fn build_core_app<R: tauri::Runtime>(
 
                                     // Flush layout state
                                     state::flush_persisted_state(&app_state);
+                                    if let Err(error) = active_workspace_persistence::flush_latest(&async_handle) {
+                                        eprintln!("[codemux::selection] close flush failed: {error}");
+                                    }
 
                                     // Now actually close the window. The re-entry guard
                                     // ensures this CloseRequested passes through.
@@ -788,6 +846,9 @@ fn build_core_app<R: tauri::Runtime>(
                                 let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
                                 scrollback::refresh_stale_scrollback_metadata(&app_state);
                                 state::flush_persisted_state(&app_state);
+                                if let Err(error) = active_workspace_persistence::flush_latest(&close_handle) {
+                                    eprintln!("[codemux::selection] close flush failed: {error}");
+                                }
                             }
                         }
                     });
@@ -843,19 +904,10 @@ fn build_core_app<R: tauri::Runtime>(
                 if std::env::var_os("CODEMUX_DISABLE_PTY_DAEMON").is_none() {
                     tauri::async_runtime::spawn(async move {
                         match pty_daemon::ensure_daemon().await {
-                            Ok(client) => match client.list().await {
-                                Ok(sessions) => {
-                                    eprintln!(
-                                        "[codemux::pty_daemon] startup adoption ok: {} live sessions",
-                                        sessions.len()
-                                    );
-                                }
-                                Err(error) => {
-                                    eprintln!(
-                                        "[codemux::pty_daemon] startup adoption: list failed: {error}"
-                                    );
-                                }
-                            },
+                            // Workspace hydration is the sole owner of List.
+                            // Warmup only establishes/adopts the client so an
+                            // eight-pane restore still emits exactly one List.
+                            Ok(_) => eprintln!("[codemux::pty_daemon] startup adoption ok"),
                             Err(error) => {
                                 eprintln!(
                                     "[codemux::pty_daemon] startup adoption failed: {error} \
@@ -1073,8 +1125,8 @@ fn build_core_app<R: tauri::Runtime>(
 
             // Periodically refresh git info for the workspaces due this tick
             // (so non-active sidebar rows stay honest when agents switch
-            // branches), plus PR/issue info for the active workspace only
-            // (where `gh` CLI calls are the expensive part and only the
+            // branches), plus provider/issue info for the active workspace only
+            // (where hosting CLI calls are the expensive part and only the
             // visible row benefits from being up-to-date every 5s).
             //
             // Three properties keep this off the interaction path:
@@ -1085,7 +1137,7 @@ fn build_core_app<R: tauri::Runtime>(
             //    tick instead of N.
             //  - **Deduped.** Workspaces sharing a checkout gather once.
             //  - **Change-gated.** The snapshot emit happens only when a
-            //    workspace's git/PR/issue metadata actually moved. An idle
+            //    workspace's git/provider/issue metadata actually moved. An idle
             //    fleet costs zero serialise + IPC + render passes.
             //
             // Serial iteration on purpose — cost stays predictable — but the
@@ -1093,15 +1145,11 @@ fn build_core_app<R: tauri::Runtime>(
             // stall the Tokio worker that also drives in-flight IPC calls.
             // Skips the tick entirely when the main window is off screen.
             let git_handle = app.handle().clone();
+            let workspace_status_singleflight =
+                std::sync::Arc::new(jobs::SingleflightJob::default());
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(2))).await;
                 let mut tick: u64 = 0;
-                // Last branch-PR lookup error logged by this loop. The loop
-                // ticks every 5 s, so a persistent condition (expired `gh`
-                // token, no network) would otherwise write the same line to
-                // stderr ~17k times a day. Log each distinct message once and
-                // reset on the next success, so a *new* failure is still loud.
-                let mut last_pr_error: Option<String> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     tick = tick.wrapping_add(1);
@@ -1141,13 +1189,9 @@ fn build_core_app<R: tauri::Runtime>(
                     // Refresh the workspaces due this tick, gathering once
                     // per distinct checkout.
                     //
-                    // `changed` tracks the domains that still ride a full
-                    // snapshot (PR pill, linked issue). Git metadata ships as
-                    // a per-workspace `WorkspaceGit` delta instead — the
-                    // steady state of this loop is one workspace's branch
-                    // counters moving, which has no business re-serialising
-                    // and re-parsing the whole app state.
-                    let mut changed = false;
+                    // Git metadata ships as a per-workspace delta — the steady
+                    // state of this loop has no reason to re-serialize the full
+                    // app state.
                     let mut gathered: std::collections::HashMap<
                         String,
                         commands::workspace::WorkspaceGitInfo,
@@ -1161,7 +1205,12 @@ fn build_core_app<R: tauri::Runtime>(
                     for step in steps {
                         let info = if step.gather {
                             let path = std::path::PathBuf::from(&step.cwd);
+                            let queued_at = std::time::Instant::now();
                             let gather = tokio::task::spawn_blocking(move || {
+                                diagnostics::record_perf_timing(
+                                    "background.git-sweep.queue-delay",
+                                    queued_at.elapsed(),
+                                );
                                 commands::workspace::gather_workspace_git_info(&path)
                             })
                             .await;
@@ -1193,109 +1242,155 @@ fn build_core_app<R: tauri::Runtime>(
                         }
                     }
 
-                    // PR / linked-issue refresh stays scoped to the active
-                    // workspace — each call shells out to `gh`, which is the
-                    // expensive part, and the user can only see one PR panel
-                    // at a time anyway.
+                    // Provider classification and linked-issue refresh stay
+                    // scoped to the active workspace. The dedicated 60s PR
+                    // poller below is the sole owner of PR association; doing
+                    // the same network lookup here every 5s created competing
+                    // writers and twice the CLI load.
+                    //
+                    // Everything that can touch git, the filesystem, or a
+                    // provider trait runs in ONE blocking task. The generation
+                    // gate prevents overlap: a task that outlives the 5s tick
+                    // keeps the singleflight slot until it really exits, so
+                    // the next tick cannot start a second one. Its result is
+                    // NOT discarded for being slow — the provider's own hard
+                    // deadline (`ISSUE_FETCH_TIMEOUT`, 10s) already bounds
+                    // the work, and a `gh issue view` that takes 6s on a slow
+                    // link is still the freshest answer we have. Throwing it
+                    // away meant the linked-issue pill never updated on such
+                    // a network, because every tick's result arrived "late".
+                    // Staleness is guarded by content instead: `complete`
+                    // publishes only for the owning generation, and the
+                    // issue is written only if the workspace still links
+                    // that number (the user may have unlinked it meanwhile).
+                    //
+                    // Soft budget, deliberately one polling period: past it
+                    // the run is logged and counted as slow, never dropped.
+                    // The hard bound is the provider's `ISSUE_FETCH_TIMEOUT`.
+                    const WORKSPACE_STATUS_SLOW_WARN_AFTER: std::time::Duration =
+                        std::time::Duration::from_secs(5);
                     if let Some((workspace_id, cwd)) = active {
+                        let issue_number =
+                            state.workspace_linked_issue_number(&workspace_id);
                         let path = std::path::PathBuf::from(&cwd);
-                        // Detection is a pure `git remote -v` read (no CLI,
-                        // no network) behind a 60s cache, and it matches the
-                        // gate the dedicated PR poller already applies.
-                        // Without it a workspace hosted elsewhere — or with
-                        // no remote at all — would shell out every tick just
-                        // to fail.
-                        let detected = git_provider::detect_provider(&path);
-                        changed |= state.update_workspace_provider_kind(
-                            &workspace_id,
-                            git_provider::provider_kind_field(&detected),
-                        );
-                        let provider = git_provider::provider_for_detection(&detected);
-                        if provider.is_implemented() && provider.cli_available() {
-                            // Branch/repository identity owns association. A
-                            // failed lookup preserves the last known state;
-                            // a successful empty result is authoritative and
-                            // clears any stale association.
-                            let lookup = provider.workspace_pull_request(&path);
-                            match &lookup {
-                                Err(e) => {
-                                    let message = format!(
-                                        "[codemux::github] Failed to fetch PR info for {cwd}: {e}"
+                        if let Some(generation) = workspace_status_singleflight.request() {
+                            let job = workspace_status_singleflight.clone();
+                            let result_handle = git_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let started = std::time::Instant::now();
+                                let queued_at = std::time::Instant::now();
+                                let mut blocking = tokio::task::spawn_blocking(move || -> Result<_, String> {
+                                    diagnostics::record_perf_timing(
+                                        "background.workspace-status.queue-delay",
+                                        queued_at.elapsed(),
                                     );
-                                    if last_pr_error.as_deref() != Some(message.as_str()) {
-                                        eprintln!("{message}");
-                                        last_pr_error = Some(message);
-                                    }
-                                }
-                                Ok(_) => last_pr_error = None,
-                            }
-                            // Decision matrix lives in `github::branch_pr_outcome`
-                            // (Write / Clear / Preserve) so the poll loop and
-                            // the on-demand refresh cannot drift apart. Each
-                            // arm still feeds `changed`, because the PR pill is
-                            // one of the two domains this loop ships on a FULL
-                            // snapshot rather than a delta — dropping the flag
-                            // would leave a badge change with nothing to emit
-                            // it, and the pill would sit stale until some
-                            // unrelated mutation happened to flush the state.
-                            match github::branch_pr_outcome(lookup) {
-                                github::BranchPrOutcome::Write(pr) => {
-                                    changed |= state.update_workspace_pr_info(
-                                        &workspace_id,
-                                        Some(pr.number),
-                                        Some(pr.display_state()),
-                                        Some(pr.url),
-                                        pr.head_branch,
-                                    );
-                                }
-                                github::BranchPrOutcome::Clear => {
-                                    changed |= state.update_workspace_pr_info(
-                                        &workspace_id,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                    );
-                                }
-                                // Nothing was written, so nothing is owed an
-                                // emit — `Preserve` exists precisely to leave
-                                // the last known pill alone.
-                                github::BranchPrOutcome::Preserve => {}
-                            }
+                                    let detected = git_provider::try_detect_provider(&path)?;
+                                    let provider =
+                                        git_provider::provider_for_detection(&detected);
+                                    let issue = if let Some(number) = issue_number {
+                                        if provider.is_implemented() && provider.cli_available() {
+                                            Some(provider.get_issue_fresh(&path, number).map(|issue| {
+                                                github::LinkedIssue {
+                                                    number: issue.number,
+                                                    title: issue.title,
+                                                    state: issue.state,
+                                                    labels: issue.labels,
+                                                }
+                                            }))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    Ok((detected, issue))
+                                });
 
-                            // Refresh linked issue state (lightweight: only if workspace has one)
-                            let issue_number = {
-                                let snap = state.snapshot();
-                                snap.workspaces.iter()
-                                    .find(|w| w.workspace_id.0 == workspace_id)
-                                    .and_then(|w| w.linked_issue.as_ref().map(|li| li.number))
-                            };
-                            if let Some(num) = issue_number {
-                                if let Ok(issue) = provider.get_issue_fresh(&path, num) {
-                                    changed |= state.link_workspace_issue(&workspace_id, github::LinkedIssue {
-                                        number: issue.number,
-                                        title: issue.title,
-                                        state: issue.state,
-                                        labels: issue.labels,
-                                    });
+                                // Soft budget: one polling period. Crossing it
+                                // is logged so a chronically slow provider is
+                                // visible in the diagnostics, but the task is
+                                // awaited to completion either way — it cannot
+                                // be cancelled, and its result is still wanted.
+                                let joined = match tokio::time::timeout(
+                                    WORKSPACE_STATUS_SLOW_WARN_AFTER,
+                                    &mut blocking,
+                                )
+                                .await
+                                {
+                                    Ok(joined) => joined,
+                                    Err(_) => {
+                                        eprintln!(
+                                            "[codemux::job] active workspace provider refresh exceeded {:?}; still waiting for the provider's own deadline",
+                                            WORKSPACE_STATUS_SLOW_WARN_AFTER
+                                        );
+                                        diagnostics::record_perf_timing(
+                                            "background.workspace-status.slow",
+                                            std::time::Duration::ZERO,
+                                        );
+                                        blocking.await
+                                    }
+                                };
+                                let elapsed = started.elapsed();
+                                diagnostics::record_perf_timing(
+                                    "background.workspace-status",
+                                    elapsed,
+                                );
+
+                                let completed = job.complete(generation, || {
+                                    let Ok(Ok((detected, issue))) = joined else {
+                                        // A failed/timed-out detector is not an
+                                        // authoritative `Unknown`: preserve the
+                                        // last-known provider and issue pills.
+                                        return;
+                                    };
+                                    let state: tauri::State<'_, state::AppStateStore> =
+                                        result_handle.state();
+                                    let mut changed = state.update_workspace_provider_kind(
+                                        &workspace_id,
+                                        git_provider::provider_kind_field(&detected),
+                                    );
+                                    if let Some(Ok(issue)) = issue {
+                                        // Only publish while the workspace still
+                                        // links this issue; a fetch that outlived
+                                        // an unlink must not re-link it.
+                                        let still_linked = state
+                                            .workspace_linked_issue_number(&workspace_id)
+                                            == Some(issue.number);
+                                        if still_linked {
+                                            changed |=
+                                                state.link_workspace_issue(&workspace_id, issue);
+                                        } else {
+                                            diagnostics::record_perf_timing(
+                                                "background.workspace-status.stale-result",
+                                                std::time::Duration::ZERO,
+                                            );
+                                        }
+                                    }
+                                    if changed {
+                                        state::schedule_emit_app_state(&result_handle);
+                                    }
+                                });
+                                if !completed {
+                                    // Only reached when this generation no longer
+                                    // owns the singleflight slot — the one case
+                                    // where a result really is discarded.
+                                    diagnostics::record_perf_timing(
+                                        "background.workspace-status.stale-result",
+                                        std::time::Duration::ZERO,
+                                    );
                                 }
-                            }
+                            });
+                        } else {
+                            diagnostics::record_perf_timing(
+                                "background.workspace-status.overlap",
+                                std::time::Duration::ZERO,
+                            );
                         }
                     }
 
-                    // At most one full emit per tick, and only when this tick
-                    // moved something outside the delta domains (the PR pill
-                    // or the linked issue). An idle fleet emits nothing.
-                    //
-                    // Coalesced because this loop fires every 5 s; if a user
-                    // action emits within 16 ms of this tick, both collapse
-                    // into one snapshot serialise + IPC + frontend render
-                    // pass instead of two.
-                    if changed {
-                        state::schedule_emit_app_state(&git_handle);
-                    }
-
-                    let tick_ms = tick_started.elapsed().as_millis();
+                    let tick_elapsed = tick_started.elapsed();
+                    diagnostics::record_perf_timing("background.git-sweep", tick_elapsed);
+                    let tick_ms = tick_elapsed.as_millis();
                     if tick_ms > 50 {
                         eprintln!("[codemux::perf::job] git-sweep tick={tick_ms}ms");
                     }
@@ -1539,7 +1634,9 @@ fn build_core_app<R: tauri::Runtime>(
                     // The tick now drains its own queue, so ticks can't
                     // overlap — but a queue that outlives its period means
                     // fetches are the reason a repo's ahead/behind lags.
-                    let tick_secs = tick_started.elapsed().as_secs();
+                    let tick_elapsed = tick_started.elapsed();
+                    diagnostics::record_perf_timing("background.git-fetch", tick_elapsed);
+                    let tick_secs = tick_elapsed.as_secs();
                     if tick_secs >= TICK_SECS {
                         eprintln!(
                             "[codemux::perf::job] git-fetch tick={tick_secs}s repos={target_count} \
@@ -1549,16 +1646,16 @@ fn build_core_app<R: tauri::Runtime>(
                 }
             });
 
-            // Background PR polling for the sidebar PR-status icon. The 5s
-            // tick above only refreshes the active workspace's PR info; this
-            // 60s tick walks every workspace so non-active sidebar rows
-            // don't go stale (the user might leave the app open while a
-            // teammate merges a PR on GitHub).
+            // Background PR polling for the sidebar PR-status icon. This 60s
+            // loop is the sole owner of branch-to-PR association and walks every
+            // workspace, so active and inactive rows share one cadence and one
+            // preserve/write/clear decision matrix.
             //
             // Sequential per tick on purpose — each branch PR query is a
             // subprocess fork, and we'd rather take ~Nx longer than slam
-            // `gh` with N parallel children. Each call gets a 10s timeout
-            // so a single hanging `gh` doesn't block subsequent workspaces.
+            // `gh` with N parallel children. Provider subprocess helpers own
+            // hard kill+reap deadlines; awaiting the blocking task itself
+            // prevents a timed-out task from overlapping the next workspace.
             //
             // Skips a workspace whose provider CLI is missing or logged
             // out. The probe is per *instance* (product + host) rather
@@ -1572,7 +1669,6 @@ fn build_core_app<R: tauri::Runtime>(
             let pr_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const TICK_SECS: u64 = 60;
-                const PER_CALL_TIMEOUT_SECS: u64 = 10;
                 let mut last_status_authed: std::collections::HashMap<String, bool> =
                     std::collections::HashMap::new();
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(3))).await;
@@ -1588,20 +1684,7 @@ fn build_core_app<R: tauri::Runtime>(
                         std::collections::HashMap::new();
 
                     let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
-                    let workspaces: Vec<(String, String)> = {
-                        let snapshot = state.snapshot();
-                        snapshot
-                            .workspaces
-                            .iter()
-                            .map(|w| {
-                                let path = w
-                                    .worktree_path
-                                    .clone()
-                                    .unwrap_or_else(|| w.cwd.clone());
-                                (w.workspace_id.0.clone(), path)
-                            })
-                            .collect()
-                    };
+                    let workspaces = state.workspace_provider_poll_targets();
 
                     // `refreshed` counts workspaces this tick wrote to (the
                     // log's unit of work); `changed` is the narrower
@@ -1611,7 +1694,6 @@ fn build_core_app<R: tauri::Runtime>(
                     let mut refreshed = 0usize;
                     let mut skipped_unsupported = 0usize;
                     let mut skipped_unauthenticated = 0usize;
-                    let mut timed_out = 0usize;
 
                     for (workspace_id, cwd) in workspaces {
                         let path = std::path::PathBuf::from(&cwd);
@@ -1620,20 +1702,20 @@ fn build_core_app<R: tauri::Runtime>(
                         // hosted somewhere Codemux can't serve costs one
                         // cached `git remote -v` instead of a network call.
                         let path_for_repo = path.clone();
-                        let detected = tokio::time::timeout(
-                            std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
-                            tokio::task::spawn_blocking(move || {
-                                git_provider::detect_provider(&path_for_repo)
-                            }),
-                        )
+                        let queued_at = std::time::Instant::now();
+                        let detected = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing(
+                                "background.pr-poll.queue-delay",
+                                queued_at.elapsed(),
+                            );
+                            git_provider::try_detect_provider(&path_for_repo)
+                        })
                         .await;
                         let detected = match detected {
                             Ok(Ok(detected)) => detected,
-                            Ok(Err(_)) => git_provider::DetectedProvider::unknown(),
-                            Err(_) => {
-                                timed_out += 1;
-                                continue;
-                            }
+                            // Detection failure is not authoritative and must
+                            // not clear a last-known provider/PR pill.
+                            Ok(Err(_)) | Err(_) => continue,
                         };
                         changed |= state.update_workspace_provider_kind(
                             &workspace_id,
@@ -1658,24 +1740,22 @@ fn build_core_app<R: tauri::Runtime>(
                             Some(authed) => *authed,
                             None => {
                                 let probe = provider.clone();
-                                // Cheap (~50ms fork+exec), but it is
-                                // still a subprocess: off the async
-                                // thread like every other shell-out
-                                // here, and behind the same deadline —
-                                // a CLI hanging on TCP to an
-                                // unreachable self-hosted instance must
-                                // cost one workspace's tick, not the
-                                // whole sweep. A timeout is a
-                                // this-tick "unavailable" and is not
-                                // remembered as a verdict.
-                                let status = tokio::time::timeout(
-                                    std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
-                                    tokio::task::spawn_blocking(move || probe.auth_status()),
-                                )
+                                // Cheap (~50ms fork+exec), but still a
+                                // subprocess: off the async thread like every
+                                // other shell-out here. Each provider's auth
+                                // helper owns its hard deadline.
+                                let queued_at = std::time::Instant::now();
+                                let status = tokio::task::spawn_blocking(move || {
+                                    diagnostics::record_perf_timing(
+                                        "background.pr-poll.queue-delay",
+                                        queued_at.elapsed(),
+                                    );
+                                    probe.auth_status()
+                                })
                                 .await;
                                 let authed = matches!(
                                     status,
-                                    Ok(Ok(github::GhStatus::Authenticated { .. }))
+                                    Ok(github::GhStatus::Authenticated { .. })
                                 );
                                 auth_this_tick.insert(auth_key.clone(), authed);
                                 // Log transitions only — avoids spamming
@@ -1699,16 +1779,18 @@ fn build_core_app<R: tauri::Runtime>(
 
                         let path_for_pr = path.clone();
                         let provider_for_pr = provider.clone();
-                        let pr_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
-                            tokio::task::spawn_blocking(move || {
-                                provider_for_pr.workspace_pull_request(&path_for_pr)
-                            }),
-                        )
+                        let queued_at = std::time::Instant::now();
+                        let pr_result = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing(
+                                "background.pr-poll.queue-delay",
+                                queued_at.elapsed(),
+                            );
+                            provider_for_pr.workspace_pull_request(&path_for_pr)
+                        })
                         .await;
 
                         match pr_result {
-                            Ok(Ok(lookup)) => {
+                            Ok(lookup) => {
                                 if let Err(e) = &lookup {
                                     eprintln!(
                                         "[codemux::pr-poll] workspace PR lookup failed for {workspace_id}: {e}"
@@ -1717,9 +1799,9 @@ fn build_core_app<R: tauri::Runtime>(
                                 // Shared matrix: match -> write, successful
                                 // empty -> authoritative clear, error (or
                                 // detached HEAD) -> retain the last known
-                                // value. Same helper the 5 s sweep uses, so
-                                // the two pollers cannot disagree about what
-                                // a given lookup means.
+                                // value. Keeping that matrix in one helper makes
+                                // manual refreshes and this poller agree about
+                                // what a given lookup means.
                                 //
                                 // `changed` is still threaded through every
                                 // writing arm: this loop is change-gated and
@@ -1750,16 +1832,10 @@ fn build_core_app<R: tauri::Runtime>(
                                     github::BranchPrOutcome::Preserve => {}
                                 }
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 eprintln!(
                                     "[codemux::pr-poll] join error for {workspace_id}: {e}"
                                 );
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "[codemux::pr-poll] branch PR lookup timed out (>{PER_CALL_TIMEOUT_SECS}s) for {workspace_id}"
-                                );
-                                timed_out += 1;
                             }
                         }
                     }
@@ -1770,18 +1846,19 @@ fn build_core_app<R: tauri::Runtime>(
                         // emits collapse into one frontend render.
                         state::schedule_emit_app_state(&pr_handle);
                     }
-                    // Log only ticks that did something or hit a timeout —
-                    // the steady state is silent, so a line in the log means
-                    // a real event instead of a heartbeat to scroll past.
-                    if refreshed > 0 || timed_out > 0 {
+                    // Log only ticks that refreshed something. The steady state
+                    // is silent, so a line means a real event instead of a
+                    // heartbeat to scroll past.
+                    if refreshed > 0 {
                         eprintln!(
                             "[codemux::pr-poll] tick — refreshed={refreshed} \
                              skipped_unsupported={skipped_unsupported} \
-                             skipped_unauthenticated={skipped_unauthenticated} \
-                             timed_out={timed_out}"
+                             skipped_unauthenticated={skipped_unauthenticated}"
                         );
                     }
-                    let tick_ms = tick_started.elapsed().as_millis();
+                    let tick_elapsed = tick_started.elapsed();
+                    diagnostics::record_perf_timing("background.pr-poll", tick_elapsed);
+                    let tick_ms = tick_elapsed.as_millis();
                     if tick_ms > 50 {
                         eprintln!("[codemux::perf::job] pr-poll tick={tick_ms}ms");
                     }
@@ -1790,6 +1867,9 @@ fn build_core_app<R: tauri::Runtime>(
 
             // Periodically scan for listening TCP ports and associate with workspaces
             let port_handle = app.handle().clone();
+            let port_singleflight = std::sync::Arc::new(jobs::SingleflightJob::default());
+            let port_scan_cache =
+                std::sync::Arc::new(std::sync::Mutex::new(ports::PortScanCache::default()));
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_millis(1500)))
                     .await;
@@ -1824,11 +1904,10 @@ fn build_core_app<R: tauri::Runtime>(
                         .try_state::<web_remote::WebRemoteState>()
                         .map(|s| s.active_connection_count() > 0)
                         .unwrap_or(false);
-                    if !window_active && !remote_viewers {
+                    if !jobs::should_poll_ports(window_active, remote_viewers) {
                         continue;
                     }
 
-                    let tick_started = std::time::Instant::now();
                     let app_state: tauri::State<'_, state::AppStateStore> = port_handle.state();
                     let pty_state: tauri::State<'_, terminal::PtyState> = port_handle.state();
 
@@ -1836,36 +1915,80 @@ fn build_core_app<R: tauri::Runtime>(
                     let session_workspaces = app_state.all_session_workspaces();
                     let workspace_cwds = app_state.all_workspace_cwds();
                     let workspace_paths = app_state.all_workspace_paths();
+                    let Some(generation) = port_singleflight.request() else {
+                        // Coalesce this tick into the running scan. Invalidating
+                        // the only result here would starve publication whenever
+                        // a scan takes longer than the 3s polling period.
+                        diagnostics::record_perf_timing(
+                            "background.port-scan.overlap",
+                            std::time::Duration::ZERO,
+                        );
+                        continue;
+                    };
 
-                    let ports = ports::scan_ports(
-                        &session_pids,
-                        &session_workspaces,
-                        &workspace_cwds,
-                        &workspace_paths,
-                    );
-                    let port_snapshots: Vec<state::PortInfoSnapshot> = ports
-                        .into_iter()
-                        .map(|p| state::PortInfoSnapshot {
-                            port: p.port,
-                            pid: p.pid,
-                            process_name: p.process_name,
-                            workspace_id: p.workspace_id,
-                            label: p.label,
-                            source: p.source,
+                    let job = port_singleflight.clone();
+                    let cache = port_scan_cache.clone();
+                    let result_handle = port_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let scan_started = std::time::Instant::now();
+                        let queued_at = std::time::Instant::now();
+                        let scan = tokio::task::spawn_blocking(move || {
+                            diagnostics::record_perf_timing(
+                                "background.port-scan.queue-delay",
+                                queued_at.elapsed(),
+                            );
+                            let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                            ports::scan_ports_with_cache(
+                                &mut cache,
+                                &session_pids,
+                                &session_workspaces,
+                                &workspace_cwds,
+                                &workspace_paths,
+                            )
                         })
-                        .collect();
+                        .await;
+                        let elapsed = scan_started.elapsed();
+                        diagnostics::record_perf_timing("background.port-scan", elapsed);
 
-                    // The detected-port list is its own domain: nothing else
-                    // in the app state moves when it changes, so it ships as a
-                    // delta rather than a full snapshot.
-                    if let Some(delta) = app_state.update_detected_ports_delta(port_snapshots) {
-                        state::emit_app_state_delta(&port_handle, delta);
-                    }
-
-                    let tick_ms = tick_started.elapsed().as_millis();
-                    if tick_ms > 50 {
-                        eprintln!("[codemux::perf::job] port-poll tick={tick_ms}ms");
-                    }
+                        let completed = job.complete(generation, || {
+                            let Ok(ports) = scan else {
+                                eprintln!("[codemux::job] port scan worker panicked");
+                                return;
+                            };
+                            let port_snapshots: Vec<state::PortInfoSnapshot> = ports
+                                .into_iter()
+                                .map(|p| state::PortInfoSnapshot {
+                                    port: p.port,
+                                    pid: p.pid,
+                                    process_name: p.process_name,
+                                    workspace_id: p.workspace_id,
+                                    label: p.label,
+                                    source: p.source,
+                                })
+                                .collect();
+                            let state: tauri::State<'_, state::AppStateStore> =
+                                result_handle.state();
+                            // The detected-port list is its own domain: nothing
+                            // else moves, so it ships as a change-gated delta.
+                            if let Some(delta) =
+                                state.update_detected_ports_delta(port_snapshots)
+                            {
+                                state::emit_app_state_delta(&result_handle, delta);
+                            }
+                            if elapsed.as_millis() > 50 {
+                                eprintln!(
+                                    "[codemux::perf::job] port-poll tick={}ms",
+                                    elapsed.as_millis()
+                                );
+                            }
+                        });
+                        if !completed {
+                            diagnostics::record_perf_timing(
+                                "background.port-scan.stale-result",
+                                std::time::Duration::ZERO,
+                            );
+                        }
+                    });
                 }
             });
 
@@ -2000,9 +2123,12 @@ fn build_core_app<R: tauri::Runtime>(
                 ));
             }
 
+            diagnostics::record_startup_milestone("startup.setup-exit");
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            diagnostics::get_performance_diagnostics,
             commands::get_current_theme,
             commands::get_shell_appearance,
             commands::get_app_state,
@@ -2010,6 +2136,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::create_empty_workspace,
             commands::get_or_create_home_workspace,
             commands::regenerate_mcp_config,
+            mcp_server::repair_inactive_mcp_configs,
             // MCP runtime registry commands. Frontend invokes these via
             // `src/tauri/commands.ts` and `src/hooks/use-mcp-runtime.ts`.
             // Defined in `commands/mcp.rs`; missing registration is what
@@ -2307,6 +2434,8 @@ fn build_core_app<R: tauri::Runtime>(
             commands::signup_email,
             commands::forgot_password,
             commands::check_auth,
+            commands::bootstrap_session,
+            commands::refresh_session,
             commands::sign_out,
             commands::get_auth_token,
             commands::get_sync_status,

@@ -33,6 +33,7 @@ import {
   evalOnDaemon,
 } from "./stream-protocol";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 
 interface Props {
   browserId: string;
@@ -46,6 +47,9 @@ interface Props {
    *  so the `agent_browser_sessions` lookup still finds it. No-op for the
    *  normal pane-attached case, where `browser_id` alone always resolves. */
   workspaceId?: string;
+  /** Owning workspace used only for performance-trace attribution. Unlike
+   *  `workspaceId`, this never changes browser-session resolution. */
+  traceWorkspaceId?: string;
   /** Suppresses the embedded address-bar toolbar. Used by the peek
    *  overlay, which renders its own compact header with a URL readout and
    *  promote/close actions instead. Defaults to showing the toolbar
@@ -89,7 +93,7 @@ interface PendingMove {
 // PaneNode drives this with primitive props (browserId/focused/visible), so the
 // pane skips re-render on backend ticks that don't touch them. Export-only
 // wrapper: the component body below is unchanged.
-export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar, fixedViewport }: Props) {
+export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, traceWorkspaceId, hideToolbar, fixedViewport }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -352,6 +356,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
               if (!hasFrameRef.current) {
                 hasFrameRef.current = true;
                 setHasFrame(true);
+                markPaneReady("browser", {
+                  target:
+                    traceWorkspaceId ??
+                    workspaceId ??
+                    useAppStore.getState().appState?.active_workspace_id ??
+                    undefined,
+                });
               }
               if (statusRef.current !== "live") {
                 setStatus("live");

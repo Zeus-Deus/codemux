@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ModelPicker } from "./ModelPicker";
@@ -82,8 +82,11 @@ const capsState = {
   },
   claudeError: null,
   codexError: null,
-  loaded: true,
 };
+
+const { refreshForIntent } = vi.hoisted(() => ({
+  refreshForIntent: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock("@/stores/provider-capabilities-store", () => ({
   useProviderCapabilities: Object.assign(
@@ -94,6 +97,7 @@ vi.mock("@/stores/provider-capabilities-store", () => ({
     state: typeof capsState,
     provider: "claude" | "codex",
   ) => state[provider],
+  refreshProviderCapabilitiesForIntent: refreshForIntent,
   // Mirror the real selector: exact id match, with the persisted
   // `"default"` alias falling back to the roster's first row.
   selectModel: (
@@ -110,6 +114,7 @@ vi.mock("@/stores/provider-capabilities-store", () => ({
 
 afterEach(() => {
   cleanup();
+  refreshForIntent.mockClear();
 });
 
 describe("ModelPicker — render", () => {
@@ -195,6 +200,22 @@ describe("ModelPicker — render", () => {
 });
 
 describe("ModelPicker — interaction", () => {
+  it("does not discover capabilities until the picker opens", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <TooltipProvider>
+        <ModelPicker provider="claude" value={null} onChange={vi.fn()} />
+      </TooltipProvider>,
+    );
+    expect(refreshForIntent).not.toHaveBeenCalled();
+
+    await user.click(container.querySelector("button") as HTMLElement);
+
+    await waitFor(() => {
+      expect(refreshForIntent).toHaveBeenCalledWith("claude");
+    });
+  });
+
   it("opening the popover lists every model for the provider and each row has the provider logo", async () => {
     const user = userEvent.setup();
     const { container } = render(

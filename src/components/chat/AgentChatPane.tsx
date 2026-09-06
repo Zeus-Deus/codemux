@@ -35,6 +35,7 @@ import {
   hydrateThreadByCursor,
   resolveThreadRunLive,
 } from "@/lib/agent-chat/cursor-hydrate";
+import { markPaneReady } from "@/lib/perf/interaction-trace";
 import {
   enqueueAgentChatEvent,
   flushAgentChatEvents,
@@ -75,10 +76,12 @@ import { useConversationSearchStore } from "@/stores/conversation-search-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
+  refreshProviderCapabilitiesForIntent,
   selectCapabilities,
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import {
   agentChatCancelQueuedTurn,
   agentChatSendQueuedTurnNow,
@@ -215,7 +218,29 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
   const [provider, setProvider] =
     useState<AgentChatProviderKind>(initialProvider);
+  const providerRuntimeIntent = useProviderRuntimeIntent(
+    (state) => state.providers[provider] === true,
+  );
+  const observeProviderRuntimeIntent = useProviderRuntimeIntent(
+    (state) => state.observe,
+  );
+  // Intent on this pane is also intent to know the provider's catalog: warm
+  // it here so the effort / permission / model controls are populated by the
+  // time the user reaches for them, instead of only after a picker opens.
+  // Persisted catalogs paint first; this is the background refresh behind
+  // them, and it shares the picker's singleflight so nothing runs twice.
+  useEffect(() => {
+    if (!providerRuntimeIntent) return;
+    void refreshProviderCapabilitiesForIntent(provider);
+  }, [providerRuntimeIntent, provider]);
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  // A fresh pane intentionally waits for explicit user intent before it
+  // starts a provider session. Keep text typed during that async startup
+  // locally, then move it into the authoritative thread slice as soon as the
+  // backend returns the thread id. Dropping onDraftChange while threadId was
+  // null made the first keystrokes disappear on slower provider launches.
+  const [pendingSessionDraft, setPendingSessionDraft] = useState("");
+  const pendingSessionDraftRef = useRef("");
   const conversationSearchJumpRequest = useConversationSearchStore((state) =>
     state.target?.threadId === threadId ? state.target : null,
   );
@@ -476,6 +501,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const paneWorkspaceId = useAppStore(
     (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
   );
+  useEffect(() => {
+    // A brand-new conversation has no transcript to hydrate; its composer is
+    // usable as soon as the pane mounts. Scope this to its owning workspace so
+    // a late effect from rapid switch A cannot complete switch B's trace.
+    if (!threadId) {
+      markPaneReady("agent-chat", {
+        target: paneWorkspaceId ?? undefined,
+      });
+    }
+  }, [threadId, paneWorkspaceId]);
   const rightPanelTab = useUIStore((state) =>
     paneWorkspaceId ? (state.rightPanelTabs?.[paneWorkspaceId] ?? null) : null,
   );
@@ -496,6 +531,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const ensureThread = useAgentChatStore((s) => s.ensureThread);
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
+  const commitPendingSessionDraft = useCallback(
+    (targetThreadId: string) => {
+      const pendingDraft = pendingSessionDraftRef.current;
+      if (!pendingDraft) return;
+      setInputDraft(targetThreadId, pendingDraft);
+      pendingSessionDraftRef.current = "";
+      setPendingSessionDraft("");
+    },
+    [setInputDraft],
+  );
   const setStoreModel = useAgentChatStore((s) => s.setModel);
   const setStorePermissionMode = useAgentChatStore((s) => s.setPermissionMode);
   const setSessionLaunchMode = useAgentChatStore((s) => s.setSessionLaunchMode);
@@ -557,9 +602,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // typing therefore leaves `timeline` identical, and the memo boundary on
   // `ChatTranscript` turns that into zero timeline rows rendered per
   // keystroke. (The pane itself still re-renders — it owns the composer.)
-  const draft = useAgentChatStore((s) =>
+  const storedDraft = useAgentChatStore((s) =>
     threadId ? (s.threads[threadId]?.inputDraft ?? "") : "",
   );
+  const draft = threadId ? storedDraft : pendingSessionDraft;
   const timeline = useAgentChatStore(
     useShallow((s) => {
       const t = threadId ? s.threads[threadId] : undefined;
@@ -1175,7 +1221,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (hydrateAttemptedRef.current === threadId) return;
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
-    void hydrateThreadByCursor(threadId, provider, () => cancelled);
+    void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
+      if (!cancelled) {
+        markPaneReady("agent-chat", {
+          target: paneWorkspaceId ?? undefined,
+        });
+      }
+    });
     return () => {
       cancelled = true;
       // The hold belongs to the hydrate, which drops or releases it under
@@ -1193,9 +1245,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         hydrateAttemptedRef.current = null;
       }
     };
-  }, [threadId]);
+  }, [threadId, paneWorkspaceId]);
 
-  // Start a session on mount if the pane doesn't already have one.
+  // Start a session only after the user interacts with this provider's chat
+  // pane. Restoring an empty persisted pane during application startup must
+  // not launch (and potentially leave behind) a provider child process.
   const startAttempted = useRef(false);
   // Tracks whether we've already attempted to recover a partial
   // materialise on this mount. Unlike `startAttempted` (which resets
@@ -1206,16 +1260,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   useEffect(() => {
     if (threadId) {
       ensureThread(threadId);
+      commitPendingSessionDraft(threadId);
       return;
     }
     // Stage C race fix: if a promoted draft owns this workspace, it
     // already started the session under `draft.threadId`. Just adopt
     // that id — don't spin up a second session.
     if (promotedDraftThreadId) {
-      setThreadId(promotedDraftThreadId);
       ensureThread(promotedDraftThreadId);
+      commitPendingSessionDraft(promotedDraftThreadId);
+      setThreadId(promotedDraftThreadId);
       return;
     }
+    if (!providerRuntimeIntent) return;
     // Recovery: the draft completed step 2 (workspace + pane) but
     // step 3 (start_session) or step 4 (send_turn) failed. Adopt
     // the orphan thread id (which already has the user's optimistic
@@ -1250,8 +1307,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           // The provider just ran — retire any stale failure banner
           // (no-op when nothing is bannered).
           void useProviderHealth.getState().noteProviderSuccess(provider);
-          setThreadId(id);
           ensureThread(id);
+          commitPendingSessionDraft(id);
+          setThreadId(id);
           if (recoveryDraft.model !== null) {
             setStoreModel(id, recoveryDraft.model);
           } else {
@@ -1316,8 +1374,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // A session that started IS the provider working: clear any
         // stale failure banner (no-op when nothing is bannered).
         void useProviderHealth.getState().noteProviderSuccess(provider);
-        setThreadId(id);
         ensureThread(id);
+        commitPendingSessionDraft(id);
+        setThreadId(id);
         setStoreModel(id, defaultModel);
         if (startMode !== null) {
           setStorePermissionMode(id, startMode);
@@ -1341,8 +1400,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     starting,
     pane.pane_id,
     provider,
+    providerRuntimeIntent,
     cwd,
     ensureThread,
+    commitPendingSessionDraft,
     setStoreModel,
     setStorePermissionMode,
     setStoreEffort,
@@ -3225,6 +3286,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 
   const sessionReady = threadId != null && !starting && !restarting;
+  // A fresh pane parks on the runtime-intent gate until the user touches
+  // it (see the start-session effect). Nothing is starting yet, so the
+  // composer must not claim it is.
+  const sessionAwaitingIntent =
+    threadId == null &&
+    !starting &&
+    !providerRuntimeIntent &&
+    promotedDraftThreadId == null;
 
   // ── Thread Scope (new-thread empty state) ──
   //
@@ -3449,6 +3518,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
       contextUsageProviderLabel={contextUsageProviderLabel}
       sessionReady={sessionReady}
+      sessionAwaitingIntent={sessionAwaitingIntent}
       configurationReady={!grokConfigurationBusy}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
@@ -3478,8 +3548,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       providerCliInstalled={providerCliInstalled}
       providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => {
-        if (!threadId) return;
-        setInputDraft(threadId, next);
+        if (threadId) {
+          setInputDraft(threadId, next);
+          return;
+        }
+        pendingSessionDraftRef.current = next;
+        setPendingSessionDraft(next);
       }}
       onSubmit={composerOnSubmit}
       onStop={handleStop}
@@ -3503,7 +3577,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ) : null;
 
   return (
-    <div className="relative flex h-full w-full flex-col bg-background">
+    <div
+      className="relative flex h-full w-full flex-col bg-background"
+      onFocusCapture={() => observeProviderRuntimeIntent(provider)}
+      onKeyDownCapture={() => observeProviderRuntimeIntent(provider)}
+      onPointerDownCapture={() => observeProviderRuntimeIntent(provider)}
+    >
       {/* Provider runtime health (probe-backed, TTL-cached): a dead CLI
           used to fail silently into a perpetual "Working…" spinner.
           Renders as a floating top overlay; needs `relative` above. */}

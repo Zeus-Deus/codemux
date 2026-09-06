@@ -3,6 +3,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+// Intent-driven discovery starts only after the popover opens. Keep requests
+// pending so tests can continue to exercise their explicitly seeded loading,
+// capability, and error states without reaching a real Tauri runtime.
+vi.mock("@/tauri/commands", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/tauri/commands")>()),
+  listChatProviderCapabilities: vi.fn(() => new Promise(() => {})),
+  agentChatProviderHealth: vi.fn(async (provider) => ({
+    provider,
+    status: "ready",
+    installed: true,
+    message: null,
+    version: null,
+  })),
+}));
+
 import type {
   ChatModelInfo,
   ProviderChatCapabilities,
@@ -133,7 +148,6 @@ function seedStore(opts: {
     cursorError: opts.cursorError ?? null,
     grokError: opts.grokError ?? null,
     opencodeError: opts.opencodeError ?? null,
-    loaded: false,
   });
 }
 
@@ -591,12 +605,21 @@ describe("MultiProviderModelPicker — empty + error states", () => {
           finishHealthRefresh = resolve;
         }),
     );
-    const refreshCapabilities = vi.fn().mockImplementation(async () => {
-      useProviderCapabilities.setState({
-        grok: GROK_CAPS,
-        grokError: null,
+    // Opening the picker is itself an intent to discover, so the store
+    // harvests once before the click. That first harvest still can't reach
+    // the signed-out CLI; the rail click is the recovery that succeeds.
+    let grokHarvests = 0;
+    const refreshCapabilities = vi
+      .fn()
+      .mockImplementation(async (harvested: string) => {
+        if (harvested !== "grok") return;
+        grokHarvests += 1;
+        if (grokHarvests < 2) return;
+        useProviderCapabilities.setState({
+          grok: GROK_CAPS,
+          grokError: null,
+        });
       });
-    });
     useProviderHealth.setState({ refresh: refreshHealth });
     useProviderCapabilities.setState({ refresh: refreshCapabilities });
 
@@ -607,7 +630,7 @@ describe("MultiProviderModelPicker — empty + error states", () => {
 
     expect(await screen.findByText("Grok is not signed in")).toBeInTheDocument();
     finishHealthRefresh();
-    await waitFor(() => expect(refreshCapabilities).toHaveBeenCalledWith("grok"));
+    await waitFor(() => expect(grokHarvests).toBe(2));
     expect(await screen.findByText("Grok default")).toBeInTheDocument();
     expect(screen.queryByText("Grok is not signed in")).not.toBeInTheDocument();
   });

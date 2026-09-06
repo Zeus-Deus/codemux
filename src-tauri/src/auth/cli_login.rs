@@ -39,8 +39,8 @@ use serde::Deserialize;
 
 use crate::auth::{
     api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
-    load_stored_auth_method, load_token, login_email_api, save_auth,
-    save_stored_auth_method, AuthUser,
+    load_stored_auth_method, load_token, login_email_api, save_auth, save_stored_auth_method,
+    AuthUser,
 };
 use crate::database::DatabaseStore;
 
@@ -556,7 +556,9 @@ pub(crate) async fn ensure_signed_in(
         // An OAuth-only account has no password to prompt for, so name the
         // escape hatch here rather than after a failed attempt.
         _ => prompt_email().map_err(|e| {
-            format!("{e}\nFor an account with no password, run `codemux login --token <token>` first.")
+            format!(
+                "{e}\nFor an account with no password, run `codemux login --token <token>` first."
+            )
         })?,
     };
     let password = resolve_password()?;
@@ -760,7 +762,9 @@ mod tests {
             .await
             .expect_err("connection refused");
         assert!(matches!(err, LoginError::Network(_)), "got {err:?}");
-        assert!(err.user_message().contains("Could not reach the Codemux API"));
+        assert!(err
+            .user_message()
+            .contains("Could not reach the Codemux API"));
         assert!(load_token(&db).is_none());
     }
 
@@ -847,10 +851,16 @@ mod tests {
         let (token, expires_at) = load_token(&db).expect("token stored");
         assert_eq!(token, "sess_pasted_token");
         assert_eq!(expires_at, "2099-06-07T08:09:10Z");
-        assert_eq!(load_cached_user(&db).map(|u| u.id).as_deref(), Some("usr_token_1"));
+        assert_eq!(
+            load_cached_user(&db).map(|u| u.id).as_deref(),
+            Some("usr_token_1")
+        );
         assert_eq!(load_stored_auth_method(&db).as_deref(), Some("token"));
         // And it reads as a live session to `whoami` / `connect`.
-        assert!(matches!(auth_status(&db), AuthStatusReport::SignedIn { .. }));
+        assert!(matches!(
+            auth_status(&db),
+            AuthStatusReport::SignedIn { .. }
+        ));
     }
 
     #[tokio::test]
@@ -950,7 +960,9 @@ mod tests {
             .await
             .expect_err("connection refused");
         assert!(matches!(err, LoginError::Network(_)), "got {err:?}");
-        assert!(err.user_message().contains("Could not reach the Codemux API"));
+        assert!(err
+            .user_message()
+            .contains("Could not reach the Codemux API"));
     }
 
     // ── connect's step 1 ─────────────────────────────────────────

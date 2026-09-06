@@ -32,11 +32,11 @@ import type { ChatDraft } from "@/stores/chat-draft-store";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
-  agentChatCreatePane,
   applyPreset,
   createBrowserPane,
   createTab,
 } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import type { TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
 
 /**
@@ -320,7 +320,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
 
   const launchChat = () => {
     setOpen(false);
-    agentChatCreatePane(workspaceId, "claude", null, "new_tab").catch((err) => {
+    launchAgentChatPane(workspaceId, "claude", null, "new_tab").catch((err) => {
       toast.error(`Chat Agent: ${errorMessage(err)}`);
       console.error("[agent-launcher] chat launch failed:", err);
     });

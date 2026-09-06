@@ -755,13 +755,18 @@ async fn spawn_pty(
         cmd.env_remove(key);
     }
 
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("spawn: {e}"))?;
-    let pid = child
-        .process_id()
-        .ok_or_else(|| "spawned child has no pid".to_string())?;
+    let pid = match child.process_id() {
+        Some(pid) => pid,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("spawned child has no pid".to_string());
+        }
+    };
     // Keep the Child handle so we can reap it and report an honest exit
     // code via the Exited event. The child moves into the waiter thread
     // spawned below.
@@ -770,14 +775,22 @@ async fn spawn_pty(
     // the child exits (same invariant as the in-process spawn path).
     drop(pair.slave);
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("clone reader: {e}"))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("take writer: {e}"))?;
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("clone reader: {error}"));
+        }
+    };
+    let writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("take writer: {error}"));
+        }
+    };
 
     let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
     let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));

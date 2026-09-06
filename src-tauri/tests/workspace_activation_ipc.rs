@@ -57,6 +57,28 @@ fn isolate_env(tmp: &std::path::Path) {
     std::env::remove_var("WAYLAND_DISPLAY");
 }
 
+/// Persistence is intentionally off the activation path: `emit_app_state`
+/// hands the selection to a coalesced background worker
+/// (`active_workspace_persistence`), so the DB record lands shortly *after*
+/// the invoke returns. Reading immediately would race that worker — poll
+/// instead, with a deadline far beyond any healthy write.
+fn await_persisted_active_workspace(db: &DatabaseStore, expected: &str, context: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let last_seen = db.get_ui_state("active_workspace");
+        if last_seen.as_deref() == Some(expected) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{context}: expected active_workspace {expected:?} to be persisted \
+                 within 10s, last saw {last_seen:?}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn invoke(
     webview: &WebviewWindow<tauri::test::MockRuntime>,
     invoke_key: String,
@@ -114,10 +136,10 @@ fn activate_and_cycle_both_persist_the_active_workspace() {
         json!({ "workspaceId": first }),
     )
     .expect("activate_workspace should dispatch Ok");
-    assert_eq!(
-        db.get_ui_state("active_workspace").as_deref(),
-        Some(first.as_str()),
-        "activate_workspace must persist the active workspace"
+    await_persisted_active_workspace(
+        &db,
+        &first,
+        "activate_workspace must persist the active workspace",
     );
 
     let cycled = invoke(&webview, invoke_key, "cycle_workspace", json!({ "step": 1 }))
@@ -129,11 +151,11 @@ fn activate_and_cycle_both_persist_the_active_workspace() {
         cycled,
         "the cycled-to workspace must be the active one in memory"
     );
-    assert_eq!(
-        db.get_ui_state("active_workspace").as_deref(),
-        Some(cycled),
+    await_persisted_active_workspace(
+        &db,
+        cycled,
         "cycle_workspace must persist the active workspace so Ctrl+Tab \
-         switches survive a restart"
+         switches survive a restart",
     );
     // Sanity: the two workspaces are distinct, so the cycle genuinely moved.
     assert_ne!(first, second);

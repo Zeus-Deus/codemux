@@ -1,8 +1,16 @@
 use crate::control::{send_control_request, ControlRequest, ControlResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+// Serialize checkout-level config reconciliation. Deferred startup repair
+// rechecks live workspace ownership while holding this lock, so a concurrent
+// final-workspace close either happens before the check (and is skipped) or
+// removes the entry after the repair. It can never remove-then-resurrect it.
+static MCP_CONFIG_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Check if auto-MCP config is enabled in settings (default: true).
 pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
@@ -935,8 +943,10 @@ fn pane_split_direction(tool: &str) -> &'static str {
 /// `codemux mcp` child (spawned with no workspace env), so the registry
 /// tags each call with the calling session's workspace in
 /// `_meta[WORKSPACE_META_KEY]`. The env var still covers children the
-/// workspace lifecycle spawns per-workspace via `.mcp.json` (which never
-/// send `_meta`). `env_fallback` is passed in so tests stay hermetic.
+/// workspace lifecycle launches from its per-workspace PTYs via `.mcp.json`
+/// (which never send `_meta`); the path-level entry intentionally inherits
+/// that PTY env instead of overriding it. `env_fallback` is passed in so tests
+/// stay hermetic.
 /// The id is forwarded as-is; the control layer drops one that names no
 /// live workspace (`resolve_browser_workspace_id`).
 fn resolve_workspace_id(params: &Value, env_fallback: Option<String>) -> String {
@@ -1699,20 +1709,204 @@ pub async fn run_mcp_server() -> Result<(), String> {
 // .mcp.json auto-discovery helpers
 // ---------------------------------------------------------------------------
 
-/// Build the codemux MCP server entry for .mcp.json.
-/// Uses the absolute path to the current binary so agents can find it
-/// regardless of PATH.
-fn codemux_mcp_entry(workspace_id: &str) -> Value {
-    let command = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "codemux".to_string());
+/// Build the codemux MCP server entry for `.mcp.json`.
+///
+/// The entry deliberately carries no `CODEMUX_WORKSPACE_ID`. Agents launched
+/// inside a Codemux terminal inherit that workspace-specific variable from
+/// their PTY, so copying one workspace id into a path-level file made the last
+/// workspace opened at a shared CWD steal every other workspace's tool calls.
+/// Callers without an inherited id continue to use the MCP server's cwd
+/// fallback.
+fn codemux_mcp_entry() -> Value {
+    let command = codemux_mcp_command();
     json!({
         "command": command,
-        "args": ["mcp"],
-        "env": {
-            "CODEMUX_WORKSPACE_ID": workspace_id
-        }
+        "args": ["mcp"]
     })
+}
+
+/// Resolve a durable command for the on-disk entry. `current_exe()` points
+/// inside a transient mount for a raw AppImage launch; the wrapper named by
+/// `$APPIMAGE` survives after the desktop process exits and accepts the same
+/// `mcp` argument.
+fn codemux_mcp_command() -> String {
+    std::env::var_os("APPIMAGE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| std::env::current_exe().ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "codemux".to_string())
+}
+
+/// One unique checkout that needs an MCP config reconciliation.
+///
+/// `workspace_id` records the last workspace at the path to preserve the
+/// startup loop's historical last-writer semantics while the entry is being
+/// migrated. The generated entry is now path-level rather than
+/// workspace-level, so the id is retained only for call-site compatibility
+/// and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfigReconciliationTarget {
+    pub workspace_dir: PathBuf,
+    pub workspace_id: String,
+}
+
+/// Active-first boot plan. The caller should reconcile `active`
+/// synchronously before restored agents start, then schedule `inactive` after
+/// the renderer's first paint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfigReconciliationPlan {
+    pub active: Option<McpConfigReconciliationTarget>,
+    pub inactive: Vec<McpConfigReconciliationTarget>,
+}
+
+/// Collapse a restored snapshot to one target per exact CWD while preserving
+/// the old loop's final value (the last workspace at a duplicate path wins).
+/// Target order follows each path's first appearance, making the inactive
+/// batch stable without canonicalizing or inspecting the filesystem.
+pub fn plan_boot_mcp_reconciliation(
+    snapshot: &crate::state::AppStateSnapshot,
+) -> McpConfigReconciliationPlan {
+    let mut targets = Vec::<McpConfigReconciliationTarget>::new();
+    let mut path_indexes = HashMap::<String, usize>::new();
+
+    for workspace in &snapshot.workspaces {
+        if let Some(index) = path_indexes.get(&workspace.cwd).copied() {
+            targets[index].workspace_id = workspace.workspace_id.0.clone();
+        } else {
+            path_indexes.insert(workspace.cwd.clone(), targets.len());
+            targets.push(McpConfigReconciliationTarget {
+                workspace_dir: PathBuf::from(&workspace.cwd),
+                workspace_id: workspace.workspace_id.0.clone(),
+            });
+        }
+    }
+
+    let active_path = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == snapshot.active_workspace_id)
+        .map(|workspace| workspace.cwd.as_str());
+    let active_index = active_path.and_then(|path| path_indexes.get(path)).copied();
+    let active = active_index.map(|index| targets.remove(index));
+
+    McpConfigReconciliationPlan { active, inactive: targets }
+}
+
+/// Apply a planned batch. Keeping execution separate from planning lets boot
+/// run the active target synchronously and move the inactive vector to a
+/// blocking worker after first paint without inspecting a checkout twice.
+pub fn reconcile_mcp_config_targets(targets: &[McpConfigReconciliationTarget]) {
+    for target in targets {
+        upsert_mcp_config(&target.workspace_dir);
+    }
+}
+
+fn reconciliation_target_is_live(
+    snapshot: &crate::state::AppStateSnapshot,
+    target: &McpConfigReconciliationTarget,
+) -> bool {
+    snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| Path::new(&workspace.cwd) == target.workspace_dir)
+}
+
+fn reconcile_live_mcp_config_targets<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    targets: &[McpConfigReconciliationTarget],
+) -> usize {
+    use tauri::Manager as _;
+
+    // Re-read both preference and ownership at the final filesystem commit
+    // point. The startup plan is intentionally stale by the time first paint
+    // occurs: users can close workspaces or disable auto-MCP during that gap.
+    // The preference is global, not per checkout, so one SQLite read covers
+    // the whole batch.
+    if !is_auto_mcp_enabled(app) {
+        return 0;
+    }
+    let mut repaired = 0;
+    for target in targets {
+        let _io_guard = MCP_CONFIG_IO_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        if !reconciliation_target_is_live(&state.snapshot(), target) {
+            continue;
+        }
+        upsert_mcp_config_with_entry_locked(&target.workspace_dir, codemux_mcp_entry());
+        repaired += 1;
+    }
+    repaired
+}
+
+/// One-shot queue populated by startup and drained after the renderer's first
+/// paint. Keeping the planned targets (rather than recomputing against the
+/// then-current active workspace) makes a fast workspace switch harmless.
+#[derive(Debug, Default)]
+pub struct PendingMcpConfigRepairs {
+    targets: std::sync::Mutex<Vec<McpConfigReconciliationTarget>>,
+}
+
+impl PendingMcpConfigRepairs {
+    pub fn replace(&self, targets: Vec<McpConfigReconciliationTarget>) {
+        *self.targets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = targets;
+    }
+
+    fn take(&self) -> Vec<McpConfigReconciliationTarget> {
+        std::mem::take(
+            &mut *self
+                .targets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn restore_after_join_failure(&self, targets: Vec<McpConfigReconciliationTarget>) {
+        let mut pending = self.targets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_empty() {
+            *pending = targets;
+        }
+    }
+}
+
+async fn repair_inactive_mcp_configs_inner<F>(
+    pending: &PendingMcpConfigRepairs,
+    repair: F,
+) -> Result<usize, String>
+where
+    F: FnOnce(&[McpConfigReconciliationTarget]) -> usize + Send + 'static,
+{
+    let targets = pending.take();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    let retry_targets = targets.clone();
+    match tokio::task::spawn_blocking(move || repair(&targets)).await {
+        Ok(repaired) => Ok(repaired),
+        Err(error) => {
+            pending.restore_after_join_failure(retry_targets);
+            Err(format!("inactive MCP config repair task failed: {error}"))
+        }
+    }
+}
+
+/// Drain the inactive boot-repair queue. The frontend calls this once after
+/// first paint; repeated or concurrent invocations return `0` without another
+/// filesystem inspection.
+#[tauri::command]
+pub async fn repair_inactive_mcp_configs<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    pending: tauri::State<'_, PendingMcpConfigRepairs>,
+) -> Result<usize, String> {
+    let repair_app = app.clone();
+    repair_inactive_mcp_configs_inner(&pending, move |targets| {
+        reconcile_live_mcp_config_targets(&repair_app, targets)
+    })
+    .await
 }
 
 /// Upsert the "codemux" entry in `.mcp.json`.
@@ -1721,7 +1915,18 @@ fn codemux_mcp_entry(workspace_id: &str) -> Value {
 /// - If it exists with valid JSON, merges the codemux entry alongside any
 ///   existing servers (shadcn, database tools, etc.) — never removes them.
 /// - If it exists but is invalid JSON, logs a warning and does NOT modify it.
-pub fn upsert_mcp_config(workspace_dir: &Path, workspace_id: &str) {
+pub fn upsert_mcp_config(workspace_dir: &Path) {
+    upsert_mcp_config_with_entry(workspace_dir, codemux_mcp_entry());
+}
+
+fn upsert_mcp_config_with_entry(workspace_dir: &Path, desired_entry: Value) {
+    let _io_guard = MCP_CONFIG_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    upsert_mcp_config_with_entry_locked(workspace_dir, desired_entry);
+}
+
+fn upsert_mcp_config_with_entry_locked(workspace_dir: &Path, desired_entry: Value) {
     let mcp_path = workspace_dir.join(".mcp.json");
 
     let mut config = if mcp_path.exists() {
@@ -1750,11 +1955,24 @@ pub fn upsert_mcp_config(workspace_dir: &Path, workspace_id: &str) {
         json!({})
     };
 
+    // A semantic match is a true no-op: preserve the user's original bytes,
+    // key order, indentation, inode, and mtime. Git exclusion is independently
+    // idempotent and may still repair a missing exclude entry.
+    if config
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get("codemux"))
+        == Some(&desired_entry)
+    {
+        crate::git::ensure_git_exclude(workspace_dir, ".mcp.json");
+        return;
+    }
+
     // Ensure mcpServers object exists.
     if !config.get("mcpServers").is_some_and(Value::is_object) {
         config["mcpServers"] = json!({});
     }
-    config["mcpServers"]["codemux"] = codemux_mcp_entry(workspace_id);
+    config["mcpServers"]["codemux"] = desired_entry;
 
     match serde_json::to_string_pretty(&config) {
         Ok(json) => {
@@ -1860,6 +2078,13 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// - If codemux was the only server, deletes the file.
 /// - If the file doesn't exist or is invalid JSON, does nothing.
 pub fn remove_mcp_config(workspace_dir: &Path) {
+    let _io_guard = MCP_CONFIG_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_mcp_config_locked(workspace_dir);
+}
+
+fn remove_mcp_config_locked(workspace_dir: &Path) {
     let mcp_path = workspace_dir.join(".mcp.json");
     if !mcp_path.exists() {
         return;
@@ -1880,9 +2105,19 @@ pub fn remove_mcp_config(workspace_dir: &Path) {
         None => return,
     };
 
-    servers.remove("codemux");
+    if servers.remove("codemux").is_none() {
+        return;
+    }
 
     if servers.is_empty() {
+        // Drop our now-empty container, but keep unrelated top-level user
+        // configuration instead of deleting the entire file.
+        if let Some(root) = config.as_object_mut() {
+            root.remove("mcpServers");
+        }
+    }
+
+    if config.as_object().is_some_and(|root| root.is_empty()) {
         let _ = std::fs::remove_file(&mcp_path);
     } else if let Ok(json) = serde_json::to_string_pretty(&config) {
         // Mirror upsert's atomic-write path so a crash on cleanup can't
@@ -2119,6 +2354,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn path_level_entry_leaves_each_session_workspace_id_inherited() {
+        let entry = codemux_mcp_entry();
+        assert!(
+            entry.get("env").is_none(),
+            "a shared path must not pin one workspace id in .mcp.json"
+        );
+
+        let params = json!({ "name": "browser_navigate", "arguments": {} });
+        assert_eq!(
+            resolve_workspace_id(&params, Some("workspace-a".into())),
+            "workspace-a"
+        );
+        assert_eq!(
+            resolve_workspace_id(&params, Some("workspace-b".into())),
+            "workspace-b"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Dispatch tests (async)
     // -----------------------------------------------------------------------
@@ -2221,12 +2475,12 @@ mod tests {
     #[test]
     fn mcp_json_create_new() {
         let dir = test_dir("mcp_create_new");
-        upsert_mcp_config(&dir, "ws-123");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
         assert_eq!(config["mcpServers"]["codemux"]["args"][0], "mcp");
-        assert_eq!(config["mcpServers"]["codemux"]["env"]["CODEMUX_WORKSPACE_ID"], "ws-123");
+        assert!(config["mcpServers"]["codemux"].get("env").is_none());
 
         cleanup(&dir);
     }
@@ -2239,7 +2493,7 @@ mod tests {
             r#"{"mcpServers":{"shadcn":{"command":"npx","args":["shadcn@latest","mcp"]}}}"#,
         ).unwrap();
 
-        upsert_mcp_config(&dir, "ws-456");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         // shadcn preserved
@@ -2259,12 +2513,12 @@ mod tests {
             r#"{"mcpServers":{"codemux":{"command":"old","args":["old"]},"other":{"command":"x"}}}"#,
         ).unwrap();
 
-        upsert_mcp_config(&dir, "ws-new");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         // codemux updated
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
-        assert_eq!(config["mcpServers"]["codemux"]["env"]["CODEMUX_WORKSPACE_ID"], "ws-new");
+        assert!(config["mcpServers"]["codemux"].get("env").is_none());
         // other server untouched
         assert_eq!(config["mcpServers"]["other"]["command"], "x");
 
@@ -2277,7 +2531,7 @@ mod tests {
         let bad_content = "not json{{{";
         std::fs::write(dir.join(".mcp.json"), bad_content).unwrap();
 
-        upsert_mcp_config(&dir, "ws-789");
+        upsert_mcp_config(&dir);
 
         // File unchanged
         let content = std::fs::read_to_string(dir.join(".mcp.json")).unwrap();
@@ -2287,29 +2541,162 @@ mod tests {
     }
 
     #[test]
-    fn mcp_json_idempotent() {
+    fn mcp_json_equivalent_entry_preserves_formatting_inode_and_mtime() {
         let dir = test_dir("mcp_idempotent");
-        upsert_mcp_config(&dir, "ws-111");
-        upsert_mcp_config(&dir, "ws-111");
+        let path = dir.join(".mcp.json");
+        let desired = serde_json::to_string(&codemux_mcp_entry()).unwrap();
+        let original = format!(
+            "{{\n\t\"userFormatting\" : true,\n\t\"mcpServers\" : {{ \"codemux\" : {desired} }}\n}}\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
 
-        let config = read_mcp(&dir);
-        let servers = config["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 1, "Should have exactly one server entry");
-        assert!(servers.contains_key("codemux"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        upsert_mcp_config(&dir);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(before.ino(), after.ino());
+        }
 
         cleanup(&dir);
     }
 
     #[test]
-    fn mcp_json_workspace_id_updated() {
-        let dir = test_dir("mcp_id_update");
-        upsert_mcp_config(&dir, "ws-old-id");
-        upsert_mcp_config(&dir, "ws-new-id");
+    fn mcp_json_binary_change_writes_once_then_becomes_noop() {
+        let dir = test_dir("mcp_binary_change");
+        let path = dir.join(".mcp.json");
+        let old_entry = json!({ "command": "/old/codemux", "args": ["mcp"] });
+        let new_entry = json!({ "command": "/new/codemux", "args": ["mcp"] });
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({ "mcpServers": { "codemux": old_entry } })).unwrap(),
+        )
+        .unwrap();
 
-        let config = read_mcp(&dir);
-        assert_eq!(config["mcpServers"]["codemux"]["env"]["CODEMUX_WORKSPACE_ID"], "ws-new-id");
+        upsert_mcp_config_with_entry(&dir, new_entry.clone());
+        assert_eq!(read_mcp(&dir)["mcpServers"]["codemux"], new_entry);
+        let after_update = std::fs::read(&path).unwrap();
+        let after_update_meta = std::fs::metadata(&path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        upsert_mcp_config_with_entry(&dir, new_entry);
+        assert_eq!(std::fs::read(&path).unwrap(), after_update);
+        let after_noop_meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            after_update_meta.modified().unwrap(),
+            after_noop_meta.modified().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(after_update_meta.ino(), after_noop_meta.ino());
+        }
 
         cleanup(&dir);
+    }
+
+    #[test]
+    fn mcp_json_workspace_id_change_is_a_noop() {
+        let dir = test_dir("mcp_id_update");
+        upsert_mcp_config(&dir);
+        let before = std::fs::read(dir.join(".mcp.json")).unwrap();
+        upsert_mcp_config(&dir);
+
+        let config = read_mcp(&dir);
+        assert!(config["mcpServers"]["codemux"].get("env").is_none());
+        assert_eq!(std::fs::read(dir.join(".mcp.json")).unwrap(), before);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn boot_plan_deduplicates_cwds_and_keeps_active_first() {
+        let store = crate::state::AppStateStore::default();
+        store.clear_workspaces();
+        let first = store.create_workspace_at_path(PathBuf::from("shared-checkout"));
+        let active = store.create_workspace_at_path(PathBuf::from("active-checkout"));
+        let last = store.create_workspace_at_path(PathBuf::from("shared-checkout"));
+        assert!(store.activate_workspace(&active.0));
+
+        let plan = plan_boot_mcp_reconciliation(&store.snapshot());
+        assert_eq!(
+            plan.active.as_ref().map(|target| target.workspace_dir.as_path()),
+            Some(Path::new("active-checkout"))
+        );
+        assert_eq!(plan.inactive.len(), 1);
+        assert_eq!(plan.inactive[0].workspace_dir, PathBuf::from("shared-checkout"));
+        assert_eq!(
+            plan.inactive[0].workspace_id, last.0,
+            "duplicate paths retain the old loop's last-workspace result"
+        );
+        assert_ne!(first, last);
+    }
+
+    #[tokio::test]
+    async fn inactive_mcp_repair_command_drains_planned_targets_once() {
+        let first = test_dir("inactive_repair_first");
+        let second = test_dir("inactive_repair_second");
+        let pending = PendingMcpConfigRepairs::default();
+        pending.replace(vec![
+            McpConfigReconciliationTarget {
+                workspace_dir: first.clone(),
+                workspace_id: "workspace-first".into(),
+            },
+            McpConfigReconciliationTarget {
+                workspace_dir: second.clone(),
+                workspace_id: "workspace-second".into(),
+            },
+        ]);
+
+        assert_eq!(
+            repair_inactive_mcp_configs_inner(&pending, |targets| {
+                reconcile_mcp_config_targets(targets);
+                targets.len()
+            })
+            .await
+            .unwrap(),
+            2
+        );
+        let first_bytes = std::fs::read(first.join(".mcp.json")).unwrap();
+        let second_bytes = std::fs::read(second.join(".mcp.json")).unwrap();
+
+        assert_eq!(
+            repair_inactive_mcp_configs_inner(&pending, |targets| {
+                reconcile_mcp_config_targets(targets);
+                targets.len()
+            })
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(first.join(".mcp.json")).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(second.join(".mcp.json")).unwrap(), second_bytes);
+
+        cleanup(&first);
+        cleanup(&second);
+    }
+
+    #[test]
+    fn deferred_repair_rejects_a_target_after_its_last_workspace_closes() {
+        let checkout = test_dir("inactive_repair_closed_target");
+        let store = crate::state::AppStateStore::default();
+        store.clear_workspaces();
+        let workspace = store.create_workspace_at_path(checkout.clone());
+        let target = McpConfigReconciliationTarget {
+            workspace_dir: checkout.clone(),
+            workspace_id: workspace.0.clone(),
+        };
+
+        assert!(reconciliation_target_is_live(&store.snapshot(), &target));
+        store.close_workspace(&workspace.0).unwrap();
+        assert!(!reconciliation_target_is_live(&store.snapshot(), &target));
+
+        cleanup(&checkout);
     }
 
     // -----------------------------------------------------------------------
@@ -2343,6 +2730,38 @@ mod tests {
 
         remove_mcp_config(&dir);
         assert!(!dir.join(".mcp.json").exists(), "File should be deleted when empty");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn mcp_json_remove_codemux_keeps_unrelated_top_level_config() {
+        let dir = test_dir("mcp_remove_keeps_top_level");
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"userConfig":{"keep":true},"mcpServers":{"codemux":{"command":"codemux"}}}"#,
+        )
+        .unwrap();
+
+        remove_mcp_config(&dir);
+
+        let config = read_mcp(&dir);
+        assert_eq!(config["userConfig"]["keep"], true);
+        assert!(config.get("mcpServers").is_none());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn mcp_json_remove_without_codemux_preserves_bytes() {
+        let dir = test_dir("mcp_remove_absent");
+        let path = dir.join(".mcp.json");
+        let original = "{ \"mcpServers\" : { \"other\" : { \"command\" : \"keep\" } } }\n";
+        std::fs::write(&path, original).unwrap();
+
+        remove_mcp_config(&dir);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 
         cleanup(&dir);
     }
@@ -2499,7 +2918,7 @@ mod tests {
     #[test]
     fn upsert_uses_atomic_write_no_tmp_leftover() {
         let dir = test_dir("upsert_atomic");
-        upsert_mcp_config(&dir, "ws-atomic");
+        upsert_mcp_config(&dir);
 
         assert!(dir.join(".mcp.json").exists());
         assert!(

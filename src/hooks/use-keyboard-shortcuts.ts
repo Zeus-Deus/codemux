@@ -4,14 +4,13 @@ import {
   closePane,
   createTab,
   closeTab,
-  cycleWorkspace,
   activateTab,
   activateWorkspace,
   createEmptyWorkspace,
-  agentChatCreatePane,
   runProjectDevCommand,
 } from "@/tauri/commands";
-import { useAppStore } from "@/stores/app-store";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -22,6 +21,7 @@ import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import { selectWorkspaceNavigationTarget } from "@/lib/workspace-navigation";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -91,6 +91,10 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
     // dismissible overlays so Escape always provides an escape hatch.
     if (ui.onboardingProjectDir) {
       ui.setOnboardingProjectDir(null);
+      return true;
+    }
+    if (ui.themeStudio) {
+      ui.closeThemeStudio();
       return true;
     }
     if (ui.renameWorkspaceId) {
@@ -177,12 +181,21 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   // ── Workspaces ──
-  if (actionId === "nextWorkspace") {
-    cycleWorkspace(1).catch(console.error);
-    return true;
-  }
-  if (actionId === "prevWorkspace") {
-    cycleWorkspace(-1).catch(console.error);
+  if (actionId === "nextWorkspace" || actionId === "prevWorkspace") {
+    const store = useAppStore.getState();
+    const currentId = selectActiveWorkspaceId(store);
+    const target = selectWorkspaceNavigationTarget(
+      store.appState?.workspaces ?? [],
+      currentId,
+      actionId === "nextWorkspace" ? 1 : -1,
+    );
+    // A cycle that resolves to the already-selected workspace (single
+    // workspace, or a wrap back onto the optimistic pending selection) is a
+    // no-op: running the activation anyway would clear an open draft
+    // composer and fire an IPC for a switch that never happens.
+    if (target && target !== currentId) {
+      activateWorkspaceInteraction(target).catch(console.error);
+    }
     return true;
   }
 
@@ -258,7 +271,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
       try {
         const wsId = await createEmptyWorkspace(projectPath);
         await activateWorkspace(wsId);
-        await agentChatCreatePane(wsId, null, projectPath);
+        await launchAgentChatPane(wsId, null, projectPath);
       } catch (err) {
         console.error("[shortcut] new workspace in project failed:", err);
         ui.setShowNewWorkspaceDialog(true, projectPath);

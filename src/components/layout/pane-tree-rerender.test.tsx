@@ -226,11 +226,11 @@ afterEach(() => {
 });
 
 describe("pane tree re-render economics (#127)", () => {
-  it("mounts the active workspace's split pane tree", () => {
-    const { getByTestId } = mount(makeSnapshot());
+  it("mounts the active workspace's split pane tree", async () => {
+    const { findByTestId } = mount(makeSnapshot());
     // Both terminal leaves of ws-A's split root are present.
-    expect(getByTestId("term-sa1")).toBeInTheDocument();
-    expect(getByTestId("term-sa2")).toBeInTheDocument();
+    expect(await findByTestId("term-sa1")).toBeInTheDocument();
+    expect(await findByTestId("term-sa2")).toBeInTheDocument();
   });
 
   it("no-op tick (deep-equal fresh-ref snapshot) causes ZERO re-renders", () => {

@@ -1,6 +1,5 @@
 import {
   activateWorkspace,
-  agentChatCreatePane,
   agentChatSendTurn,
   agentChatStartSession,
   applyPreset,
@@ -22,6 +21,7 @@ import {
   isDefaultWorkspaceTitle,
 } from "./derive-title";
 import { defaultPermissionModeForProvider } from "./capability-defaults";
+import { launchAgentChatPane } from "./launch-pane";
 import { applyAllPrefixes } from "./mode-prefix";
 import { normalizeChatModeForProvider } from "./mode-compatibility";
 import { formatProviderError } from "./provider-error";
@@ -298,10 +298,14 @@ export async function materializeAndSend(
     }
   }
 
-  // 2. Create a chat pane on that workspace.
+  // 2. Create a chat pane on that workspace. A draft submit is explicit
+  // user intent for `draft.provider`, so go through `launchAgentChatPane`:
+  // it records runtime intent before the pane exists. Otherwise, if
+  // start_session/send_turn fails below, the mounted pane sits gated on
+  // "Starting session…" until the user happens to click it.
   let paneId: string;
   try {
-    paneId = await agentChatCreatePane(workspaceId, draft.provider, effectiveCwd);
+    paneId = await launchAgentChatPane(workspaceId, draft.provider, effectiveCwd);
   } catch (err) {
     const message = errorMessage(err);
     actions.removeUserMessageByNonce(draft.threadId, clientNonce);
@@ -507,9 +511,10 @@ export async function materializeWithPreset(
       }
     }
 
+    // Same intent-recording launch as `materializeAndSend`.
     let paneId: string;
     try {
-      paneId = await agentChatCreatePane(workspaceId, draft.provider, cwd);
+      paneId = await launchAgentChatPane(workspaceId, draft.provider, cwd);
     } catch (err) {
       const message = errorMessage(err);
       actions.markSendFailed(draft.draftId, message);

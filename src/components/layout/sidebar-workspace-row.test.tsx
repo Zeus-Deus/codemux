@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, act, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
@@ -20,6 +20,7 @@ const {
   mockCloseWorkspace,
   mockCloseWorkspaceWithWorktree,
   mockGetDefaultBranch,
+  mockDetectEditors,
   mockSetWorkspacePinned,
   mockSetWorkspaceMuted,
   mockToast,
@@ -30,6 +31,7 @@ const {
   mockCloseWorkspace: vi.fn(),
   mockCloseWorkspaceWithWorktree: vi.fn(),
   mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
+  mockDetectEditors: vi.fn().mockResolvedValue([]),
   mockSetWorkspacePinned: vi.fn().mockResolvedValue(undefined),
   mockSetWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
   mockToast: {
@@ -54,7 +56,7 @@ vi.mock("@/tauri/commands", () => ({
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   setWorkspacePinned: (...args: unknown[]) => mockSetWorkspacePinned(...args),
   setWorkspaceMuted: (...args: unknown[]) => mockSetWorkspaceMuted(...args),
-  detectEditors: vi.fn().mockResolvedValue([]),
+  detectEditors: (...args: unknown[]) => mockDetectEditors(...args),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
   openInEditor: vi.fn().mockResolvedValue(undefined),
   runWorkspaceSetup: vi.fn().mockResolvedValue(undefined),
@@ -104,7 +106,13 @@ vi.mock("@/components/ui/context-menu", () => {
     </button>
   );
   return {
-    ContextMenu: passthrough,
+    ContextMenu: ({
+      children,
+      onOpenChange,
+    }: {
+      children?: React.ReactNode;
+      onOpenChange?: (open: boolean) => void;
+    }) => <div onContextMenu={() => onOpenChange?.(true)}>{children}</div>,
     ContextMenuTrigger: passthrough,
     ContextMenuContent: ({ children }: { children?: React.ReactNode }) => (
       <div role="menu">{children}</div>
@@ -165,6 +173,7 @@ import {
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 import { useUIStore } from "@/stores/ui-store";
+import { _resetEditorDiscoveryForTests } from "@/stores/editor-discovery-store";
 
 /** Build a single-terminal-pane surface carrying a known pane id. */
 function surfaceWithPane(paneId: string): SurfaceSnapshot {
@@ -247,6 +256,8 @@ beforeEach(() => {
   mockCloseWorkspaceWithWorktree.mockResolvedValue(undefined);
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");
+  mockDetectEditors.mockReset();
+  mockDetectEditors.mockResolvedValue([]);
   mockSetWorkspacePinned.mockReset();
   mockSetWorkspacePinned.mockResolvedValue(undefined);
   mockSetWorkspaceMuted.mockReset();
@@ -256,6 +267,7 @@ beforeEach(() => {
   mockToast.undoable.mockReset();
   useUIStore.setState({ renameWorkspaceId: null });
   __resetDefaultBranchCacheForTests();
+  _resetEditorDiscoveryForTests();
 });
 
 describe("Checkout default branch menu item", () => {
@@ -374,6 +386,27 @@ describe("Checkout default branch menu item", () => {
       </TooltipProvider>,
     );
     expect(container.querySelector("svg.lucide-laptop")).toBeInTheDocument();
+    expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+    expect(mockDetectEditors).not.toHaveBeenCalled();
+  });
+
+  it("defers editor and default-branch discovery until the context menu opens", async () => {
+    const ws = makeWorkspace({ worktree_path: null });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+
+    expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+    expect(mockDetectEditors).not.toHaveBeenCalled();
+
+    fireEvent.contextMenu(container.querySelector('[role="button"]') as HTMLElement);
+
+    await waitFor(() => {
+      expect(mockGetDefaultBranch).toHaveBeenCalledTimes(1);
+      expect(mockDetectEditors).toHaveBeenCalledTimes(1);
+    });
   });
 
   // ── Edge cases ──

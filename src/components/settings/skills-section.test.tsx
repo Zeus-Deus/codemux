@@ -44,6 +44,7 @@ import {
   openInEditor,
   startSkillsWatcher,
 } from "@/tauri/commands";
+import { _resetEditorDiscoveryForTests } from "@/stores/editor-discovery-store";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "@/lib/toast";
 import { useSkillsStore } from "@/stores/skills-store";
@@ -108,6 +109,7 @@ function clearPreferredEditor() {
 
 describe("SkillsSection", () => {
   beforeEach(() => {
+    _resetEditorDiscoveryForTests();
     resetSkillsStore();
     clearPreferredEditor();
     listSkillsMock.mockReset();

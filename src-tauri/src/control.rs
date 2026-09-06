@@ -870,7 +870,6 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
         }
         "activate_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
-            let db: State<'_, crate::database::DatabaseStore> = app.state();
             let workspace_id = request
                 .params
                 .get("workspace_id")
@@ -880,12 +879,11 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             workspace_id.and_then(|ws_id| {
                 // Reuse the in-app workspace-switch path so the socket / MCP
                 // surface gets identical side effects: git refresh, PTY
-                // hydration, app-state emit, persisted ui_state. See
+                // hydration, app-state emit, and queued ui-state persistence. See
                 // `activate_workspace_impl` for the full breakdown.
                 crate::commands::workspace::activate_workspace_impl(
                     app.clone(),
                     &state,
-                    &db,
                     ws_id.clone(),
                 )
                 .map(|_| serde_json::json!({ "workspace_id": ws_id, "activated": true }))

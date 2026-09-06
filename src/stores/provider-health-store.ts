@@ -22,10 +22,11 @@ import type { AgentChatProviderKind, ProviderHealthReport } from "@/tauri/types"
  *
  * Recovery is symmetric with failure: a banner that only ever appears is
  * worse than none, so a successful start/turn clears a stale failure
- * (`noteProviderSuccess`) and a mounted surface polls an unhealthy
+ * (`noteProviderSuccess`) and a mounted surface polls an already-unhealthy
  * provider on the TTL cadence (`reprobeUnhealthy`) — the user who fixed
  * things out-of-band (`claude login` in a terminal) gets the banner back
- * without touching the app.
+ * without touching the app. Mounting a surface never starts an initial
+ * probe; picker/provider intent and start/send outcomes own that work.
  */
 
 /** Re-probe interval. Matches the "every few minutes is plenty" cadence
@@ -250,25 +251,22 @@ export function selectVisibleHealthReport(
   return slot.report;
 }
 
-/** Kick a TTL-respecting probe for `provider` on mount and whenever the
- *  selected provider changes, then poll for recovery on the TTL cadence.
+/** Poll an already-known unhealthy provider for recovery on the TTL cadence.
  *
  *  The poll is what closes the "fixed it, banner still up" gap: nothing
  *  in the app observes a `claude login` run in some other terminal, so
  *  without it a banner could outlive its cause until the next failed
- *  send. `reprobeUnhealthy` no-ops while the provider is healthy, so a
- *  mounted surface on a working provider spawns nothing. */
-export function useProviderHealthProbe(
+ *  send. There is deliberately no eager `refresh` here: merely restoring a
+ *  persisted chat pane is not provider intent and must never spawn a CLI. */
+export function useProviderHealthRecoveryPoll(
   provider: AgentChatProviderKind | null | undefined,
 ): void {
-  const refresh = useProviderHealth((s) => s.refresh);
   const reprobeUnhealthy = useProviderHealth((s) => s.reprobeUnhealthy);
   useEffect(() => {
     if (!provider) return;
-    void refresh(provider);
     const timer = setInterval(() => {
       void reprobeUnhealthy(provider);
     }, HEALTH_REPROBE_MS);
     return () => clearInterval(timer);
-  }, [provider, refresh, reprobeUnhealthy]);
+  }, [provider, reprobeUnhealthy]);
 }

@@ -173,6 +173,87 @@ describe("synced-settings-store", () => {
 
       expect(useSyncedSettingsStore.getState().settings).toEqual(DARK_SETTINGS);
     });
+
+    it("does not let a delayed remote refresh clobber a newer optimistic write", async () => {
+      let resolveWrite!: (settings: UserSettings) => void;
+      mockUpdateSetting.mockReturnValue(
+        new Promise<UserSettings>((resolve) => {
+          resolveWrite = resolve;
+        }),
+      );
+      const remoteToken = useSyncedSettingsStore
+        .getState()
+        .remoteReconcileToken();
+      const write = useSyncedSettingsStore
+        .getState()
+        .updateSetting("appearance", "theme", "local-newer");
+
+      expect(
+        useSyncedSettingsStore
+          .getState()
+          .reconcileRemoteSettings(DARK_SETTINGS, remoteToken),
+      ).toBe(false);
+      useSyncedSettingsStore
+        .getState()
+        .finishRemoteReconcile(remoteToken);
+      expect(useSyncedSettingsStore.getState().settings.appearance.theme).toBe(
+        "local-newer",
+      );
+
+      resolveWrite(DARK_SETTINGS);
+      await write;
+      expect(useSyncedSettingsStore.getState().settings.appearance.theme).toBe(
+        "local-newer",
+      );
+    });
+
+    it("does not let the previous account's write block the next account's settings", async () => {
+      let resolveOldWrite!: (settings: UserSettings) => void;
+      mockUpdateSetting.mockReturnValue(
+        new Promise<UserSettings>((resolve) => {
+          resolveOldWrite = resolve;
+        }),
+      );
+      const oldWrite = useSyncedSettingsStore
+        .getState()
+        .updateSetting("appearance", "theme", "user-a-pending");
+
+      // User A signs out and User B signs in while A's backend request is
+      // still pending. B's refresh begins after the session replacement.
+      useSyncedSettingsStore
+        .getState()
+        .replaceSessionSettings(DEFAULT_SETTINGS);
+      const userBToken = useSyncedSettingsStore
+        .getState()
+        .remoteReconcileToken();
+      const userBSettings: UserSettings = {
+        ...DEFAULT_SETTINGS,
+        appearance: {
+          ...DEFAULT_SETTINGS.appearance,
+          theme: "user-b",
+        },
+      };
+
+      expect(
+        useSyncedSettingsStore
+          .getState()
+          .reconcileRemoteSettings(userBSettings, userBToken),
+      ).toBe(true);
+      useSyncedSettingsStore
+        .getState()
+        .finishRemoteReconcile(userBToken);
+      expect(useSyncedSettingsStore.getState().settings.appearance.theme).toBe(
+        "user-b",
+      );
+
+      // A's late response must neither replace B's settings nor disturb B's
+      // session-scoped reconciliation bookkeeping.
+      resolveOldWrite(DARK_SETTINGS);
+      await oldWrite;
+      expect(useSyncedSettingsStore.getState().settings.appearance.theme).toBe(
+        "user-b",
+      );
+    });
   });
 
   describe("user isolation", () => {

@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+const CLI_AVAILABILITY_TTL: Duration = Duration::from_secs(60);
+const CLI_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+const GH_AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+static GH_AVAILABILITY_CACHE: OnceLock<crate::git_provider::cache::TtlCache<bool>> =
+    OnceLock::new();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestInfo {
     pub number: u32,
@@ -543,13 +549,13 @@ pub fn check_gh_status() -> GhStatus {
     // every `gh auth status` look NotAuthenticated even after a
     // successful `gh auth login`.
     sanitize_gui_env_std_keep_dbus(&mut cmd);
-    let output = cmd.output();
+    let output = crate::git_provider::exec::run_timed(cmd, GH_AUTH_STATUS_TIMEOUT);
 
     let Ok(output) = output else {
         return GhStatus::NotAuthenticated;
     };
 
-    if !output.status.success() {
+    if !output.success {
         return GhStatus::NotAuthenticated;
     }
 
@@ -560,10 +566,8 @@ pub fn check_gh_status() -> GhStatus {
     // but nothing could be attributed to "you", so the Pull Requests
     // page filed the user's own PRs under Watching and the panel never
     // showed the author's action bar. Check stdout first, then stderr.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let username = parse_auth_status_username(&stdout)
-        .or_else(|| parse_auth_status_username(&stderr))
+    let username = parse_auth_status_username(&output.stdout)
+        .or_else(|| parse_auth_status_username(&output.stderr))
         .unwrap_or_default();
 
     GhStatus::Authenticated { username }
@@ -626,11 +630,18 @@ fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
 }
 
 pub fn gh_available() -> bool {
-    let mut cmd = crate::execution::host_command("which");
-    cmd.arg("gh");
-    sanitize_gui_env_std(&mut cmd);
-    cmd.output()
-        .map(|o| o.status.success())
+    GH_AVAILABILITY_CACHE
+        .get_or_init(crate::git_provider::cache::TtlCache::new)
+        .get_or_fetch("gh", CLI_AVAILABILITY_TTL, || {
+            let mut cmd = crate::execution::host_command("which");
+            cmd.arg("gh");
+            sanitize_gui_env_std(&mut cmd);
+            Ok::<bool, ()>(
+                crate::git_provider::exec::run_timed(cmd, CLI_AVAILABILITY_TIMEOUT)
+                    .map(|output| output.success)
+                    .unwrap_or(false),
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -1092,14 +1103,7 @@ fn get_pr_diff_capped(
 const BRANCH_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn run_git_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = crate::execution::host_command("git");
-    cmd.args(args).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
-    cmd.output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|output| !output.is_empty())
+    crate::git_provider::detect::run_git(repo_path, args)
 }
 
 /// Parse a GitHub remote into `(owner, repository)`. The normalized identity

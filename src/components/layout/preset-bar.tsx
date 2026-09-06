@@ -44,12 +44,12 @@ import {
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import {
-  agentChatCreatePane,
   applyPreset,
   getPresets,
   reorderPresets,
   setPresetBarVisible,
 } from "@/tauri/commands";
+import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import { onPresetsChanged } from "@/tauri/events";
 import type {
   LaunchMode,
@@ -593,19 +593,18 @@ function SortablePresetButton({
 
 /** Spawn a ChatAgent preset on an existing workspace (no draft).
  *
- *  Kept at module scope so the click handler stays flat. We only
- *  call `agentChatCreatePane` here — the mounted `AgentChatPane`
- *  component starts its own session on first render (see
- *  AgentChatPane.tsx:157-202), so no explicit `start_session` call
- *  is needed at this layer. Provider defaults to Claude per the
- *  locked decision.
+ *  Kept at module scope so the click handler stays flat. The click is
+ *  the user's intent to run a provider, so it goes through
+ *  `launchAgentChatPane`, which records that intent and creates the pane;
+ *  the mounted `AgentChatPane` then starts its own session. Provider
+ *  defaults to Claude per the locked decision.
  */
 async function launchChatAgentOnWorkspace(
   _preset: TerminalPreset,
   workspaceId: string,
   launchMode: LaunchMode,
 ): Promise<void> {
-  await agentChatCreatePane(workspaceId, "claude", null, launchMode);
+  await launchAgentChatPane(workspaceId, "claude", null, launchMode);
 }
 
 // #127: memo is effective because setAppState performs structural sharing. The

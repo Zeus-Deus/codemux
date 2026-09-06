@@ -72,8 +72,7 @@ pub fn spawn_tunnel_status_forwarder<R: tauri::Runtime>(
     });
 }
 
-static REGISTRY: OnceCell<Mutex<HashMap<String, Arc<TunnelSupervisor>>>> =
-    OnceCell::const_new();
+static REGISTRY: OnceCell<Mutex<HashMap<String, Arc<TunnelSupervisor>>>> = OnceCell::const_new();
 
 async fn registry() -> &'static Mutex<HashMap<String, Arc<TunnelSupervisor>>> {
     REGISTRY
@@ -85,10 +84,7 @@ async fn registry() -> &'static Mutex<HashMap<String, Arc<TunnelSupervisor>>> {
 /// id. If an existing supervisor is registered, it's gracefully
 /// shut down before the new one takes its place — protects against
 /// double-pushes leaking a tunnel.
-pub async fn install_supervisor(
-    workspace_id: &str,
-    supervisor: Arc<TunnelSupervisor>,
-) {
+pub async fn install_supervisor(workspace_id: &str, supervisor: Arc<TunnelSupervisor>) {
     let map = registry().await;
     let mut guard = map.lock().await;
     let prev = guard.insert(workspace_id.to_string(), supervisor);
@@ -106,9 +102,7 @@ pub async fn install_supervisor(
 
 /// Look up a supervisor by workspace id. Returns `None` when the
 /// workspace is local or was never pushed.
-pub async fn get_supervisor(
-    workspace_id: &str,
-) -> Option<Arc<TunnelSupervisor>> {
+pub async fn get_supervisor(workspace_id: &str) -> Option<Arc<TunnelSupervisor>> {
     let map = registry().await;
     let guard = map.lock().await;
     let result = guard.get(workspace_id).cloned();
@@ -181,9 +175,8 @@ static WORKSPACE_CLIENTS: OnceCell<
     Mutex<HashMap<String, std::sync::Arc<crate::pty_daemon::PtyDaemonClient>>>,
 > = OnceCell::const_new();
 
-async fn workspace_clients() -> &'static Mutex<
-    HashMap<String, std::sync::Arc<crate::pty_daemon::PtyDaemonClient>>,
-> {
+async fn workspace_clients(
+) -> &'static Mutex<HashMap<String, std::sync::Arc<crate::pty_daemon::PtyDaemonClient>>> {
     WORKSPACE_CLIENTS
         .get_or_init(|| async { Mutex::new(HashMap::new()) })
         .await
@@ -192,8 +185,8 @@ async fn workspace_clients() -> &'static Mutex<
 /// Resolve the `PtyDaemonClient` for a workspace given its host
 /// assignment.
 ///
-/// - `host_id = None`: returns the singleton local daemon client.
-///   Cheap on every call thanks to its OnceCell.
+/// - `host_id = None`: returns the singleton live local daemon client,
+///   reconnecting after its reader observes EOF.
 /// - `host_id = Some(id)`: returns the per-workspace client
 ///   connected through the workspace's SSH tunnel. If no tunnel
 ///   exists yet (e.g. the workspace was restored from a snapshot
@@ -211,10 +204,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     workspace_id: &str,
     host_id: Option<i64>,
-) -> Result<
-    std::sync::Arc<crate::pty_daemon::PtyDaemonClient>,
-    crate::pty_daemon::PtyDaemonError,
-> {
+) -> Result<std::sync::Arc<crate::pty_daemon::PtyDaemonClient>, crate::pty_daemon::PtyDaemonError> {
     use crate::pty_daemon::{ensure_daemon, PtyDaemonClient, PtyDaemonError};
     use std::time::{Duration, Instant};
     use tauri::Manager;
@@ -227,9 +217,19 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     // Per-workspace cache.
     {
         let map = workspace_clients().await;
-        let guard = map.lock().await;
-        if let Some(client) = guard.get(workspace_id) {
-            return Ok(client.clone());
+        let mut guard = map.lock().await;
+        if let Some(client) = guard.get(workspace_id).cloned() {
+            if !client.is_closed() {
+                return Ok(client);
+            }
+            // A tunnel or remote-daemon restart permanently closes this
+            // socket. Evict it so the existing supervisor can establish a new
+            // connection below; returning the same dead Arc would make every
+            // subsequent retry fail immediately forever.
+            crate::trace_cloud_push!(
+                "[client_for_workspace:{workspace_id}] cached daemon client closed; reconnecting"
+            );
+            guard.remove(workspace_id);
         }
     }
 
@@ -268,11 +268,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 "$HOME/.local/bin/codemux-remote".to_string(),
             );
             install_supervisor(workspace_id, s.clone()).await;
-            spawn_tunnel_status_forwarder(
-                app.clone(),
-                workspace_id.to_string(),
-                &s,
-            );
+            spawn_tunnel_status_forwarder(app.clone(), workspace_id.to_string(), &s);
             s
         }
     };
@@ -332,11 +328,7 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
         }
         // Wait for next status change (with a short timeout so we
         // re-check the deadline periodically).
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            rx.changed(),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
     }
 
     // Connect + Hello with retry. SSH -L can have the local socket
@@ -356,29 +348,46 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
     #[allow(unused_assignments)]
     let mut last_err: Option<String> = None;
     let client_arc = loop {
-        match PtyDaemonClient::connect(supervisor.local_socket()).await {
-            Ok(c) => {
+        if Instant::now() >= connect_deadline {
+            return Err(PtyDaemonError::Daemon(format!(
+                "tunnel up but remote daemon never responded after 20s \
+                 (last error: {}). The remote codemux-remote binary may have \
+                 failed to start — try Test connection in Settings → Hosts.",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        let remaining = connect_deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(
+            remaining,
+            PtyDaemonClient::connect(supervisor.local_socket()),
+        )
+        .await
+        {
+            Ok(Ok(c)) => {
                 // Connection accepted — but verify the daemon is
                 // actually responsive by doing a Hello round-trip.
                 // SSH -L's connection-refused → succeed-then-EOF
                 // semantics means a successful connect() doesn't
                 // prove the remote side is healthy.
-                match c.hello().await {
-                    Ok((pid, version, _)) => {
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, c.hello()).await {
+                    Ok(Ok((pid, version, _))) => {
                         eprintln!(
                             "[client_for_workspace:{workspace_id}] daemon reached: \
                              pid={pid} version={version}"
                         );
                         break c;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         last_err = Some(format!("hello: {error}"));
                     }
+                    Err(_) => last_err = Some("hello: overall 20s deadline elapsed".into()),
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 last_err = Some(format!("connect: {error}"));
             }
+            Err(_) => last_err = Some("connect: overall 20s deadline elapsed".into()),
         }
         if Instant::now() >= connect_deadline {
             return Err(PtyDaemonError::Daemon(format!(
@@ -388,7 +397,8 @@ pub async fn client_for_workspace<R: tauri::Runtime>(
                 last_err.unwrap_or_else(|| "unknown".into())
             )));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let remaining = connect_deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(Duration::from_millis(500).min(remaining)).await;
     };
     {
         let map = workspace_clients().await;

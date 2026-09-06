@@ -26,6 +26,7 @@ import {
   usePickerFavorites,
 } from "@/stores/picker-favorites-store";
 import {
+  refreshProviderCapabilitiesForIntent,
   selectCapabilities,
   selectError,
   selectModel,
@@ -242,6 +243,13 @@ export function MultiProviderModelPicker({
     () => filterProviders(allowedProviders),
     [allowedProviders],
   );
+
+  useEffect(() => {
+    if (!open) return;
+    for (const visibleProvider of visibleProviders) {
+      void refreshProviderCapabilitiesForIntent(visibleProvider.kind);
+    }
+  }, [open, visibleProviders]);
 
   // Reset the rail + search to the active provider whenever the
   // popover opens. Lets the picker stay in sync with external

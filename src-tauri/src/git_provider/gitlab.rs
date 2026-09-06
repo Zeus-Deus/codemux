@@ -52,6 +52,9 @@ use crate::github::{
 /// detail-shaped call, past which a wedged CLI must surface as an error
 /// rather than pin the blocking pool.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_AVAILABILITY_TTL: Duration = Duration::from_secs(60);
+const CLI_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+static GLAB_AVAILABILITY_CACHE: LazyLock<TtlCache<bool>> = LazyLock::new(TtlCache::new);
 /// Matches `github::INCOMING_PRS_TIMEOUT`. List queries against a busy
 /// project are legitimately slower than a single-object fetch.
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -161,10 +164,18 @@ const NOT_AUTHENTICATED: &str = "glab CLI is not authenticated. Run: glab auth l
 // ── Subprocess plumbing ─────────────────────────────────────────
 
 fn glab_available() -> bool {
-    let mut cmd = crate::execution::host_command("which");
-    cmd.arg("glab");
-    sanitize_gui_env_std(&mut cmd);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    GLAB_AVAILABILITY_CACHE
+        .get_or_fetch("glab", CLI_AVAILABILITY_TTL, || {
+            let mut cmd = crate::execution::host_command("which");
+            cmd.arg("glab");
+            sanitize_gui_env_std(&mut cmd);
+            Ok::<bool, ()>(
+                run_timed(cmd, CLI_AVAILABILITY_TIMEOUT)
+                    .map(|output| output.success)
+                    .unwrap_or(false),
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// A `glab` invocation, with the keyring-safe environment every call
