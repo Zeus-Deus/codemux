@@ -14,6 +14,7 @@ import {
   type DivergedRowLabel,
 } from "@/lib/devices-attention";
 import { cn } from "@/lib/utils";
+import { hasDevicesToShow } from "./footer-availability";
 import type { HostView, WorkspaceSyncView } from "@/tauri/commands";
 
 /**
@@ -99,8 +100,7 @@ export function SidebarDevicesButton({
     [hosts, statuses, rows, transferError],
   );
 
-  const hasSiblingRows = rows.some((row) => row.workspace_id === null);
-  if (hosts.length === 0 && !hasSiblingRows) return null;
+  if (!hasDevicesToShow(hosts, rows)) return null;
 
   return (
     <Tooltip>

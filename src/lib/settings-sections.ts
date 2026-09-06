@@ -129,10 +129,6 @@ export const SETTINGS_SECTIONS = buildNavGroups(true).flatMap(
   (group) => group.items,
 );
 
-export function isSettingsSection(id: string): id is Section {
-  return SETTINGS_SECTIONS.some((section) => section.id === id);
-}
-
 export function isSettingsSectionAvailable(
   id: string,
   agentChatEnabled: boolean,

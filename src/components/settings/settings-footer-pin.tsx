@@ -15,7 +15,6 @@ export function SettingsFooterPin({ section }: { section: Section }) {
       variant="ghost"
       size="sm"
       className="ml-auto text-muted-foreground"
-      aria-pressed={pinned}
       onClick={() => togglePin(id)}
     >
       <Icon className="size-3.5" />

@@ -17,7 +17,7 @@ export const DEFAULT_FOOTER_PINS: FooterPin[] = [
   { id: "codemux.pull-requests.open" },
   { id: "codemux.ports.open" },
 ];
-export const FOOTER_STORAGE_KEY = "codemux:footer-pins:v1";
+export const FOOTER_STORAGE_KEY = "codemux:footer-pins";
 
 /** Keep known but temporarily unavailable pins in place; discard stale IDs,
  * duplicates and untrusted icon values without sorting the user's order. */

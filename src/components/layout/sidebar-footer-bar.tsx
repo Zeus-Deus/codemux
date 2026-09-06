@@ -291,28 +291,31 @@ function FooterDestination({
         tooltipSide={tooltipSide}
       />
     );
+  const button = (
+    <Button
+      variant="ghost"
+      size={labeled ? "sm" : "icon-xs"}
+      aria-label={action.label}
+      className={cn(
+        "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+        labeled ? "gap-1.5 px-2 text-[12px]" : "w-7",
+        fullWidth && "w-full justify-start",
+      )}
+      onClick={() =>
+        action.section
+          ? setShowSettings(true, action.section)
+          : setShowAutomations(true)
+      }
+    >
+      <Icon className={labeled ? "size-[13px]" : "size-[18px]"} />
+      {labeled && action.label}
+    </Button>
+  );
+  // A labelled row already says what it is; only icon-only buttons need the tooltip.
+  if (labeled) return button;
   return (
     <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size={labeled ? "sm" : "icon-xs"}
-          aria-label={action.label}
-          className={cn(
-            "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-            labeled ? "gap-1.5 px-2 text-[12px]" : "w-7",
-            fullWidth && "w-full justify-start",
-          )}
-          onClick={() =>
-            action.section
-              ? setShowSettings(true, action.section)
-              : setShowAutomations(true)
-          }
-        >
-          <Icon className={labeled ? "size-[13px]" : "size-[18px]"} />
-          {labeled && action.label}
-        </Button>
-      </TooltipTrigger>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
       <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
         {action.label}
       </TooltipContent>

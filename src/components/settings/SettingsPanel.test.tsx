@@ -559,7 +559,7 @@ describe("Settings footer navigation", () => {
     const view = render(<SettingsView />);
     fireEvent.click(view.getByRole("button", { name: "Pin to footer" }));
     expect(useFooterPinsStore.getState().pins.slice(-1)[0]?.id).toBe("codemux.settings.appearance");
-    expect(view.getByRole("button", { name: "Unpin from footer" })).toHaveAttribute("aria-pressed", "true");
+    expect(view.getByRole("button", { name: "Unpin from footer" })).toBeInTheDocument();
     view.unmount();
     requestedSection = null;
   });
