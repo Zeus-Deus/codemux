@@ -2007,6 +2007,43 @@ export const agentChatListMessagesAfter = (
 export const agentChatThreadHeadId = (threadId: string) =>
   invoke<number | null>("agent_chat_thread_head_id", { threadId });
 
+/** The newest whole turns of a thread. Mirrors `AgentChatMessageTail` in
+ *  `commands/agent_chat.rs`. */
+export interface AgentChatMessageTail {
+  /** Ascending; starts at a `user_message` row unless `complete`. */
+  rows: AgentChatMessageRow[];
+  /** Rows the thread holds in total. */
+  total_rows: number;
+  /** `rows` is the whole thread — nothing older to backfill. */
+  complete: boolean;
+}
+
+/**
+ * Tail read for a COLD open: at least the last `limit` rows, widened down
+ * to the nearest user-turn boundary so the page replays cleanly (the
+ * reducer correlates rows within a turn). The pane renders this at once
+ * and backfills the rest through `agentChatListMessagesBefore`.
+ * Payloads are shaped like `agentChatListMessagesAfter`.
+ */
+export const agentChatListMessagesTail = (threadId: string, limit: number) =>
+  invoke<AgentChatMessageTail>("agent_chat_list_messages_tail", {
+    threadId,
+    limit,
+  });
+
+/** Backfill page: the newest `limit` rows strictly older than `beforeId`,
+ *  ascending. A page shorter than `limit` is the start of the thread. */
+export const agentChatListMessagesBefore = (
+  threadId: string,
+  beforeId: number,
+  limit: number,
+) =>
+  invoke<AgentChatMessageRow[]>("agent_chat_list_messages_before", {
+    threadId,
+    beforeId,
+    limit,
+  });
+
 /** Fetch one persisted row verbatim, by id: the full tool-result payload
  *  behind a lazy stub. */
 export const agentChatGetToolResult = (rowId: number) =>

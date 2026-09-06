@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { Activity } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type {
   PermissionRequestItem,
@@ -77,6 +78,20 @@ function phase(overrides: Partial<WorkflowPhaseView> = {}): WorkflowPhaseView {
 }
 
 describe("WorkflowRunCard — pending_approval", () => {
+  it("closes the transient script viewer on transcript disconnection without deciding approval", async () => {
+    const onDecide = vi.fn();
+    const card = <WorkflowRunCard item={workflowItem()} approval={pendingRequest()} onDecide={onDecide} />;
+    const view = render(<Activity mode="visible">{card}</Activity>);
+    fireEvent.click(screen.getByText("View script"));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    view.rerender(<Activity mode="hidden">{card}</Activity>);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    view.rerender(<Activity mode="visible">{card}</Activity>);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(onDecide).not.toHaveBeenCalled();
+  });
+
   it("renders planned phases and all four action buttons", () => {
     render(
       <WorkflowRunCard

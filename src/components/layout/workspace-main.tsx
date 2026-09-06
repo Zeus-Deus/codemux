@@ -15,6 +15,7 @@ import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
 import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
+import { WorkspaceTranscriptCache } from "@/components/chat/workspace-transcript-cache";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { cn } from "@/lib/utils";
@@ -329,6 +330,7 @@ export function WorkspaceMain() {
             enableAgentChat && !isSoleRootChat && "pt-10",
           )}
         >
+          <WorkspaceTranscriptCache workspace={activeWorkspace} enabled={enableAgentChat}>
           {activeTab?.kind === "diff" ? (
             <LazyBoundary label="diff" className="h-full">
               <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
@@ -343,6 +345,7 @@ export function WorkspaceMain() {
           ) : (
             <PaneContainer workspace={activeWorkspace} />
           )}
+          </WorkspaceTranscriptCache>
         </div>
       </div>
 

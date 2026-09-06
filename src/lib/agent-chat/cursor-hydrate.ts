@@ -1,9 +1,12 @@
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import {
   agentChatListMessagesAfter,
+  agentChatListMessagesBefore,
+  agentChatListMessagesTail,
   agentChatThreadHeadId,
   agentChatTurnActive,
   type AgentChatMessageRow,
+  type AgentChatMessageTail,
 } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
@@ -36,7 +39,39 @@ import type { LiveChatEvent } from "./types";
  *    tail is the common case and does no work at all.
  *  - **Cold** (no cursor, cursor above the thread's head, or a tail
  *    past {@link MAX_WARM_TAIL_ROWS}): fetch the thread and replay it
- *    once, replacing the transcript wholesale.
+ *    once, replacing the transcript wholesale. A LONG thread is opened
+ *    tail-first — see "Tail-first cold open" below.
+ *
+ * ## Tail-first cold open
+ *
+ * A cold read of a 10k-row thread spends ~1.5 s moving 40 MB of payload
+ * across the IPC before the reducer gets to run for 57 ms; the pane is
+ * blank the whole time. The user only needs the newest turns to start
+ * reading, so a cold open asks for the TAIL first ({@link TAIL_FIRST_ROWS}
+ * rows, widened by the backend to a `user_message` boundary so the page
+ * is whole turns), replays that at once through `hydrateThreadTail`, and
+ * then backfills the older rows in pages while the user is already
+ * looking at the bottom of the transcript.
+ *
+ * The backfill does NOT merge reduced items — it re-replays the COMPLETE
+ * row set through one `hydrateThread`. The reducer is not additive across
+ * a turn boundary in the other direction either (an item's post-passes
+ * depend on what follows it), and 57 ms for the whole set is cheap.
+ * `adoptItemIds` carries the visible rows' keys over so the transcript
+ * list does not remount what the user is reading.
+ *
+ * Two invariants keep the slice honest across the two phases:
+ *
+ *  - the tail preview leaves `lastPersistedEventId` NULL. A non-null
+ *    cursor promises "everything at or below is represented", and a warm
+ *    revisit trusts that — with a tail-only slice it would never fetch
+ *    the prefix. Only the final `hydrateThread` sets the cursor.
+ *  - the hold stays in place until the final replay. Releasing between
+ *    the phases would apply live events to a slice the backfill's
+ *    replay is about to REPLACE wholesale, losing them.
+ *
+ * A cancellation between the phases drops the held events and leaves the
+ * cursor null, so the next mount opens cold again from the tail.
  *
  * ## The attach/hydrate race
  *
@@ -85,6 +120,21 @@ export interface CursorHydrateDeps {
     provider: AgentChatProviderKind,
     threadId: string,
   ) => Promise<boolean>;
+  /** Cold-open tail read: at least `limit` rows, widened to a user-turn
+   *  boundary, with `complete` telling whether that was the whole thread.
+   *  Optional so a caller (or older test) without it still gets the plain
+   *  full read. */
+  listTail?: (threadId: string, limit: number) => Promise<AgentChatMessageTail>;
+  /** Backfill page: the newest `limit` rows strictly older than
+   *  `beforeId`, ascending. A short page is the start of the thread. */
+  listBefore?: (
+    threadId: string,
+    beforeId: number,
+    limit: number,
+  ) => Promise<AgentChatMessageRow[]>;
+  /** Rows per backfill page; defaults to {@link BACKFILL_PAGE_ROWS}.
+   *  Injected by tests to exercise the multi-page walk. */
+  backfillPageRows?: number;
   /** Resolves once the thread's live channel is attached. Defaults to the
    *  attach registry the subscription hook writes. */
   awaitAttach?: (threadId: string) => Promise<void>;
@@ -96,7 +146,24 @@ const defaultDeps: CursorHydrateDeps = {
   listAfter: agentChatListMessagesAfter,
   headId: agentChatThreadHeadId,
   turnActive: agentChatTurnActive,
+  listTail: agentChatListMessagesTail,
+  listBefore: agentChatListMessagesBefore,
 };
+
+/**
+ * Minimum rows a cold open renders before anything else: a few turns of
+ * a busy thread, enough to fill the viewport and then some. The backend
+ * widens it down to the nearest `user_message` so the page replays clean.
+ */
+export const TAIL_FIRST_ROWS = 400;
+
+/**
+ * Rows per backfill page. Sized so one page is a few MB at most even on
+ * a tool-heavy thread — the point of paging is that a giant single
+ * response would block the IPC (and the renderer's main thread while it
+ * deserialises) for the exact stretch the tail preview just freed.
+ */
+export const BACKFILL_PAGE_ROWS = 2_000;
 
 /**
  * Probe the backend for "is this thread's run still in flight", returning
@@ -266,15 +333,32 @@ async function hydratePass(
     const slice = useAgentChatStore.getState().threads[threadId];
     const cursor = slice?.lastPersistedEventId ?? null;
     const warm = slice != null && cursor != null;
+    // A cold open of a long thread goes tail-first (see the module doc).
+    // Both reads must be available; otherwise it is the plain full read.
+    const tailFirst = !warm && deps.listTail != null && deps.listBefore != null;
     // The head probe rides alongside the tail read so a cursor from a
     // foreign id space (a merged / deleted thread whose rows were
     // re-homed) is caught without a full-history fetch.
     const readStarted = startSubMeasure();
-    const [rows, headId] = await Promise.all([
-      deps.listAfter(threadId, warm ? cursor : null),
+    const [rows, headId, tail] = await Promise.all([
+      tailFirst
+        ? Promise.resolve([] as AgentChatMessageRow[])
+        : deps.listAfter(threadId, warm ? cursor : null),
       warm ? deps.headId(threadId) : Promise.resolve(null),
+      tailFirst
+        ? deps.listTail!(threadId, TAIL_FIRST_ROWS)
+        : Promise.resolve<AgentChatMessageTail | null>(null),
     ]);
-    endSubMeasure(warm ? "hydrate:read-tail" : "hydrate:read-full", readStarted);
+    // A tail that turned out to be the whole thread IS the full read, and
+    // is measured as one so the before/after numbers stay comparable.
+    endSubMeasure(
+      warm
+        ? "hydrate:read-tail"
+        : tail != null && !tail.complete
+          ? `hydrate:read-tail-first(${tail.rows.length}/${tail.total_rows})`
+          : "hydrate:read-full",
+      readStarted,
+    );
     if (isCancelled()) return false;
     const cursorAhead =
       warm && cursor !== 0 && (headId === null || headId < cursor);
@@ -302,7 +386,24 @@ async function hydratePass(
       releaseFilter = dropDeltasSettledByRead(rows[rows.length - 1].id);
       return false;
     }
-    const full = warm ? await deps.listAfter(threadId, null) : rows;
+    if (tail != null && (
+      (tail.complete && tail.rows.length !== tail.total_rows) ||
+      (!tail.complete && tail.rows.length === 0)
+    )) {
+      throw new Error("Incomplete chat tail read");
+    }
+    if (tail != null && !tail.complete) {
+      releaseFilter = await hydrateTailFirst(
+        threadId,
+        provider,
+        isCancelled,
+        deps,
+        tail,
+        (filter) => { releaseFilter = filter; },
+      );
+      return false;
+    }
+    const full = tail != null ? tail.rows : warm ? await deps.listAfter(threadId, null) : rows;
     if (isCancelled()) return false;
     // A cold read of NOTHING over a transcript that has messages is not
     // an empty thread — it is a thread whose rows are not (yet) filed
@@ -349,6 +450,99 @@ async function hydratePass(
       if (!retry) useAgentChatStore.getState().evictColdThreads([threadId]);
     }
   }
+}
+
+/**
+ * The two-phase body of a tail-first cold open (module doc: "Tail-first
+ * cold open"). Runs INSIDE `hydratePass`'s hold: the caller owns the
+ * token and releases (or drops, on cancel) in its `finally`. Install a
+ * preview release filter immediately after applying it: a later read
+ * can fail before this function returns. The
+ * preview's null cursor cannot deduplicate persisted overlap itself.
+ *
+ * Phase 1 replays the tail as a preview so the newest turn is on screen
+ * while the rest of the history is still being read. Phase 2 pages the older rows down from the tail's first id until a
+ * page comes back short, then re-replays the WHOLE set once and syncs
+ * the cursor to the head. A cancel anywhere in phase 2 leaves the slice
+ * as the preview with a null cursor — cold, so the next mount starts
+ * over rather than trusting a half-fetched history.
+ */
+async function hydrateTailFirst(
+  threadId: string,
+  provider: AgentChatProviderKind,
+  isCancelled: () => boolean,
+  deps: CursorHydrateDeps,
+  tail: AgentChatMessageTail,
+  setReleaseFilter: (filter: HeldEventFilter) => void,
+): Promise<HeldEventFilter | undefined> {
+  const liveStarted = startSubMeasure();
+  const runLive = await resolveThreadRunLive(provider, threadId, deps);
+  endSubMeasure("hydrate:run-live-probe", liveStarted);
+  if (isCancelled()) return undefined;
+
+  const previewStarted = startSubMeasure();
+  useAgentChatStore
+    .getState()
+    .hydrateThreadTail(threadId, tail.rows, { runLive, provider });
+  const previewIds = new Set(tail.rows.map((row) => row.id));
+  const dropSettledDeltas = dropDeltasSettledByRead(tail.rows[tail.rows.length - 1].id);
+  setReleaseFilter((events) => dropSettledDeltas(events).filter(
+    ({ persistedId }) => persistedId == null || !previewIds.has(persistedId),
+  ));
+  endSubMeasure(`hydrate:replay(${tail.rows.length})`, previewStarted);
+
+  // Newest page first, so the pages are collected in reverse and flipped
+  // when assembled. Each page's first row is the next page's exclusive
+  // upper bound; a short (or empty) page is the start of the thread.
+  const backfillStarted = startSubMeasure();
+  const pageRows = deps.backfillPageRows ?? BACKFILL_PAGE_ROWS;
+  const pagesNewestFirst: AgentChatMessageRow[][] = [];
+  let beforeId = tail.rows[0].id;
+  let fetched = 0;
+  for (;;) {
+    const page = await deps.listBefore!(threadId, beforeId, pageRows);
+    if (isCancelled()) {
+      // Nothing below the tail is represented, and the preview's cursor
+      // is already null — but say so explicitly: a cancelled backfill
+      // must never leave a slice that looks warm.
+      useAgentChatStore.getState().invalidateThreadCursor(threadId);
+      return undefined;
+    }
+    if (page.length === 0) break;
+    pagesNewestFirst.push(page);
+    fetched += page.length;
+    if (page.length < pageRows) break;
+    beforeId = page[0].id;
+  }
+  endSubMeasure(
+    `hydrate:backfill(${fetched}/${pagesNewestFirst.length}p)`,
+    backfillStarted,
+  );
+
+  const all: AgentChatMessageRow[] = [];
+  for (let i = pagesNewestFirst.length - 1; i >= 0; i -= 1) {
+    for (const row of pagesNewestFirst[i]) all.push(row);
+  }
+  for (const row of tail.rows) all.push(row);
+
+  // A short page proves EOF only for a successful, consistent walk.
+  // Deletion/re-homing during pagination can remove an unfetched prefix;
+  // never promise a warm cursor for that partial snapshot.
+  if (all.length !== tail.total_rows) {
+    throw new Error("Chat history changed during backfill");
+  }
+
+  // One replay of the complete set. `hydrateThread` adopts the preview's
+  // item ids for the suffix it re-creates, so the rows on screen keep
+  // their keys and the history slides in above them. The liveness answer
+  // from before the backfill is reused: anything that settled meanwhile
+  // is sitting in the held buffer and lands right after this.
+  const replayStarted = startSubMeasure();
+  useAgentChatStore
+    .getState()
+    .hydrateThread(threadId, all, { runLive, provider });
+  endSubMeasure(`hydrate:backfill-replay(${all.length})`, replayStarted);
+  return dropDeltasSettledByRead(all[all.length - 1].id);
 }
 
 function defaultDelay(ms: number): Promise<void> {

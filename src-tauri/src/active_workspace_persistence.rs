@@ -22,6 +22,8 @@ struct PersistQueue {
     latest_state_revision: u64,
     pending: Option<PersistRequest>,
     worker_running: bool,
+    /// Latest accepted selection, retained independently of worker retry state.
+    latest_desired: Option<String>,
     latest_requested: Option<String>,
     last_persisted: Option<String>,
     last_reported_failure: Option<String>,
@@ -45,6 +47,7 @@ impl PersistQueue {
             return false;
         }
         self.latest_state_revision = state_revision;
+        self.latest_desired = Some(workspace_id.to_owned());
         // Deduplicate only when the selection is genuinely covered: queued
         // or in flight with a live worker, or already durable with nothing
         // queued. After a worker abort neither holds for the request the
@@ -126,13 +129,14 @@ impl PersistQueue {
         }
         self.latest_requested = Some(workspace_id.to_owned());
         self.last_persisted = Some(workspace_id.to_owned());
+        self.latest_desired = Some(workspace_id.to_owned());
     }
 
     /// Called when a worker thread exits without draining the queue (a
     /// panic, or any early bail-out). Only clears the running flag: a
     /// selection enqueued while the worker was unwinding survives untouched,
     /// so the next state emit starts a fresh worker that drains it and
-    /// `flush_latest` still sees the `latest_requested`/`last_persisted`
+    /// `flush_latest` still sees the `latest_desired`/`last_persisted`
     /// gap. The request the dead worker had already taken was never marked
     /// persisted either, so a duplicate emit re-enqueues it (see `enqueue`)
     /// and a shutdown flush re-persists it.
@@ -141,7 +145,7 @@ impl PersistQueue {
     }
 
     fn take_latest_for_flush(&mut self) -> Option<PersistRequest> {
-        let latest = self.latest_requested.clone()?;
+        let latest = self.latest_desired.clone()?;
         if self.last_persisted.as_deref() == Some(&latest) && self.pending.is_none() {
             return None;
         }
@@ -381,6 +385,71 @@ mod tests {
         let flush = queue.take_latest_for_flush().unwrap();
         assert_eq!(flush.workspace_id, "c");
         queue.complete(&flush, true);
+        assert!(queue.take_latest_for_flush().is_none());
+    }
+
+    #[test]
+    fn shutdown_flush_retries_a_failed_final_selection_without_another_emit() {
+        let mut queue = PersistQueue::default();
+        queue.seed_persisted("a");
+        assert!(queue.enqueue("b", 1));
+        let failed = queue.take().unwrap();
+        assert!(queue.complete(&failed, false));
+        assert!(queue.take().is_none());
+
+        let flush = queue
+            .take_latest_for_flush()
+            .expect("failed selection must survive");
+        assert_eq!(flush.workspace_id, "b");
+        assert!(flush.generation > failed.generation);
+        assert!(
+            !queue.complete(&flush, false),
+            "do not repeat the failure toast"
+        );
+        let retry = queue
+            .take_latest_for_flush()
+            .expect("failed flush must also retry");
+        assert_eq!(retry.workspace_id, "b");
+        assert!(retry.generation > flush.generation);
+        queue.complete(&retry, true);
+        assert_eq!(queue.last_persisted.as_deref(), Some("b"));
+        assert!(queue.take_latest_for_flush().is_none());
+    }
+
+    #[test]
+    fn returning_to_durable_selection_after_failure_cancels_shutdown_retry() {
+        let mut queue = PersistQueue::default();
+        queue.seed_persisted("a");
+        assert!(queue.enqueue("b", 1));
+        let failed = queue.take().unwrap();
+        queue.complete(&failed, false);
+        assert!(queue.take().is_none());
+
+        assert!(
+            !queue.enqueue("a", 2),
+            "already durable selection needs no worker"
+        );
+        assert!(queue.take_latest_for_flush().is_none());
+    }
+
+    #[test]
+    fn failed_selection_can_retry_before_worker_exits_without_accepting_stale_emit() {
+        let mut queue = PersistQueue::default();
+        queue.seed_persisted("a");
+        assert!(queue.enqueue("b", 2));
+        let failed = queue.take().unwrap();
+        queue.complete(&failed, false);
+
+        assert!(!queue.enqueue("a", 1));
+        assert!(
+            !queue.enqueue("b", 2),
+            "reuse the worker that has not exited yet"
+        );
+        let retry = queue.take().expect("same-revision retry must be queued");
+        assert_eq!(retry.workspace_id, "b");
+        assert!(retry.generation > failed.generation);
+        queue.complete(&retry, true);
+        assert!(queue.take().is_none());
         assert!(queue.take_latest_for_flush().is_none());
     }
 

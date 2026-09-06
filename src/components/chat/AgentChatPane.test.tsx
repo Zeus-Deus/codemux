@@ -441,6 +441,14 @@ vi.mock("@/tauri/commands", () => ({
   // Cursor resume reads. `after` returns rows (`{id, payload}`); the
   // head probe guards against a cursor from a foreign id space.
   agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
+  // Existing pane scenarios supply complete, small histories through the
+  // shared row-read stub. Paging/error behavior is exercised in cursor-hydrate.
+  agentChatListMessagesTail: vi.fn(async (threadId: string) => {
+    const { agentChatListMessagesAfter } = await import("@/tauri/commands");
+    const rows = await agentChatListMessagesAfter(threadId, null);
+    return { rows, total_rows: rows.length, complete: true };
+  }),
+  agentChatListMessagesBefore: vi.fn().mockResolvedValue([]),
   agentChatThreadHeadId: vi.fn().mockResolvedValue(null),
   // Liveness probe fired right after the transcript read on the
   // hydrate path. Default to `false` (no live turn) so hydrate keeps its
