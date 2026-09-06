@@ -801,8 +801,9 @@ pub enum AppStateDelta {
     /// A workspace switch. Carries exactly what
     /// [`AppStateStore::record_workspace_switch`] mutates, so applying it
     /// yields the same snapshot the full emit used to ship — minus the
-    /// ~600KB of workspaces the switch never touched. Wire shape is
-    /// documented for the renderer in `/tmp/pr338-activation-delta-contract.md`.
+    /// ~600KB of workspaces the switch never touched. The wire shape is
+    /// mirrored by `ActiveWorkspaceDelta` in `src/tauri/types.ts` and consumed
+    /// by `applyActiveWorkspaceDelta` in `src/stores/app-store.ts`.
     ActiveWorkspace {
         /// The new `active_workspace_id`.
         workspace_id: String,
@@ -10324,7 +10325,7 @@ mod workspace_activity_tests {
 
     #[test]
     fn activation_delta_wire_shape_matches_the_frontend_contract() {
-        // Pinned to /tmp/pr338-activation-delta-contract.md — the frontend
+        // Pinned to `ActiveWorkspaceDelta` in `src/tauri/types.ts`: the frontend
         // switch on `domain` and the field names are what it reads.
         let delta = RevisionedDelta {
             revision: 7,
