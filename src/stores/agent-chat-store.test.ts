@@ -23,6 +23,43 @@ function resetStore() {
 }
 
 describe("agent-chat-store", () => {
+  it("keeps the active turn when an async question is answered", () => {
+    resetStore();
+    const store = useAgentChatStore.getState();
+    store.ensureThread("async");
+    store.applyEvent("async", {
+      type: "session_state_changed",
+      thread_id: "async",
+      status: { status: "running", active_turn: "turn" },
+    });
+    store.applyEvent("async", {
+      type: "questions_asked",
+      thread_id: "async",
+      question: {
+        id: "q",
+        target: "native",
+        source_item_id: "q",
+        source_turn_id: "turn",
+        text: "",
+        questions: [{ title: "Storage?", options: [] }],
+      },
+    });
+    store.applyEvent("async", {
+      type: "question_resolved",
+      thread_id: "async",
+      question_id: "q",
+      resolution: {
+        status: "answered",
+        answers: ["SQLite"],
+        submission_id: "reply",
+        delivery: { kind: "inflight", turn_id: "turn" },
+      },
+    });
+    expect(useAgentChatStore.getState().threads.async.activeTurnId).toBe(
+      "turn",
+    );
+    expect(useAgentChatStore.getState().threads.async.streaming).toBe(true);
+  });
   beforeEach(() => {
     resetStore();
   });

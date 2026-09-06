@@ -1845,7 +1845,7 @@ async fn deleting_a_session_removes_all_hidden_checkpoint_refs() {
     let app = tauri::test::mock_app();
     app.manage(db);
     let handle = app.handle().clone();
-    agent_chat_delete_session(handle.state(), thread_id.into())
+    agent_chat_delete_session(handle.clone(), handle.state(), thread_id.into())
         .await
         .unwrap();
 
@@ -1977,5 +1977,104 @@ mod workspace_identity {
             Some(&ws.0),
             "env overlay agrees with the first-class id"
         );
+    }
+}
+
+#[tokio::test]
+async fn async_question_command_claims_once_and_keeps_other_providers_disabled() {
+    use codemux_lib::agent_provider::{
+        AgentProvider, QuestionResolution, UserQuestion, UserQuestionSet,
+    };
+    use codemux_lib::commands::async_questions::{
+        agent_chat_answer_question, QuestionAction,
+    };
+    for kind in [ProviderKind::Codex, ProviderKind::Claude] {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let db = DatabaseStore::new_in_memory();
+        let provider_name = if kind == ProviderKind::Codex {
+            "codex"
+        } else {
+            "claude"
+        };
+        db.upsert_agent_chat_session("thread", "workspace", None, provider_name)
+            .unwrap();
+        db.record_async_question(
+            "thread",
+            &UserQuestionSet {
+                id: "q".into(),
+                target: "native".into(),
+                source_item_id: "q".into(),
+                source_turn_id: "native-turn".into(),
+                text: String::new(),
+                questions: vec![UserQuestion {
+                    title: "Which storage?".into(),
+                    options: vec![],
+                }],
+                subagent_id: None,
+            },
+        )
+        .unwrap();
+        let mut mock = MockAgentProvider::new(kind);
+        mock.async_questions = kind == ProviderKind::Codex;
+        let mock = Arc::new(mock);
+        mock.start_session(start_input("thread")).await.unwrap();
+        let registry = ProviderRegistry::new();
+        if kind == ProviderKind::Codex {
+            registry.set_codex(mock.clone() as _).await;
+        } else {
+            registry.set_claude(mock.clone() as _).await;
+        }
+        app.manage(registry);
+        app.manage(db);
+        app.manage(test_observability(true));
+        app.manage(AgentChatChannelRegistry::default());
+        let action = QuestionAction::Answer {
+            answers: vec!["SQLite".into()],
+            submission_id: "b531755f-e50c-47e0-8d75-ed3a7d70b522".into(),
+            retry_unknown: false,
+        };
+        let (first, second) = tokio::join!(
+            agent_chat_answer_question(
+                handle.clone(),
+                ThreadId("thread".into()),
+                "q".into(),
+                action.clone()
+            ),
+            agent_chat_answer_question(
+                handle.clone(),
+                ThreadId("thread".into()),
+                "q".into(),
+                action
+            )
+        );
+        let db: State<'_, DatabaseStore> = handle.state();
+        if kind == ProviderKind::Codex {
+            assert!(first.is_ok() && second.is_ok());
+            assert!(matches!(
+                db.async_question("thread", "q").unwrap().1,
+                QuestionResolution::Answered { .. }
+            ));
+            assert_eq!(
+                mock.calls
+                    .snapshot()
+                    .iter()
+                    .filter(|call| matches!(call, MockCall::AnswerQuestion(..)))
+                    .count(),
+                1
+            );
+        } else {
+            assert!(first.unwrap_err().contains("does not support"));
+            assert!(second.is_err());
+            assert_eq!(
+                db.async_question("thread", "q").unwrap().1,
+                QuestionResolution::Pending
+            );
+            assert!(!mock
+                .calls
+                .snapshot()
+                .iter()
+                .any(|call| matches!(call, MockCall::AnswerQuestion(..))));
+        }
     }
 }

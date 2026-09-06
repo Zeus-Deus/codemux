@@ -82,7 +82,6 @@ const capsState = {
   },
   claudeError: null,
   codexError: null,
-  loaded: true,
 };
 
 const { refreshForIntent } = vi.hoisted(() => ({

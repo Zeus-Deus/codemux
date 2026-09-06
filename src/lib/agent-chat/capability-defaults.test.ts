@@ -57,7 +57,6 @@ function resetCaps() {
     cursorError: null,
     grokError: null,
     opencodeError: null,
-    loaded: false,
   });
 }
 

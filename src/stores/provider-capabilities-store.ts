@@ -77,8 +77,6 @@ interface ProviderCapabilitiesStore {
   /** Per-provider request lifecycle. `true` means the latest refresh settled,
    *  whether it returned models, an empty catalog, or an error. */
   loadedProviders: Partial<Record<AgentChatProviderKind, boolean>>;
-  /** True only after every provider has settled at least once. */
-  loaded: boolean;
   refresh: (provider: AgentChatProviderKind) => Promise<void>;
 }
 
@@ -97,13 +95,6 @@ const providerIntentRefreshedAt = new Map<AgentChatProviderKind, number>();
 // just-cleared catalog in memory (and, via the persist middleware, back into
 // localStorage after `clearStorage()`).
 let providerResetEpoch = 0;
-const PROVIDERS: readonly AgentChatProviderKind[] = [
-  "claude",
-  "codex",
-  "cursor",
-  "grok",
-  "opencode",
-];
 // Providers whose catalogue lives in an installed CLI and can change without
 // a Codemux release. A later intent past this window re-harvests; every other
 // provider stays a once-per-renderer intent because its catalogue ships with
@@ -131,7 +122,6 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
       grokError: null,
       opencodeError: null,
       loadedProviders: {},
-      loaded: false,
       refresh: (provider) => {
         const existing = providerRefreshInFlight.get(provider);
         if (existing) return existing;
@@ -141,7 +131,6 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
             ...state.loadedProviders,
             [provider]: false,
           },
-          loaded: false,
         }));
 
         const startedEpoch = providerResetEpoch;
@@ -164,18 +153,12 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>()(
           // `loadedProviders` here would mark a wiped slot as settled (or
           // clobber the lifecycle of a fresher post-reset flight).
           if (providerResetEpoch === startedEpoch) {
-            set((state) => {
-              const loadedProviders = {
+            set((state) => ({
+              loadedProviders: {
                 ...state.loadedProviders,
                 [provider]: true,
-              };
-              return {
-                loadedProviders,
-                loaded: PROVIDERS.every(
-                  (candidate) => loadedProviders[candidate] === true,
-                ),
-              };
-            });
+              },
+            }));
           }
           // Only clear our own dedupe entry. After a reset the map is
           // cleared and may already hold a newer flight for this provider;
@@ -286,7 +269,6 @@ export function resetProviderCapabilities(): void {
     grokError: null,
     opencodeError: null,
     loadedProviders: {},
-    loaded: false,
   });
   useProviderCapabilities.persist.clearStorage();
 }

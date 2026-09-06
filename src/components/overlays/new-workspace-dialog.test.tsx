@@ -264,7 +264,6 @@ beforeEach(() => {
     cursorError: null,
     opencodeError: null,
     loadedProviders: {},
-    loaded: false,
   });
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);

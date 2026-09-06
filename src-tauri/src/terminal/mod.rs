@@ -481,7 +481,6 @@ fn spawn_placeholder_is_observable(runtime: &SessionRuntime) -> bool {
 /// Used by tests and by `spawn_missing_ptys_for_workspace` to skip sessions
 /// whose runtime is already populated. Acquires the `PtyState::sessions`
 /// mutex; do not hold any other lock across this call.
-#[allow(dead_code)]
 fn is_session_spawn_active(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,

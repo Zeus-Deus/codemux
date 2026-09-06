@@ -1,3 +1,4 @@
+import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, GitBranch, Home } from "lucide-react";
 
@@ -3657,6 +3658,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               composer card — below the scrolling transcript. */}
           <div className="pt-3.5">
             {pendingInputPanelEl}
+            {threadId && (
+              <AsyncQuestionPanel
+                threadId={threadId}
+                working={streaming}
+                items={messages.filter(
+                  (
+                    m,
+                  ): m is import("@/lib/agent-chat/types").AsyncQuestionItem =>
+                    m.kind === "async_question",
+                )}
+              />
+            )}
             {debugBannerEl}
             {composerEl}
           </div>

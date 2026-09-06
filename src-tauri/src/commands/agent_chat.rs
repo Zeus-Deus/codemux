@@ -403,7 +403,7 @@ fn provider_err(err: ProviderError) -> String {
     serde_json::to_string(&ser).unwrap_or_else(|_| "provider_error".to_string())
 }
 
-async fn lookup_provider(
+pub(super) async fn lookup_provider(
     registry: &ProviderRegistry,
     kind: ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>, String> {
@@ -1147,7 +1147,7 @@ struct PreparedTurnCheckpoint {
     _timeline_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
-struct GitTurnDispatchCheckpoint<R: Runtime> {
+pub(super) struct GitTurnDispatchCheckpoint<R: Runtime> {
     app: AppHandle<R>,
     thread_id: String,
     workspace_id: String,
@@ -1167,7 +1167,7 @@ impl<R: Runtime> std::fmt::Debug for GitTurnDispatchCheckpoint<R> {
 }
 
 impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
-    fn new(
+    pub(super) fn new(
         app: AppHandle<R>,
         thread_id: String,
         workspace_id: String,
@@ -1616,6 +1616,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         transcript_cutoff_id: target.transcript_cutoff_id,
         remaining_checkpoints: remaining_checkpoints.clone(),
     };
+    super::async_questions::publish_attention(&app);
     if let Err(error) = app.emit(AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT, &payload) {
         eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
     }
@@ -1792,6 +1793,15 @@ pub async fn ensure_live_session<R: Runtime>(
     provider_kind: ProviderKind,
     thread_id: &ThreadId,
 ) -> Result<(), String> {
+    ensure_live_session_mode(app, provider_kind, thread_id, false).await
+}
+
+pub(super) async fn ensure_live_session_mode<R: Runtime>(
+    app: &AppHandle<R>,
+    provider_kind: ProviderKind,
+    thread_id: &ThreadId,
+    require_original: bool,
+) -> Result<(), String> {
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider_kind).await?;
     // Fast path: a live session already exists, so no need to serialize
@@ -1864,9 +1874,16 @@ pub async fn ensure_live_session<R: Runtime>(
             }
             None
         }
+        Some(id) if require_original => {
+            Some(serde_json::json!({ "resume": id, "requireOriginal": true }))
+        }
         Some(id) => Some(serde_json::json!({ "resume": id })),
         None => None,
     };
+
+    if require_original && resume_cursor.is_none() {
+        return Err("The original conversation cannot be resumed.".into());
+    }
 
     // Resolve both legacy NULL rows and the v0.14.2 cross-provider
     // Full-access values through the same canonical start-path helper. The
@@ -1926,7 +1943,7 @@ pub async fn ensure_live_session<R: Runtime>(
         .await
     {
         Ok(_) => Ok(()),
-        Err(err) if resume_cursor.is_some() => {
+        Err(err) if resume_cursor.is_some() && !require_original => {
             // Resume-start failed — retry once as a fresh session. The
             // transcript already hydrates from the DB, so the user keeps
             // their visible history.
@@ -4411,7 +4428,8 @@ pub async fn agent_chat_rename_session(
 /// first if the row being deleted is the current pane's active chat.
 /// Persisted messages cascade-delete from the FK on agent_chat_messages.
 #[tauri::command]
-pub async fn agent_chat_delete_session(
+pub async fn agent_chat_delete_session<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
@@ -4451,6 +4469,7 @@ pub async fn agent_chat_delete_session(
         ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
+    super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
@@ -4917,6 +4936,31 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // what lets a resuming pane tell "already replayed from the tail"
     // apart from "new".
     let mut persisted_id: Option<i64> = None;
+    if let ProviderRuntimeEvent::QuestionsAsked {
+        thread_id,
+        question,
+    } = &event
+    {
+        let db: State<'_, DatabaseStore> = app.state();
+        match db.record_async_question(&thread_id.0, question) {
+            Ok(Some(id)) => {
+                persisted_id = Some(id);
+                super::async_questions::publish_attention(app);
+            }
+            Ok(None) => return, // Native duplicate/replay, including already answered questions.
+            Err(error) => {
+                forward_event(app, ProviderRuntimeEvent::ItemCompleted {
+                    thread_id: thread_id.clone(), turn_id: TurnId(question.source_turn_id.clone()),
+                    subagent_id: question.subagent_id.clone(),
+                    item: crate::agent_provider::CompletedItem::AssistantText {
+                        text: format!("{}\n\n{}\n\nCould not save this question. Reply in the conversation instead.", question.text, question.questions.iter().map(|q| q.title.as_str()).collect::<Vec<_>>().join("\n")),
+                    },
+                });
+                eprintln!("[codemux] could not persist async question: {error}");
+                return;
+            }
+        }
+    }
 
     // Plan quota is provider-scoped level state, not transcript or
     // history: intercept it, update the in-memory store, and return. Like
@@ -5146,7 +5190,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
 /// Extracted so [`fan_out_user_message`] delivers on exactly the same path
 /// and in the same persist-before-fan-out order as [`forward_event`],
 /// rather than growing a second delivery mechanism next to it.
-fn fan_out_to_thread_channels<R: Runtime>(
+pub(super) fn fan_out_to_thread_channels<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: &ThreadId,
     payload: &AgentChatEventPayload,
@@ -6092,7 +6136,7 @@ fn map_event_to_pane_status(
         // `agent_chat_send_turn` already owns the send's status transition
         // (and it runs on the sending client's command, before any of this),
         // so re-deriving one here would only race it.
-        ProviderRuntimeEvent::UserMessage { .. } => None,
+        ProviderRuntimeEvent::QuestionsAsked { .. } | ProviderRuntimeEvent::QuestionResolved { .. } | ProviderRuntimeEvent::UserMessage { .. } => None,
     }
 }
 
@@ -6691,7 +6735,9 @@ pub fn claude_session_file_missing(session_id: &str) -> bool {
 /// (e.g. global `RuntimeWarning`s).
 pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
     match event {
-        ProviderRuntimeEvent::SessionConfigured { thread_id, .. }
+        ProviderRuntimeEvent::QuestionsAsked { thread_id, .. }
+        | ProviderRuntimeEvent::QuestionResolved { thread_id, .. }
+        | ProviderRuntimeEvent::SessionConfigured { thread_id, .. }
         | ProviderRuntimeEvent::ContentDelta { thread_id, .. }
         | ProviderRuntimeEvent::ItemCompleted { thread_id, .. }
         | ProviderRuntimeEvent::TurnCompleted { thread_id, .. }

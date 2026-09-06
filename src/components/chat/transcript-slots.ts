@@ -96,7 +96,7 @@ function splitTurns(messages: ChatViewItem[]): TurnSegment[] {
   const segments: TurnSegment[] = [];
   let current: TurnSegment | null = null;
   for (const item of messages) {
-    if (item.kind === "user_message") {
+    if (item.kind === "user_message" && !item.inflight) {
       if (current) segments.push(current);
       current = { user: item, items: [item] };
       continue;
@@ -487,6 +487,6 @@ function slotIdentity(body: SlotBody): {
   return {
     key: body.item.id,
     messageId: body.item.id,
-    scrollAnchor: body.item.kind === "user_message",
+    scrollAnchor: body.item.kind === "user_message" && !body.item.inflight,
   };
 }

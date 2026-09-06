@@ -1,3 +1,4 @@
+import { AgentQuestionBadge } from "./agent-question-badge";
 import { memo, useEffect, useState } from "react";
 import {
   AlarmClock,
@@ -572,6 +573,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   />
                 )}
                 <span className="flex-1" />
+                <AgentQuestionBadge workspaceId={workspace.workspace_id} />
                 {/* "Woke": the list keeps a stable order, so a card returning
                     from a snooze slots back where it was and nothing about its
                     position says it moved. This pill is the only signal. Green

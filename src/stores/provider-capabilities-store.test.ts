@@ -93,7 +93,6 @@ function resetStore() {
     grokError: null,
     opencodeError: null,
     loadedProviders: {},
-    loaded: false,
   });
   localStorage.removeItem(PROVIDER_CAPABILITIES_STORAGE_KEY);
   mockList.mockReset();
@@ -213,7 +212,6 @@ describe("provider-capabilities-store", () => {
     useProviderCapabilities.setState({
       claude,
       claudeError: "transient failure",
-      loaded: true,
     });
 
     const persisted = JSON.parse(
@@ -253,7 +251,6 @@ describe("provider-capabilities-store", () => {
     expect(state.claude?.models).toEqual([]);
     expect(selectProviderCapabilitiesLoaded(state, "claude")).toBe(true);
     expect(selectProviderCapabilitiesLoaded(state, "codex")).toBe(false);
-    expect(state.loaded).toBe(false);
   });
 
   it("parallel per-provider refreshes settle every slot and derive loaded", async () => {
@@ -281,8 +278,6 @@ describe("provider-capabilities-store", () => {
       "opencode",
     ]);
     const state = useProviderCapabilities.getState();
-    // `loaded` is derived from loadedProviders once all five settle.
-    expect(state.loaded).toBe(true);
     expect(state.claude).not.toBeNull();
     expect(state.codex).not.toBeNull();
     expect(state.cursor).not.toBeNull();
@@ -308,8 +303,6 @@ describe("provider-capabilities-store", () => {
       store.refresh("opencode"),
     ]);
     const state = useProviderCapabilities.getState();
-    // A failed harvest still counts as settled, so `loaded` derives true.
-    expect(state.loaded).toBe(true);
     expect(state.claude?.models[0]?.id).toBe("model-claude");
     expect(state.codex?.models[0]?.id).toBe("model-codex");
     expect(state.cursor?.models[0]?.id).toBe("model-cursor");
@@ -334,7 +327,6 @@ describe("provider-capabilities-store", () => {
     expect(state.claude).toBeNull();
     expect(state.claudeError).toBeNull();
     expect(state.loadedProviders).toEqual({});
-    expect(state.loaded).toBe(false);
     expect(localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY)).toBeNull();
   });
 
@@ -360,7 +352,6 @@ describe("provider-capabilities-store", () => {
     expect(state.claudeError).toBeNull();
     // The doomed flight must not mark its slot settled either.
     expect(state.loadedProviders).toEqual({});
-    expect(state.loaded).toBe(false);
     expect(localStorage.getItem(PROVIDER_CAPABILITIES_STORAGE_KEY)).toBeNull();
   });
 
@@ -381,7 +372,6 @@ describe("provider-capabilities-store", () => {
     expect(state.claudeError).toBeNull();
     expect(state.claude).toBeNull();
     expect(state.loadedProviders).toEqual({});
-    expect(state.loaded).toBe(false);
   });
 
   it("a refresh started after reset is not deduped against the doomed flight", async () => {

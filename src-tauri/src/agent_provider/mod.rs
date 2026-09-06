@@ -7,6 +7,11 @@
 pub mod acp;
 pub mod claude;
 pub mod codex;
+pub mod questions;
+pub use questions::{
+    AnswerQuestionInput, QuestionDelivery, QuestionDeliveryError, QuestionResolution, UserQuestion,
+    UserQuestionSet,
+};
 pub mod context_usage;
 pub mod cursor;
 pub mod errors;

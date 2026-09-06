@@ -84,6 +84,15 @@ function maybeCapMessages(state: ChatThreadState): ChatThreadState {
   if (state.messages.length <= MAX_MESSAGES_PER_THREAD) return state;
   if (state.streaming) return state;
   if (state.pendingRequestIds.length > 0) return state;
+  if (
+    state.messages.some(
+      (m) =>
+        m.kind === "async_question" &&
+        m.resolution.status !== "answered" &&
+        m.resolution.status !== "dismissed",
+    )
+  )
+    return state;
   const drop = state.messages.length - TRIM_TARGET_MESSAGES;
   return { ...state, messages: state.messages.slice(drop) };
 }
@@ -147,6 +156,13 @@ function findTrailingAssistant(
 ): { index: number; item: AssistantMessageItem } | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
+    // Native async questions and their replies are chronological boundaries.
+    // A later completed message must not overwrite prose before either one.
+    if (
+      item.kind === "async_question" ||
+      (item.kind === "user_message" && item.inflight)
+    )
+      return null;
     if (item.kind !== "assistant_message") continue;
     if (item.turn_id && item.turn_id !== turnId) return null;
     return { index: i, item };
@@ -972,7 +988,7 @@ function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "user_message") {
-      if (!item.queued) return false;
+      if (!item.queued && !item.inflight) return false;
       continue;
     }
     if (item.kind !== "subagent_run") continue;
@@ -994,7 +1010,8 @@ function trailingTurnEndIndex(messages: ChatViewItem[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "subagent_run") continue;
-    if (item.kind === "user_message" && item.queued) continue;
+    if (item.kind === "user_message" && (item.queued || item.inflight))
+      continue;
     return item.kind === "turn_ended" ? i : -1;
   }
   return -1;
@@ -1341,6 +1358,97 @@ function applyEventInner(
     state = { ...state, stalled: null };
   }
   switch (event.type) {
+    case "questions_asked": {
+      if (
+        state.messages.some(
+          (m) =>
+            m.kind === "async_question" && m.question.id === event.question.id,
+        )
+      )
+        return state;
+      const { seq, next } = takeSeq(state);
+      return {
+        ...next,
+        messages: [
+          ...next.messages,
+          {
+            kind: "async_question",
+            id: event.question.id,
+            seq,
+            question: event.question,
+            resolution: { status: "pending" },
+          },
+        ],
+      };
+    }
+    case "question_resolved": {
+      const index = state.messages.findIndex(
+        (m) =>
+          m.kind === "async_question" && m.question.id === event.question_id,
+      );
+      const question = state.messages[index];
+      if (question?.kind !== "async_question") return state;
+      // A late command result cannot overwrite an already accepted answer.
+      if (question.resolution.status === "answered") return state;
+      let next = {
+        ...state,
+        messages: replaceItem(state.messages, index, {
+          ...question,
+          resolution: event.resolution,
+        }),
+      };
+      if (event.resolution.status !== "answered") return next;
+      const resolution = event.resolution;
+      if (hasUserMessageNonce(next, resolution.submission_id)) return next;
+      const text = question.question.questions
+        .map((q, i) => `${q.title}\n${resolution.answers[i] ?? ""}`)
+        .join("\n\n");
+      const inflight = resolution.delivery.kind === "inflight";
+      if (!inflight) {
+        next = appendUserMessageLocal(
+          next,
+          text,
+          now,
+          resolution.submission_id,
+        );
+        // A fast follow-up can finish before its RPC acknowledgement arrives.
+        if (
+          next.messages.some(
+            (m) =>
+              m.kind === "turn_ended" &&
+              m.turn_id === resolution.delivery.turn_id &&
+              !m.interim,
+          )
+        )
+          next = { ...next, turnUnsettled: false };
+        const last = next.messages[next.messages.length - 1];
+        if (last?.kind === "user_message")
+          next.messages = replaceItem(next.messages, next.messages.length - 1, {
+            ...last,
+            in_reply_to: event.question_id,
+            turn_id: resolution.delivery.turn_id,
+          });
+        return next;
+      }
+      const { seq, next: bumped } = takeSeq(next);
+      return {
+        ...bumped,
+        messages: [
+          ...bumped.messages,
+          {
+            kind: "user_message",
+            id: nextId("user"),
+            seq,
+            text,
+            inflight: true,
+            in_reply_to: event.question_id,
+            turn_id: resolution.delivery.turn_id,
+            clientNonce: resolution.submission_id,
+            created_at: now(),
+          },
+        ],
+      };
+    }
     case "run_stalled": {
       const next = { silentForSecs: event.silent_for_secs };
       if (state.stalled && state.stalled.silentForSecs === next.silentForSecs) {

@@ -187,7 +187,7 @@ pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&repo_path);
     }
 
     crate::state::emit_app_state(&app);
@@ -241,7 +241,7 @@ pub fn regenerate_mcp_config(
         .iter()
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd), &workspace_id);
+    crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd));
     Ok(())
 }
 
@@ -312,7 +312,7 @@ pub async fn create_empty_workspace<R: tauri::Runtime>(
         spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
 
         if crate::mcp_server::is_auto_mcp_enabled(&app) {
-            crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+            crate::mcp_server::upsert_mcp_config(&repo_path);
         }
     }
 
@@ -699,7 +699,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf);
     }
 
     // Auto-launch agent preset if requested
@@ -876,7 +876,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
-        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf);
     }
 
     crate::state::emit_app_state(&app);
@@ -986,26 +986,24 @@ fn workspace_owns_mcp_config_dir(
 }
 
 /// Repair or remove a checkout's shared MCP entry against the post-close
-/// snapshot. Iterating from the back retains the historical last-workspace
-/// choice for callers still passing a workspace id, while the generated entry
-/// itself inherits the surviving agent session's id.
+/// snapshot. The generated entry inherits the surviving agent session's id,
+/// so only whether any surviving workspace still owns the checkout matters.
 fn reconcile_mcp_config_after_close(
     snapshot: &AppStateSnapshot,
     config_dir: &Path,
     auto_mcp_enabled: bool,
 ) {
-    if let Some(survivor) = snapshot
+    if snapshot
         .workspaces
         .iter()
-        .rev()
-        .find(|workspace| workspace_owns_mcp_config_dir(workspace, config_dir))
+        .any(|workspace| workspace_owns_mcp_config_dir(workspace, config_dir))
     {
         // Opt-out means "do not create or repair". In particular, closing one
         // of two duplicate-CWD workspaces must not recreate a config the user
         // disabled (or never had). The final owner close below may still
         // remove an old Codemux entry left from before opt-out.
         if auto_mcp_enabled {
-            crate::mcp_server::upsert_mcp_config(config_dir, &survivor.workspace_id.0);
+            crate::mcp_server::upsert_mcp_config(config_dir);
         }
     } else {
         crate::mcp_server::remove_mcp_config(config_dir);
@@ -2927,7 +2925,7 @@ mod empty_workspace_skip_setup_tests {
         let tmp = TempDir::new().unwrap();
         let mcp_path = tmp.path().join(".mcp.json");
         assert!(!mcp_path.exists(), "pre-condition: no .mcp.json yet");
-        crate::mcp_server::upsert_mcp_config(tmp.path(), "ws-baseline");
+        crate::mcp_server::upsert_mcp_config(tmp.path());
         assert!(
             mcp_path.exists(),
             "upsert_mcp_config must create .mcp.json — the skip-setup test \
@@ -3105,7 +3103,7 @@ mod phase_1_6_close_tests {
         store.clear_workspaces();
         let first = store.create_workspace_at_path(checkout.path().to_path_buf());
         let second = store.create_workspace_at_path(checkout.path().to_path_buf());
-        crate::mcp_server::upsert_mcp_config(checkout.path(), &first.0);
+        crate::mcp_server::upsert_mcp_config(checkout.path());
         let original = std::fs::read(&config_path).expect("created config");
 
         store.close_workspace(&first.0).expect("close first duplicate");

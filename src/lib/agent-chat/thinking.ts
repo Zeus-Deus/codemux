@@ -50,9 +50,8 @@ export function shouldShowThinkingIndicator(
       // The workflow card shows its own spinner/progress bar while the
       // run is live (and the approval card while pending), so the tail
       // pulse steps back until the run reaches a terminal state.
-      return (
-        last.status !== "running" && last.status !== "pending_approval"
-      );
+      return last.status !== "running" && last.status !== "pending_approval";
+    case "async_question":
     case "user_message":
     case "turn_ended":
     case "runtime_notice":

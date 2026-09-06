@@ -69,7 +69,6 @@ interface AuthStore {
   isLoading: boolean;
   isSigningIn: boolean;
   error: string | null;
-  devBypass: boolean;
   sessionStatus: AuthSessionStatus;
 
   // Skills sync. Stored server-side (no client-held key), so
@@ -103,7 +102,6 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   isLoading: true,
   isSigningIn: false,
   error: null,
-  devBypass: false,
   sessionStatus: "signed-out",
   syncAvailable: false,
   authMethod: null,
@@ -121,7 +119,6 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         syncAvailable: session.authenticated,
         authMethod: session.authMethod,
         sessionStatus: session.status,
-        devBypass: false,
       });
     } catch (error) {
       resetProviderScopedStateOnIdentityChange(get().user, null);
@@ -168,7 +165,6 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           syncAvailable: session.authenticated,
           authMethod: session.authMethod,
           sessionStatus: session.status,
-          devBypass: false,
         });
       } catch (error) {
         if (flightEpoch !== sessionEpoch) return;
@@ -275,7 +271,6 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       user: null,
       isAuthenticated: false,
       isSigningIn: false,
-      devBypass: false,
       syncAvailable: false,
       authMethod: null,
       sessionStatus: "signed-out",
