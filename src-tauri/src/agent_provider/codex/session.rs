@@ -863,12 +863,7 @@ impl CodexSession {
             None,
         )
         .await
-        .map_err(|error| ProviderError::RpcError {
-            message: match error {
-                crate::agent_provider::QuestionDeliveryError::Rejected(m)
-                | crate::agent_provider::QuestionDeliveryError::Unknown(m) => m,
-            },
-        })
+        .map_err(plain_send_error)
     }
 
     async fn do_send_with_id(
@@ -879,7 +874,7 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
         client_id: Option<String>,
-    ) -> Result<TurnId, crate::agent_provider::QuestionDeliveryError> {
+    ) -> Result<TurnId, TurnStartError> {
         let (codex_thread_id, model_default, effort_default, fast_mode) = {
             let state = self.state.lock().await;
             (
@@ -957,12 +952,9 @@ impl CodexSession {
             .child
             .request("turn/start", params_value)
             .await
-            .map_err(question_rpc_error)?;
-        let parsed: TurnStartResponse = serde_json::from_value(resp).map_err(|e| {
-            crate::agent_provider::QuestionDeliveryError::Unknown(format!(
-                "Malformed turn/start response: {e}"
-            ))
-        })?;
+            .map_err(TurnStartError::Rpc)?;
+        let parsed: TurnStartResponse =
+            serde_json::from_value(resp).map_err(TurnStartError::Malformed)?;
         let turn_id = TurnId(parsed.turn.id);
         {
             let mut state = self.state.lock().await;
@@ -1094,7 +1086,7 @@ impl CodexSession {
                         if let Some(checkpoint) = &input.checkpoint {
                             checkpoint.abort().await;
                         }
-                        return Err(error);
+                        return Err(question_turn_start_error(error));
                     }
                 }
             }
@@ -1943,6 +1935,89 @@ mod tests {
             .unwrap()
             .contains("registry is unavailable"));
     }
+
+    fn rpc_failure(code: i64) -> TurnStartError {
+        TurnStartError::Rpc(crate::json_rpc_child::RpcChildError::RpcError(
+            crate::json_rpc_child::RpcError {
+                code,
+                message: "thread not found".into(),
+                data: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn plain_send_failure_keeps_turn_start_wording() {
+        // An ordinary user send must not borrow the answer-delivery
+        // wording; the toast keeps naming the RPC that failed.
+        for code in [-32000, -32603, -32600] {
+            let ProviderError::RpcError { message } = plain_send_error(rpc_failure(code)) else {
+                panic!("expected an rpc error");
+            };
+            assert!(message.starts_with("turn/start failed: "), "{message}");
+            assert!(!message.contains("Answer delivery"), "{message}");
+        }
+        let malformed = serde_json::from_value::<TurnStartResponse>(json!({})).unwrap_err();
+        let ProviderError::RpcError { message } =
+            plain_send_error(TurnStartError::Malformed(malformed))
+        else {
+            panic!("expected an rpc error");
+        };
+        assert!(
+            message.starts_with("malformed turn/start response: "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn question_turn_start_failure_distinguishes_unknown_from_rejected() {
+        use crate::agent_provider::QuestionDeliveryError as Error;
+        assert!(matches!(
+            question_turn_start_error(rpc_failure(-32000)),
+            Error::Unknown(m) if m.starts_with("Answer delivery could not be confirmed: ")
+        ));
+        assert!(matches!(
+            question_turn_start_error(rpc_failure(-32600)),
+            Error::Rejected(_)
+        ));
+        let malformed = serde_json::from_value::<TurnStartResponse>(json!({})).unwrap_err();
+        assert!(matches!(
+            question_turn_start_error(TurnStartError::Malformed(malformed)),
+            Error::Unknown(m) if m.starts_with("Malformed turn/start response: ")
+        ));
+    }
+}
+
+/// Why `turn/start` produced no turn id. Kept raw so each caller words
+/// the failure for its own surface: a plain user send reports a generic
+/// RPC failure, while answer delivery must tell a confirmed rejection
+/// apart from one whose outcome is unknown.
+#[derive(Debug)]
+enum TurnStartError {
+    Rpc(crate::json_rpc_child::RpcChildError),
+    Malformed(serde_json::Error),
+}
+
+/// Wording for an ordinary user send that failed at `turn/start`.
+fn plain_send_error(error: TurnStartError) -> ProviderError {
+    ProviderError::RpcError {
+        message: match error {
+            TurnStartError::Rpc(e) => format!("turn/start failed: {e}"),
+            TurnStartError::Malformed(e) => format!("malformed turn/start response: {e}"),
+        },
+    }
+}
+
+/// Wording for a question answer that failed at `turn/start`.
+fn question_turn_start_error(
+    error: TurnStartError,
+) -> crate::agent_provider::QuestionDeliveryError {
+    match error {
+        TurnStartError::Rpc(e) => question_rpc_error(e),
+        TurnStartError::Malformed(e) => crate::agent_provider::QuestionDeliveryError::Unknown(
+            format!("Malformed turn/start response: {e}"),
+        ),
+    }
 }
 
 fn question_rpc_error(
@@ -1977,7 +2052,9 @@ fn find_answer_in_history(
 ) -> Option<crate::agent_provider::QuestionDelivery> {
     use crate::agent_provider::QuestionDelivery;
     for turn in thread.get("turns")?.as_array()? {
-        let items = turn.get("items")?.as_array()?;
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
         for (index, item) in items
             .iter()
             .filter(|item| item["type"] == "userMessage")

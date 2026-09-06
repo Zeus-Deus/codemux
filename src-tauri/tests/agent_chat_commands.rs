@@ -1985,7 +1985,7 @@ async fn async_question_command_claims_once_and_keeps_other_providers_disabled()
     use codemux_lib::agent_provider::{
         AgentProvider, QuestionResolution, UserQuestion, UserQuestionSet,
     };
-    use codemux_lib::commands::agent_chat::async_questions::{
+    use codemux_lib::commands::async_questions::{
         agent_chat_answer_question, QuestionAction,
     };
     for kind in [ProviderKind::Codex, ProviderKind::Claude] {

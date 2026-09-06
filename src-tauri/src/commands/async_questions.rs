@@ -1,6 +1,19 @@
 //! Commands for conversation-owned questions. Approval callbacks are unchanged.
-use super::*;
-use crate::agent_provider::{AnswerQuestionInput, QuestionDeliveryError, QuestionResolution};
+use std::sync::Arc;
+
+use serde::Deserialize;
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+
+use super::agent_chat::{
+    ensure_live_session_mode, fan_out_to_thread_channels, feature_flag_on, lookup_provider,
+    run_checkpoints_enabled, AgentChatEventPayload, GitTurnDispatchCheckpoint, ProviderRegistry,
+};
+use crate::agent_provider::{
+    AnswerQuestionInput, ProviderKind, ProviderRuntimeEvent, QuestionDeliveryError,
+    QuestionResolution, ThreadId, TurnDispatchCheckpoint,
+};
+use crate::database::DatabaseStore;
+use crate::observability::ObservabilityStore;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]

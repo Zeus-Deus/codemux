@@ -13,9 +13,6 @@
 //! any session is bound to it. Provider-session commands and the
 //! event bridge land in follow-up commits.
 
-#[path = "async_questions.rs"]
-pub mod async_questions;
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -406,7 +403,7 @@ fn provider_err(err: ProviderError) -> String {
     serde_json::to_string(&ser).unwrap_or_else(|_| "provider_error".to_string())
 }
 
-async fn lookup_provider(
+pub(super) async fn lookup_provider(
     registry: &ProviderRegistry,
     kind: ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>, String> {
@@ -1150,7 +1147,7 @@ struct PreparedTurnCheckpoint {
     _timeline_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
-struct GitTurnDispatchCheckpoint<R: Runtime> {
+pub(super) struct GitTurnDispatchCheckpoint<R: Runtime> {
     app: AppHandle<R>,
     thread_id: String,
     workspace_id: String,
@@ -1170,7 +1167,7 @@ impl<R: Runtime> std::fmt::Debug for GitTurnDispatchCheckpoint<R> {
 }
 
 impl<R: Runtime> GitTurnDispatchCheckpoint<R> {
-    fn new(
+    pub(super) fn new(
         app: AppHandle<R>,
         thread_id: String,
         workspace_id: String,
@@ -1619,7 +1616,7 @@ pub async fn agent_chat_revert_turn_checkpoint<R: Runtime>(
         transcript_cutoff_id: target.transcript_cutoff_id,
         remaining_checkpoints: remaining_checkpoints.clone(),
     };
-    async_questions::publish_attention(&app);
+    super::async_questions::publish_attention(&app);
     if let Err(error) = app.emit(AGENT_CHAT_TURN_CHECKPOINT_REVERTED_EVENT, &payload) {
         eprintln!("[codemux::agent_chat] failed to emit turn revert: {error}");
     }
@@ -1799,7 +1796,7 @@ pub async fn ensure_live_session<R: Runtime>(
     ensure_live_session_mode(app, provider_kind, thread_id, false).await
 }
 
-async fn ensure_live_session_mode<R: Runtime>(
+pub(super) async fn ensure_live_session_mode<R: Runtime>(
     app: &AppHandle<R>,
     provider_kind: ProviderKind,
     thread_id: &ThreadId,
@@ -4472,7 +4469,7 @@ pub async fn agent_chat_delete_session<R: Runtime>(
         ]
     }));
     db.delete_agent_chat_session(&thread_id)?;
-    async_questions::publish_attention(&app);
+    super::async_questions::publish_attention(&app);
     // The thread is gone; its dispatch lock can never be contended again.
     forget_turn_checkpoint_lock(&thread_id);
     for (repo_path, ref_name) in checkpoint_refs {
@@ -4948,7 +4945,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         match db.record_async_question(&thread_id.0, question) {
             Ok(Some(id)) => {
                 persisted_id = Some(id);
-                async_questions::publish_attention(app);
+                super::async_questions::publish_attention(app);
             }
             Ok(None) => return, // Native duplicate/replay, including already answered questions.
             Err(error) => {
@@ -5193,7 +5190,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
 /// Extracted so [`fan_out_user_message`] delivers on exactly the same path
 /// and in the same persist-before-fan-out order as [`forward_event`],
 /// rather than growing a second delivery mechanism next to it.
-fn fan_out_to_thread_channels<R: Runtime>(
+pub(super) fn fan_out_to_thread_channels<R: Runtime>(
     app: &AppHandle<R>,
     thread_id: &ThreadId,
     payload: &AgentChatEventPayload,

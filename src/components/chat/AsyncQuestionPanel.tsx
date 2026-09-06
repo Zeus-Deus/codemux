@@ -67,7 +67,7 @@ export function AsyncQuestionPanel({
         }
         if (resolution.status === "failed") throw new Error(resolution.message);
       } catch (cause) {
-        setError(String(cause));
+        setError(cause instanceof Error ? cause.message : String(cause));
         throw cause;
       }
     },
