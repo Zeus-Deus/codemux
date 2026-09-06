@@ -142,11 +142,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Linux normally finishes well below 15 min, while the larger Windows test
-    # build is the critical path and can approach 30 min on a poor cache. Keep
-    # a tight ceiling so a hung test cannot pin a runner for GitHub's six-hour
-    # default (see PR #28's post-merge CI).
-    timeout-minutes: 30
+    # A cold Windows run can spend nearly 30 min building and testing, before
+    # the post-job Rust cache save starts. Leave room for that cleanup so a
+    # passing test run is not cancelled while saving its cache. Test execution
+    # has its own tighter limit below; Linux keeps the existing job ceiling.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
 
     steps:
       - name: Checkout
@@ -385,4 +385,5 @@ jobs:
 
       - name: Cargo test (Windows)
         if: matrix.os == 'windows-latest'
+        timeout-minutes: 15
         run: cargo test --manifest-path src-tauri/Cargo.toml

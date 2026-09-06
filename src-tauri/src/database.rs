@@ -1,10 +1,12 @@
+pub mod async_questions;
+
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -442,6 +444,9 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             tokenize = 'unicode61 remove_diacritics 2'
         );
 
+        -- Reinstall derived-index triggers so existing databases get new event types.
+        DROP TRIGGER IF EXISTS agent_chat_search_after_insert;
+        DROP TRIGGER IF EXISTS agent_chat_search_after_update;
         CREATE TRIGGER IF NOT EXISTS agent_chat_search_after_insert
         AFTER INSERT ON agent_chat_messages
         BEGIN
@@ -451,22 +456,33 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
                 CASE
                     WHEN json_extract(NEW.payload, '$.type') = 'user_message'
                         THEN json_extract(NEW.payload, '$.text')
+                    WHEN json_extract(NEW.payload, '$.type') = 'questions_asked'
+                        THEN COALESCE(json_extract(NEW.payload, '$.question.text'), '') || char(10) ||
+                            (SELECT group_concat(json_extract(value, '$.title'), char(10)) FROM json_each(NEW.payload, '$.question.questions'))
+                    WHEN json_extract(NEW.payload, '$.type') = 'question_resolved'
+                        THEN (SELECT group_concat(value, char(10)) FROM json_each(NEW.payload, '$.resolution.answers'))
                     ELSE json_extract(NEW.payload, '$.item.text')
                 END,
                 NEW.thread_id,
                 CASE
-                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                    WHEN json_extract(NEW.payload, '$.type') IN ('user_message', 'question_resolved')
                         THEN 'user'
                     ELSE 'assistant'
                 END,
                 CASE
                     WHEN json_extract(NEW.payload, '$.type') = 'item_completed'
                         THEN json_extract(NEW.payload, '$.turn_id')
+                    WHEN json_extract(NEW.payload, '$.type') = 'questions_asked'
+                        THEN json_extract(NEW.payload, '$.question.source_turn_id')
+                    WHEN json_extract(NEW.payload, '$.type') = 'question_resolved'
+                        THEN json_extract(NEW.payload, '$.resolution.delivery.turn_id')
                     ELSE NULL
                 END
             WHERE json_valid(NEW.payload)
               AND (
-                    (
+                    (json_extract(NEW.payload, '$.type') = 'questions_asked' AND json_extract(NEW.payload, '$.question.subagent_id') IS NULL)
+                    OR (json_extract(NEW.payload, '$.type') = 'question_resolved' AND json_extract(NEW.payload, '$.resolution.status') = 'answered')
+                    OR (
                         json_extract(NEW.payload, '$.type') = 'user_message'
                         AND length(trim(COALESCE(json_extract(NEW.payload, '$.text'), ''))) > 0
                     )
@@ -498,22 +514,33 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
                 CASE
                     WHEN json_extract(NEW.payload, '$.type') = 'user_message'
                         THEN json_extract(NEW.payload, '$.text')
+                    WHEN json_extract(NEW.payload, '$.type') = 'questions_asked'
+                        THEN COALESCE(json_extract(NEW.payload, '$.question.text'), '') || char(10) ||
+                            (SELECT group_concat(json_extract(value, '$.title'), char(10)) FROM json_each(NEW.payload, '$.question.questions'))
+                    WHEN json_extract(NEW.payload, '$.type') = 'question_resolved'
+                        THEN (SELECT group_concat(value, char(10)) FROM json_each(NEW.payload, '$.resolution.answers'))
                     ELSE json_extract(NEW.payload, '$.item.text')
                 END,
                 NEW.thread_id,
                 CASE
-                    WHEN json_extract(NEW.payload, '$.type') = 'user_message'
+                    WHEN json_extract(NEW.payload, '$.type') IN ('user_message', 'question_resolved')
                         THEN 'user'
                     ELSE 'assistant'
                 END,
                 CASE
                     WHEN json_extract(NEW.payload, '$.type') = 'item_completed'
                         THEN json_extract(NEW.payload, '$.turn_id')
+                    WHEN json_extract(NEW.payload, '$.type') = 'questions_asked'
+                        THEN json_extract(NEW.payload, '$.question.source_turn_id')
+                    WHEN json_extract(NEW.payload, '$.type') = 'question_resolved'
+                        THEN json_extract(NEW.payload, '$.resolution.delivery.turn_id')
                     ELSE NULL
                 END
             WHERE json_valid(NEW.payload)
               AND (
-                    (
+                    (json_extract(NEW.payload, '$.type') = 'questions_asked' AND json_extract(NEW.payload, '$.question.subagent_id') IS NULL)
+                    OR (json_extract(NEW.payload, '$.type') = 'question_resolved' AND json_extract(NEW.payload, '$.resolution.status') = 'answered')
+                    OR (
                         json_extract(NEW.payload, '$.type') = 'user_message'
                         AND length(trim(COALESCE(json_extract(NEW.payload, '$.text'), ''))) > 0
                     )
@@ -1016,6 +1043,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| format!("Failed to backfill agent chat search index: {e}"))?;
     }
+
+    async_questions::create_schema(conn)?;
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new

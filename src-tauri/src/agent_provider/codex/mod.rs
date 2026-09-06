@@ -236,6 +236,45 @@ impl AgentProvider for CodexAgentProvider {
         })
     }
 
+    fn supports_async_questions(&self) -> bool {
+        true
+    }
+
+    async fn answer_question(
+        &self,
+        input: crate::agent_provider::AnswerQuestionInput,
+    ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
+    {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&input.thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::agent_provider::QuestionDeliveryError::Rejected(
+                    "The Codex session is not available.".into(),
+                )
+            })?;
+        session.answer_question(input).await
+    }
+
+    async fn find_question_answer(
+        &self,
+        thread_id: ThreadId,
+        target: String,
+        submission_id: String,
+    ) -> Result<Option<crate::agent_provider::QuestionDelivery>, String> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or("The Codex session is not available.")?;
+        session.find_question_answer(&target, &submission_id).await
+    }
+
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
         let session = {
             let sessions = self.sessions.read().await;

@@ -1104,6 +1104,69 @@ const MOCK_SKILL_INVENTORY = {
 // `window.__codemuxChatMock.streamReply()` triggers one on demand for
 // scroll/perf testing.
 
+// Synthetic native Codex question fixture: opt in with ?asyncq=1.
+const asyncQuestionSeedEnabled = () =>
+  new URLSearchParams(location.search).get("asyncq") === "1";
+const MOCK_ASYNC_QUESTION = {
+  id: "codex:sample:storage",
+  target: "sample",
+  source_item_id: "storage",
+  source_turn_id: "sample-turn",
+  text: "I can build the interface while you choose the storage.",
+  questions: [
+    {
+      title: "Which storage should the sample use?",
+      options: ["SQLite", "PostgreSQL"],
+    },
+  ],
+};
+let asyncQuestionSeeded = false;
+let asyncQuestionResolution: import("@/tauri/events").QuestionResolution = {
+  status: "pending",
+};
+let asyncQuestionRevision = 0;
+function mockQuestionAttention() {
+  return {
+    revision: asyncQuestionRevision,
+    workspaces:
+      asyncQuestionSeedEnabled() &&
+      !["answered", "dismissed"].includes(asyncQuestionResolution.status)
+        ? { "ws-codemux-chat": 1 }
+        : {},
+  };
+}
+function seedAsyncQuestion(threadId: string) {
+  if (
+    !asyncQuestionSeedEnabled() ||
+    asyncQuestionSeeded ||
+    threadId !== MOCK_CHAT_THREAD_ID
+  )
+    return;
+  asyncQuestionSeeded = true;
+  setTimeout(() => {
+    emitChatEvent(threadId, {
+      type: "session_state_changed",
+      thread_id: threadId,
+      status: { status: "running", active_turn: "sample-turn" },
+    });
+    emitChatEvent(threadId, {
+      type: "questions_asked",
+      thread_id: threadId,
+      question: MOCK_ASYNC_QUESTION,
+    });
+    emitChatEvent(threadId, {
+      type: "content_delta",
+      thread_id: threadId,
+      turn_id: "sample-turn",
+      delta: {
+        kind: "text",
+        text: "I’m building the settings interface while you choose the storage.",
+      },
+    });
+    emitEvent("agent-chat-question-attention", mockQuestionAttention());
+  }, 600);
+}
+
 // ── Pending AskUserQuestion seed (`?askq=1`) ────────────────────────
 //
 // The seeded transcript carries a RESOLVED `user-input` request so the
@@ -3752,6 +3815,48 @@ const handlers: Record<string, Handler> = {
   // request and echoes `request_resolved` back over the thread channel.
   // Mirror that so the `?askq=1` seed actually settles (panel dismounts,
   // the answer lands as a reply bubble) instead of hanging pending.
+  agent_chat_question_attention: () => mockQuestionAttention(),
+  agent_chat_answer_question: (a) => {
+    const action = a.action as import("@/tauri/commands").QuestionAction;
+    if (action.action === "answer") {
+      asyncQuestionResolution = {
+        status: "answered",
+        submission_id: action.submission_id,
+        answers: action.answers,
+        delivery: { kind: "inflight", turn_id: "sample-turn" },
+      };
+      setTimeout(() => {
+        emitChatEvent(a.threadId as string, {
+          type: "item_completed",
+          thread_id: a.threadId,
+          turn_id: "sample-turn",
+          item: {
+            kind: "assistant_text",
+            text: `The interface is ready. I’ll use ${action.answers[0]} for storage.`,
+          },
+        });
+        emitChatEvent(a.threadId as string, {
+          type: "turn_completed",
+          thread_id: a.threadId,
+          turn_id: "sample-turn",
+          status: { kind: "success" },
+          usage: null,
+        });
+      }, 900);
+    } else if (action.action === "dismiss")
+      asyncQuestionResolution = { status: "dismissed" };
+    else if (action.action === "reopen")
+      asyncQuestionResolution = { status: "pending" };
+    asyncQuestionRevision++;
+    emitChatEvent(a.threadId as string, {
+      type: "question_resolved",
+      thread_id: a.threadId,
+      question_id: a.questionId,
+      resolution: asyncQuestionResolution,
+    });
+    emitEvent("agent-chat-question-attention", mockQuestionAttention());
+    return asyncQuestionResolution;
+  },
   agent_chat_respond_to_request: (a) => {
     const { threadId, requestId, decision } = a as {
       threadId: string;
@@ -3820,6 +3925,7 @@ const handlers: Record<string, Handler> = {
       nextIndex: 0,
     });
     seedPendingAskQuestion(threadId);
+    seedAsyncQuestion(threadId);
     return generation;
   },
   detach_agent_chat_output: (a) => {

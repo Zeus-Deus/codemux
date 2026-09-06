@@ -246,10 +246,27 @@ export function stampSearchSourceId<T extends ChatThreadState>(
       }
     }
   }
+  if (event.type === "questions_asked") {
+    targetIndex = next.messages.findIndex(
+      (item) =>
+        item.kind === "async_question" &&
+        item.question.id === event.question.id,
+    );
+  } else if (
+    event.type === "question_resolved" &&
+    event.resolution.status === "answered"
+  ) {
+    const nonce = event.resolution.submission_id;
+    targetIndex = next.messages.findIndex(
+      (item) => item.kind === "user_message" && item.clientNonce === nonce,
+    );
+  }
   if (targetIndex < 0) return next;
   const target = next.messages[targetIndex];
   if (
-    (target.kind !== "user_message" && target.kind !== "assistant_message") ||
+    (target.kind !== "user_message" &&
+      target.kind !== "assistant_message" &&
+      target.kind !== "async_question") ||
     target.source_event_id === persistedId
   ) {
     return next;
@@ -411,7 +428,17 @@ export function lastTurnUnsettled(
   previous = false,
 ): boolean {
   let unsettled = previous;
+  const completed = new Set(
+    parsed.filter((r) => r.type === "turn_completed").map((r) => r.turn_id),
+  );
   for (const row of parsed) {
+    if (
+      row.type === "question_resolved" &&
+      row.resolution.status === "answered" &&
+      row.resolution.delivery.kind === "new_turn" &&
+      !completed.has(row.resolution.delivery.turn_id)
+    )
+      unsettled = true;
     if (row.type === "user_message") unsettled = true;
     else if (row.type === "turn_completed") unsettled = false;
   }

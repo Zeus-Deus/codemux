@@ -694,7 +694,7 @@ export function subagentWaves(messages: ChatViewItem[]): SubagentWave[] {
   ordered.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   for (const item of ordered) {
     if (item.kind === "user_message") {
-      if (item.queued) continue;
+      if (item.queued || item.inflight) continue;
       const line = firstLine(item.text);
       prompt = line.length > 0 ? line : null;
       promptId = prompt == null ? null : item.id;

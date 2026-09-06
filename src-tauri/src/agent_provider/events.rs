@@ -482,6 +482,15 @@ pub struct PlanUsageWindow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderRuntimeEvent {
+    QuestionsAsked {
+        thread_id: ThreadId,
+        question: super::UserQuestionSet,
+    },
+    QuestionResolved {
+        thread_id: ThreadId,
+        question_id: String,
+        resolution: super::QuestionResolution,
+    },
     /// The provider has fully configured the session and assigned its own
     /// internal identifier.
     SessionConfigured {

@@ -39,6 +39,25 @@ function tool(seq: number): ToolCallItem {
 }
 
 describe("buildTrailEntries", () => {
+  it("keeps in-flight question answers inside their existing turn", () => {
+    const slots = buildTranscriptSlots([
+      userMsg(0, "Build the sample"),
+      {
+        kind: "user_message",
+        id: "reply",
+        seq: 1,
+        text: "SQLite",
+        inflight: true,
+      },
+      assistantMsg(2, "Using SQLite"),
+    ]);
+    const entries = buildTrailEntries(slots);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].replySnippet).toBe("Using SQLite");
+    expect(slots.find((slot) => slot.messageId === "reply")?.scrollAnchor).toBe(
+      false,
+    );
+  });
   it("returns no entries when there are no user turns", () => {
     const slots = buildTranscriptSlots([assistantMsg(0), tool(1)]);
     expect(buildTrailEntries(slots)).toEqual([]);
