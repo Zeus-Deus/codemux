@@ -10,12 +10,16 @@ import type {
 
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 import {
+  appendTranscriptItem,
+  hasRunningSubagents,
   interruptRunningSubagents,
   isMonitorTask,
   isRunning,
   mergeSnapshot,
   newSubagentView,
+  replaceTranscriptItem,
   settleSubagentsForToolResult,
+  transcriptIndex,
 } from "./subagents";
 import {
   emptyThreadState,
@@ -127,14 +131,23 @@ function takeSeq(state: ChatThreadState): { seq: number; next: ChatThreadState }
   return { seq: state.nextSeq, next: { ...state, nextSeq: state.nextSeq + 1 } };
 }
 
+/** Copy-on-write single-row replace. Routed through the transcript index
+ *  primitive so the O(1) "does any row match?" lookups (`findToolCallByUseId`
+ *  on a fresh tool_use, subagent settlement on a tool_result, workflow
+ *  lookups on a thread with none) stay exact across every edit. */
 function replaceItem(
   messages: ChatViewItem[],
   index: number,
   next: ChatViewItem,
 ): ChatViewItem[] {
-  const copy = messages.slice();
-  copy[index] = next;
-  return copy;
+  return replaceTranscriptItem(messages, index, next);
+}
+
+/** Copy-on-write append — the index-carrying twin of `replaceItem`. Every
+ *  append in this module goes through here (never a bare spread) so the
+ *  index rides along the whole replay instead of being rebuilt. */
+function appendItem(messages: ChatViewItem[], item: ChatViewItem): ChatViewItem[] {
+  return appendTranscriptItem(messages, item);
 }
 
 function findTrailingAssistant(
@@ -161,6 +174,11 @@ function findToolCallByUseId(
   messages: ChatViewItem[],
   toolUseId: string,
 ): { index: number; item: ToolCallItem } | null {
+  // A tool_use that has never been seen (the ordinary case for every new
+  // call) used to walk the entire transcript to learn that. The index
+  // says so in O(1); a hit still scans from the tail, where the match
+  // almost always is (its tool_result lands a few rows later).
+  if (!transcriptIndex(messages).toolUseIds.has(toolUseId)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "tool_call" && item.tool_use_id === toolUseId) {
@@ -297,7 +315,7 @@ function appendThinkingDelta(
     streaming: true,
     started_at: now(),
   };
-  return { messages: [...c2.messages, newReasoning], nextSeq: c2.nextSeq };
+  return { messages: appendItem(c2.messages, newReasoning), nextSeq: c2.nextSeq };
 }
 
 /** Append a text delta: seal any trailing reasoning, then tail-merge into
@@ -351,7 +369,7 @@ function appendTextDelta(
     streaming: true,
     created_at: now(),
   };
-  return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
+  return { messages: appendItem(c2.messages, newAssistant), nextSeq: c2.nextSeq };
 }
 
 /** Apply a `content_delta` (text / thinking; tool_input is a no-op) to a
@@ -415,7 +433,7 @@ function applyCompletedItemToList(
         streaming: false,
         created_at: now(),
       };
-      return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
+      return { messages: appendItem(c2.messages, newAssistant), nextSeq: c2.nextSeq };
     }
     case "assistant_thinking": {
       const found = findTrailingReasoning(ctx.messages, turnId);
@@ -444,7 +462,7 @@ function applyCompletedItemToList(
         text: item.text,
         streaming: false,
       };
-      return { messages: [...c2.messages, newReasoning], nextSeq: c2.nextSeq };
+      return { messages: appendItem(c2.messages, newReasoning), nextSeq: c2.nextSeq };
     }
     case "tool_use": {
       const messages = sealTrailingReasoningList(ctx.messages, now);
@@ -469,11 +487,16 @@ function applyCompletedItemToList(
         };
       }
       const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
-      const priorRequest = c2.messages.find(
-        (m): m is PermissionRequestItem =>
-          m.kind === "permission_request" &&
-          m.tool_use_id === item.tool_use_id,
-      );
+      // Only worth a scan when an approval row exists at all — on a thread
+      // that auto-approves everything this was a full walk per tool call.
+      const priorRequest =
+        transcriptIndex(c2.messages).permissionRequestCount > 0
+          ? c2.messages.find(
+              (m): m is PermissionRequestItem =>
+                m.kind === "permission_request" &&
+                m.tool_use_id === item.tool_use_id,
+            )
+          : undefined;
       const newToolCall: ToolCallItem = {
         kind: "tool_call",
         id: nextId("tool"),
@@ -487,7 +510,7 @@ function applyCompletedItemToList(
         approval_request_id: priorRequest?.request_id ?? null,
         started_at: now(),
       };
-      return { messages: [...c2.messages, newToolCall], nextSeq: c2.nextSeq };
+      return { messages: appendItem(c2.messages, newToolCall), nextSeq: c2.nextSeq };
     }
     case "tool_result": {
       const messages = sealTrailingReasoningList(ctx.messages, now);
@@ -504,12 +527,15 @@ function applyCompletedItemToList(
           nextSeq: ctx.nextSeq,
         };
       }
-      const specializedPending = messages.find(
-        (m): m is PermissionRequestItem =>
-          m.kind === "permission_request" &&
-          m.tool_use_id === item.tool_use_id &&
-          SPECIALIZED_REQUEST_KINDS.has(m.request_kind),
-      );
+      const specializedPending =
+        transcriptIndex(messages).permissionRequestCount > 0
+          ? messages.find(
+              (m): m is PermissionRequestItem =>
+                m.kind === "permission_request" &&
+                m.tool_use_id === item.tool_use_id &&
+                SPECIALIZED_REQUEST_KINDS.has(m.request_kind),
+            )
+          : undefined;
       if (specializedPending) {
         return { messages, nextSeq: ctx.nextSeq };
       }
@@ -527,7 +553,7 @@ function applyCompletedItemToList(
         approval_request_id: null,
         completed_at: now(),
       };
-      return { messages: [...c2.messages, placeholder], nextSeq: c2.nextSeq };
+      return { messages: appendItem(c2.messages, placeholder), nextSeq: c2.nextSeq };
     }
     default: {
       warnOnce(
@@ -606,7 +632,7 @@ function locateOrCreateSubagent(
     subagents: [view],
   };
   return {
-    messages: [...sealed, newCard],
+    messages: appendItem(sealed, newCard),
     nextSeq: state.nextSeq + 1,
     cardIndex: sealed.length,
     subIndex: 0,
@@ -639,10 +665,18 @@ function replaceSubagent(
 // behavior — it never reaches this code path.
 // ---------------------------------------------------------------------------
 
+/** Whether the transcript holds any `workflow_run` row at all. Most
+ *  threads never launch a workflow, yet every parent tool_result and every
+ *  approval used to walk the whole transcript to discover that. */
+function hasWorkflows(messages: ChatViewItem[]): boolean {
+  return transcriptIndex(messages).workflowCount > 0;
+}
+
 function findWorkflow(
   messages: ChatViewItem[],
   workflowId: string,
 ): { index: number; item: WorkflowRunItem } | null {
+  if (!hasWorkflows(messages)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "workflow_run" && item.workflowId === workflowId) {
@@ -656,6 +690,7 @@ function findWorkflowByApprovalRequestId(
   messages: ChatViewItem[],
   requestId: string,
 ): { index: number; item: WorkflowRunItem } | null {
+  if (!hasWorkflows(messages)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "workflow_run" && item.approvalRequestId === requestId) {
@@ -672,6 +707,7 @@ function findSubagentInWorkflows(
   messages: ChatViewItem[],
   subagentId: string,
 ): { itemIndex: number; phaseIndex: number; subIndex: number } | null {
+  if (!hasWorkflows(messages)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind !== "workflow_run") continue;
@@ -761,14 +797,18 @@ function applyWorkflowSubagentUpdated(
  *  can cheaply detect a no-op (issue #153: the session-close settle path
  *  keys off reference identity to avoid a needless state churn). */
 function stopRunningWorkflows(messages: ChatViewItem[]): ChatViewItem[] {
-  let changed = false;
-  const next: ChatViewItem[] = messages.map((m) => {
-    if (m.kind !== "workflow_run") return m;
-    if (m.status !== "running" && m.status !== "pending_approval") return m;
-    changed = true;
-    return { ...m, status: "stopped" };
-  });
-  return changed ? next : messages;
+  // Runs on every user turn (live and replayed) — an O(1) exit for the
+  // workflow-free thread keeps a long replay from mapping the transcript
+  // once per turn.
+  if (!hasWorkflows(messages)) return messages;
+  let next = messages;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.kind !== "workflow_run") continue;
+    if (m.status !== "running" && m.status !== "pending_approval") continue;
+    next = replaceItem(next, i, { ...m, status: "stopped" });
+  }
+  return next;
 }
 
 /** Settle a workflow whose spawning `Workflow` tool_use just produced a
@@ -869,10 +909,10 @@ function applyWorkflowUpdated(
   const item = newWorkflowRunItem(nextId("workflow"), seq, now(), snap);
   return {
     ...seqBumped,
-    messages: [
-      ...seqBumped.messages,
-      { ...item, turn_id: trailingTurnId(seqBumped.messages) },
-    ],
+    messages: appendItem(seqBumped.messages, {
+      ...item,
+      turn_id: trailingTurnId(seqBumped.messages),
+    }),
   };
 }
 
@@ -943,6 +983,8 @@ function routeSubagentItem(
  *  at "working" forever (the issue-#153 shape). Mirrors the backend's
  *  pane-status rule so the sidebar and the thread settle together. */
 function hasLiveDelegatedWork(messages: ChatViewItem[]): boolean {
+  // Nothing running anywhere means nothing running in this segment.
+  if (!hasRunningSubagents(messages)) return false;
   for (let i = messages.length - 1; i >= 0; i--) {
     const item = messages[i];
     if (item.kind === "user_message") {
@@ -1117,7 +1159,7 @@ function appendUserMessageLocal(
     // settled. The persisted `user_message` row folds through here too and
     // is deduped by nonce, so live and replay agree.
     turnUnsettled: true,
-    messages: [...next.messages, item],
+    messages: appendItem(next.messages, item),
   };
 }
 
@@ -1533,7 +1575,7 @@ function applyEventInner(
               ...next,
               streaming: false,
               interrupted,
-              messages: [...next.messages, item],
+              messages: appendItem(next.messages, item),
             };
           }
         }
@@ -1714,17 +1756,14 @@ function applyEventInner(
           // recorded an ending, which is all `lastTurnUnsettled` asks. The
           // `interrupted` flag above carries the "it died" meaning.
           turnUnsettled: false,
-          messages: [
-            ...seqBumped.messages,
-            {
-              kind: "turn_ended",
-              id: nextId("turn-end"),
-              seq,
-              turn_id: event.turn_id,
-              status: event.status,
-              completed_at: now(),
-            },
-          ],
+          messages: appendItem(seqBumped.messages, {
+            kind: "turn_ended",
+            id: nextId("turn-end"),
+            seq,
+            turn_id: event.turn_id,
+            status: event.status,
+            completed_at: now(),
+          }),
         };
       }
       // A clean (non-error) completion clears any lingering `interrupted`
@@ -1758,18 +1797,15 @@ function applyEventInner(
         // row IS persisted, so a later hydrate scanning history finds it and
         // must reach the same answer this live fold does.
         turnUnsettled: false,
-        messages: [
-          ...seqBumped.messages,
-          {
-            kind: "turn_ended",
-            id: nextId("turn-end"),
-            seq,
-            turn_id: event.turn_id,
-            status: event.status,
-            completed_at: now(),
-            ...(interim ? { interim: true } : {}),
-          },
-        ],
+        messages: appendItem(seqBumped.messages, {
+          kind: "turn_ended",
+          id: nextId("turn-end"),
+          seq,
+          turn_id: event.turn_id,
+          status: event.status,
+          completed_at: now(),
+          ...(interim ? { interim: true } : {}),
+        }),
       };
     }
 
@@ -1802,7 +1838,7 @@ function applyEventInner(
       // that hasn't landed yet — the latter is unexpected in Claude's
       // ordering but handled defensively by keeping the standalone
       // row until tool_use arrives, at which point we stamp it).
-      let messages: ChatViewItem[] = [...seqBumped.messages, item];
+      let messages: ChatViewItem[] = appendItem(seqBumped.messages, item);
       if (event.tool_use_id) {
         const toolMatch = findToolCallByUseId(messages, event.tool_use_id);
         if (toolMatch) {
@@ -1968,7 +2004,7 @@ function applyEventInner(
         seq,
         message: notice,
       };
-      return { ...next, messages: [...next.messages, item] };
+      return { ...next, messages: appendItem(next.messages, item) };
     }
 
     case "resume_cursor_updated": {
@@ -2012,7 +2048,7 @@ function applyEventInner(
         queued: { queuedId: event.queued_id },
         ...(nonce != null ? { clientNonce: nonce } : {}),
       };
-      return { ...next, messages: [...next.messages, item] };
+      return { ...next, messages: appendItem(next.messages, item) };
     }
 
     case "queued_turn_dispatched": {

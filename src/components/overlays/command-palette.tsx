@@ -330,7 +330,16 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const [conversationRows, setConversationRows] = useState<AgentChatSearchResult[]>([]);
   const [conversationSearching, setConversationSearching] = useState(false);
 
-  const appState = useAppStore((s) => s.appState);
+  // Narrow subscriptions, not the whole snapshot. The palette mounts on the
+  // switch path (it is one of the ways to switch), and `appState` itself
+  // gets a fresh reference on every snapshot AND delta commit — subscribing
+  // to it re-ran the row build on every backend tick while open. These three
+  // are the only fields it reads; with structural sharing on the snapshot
+  // path and targeted replacement on the delta path they keep their identity
+  // unless their own domain moved.
+  const workspacesSlice = useAppStore((s) => s.appState?.workspaces);
+  const activeWorkspaceId = useAppStore((s) => s.appState?.active_workspace_id);
+  const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const { getKeysForAction } = useResolvedKeybinds();
@@ -359,10 +368,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     void loadInbox();
   }, [loadInbox]);
 
-  const workspaces = useMemo(
-    () => appState?.workspaces ?? [],
-    [appState?.workspaces],
-  );
+  const workspaces = useMemo(() => workspacesSlice ?? [], [workspacesSlice]);
   const projectGroups = useProjectGroupedWorkspaces(workspaces, homeDir, hosts);
 
   const parkedIds = useMemo(() => {
@@ -373,11 +379,8 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   }, [settled, snoozed]);
 
   const activeWorkspace = useMemo(
-    () =>
-      appState?.workspaces.find(
-        (w) => w.workspace_id === appState.active_workspace_id,
-      ) ?? null,
-    [appState],
+    () => workspaces.find((w) => w.workspace_id === activeWorkspaceId) ?? null,
+    [workspaces, activeWorkspaceId],
   );
   const activePaneId = activeWorkspace?.surfaces.find(
     (s) => s.surface_id === activeWorkspace.active_surface_id,
@@ -385,7 +388,6 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   // ── Workspace rows ─────────────────────────────────────────────────────
   const workspaceRows = useMemo<WorkspaceRow[]>(() => {
-    const paneStatuses = appState?.pane_statuses;
     const repoOf = new Map<string, { name: string; path: string }>();
     for (const group of projectGroups) {
       for (const ws of group.workspaces) {
@@ -417,7 +419,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     // every render, so depending on it here would re-map and re-sort every
     // workspace on every keystroke. Nothing above is time-derived — the idle
     // age is formatted at render time by the row itself.
-  }, [workspaces, projectGroups, appState?.pane_statuses, statusSince, settledAt, parkedIds]);
+  }, [workspaces, projectGroups, paneStatuses, statusSince, settledAt, parkedIds]);
 
   // ── Project rows ───────────────────────────────────────────────────────
   const projectRows = useMemo<ProjectRow[]>(

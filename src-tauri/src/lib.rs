@@ -1136,9 +1136,18 @@ fn build_core_app<R: tauri::Runtime>(
             //    position, so a 79-workspace profile forks ~N/6 gathers per
             //    tick instead of N.
             //  - **Deduped.** Workspaces sharing a checkout gather once.
-            //  - **Change-gated.** The snapshot emit happens only when a
-            //    workspace's git/provider/issue metadata actually moved. An idle
-            //    fleet costs zero serialise + IPC + render passes.
+            //  - **Change-gated, twice.** Before forking anything for an
+            //    inactive checkout, a `stat`-only fingerprint of its `.git`
+            //    metadata (`jobs::repo_fingerprint`) is compared with the
+            //    one from its last gather; an unchanged repo costs zero
+            //    subprocesses. Because an edit to a tracked file never
+            //    touches `.git`, the gate also forces a full gather on a
+            //    slow, backing-off cadence (`jobs::SweepGate`) so a dirty
+            //    badge on a background row is at most ~60 s stale while
+            //    branch / ahead / behind stay exact. The active workspace
+            //    is never gated. Then the snapshot emit happens only when a
+            //    workspace's git/provider/issue metadata actually moved. An
+            //    idle fleet costs zero serialise + IPC + render passes.
             //
             // Serial iteration on purpose — cost stays predictable — but the
             // git subprocesses run on the blocking pool so a slow disk can't
@@ -1150,6 +1159,9 @@ fn build_core_app<R: tauri::Runtime>(
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(2))).await;
                 let mut tick: u64 = 0;
+                // Per-checkout fingerprints + forced-gather countdowns.
+                // Lives in this task only; nothing else needs it.
+                let mut sweep_gate = jobs::SweepGate::default();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     tick = tick.wrapping_add(1);
@@ -1202,8 +1214,25 @@ fn build_core_app<R: tauri::Runtime>(
                         active.as_ref().map(|(id, _)| id.as_str()),
                         jobs::GIT_SWEEP_STRIDE,
                     );
+                    // Forget checkouts no workspace points at any more so
+                    // the gate cannot grow with every workspace ever opened.
+                    {
+                        let live: std::collections::HashSet<&str> =
+                            all_workspaces.iter().map(|(_, cwd)| cwd.as_str()).collect();
+                        sweep_gate.retain(|cwd| live.contains(cwd));
+                    }
+                    // Gate by checkout, not by workspace id: when the active
+                    // workspace shares a directory with an earlier-sorted
+                    // row, the earlier row is the one that gathers.
+                    let active_cwd = active.as_ref().map(|(_, cwd)| cwd.as_str());
                     for step in steps {
+                        // Held until the state write tells us whether the
+                        // gathered values actually moved; the gate uses that
+                        // to keep a busy repo on the short forced cadence.
+                        let mut gate_outcome = None;
                         let info = if step.gather {
+                            let plan = sweep_gate
+                                .plan(&step.cwd, active_cwd == Some(step.cwd.as_str()));
                             let path = std::path::PathBuf::from(&step.cwd);
                             let queued_at = std::time::Instant::now();
                             let gather = tokio::task::spawn_blocking(move || {
@@ -1211,7 +1240,11 @@ fn build_core_app<R: tauri::Runtime>(
                                     "background.git-sweep.queue-delay",
                                     queued_at.elapsed(),
                                 );
-                                commands::workspace::gather_workspace_git_info(&path)
+                                jobs::gate_gather(
+                                    &plan,
+                                    &path,
+                                    commands::workspace::gather_workspace_git_info,
+                                )
                             })
                             .await;
                             // A panicked gather knows nothing about the
@@ -1219,14 +1252,32 @@ fn build_core_app<R: tauri::Runtime>(
                             // "not a repo", which wipes the branch and the PR
                             // pill. Leaving the last good values alone is the
                             // honest outcome — the next tick retries.
-                            let Ok(info) = gather else {
+                            let Ok(outcome) = gather else {
                                 eprintln!(
                                     "[codemux::job] git gather failed for {}, keeping last values",
                                     step.cwd
                                 );
                                 continue;
                             };
+                            let Some((_, info)) = &outcome.gathered else {
+                                // Fingerprint unchanged and no forced gather
+                                // due: zero forks for this checkout. Counted
+                                // (zero-duration sample) so the diagnostics
+                                // show the skip/gather ratio.
+                                diagnostics::record_perf_timing(
+                                    "background.git-sweep.skipped",
+                                    std::time::Duration::ZERO,
+                                );
+                                sweep_gate.record(&step.cwd, &outcome, false);
+                                continue;
+                            };
+                            diagnostics::record_perf_timing(
+                                "background.git-sweep.gathered",
+                                std::time::Duration::ZERO,
+                            );
+                            let info = info.clone();
                             gathered.insert(step.cwd.clone(), info.clone());
+                            gate_outcome = Some(outcome);
                             info
                         } else {
                             match gathered.get(&step.cwd) {
@@ -1234,10 +1285,14 @@ fn build_core_app<R: tauri::Runtime>(
                                 None => continue,
                             }
                         };
-                        if let Some(delta) = state.update_workspace_git_info_delta(
+                        let delta = state.update_workspace_git_info_delta(
                             &step.workspace_id,
                             commands::workspace::git_delta_of(info),
-                        ) {
+                        );
+                        if let Some(outcome) = &gate_outcome {
+                            sweep_gate.record(&step.cwd, outcome, delta.is_some());
+                        }
+                        if let Some(delta) = delta {
                             state::emit_app_state_delta(&git_handle, delta);
                         }
                     }

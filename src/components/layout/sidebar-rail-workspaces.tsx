@@ -136,11 +136,15 @@ function RailWorkspaceItem({
  * stays visible while collapsed.
  */
 export function SidebarRailWorkspaces() {
-  const appState = useAppStore((s) => s.appState);
-  const allWorkspaces = useMemo(
-    () => appState?.workspaces ?? [],
-    [appState?.workspaces],
-  );
+  // Narrow subscriptions, not the whole snapshot (same reasoning as the
+  // expanded inbox): the top-level `appState` reference moves on EVERY
+  // snapshot and delta commit, so subscribing to it re-rendered the whole
+  // rail on each backend tick. `workspaces` keeps its identity across
+  // git/port/status deltas and structurally-shared snapshots, and "has the
+  // first snapshot landed" is all the prune effect actually needs.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const appStateLoaded = useAppStore((s) => s.appState !== null);
+  const allWorkspaces = useMemo(() => workspaces ?? [], [workspaces]);
   // Pending-aware so the highlight moves in the click's own task, before the
   // backend snapshot lands.
   const selectedWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
@@ -172,9 +176,9 @@ export function SidebarRailWorkspaces() {
   // vanished (archived / deleted). Mirrored here so a session spent entirely
   // in the collapsed rail still trims the blob.
   useEffect(() => {
-    if (!loaded || !appState) return;
+    if (!loaded || !appStateLoaded) return;
     prune(new Set(allWorkspaces.map((w) => w.workspace_id)));
-  }, [loaded, appState, allWorkspaces, prune]);
+  }, [loaded, appStateLoaded, allWorkspaces, prune]);
 
   // workspace_id → project identity, from the same grouping pipeline the
   // expanded inbox uses (dedup'd names, Home labeling, host suffixes).

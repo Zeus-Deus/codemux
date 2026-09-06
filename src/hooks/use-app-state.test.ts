@@ -30,6 +30,15 @@ vi.mock("@/tauri/events", () => ({
 
 import { confirmsPendingActivation, useAppStateInit } from "./use-app-state";
 import { useAppStore, DELTA_REORDER_WINDOW_MS } from "@/stores/app-store";
+import {
+  abandonInteraction,
+  beginInteraction,
+  clearTraces,
+  configureInteractionTrace,
+  getTraces,
+  mark,
+  markOpenInteraction,
+} from "@/lib/perf/interaction-trace";
 import type {
   AppStateDelta,
   AppStateSnapshot,
@@ -494,5 +503,188 @@ describe("useAppStateInit — deltas, gaps and the revision heartbeat", () => {
     const state = useAppStore.getState();
     expect(state.lastSeenRevision).toBe(3);
     expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+  });
+});
+
+describe("useAppStateInit — activation arrives as a delta", () => {
+  const activation: AppStateDelta = {
+    domain: "active_workspace",
+    workspace_id: "ws-B",
+    previous_workspace_id: "ws-A",
+    last_visited_at: 1_000,
+    previous_last_visited_at: 1_000,
+    cleared_review_pane_ids: [],
+  };
+
+  function resetStore(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+      backendInstance: null,
+      resyncInFlight: false,
+      resyncRequestId: 0,
+      deltaBuffer: new Map(),
+      gapWindowId: 0,
+    });
+  }
+
+  beforeEach(() => {
+    // `performance` and rAF are faked too so the trace's double-rAF paint
+    // stamp and its span arithmetic run on the same clock as the timers.
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+        "performance",
+        "Date",
+      ],
+    });
+    deliverSnapshot = null;
+    deliverDelta = null;
+    deliverRevision = null;
+    getAppStateMock.mockReset();
+    getAppStateMock.mockImplementation(() => new Promise<never>(() => {}));
+    resetStore();
+    configureInteractionTrace({ enabled: true, console: false });
+    clearTraces();
+  });
+
+  afterEach(() => {
+    cleanup();
+    configureInteractionTrace({ enabled: false, console: false });
+    clearTraces();
+    vi.useRealTimers();
+    resetStore();
+  });
+
+  async function mountListeners() {
+    renderHook(() => useAppStateInit());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(deliverDelta).not.toBeNull();
+  }
+
+  function snapshotAt(revision: number): AppStateSnapshot {
+    const snapshot = makeAppState("ws-A");
+    snapshot.snapshot_revision = revision;
+    return snapshot;
+  }
+
+  it("confirms the optimistic selection without any full snapshot", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!(snapshotAt(10));
+      vi.advanceTimersByTime(16);
+    });
+    act(() => {
+      useAppStore.getState().beginPendingActivation("ws-B");
+      deliverDelta!({ revision: 11, delta: activation });
+    });
+
+    // No timer advanced: the delta bypasses the coalescing window, exactly as
+    // the confirming snapshot did.
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.pendingActiveWorkspaceId).toBeNull();
+    expect(state.lastSeenRevision).toBe(11);
+  });
+
+  it("stamps the trace's state-event and commit phases so the switch trace closes", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!(snapshotAt(10));
+      vi.advanceTimersByTime(16);
+    });
+
+    const id = beginInteraction("workspace-switch", { target: "ws-B" });
+    act(() => {
+      mark(id, "click");
+      mark(id, "invoke-start");
+      useAppStore.getState().beginPendingActivation("ws-B");
+      // Optimistic paint lands before the backend answers.
+      markOpenInteraction("pane-mounted", { target: "ws-B" });
+      markOpenInteraction("pane-content-ready", { target: "ws-B", meta: { paneKind: 1 } });
+      markOpenInteraction("pane-interactive", { target: "ws-B", meta: { paneKind: 1 } });
+      vi.advanceTimersByTime(40); // double-rAF → painted
+      mark(id, "invoke-returned");
+      vi.advanceTimersByTime(20);
+      deliverDelta!({ revision: 11, delta: activation });
+    });
+
+    const traces = getTraces();
+    expect(traces).toHaveLength(1);
+    expect(traces[0].complete).toBe(true);
+    expect(traces[0].abandoned).toBe(false);
+    // `state-committed` is the closing phase; both marks must be present for
+    // the trace to close on the delta rather than the 3 s post-paint grace.
+    const phases = traces[0].marks.map((m) => m.phase);
+    expect(phases).toContain("snapshot-received");
+    expect(phases).toContain("state-committed");
+  });
+
+  it("does not stamp state-committed for an activation delta that had to be buffered", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!(snapshotAt(10));
+      vi.advanceTimersByTime(16);
+    });
+
+    const id = beginInteraction("workspace-switch", { target: "ws-B" });
+    act(() => {
+      mark(id, "click");
+      mark(id, "invoke-start");
+      useAppStore.getState().beginPendingActivation("ws-B");
+      markOpenInteraction("pane-mounted", { target: "ws-B" });
+      markOpenInteraction("pane-content-ready", { target: "ws-B", meta: { paneKind: 1 } });
+      markOpenInteraction("pane-interactive", { target: "ws-B", meta: { paneKind: 1 } });
+      vi.advanceTimersByTime(40); // double-rAF → painted
+      mark(id, "invoke-returned");
+      // Revision 12 arrives before 11 — held in the reorder buffer, not applied.
+      deliverDelta!({ revision: 12, delta: activation });
+    });
+    expect(useAppStore.getState().lastSeenRevision).toBe(10);
+    expect(getTraces()).toHaveLength(0);
+
+    // The gap fills; draining commits the activation and the trace closes on
+    // the message that actually committed it — the snapshot, stamped with the
+    // DRAINED active id rather than its own stale one. This snapshot is not
+    // itself a confirming one, so it rides the ordinary coalescing window.
+    act(() => {
+      deliverSnapshot!(snapshotAt(11));
+      vi.advanceTimersByTime(16);
+    });
+    expect(useAppStore.getState().lastSeenRevision).toBe(12);
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-B");
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBeNull();
+    const traces = getTraces();
+    expect(traces).toHaveLength(1);
+    expect(traces[0].complete).toBe(true);
+  });
+
+  it("ignores non-activation deltas for trace purposes", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!(snapshotAt(10));
+      vi.advanceTimersByTime(16);
+    });
+    const id = beginInteraction("workspace-switch", { target: "ws-B" });
+    act(() => {
+      mark(id, "click");
+      mark(id, "invoke-start");
+      deliverDelta!({
+        revision: 11,
+        delta: { domain: "pane_status", pane_id: "p", status: "working" },
+      });
+    });
+    // Still open: a pane-status delta is not the confirming state event.
+    expect(getTraces()).toHaveLength(0);
+    abandonInteraction(id);
   });
 });

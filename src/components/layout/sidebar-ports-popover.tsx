@@ -90,15 +90,17 @@ export function groupPorts(
 
 export function SidebarPortsPopover() {
   const [open, setOpen] = useState(false);
-  const appState = useAppStore((s) => s.appState);
+  // Narrow subscriptions: the popover only groups ports by workspace, so it
+  // has no reason to wake on the pane-status / activation traffic that moves
+  // the top-level `appState` reference on every commit. Both fields keep
+  // their identity across commits that don't touch them.
+  const detectedPorts = useAppStore((s) => s.appState?.detected_ports);
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
 
-  const ports = useMemo(
-    () => appState?.detected_ports ?? [],
-    [appState?.detected_ports],
-  );
+  const ports = useMemo(() => detectedPorts ?? [], [detectedPorts]);
   const groups = useMemo(
-    () => groupPorts(ports, appState?.workspaces ?? []),
-    [ports, appState?.workspaces],
+    () => groupPorts(ports, workspaces ?? []),
+    [ports, workspaces],
   );
 
   const portCount = ports.length;

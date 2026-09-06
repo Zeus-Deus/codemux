@@ -1073,8 +1073,21 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 fn open_connection(path: &std::path::Path) -> Result<Connection, String> {
     let conn = Connection::open(path)
         .map_err(|e| format!("Failed to open database at {}: {e}", path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        .map_err(|e| format!("Failed to set PRAGMA: {e}"))?;
+    // WAL is already the journal mode. Under WAL, `synchronous=NORMAL` only
+    // skips the fsync of the WAL file on each commit (the WAL is still
+    // fsynced at checkpoint), so a power loss can lose the last few commits
+    // but can never corrupt the database — the default FULL was paying an
+    // fsync per transcript/selection write for durability we do not need.
+    // `busy_timeout` makes a second writer (the persistence worker racing an
+    // IPC command, or a checkpoint) wait instead of failing with
+    // SQLITE_BUSY immediately.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; \
+         PRAGMA synchronous=NORMAL; \
+         PRAGMA busy_timeout=5000; \
+         PRAGMA foreign_keys=ON;",
+    )
+    .map_err(|e| format!("Failed to set PRAGMA: {e}"))?;
     Ok(conn)
 }
 
@@ -6299,6 +6312,30 @@ mod tests {
             assert_eq!(projects.len(), 1);
             assert_eq!(projects[0].name, "myapp");
         }
+    }
+
+    #[test]
+    fn file_connection_sets_wal_normal_sync_and_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pragmas.db");
+        let conn = open_connection(&db_path).unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        // synchronous: 1 = NORMAL (0 OFF, 2 FULL, 3 EXTRA).
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
     }
 
     #[test]

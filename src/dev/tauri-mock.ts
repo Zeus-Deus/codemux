@@ -95,6 +95,7 @@ import type {
 } from "@/tauri/commands";
 import type {
   AgentBrowserSession,
+  AppStateDelta,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   CheckInfo,
@@ -114,6 +115,7 @@ import type {
   ProviderChatCapabilities,
   ProviderHealthReport,
   ResourceMetricsSnapshot,
+  RevisionedDelta,
   ShellAppearance,
   ThemeColors,
   UserSettings,
@@ -133,7 +135,6 @@ console.log(
 
 let appState: AppStateSnapshot = createSeedAppState();
 let stressDeltaTimer: number | null = null;
-let stressDeltaRevision = 0;
 let stressDeltaCount = 0;
 let providerRuntimeCommandCount = 0;
 
@@ -174,11 +175,7 @@ function startStressDeltaDriver(): void {
   stressDeltaTimer = window.setInterval(() => {
     const status = statuses[stressDeltaCount % statuses.length];
     stressDeltaCount += 1;
-    stressDeltaRevision += 1;
-    emitEvent("app-state-delta", {
-      revision: stressDeltaRevision,
-      delta: { domain: "pane_status", pane_id: paneId, status },
-    });
+    emitAppStateDelta({ domain: "pane_status", pane_id: paneId, status });
   }, periodMs);
 }
 
@@ -484,6 +481,25 @@ function findChatPaneLocation(threadId: string): {
 
 function emitAppState(): void {
   emitEvent("app-state-changed", appState);
+}
+
+/** One revision counter for every mock delta (activation and the stress
+ *  driver alike), because the store requires deltas to be contiguous: two
+ *  independent counters would hand it the same revision twice. The mock's
+ *  full snapshots stay unrevisioned (revision 0 = "always apply", baseline
+ *  untouched), so they interleave with this stream without disturbing it. */
+let mockDeltaRevision = 0;
+
+function emitAppStateDelta(delta: AppStateDelta): void {
+  mockDeltaRevision += 1;
+  const payload: RevisionedDelta = { revision: mockDeltaRevision, delta };
+  emitEvent("app-state-delta", payload);
+}
+
+/** Every leaf pane id under `node`, in tree order. */
+function leafPaneIds(node: PaneNodeSnapshot): string[] {
+  if (node.kind !== "split") return [node.pane_id];
+  return node.children.flatMap(leafPaneIds);
 }
 
 // ── Event subsystem ─────────────────────────────────────────────────
@@ -5365,11 +5381,57 @@ const handlers: Record<string, Handler> = {
   },
 
   // ── Mutators: patch in-memory state + re-emit ──
+  //
+  // Activation ships an `active_workspace` delta, not the full snapshot,
+  // mirroring the real backend so the mock sweep exercises the delta path
+  // (`applyDeltaToSnapshot` + pending confirmation). The mock's own copy is
+  // mutated identically so any later full emit (rename, close, …) agrees
+  // with what the renderer already derived from the delta.
   activate_workspace: (a) => {
-    if (findWorkspace(a.workspaceId)) {
-      appState = { ...appState, active_workspace_id: a.workspaceId as string };
-      emitAppState();
+    const target = findWorkspace(a.workspaceId);
+    if (!target) return undefined;
+    const now = Date.now();
+    const previousId = appState.active_workspace_id || null;
+    const previous = previousId ? findWorkspace(previousId) : undefined;
+    const previousLastVisited =
+      previous && previousId !== target.workspace_id ? now : null;
+    const surface = target.surfaces.find(
+      (candidate) => candidate.surface_id === target.active_surface_id,
+    );
+    const clearedReviewPaneIds: string[] = [];
+    if (surface) {
+      for (const paneId of leafPaneIds(surface.root)) {
+        if (appState.pane_statuses[paneId] === "review") {
+          clearedReviewPaneIds.push(paneId);
+        }
+      }
     }
+    // Apply to the mock's state exactly as the delta tells the renderer to.
+    target.last_visited_at = now;
+    target.notification_count = 0;
+    if (previous && previousLastVisited !== null) {
+      previous.last_visited_at = previousLastVisited;
+    }
+    const pane_statuses = { ...appState.pane_statuses };
+    for (const paneId of clearedReviewPaneIds) delete pane_statuses[paneId];
+    appState = {
+      ...appState,
+      active_workspace_id: target.workspace_id,
+      pane_statuses,
+      notifications: appState.notifications.map((n) =>
+        n.workspace_id === target.workspace_id && !n.read
+          ? { ...n, read: true }
+          : n,
+      ),
+    };
+    emitAppStateDelta({
+      domain: "active_workspace",
+      workspace_id: target.workspace_id,
+      previous_workspace_id: previousId,
+      last_visited_at: now,
+      previous_last_visited_at: previousLastVisited,
+      cleared_review_pane_ids: clearedReviewPaneIds,
+    });
     return undefined;
   },
   rename_workspace: (a) => {

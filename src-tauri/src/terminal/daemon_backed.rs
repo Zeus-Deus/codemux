@@ -376,13 +376,13 @@ pub(crate) async fn hydrate_workspace_via_daemon<R: Runtime>(
                 workspace_env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
             }
         }
-        let disk_meta: HashMap<_, _> = prep_sessions
+        // One directory walk for the whole workspace: the per-session lookup
+        // re-read and re-parsed every meta file on disk for each pane.
+        let wanted: std::collections::HashSet<&str> = prep_sessions
             .iter()
-            .filter_map(|session| {
-                crate::scrollback::find_scrollback_meta_for_session(&session.session_id)
-                    .map(|meta| (session.session_id.clone(), meta))
-            })
+            .map(|session| session.session_id.as_str())
             .collect();
+        let disk_meta: HashMap<_, _> = crate::scrollback::find_scrollback_meta_for_sessions(&wanted);
         let shell = if is_remote {
             "bash".to_string()
         } else {
