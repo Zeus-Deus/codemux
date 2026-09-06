@@ -1221,7 +1221,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
     void hydrateThreadByCursor(threadId, provider, () => cancelled).finally(() => {
-      if (!cancelled) {
+      // Nonempty transcripts report readiness from their visible rows, not
+      // this promise: the virtualizer can still be measuring hidden content.
+      if (!cancelled && !useAgentChatStore.getState().threads[threadId]?.messages.length) {
         markPaneReady("agent-chat", {
           target: paneWorkspaceId ?? undefined,
         });

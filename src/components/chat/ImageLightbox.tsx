@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { X } from "lucide-react";
+import { useDismissOnDisconnect } from "./use-dismiss-on-disconnect";
 
 import {
   Dialog,
@@ -27,6 +28,7 @@ export function ImageLightbox({
   description?: string;
   children: ReactNode;
 }) {
+  useDismissOnDisconnect(open, onOpenChange);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent

@@ -25,10 +25,6 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
-import {
-  assistantReferenceCwds,
-  assistantReferencePaths,
-} from "@/lib/agent-chat/reference-cwd";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -58,10 +54,12 @@ import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ChatFileLinkContext } from "./chat-file-link-context";
 import { resolveConversationSearchTargetIndex } from "./conversation-search-target";
+import { lookupApproval } from "./always-render-keys";
 import {
-  deriveAlwaysRenderKeys,
-  lookupApproval,
-} from "./always-render-keys";
+  getTranscriptHistory,
+  getTranscriptPresentation,
+  type TranscriptHistory,
+} from "./transcript-derivations";
 import { CHAT_COLUMN } from "./chat-column";
 import {
   subscribeTranscriptFade,
@@ -77,12 +75,10 @@ import {
   type SendAnchorRequest,
   type SendScrollMode,
 } from "./send-scroll-state";
-import {
-  buildTranscriptSlots,
-  reuseTranscriptSlots,
-  type ActivityStep,
-  type SlotBody,
-  type TranscriptSlot,
+import type {
+  ActivityStep,
+  SlotBody,
+  TranscriptSlot,
 } from "./transcript-slots";
 
 interface Props {
@@ -240,41 +236,28 @@ export const MessageList = memo(function MessageList({
     transcriptFadeEnabled,
   );
 
-  // Sort by seq so order is a property of the data, not of React
-  // reconciliation or store-update timing (stable id tiebreak).
-  const ordered = useMemo(() => {
-    const copy = messages.slice();
-    copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
-    return copy;
+  // Pure history derivations survive remounts by immutable messages identity,
+  // not by keeping a hidden list alive. The local previous value still seeds
+  // reference-map/path-array sharing when a new streaming snapshot arrives.
+  const prevHistoryRef = useRef<TranscriptHistory | undefined>(undefined);
+  const history = useMemo(() => {
+    const next = getTranscriptHistory(messages, prevHistoryRef.current);
+    prevHistoryRef.current = next;
+    return next;
   }, [messages]);
-  // File-link resolution context, recomputed per store update but carried
-  // forward by identity (issue #129, same cache pattern as `prevSlotsRef`
-  // below): the builders return the previous map — and the previous per-row
-  // path array — whenever nothing changed, so a streaming delta does not
-  // hand every reference-bearing row a fresh prop and bust `SlotRowMemo`.
-  const prevReferenceCwdsRef = useRef<ReadonlyMap<string, string>>(new Map());
-  const referenceCwdByMessageId = useMemo(() => {
-    const next = assistantReferenceCwds(ordered, prevReferenceCwdsRef.current);
-    prevReferenceCwdsRef.current = next;
-    return next;
-  }, [ordered]);
-  const prevReferencePathsRef = useRef<ReadonlyMap<string, readonly string[]>>(
-    new Map(),
-  );
-  const referencePathsByMessageId = useMemo(() => {
-    const next = assistantReferencePaths(ordered, prevReferencePathsRef.current);
-    prevReferencePathsRef.current = next;
-    return next;
-  }, [ordered]);
+  const {
+    ordered,
+    referenceCwdByMessageId,
+    referencePathsByMessageId,
+    subagentNames,
+    requestsById,
+  } = history;
 
   // Turn-fold expansion lives above the virtualized rows so recycling or
   // measurement churn never loses the user's disclosure choice.
   const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(
     () => new Set(),
   );
-  useEffect(() => {
-    setExpandedTurnIds(new Set());
-  }, [threadKey]);
   const toggleTurnFold = useCallback((turnId: string) => {
     setExpandedTurnIds((current) => {
       const next = new Set(current);
@@ -284,46 +267,20 @@ export const MessageList = memo(function MessageList({
     });
   }, []);
 
-  // Subagent-id → display name, for the "from subagent X" label on a
-  // bubbled approval request (locked decision 4).
-  const subagentNames = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const m of ordered) {
-      if (m.kind !== "subagent_run") continue;
-      for (const sub of m.subagents) {
-        map.set(sub.id, sub.name ?? sub.agentType ?? "subagent");
-      }
-    }
-    return map;
-  }, [ordered]);
-
-  // Resolve tool-card approvals in O(1) from the request id the reducer
-  // stamped onto the gated tool call.
-  const requestsById = useMemo(() => {
-    const map = new Map<string, PermissionRequestItem>();
-    for (const m of ordered) {
-      if (m.kind === "permission_request") map.set(m.request_id, m);
-    }
-    return map;
-  }, [ordered]);
-
-  // Slot-object reuse across rebuilds (issue #129). Every store update (each
-  // streaming token) rebuilds all slots, but `reuseTranscriptSlots` swaps
-  // unchanged slots back to their previous object identity — that identity is
-  // exactly what lets the memoized `SlotRowMemo` wrapper skip. The ref holds
-  // the last returned array to diff against; mutating it inside `useMemo` is
-  // the accepted cache pattern here (deterministic under StrictMode's
-  // double-render — the second pass diffs the first pass's result and returns
-  // it unchanged).
-  const prevSlotsRef = useRef<TranscriptSlot[]>([]);
-  const slots = useMemo(() => {
-    const next = reuseTranscriptSlots(
+  // Default collapsed slots (including live-control keys) are cached for
+  // each streaming mode. Disclosure state stays local and resets as before;
+  // new snapshots/expanded folds still use structural slot reuse (issue #129).
+  const prevSlotsRef = useRef<TranscriptSlot[] | undefined>(undefined);
+  const { slots, alwaysRenderKeys } = useMemo(() => {
+    const next = getTranscriptPresentation(
+      history,
+      streaming,
+      expandedTurnIds,
       prevSlotsRef.current,
-      buildTranscriptSlots(ordered, streaming, expandedTurnIds),
     );
-    prevSlotsRef.current = next;
+    prevSlotsRef.current = next.slots;
     return next;
-  }, [expandedTurnIds, ordered, streaming]);
+  }, [expandedTurnIds, history, streaming]);
 
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
@@ -380,6 +337,7 @@ export const MessageList = memo(function MessageList({
   // prompt; "settled" gates the stream-advance effect so a fast first token
   // cannot fight the glide.
   const anchorIndexRef = useRef<number | null>(null);
+  const anchorReadyRef = useRef<{ nonce: number; info: SendAnchorReadyInfo } | null>(null);
   const localPositionedNonceRef = useRef<number | null>(null);
   const positionedRef = positionedNonceRef ?? localPositionedNonceRef;
   const settledNonceRef = useRef<number | null>(null);
@@ -513,6 +471,9 @@ export const MessageList = memo(function MessageList({
     // Thread / pane identity changed: behave like a fresh hydrated open
     // rather than resuming a stale follow or anchor decision.
     lastThreadKeyRef.current = threadKey;
+    // Disclosure belongs to the thread, not to an effect connection. Activity
+    // reconnects effects with the same retained state on every reveal.
+    setExpandedTurnIds(new Set());
     lastSendNonceRef.current = sendNonce;
     claimScroll("following-end");
     setShowJumpToLatest(false);
@@ -555,6 +516,14 @@ export const MessageList = memo(function MessageList({
       // positioned to the next mount.
       pendingPositionNonceRef.current = null;
       settleCleanupRef.current?.();
+      // Hiding destroys the settle handshake but retains these refs. Do not
+      // leave stream advancement waiting forever for a canceled callback.
+      // The already-issued positioning remains one-shot; a later send owns
+      // a different nonce and must make its own placement decision.
+      if (glideOwnerNonceRef.current !== null) {
+        settledNonceRef.current = glideOwnerNonceRef.current;
+        glideOwnerNonceRef.current = null;
+      }
     },
     [],
   );
@@ -612,9 +581,13 @@ export const MessageList = memo(function MessageList({
   useEffect(() => {
     const state = listRef.current?.getState();
     if (!state) return;
-    handleIsAtEndChange(state.isNearEnd ?? state.isAtEnd);
+    const atEnd = state.isNearEnd ?? state.isAtEnd;
+    handleIsAtEndChange(atEnd);
+    // Reconnecting with the same off-edge value is not an edge transition,
+    // but its pending pill timer was canceled by cleanup.
+    if (!atEnd && !ownsScroll()) scheduleJumpToLatest();
     return state.listen("isNearEnd", handleIsAtEndChange);
-  }, [handleIsAtEndChange]);
+  }, [handleIsAtEndChange, ownsScroll, scheduleJumpToLatest]);
 
   // Only genuine navigation gestures release follow. Deliberately NOT
   // `scroll`: every programmatic correction below emits one, and treating
@@ -666,6 +639,7 @@ export const MessageList = memo(function MessageList({
       const nonce = sendNonce;
       const anchorIndex = info.anchorIndex;
       if (!clientNonce || nonce === null || anchorIndex === undefined) return;
+      anchorReadyRef.current = { nonce, info };
       // Always refresh the index: rows landing above the prompt shift it.
       anchorIndexRef.current = anchorIndex;
 
@@ -795,6 +769,14 @@ export const MessageList = memo(function MessageList({
     },
     [anchorClientNonce, maybeRestoreEndPin, ownsScroll, positionedRef, sendNonce],
   );
+
+  // LegendList emits readiness on geometry changes, not on effect reconnect.
+  // Retry only an already-measured, still-current intent whose frame was
+  // canceled while hidden; the positioner's nonce guards keep this one-shot.
+  useEffect(() => {
+    const ready = anchorReadyRef.current;
+    if (ready && ready.nonce === sendNonce) handleAnchorReady(ready.info);
+  }, [handleAnchorReady, sendNonce]);
 
   // Two nested frames let LegendList lay out and measure new content before
   // the advance decision reads its geometry. One scheduler is shared by the
@@ -937,11 +919,14 @@ export const MessageList = memo(function MessageList({
       return;
     }
     if (modeRef.current !== "following-end") return;
-    // Whenever LegendList's own end pin is enabled it already owns this —
-    // driving it twice would be redundant work on every streamed token. We
-    // only take over for the window where an anchor has disabled that pin
-    // but the reader is back at the edge.
-    if (!anchoredEndSpace || endPinReleased) return;
+    // Usually LegendList's end pin already did the work. On a retained
+    // viewport, however, background growth can leave the old bottom outside
+    // its narrow pin threshold. Follow intent is still ours (reader gestures
+    // release it above), so recover that missed pin without driving it twice.
+    if (!anchoredEndSpace || endPinReleased) {
+      if (!state.isAtEnd) void list.scrollToEnd({ animated: false });
+      return;
+    }
     // Without this the reserved blank space would be a scroll target.
     if (!realContentOverflowsViewport(state)) return;
     void list.scrollToEnd({ animated: false });
@@ -1034,15 +1019,6 @@ export const MessageList = memo(function MessageList({
       conversationSearchJumpRequest,
     );
   }, [conversationSearchJumpRequest, slots]);
-
-  // Rows with live controls must not unmount while the reader scrolls away:
-  // queued-turn cancel/send-now actions and pending approval forms can carry
-  // transient local input. Derivation lives in `always-render-keys.ts` so the
-  // contract is unit-testable without mounting the virtualizer.
-  const alwaysRenderKeys = useMemo(
-    () => deriveAlwaysRenderKeys(slots, requestsById),
-    [requestsById, slots],
-  );
 
   useEffect(() => {
     if (!subagentJumpRequest || subagentTargetIndex < 0) return;
@@ -1250,6 +1226,9 @@ export const MessageList = memo(function MessageList({
         getItemType={transcriptSlotType}
         itemsAreEqual={transcriptSlotsAreEqual}
         renderItem={renderItem}
+        // Rows also depend on pane-owned callbacks/context, not only slot data.
+        // A retained list can receive fresh owners with the same messages.
+        extraData={renderItem}
         estimatedItemSize={112}
         estimatedHeaderSize={48}
         drawDistance={250}

@@ -1,4 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { Activity } from "react";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   act,
@@ -197,6 +198,67 @@ function renderList(
     <MessageList messages={messages} {...extra} {...noopHandlers} />,
   );
 }
+
+describe("MessageList retained scroll state", () => {
+  it("does not duplicate an end pin that already reached the tail", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a")]);
+    view.rerender(<MessageList messages={[readCall(0, "/a"), readCall(1, "/b")]} {...noopHandlers} />);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not recover the end pin after the reader takes scroll ownership", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const view = renderList([readCall(0, "/a")]);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    listState.isAtEnd = false;
+    listState.isNearEnd = false;
+    fireEvent.wheel(view.container.querySelector('[data-slot="transcript-list"]')!, { deltaY: -100 });
+    scrollToEndSpy.mockClear();
+    view.rerender(<MessageList messages={[readCall(0, "/a"), readCall(1, "/b")]} {...noopHandlers} />);
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("reveals background growth when a resumed tail follower misses the built-in end pin", async () => {
+    listState.isAtEnd = true;
+    listState.isNearEnd = true;
+    const tree = (mode: "visible" | "hidden", messages: ChatViewItem[]) => (
+      <Activity mode={mode}><MessageList messages={messages} {...noopHandlers} /></Activity>
+    );
+    const messages = [readCall(0, "/a")];
+    const view = render(tree("visible", messages));
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    view.rerender(tree("hidden", messages));
+    scrollToEndSpy.mockClear();
+    // Native reproduction: 143px of new rows exceeds the 3% end-pin
+    // threshold, but remains inside the near-end/follow threshold.
+    listState.isAtEnd = false;
+    listState.isNearEnd = true;
+    view.rerender(tree("visible", [...messages, readCall(1, "/b")]));
+    await waitFor(() => expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false }));
+  });
+
+  it("re-arms an off-edge pill canceled while effects were disconnected", async () => {
+    // The real-LegendList lifecycle suite also covers this path. This existing
+    // measured double isolates MessageList from LegendList's bootstrap replay.
+    const messages: ChatViewItem[] = [readCall(0, "/a")];
+    const tree = (mode: "visible" | "hidden") => (
+      <Activity mode={mode}><MessageList messages={messages} {...noopHandlers} /></Activity>
+    );
+    const view = render(tree("visible"));
+    await act(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+    const viewport = view.container.querySelector<HTMLElement>('[data-slot="transcript-list"]')!;
+    fireEvent.wheel(viewport, { deltaY: -100 });
+    view.rerender(tree("hidden"));
+    await act(() => new Promise<void>((resolve) => window.setTimeout(resolve, 180)));
+    view.rerender(tree("visible"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeNull());
+  });
+});
 
 describe("MessageList titlebar scroll edge", () => {
   it("publishes only after the transcript scrolls beneath the overlay", () => {

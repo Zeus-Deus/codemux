@@ -582,7 +582,8 @@ impl SweepGate {
                     GatherReason::Periodic if !info_changed => (entry.full_every * 2).min(max),
                     _ => min,
                 };
-                entry.visits_until_full = entry.full_every;
+                // The next forced gather is itself one visit in the interval.
+                entry.visits_until_full = entry.full_every.saturating_sub(1);
             }
             None => {
                 // Stagger first-seen checkouts across the cadence so a
@@ -592,7 +593,7 @@ impl SweepGate {
                     cwd.to_string(),
                     GateEntry {
                         fingerprint: outcome.fingerprint.clone(),
-                        visits_until_full: min.saturating_sub(stagger),
+                        visits_until_full: min.saturating_sub(stagger).saturating_sub(1),
                         full_every: min,
                     },
                 );
@@ -1125,7 +1126,7 @@ mod fingerprint_tests {
         assert_eq!(forks, 1);
         // The gather's own index refresh must not read as a change.
         settle();
-        for _ in 0..GIT_SWEEP_FULL_GATHER_MIN_VISITS {
+        for _ in 1..GIT_SWEEP_FULL_GATHER_MIN_VISITS {
             assert_eq!(visit(&mut gate, &mut forks, false), None);
         }
         assert_eq!(forks, 1, "unchanged repo must cost zero gathers");
@@ -1133,7 +1134,7 @@ mod fingerprint_tests {
         assert_eq!(visit(&mut gate, &mut forks, false), Some(GatherReason::Periodic));
         assert_eq!(forks, 2);
         // Quiet periodic gather doubled the interval.
-        for _ in 0..(GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2) {
+        for _ in 1..(GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2) {
             assert_eq!(visit(&mut gate, &mut forks, false), None);
         }
         assert_eq!(visit(&mut gate, &mut forks, false), Some(GatherReason::Periodic));
@@ -1223,7 +1224,7 @@ mod fingerprint_tests {
 
         let (skipped, reason) = visits_until_forced(&mut gate);
         assert_eq!(reason, GatherReason::Periodic);
-        assert!(skipped <= GIT_SWEEP_FULL_GATHER_MIN_VISITS);
+        assert_eq!(skipped + 1, GIT_SWEEP_FULL_GATHER_MIN_VISITS);
         // Quiet: interval doubles.
         gate.record(
             "/r",
@@ -1233,7 +1234,10 @@ mod fingerprint_tests {
             },
             false,
         );
-        assert_eq!(visits_until_forced(&mut gate).0, GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2);
+        assert_eq!(
+            visits_until_forced(&mut gate).0 + 1,
+            GIT_SWEEP_FULL_GATHER_MIN_VISITS * 2
+        );
         // Busy: values moved on the forced gather, back to the minimum.
         gate.record(
             "/r",
@@ -1243,7 +1247,10 @@ mod fingerprint_tests {
             },
             true,
         );
-        assert_eq!(visits_until_forced(&mut gate).0, GIT_SWEEP_FULL_GATHER_MIN_VISITS);
+        assert_eq!(
+            visits_until_forced(&mut gate).0 + 1,
+            GIT_SWEEP_FULL_GATHER_MIN_VISITS
+        );
     }
 
     #[test]
@@ -1280,7 +1287,42 @@ mod fingerprint_tests {
             );
             skipped += 1;
         }
-        assert_eq!(skipped, GIT_SWEEP_FULL_GATHER_MAX_VISITS);
+        assert_eq!(skipped + 1, GIT_SWEEP_FULL_GATHER_MAX_VISITS);
+    }
+
+    #[test]
+    fn first_periodic_gather_keeps_stagger_without_an_extra_visit() {
+        let mut gate = SweepGate::default();
+        let fp = RepoFingerprint::default();
+        let min = GIT_SWEEP_FULL_GATHER_MIN_VISITS;
+        for index in 0..(min * 2) {
+            let cwd = format!("/repo-{index}");
+            gate.record(
+                &cwd,
+                &GateOutcome {
+                    fingerprint: fp.clone(),
+                    gathered: Some((GatherReason::FirstSeen, ())),
+                },
+                false,
+            );
+            let interval = min - index % min;
+            for visit in 1..=interval {
+                let reason = gate.plan(&cwd, false).reason_for(&fp);
+                assert_eq!(
+                    reason,
+                    (visit == interval).then_some(GatherReason::Periodic),
+                    "checkout {index}, visit {visit}"
+                );
+                gate.record(
+                    &cwd,
+                    &GateOutcome {
+                        fingerprint: fp.clone(),
+                        gathered: reason.map(|reason| (reason, ())),
+                    },
+                    false,
+                );
+            }
+        }
     }
 
     #[test]

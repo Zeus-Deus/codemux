@@ -4,11 +4,14 @@ import { cleanup, render } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
 import type { TasksSnapshot } from "@/tauri/events";
+import { ChatTranscript } from "@/components/chat/ChatTranscript";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mutable mock state ──
 const state = {
   workspace: null as WorkspaceSnapshot | null,
+  workspaces: null as WorkspaceSnapshot[] | null,
+  cacheProbe: false,
   enableAgentChat: false,
   enableLazy: false,
   activeDraftId: null as string | null,
@@ -34,7 +37,18 @@ vi.mock("./preset-bar", () => ({
   PresetBar: () => <div data-testid="preset-bar" />,
 }));
 vi.mock("./pane-container", () => ({
-  PaneContainer: () => <div data-testid="pane-container" />,
+  PaneContainer: ({ workspace }: { workspace: WorkspaceSnapshot }) => state.cacheProbe ? (
+    <section key={workspace.workspace_id} data-testid="pane-container">
+      <textarea data-testid="composer" />
+      <ChatTranscript workspaceId={workspace.workspace_id} threadKey={`thread-${workspace.workspace_id}`}
+        provider="claude" cwd="/p" streaming={false}
+        messages={[{ kind: "assistant_message", id: workspace.workspace_id, seq: 1, text: workspace.workspace_id, streaming: false, turn_id: "t" }]}
+        onRespondToRequest={vi.fn()} onAcceptPlan={vi.fn()} onRejectPlan={vi.fn()} />
+    </section>
+  ) : <div data-testid="pane-container" />,
+}));
+vi.mock("@/components/chat/MessageList", () => ({
+  MessageList: ({ messages }: { messages: { id: string }[] }) => <div data-slot="transcript-list"><button>{messages[0].id}</button></div>,
 }));
 vi.mock("./right-panel", () => ({
   RightPanel: ({ activeTab }: { activeTab: string | null }) => (
@@ -57,7 +71,7 @@ vi.mock("@/components/overlays/project-onboarding", () => ({
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => state.workspace,
   useAppStore: vi.fn((sel: (s: unknown) => unknown) =>
-    sel({ appState: { workspaces: [] } }),
+    sel({ appState: { workspaces: state.workspaces ?? (state.workspace ? [state.workspace] : []) } }),
   ),
 }));
 
@@ -158,6 +172,8 @@ function makeWorkspace(
 
 beforeEach(() => {
   state.workspace = makeWorkspace();
+  state.workspaces = null;
+  state.cacheProbe = false;
   state.enableAgentChat = false;
   state.enableLazy = false;
   state.activeDraftId = null;
@@ -168,6 +184,79 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+function cacheWorkspace(id: string) {
+  return makeWorkspace({ workspace_id: id, surfaces: [{ surface_id: "surface-1", title: "Chat", active_pane_id: `pane-${id}`,
+    root: { kind: "agent_chat", pane_id: `pane-${id}`, title: "Chat", thread_id: `thread-${id}`, provider: "claude", cwd: "/p" } }] });
+}
+it("reuses transcript DOM across sole-chat workspaces but remounts the composer", () => {
+  state.enableAgentChat = state.cacheProbe = true;
+  const a = cacheWorkspace("a");
+  const b = cacheWorkspace("b");
+  state.workspaces = [a, b];
+  state.workspace = a;
+  const view = render(<WorkspaceMain />);
+  const row = view.getByText("a");
+  const composer = view.getByTestId("composer");
+  state.workspace = b;
+  view.rerender(<WorkspaceMain />);
+  state.workspace = a;
+  view.rerender(<WorkspaceMain />);
+  expect(view.getByText("a")).toBe(row);
+  expect(view.getByTestId("composer")).not.toBe(composer);
+});
+
+it("does not remount the live pane/composer when eligibility changes to a multi-tab route", () => {
+  state.enableAgentChat = state.cacheProbe = true;
+  const a = cacheWorkspace("a");
+  state.workspace = a;
+  const view = render(<WorkspaceMain />);
+  const composer = view.getByTestId("composer");
+  state.workspace = { ...a, tabs: [...a.tabs, { ...a.tabs[0], tab_id: "extra" }] };
+  view.rerender(<WorkspaceMain />);
+  expect(view.getByTestId("composer")).toBe(composer);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(0);
+});
+
+it.each(["terminal", "browser", "editor", "diff", "split", "draft", "none"])("clears cached transcripts and uses the prior %s route", async (route) => {
+  state.enableAgentChat = state.cacheProbe = true;
+  const a = cacheWorkspace("a");
+  const b = cacheWorkspace("b");
+  state.workspaces = [a, b]; state.workspace = a;
+  const view = render(<WorkspaceMain />);
+  const row = view.getByText("a");
+  state.workspace = b; view.rerender(<WorkspaceMain />);
+  const other = makeWorkspace({ workspace_id: "other" });
+  if (route === "editor" || route === "diff" || route === "browser") other.tabs[0].kind = route;
+  if (route === "split") other.surfaces[0].root = { kind: "split", pane_id: "split", direction: "horizontal", child_sizes: [1], children: [a.surfaces[0].root] };
+  state.workspace = route === "none" ? null : other;
+  if (route === "draft") { state.enableLazy = true; state.activeDraftId = "draft"; }
+  view.rerender(<WorkspaceMain />);
+  if (route === "draft") await view.findByTestId("draft-surface");
+  if (route === "editor") await view.findByTestId("editor-pane");
+  if (route === "diff") await view.findByTestId("diff-pane");
+  expect(row.isConnected).toBe(false);
+  expect(view.container.querySelectorAll('[data-transcript-cache-host]')).toHaveLength(0);
+});
+it.each(["delete", "thread", "provider", "cwd", "conversion"])("promptly evicts hidden %s invalidation without remounting the active transcript", (change) => {
+  state.enableAgentChat = state.cacheProbe = true;
+  const a = cacheWorkspace("a"); const b = cacheWorkspace("b");
+  state.workspaces = [a, b]; state.workspace = a;
+  const view = render(<WorkspaceMain />);
+  const row = view.getByText("a");
+  state.workspace = b; view.rerender(<WorkspaceMain />);
+  const active = view.getByText("b");
+  const changed = structuredClone(a);
+  if (changed.surfaces[0].root.kind !== "agent_chat") throw Error("fixture");
+  if (change === "thread") changed.surfaces[0].root.thread_id = "new-thread";
+  if (change === "provider") changed.surfaces[0].root.provider = "codex";
+  if (change === "cwd") changed.surfaces[0].root.cwd = "/new-project";
+  if (change === "conversion") changed.surfaces[0].root = { kind: "terminal", pane_id: "new", session_id: "session", title: "sh" };
+  state.workspaces = change === "delete" ? [b] : [changed, b];
+  view.rerender(<WorkspaceMain />);
+  expect(row.isConnected).toBe(false);
+  expect(view.getByText("b")).toBe(active);
+});
 
 describe("WorkspaceMain chrome rows", () => {
   it("renders legacy TabBar + PresetBar when the Agent Chat Beta is OFF", () => {

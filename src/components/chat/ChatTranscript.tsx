@@ -1,4 +1,6 @@
-import { memo, useMemo } from "react";
+import { memo, useContext, useEffect, useMemo, useRef } from "react";
+import { isInteractionTraceEnabled, markPaneReady } from "@/lib/perf/interaction-trace";
+import { observeTranscriptReady } from "@/lib/perf/transcript-ready";
 
 import { shouldShowThinkingIndicator } from "@/lib/agent-chat/thinking";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
@@ -6,6 +8,10 @@ import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
+import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
+import { TranscriptCacheMount } from "./transcript-cache";
+import { TranscriptBindingContext } from "./transcript-cache-binding";
 import { MessageList } from "./MessageList";
 import type { SendAnchorRequest } from "./send-scroll-state";
 
@@ -105,13 +111,24 @@ export const ChatTranscript = memo(function ChatTranscript({
   workspaceId,
   cwd,
 }: Props) {
+  const binding = useContext(TranscriptBindingContext);
+  const cacheKey = binding && binding.workspaceId === workspaceId && binding.threadKey === threadKey &&
+    binding.provider === provider && binding.cwd === cwd ? binding.key : null;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const hasMessages = messages.length > 0;
+  useEffect(() => {
+    if (!isInteractionTraceEnabled() || !workspaceId || !hasMessages || !rootRef.current) return;
+    return observeTranscriptReady(rootRef.current, () => {
+      markPaneReady("agent-chat", { target: workspaceId });
+    });
+  }, [workspaceId, threadKey, hasMessages]);
+
   const showThinking = useMemo(
     () => shouldShowThinkingIndicator(messages, streaming),
     [messages, streaming],
   );
 
-  return (
-    <div className="flex-1 min-h-0 w-full">
+  const list = (
       <MessageList
         messages={messages}
         showThinking={showThinking}
@@ -138,6 +155,19 @@ export const ChatTranscript = memo(function ChatTranscript({
         workspaceId={workspaceId}
         cwd={cwd}
       />
+  );
+  // Portals follow React ancestry, not the physical slot's ancestry. The
+  // sole pane is already active; reproduce only AgentChatPane's runtime-intent
+  // capture here. The uncached path still bubbles through the normal pane.
+  const observeIntent = () => { if (provider) useProviderRuntimeIntent.getState().observe(provider); };
+  return (
+    <div ref={rootRef} className="flex-1 min-h-0 w-full">
+      {cacheKey ? <TranscriptCacheMount cacheKey={cacheKey}>
+        <div className="h-full min-h-0 w-full" onFocusCapture={observeIntent}
+          onKeyDownCapture={observeIntent} onPointerDownCapture={observeIntent}>
+          <LazyBoundary label="agent chat" className="h-full">{list}</LazyBoundary>
+        </div>
+      </TranscriptCacheMount> : list}
     </div>
   );
 });

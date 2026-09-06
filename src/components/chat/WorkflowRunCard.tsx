@@ -26,6 +26,7 @@ import type { PermissionRequestItem, WorkflowRunItem } from "@/lib/agent-chat/ty
 import { cn } from "@/lib/utils";
 import type { ApprovalDecision } from "@/tauri/events";
 import { useUIStore } from "@/stores/ui-store";
+import { useDismissOnDisconnect } from "./use-dismiss-on-disconnect";
 
 interface Props {
   item: WorkflowRunItem;
@@ -89,6 +90,7 @@ function WorkflowApprovalCard({
   onDecide: (decision: ApprovalDecision) => void;
 }) {
   const [scriptOpen, setScriptOpen] = useState(false);
+  useDismissOnDisconnect(scriptOpen, setScriptOpen);
   // Same synchronous in-flight guard ToolCallCard's ApprovalFooter uses:
   // the parent only flips `approval.resolution` to `responding` after the
   // IPC round-trips, so a double-click in the same tick could otherwise
