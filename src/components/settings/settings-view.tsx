@@ -1342,7 +1342,6 @@ export function SettingsView() {
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
-  const isDevBypass = useAuthStore((s) => s.devBypass);
   const signOut = useAuthStore((s) => s.signOut);
   const syncedSettings = useSyncedSettingsStore((s) => s.settings);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
@@ -1574,14 +1573,6 @@ export function SettingsView() {
                   <SettingRow label="Name" description="Your display name.">
                     <span className="select-text text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
                   </SettingRow>
-                  {isDevBypass && (
-                    <>
-                      <Separator />
-                      <SettingRow label="Mode" description="Running in dev bypass mode — no server connection.">
-                        <Badge variant="secondary">Dev Mode</Badge>
-                      </SettingRow>
-                    </>
-                  )}
                 </>
               ) : (
                 <div className="py-4 text-sm text-muted-foreground">

@@ -243,7 +243,7 @@ export function assistantReferenceCwds(
   let turnCwd: string | null = null;
 
   for (const item of orderedItems) {
-    if (item.kind === "user_message") {
+    if (item.kind === "user_message" && !item.inflight) {
       turnCwd = null;
       continue;
     }
@@ -290,7 +290,10 @@ export function assistantReferencePaths(
   let allReused = true;
 
   for (const item of orderedItems) {
-    if (item.kind === "user_message" || item.kind === "turn_ended") {
+    if (
+      (item.kind === "user_message" && !item.inflight) ||
+      item.kind === "turn_ended"
+    ) {
       turnPaths = [];
       continue;
     }

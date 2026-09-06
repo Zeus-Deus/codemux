@@ -1,3 +1,4 @@
+import type { UserQuestionSet, QuestionResolution } from "@/tauri/events";
 import type {
   ApprovalDecision,
   ContextUsageSnapshot,
@@ -60,6 +61,10 @@ export interface UserMessageImage {
  * resolving a permission request) MUST preserve the original `seq`.
  */
 export interface UserMessageItem {
+  /** Input accepted inside an existing provider turn is not a new boundary. */
+  inflight?: boolean;
+  in_reply_to?: string;
+  turn_id?: string;
   kind: "user_message";
   id: ChatItemId;
   seq: number;
@@ -368,7 +373,17 @@ export interface RuntimeNoticeItem {
   severity?: "warning" | "error";
 }
 
+export interface AsyncQuestionItem {
+  source_event_id?: number;
+  kind: "async_question";
+  id: string;
+  seq: number;
+  question: UserQuestionSet;
+  resolution: QuestionResolution;
+}
+
 export type ChatViewItem =
+  | AsyncQuestionItem
   | UserMessageItem
   | AssistantMessageItem
   | ReasoningItem

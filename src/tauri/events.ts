@@ -357,7 +357,43 @@ export interface ContextUsageSnapshot {
   compacts_automatically?: boolean | null;
 }
 
+export interface UserQuestionSet {
+  id: string;
+  target: string;
+  source_item_id: string;
+  source_turn_id: string;
+  text: string;
+  questions: Array<{ title: string; options: string[] }>;
+  subagent_id?: string | null;
+}
+export type QuestionDelivery = {
+  kind: "inflight" | "new_turn";
+  turn_id: string;
+};
+export type QuestionResolution =
+  | { status: "pending" | "dismissed" }
+  | { status: "submitting"; submission_id: string; answers: string[] }
+  | {
+      status: "answered";
+      submission_id: string;
+      answers: string[];
+      delivery: QuestionDelivery;
+    }
+  | {
+      status: "failed" | "unknown";
+      submission_id: string;
+      answers: string[];
+      message: string;
+    };
+
 export type ProviderRuntimeEvent =
+  | { type: "questions_asked"; thread_id: string; question: UserQuestionSet }
+  | {
+      type: "question_resolved";
+      thread_id: string;
+      question_id: string;
+      resolution: QuestionResolution;
+    }
   | {
       type: "session_configured";
       thread_id: string;

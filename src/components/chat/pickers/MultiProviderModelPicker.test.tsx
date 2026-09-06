@@ -148,7 +148,6 @@ function seedStore(opts: {
     cursorError: opts.cursorError ?? null,
     grokError: opts.grokError ?? null,
     opencodeError: opts.opencodeError ?? null,
-    loaded: false,
   });
 }
 

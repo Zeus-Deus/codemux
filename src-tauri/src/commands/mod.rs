@@ -1,5 +1,6 @@
 pub mod agent_chat;
 pub mod ai;
+pub mod async_questions;
 pub mod auth;
 pub mod automations;
 pub mod branch_name;

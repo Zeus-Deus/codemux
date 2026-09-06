@@ -47,6 +47,8 @@ Your active mode changes only when new developer instructions with a different `
 
 Use the `request_user_input` tool only when it is listed in the available tools for this turn.
 
+When `request_user_input_async` is available, use it for clarification questions and continue useful work that does not depend on the answer. Incorporate answers as they arrive. Do not proceed with work that requires an unanswered question or approval. If that tool is unavailable, use the question behavior below.
+
 In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
 </collaboration_mode>"#;
 
@@ -206,6 +208,7 @@ pub(crate) struct CodexSession {
     pub child: Arc<JsonRpcChild>,
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
+    outbound: Mutex<()>,
     /// Broadcast sender used to emit runtime events from methods that
     /// mutate the follow-up queue (enqueue / dispatch / cancel). The
     /// background tasks receive their own clone via spawn args.
@@ -454,6 +457,11 @@ impl CodexSession {
         }
 
         // --- thread/start or thread/resume ----------------------------------
+        let require_original = resume_cursor
+            .as_ref()
+            .and_then(|v| v.get("requireOriginal"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let codex_thread_id = match &resume_cursor {
             Some(cursor) => {
                 let resume_id = codex_thread_id_from_resume_cursor(cursor);
@@ -485,7 +493,10 @@ impl CodexSession {
                                     })
                                 }
                             },
-                            Err(err) if is_recoverable_resume_error(&err.to_string()) => {
+                            Err(err)
+                                if !require_original
+                                    && is_recoverable_resume_error(&err.to_string()) =>
+                            {
                                 // Fall back to a fresh thread/start and
                                 // emit a warning so the UI can show the
                                 // transition.
@@ -529,6 +540,7 @@ impl CodexSession {
             cwd,
             child: Arc::clone(&child),
             state,
+            outbound: Mutex::new(()),
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
@@ -599,6 +611,7 @@ impl CodexSession {
         self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<SendOutcome, ProviderError> {
+        let _outbound = self.outbound.lock().await;
         {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
@@ -657,6 +670,9 @@ impl CodexSession {
     /// dispatch cancels the item (never wedges the queue) and the next is
     /// attempted.
     pub async fn drain_queue(self: &Arc<Self>) {
+        let Ok(_outbound) = self.outbound.try_lock() else {
+            return;
+        };
         loop {
             let next = {
                 let mut state = self.state.lock().await;
@@ -838,6 +854,27 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
+        self.do_send_with_id(
+            text,
+            images,
+            skill_invocations,
+            model_override,
+            effort_override,
+            None,
+        )
+        .await
+        .map_err(plain_send_error)
+    }
+
+    async fn do_send_with_id(
+        &self,
+        text: String,
+        images: Vec<crate::agent_provider::ImageInput>,
+        skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
+        model_override: Option<String>,
+        effort_override: Option<String>,
+        client_id: Option<String>,
+    ) -> Result<TurnId, TurnStartError> {
         let (codex_thread_id, model_default, effort_default, fast_mode) = {
             let state = self.state.lock().await;
             (
@@ -907,18 +944,17 @@ impl CodexSession {
             effort,
             collaboration_mode,
         };
-        let params_value = serde_json::to_value(&params).unwrap();
+        let mut params_value = serde_json::to_value(&params).unwrap();
+        if let Some(id) = client_id {
+            params_value["clientUserMessageId"] = json!(id);
+        }
         let resp = self
             .child
             .request("turn/start", params_value)
             .await
-            .map_err(|e| ProviderError::RpcError {
-                message: format!("turn/start failed: {e}"),
-            })?;
+            .map_err(TurnStartError::Rpc)?;
         let parsed: TurnStartResponse =
-            serde_json::from_value(resp).map_err(|e| ProviderError::RpcError {
-                message: format!("malformed turn/start response: {e}"),
-            })?;
+            serde_json::from_value(resp).map_err(TurnStartError::Malformed)?;
         let turn_id = TurnId(parsed.turn.id);
         {
             let mut state = self.state.lock().await;
@@ -935,6 +971,156 @@ impl CodexSession {
     /// treated as absent by the provider so the next send auto-resumes.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
+    }
+
+    pub async fn answer_question(
+        self: &Arc<Self>,
+        input: crate::agent_provider::AnswerQuestionInput,
+    ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
+    {
+        let result = {
+            let _outbound = self.outbound.lock().await;
+            self.deliver_question_answer(input).await
+        };
+        self.drain_queue().await;
+        result
+    }
+
+    async fn deliver_question_answer(
+        &self,
+        input: crate::agent_provider::AnswerQuestionInput,
+    ) -> Result<crate::agent_provider::QuestionDelivery, crate::agent_provider::QuestionDeliveryError>
+    {
+        use crate::agent_provider::{QuestionDelivery as Delivery, QuestionDeliveryError as Error};
+        let text = input
+            .question
+            .answer_text(&input.answers)
+            .map_err(Error::Rejected)?;
+        let root = self.state.lock().await.codex_thread_id.clone();
+        // Resuming a missing conversation can create a new native thread in the
+        // legacy send path. Never deliver an old answer to that replacement.
+        if input.question.subagent_id.is_none() && input.question.target != root {
+            return Err(Error::Rejected(
+                "The original conversation could not be resumed. Your answer has been kept.".into(),
+            ));
+        }
+        for attempt in 0..2 {
+            // Read native state once per submission, also supporting questions
+            // from a child without substituting the parent's active turn ID.
+            let thread = self
+                .read_question_thread(&input.question.target)
+                .await
+                .map_err(Error::Rejected)?;
+            if let Some(delivery) = find_answer_in_history(&thread, &input.submission_id) {
+                return Ok(delivery);
+            }
+            let active = thread
+                .get("turns")
+                .and_then(Value::as_array)
+                .and_then(|turns| turns.iter().rev().find(|t| t["status"] == "inProgress"))
+                .and_then(|t| t["id"].as_str())
+                .map(str::to_owned);
+            if let Some(turn_id) = active {
+                let params = super::protocol::TurnSteerParams {
+                    thread_id: input.question.target.clone(),
+                    expected_turn_id: turn_id.clone(),
+                    client_user_message_id: input.submission_id.clone(),
+                    input: vec![TurnInputItem::Text {
+                        text: text.clone(),
+                        text_elements: vec![],
+                    }],
+                };
+                match self
+                    .child
+                    .request("turn/steer", serde_json::to_value(params).unwrap())
+                    .await
+                {
+                    Ok(value) => {
+                        let accepted =
+                            value.get("turnId").and_then(Value::as_str).ok_or_else(|| {
+                                Error::Unknown(
+                                    "Codex accepted the answer but returned no turn ID.".into(),
+                                )
+                            })?;
+                        return Ok(Delivery::Inflight {
+                            turn_id: TurnId(accepted.into()),
+                        });
+                    }
+                    Err(crate::json_rpc_child::RpcChildError::RpcError(error))
+                        if attempt == 0 && steer_precondition_rejected(&error) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(question_rpc_error(error)),
+                }
+            } else {
+                if input.question.target != root {
+                    return Err(Error::Rejected("This subagent is no longer running. Continue in the main conversation to discuss its question.".into()));
+                }
+                if !self.state.lock().await.pending_approvals.is_empty() {
+                    return Err(Error::Rejected(
+                        "Resolve the pending approval before starting a follow-up.".into(),
+                    ));
+                }
+                if let Some(checkpoint) = &input.checkpoint {
+                    checkpoint.prepare().await;
+                }
+                let result = self
+                    .do_send_with_id(
+                        text.clone(),
+                        vec![],
+                        vec![],
+                        None,
+                        None,
+                        Some(input.submission_id.clone()),
+                    )
+                    .await;
+                match result {
+                    Ok(turn_id) => {
+                        if let Some(checkpoint) = &input.checkpoint {
+                            checkpoint.commit().await;
+                        }
+                        return Ok(Delivery::NewTurn { turn_id });
+                    }
+                    Err(error) => {
+                        if let Some(checkpoint) = &input.checkpoint {
+                            checkpoint.abort().await;
+                        }
+                        return Err(question_turn_start_error(error));
+                    }
+                }
+            }
+        }
+        Err(Error::Rejected(
+            "The active turn changed. Try submitting your answer again.".into(),
+        ))
+    }
+
+    async fn read_question_thread(&self, target: &str) -> Result<Value, String> {
+        let value = self
+            .child
+            .request(
+                "thread/read",
+                json!({"threadId": target, "includeTurns": true}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let thread = value
+            .get("thread")
+            .ok_or("Codex returned no conversation.")?;
+        if thread["id"].as_str() != Some(target) || !thread["turns"].is_array() {
+            return Err("Codex did not return the requested conversation history.".into());
+        }
+        Ok(thread.clone())
+    }
+
+    pub async fn find_question_answer(
+        &self,
+        target: &str,
+        submission_id: &str,
+    ) -> Result<Option<crate::agent_provider::QuestionDelivery>, String> {
+        let thread = self.read_question_thread(target).await?;
+        Ok(find_answer_in_history(&thread, submission_id))
     }
 
     /// Interrupt the currently active turn. If `turn_id` is provided,
@@ -1749,4 +1935,140 @@ mod tests {
             .unwrap()
             .contains("registry is unavailable"));
     }
+
+    fn rpc_failure(code: i64) -> TurnStartError {
+        TurnStartError::Rpc(crate::json_rpc_child::RpcChildError::RpcError(
+            crate::json_rpc_child::RpcError {
+                code,
+                message: "thread not found".into(),
+                data: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn plain_send_failure_keeps_turn_start_wording() {
+        // An ordinary user send must not borrow the answer-delivery
+        // wording; the toast keeps naming the RPC that failed.
+        for code in [-32000, -32603, -32600] {
+            let ProviderError::RpcError { message } = plain_send_error(rpc_failure(code)) else {
+                panic!("expected an rpc error");
+            };
+            assert!(message.starts_with("turn/start failed: "), "{message}");
+            assert!(!message.contains("Answer delivery"), "{message}");
+        }
+        let malformed = serde_json::from_value::<TurnStartResponse>(json!({})).unwrap_err();
+        let ProviderError::RpcError { message } =
+            plain_send_error(TurnStartError::Malformed(malformed))
+        else {
+            panic!("expected an rpc error");
+        };
+        assert!(
+            message.starts_with("malformed turn/start response: "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn question_turn_start_failure_distinguishes_unknown_from_rejected() {
+        use crate::agent_provider::QuestionDeliveryError as Error;
+        assert!(matches!(
+            question_turn_start_error(rpc_failure(-32000)),
+            Error::Unknown(m) if m.starts_with("Answer delivery could not be confirmed: ")
+        ));
+        assert!(matches!(
+            question_turn_start_error(rpc_failure(-32600)),
+            Error::Rejected(_)
+        ));
+        let malformed = serde_json::from_value::<TurnStartResponse>(json!({})).unwrap_err();
+        assert!(matches!(
+            question_turn_start_error(TurnStartError::Malformed(malformed)),
+            Error::Unknown(m) if m.starts_with("Malformed turn/start response: ")
+        ));
+    }
+}
+
+/// Why `turn/start` produced no turn id. Kept raw so each caller words
+/// the failure for its own surface: a plain user send reports a generic
+/// RPC failure, while answer delivery must tell a confirmed rejection
+/// apart from one whose outcome is unknown.
+#[derive(Debug)]
+enum TurnStartError {
+    Rpc(crate::json_rpc_child::RpcChildError),
+    Malformed(serde_json::Error),
+}
+
+/// Wording for an ordinary user send that failed at `turn/start`.
+fn plain_send_error(error: TurnStartError) -> ProviderError {
+    ProviderError::RpcError {
+        message: match error {
+            TurnStartError::Rpc(e) => format!("turn/start failed: {e}"),
+            TurnStartError::Malformed(e) => format!("malformed turn/start response: {e}"),
+        },
+    }
+}
+
+/// Wording for a question answer that failed at `turn/start`.
+fn question_turn_start_error(
+    error: TurnStartError,
+) -> crate::agent_provider::QuestionDeliveryError {
+    match error {
+        TurnStartError::Rpc(e) => question_rpc_error(e),
+        TurnStartError::Malformed(e) => crate::agent_provider::QuestionDeliveryError::Unknown(
+            format!("Malformed turn/start response: {e}"),
+        ),
+    }
+}
+
+fn question_rpc_error(
+    error: crate::json_rpc_child::RpcChildError,
+) -> crate::agent_provider::QuestionDeliveryError {
+    use crate::agent_provider::QuestionDeliveryError as Error;
+    match error {
+        // The transport also uses -32000 when its child exits with an
+        // outstanding request. That is not proof the provider rejected it.
+        crate::json_rpc_child::RpcChildError::RpcError(error)
+            if error.code == -32000 || error.code == -32603 =>
+        {
+            Error::Unknown(format!("Answer delivery could not be confirmed: {error}"))
+        }
+        crate::json_rpc_child::RpcChildError::RpcError(error) => Error::Rejected(error.to_string()),
+        other => Error::Unknown(format!("Answer delivery could not be confirmed: {other}")),
+    }
+}
+
+fn steer_precondition_rejected(error: &crate::json_rpc_child::RpcError) -> bool {
+    // Only explicit server rejections are eligible for retry; never timeouts.
+    let message = error.message.to_ascii_lowercase();
+    matches!(error.code, -32600 | -32000)
+        && (message.contains("no active turn")
+            || message.contains("expected turn")
+            || message.contains("turn id mismatch"))
+}
+
+fn find_answer_in_history(
+    thread: &Value,
+    submission_id: &str,
+) -> Option<crate::agent_provider::QuestionDelivery> {
+    use crate::agent_provider::QuestionDelivery;
+    for turn in thread.get("turns")?.as_array()? {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, item) in items
+            .iter()
+            .filter(|item| item["type"] == "userMessage")
+            .enumerate()
+        {
+            if item["type"] == "userMessage" && item["clientId"].as_str() == Some(submission_id) {
+                let turn_id = TurnId(turn.get("id")?.as_str()?.to_string());
+                return Some(if index == 0 {
+                    QuestionDelivery::NewTurn { turn_id }
+                } else {
+                    QuestionDelivery::Inflight { turn_id }
+                });
+            }
+        }
+    }
+    None
 }

@@ -1799,7 +1799,7 @@ pub fn plan_boot_mcp_reconciliation(
 /// blocking worker after first paint without inspecting a checkout twice.
 pub fn reconcile_mcp_config_targets(targets: &[McpConfigReconciliationTarget]) {
     for target in targets {
-        upsert_mcp_config(&target.workspace_dir, &target.workspace_id);
+        upsert_mcp_config(&target.workspace_dir);
     }
 }
 
@@ -1819,18 +1819,19 @@ fn reconcile_live_mcp_config_targets<R: tauri::Runtime>(
 ) -> usize {
     use tauri::Manager as _;
 
+    // Re-read both preference and ownership at the final filesystem commit
+    // point. The startup plan is intentionally stale by the time first paint
+    // occurs: users can close workspaces or disable auto-MCP during that gap.
+    // The preference is global, not per checkout, so one SQLite read covers
+    // the whole batch.
+    if !is_auto_mcp_enabled(app) {
+        return 0;
+    }
     let mut repaired = 0;
     for target in targets {
         let _io_guard = MCP_CONFIG_IO_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Re-read both preference and ownership at the final filesystem
-        // commit point. The startup plan is intentionally stale by the time
-        // first paint occurs: users can close workspaces or disable auto-MCP
-        // during that gap.
-        if !is_auto_mcp_enabled(app) {
-            continue;
-        }
         let state: tauri::State<'_, crate::state::AppStateStore> = app.state();
         if !reconciliation_target_is_live(&state.snapshot(), target) {
             continue;
@@ -1914,7 +1915,7 @@ pub async fn repair_inactive_mcp_configs<R: tauri::Runtime>(
 /// - If it exists with valid JSON, merges the codemux entry alongside any
 ///   existing servers (shadcn, database tools, etc.) — never removes them.
 /// - If it exists but is invalid JSON, logs a warning and does NOT modify it.
-pub fn upsert_mcp_config(workspace_dir: &Path, _workspace_id: &str) {
+pub fn upsert_mcp_config(workspace_dir: &Path) {
     upsert_mcp_config_with_entry(workspace_dir, codemux_mcp_entry());
 }
 
@@ -2474,7 +2475,7 @@ mod tests {
     #[test]
     fn mcp_json_create_new() {
         let dir = test_dir("mcp_create_new");
-        upsert_mcp_config(&dir, "ws-123");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         assert!(config["mcpServers"]["codemux"]["command"].as_str().is_some_and(|c| !c.is_empty()));
@@ -2492,7 +2493,7 @@ mod tests {
             r#"{"mcpServers":{"shadcn":{"command":"npx","args":["shadcn@latest","mcp"]}}}"#,
         ).unwrap();
 
-        upsert_mcp_config(&dir, "ws-456");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         // shadcn preserved
@@ -2512,7 +2513,7 @@ mod tests {
             r#"{"mcpServers":{"codemux":{"command":"old","args":["old"]},"other":{"command":"x"}}}"#,
         ).unwrap();
 
-        upsert_mcp_config(&dir, "ws-new");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         // codemux updated
@@ -2530,7 +2531,7 @@ mod tests {
         let bad_content = "not json{{{";
         std::fs::write(dir.join(".mcp.json"), bad_content).unwrap();
 
-        upsert_mcp_config(&dir, "ws-789");
+        upsert_mcp_config(&dir);
 
         // File unchanged
         let content = std::fs::read_to_string(dir.join(".mcp.json")).unwrap();
@@ -2551,7 +2552,7 @@ mod tests {
         let before = std::fs::metadata(&path).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        upsert_mcp_config(&dir, "ws-111");
+        upsert_mcp_config(&dir);
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         let after = std::fs::metadata(&path).unwrap();
@@ -2602,9 +2603,9 @@ mod tests {
     #[test]
     fn mcp_json_workspace_id_change_is_a_noop() {
         let dir = test_dir("mcp_id_update");
-        upsert_mcp_config(&dir, "ws-old-id");
+        upsert_mcp_config(&dir);
         let before = std::fs::read(dir.join(".mcp.json")).unwrap();
-        upsert_mcp_config(&dir, "ws-new-id");
+        upsert_mcp_config(&dir);
 
         let config = read_mcp(&dir);
         assert!(config["mcpServers"]["codemux"].get("env").is_none());
@@ -2917,7 +2918,7 @@ mod tests {
     #[test]
     fn upsert_uses_atomic_write_no_tmp_leftover() {
         let dir = test_dir("upsert_atomic");
-        upsert_mcp_config(&dir, "ws-atomic");
+        upsert_mcp_config(&dir);
 
         assert!(dir.join(".mcp.json").exists());
         assert!(

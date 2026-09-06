@@ -2032,3 +2032,13 @@ mod tests {
         assert_eq!(value["dynamicTools"][0]["inputSchema"]["type"], "object");
     }
 }
+
+/// Native non-interrupting input. The turn precondition prevents a stale send.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerParams {
+    pub thread_id: String,
+    pub expected_turn_id: String,
+    pub client_user_message_id: String,
+    pub input: Vec<TurnInputItem>,
+}

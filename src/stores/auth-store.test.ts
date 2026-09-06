@@ -81,7 +81,6 @@ beforeEach(() => {
     isLoading: true,
     isSigningIn: false,
     error: null,
-    devBypass: false,
     sessionStatus: "signed-out",
     syncAvailable: false,
     authMethod: null,
@@ -128,7 +127,6 @@ describe("auth store", () => {
     const state = useAuthStore.getState();
     expect(state.isLoading).toBe(false);
     expect(state.isAuthenticated).toBe(false);
-    expect(state.devBypass).toBe(false);
     expect(state.user).toBeNull();
   });
 
