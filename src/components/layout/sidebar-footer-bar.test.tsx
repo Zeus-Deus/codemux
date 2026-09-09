@@ -143,6 +143,25 @@ describe("SidebarFooterBar — expanded", () => {
     expect(setShowAutomationsMock).toHaveBeenCalledWith(true);
   });
 
+  it("keeps the icon destinations clustered with the menu on the right", () => {
+    hosts = [host(1, "zeus")];
+    statuses = { 1: status(1, { reachable: true }) };
+    const { container } = renderFooter(true);
+
+    const menu = container.querySelector(
+      'button[aria-label="Menu"]',
+    ) as HTMLElement;
+    const cluster = menu.parentElement as HTMLElement;
+    // The slack a labelled destination opens up belongs before the cluster,
+    // not as a hole between the last icon and the gear.
+    expect(cluster.className).toContain("ml-auto");
+    expect(
+      cluster.querySelector('[data-testid="sidebar-devices"]'),
+    ).not.toBeNull();
+    // The labelled headline stays outside the cluster, on the left.
+    expect(cluster.querySelector('button[aria-label="Automations"]')).toBeNull();
+  });
+
   it("hides the Devices button until a device is configured", () => {
     const { container } = renderFooter(true);
     expect(container.querySelector('[data-testid="sidebar-devices"]')).toBeNull();
