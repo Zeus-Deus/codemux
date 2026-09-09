@@ -646,11 +646,16 @@ function PreviewCodeLine({
   );
 }
 
+/**
+ * The real terminal paints `--background`; the preview only dips a touch
+ * below the page so it reads as a pane. A 16% black mix is right on a dark
+ * canvas but lands as a grey slab on white, so light dips 4%.
+ */
 function TerminalPreview({ family, size }: { family: string; size: number }) {
   return (
     <PreviewFrame>
       <div
-        className="overflow-x-auto bg-[color-mix(in_srgb,var(--background)_84%,black)] px-3 py-2.5"
+        className="overflow-x-auto bg-[color-mix(in_srgb,var(--background)_96%,black)] px-3 py-2.5 dark:bg-[color-mix(in_srgb,var(--background)_84%,black)]"
         style={{ fontFamily: family, fontSize: size, lineHeight: 1.5 }}
       >
         <p className="whitespace-pre">

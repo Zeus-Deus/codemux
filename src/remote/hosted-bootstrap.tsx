@@ -16,6 +16,7 @@
 import React from "react";
 import {
   BootstrapOverlay,
+  bootstrapColors,
   cardStyle,
   errorStyle,
   inputStyle,
@@ -385,7 +386,7 @@ function DevicePicker(props: {
             <span
               style={{
                 fontSize: 11.5,
-                color: "var(--muted-foreground, #9a9a97)",
+                color: bootstrapColors.mutedForeground,
               }}
             >
               {device.platform}
@@ -465,7 +466,7 @@ function Spinner(props: { title: string; detail: string }): React.ReactElement {
           height: 26,
           margin: "0 auto 18px",
           borderRadius: "50%",
-          border: "2.5px solid var(--border, rgba(255,255,255,0.15))",
+          border: `2.5px solid ${bootstrapColors.hairline}`,
           borderTopColor: "var(--accent-ember, oklch(0.705 0.152 47))",
           animation: "codemux-hosted-spin 0.8s linear infinite",
         }}
@@ -477,7 +478,7 @@ function Spinner(props: { title: string; detail: string }): React.ReactElement {
         style={{
           fontSize: 12.5,
           lineHeight: 1.5,
-          color: "var(--muted-foreground, #9a9a97)",
+          color: bootstrapColors.mutedForeground,
         }}
       >
         {props.detail}
@@ -498,7 +499,7 @@ const titleStyle: React.CSSProperties = {
 const subtitleStyle: React.CSSProperties = {
   fontSize: 13,
   lineHeight: 1.5,
-  color: "var(--muted-foreground, #9a9a97)",
+  color: bootstrapColors.mutedForeground,
   marginBottom: 18,
 };
 
@@ -512,9 +513,9 @@ const githubButtonStyle = (busy: boolean): React.CSSProperties => ({
   fontSize: 13.5,
   fontWeight: 600,
   cursor: busy ? "default" : "pointer",
-  color: "var(--foreground, #e8e8e8)",
-  background: "var(--background, #0C0C0E)",
-  border: "1px solid var(--input, rgba(255,255,255,0.15))",
+  color: bootstrapColors.foreground,
+  background: bootstrapColors.background,
+  border: `1px solid ${bootstrapColors.fieldBorder}`,
   borderRadius: 9,
   opacity: busy ? 0.7 : 1,
 });
@@ -529,19 +530,19 @@ const dividerStyle: React.CSSProperties = {
 const dividerLineStyle: React.CSSProperties = {
   flex: 1,
   height: 1,
-  background: "var(--border, rgba(255,255,255,0.1))",
+  background: bootstrapColors.hairline,
 };
 
 const dividerTextStyle: React.CSSProperties = {
   fontSize: 11,
-  color: "var(--muted-foreground, #9a9a97)",
+  color: bootstrapColors.mutedForeground,
 };
 
 const derivationNoteStyle: React.CSSProperties = {
   marginTop: 14,
   fontSize: 11,
   lineHeight: 1.45,
-  color: "var(--muted-foreground, #9a9a97)",
+  color: bootstrapColors.mutedForeground,
 };
 
 const deviceRowStyle: React.CSSProperties = {
@@ -552,9 +553,9 @@ const deviceRowStyle: React.CSSProperties = {
   textAlign: "left",
   padding: "11px 13px",
   cursor: "pointer",
-  color: "var(--foreground, #e8e8e8)",
-  background: "var(--background, #0C0C0E)",
-  border: "1px solid var(--input, rgba(255,255,255,0.15))",
+  color: bootstrapColors.foreground,
+  background: bootstrapColors.background,
+  border: `1px solid ${bootstrapColors.fieldBorder}`,
   borderRadius: 9,
 };
 

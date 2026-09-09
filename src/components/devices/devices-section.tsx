@@ -310,7 +310,11 @@ function DeviceCardView({
           <button
             type="button"
             onClick={() => void openUrl(HOSTED_CLIENT_URL)}
-            className="shrink-0 rounded-[7px] bg-accent-ember px-3 py-1.5 text-[11px] font-semibold text-white shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
+            // Ink on the brand accent is the palette's own readable pair for
+            // it (`sidebarPrimary` is the brand accent, and its foreground is
+            // solved against it) — a literal white only ever cleared 2.8:1 on
+            // the dark ember and would not survive a light theme's darker one.
+            className="shrink-0 rounded-[7px] bg-accent-ember px-3 py-1.5 text-[11px] font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
           >
             Connect
           </button>

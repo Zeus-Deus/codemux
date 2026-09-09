@@ -148,6 +148,22 @@ describe("command palette — theme picker", () => {
     expect(screen.getByText("Paste a VS Code or shadcn theme…")).toBeInTheDocument();
   });
 
+  it("finds the light themes by scheme, and every row says which it is", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "light");
+
+    // "light" is how you ask for the one light theme in an otherwise dark
+    // list — it is part of the row's search text, not just its label.
+    const lightRow = screen.getByText("Graphite Light").closest("[cmdk-item]");
+    expect(lightRow).toHaveTextContent("light");
+    expect(screen.queryByText("Abyss")).not.toBeInTheDocument();
+
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "theme");
+    expect(screen.getByText("Abyss").closest("[cmdk-item]")).toHaveTextContent("dark");
+  });
+
   it("repaints the app for the highlighted row without committing anything", async () => {
     const user = userEvent.setup();
     renderPalette();

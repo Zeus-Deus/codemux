@@ -28,8 +28,6 @@ if (import.meta.env.DEV) {
     queryClient;
 }
 
-document.documentElement.classList.add("dark");
-
 function dismissSplash() {
   const splash = document.getElementById("splash");
   if (!splash) return;

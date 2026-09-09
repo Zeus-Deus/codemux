@@ -1,29 +1,46 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   ANSI_SLOTS,
   BUILT_IN_THEMES,
   THEME_ROLES,
+  THEME_BOOT_STORAGE_KEY,
   THEME_ROLE_VARIABLES,
+  applyTheme,
   contrastRatio,
   createGeneratedTheme,
   importThemeDetailed,
   importThemeText,
   normalizeColor,
   parseCustomTheme,
+  relativeLuminance,
+  schemeForBackground,
   serializeTheme,
 } from "./themes";
 
 describe("theme registry", () => {
-  it("ships complete, unique, dark built-ins", () => {
+  it("ships complete, unique built-ins whose scheme matches their canvas", () => {
     expect(new Set(BUILT_IN_THEMES.map((theme) => theme.id)).size).toBe(BUILT_IN_THEMES.length);
     for (const theme of BUILT_IN_THEMES) {
-      expect(theme.scheme).toBe("dark");
+      expect(theme.scheme).toBe(schemeForBackground(theme.roles.background));
       expect(Object.keys(theme.roles).sort()).toEqual([...THEME_ROLES].sort());
       expect(Object.keys(theme.ansi).sort()).toEqual([...ANSI_SLOTS].sort());
     }
+  });
+
+  it("offers a light built-in alongside Graphite", () => {
+    const light = BUILT_IN_THEMES.find((theme) => theme.id === "graphite-light");
+    expect(light?.label).toBe("Graphite Light");
+    expect(light?.scheme).toBe("light");
+    // The brand accent has to survive directly on the canvas as inline code
+    // and as a status dot, which is why it is not Graphite's own ember.
+    expect(contrastRatio(light!.roles.brandAccent, light!.roles.background)).toBeGreaterThanOrEqual(3);
+    expect(contrastRatio(light!.roles.foreground, light!.roles.background)).toBeGreaterThanOrEqual(7);
+    expect(contrastRatio(light!.roles.mutedForeground, light!.roles.background)).toBeGreaterThanOrEqual(4.5);
+    expect(relativeLuminance(light!.ansi.black)).toBeLessThan(0.1);
+    expect(relativeLuminance(light!.ansi.white)).toBeGreaterThan(0.5);
   });
 
   it("generates a complete contrast-solved palette from two colors", () => {
@@ -36,8 +53,53 @@ describe("theme registry", () => {
     expect(Object.keys(theme.ansi)).toHaveLength(16);
   });
 
-  it("rejects a light canvas until the app shell supports light mode", () => {
-    expect(() => createGeneratedTheme("Day", "#ffffff", "#0066cc")).toThrow(/Light themes/);
+  it("turns a light canvas into a light theme instead of refusing it", () => {
+    const theme = createGeneratedTheme("Day", "#ffffff", "#0066cc");
+    expect(theme.scheme).toBe("light");
+    expect(contrastRatio(theme.roles.foreground, theme.roles.background)).toBeGreaterThanOrEqual(7);
+    expect(contrastRatio(theme.roles.mutedForeground, theme.roles.background)).toBeGreaterThanOrEqual(4.5);
+
+    // Surfaces step *away* from the canvas, which on white means downward.
+    const canvas = relativeLuminance(theme.roles.background);
+    for (const role of ["card", "secondary", "border", "input"] as const) {
+      expect(relativeLuminance(theme.roles[role])).toBeLessThan(canvas);
+    }
+    // …and the ramp still has to be legible as a ramp.
+    expect(relativeLuminance(theme.roles.border)).toBeLessThan(relativeLuminance(theme.roles.card));
+    expect(relativeLuminance(theme.roles.input)).toBeLessThan(relativeLuminance(theme.roles.border));
+
+    // Only the terminal's default pair follows the scheme; the named slots
+    // keep their names' meaning so `\e[30m` never paints white on white.
+    expect(relativeLuminance(theme.ansi.black)).toBeLessThan(0.1);
+    expect(relativeLuminance(theme.ansi.white)).toBeGreaterThan(0.5);
+    expect(relativeLuminance(theme.ansi.brightWhite)).toBeGreaterThan(relativeLuminance(theme.ansi.white));
+  });
+
+  it("keeps a dark canvas dark, deltas and all", () => {
+    const theme = createGeneratedTheme("Night", "#10171b", "#e07850");
+    expect(theme.scheme).toBe("dark");
+    const canvas = relativeLuminance(theme.roles.background);
+    for (const role of ["card", "secondary", "border", "input"] as const) {
+      expect(relativeLuminance(theme.roles[role])).toBeGreaterThan(canvas);
+    }
+    expect(theme.ansi.black).toBe("#10171b");
+  });
+
+  it("round-trips a light theme's scheme and lets the canvas overrule a wrong one", () => {
+    const light = createGeneratedTheme("Day", "#ffffff", "#0066cc");
+    const serialized = JSON.parse(serializeTheme(light));
+    expect(serialized.scheme).toBe("light");
+    expect(parseCustomTheme(serialized)?.scheme).toBe("light");
+
+    // The palette is the truth: a file can claim whatever it likes.
+    const lying = parseCustomTheme({
+      version: 1,
+      id: "custom-lying",
+      label: "Lying",
+      scheme: "dark",
+      roles: { background: "#ffffff", primary: "#0066cc" },
+    });
+    expect(lying?.scheme).toBe("light");
   });
 
   it("flattens hex and OKLCH alpha over the resolved background", () => {
@@ -132,6 +194,45 @@ describe("no-flash boot parity", () => {
 
   it("knows every runtime role variable", () => {
     for (const variable of Object.values(THEME_ROLE_VARIABLES)) expect(html).toContain(variable);
+  });
+
+  it("replays the stored scheme before the first frame, defaulting to dark", () => {
+    // Static default: nothing in storage must still paint Graphite.
+    expect(html).toContain('<html lang="en" class="dark">');
+    expect(html).toContain('stored.scheme === "light"');
+    expect(html).toContain('root.classList.toggle("dark", bootScheme === "dark")');
+    expect(html).toContain("root.style.colorScheme = bootScheme");
+  });
+});
+
+describe("applyTheme", () => {
+  const light = BUILT_IN_THEMES.find((theme) => theme.id === "graphite-light")!;
+  const dark = BUILT_IN_THEMES[0]!;
+
+  afterEach(() => {
+    applyTheme(dark, { animate: false, persist: false });
+  });
+
+  it("hands the scheme to the document root, not just the variables", () => {
+    applyTheme(light, { animate: false, persist: false });
+    const root = document.documentElement;
+    expect(root.classList.contains("dark")).toBe(false);
+    expect(root.style.colorScheme).toBe("light");
+    expect(root.dataset.themeScheme).toBe("light");
+    expect(root.dataset.themeId).toBe("graphite-light");
+    expect(root.style.getPropertyValue(THEME_ROLE_VARIABLES.background)).toBe(light.roles.background);
+
+    applyTheme(dark, { animate: false, persist: false });
+    expect(root.classList.contains("dark")).toBe(true);
+    expect(root.style.colorScheme).toBe("dark");
+    expect(root.dataset.themeScheme).toBe("dark");
+  });
+
+  it("persists the scheme so the boot script can replay it", () => {
+    applyTheme(light, { animate: false });
+    const stored = JSON.parse(window.localStorage.getItem(THEME_BOOT_STORAGE_KEY) ?? "null");
+    expect(stored.scheme).toBe("light");
+    expect(stored.id).toBe("graphite-light");
   });
 });
 
@@ -279,5 +380,78 @@ describe("VS Code import — picking the theme's identity colour", () => {
       }),
     );
     expect(contrastRatio(theme.roles.brandAccent, theme.roles.background)).toBeGreaterThanOrEqual(2.9);
+  });
+});
+
+describe("VS Code light import", () => {
+  // A trimmed VS Code Light Modern: white canvas, dark ink, and the blue
+  // button colour every Microsoft light theme uses as its identity.
+  const lightModernish = {
+    name: "Light Modernish",
+    type: "light",
+    colors: {
+      "editor.background": "#ffffff",
+      "editor.foreground": "#3b3b3b",
+      "button.background": "#005fb8",
+      "sideBar.background": "#f8f8f8",
+      descriptionForeground: "#3b3b3b",
+    },
+  };
+
+  it("classifies a white canvas as a light theme", () => {
+    const { theme } = importThemeDetailed(JSON.stringify(lightModernish));
+    expect(theme.scheme).toBe("light");
+    expect(theme.roles.background.toLowerCase()).toBe("#ffffff");
+    expect(theme.roles.brandAccent.toLowerCase()).toBe("#005fb8");
+  });
+
+  it("keeps the imported palette readable on its own canvas", () => {
+    const { theme } = importThemeDetailed(JSON.stringify(lightModernish));
+    const bg = theme.roles.background;
+    expect(contrastRatio(theme.roles.foreground, bg)).toBeGreaterThanOrEqual(7);
+    expect(contrastRatio(theme.roles.mutedForeground, bg)).toBeGreaterThanOrEqual(4.5);
+    // The accent has to survive as inline code on the canvas, whichever way
+    // the canvas points.
+    expect(contrastRatio(theme.roles.brandAccent, bg)).toBeGreaterThanOrEqual(3);
+    // Surfaces step *down* from a white canvas, not up past it.
+    expect(relativeLuminance(theme.roles.card)).toBeLessThan(relativeLuminance(bg));
+  });
+
+  it("lifts an illegible accent by darkening it, not lightening it", () => {
+    // Every brand token is a near-white the canvas swallows; on a light theme
+    // the only way out is down.
+    const { theme } = importThemeDetailed(
+      JSON.stringify({
+        type: "light",
+        colors: { "editor.background": "#ffffff", "activityBarBadge.background": "#f2f2f2" },
+      }),
+    );
+    expect(contrastRatio(theme.roles.brandAccent, theme.roles.background)).toBeGreaterThanOrEqual(2.9);
+    expect(relativeLuminance(theme.roles.brandAccent)).toBeLessThan(
+      relativeLuminance(theme.roles.background),
+    );
+  });
+
+  it("composites a translucent canvas over white when the file declares light", () => {
+    // Flattened over black — the dark-theme assumption — `#ffffffcc` lands on
+    // a mid grey and the whole import comes back dark.
+    const { theme } = importThemeDetailed(
+      JSON.stringify({
+        type: "light",
+        colors: { "editor.background": "#ffffffcc", "button.background": "#005fb8" },
+      }),
+    );
+    expect(theme.scheme).toBe("light");
+  });
+
+  it("trusts the canvas over a file that mislabels itself", () => {
+    const { theme } = importThemeDetailed(
+      JSON.stringify({
+        type: "dark",
+        colors: { "editor.background": "#fdfdfd", "button.background": "#005fb8" },
+      }),
+    );
+    expect(theme.scheme).toBe("light");
+    expect(contrastRatio(theme.roles.foreground, theme.roles.background)).toBeGreaterThanOrEqual(7);
   });
 });

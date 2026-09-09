@@ -450,8 +450,8 @@ function GenerateColumn({
         <SolvedRoles theme={theme} />
       ) : (
         <p className="rounded-[9px] border border-warning/25 bg-warning/10 px-3 py-2 text-[11px] leading-relaxed text-warning">
-          Use valid colors and keep the background dark enough — Codemux themes
-          are dark-only for now.
+          Use a valid hex or OKLCH background and accent. Either polarity works
+          — the background's brightness is what makes the theme light or dark.
         </p>
       )}
 
@@ -480,12 +480,17 @@ function SolvedRoles({ theme }: { theme: ThemeDefinition }) {
         <span className="font-mono text-[10px] text-muted-foreground">
           {THEME_ROLES.length} tokens
         </span>
+        {/* Which way the palette was solved, decided by the background you
+            typed rather than by a switch you have to find. */}
+        <span className="font-mono text-[10px] text-muted-foreground/70">
+          · {theme.scheme}
+        </span>
       </div>
       <div className="grid grid-cols-8 gap-[5px]">
         {swatches.map((color, index) => (
           <span
             key={`${color}-${index}`}
-            className="h-[22px] rounded-[5px] border border-white/[0.09]"
+            className="h-[22px] rounded-[5px] border border-foreground/10"
             style={{ background: normalizeColor(color, normalizeColor(theme.roles.background) ?? "#000") ?? color }}
           />
         ))}

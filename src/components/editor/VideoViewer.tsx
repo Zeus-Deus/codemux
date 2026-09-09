@@ -48,6 +48,13 @@ export function VideoViewer({ filePath }: Props) {
   }
 
   return (
+    // Cinema stage — deliberately dark in BOTH schemes. A player is judged
+    // against the frame it is showing, not against the app around it, so a
+    // light theme gets the same backdrop a dark one does. Kept a hair off
+    // pure black so the video's own `bg-black` letterbox stays distinguishable
+    // from the stage behind it; the white spinner sits on this stage too.
+    // (The error fallback below is the opposite case — it is UI, not media,
+    // so it paints on `--background`.)
     <div
       data-testid="video-viewer"
       className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[#050505] p-3 sm:p-4"

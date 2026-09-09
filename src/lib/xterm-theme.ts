@@ -1,7 +1,15 @@
 import type { ITheme } from "@xterm/xterm";
 import type { ThemeColors } from "@/tauri/types";
 
-/** Maps the shared app/system syntax palette into xterm's named slots. */
+/**
+ * Maps the shared app/system syntax palette into xterm's named slots.
+ *
+ * Straight pass-through, including for the scheme-sensitive slots: the
+ * selection pair is already resolved for the palette's canvas by
+ * `themeToSyntaxColors` (or by the desktop theme on the "system" path), and
+ * `cursorAccent` is the canvas itself so a block cursor inverts whichever way
+ * the scheme runs.
+ */
 export function themeColorsToXtermTheme(theme: ThemeColors): ITheme {
   return {
     background: theme.background,

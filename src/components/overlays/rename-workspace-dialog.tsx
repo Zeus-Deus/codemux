@@ -182,7 +182,14 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
         }}
         className={cn(
           "top-[46%] flex w-[436px] max-w-[calc(100vw-48px)] flex-col gap-0 overflow-hidden rounded-[14px] border border-border bg-popover p-0 text-popover-foreground ring-0",
-          "shadow-[0_32px_90px_oklch(0_0_0/.62),inset_0_2px_0_oklch(1_0_0/.04)]",
+          // Same elevation language as `.cm-menu-surface`: the cast shadow
+          // stays literal black (a shadow is an absence of light, not a
+          // themed surface) but its alpha is scheme-aware, because a plume
+          // that reads as "lifted" over a dark app reads as "smeared" over a
+          // white one. The inner top highlight IS a light, so it is derived
+          // from --foreground and flips with the scheme on its own.
+          "shadow-[0_32px_90px_oklch(0_0_0/.20),inset_0_2px_0_color-mix(in_oklch,var(--foreground)_4%,transparent)]",
+          "dark:shadow-[0_32px_90px_oklch(0_0_0/.62),inset_0_2px_0_color-mix(in_oklch,var(--foreground)_4%,transparent)]",
           "sm:max-w-[436px]",
         )}
       >
@@ -308,7 +315,11 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               className={cn(
                 "flex h-[31px] shrink-0 items-center gap-2 rounded-lg pr-3 pl-[13px] text-[12.5px] font-semibold tracking-[-0.005em] transition-[background-color,opacity,filter] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 isDirty && !isError
-                  ? "cursor-pointer bg-accent-ember text-[oklch(0.16_0.02_47)] hover:brightness-105"
+                  // The ink on the brand accent comes from the palette, not
+                  // from a literal: a light theme darkens its ember, and
+                  // `sidebar-primary-foreground` is the readable pair the
+                  // theme already computed for that exact colour.
+                  ? "cursor-pointer bg-accent-ember text-sidebar-primary-foreground hover:brightness-105"
                   : "cursor-not-allowed bg-accent text-muted-foreground",
                 isError && "opacity-50",
                 submitting && "opacity-60",

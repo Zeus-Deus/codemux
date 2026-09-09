@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { whiteMarkClass } from "@/components/icons/preset-icon";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 // Reuse the branded marks Codemux already ships for the preset bar
@@ -38,7 +39,9 @@ export function ProviderLogo({ provider, className }: Props) {
       src={PROVIDER_ICON_MAP[provider]}
       alt={PROVIDER_LABEL[provider]}
       data-provider={provider}
-      className={cn("shrink-0 object-contain", className)}
+      // Same marks, same problem: `codex` is a white-only silhouette, so it
+      // has to flip with the scheme or the provider chip renders empty.
+      className={cn("shrink-0 object-contain", whiteMarkClass(provider), className)}
     />
   );
 }

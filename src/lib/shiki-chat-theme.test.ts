@@ -46,6 +46,21 @@ describe("buildChatCodeThemes", () => {
     expect(light.name).not.toBe(dark.name);
   });
 
+  // Streamdown picks between the two slots with a `dark:` variant bound to
+  // the `.dark` class, which the active palette owns. Filling both slots from
+  // that same palette is what makes the choice a no-op: a light theme keeps
+  // its own colors even though the class picks the "light" slot, and a dark
+  // theme keeps its own even though the class picks the "dark" one.
+  it("fills both slots from the active palette so the class choice can't mismatch", () => {
+    const [light, dark] = buildChatCodeThemes(palette);
+    const colors = (theme: (typeof light)) => ({
+      bg: (theme as { bg?: string }).bg,
+      fg: (theme as { fg?: string }).fg,
+      tokenColors: (theme as { tokenColors?: unknown }).tokenColors,
+    });
+    expect(colors(light)).toEqual(colors(dark));
+  });
+
   it("maps token scopes to the ANSI palette, matching the editor theme", () => {
     const [theme] = buildChatCodeThemes(palette);
     // Mirrors src/lib/codemirror-theme.ts so chat and the editor agree.
