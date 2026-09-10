@@ -33,6 +33,9 @@ pub const METHOD_STOP_SESSION: &str = "stop-session";
 pub const METHOD_PROBE_INSTALLED: &str = "probe-installed";
 pub const METHOD_PROBE_AUTHENTICATED: &str = "probe-authenticated";
 pub const METHOD_LIST_SESSIONS: &str = "list-sessions";
+/// Page through one on-disk session's messages (read-only history import
+/// for adopted terminal sessions).
+pub const METHOD_GET_SESSION_MESSAGES: &str = "get-session-messages";
 
 // ---------------------------------------------------------------------------
 // Request params — client → sidecar

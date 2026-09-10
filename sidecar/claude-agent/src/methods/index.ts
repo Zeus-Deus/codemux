@@ -19,6 +19,10 @@ import {
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
+import {
+  getSessionMessages,
+  type GetSessionMessagesInput,
+} from "./get-session-messages.ts";
 import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
 import { listSessions, type ListSessionsInput } from "./list-sessions.ts";
@@ -399,6 +403,31 @@ const listSessionsMethod: MethodHandler = async (params) => {
   return listSessions(input);
 };
 
+const getSessionMessagesMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "get-session-messages");
+  const sessionId = asString(p["sessionId"], "sessionId").trim();
+  if (sessionId === "") {
+    throw new InvalidParamsError("sessionId must not be empty");
+  }
+  const limit = optNumber(p["limit"], "limit");
+  if (limit === undefined || !Number.isInteger(limit) || limit < 1) {
+    throw new InvalidParamsError("limit must be an integer >= 1");
+  }
+  const input: GetSessionMessagesInput = { sessionId, limit };
+  const dir = optString(p["dir"], "dir");
+  if (dir !== undefined) input.dir = dir;
+  const beforeOffset = optNumber(p["beforeOffset"], "beforeOffset");
+  if (beforeOffset !== undefined) {
+    if (!Number.isInteger(beforeOffset) || beforeOffset < 0) {
+      throw new InvalidParamsError(
+        "beforeOffset must be an integer >= 0 when present",
+      );
+    }
+    input.beforeOffset = beforeOffset;
+  }
+  return getSessionMessages(input);
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -424,6 +453,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "list-models": listModelsMethod,
     "list-commands": listCommandsMethod,
     "list-sessions": listSessionsMethod,
+    "get-session-messages": getSessionMessagesMethod,
   };
 }
 

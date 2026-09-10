@@ -18,6 +18,9 @@ vi.mock("@/tauri/commands", () => ({
   agentChatAdoptExternalSession: vi.fn(),
   agentChatGetSession: vi.fn().mockResolvedValue(null),
   agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
+  agentChatLoadAdoptedHistory: vi
+    .fn()
+    .mockResolvedValue({ rows: [], total: 0, offset: 0 }),
   agentChatStartSession: vi.fn(
     (
       _paneId: string,
@@ -54,6 +57,7 @@ import {
   agentChatAdoptExternalSession,
   agentChatGetSession,
   agentChatListMessagesAfter,
+  agentChatLoadAdoptedHistory,
   agentChatStartSession,
   agentChatStopSession,
   type AdoptableAgentSession,
@@ -61,6 +65,10 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { adoptedSessionLastActiveAt } from "@/lib/agent-chat/adopt-external-session";
+import {
+  ADOPTED_HISTORY_PAGE_SIZE,
+  resetAdoptedHistoryForTests,
+} from "@/lib/agent-chat/adopted-history";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
@@ -158,6 +166,8 @@ beforeEach(() => {
   vi.mocked(agentChatGetSession).mockResolvedValue(null);
   vi.mocked(agentChatListMessagesAfter).mockReset();
   vi.mocked(agentChatListMessagesAfter).mockResolvedValue(DIVIDER_ROWS);
+  vi.mocked(agentChatLoadAdoptedHistory).mockClear();
+  resetAdoptedHistoryForTests();
   vi.mocked(agentChatStartSession).mockClear();
   vi.mocked(agentChatStopSession).mockClear();
   vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
@@ -217,6 +227,25 @@ describe("handleAdoptExternalSession — adoption", () => {
     expect(
       useAgentChatStore.getState().threads["chat-adopted-1"],
     ).toBeDefined();
+  });
+
+  it("starts importing the terminal history for the adopted thread once it is running", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane()),
+    );
+    await result.current.handleAdoptExternalSession(makeSession());
+
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenCalledWith(
+      "chat-adopted-1",
+      null,
+      ADOPTED_HISTORY_PAGE_SIZE,
+    );
+    expect(
+      vi.mocked(agentChatStartSession).mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      vi.mocked(agentChatLoadAdoptedHistory).mock.invocationCallOrder[0]!,
+    );
   });
 
   it("keeps Codemux's current permission mode, not the external session's", async () => {

@@ -15,6 +15,7 @@ pub mod auth;
 pub mod capabilities;
 pub mod external_sessions;
 pub mod protocol;
+pub mod session_history;
 pub mod slash_commands;
 pub(crate) mod session;
 pub mod sidecar_path;

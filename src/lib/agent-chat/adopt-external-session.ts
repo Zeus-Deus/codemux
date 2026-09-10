@@ -9,6 +9,7 @@ import {
 } from "@/tauri/commands";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { loadAdoptedHistory } from "./adopted-history";
 import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { sessionDisplayTitle } from "./session-history";
 
@@ -197,6 +198,10 @@ export async function launchAdoptedThread(
     contextWindow: launch.contextWindow,
     fastMode,
   });
+  // Fill in what happened in the terminal above the divider. Fire and
+  // forget: the session is already running, and a failed import only
+  // leaves the "agent has the full history" line in place.
+  void loadAdoptedHistory(threadId, provider);
 
   if (result.resume_divider_written && dividerVisible) {
     toast.success(

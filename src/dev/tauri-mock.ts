@@ -412,6 +412,36 @@ function findChatPaneIdForThread(threadId: string): string | null {
   return null;
 }
 
+/** Point the `agent_chat` pane `paneId` at `threadId` (and `provider`,
+ *  when given) and re-emit — the mock's stand-in for the binding
+ *  `agent_chat_start_session` persists. No-op for an unknown pane. */
+function bindThreadToPane(
+  paneId: string,
+  threadId: string,
+  provider: unknown,
+): void {
+  let changed = false;
+  const walk = (node: PaneNodeSnapshot): void => {
+    if (node.kind === "split") {
+      node.children.forEach(walk);
+      return;
+    }
+    if (node.kind !== "agent_chat" || node.pane_id !== paneId) return;
+    if (node.thread_id !== threadId) {
+      node.thread_id = threadId;
+      changed = true;
+    }
+    if (typeof provider === "string" && node.provider !== provider) {
+      node.provider = provider as typeof node.provider;
+      changed = true;
+    }
+  };
+  for (const ws of appState.workspaces) {
+    for (const surface of ws.surfaces) walk(surface.root);
+  }
+  if (changed) emitAppState();
+}
+
 function findChatPaneLocation(threadId: string): {
   workspace: WorkspaceSnapshot;
   surface: SurfaceSnapshot;
@@ -1328,6 +1358,82 @@ function mockThreadPayloads(threadId: string): string[] {
   }
   if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
   return mockWorkflowTranscript(threadId) ?? [];
+}
+
+const MOCK_ADOPTED_HISTORY_MESSAGES = 60;
+
+/** One message of the mock terminal session, by index. Six messages per
+ *  turn — prompt, a first answer, a Read call and its result, the
+ *  closing answer, then the turn end — so a page shows every row kind
+ *  the live transcript renders. */
+function mockAdoptedHistoryEnvelope(threadId: string, index: number): unknown {
+  const turn = Math.floor(index / 6) + 1;
+  const turnId = `terminal-turn-${turn}`;
+  const toolUseId = `terminal-tu-${turn}`;
+  switch (index % 6) {
+    case 0:
+      return {
+        type: "user_message",
+        thread_id: threadId,
+        client_nonce: `terminal-nonce-${turn}`,
+        text:
+          turn === 1
+            ? "Where does the resume picker decide which session leads?"
+            : `Follow-up ${turn}: check how the session list is sorted after that change.`,
+      };
+    case 1:
+      return {
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "assistant_text",
+          text: "Let me look at the picker's ordering before answering.",
+        },
+      };
+    case 2:
+      return {
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "tool_use",
+          tool_name: "Read",
+          input: { file_path: `/src/lib/agent-chat/session-history.ts` },
+          tool_use_id: toolUseId,
+        },
+      };
+    case 3:
+      return {
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "tool_result",
+          tool_use_id: toolUseId,
+          content: `export function sortSessions(rows) {\n  return rows.sort((a, b) => b.lastActive - a.lastActive);\n}`,
+          is_error: false,
+        },
+      };
+    case 4:
+      return {
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "assistant_text",
+          text: `Sessions are ordered by last activity in \`sortSessions\`, newest first — turn ${turn} of the terminal conversation confirms nothing else reorders them.`,
+        },
+      };
+    default:
+      return {
+        type: "turn_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      };
+  }
 }
 
 /** Ids are per-thread here (the real table is global), which is all the
@@ -3100,6 +3206,33 @@ const handlers: Record<string, Handler> = {
           row.id <= mockChatRevertCutoff),
     );
   },
+  // Terminal-side history behind an adopted thread (the turns that
+  // happened in the CLI before Codemux resumed it). Same payload shapes
+  // the reducer replays for `agent_chat_list_messages_after`, with
+  // NEGATIVE, strictly increasing ids so they can never collide with the
+  // thread's own rows. 60 messages so the first page lands at offset 20
+  // and "Show earlier" can be exercised exactly once.
+  agent_chat_load_adopted_history: (a) => {
+    const threadId = a.threadId as string;
+    if (!threadId.startsWith("chat-adopted-")) {
+      throw new Error(`not_adopted: ${threadId} is not an adopted session`);
+    }
+    const total = MOCK_ADOPTED_HISTORY_MESSAGES;
+    const limit = Math.max(1, (a.limit as number | null | undefined) ?? 40);
+    const before = a.beforeOffset as number | null | undefined;
+    const end = before == null ? total : Math.max(0, Math.min(before, total));
+    const start = Math.max(0, end - limit);
+    const rows: MockMessageRow[] = [];
+    const startedAt = Date.now() - 6 * 86_400_000;
+    for (let index = start; index < end; index++) {
+      rows.push({
+        id: index - total,
+        payload: JSON.stringify(mockAdoptedHistoryEnvelope(threadId, index)),
+        created_at_ms: startedAt + index * 41_000,
+      });
+    }
+    return { rows, total, offset: start };
+  },
   agent_chat_thread_head_id: (a) => {
     const threadId = a.threadId as string;
     const rows = mockThreadRows(threadId).filter(
@@ -3575,7 +3708,14 @@ const handlers: Record<string, Handler> = {
       }
     );
   },
-  agent_chat_start_session: (a) => (a.input as { thread_id: string }).thread_id,
+  // Like the real command, starting a session binds the thread to the
+  // pane and emits app state, which is how the pane learns which thread
+  // it now shows (an adopted terminal session, a resumed record).
+  agent_chat_start_session: (a) => {
+    const threadId = (a.input as { thread_id: string }).thread_id;
+    bindThreadToPane(String(a.paneId ?? ""), threadId, a.provider);
+    return threadId;
+  },
   agent_chat_send_turn: (a) => {
     const input = a.input as {
       thread_id: string;

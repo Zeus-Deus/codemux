@@ -32,6 +32,12 @@ import {
   assistantReferencePaths,
 } from "@/lib/agent-chat/reference-cwd";
 import { adoptedSessionLastActiveAt } from "@/lib/agent-chat/adopt-external-session";
+import {
+  loadAdoptedHistory,
+  loadEarlierAdoptedHistory,
+  useAdoptedHistory,
+  type AdoptedHistoryState,
+} from "@/lib/agent-chat/adopted-history";
 import { agentDisplayName } from "@/lib/agent-chat/agent-display-name";
 import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
@@ -41,6 +47,10 @@ import {
   registerTitlebarTranscript,
 } from "@/lib/titlebar-content-under";
 import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
+import {
+  registerMountedThread,
+  useAgentChatStore,
+} from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
@@ -247,11 +257,46 @@ export const MessageList = memo(function MessageList({
 
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
-  const ordered = useMemo(() => {
-    const copy = messages.slice();
-    copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
-    return copy;
-  }, [messages]);
+  const liveOrdered = useMemo(() => sortBySeq(messages), [messages]);
+
+  // Imported terminal history (see lib/agent-chat/adopted-history). Only
+  // a thread carrying the "resumed from the terminal" divider has any:
+  // its shadow slice is rendered ABOVE the live rows, so the divider stays
+  // the seam between what happened in the terminal and what happens here.
+  const hasResumeDivider = useMemo(
+    () => messages.some((item) => item.kind === "resume_divider"),
+    [messages],
+  );
+  const adoptedThreadId = hasResumeDivider ? (threadKey ?? null) : null;
+  const adoptedHistory = useAdoptedHistory(adoptedThreadId);
+  const historyKey = adoptedThreadId ? adoptedHistory.historyKey : null;
+  const importedMessages = useAgentChatStore((s) =>
+    historyKey ? s.threads[historyKey]?.messages : undefined,
+  );
+  const importedOrdered = useMemo(
+    () => (importedMessages ? sortBySeq(importedMessages) : EMPTY_ITEMS),
+    [importedMessages],
+  );
+  // First page on mount (app restart, switching back) when nothing was
+  // loaded for this thread yet; the adoption path itself kicks off the
+  // load the moment the session starts.
+  useEffect(() => {
+    if (!adoptedThreadId || adoptedHistory.status !== "idle") return;
+    void loadAdoptedHistory(adoptedThreadId, provider);
+  }, [adoptedHistory.status, adoptedThreadId, provider]);
+  // The shadow slice is on screen for as long as this list is, so the
+  // store's cold-slice eviction must treat it like any mounted thread.
+  useEffect(() => {
+    if (!historyKey) return;
+    return registerMountedThread(historyKey);
+  }, [historyKey]);
+  const ordered = useMemo(
+    () =>
+      importedOrdered.length === 0
+        ? liveOrdered
+        : [...importedOrdered, ...liveOrdered],
+    [importedOrdered, liveOrdered],
+  );
   // File-link resolution context, recomputed per store update but carried
   // forward by identity (issue #129, same cache pattern as `prevSlotsRef`
   // below): the builders return the previous map — and the previous per-row
@@ -330,6 +375,22 @@ export const MessageList = memo(function MessageList({
     return next;
   }, [expandedTurnIds, ordered, streaming]);
 
+  // Which rows came from the terminal: everything before the divider's
+  // slot. Slot order follows item order and the divider is never folded,
+  // so the boundary is exact. Keyed by slot so the row renderer can read
+  // it without the list double having to report indices.
+  const importedSlotKeys = useMemo(() => {
+    if (importedOrdered.length === 0) return EMPTY_KEYS;
+    const dividerIndex = slots.findIndex(
+      (slot) =>
+        slot.body.kind === "item" && slot.body.item.kind === "resume_divider",
+    );
+    if (dividerIndex <= 0) return EMPTY_KEYS;
+    return new Set(slots.slice(0, dividerIndex).map((slot) => slot.key));
+  }, [importedOrdered.length, slots]);
+  const firstImportedSlotKey =
+    importedSlotKeys.size > 0 ? slots[0].key : null;
+
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
   // (no double indicators). The marker still fills the gap before any step
@@ -361,8 +422,15 @@ export const MessageList = memo(function MessageList({
   // and the footer says so. Gone the moment a real row lands.
   const resumedAwaitingFirstMessage =
     !streaming &&
-    ordered.length > 0 &&
-    ordered.every((item) => item.kind === "resume_divider");
+    liveOrdered.length > 0 &&
+    liveOrdered.every((item) => item.kind === "resume_divider");
+  // Once the terminal's own turns are shown above the divider, the seam
+  // speaks for itself. The line stays while the import is still on its
+  // way, when it failed (the agent does hold the history), and when the
+  // session genuinely has nothing to show.
+  const showResumeConnected =
+    resumedAwaitingFirstMessage &&
+    !(adoptedHistory.status === "ready" && adoptedHistory.total > 0);
   // When this app session adopted the thread, the divider can say how
   // long ago the terminal last touched it (see adopt-external-session).
   const resumeLastActiveAt = adoptedSessionLastActiveAt(threadKey);
@@ -978,6 +1046,40 @@ export const MessageList = memo(function MessageList({
     void listRef.current?.scrollToEnd({ animated: !prefersReducedMotion() });
   }, [claimScroll]);
 
+  // The terminal history landing. Until it arrives the divider is the only
+  // content, so the scroller sits at 0 and rows appearing above it would
+  // leave the reader at the top of a conversation they already had. Land
+  // at the seam instead — once per thread, and only while the list still
+  // owns the viewport (a reader who has scrolled is left alone). The list
+  // measures the new rows over several frames and an instant `scrollToEnd`
+  // only reaches the end it knows about, so this re-issues it each frame
+  // until the scroller reports the end, within a frame budget. Later pages
+  // ("Show earlier") are ordinary prepends that the list's own
+  // `maintainVisibleContentPosition` keeps in place.
+  const importLandedKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!historyKey || importedSlotKeys.size === 0) return;
+    if (importLandedKeyRef.current === historyKey) return;
+    importLandedKeyRef.current = historyKey;
+    if (!ownsScroll()) return;
+    let attempts = 0;
+    // Not cancelled on cleanup: a store update inside the landing window
+    // must not swallow it. `listRef` is null once unmounted.
+    const land = () => {
+      const list = listRef.current;
+      if (!list || !ownsScroll()) return;
+      const node = list.getScrollableNode();
+      const distance = node
+        ? node.scrollHeight - node.clientHeight - node.scrollTop
+        : 0;
+      if (attempts > 0 && distance <= IMPORT_LANDING_TOLERANCE_PX) return;
+      attempts += 1;
+      void list.scrollToEnd({ animated: false });
+      if (attempts < IMPORT_LANDING_ATTEMPTS) requestAnimationFrame(land);
+    };
+    requestAnimationFrame(land);
+  }, [historyKey, importedSlotKeys.size, ownsScroll]);
+
   // Publish this viewport to the titlebar's live-element registry so its
   // overlap measurement always runs against mounted nodes. `PaneContainer`
   // renders only the active surface, so switching tabs or workspaces
@@ -1150,10 +1252,17 @@ export const MessageList = memo(function MessageList({
   ]);
 
   const renderItem = useCallback(
-    ({ item: slot }: { item: TranscriptSlot }) => (
-      <div className={CHAT_COLUMN}>
+    ({ item: slot }: { item: TranscriptSlot }) => {
+      const imported = importedSlotKeys.has(slot.key);
+      return (
+      <div
+        className={cn(CHAT_COLUMN, imported && "opacity-80")}
+        data-imported-history={imported ? "" : undefined}
+      >
+        {slot.key === firstImportedSlotKey && <ImportedHistoryTag />}
         <SlotRowMemo
           slot={slot}
+          readOnly={imported}
           approval={
             slot.body.kind === "item"
               ? lookupApproval(slot.body.item, requestsById)
@@ -1181,8 +1290,11 @@ export const MessageList = memo(function MessageList({
           resumeLastActiveAt={resumeLastActiveAt}
         />
       </div>
-    ),
+      );
+    },
     [
+      firstImportedSlotKey,
+      importedSlotKeys,
       onAcceptPlan,
       onCancelQueued,
       onRejectPlan,
@@ -1205,13 +1317,34 @@ export const MessageList = memo(function MessageList({
 
   // Stable element identity: LegendList re-mounts / re-lays-out the header
   // when this prop changes, so it must not be rebuilt on unrelated renders.
+  const showImportedHistory = importedSlotKeys.size > 0;
+  const handleShowEarlier = useCallback(() => {
+    if (!adoptedThreadId) return;
+    void loadEarlierAdoptedHistory(adoptedThreadId, provider);
+  }, [adoptedThreadId, provider]);
   const listHeader = useMemo(
     () => (
       <div className={cn(CHAT_COLUMN, "pt-[26px]")}>
-        <SessionStartMarker startedAt={sessionStartedAt} />
+        {adoptedThreadId && (showImportedHistory || adoptedHistory.error) && (
+          <ImportedHistoryControls
+            history={adoptedHistory}
+            onShowEarlier={handleShowEarlier}
+          />
+        )}
+        {/* The terminal's turns predate this session, so its start
+            marker would sit above history that is older than it. */}
+        {!showImportedHistory && (
+          <SessionStartMarker startedAt={sessionStartedAt} />
+        )}
       </div>
     ),
-    [sessionStartedAt],
+    [
+      adoptedHistory,
+      adoptedThreadId,
+      handleShowEarlier,
+      sessionStartedAt,
+      showImportedHistory,
+    ],
   );
 
   const listFooter = useMemo(
@@ -1241,7 +1374,7 @@ export const MessageList = memo(function MessageList({
             <RunInterruptedDivider />
           </div>
         )}
-        {resumedAwaitingFirstMessage && (
+        {showResumeConnected && (
           <div className="mt-[13px]">
             <ResumeConnectedLine />
           </div>
@@ -1252,7 +1385,7 @@ export const MessageList = memo(function MessageList({
       backgroundBrowserSession,
       interrupted,
       ordered,
-      resumedAwaitingFirstMessage,
+      showResumeConnected,
       showBrowserChip,
       showLiveMarker,
       stalled,
@@ -1336,6 +1469,13 @@ export const MessageList = memo(function MessageList({
  *  who scrolls up gets the affordance without noticing the wait. Hiding is
  *  always immediate — an unwanted pill is worse than a late one. */
 const JUMP_PILL_SHOW_DELAY_MS = 150;
+
+/** Frames the terminal-history landing keeps re-issuing its instant
+ *  scroll-to-end while the list is still measuring the imported rows. */
+const IMPORT_LANDING_ATTEMPTS = 12;
+/** How far from the end the scroller may sit for the landing to count as
+ *  done — sub-pixel rounding, not a visible gap. */
+const IMPORT_LANDING_TOLERANCE_PX = 2;
 
 /** Frames the anchor positioner will wait for the list ref to exist before
  *  giving up. A frame budget, not a fixed timeout: it cannot assume layout
@@ -1440,6 +1580,15 @@ const WS_FADE_STYLE: CSSProperties = {
   WebkitMaskRepeat: "no-repeat",
 };
 
+const EMPTY_ITEMS: ChatViewItem[] = [];
+const EMPTY_KEYS: ReadonlySet<string> = new Set();
+
+function sortBySeq(items: ChatViewItem[]): ChatViewItem[] {
+  const copy = items.slice();
+  copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+  return copy;
+}
+
 /** Whether a rendered slot body carries the item with `id`. */
 function slotBodyContains(body: SlotBody, id: string): boolean {
   switch (body.kind) {
@@ -1494,12 +1643,10 @@ function RunInterruptedDivider() {
 /** "Resumed from the terminal" divider — the first row of an adopted
  *  thread. Shares the SessionStartMarker hairline pattern, naming the
  *  agent and, when this app session did the adopting, how long ago the
- *  terminal last touched the conversation. The earlier turns stay with
- *  the agent, which is what the status line beneath says.
- *
- *  It says the earlier turns are not here on purpose. There is no
- *  history backfill: the agent still holds the conversation, Codemux
- *  does not, and an empty transcript would read as a failed resume. */
+ *  terminal last touched the conversation. It is the seam: the terminal's
+ *  own turns are imported above it (lib/agent-chat/adopted-history), the
+ *  session's turns follow below it. Until that import lands — or when it
+ *  cannot — the status line beneath says the agent has the history. */
 function ResumeDividerRow({
   item,
   provider,
@@ -1560,6 +1707,68 @@ function ResumeConnectedLine() {
         aria-hidden
       />
       <span>{RESUME_CONNECTED_COPY}</span>
+    </div>
+  );
+}
+
+/** Small label on the first imported row: the block above the divider is
+ *  the terminal's transcript, shown here for reading. */
+function ImportedHistoryTag() {
+  return (
+    <div
+      data-testid="imported-history-tag"
+      className="mb-1 flex items-center gap-1.5 font-mono text-[10px] font-medium uppercase tracking-[0.04em] text-muted-foreground/70"
+    >
+      <Terminal className="size-3 shrink-0 text-warning" aria-hidden />
+      <span>from the terminal</span>
+    </div>
+  );
+}
+
+export const SHOW_EARLIER_LABEL = "Show earlier";
+
+/** Top of the imported block: page back through the terminal session
+ *  until its beginning, and say so when a page could not be read. Hidden
+ *  entirely once `offset` is 0 and nothing failed. */
+function ImportedHistoryControls({
+  history,
+  onShowEarlier,
+}: {
+  history: AdoptedHistoryState;
+  onShowEarlier: () => void;
+}) {
+  const canShowEarlier = history.status === "ready" && history.offset > 0;
+  if (!canShowEarlier && !history.error) return null;
+  return (
+    <div
+      data-testid="imported-history-controls"
+      className="flex flex-col items-center gap-1 pb-2"
+    >
+      {canShowEarlier && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onShowEarlier}
+          disabled={history.loadingEarlier}
+          aria-busy={history.loadingEarlier || undefined}
+          className="h-7 rounded-full px-3 text-[11px] font-medium text-muted-foreground hover:text-foreground"
+        >
+          {history.loadingEarlier ? "Loading…" : SHOW_EARLIER_LABEL}
+        </Button>
+      )}
+      {history.error && (
+        <span
+          role="alert"
+          className="text-[11px] text-destructive"
+        >
+          {history.status === "ready"
+            ? "Couldn't load earlier messages"
+            : "Couldn't load the terminal history"}
+          {" — "}
+          {history.error}
+        </span>
+      )}
     </div>
   );
 }
@@ -1951,12 +2160,16 @@ function SlotRow({
   onToggleTurnFold,
   provider,
   resumeLastActiveAt,
+  readOnly = false,
 }: {
   slot: TranscriptSlot;
   approval: PermissionRequestItem | null;
   subagentName: string | null;
   provider?: AgentChatProviderKind | null;
   resumeLastActiveAt?: number | null;
+  /** Imported terminal history: a record, not a turn of this session, so
+   *  rewind / queued-turn controls are not offered on it. */
+  readOnly?: boolean;
   workspaceId?: string | null;
   cwd?: string | null;
   referenceCwd?: string | null;
@@ -2014,11 +2227,11 @@ function SlotRow({
           onRespondToRequest={onRespondToRequest}
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
-          onCancelQueued={onCancelQueued}
-          onSendQueuedNow={onSendQueuedNow}
-          turnCheckpointByNonce={turnCheckpointByNonce}
-          onRevertTurn={onRevertTurn}
-          revertingTurnIndex={revertingTurnIndex}
+          onCancelQueued={readOnly ? undefined : onCancelQueued}
+          onSendQueuedNow={readOnly ? undefined : onSendQueuedNow}
+          turnCheckpointByNonce={readOnly ? undefined : turnCheckpointByNonce}
+          onRevertTurn={readOnly ? undefined : onRevertTurn}
+          revertingTurnIndex={readOnly ? undefined : revertingTurnIndex}
           workspaceId={workspaceId}
           cwd={cwd}
           referenceCwd={referenceCwd}

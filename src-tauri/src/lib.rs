@@ -2097,6 +2097,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
             commands::agent_chat_list_adoptable_sessions,
+            commands::agent_chat_load_adopted_history,
             commands::agent_chat_adopt_external_session,
             commands::agent_chat_list_session_mentions,
             commands::agent_chat_get_session_context,

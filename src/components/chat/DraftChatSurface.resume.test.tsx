@@ -47,6 +47,9 @@ vi.mock("@/tauri/commands", async (importActual) => {
     agentChatListAdoptableSessions: vi.fn().mockResolvedValue([]),
     agentChatAdoptExternalSession: vi.fn(),
     agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
+    agentChatLoadAdoptedHistory: vi
+      .fn()
+      .mockResolvedValue({ rows: [], total: 0, offset: 0 }),
     agentChatGetSession: vi.fn().mockResolvedValue(null),
     createEmptyWorkspaceResult: vi.fn(),
     createWorktreeWorkspaceResult: vi.fn(),

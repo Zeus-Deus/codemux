@@ -29,8 +29,34 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
-import { MessageList, RESUME_CONNECTED_COPY } from "./MessageList";
+import {
+  MessageList,
+  RESUME_CONNECTED_COPY,
+  SHOW_EARLIER_LABEL,
+} from "./MessageList";
 import { noteAdoptedSessionActivity } from "@/lib/agent-chat/adopt-external-session";
+import {
+  ADOPTED_HISTORY_PAGE_SIZE,
+  resetAdoptedHistoryForTests,
+} from "@/lib/agent-chat/adopted-history";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
+import {
+  agentChatLoadAdoptedHistory,
+  type AdoptedHistoryPage,
+  type AgentChatMessageRow,
+} from "@/tauri/commands";
+
+// The imported-terminal-history read is the one IPC call a thread carrying
+// the resume divider makes on mount; everything else stays real.
+vi.mock("@/tauri/commands", async (importActual) => {
+  const actual = (await importActual()) as Record<string, unknown>;
+  return {
+    ...actual,
+    agentChatLoadAdoptedHistory: vi
+      .fn()
+      .mockResolvedValue({ rows: [], total: 0, offset: 0 }),
+  };
+});
 
 // The assistant-turn avatar renders the provider's branded mark via
 // ProviderLogo, which imports the SVG assets at module load. vitest's
@@ -74,12 +100,10 @@ const {
     scroll: 0,
     scrollLength: 500,
     rowHeight: ROW_HEIGHT,
-    positionAtIndex(index: number) {
-      return index * this.rowHeight;
-    },
-    sizeAtIndex() {
-      return this.rowHeight;
-    },
+    // Detachable, like the real list's: `MessageTrail` hands
+    // `positionAtIndex` around unbound, so no `this` here.
+    positionAtIndex: (index: number) => index * state.rowHeight,
+    sizeAtIndex: () => state.rowHeight,
     elementAtIndex: () => null,
     listen(type: string, cb: (value: boolean) => void) {
       let set = listeners.get(type);
@@ -175,6 +199,13 @@ vi.mock("@legendapp/list/react", async () => {
 
 afterEach(() => {
   cleanup();
+  resetAdoptedHistoryForTests();
+  vi.mocked(agentChatLoadAdoptedHistory).mockReset();
+  vi.mocked(agentChatLoadAdoptedHistory).mockResolvedValue({
+    rows: [],
+    total: 0,
+    offset: 0,
+  });
   resetListDouble();
   lastListProps.current = null;
   scrollToEndSpy.mockClear();
@@ -2328,5 +2359,310 @@ describe("MessageList adopted-session divider", () => {
     unmount();
     renderList([divider], { streaming: true });
     expect(screen.queryByTestId("resume-connected")).toBeNull();
+  });
+});
+
+describe("MessageList imported terminal history", () => {
+  const THREAD = "chat-adopted-history";
+  const divider = {
+    kind: "resume_divider" as const,
+    id: "divider-h",
+    seq: 0,
+    source: "external_cli",
+    startedAt: Date.parse("2026-04-24T10:00:00.000Z"),
+    branch: "main",
+  };
+
+  /** One terminal turn as the backend pages it. Negative, increasing ids. */
+  function turnRows(turn: number, firstId: number): AgentChatMessageRow[] {
+    const turnId = `terminal-turn-${turn}`;
+    return [
+      {
+        id: firstId,
+        payload: JSON.stringify({
+          type: "user_message",
+          thread_id: THREAD,
+          client_nonce: `terminal-nonce-${turn}`,
+          text: `terminal prompt ${turn}`,
+        }),
+        created_at_ms: 1_000 * turn,
+      },
+      {
+        id: firstId + 1,
+        payload: JSON.stringify({
+          type: "item_completed",
+          thread_id: THREAD,
+          turn_id: turnId,
+          item: { kind: "assistant_text", text: `terminal answer ${turn}` },
+        }),
+        created_at_ms: 1_000 * turn + 1,
+      },
+      {
+        id: firstId + 2,
+        payload: JSON.stringify({
+          type: "turn_completed",
+          thread_id: THREAD,
+          turn_id: turnId,
+          status: { kind: "success" },
+          usage: null,
+        }),
+        created_at_ms: 1_000 * turn + 2,
+      },
+    ];
+  }
+  const LAST_PAGE: AdoptedHistoryPage = {
+    rows: [...turnRows(2, -6), ...turnRows(3, -3)],
+    total: 9,
+    offset: 3,
+  };
+  const FIRST_PAGE: AdoptedHistoryPage = {
+    rows: turnRows(1, -9),
+    total: 9,
+    offset: 0,
+  };
+
+  function renderAdopted(
+    messages: ChatViewItem[] = [divider],
+    extra: Partial<Parameters<typeof MessageList>[0]> = {},
+  ) {
+    return render(
+      <MessageList
+        messages={messages}
+        provider="claude"
+        threadKey={THREAD}
+        {...noopHandlers}
+        {...extra}
+      />,
+    );
+  }
+
+  afterEach(() => {
+    useAgentChatStore.setState({ threads: {} });
+  });
+
+  it("renders the terminal's turns above the divider, quietly tagged, and drops the connected line", async () => {
+    vi.mocked(agentChatLoadAdoptedHistory).mockResolvedValue(LAST_PAGE);
+    renderAdopted();
+
+    await waitFor(() => {
+      expect(screen.getByText("terminal prompt 3")).toBeInTheDocument();
+    });
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenCalledWith(
+      THREAD,
+      null,
+      ADOPTED_HISTORY_PAGE_SIZE,
+    );
+    // Every imported row sits before the divider in document order.
+    const dividerEl = screen.getByTestId("resume-divider");
+    for (const text of ["terminal prompt 2", "terminal prompt 3"]) {
+      const el = screen.getByText(text);
+      expect(
+        el.compareDocumentPosition(dividerEl) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+    // Quiet treatment on the block, one tag on the first imported row.
+    const importedRows = document.querySelectorAll("[data-imported-history]");
+    expect(importedRows.length).toBeGreaterThan(1);
+    for (const row of importedRows) {
+      expect(row.className).toContain("opacity-80");
+    }
+    const tag = screen.getByTestId("imported-history-tag");
+    expect(tag.textContent).toBe("from the terminal");
+    expect(tag.closest("[data-imported-history]")).toBe(importedRows[0]);
+    // The divider itself is not part of the imported block.
+    expect(dividerEl.closest("[data-imported-history]")).toBeNull();
+    // With history on screen the seam speaks for itself.
+    expect(screen.queryByTestId("resume-connected")).toBeNull();
+    // More exists (offset 3), so the control is offered.
+    expect(
+      screen.getByRole("button", { name: SHOW_EARLIER_LABEL }),
+    ).toBeInTheDocument();
+  });
+
+  it("lands the viewport at the seam once the first page arrives, not on later pages", async () => {
+    vi.mocked(agentChatLoadAdoptedHistory)
+      .mockResolvedValueOnce(LAST_PAGE)
+      .mockResolvedValueOnce(FIRST_PAGE);
+    renderAdopted();
+    await screen.findByText("terminal prompt 3");
+    await act(async () => {
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    });
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
+    scrollToEndSpy.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: SHOW_EARLIER_LABEL }));
+    await screen.findByText("terminal prompt 1");
+    await act(async () => {
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    });
+    // An earlier page is a prepend the list anchors itself; no jump.
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("pages back with Show earlier, keeps order, and hides the control at the beginning", async () => {
+    vi.mocked(agentChatLoadAdoptedHistory)
+      .mockResolvedValueOnce(LAST_PAGE)
+      .mockResolvedValueOnce(FIRST_PAGE);
+    renderAdopted();
+    const button = await screen.findByRole("button", {
+      name: SHOW_EARLIER_LABEL,
+    });
+
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(screen.getByText("terminal prompt 1")).toBeInTheDocument();
+    });
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenLastCalledWith(
+      THREAD,
+      3,
+      ADOPTED_HISTORY_PAGE_SIZE,
+    );
+    const prompts = screen
+      .getAllByText(/terminal prompt/)
+      .map((el) => el.textContent);
+    expect(prompts).toEqual([
+      "terminal prompt 1",
+      "terminal prompt 2",
+      "terminal prompt 3",
+    ]);
+    expect(
+      screen.queryByRole("button", { name: SHOW_EARLIER_LABEL }),
+    ).toBeNull();
+    // The tag moved to the new first row.
+    expect(
+      screen
+        .getByTestId("imported-history-tag")
+        .closest("[data-imported-history]")
+        ?.textContent,
+    ).toContain("terminal prompt 1");
+  });
+
+  it("shows Loading… while an earlier page is in flight and the error when it fails", async () => {
+    let reject!: (err: unknown) => void;
+    vi.mocked(agentChatLoadAdoptedHistory)
+      .mockResolvedValueOnce(LAST_PAGE)
+      .mockReturnValueOnce(
+        new Promise<AdoptedHistoryPage>((_, r) => {
+          reject = r;
+        }),
+      );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderAdopted();
+    const button = await screen.findByRole("button", {
+      name: SHOW_EARLIER_LABEL,
+    });
+
+    fireEvent.click(button);
+    expect(screen.getByRole("button", { name: "Loading…" })).toBeDisabled();
+
+    await act(async () => {
+      reject("session file vanished");
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "session file vanished",
+      );
+    });
+    // The rows already shown stay, and the control is offered again.
+    expect(screen.getByText("terminal prompt 2")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: SHOW_EARLIER_LABEL }),
+    ).toBeInTheDocument();
+    warn.mockRestore();
+  });
+
+  it("offers no rewind on imported turns while the session's own turns keep it", async () => {
+    vi.mocked(agentChatLoadAdoptedHistory).mockResolvedValue(LAST_PAGE);
+    const onRevertTurn = vi.fn();
+    // A checkpoint keyed like the imported prompt's nonce must not light
+    // it up either — the import is read-only regardless of what matches.
+    const checkpoints = new Map([
+      [
+        "terminal-nonce-3",
+        { turn_index: 1, client_nonce: "terminal-nonce-3" },
+      ],
+      ["live-nonce-1", { turn_index: 2, client_nonce: "live-nonce-1" }],
+    ]) as unknown as Parameters<typeof MessageList>[0]["turnCheckpointByNonce"];
+    renderAdopted(
+      [
+        divider,
+        {
+          kind: "user_message",
+          id: "um-live",
+          seq: 1,
+          text: "live prompt",
+          clientNonce: "live-nonce-1",
+        },
+      ],
+      { turnCheckpointByNonce: checkpoints, onRevertTurn },
+    );
+    await waitFor(() => {
+      expect(screen.getByText("terminal prompt 3")).toBeInTheDocument();
+    });
+
+    const reverts = screen.getAllByRole("button", {
+      name: "Revert to before this turn",
+    });
+    expect(reverts).toHaveLength(1);
+    expect(reverts[0].closest("[data-imported-history]")).toBeNull();
+    expect(
+      screen.getByText("terminal prompt 3").closest("[data-imported-history]"),
+    ).not.toBeNull();
+  });
+
+  it("keeps the connected line while the import is loading and when the session is empty", async () => {
+    let resolve!: (page: AdoptedHistoryPage) => void;
+    vi.mocked(agentChatLoadAdoptedHistory).mockReturnValue(
+      new Promise<AdoptedHistoryPage>((r) => {
+        resolve = r;
+      }),
+    );
+    renderAdopted();
+    expect(screen.getByTestId("resume-connected").textContent).toBe(
+      RESUME_CONNECTED_COPY,
+    );
+    expect(screen.queryByTestId("imported-history-controls")).toBeNull();
+
+    await act(async () => {
+      resolve({ rows: [], total: 0, offset: 0 });
+    });
+    expect(screen.getByTestId("resume-connected")).toBeInTheDocument();
+    expect(screen.queryByTestId("imported-history-tag")).toBeNull();
+  });
+
+  it("keeps the connected line and says why when the import fails", async () => {
+    vi.mocked(agentChatLoadAdoptedHistory).mockRejectedValue(
+      "thread is not an adopted session",
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    renderAdopted();
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toContain(
+        "thread is not an adopted session",
+      );
+    });
+    expect(screen.getByTestId("resume-connected")).toBeInTheDocument();
+    warn.mockRestore();
+  });
+
+  it("does not load history for a thread without the divider", () => {
+    render(
+      <MessageList
+        messages={[
+          { kind: "user_message", id: "um-1", seq: 0, text: "plain thread" },
+        ]}
+        provider="claude"
+        threadKey="thread-plain"
+        {...noopHandlers}
+      />,
+    );
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("imported-history-tag")).toBeNull();
   });
 });

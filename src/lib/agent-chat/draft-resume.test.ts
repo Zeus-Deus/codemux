@@ -22,6 +22,9 @@ vi.mock("@/tauri/commands", () => ({
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatGetSession: vi.fn().mockResolvedValue(null),
   agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
+  agentChatLoadAdoptedHistory: vi
+    .fn()
+    .mockResolvedValue({ rows: [], total: 0, offset: 0 }),
   agentChatSendTurn: vi.fn(),
   agentChatStartSession: vi.fn(
     (
@@ -55,6 +58,10 @@ vi.mock("@/lib/toast", () => ({
 
 import { adoptedSessionLastActiveAt } from "./adopt-external-session";
 import {
+  ADOPTED_HISTORY_PAGE_SIZE,
+  resetAdoptedHistoryForTests,
+} from "./adopted-history";
+import {
   chooseResumeWorkspace,
   resolveWorkspaceForDirectory,
   resumeExternalSessionFromDraft,
@@ -66,6 +73,7 @@ import {
   agentChatCreatePane,
   agentChatGetSession,
   agentChatListMessagesAfter,
+  agentChatLoadAdoptedHistory,
   agentChatSendTurn,
   agentChatStartSession,
   createEmptyWorkspace,
@@ -238,6 +246,8 @@ beforeEach(() => {
   vi.mocked(agentChatGetSession).mockResolvedValue(null);
   vi.mocked(agentChatListMessagesAfter).mockReset();
   vi.mocked(agentChatListMessagesAfter).mockResolvedValue(DIVIDER_ROWS);
+  vi.mocked(agentChatLoadAdoptedHistory).mockClear();
+  resetAdoptedHistoryForTests();
   vi.mocked(agentChatSendTurn).mockClear();
   vi.mocked(agentChatStartSession).mockClear();
   vi.mocked(activateWorkspace).mockClear();
@@ -404,6 +414,26 @@ describe("resumeExternalSessionFromDraft", () => {
     // The divider can say when the terminal last touched it.
     expect(adoptedSessionLastActiveAt("chat-adopted-1")).toBe(
       Date.parse("2026-08-24T12:00:00.000Z"),
+    );
+  });
+
+  it("starts importing the terminal history for the adopted thread once it is running", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    await resumeExternalSessionFromDraft(draft.draftId, makeSession());
+
+    // Fire-and-forget after the start: the last page, for THIS thread.
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(agentChatLoadAdoptedHistory)).toHaveBeenCalledWith(
+      "chat-adopted-1",
+      null,
+      ADOPTED_HISTORY_PAGE_SIZE,
+    );
+    expect(
+      vi.mocked(agentChatStartSession).mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      vi.mocked(agentChatLoadAdoptedHistory).mock.invocationCallOrder[0]!,
     );
   });
 

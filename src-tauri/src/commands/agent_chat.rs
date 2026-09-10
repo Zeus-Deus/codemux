@@ -25,6 +25,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::io::AsyncReadExt;
 
 use crate::agent_provider::claude::external_sessions::EXTERNAL_SESSION_MIN_BYTES;
+use crate::agent_provider::claude::session_history::{clamp_page_limit, AdoptedHistoryPage};
 use crate::agent_provider::types::{
     ExternalSession, ExternalSessionScope, ExternalSessionTitleSource,
 };
@@ -3822,6 +3823,57 @@ pub async fn agent_chat_list_adoptable_sessions(
     })
     .await
     .map_err(|error| format!("Failed to classify adoptable sessions: {error}"))
+}
+
+/// Page through the transcript an adopted terminal session had BEFORE it
+/// was resumed into Codemux, as rows shaped like persisted
+/// `agent_chat_messages` entries (`{ id, payload, created_at_ms }`).
+///
+/// Read-only by design: nothing is written to `agent_chat_messages`.
+/// Persisting would put imported history AFTER the resume divider (rows
+/// order by autoincrement id), re-run the search-index triggers, and
+/// invite double-counting in the usage ledger. The frontend hydrates the
+/// returned rows into an in-memory slice rendered above the divider;
+/// their ids are negative so they can never collide with real rows.
+///
+/// `before_offset` omitted → the last `limit` records; otherwise the
+/// `limit` records before that source index. `offset == 0` on the
+/// result means the beginning of the conversation was reached.
+#[tauri::command]
+pub async fn agent_chat_load_adopted_history(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    before_offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<AdoptedHistoryPage, String> {
+    let session = db
+        .get_agent_chat_session(&thread_id)
+        .ok_or_else(|| format!("No chat session found for thread {thread_id}"))?;
+    if session.origin != AGENT_CHAT_ORIGIN_EXTERNAL_CLI {
+        return Err("Only sessions resumed from the terminal have importable history".to_string());
+    }
+    let sdk_session_id = session
+        .sdk_session_id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "This thread has no provider session id to load history from".to_string())?;
+    if session.provider != "claude" {
+        return Err(format!(
+            "History import is not available for the {} provider",
+            session.provider
+        ));
+    }
+    let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
+        .map_err(|error| format!("Claude sidecar unavailable: {error}"))?;
+    crate::agent_provider::claude::session_history::load_adopted_history(
+        &sidecar,
+        &thread_id,
+        &sdk_session_id,
+        session.cwd.as_deref(),
+        clamp_page_limit(limit),
+        before_offset,
+    )
+    .await
+    .map_err(|error| format!("Failed to load session history: {error}"))
 }
 
 /// The idempotent answer for a session Codemux already has: point the

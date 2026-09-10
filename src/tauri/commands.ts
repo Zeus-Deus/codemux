@@ -2088,6 +2088,36 @@ export const agentChatListMessagesAfter = (
     afterId,
   });
 
+/** One page of an adopted terminal session's own transcript — the turns
+ *  that happened in the CLI before Codemux resumed it. Rows are
+ *  byte-compatible with `agentChatListMessagesAfter` (payload JSON the
+ *  reducer already understands), with NEGATIVE, strictly increasing ids
+ *  so they can never be mistaken for the thread's own persisted rows. */
+export interface AdoptedHistoryPage {
+  rows: AgentChatMessageRow[];
+  /** Messages in the whole session. */
+  total: number;
+  /** Index of `rows[0]` within the session; 0 means the beginning. */
+  offset: number;
+}
+
+/**
+ * Read the terminal-side history behind an adopted thread. `beforeOffset`
+ * null → the last `limit` messages (backend default 40); `beforeOffset: N`
+ * → the page ending just before index N, for "Show earlier". Throws a
+ * string when `threadId` is not an adopted session.
+ */
+export const agentChatLoadAdoptedHistory = (
+  threadId: string,
+  beforeOffset: number | null = null,
+  limit: number | null = null,
+) =>
+  invoke<AdoptedHistoryPage>("agent_chat_load_adopted_history", {
+    threadId,
+    beforeOffset,
+    limit,
+  });
+
 /** Highest stored row id for a thread (`null` when it has none). Used to
  *  detect a resume cursor that sits ABOVE the thread's own history — a
  *  cursor inherited from a merged/deleted thread — which falls back to a
