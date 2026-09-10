@@ -1178,29 +1178,42 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   );
 
   const belowComposerSlot = (
-    <div className="flex w-full flex-col items-center gap-3">
-      <ThreadScopeRow
-        target={draft.target}
-        onChangeTarget={handleChangeTarget}
-        projectPath={scopeProjectPath}
-        checkoutMode={draft.checkoutMode ?? "current"}
-        worktreeName={draft.worktreeName ?? ""}
-        baseBranch={draft.baseBranch ?? ""}
-        disabled={draft.promoting}
-        onChangeCheckoutMode={handleChangeCheckoutMode}
-        onChangeWorktreeName={handleChangeWorktreeName}
-        onChangeBaseBranch={handleChangeBaseBranch}
-        pinnedCheckout={pinnedCheckout}
-      />
-      {!pending && (
-        <ContinueTerminalSessionRow
-          sessions={adoptableSessions}
-          scope={landingScope}
-          provider={draft.provider}
+    <div className="w-full">
+      <div className="flex w-full flex-col items-center">
+        <ThreadScopeRow
+          target={draft.target}
+          onChangeTarget={handleChangeTarget}
+          projectPath={scopeProjectPath}
+          checkoutMode={draft.checkoutMode ?? "current"}
+          worktreeName={draft.worktreeName ?? ""}
+          baseBranch={draft.baseBranch ?? ""}
           disabled={draft.promoting}
-          onOpenPicker={handleOpenResumePicker}
-          onContinue={handleResumeExternalSession}
+          onChangeCheckoutMode={handleChangeCheckoutMode}
+          onChangeWorktreeName={handleChangeWorktreeName}
+          onChangeBaseBranch={handleChangeBaseBranch}
+          pinnedCheckout={pinnedCheckout}
         />
+      </div>
+      {/* The landing vertically centres headline + composer + this slot
+          as one block, so anything that adds height here nudges the
+          composer upward the moment it appears. The terminal-session row
+          therefore hangs from a zero-height anchor: it renders beneath
+          the scope strip without taking part in the centring, and the
+          composer stays exactly where it was whether or not there is a
+          session to offer. */}
+      {!pending && (
+        <div className="relative h-0 w-full">
+          <div className="absolute inset-x-0 top-3">
+            <ContinueTerminalSessionRow
+              sessions={adoptableSessions}
+              scope={landingScope}
+              provider={draft.provider}
+              disabled={draft.promoting}
+              onOpenPicker={handleOpenResumePicker}
+              onContinue={handleResumeExternalSession}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
