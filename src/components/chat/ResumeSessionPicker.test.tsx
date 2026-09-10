@@ -170,10 +170,12 @@ describe("ResumeSessionPicker · layout", () => {
     const titles = recent
       .getAllByText(/.+/, { selector: '[data-testid^="slash-item-"] > span > span:first-child' })
       .map((el) => el.textContent);
+    // The already-open conversation is a switch, not a resume: it stays
+    // in its folder and never leads RECENT.
     expect(titles).toEqual([
       "Refactor the splitter",
-      "Already here",
       "Port the invoice exporter",
+      "Fix the rounding bug",
     ]);
     // Each recent row leads with its project.
     expect(

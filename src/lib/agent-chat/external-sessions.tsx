@@ -244,9 +244,13 @@ export function groupAdoptableSessions({
     return b.newestMs - a.newestMs;
   });
 
+  // RECENT is "what you might want to continue": conversations Codemux
+  // already holds are a switch, not a resume, so they stay in their
+  // folder with the switch icon rather than leading the list.
+  const recentCandidates = rows.filter((row) => !row.alreadyOpen);
   const recent =
-    selectedKey === null && !needle && rows.length > 0
-      ? rows.slice(0, RESUME_RECENT_COUNT)
+    selectedKey === null && !needle && recentCandidates.length > 0
+      ? recentCandidates.slice(0, RESUME_RECENT_COUNT)
       : null;
 
   return { total: sessions.length, recent, folders };

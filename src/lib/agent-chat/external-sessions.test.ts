@@ -354,3 +354,38 @@ describe("abbreviateHome", () => {
     expect(abbreviateHome("/home/meow/x", "/home/me")).toBe("/home/meow/x");
   });
 });
+
+describe("groupAdoptableSessions — RECENT excludes already-open rows", () => {
+  it("never leads with a conversation Codemux already holds", () => {
+    const grouping = groupAdoptableSessions({
+      sessions: [
+        makeSession({
+          session_id: "open-newest",
+          existing_thread_id: "thread-1",
+          last_modified: "2026-04-25T12:00:00.000Z",
+        }),
+        makeSession({ session_id: "a", last_modified: "2026-04-25T11:00:00.000Z" }),
+        makeSession({ session_id: "b", last_modified: "2026-04-25T10:00:00.000Z" }),
+        makeSession({ session_id: "c", last_modified: "2026-04-25T09:00:00.000Z" }),
+        makeSession({ session_id: "d", last_modified: "2026-04-25T08:00:00.000Z" }),
+      ],
+      selectedProjectRoot: null,
+    });
+    expect(grouping.recent?.map((row) => row.session.session_id)).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    // It is still listed in its folder, as a switch.
+    const all = grouping.folders.flatMap((folder) => folder.rows);
+    expect(all.find((row) => row.session.session_id === "open-newest")?.alreadyOpen).toBe(true);
+  });
+
+  it("omits RECENT entirely when every session is already open", () => {
+    const grouping = groupAdoptableSessions({
+      sessions: [makeSession({ existing_thread_id: "thread-1" })],
+      selectedProjectRoot: null,
+    });
+    expect(grouping.recent).toBeNull();
+  });
+});

@@ -62,14 +62,18 @@ export function landingSessionSummary(
   scope: LandingScope,
   now: Date = new Date(),
 ): LandingSessionSummary {
+  // Only conversations Codemux does not already hold are candidates:
+  // an "already open" session is switched to from the picker, never
+  // featured as something to continue.
+  const adoptable = sessions.filter((s) => s.existing_thread_id === null);
   let inScope: AdoptableAgentSession[];
   if (scope.kind === "home") {
-    inScope = [...sessions];
+    inScope = [...adoptable];
   } else if (scope.projectRoot === null) {
     inScope = [];
   } else {
     const wanted = normalizeDir(scope.projectRoot);
-    inScope = sessions.filter((s) => sessionProjectKey(s) === wanted);
+    inScope = adoptable.filter((s) => sessionProjectKey(s) === wanted);
   }
   if (inScope.length === 0) return { variant: "none" };
   inScope.sort((a, b) => lastModifiedMs(b) - lastModifiedMs(a));

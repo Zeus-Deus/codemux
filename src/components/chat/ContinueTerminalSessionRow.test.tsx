@@ -282,3 +282,35 @@ describe("ContinueTerminalSessionRow · quiet and none", () => {
     expect(empty.container.innerHTML).toBe("");
   });
 });
+
+describe("landingSessionSummary — already-open sessions never feature", () => {
+  it("skips a fresher session Codemux already holds and features the next adoptable one", () => {
+    const now = new Date("2026-04-25T12:00:00.000Z");
+    const summary = landingSessionSummary(
+      [
+        session("open", {
+          existing_thread_id: "thread-1",
+          last_modified: "2026-04-25T11:58:00.000Z",
+        }),
+        session("fresh", {
+          last_modified: "2026-04-25T11:30:00.000Z",
+        }),
+      ],
+      { kind: "home" },
+      now,
+    );
+    expect(summary.variant).toBe("featured");
+    if (summary.variant === "featured") {
+      expect(summary.newest.session_id).toBe("fresh");
+      expect(summary.inScope).toBe(1);
+    }
+  });
+
+  it("renders nothing when the only sessions are already open", () => {
+    const summary = landingSessionSummary(
+      [session("open", { existing_thread_id: "thread-1" })],
+      { kind: "home" },
+    );
+    expect(summary.variant).toBe("none");
+  });
+});
