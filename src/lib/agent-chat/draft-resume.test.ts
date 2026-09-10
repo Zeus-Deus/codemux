@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 
 import type {
   AgentChatProviderKind,
@@ -13,6 +14,8 @@ import type {
 // adopted row the adopt command already minted.
 
 vi.mock("@/tauri/commands", () => ({
+  dbSetUiState: vi.fn(async () => undefined),
+  dbGetUiState: vi.fn(async () => null),
   activatePane: vi.fn().mockResolvedValue(undefined),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatAdoptExternalSession: vi.fn(),
@@ -53,6 +56,7 @@ vi.mock("@/lib/toast", () => ({
 import { adoptedSessionLastActiveAt } from "./adopt-external-session";
 import {
   chooseResumeWorkspace,
+  resolveWorkspaceForDirectory,
   resumeExternalSessionFromDraft,
 } from "./draft-resume";
 import { toast } from "@/lib/toast";
@@ -842,5 +846,38 @@ describe("resumeExternalSessionFromDraft", () => {
       "new_tab",
     );
     expectNoSplitPanes();
+  });
+});
+
+describe("resuming into a reused workspace lifts it off the settled shelf", () => {
+  it("un-settles the active workspace it resumes into", async () => {
+    const active = makeWorkspace({ workspace_id: "ws-active", cwd: "/projects/foo" });
+    seedAppState([active], "ws-active");
+    useSidebarInboxStore.getState().settle("ws-active", Date.now() - 60_000);
+    expect(
+      useSidebarInboxStore.getState().settled.some((e) => e.id === "ws-active"),
+    ).toBe(true);
+
+    const resolved = await resolveWorkspaceForDirectory("/projects/foo", null);
+
+    expect(resolved).toMatchObject({ workspaceId: "ws-active", reused: true });
+    expect(
+      useSidebarInboxStore.getState().settled.some((e) => e.id === "ws-active"),
+    ).toBe(false);
+  });
+
+  it("leaves the shelf alone when it opens a fresh workspace", async () => {
+    const other = makeWorkspace({ workspace_id: "ws-other", cwd: "/projects/other" });
+    seedAppState([other], "ws-other");
+    useSidebarInboxStore.getState().settle("ws-other", Date.now() - 60_000);
+    const unsettle = vi.spyOn(useSidebarInboxStore.getState(), "unsettle");
+    try {
+      await resolveWorkspaceForDirectory("/projects/foo", null);
+    } catch {
+      // The create path may be unmocked here; the assertion below is
+      // about the shelf, which must not have been touched either way.
+    }
+    expect(unsettle).not.toHaveBeenCalled();
+    unsettle.mockRestore();
   });
 });

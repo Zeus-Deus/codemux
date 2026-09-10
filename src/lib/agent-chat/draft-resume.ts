@@ -1,6 +1,7 @@
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { useChatDraftStore, type DraftId } from "@/stores/chat-draft-store";
 import {
   activatePane,
@@ -204,6 +205,20 @@ async function linkedWorktreeBranch(cwd: string): Promise<string | null> {
   return linked?.branch || null;
 }
 
+/** A resumed conversation is fresh activity for the workspace it lands
+ *  in. When that workspace is one the user had parked on the settled
+ *  shelf, lift it off, the same way agent activity does — otherwise the
+ *  thing they just opened sits under "Settled" while it is the one
+ *  workspace they are actually using. New workspaces are never on the
+ *  shelf, so this only matters for reuse. */
+function markWorkspaceActive(workspaceId: string): void {
+  try {
+    useSidebarInboxStore.getState().unsettle(workspaceId, "activity");
+  } catch (error) {
+    console.warn("[draft-resume] could not un-settle workspace (non-fatal):", error);
+  }
+}
+
 /**
  * The workspace a session at `cwd` should run in: the one
  * {@link chooseResumeWorkspace} allows reusing, else a new one anchored
@@ -231,6 +246,7 @@ export async function resolveWorkspaceForDirectory(
     preferredWorkspaceId,
   });
   if (existing) {
+    markWorkspaceActive(existing.workspace_id);
     return { workspaceId: existing.workspace_id, cwd, reused: true };
   }
   const branch = await linkedWorktreeBranch(cwd);
@@ -325,6 +341,7 @@ async function switchToOwnedThread(
   const recordWorkspaceStillOpen = appState?.workspaces.some(
     (ws) => ws.workspace_id === record.workspace_id,
   );
+  if (recordWorkspaceStillOpen) markWorkspaceActive(record.workspace_id);
   const workspaceId = recordWorkspaceStillOpen
     ? record.workspace_id
     : (await resolveWorkspaceForDirectory(cwd, preferredWorkspaceId))
