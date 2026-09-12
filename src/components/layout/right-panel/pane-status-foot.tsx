@@ -21,13 +21,19 @@
  * against the removed card fill, so contrast is unaffected.
  */
 import { formatContextTokens } from "@/lib/agent-chat/context-usage";
+import { cn } from "@/lib/utils";
 
 export function PaneStatusFoot({
   status,
   tokens,
+  action,
 }: {
   status: string;
   tokens: number | null;
+  /** Optional pane-owned control, printed after the status text. The deck
+   *  has one band of chrome, so a sub-view toggle a pane needs (the
+   *  Subagents pane's History) rides here rather than growing a header. */
+  action?: { label: string; onClick: () => void; pressed?: boolean };
 }) {
   return (
     <div
@@ -41,6 +47,20 @@ export function PaneStatusFoot({
       <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">
         {status}
       </span>
+      {action && (
+        <button
+          type="button"
+          data-testid="right-panel-status-action"
+          onClick={action.onClick}
+          aria-pressed={action.pressed}
+          className={cn(
+            "shrink-0 rounded-[5px] px-1.5 py-px font-mono text-[10px] hover:bg-foreground/[0.06] hover:text-foreground",
+            action.pressed ? "text-foreground" : "text-muted-foreground",
+          )}
+        >
+          {action.label}
+        </button>
+      )}
       {tokens != null && tokens > 0 && (
         <span
           data-testid="right-panel-token-total"

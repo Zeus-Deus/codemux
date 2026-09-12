@@ -72,6 +72,7 @@ import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { isMarkdownFile } from "@/components/editor/EditorPane";
+import { subagentDeckSummary } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { isImageExtension, isVideoExtension } from "@/lib/editor-languages";
 import { maxRightPanelWidth } from "@/lib/right-panel-width";
@@ -283,19 +284,17 @@ export const RightPanel = memo(function RightPanel({
   const workflowThreadId =
     workflowRun != null ? workspaceWorkflow.threadId : null;
 
-  const subagentSummary = useMemo(() => {
-    let groups = 0;
-    let running = 0;
-    for (const item of messages) {
-      if (item.kind !== "subagent_run") continue;
-      groups += 1;
-      for (const view of item.subagents) {
-        if (view.status === "running" || view.status === "pending")
-          running += 1;
-      }
-    }
-    return { groups, running };
-  }, [messages]);
+  // One derivation feeds the pane's availability gate, the tab badge and
+  // the status foot, so the strip can never disagree with the pane.
+  const dismissedSubagentAttention = useUIStore(
+    (s) => s.dismissedSubagentAttention,
+  );
+  const subagentsHistoryOpen = useUIStore((s) => s.subagentsHistoryOpen);
+  const setSubagentsHistoryOpen = useUIStore((s) => s.setSubagentsHistoryOpen);
+  const subagentSummary = useMemo(
+    () => subagentDeckSummary(messages, new Set(dismissedSubagentAttention)),
+    [messages, dismissedSubagentAttention],
+  );
 
   // ── Deck membership ──
   const openPanes = storedPanes ?? DEFAULT_RIGHT_PANEL_PANES;
@@ -628,7 +627,14 @@ export const RightPanel = memo(function RightPanel({
       }
       case "subagents":
         tab.testId = "subagents-tab";
-        if (subagentSummary.running > 0) tab.badge = subagentSummary.running;
+        // A failure the user hasn't waved off outranks a live count: it is
+        // the one thing in this pane that needs a decision.
+        if (subagentSummary.attention > 0) {
+          tab.badge = subagentSummary.attention;
+          tab.badgeTone = "attention";
+        } else if (subagentSummary.running > 0) {
+          tab.badge = subagentSummary.running;
+        }
         break;
       case "orchestration":
         tab.testId = "orchestration-tab";
@@ -852,6 +858,10 @@ export const RightPanel = memo(function RightPanel({
           agentDriven: browserSession?.is_active === true,
         }
       : null,
+    subagents: {
+      running: subagentSummary.running,
+      finished: subagentSummary.finished,
+    },
   });
 
   return (
@@ -925,6 +935,15 @@ export const RightPanel = memo(function RightPanel({
 
       <PaneStatusFoot
         status={statusLine}
+        action={
+          activePane === "subagents" && subagentSummary.groups > 0
+            ? {
+                label: "History ›",
+                onClick: () => setSubagentsHistoryOpen(!subagentsHistoryOpen),
+                pressed: subagentsHistoryOpen,
+              }
+            : undefined
+        }
         tokens={
           contextUsage?.total_processed_tokens ??
           contextUsage?.used_tokens ??

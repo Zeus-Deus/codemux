@@ -74,6 +74,7 @@ export function newSubagentView(id: string, startedAt: number): SubagentView {
 export function mergeSnapshot(
   view: SubagentView,
   snap: SubagentSnapshot,
+  now?: number,
 ): SubagentView {
   const next: SubagentView = { ...view };
   // Revive rule: a real `running` snapshot un-settles a row that was
@@ -118,6 +119,27 @@ export function mergeSnapshot(
   if (snap.tool_use_count != null) next.toolUseCount = snap.tool_use_count;
   if (snap.total_tokens != null) next.totalTokens = snap.total_tokens;
   if (snap.duration_ms != null) next.durationMs = snap.duration_ms;
+  return stampSettle(view, next, now);
+}
+
+/**
+ * Keep `finishedAt` in step with a status change: stamp it the moment a
+ * row leaves the running set (only when a clock was supplied), and clear
+ * it when a revive puts the row back to `running`. Untouched otherwise so
+ * an unchanged view keeps its exact shape.
+ */
+function stampSettle(
+  prev: SubagentView,
+  next: SubagentView,
+  now: number | undefined,
+): SubagentView {
+  const wasRunning = isRunning(prev);
+  const running = isRunning(next);
+  if (wasRunning && !running && now != null && next.finishedAt == null) {
+    next.finishedAt = now;
+  } else if (!wasRunning && running && next.finishedAt != null) {
+    delete next.finishedAt;
+  }
   return next;
 }
 
@@ -148,7 +170,14 @@ export function subagentElapsedMs(
   now: number,
 ): number | null {
   if (view.durationMs != null) return view.durationMs;
-  if (view.startedAt != null) return Math.max(0, now - view.startedAt);
+  if (view.startedAt == null) return null;
+  if (isRunning(view)) return Math.max(0, now - view.startedAt);
+  // Settled: freeze at the settle stamp. A settled row with no stamp gets
+  // no elapsed at all rather than a readout that keeps growing from its
+  // start time forever (the "18295m" tombstones).
+  if (view.finishedAt != null) {
+    return Math.max(0, view.finishedAt - view.startedAt);
+  }
   return null;
 }
 
@@ -787,6 +816,7 @@ export function settleSubagentsForToolResult(
   messages: ChatViewItem[],
   toolUseId: string,
   isError: boolean,
+  now?: number,
 ): ChatViewItem[] {
   // Almost every parent tool_result belongs to an ordinary tool (Read,
   // Bash, …) with no subagent keyed on it. The index answers that in
@@ -798,7 +828,9 @@ export function settleSubagentsForToolResult(
   return mapAllSubagents(messages, (sub) => {
     if (!isRunning(sub)) return sub;
     if (sub.id !== toolUseId && sub.parentItemId !== toolUseId) return sub;
-    return { ...sub, status: target, statusAssumed: true };
+    const settled: SubagentView = { ...sub, status: target, statusAssumed: true };
+    if (now != null) settled.finishedAt = now;
+    return settled;
   });
 }
 
@@ -812,15 +844,21 @@ export function settleSubagentsForToolResult(
  */
 export function interruptRunningSubagents(
   messages: ChatViewItem[],
+  now?: number,
 ): ChatViewItem[] {
   // The common case on a long thread — every new user turn, session close
   // and hydrate settle — is that nothing is running. Skip the map.
   if (!hasRunningSubagents(messages)) return messages;
-  return mapAllSubagents(messages, (sub) =>
-    isRunning(sub)
-      ? { ...sub, status: "interrupted", statusAssumed: true }
-      : sub,
-  );
+  return mapAllSubagents(messages, (sub) => {
+    if (!isRunning(sub)) return sub;
+    const settled: SubagentView = {
+      ...sub,
+      status: "interrupted",
+      statusAssumed: true,
+    };
+    if (now != null) settled.finishedAt = now;
+    return settled;
+  });
 }
 
 // ── Spawn waves (the Subagents pane's grouping) ──
@@ -908,9 +946,11 @@ export function subagentWaveTitle(wave: SubagentWave): string {
     if (label.length === 0) continue;
     counts.set(label, (counts.get(label) ?? 0) + 1);
   }
+  // Never a bare "Ran N subagents": an unlabeled wave still names what it
+  // is, and the ×N suffix carries the count like any repeated label.
   if (counts.size === 0) {
     const n = wave.subagents.length;
-    return `Ran ${n} subagent${n === 1 ? "" : "s"}`;
+    return n > 1 ? `Subagent ×${n}` : "Subagent";
   }
   return Array.from(counts, ([label, n]) => (n > 1 ? `${label} ×${n}` : label))
     .join(" · ");
@@ -969,4 +1009,188 @@ export function subagentOrdinals(
     out.set(s.id, next);
   }
   return out;
+}
+
+// ── Live-first pane model ──
+
+/** Row title for the pane: what the agent was asked to do, else its
+ *  name, else its type. */
+export function subagentRowTitle(view: SubagentView): string {
+  const label = firstLine(view.description ?? view.name ?? view.agentType ?? "");
+  return label.length > 0 ? label : "Subagent";
+}
+
+/** A settled row that should not fade away: it failed, or something
+ *  stopped it before it could report. `interrupted` (the view-only forced
+ *  settle) counts as stopped — the user still didn't get a result. */
+export function needsAttention(view: SubagentView): boolean {
+  return (
+    view.status === "failed" ||
+    view.status === "stopped" ||
+    view.status === "interrupted"
+  );
+}
+
+/**
+ * Everything the live-first pane, its foot line and the tab badge read,
+ * derived once from the wave list.
+ *
+ * - `running` — every running/pending row, newest first (newest wave
+ *   first, and within a wave the most recently spawned row first).
+ * - `currentWave` — the newest wave with a running row; its title heads
+ *   the WORKING section.
+ * - `attention` — failed/stopped rows from the turn currently in focus
+ *   (the running wave's turn, else the last wave's), newest first, minus
+ *   anything the user dismissed. Older turns' failures live in History.
+ * - `lastWave` — the newest wave overall, the idle receipt.
+ * - `finishedCount` — settled rows across the whole thread.
+ */
+export interface SubagentPaneModel {
+  running: SubagentView[];
+  currentWave: SubagentWave | null;
+  attention: SubagentView[];
+  lastWave: SubagentWave | null;
+  finishedCount: number;
+}
+
+export function subagentPaneModel(
+  waves: readonly SubagentWave[],
+  dismissed: ReadonlySet<string> = new Set(),
+): SubagentPaneModel {
+  const running: SubagentView[] = [];
+  let currentWave: SubagentWave | null = null;
+  let finishedCount = 0;
+  for (let i = waves.length - 1; i >= 0; i--) {
+    const wave = waves[i];
+    for (let j = wave.subagents.length - 1; j >= 0; j--) {
+      const sub = wave.subagents[j];
+      if (isRunning(sub)) {
+        running.push(sub);
+        currentWave ??= wave;
+      } else {
+        finishedCount += 1;
+      }
+    }
+  }
+  const lastWave = waves[waves.length - 1] ?? null;
+  const focus = currentWave ?? lastWave;
+  const attention: SubagentView[] = [];
+  if (focus) {
+    for (let i = waves.length - 1; i >= 0; i--) {
+      const wave = waves[i];
+      // Same turn as the focused wave. Waves without a prompt only match
+      // themselves so unrelated prompt-less cards don't chain together.
+      const sameTurn =
+        wave === focus ||
+        (focus.promptId != null && wave.promptId === focus.promptId);
+      if (!sameTurn) continue;
+      for (let j = wave.subagents.length - 1; j >= 0; j--) {
+        const sub = wave.subagents[j];
+        if (needsAttention(sub) && !dismissed.has(sub.id)) attention.push(sub);
+      }
+    }
+  }
+  return { running, currentWave, attention, lastWave, finishedCount };
+}
+
+/** When the wave settled: the latest `finishedAt` among its rows, or null
+ *  while any row is still running or no row carries a stamp. */
+export function subagentWaveSettledAt(wave: SubagentWave): number | null {
+  let latest: number | null = null;
+  for (const sub of wave.subagents) {
+    if (isRunning(sub)) return null;
+    if (sub.finishedAt != null) latest = Math.max(latest ?? 0, sub.finishedAt);
+  }
+  return latest;
+}
+
+/** "settled just now" / "settled 4m ago" / "settled 2h ago" / "settled 3d ago". */
+export function formatSettledAgo(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return "settled just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `settled ${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `settled ${h}h ago`;
+  return `settled ${Math.floor(h / 24)}d ago`;
+}
+
+// ── History sub-view ──
+
+export type SubagentHistoryFilter = "all" | "done" | "failed" | "stopped";
+
+export function matchesHistoryFilter(
+  view: SubagentView,
+  filter: SubagentHistoryFilter,
+): boolean {
+  switch (filter) {
+    case "all":
+      return true;
+    case "done":
+      return view.status === "completed";
+    case "failed":
+      return view.status === "failed";
+    case "stopped":
+      return view.status === "stopped" || view.status === "interrupted";
+  }
+}
+
+/** One turn's worth of waves for the History list: the prompt divider
+ *  and its waves, newest wave first. */
+export interface SubagentHistoryGroup {
+  promptId: string | null;
+  prompt: string | null;
+  waves: SubagentWave[];
+}
+
+/**
+ * The full record, newest first, grouped by the prompt that spawned each
+ * run of waves. Consecutive waves sharing a prompt collapse under one
+ * divider; prompt-less waves each stand alone so a hydrated gap never
+ * borrows a neighbour's prompt.
+ */
+export function subagentHistoryGroups(
+  waves: readonly SubagentWave[],
+): SubagentHistoryGroup[] {
+  const groups: SubagentHistoryGroup[] = [];
+  for (let i = waves.length - 1; i >= 0; i--) {
+    const wave = waves[i];
+    const head = groups[groups.length - 1];
+    if (head && wave.promptId != null && head.promptId === wave.promptId) {
+      head.waves.push(wave);
+    } else {
+      groups.push({ promptId: wave.promptId, prompt: wave.prompt, waves: [wave] });
+    }
+  }
+  return groups;
+}
+
+// ── Deck summary (tab badge + status foot) ──
+
+export interface SubagentDeckSummary {
+  /** `subagent_run` cards in the thread — the pane's availability gate. */
+  groups: number;
+  running: number;
+  /** Undismissed failed/stopped rows in the focused turn. */
+  attention: number;
+  finished: number;
+}
+
+export function subagentDeckSummary(
+  messages: ChatViewItem[],
+  dismissed: ReadonlySet<string> = new Set(),
+): SubagentDeckSummary {
+  // Recomputed on every transcript delta by the deck. Most threads never
+  // spawn a subagent, so answer that without paying for the wave sort.
+  if (!messages.some((item) => item.kind === "subagent_run")) {
+    return { groups: 0, running: 0, attention: 0, finished: 0 };
+  }
+  const waves = subagentWaves(messages);
+  const model = subagentPaneModel(waves, dismissed);
+  return {
+    groups: waves.length,
+    running: model.running.length,
+    attention: model.attention.length,
+    finished: model.finishedCount,
+  };
 }

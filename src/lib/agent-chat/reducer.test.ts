@@ -15,6 +15,7 @@ import {
   removeUserMessageByNonce,
   type Clock,
 } from "./reducer";
+import { subagentElapsedMs } from "./subagents";
 import type {
   AssistantMessageItem,
   ChatThreadState,
@@ -1783,6 +1784,65 @@ describe("agent-chat reducer — subagents", () => {
       name: "Explore",
       status: "running",
     });
+  });
+
+  it("freezes a settled row's elapsed at the moment its terminal snapshot landed", () => {
+    // The provider reported no `duration_ms`, so the pane derives elapsed.
+    // The reducer's clock has to stamp `finishedAt` on the settle, or the
+    // row keeps counting from `startedAt` for as long as the thread is open.
+    let clockMs = 1_000;
+    const clock: Clock = () => clockMs;
+    let state = applyEvent(
+      createEmptyThreadState(),
+      subagentUpdated({ subagent_id: "a", status: "running", name: "Explore" }),
+      clock,
+    );
+    clockMs = 4_000;
+    state = applyEvent(
+      state,
+      subagentUpdated({ subagent_id: "a", status: "completed" }),
+      clock,
+    );
+    const row = cards(state)[0].subagents[0];
+    expect(row.startedAt).toBe(1_000);
+    expect(row.finishedAt).toBe(4_000);
+    expect(subagentElapsedMs(row, 4_000)).toBe(3_000);
+    // Hours later the readout is still the run's real length.
+    expect(subagentElapsedMs(row, 9e12)).toBe(3_000);
+  });
+
+  it("stamps the settle when a parent tool_result is what ends the row", () => {
+    let clockMs = 1_000;
+    const clock: Clock = () => clockMs;
+    let state = applyEvent(
+      createEmptyThreadState(),
+      subagentUpdated({
+        subagent_id: "a",
+        status: "running",
+        name: "Explore",
+        parent_item_id: "tool-1",
+      }),
+      clock,
+    );
+    clockMs = 5_000;
+    state = applyEvent(
+      state,
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: {
+          kind: "tool_result",
+          tool_use_id: "tool-1",
+          is_error: false,
+          content: null,
+        },
+      } as never,
+      clock,
+    );
+    const row = cards(state)[0].subagents[0];
+    expect(row.status).toBe("completed");
+    expect(subagentElapsedMs(row, 9e12)).toBe(4_000);
   });
 
   it("joins a second subagent to the same contiguous card", () => {

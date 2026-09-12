@@ -126,7 +126,25 @@ export function replayTimed(
 ): ChatThreadState {
   const parsed = timed.map((row) => row.event);
   const state = foldReplayPayloads(createEmptyThreadState(), timed);
-  return finalizeReplay(state, parsed, opts, false, false);
+  return finalizeReplay(state, parsed, opts, false, false, settleClock(timed));
+}
+
+/**
+ * When the forced settle below "happened", for a transcript being rebuilt
+ * from disk. The honest answer is the last persisted row's insertion time:
+ * that is when the thread actually stopped producing, and the rows being
+ * settled were spawned against those same durable timestamps (see
+ * `foldReplayPayloads`). Stamping mount time instead would make a run that
+ * died days ago report days of elapsed. Falls back to mount time only when
+ * the rows carry no times at all — then `startedAt` is mount-stamped too,
+ * so the pair is still consistent.
+ */
+function settleClock(timed: readonly TimedReplayPayload[]): number {
+  for (let i = timed.length - 1; i >= 0; i--) {
+    const at = timed[i].createdAtMs;
+    if (at != null) return at;
+  }
+  return Date.now();
 }
 
 /**
@@ -175,6 +193,7 @@ export function applyTimedReplayTail(
     opts,
     opts.previousUnsettled,
     opts.runLive ?? false,
+    settleClock(timed),
   );
 }
 
@@ -295,6 +314,7 @@ function finalizeReplay(
   opts: ReplayOptions | undefined,
   previousUnsettled: boolean,
   skipSettlePasses: boolean,
+  settledAt: number,
 ): ChatThreadState {
   const runLive = opts?.runLive ?? false;
   // Only providers with process-local callbacks lose their requests when the
@@ -373,7 +393,7 @@ function finalizeReplay(
   // the transcript from persisted rows alone, where a `running` snapshot
   // with no terminal successor genuinely means "never settled".)
   if (!skipSettlePasses) {
-    messages = interruptRunningSubagents(messages);
+    messages = interruptRunningSubagents(messages, settledAt);
     messages = messages.map((m) =>
       m.kind === "workflow_run" && m.status === "running"
         ? { ...m, status: "stopped" as const }

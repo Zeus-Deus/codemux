@@ -764,7 +764,9 @@ function applyWorkflowSubagentUpdated(
     const item = state.messages[existing.itemIndex];
     if (item.kind !== "workflow_run") return state;
     const sub = item.phases[existing.phaseIndex].agents[existing.subIndex];
-    const nextView = mergeSnapshot(sub, snap);
+    // The clock is what stamps `finishedAt` when this snapshot settles the
+    // row, so the pane can freeze its elapsed instead of counting forever.
+    const nextView = mergeSnapshot(sub, snap, now());
     return {
       ...state,
       messages: replaceWorkflowSubagent(
@@ -777,7 +779,11 @@ function applyWorkflowSubagentUpdated(
     };
   }
   const phaseKey = workflowPhaseKeyFor(found.item, snap.phase);
-  const view = mergeSnapshot(newSubagentView(snap.subagent_id, now()), snap);
+  const view = mergeSnapshot(
+    newSubagentView(snap.subagent_id, now()),
+    snap,
+    now(),
+  );
   const phaseIndex = found.item.phases.findIndex((p) => p.title === phaseKey);
   const phases =
     phaseIndex >= 0
@@ -1087,7 +1093,9 @@ function applyGenericSubagentUpdated(
   const card = loc.messages[loc.cardIndex];
   if (card.kind !== "subagent_run") return state;
   const sub = card.subagents[loc.subIndex];
-  const nextView = mergeSnapshot(sub, snap);
+  // Same clock the row was born on: a terminal snapshot stamps `finishedAt`
+  // so the elapsed readout freezes at the settle instead of ticking on.
+  const nextView = mergeSnapshot(sub, snap, now());
   return {
     ...state,
     nextSeq: loc.nextSeq,
@@ -1132,7 +1140,10 @@ function appendUserMessageLocal(
   // terminal snapshot wins by rank.
   const afterHold = settleInterimTurnEnd(sealed.messages);
   if (!state.streaming || afterHold !== sealed.messages) {
-    const settled = interruptRunningSubagents(stopRunningWorkflows(afterHold));
+    const settled = interruptRunningSubagents(
+      stopRunningWorkflows(afterHold),
+      now(),
+    );
     if (settled !== sealed.messages) sealed = { ...sealed, messages: settled };
   }
   const { seq, next } = takeSeq(sealed);
@@ -1532,6 +1543,7 @@ function applyEventInner(
         // is cleared independently of subagent lifetimes).
         const settled = interruptRunningSubagents(
           stopRunningWorkflows(state.messages),
+          now(),
         );
         // Belt-and-braces: a death path that couldn't recover the turn id
         // still surfaces as an error while streaming. Mark the thread
@@ -1676,6 +1688,7 @@ function applyEventInner(
           messages,
           item.tool_use_id,
           item.is_error,
+          now(),
         );
         messages = settleWorkflowForToolResult(
           messages,

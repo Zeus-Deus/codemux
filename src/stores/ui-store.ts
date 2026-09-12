@@ -180,6 +180,14 @@ interface UIStore {
     subagentId: string;
     nonce: number;
   } | null;
+  /** Whether the Subagents pane is showing its History sub-view instead of
+   *  the live list. A view mode, not a preference — a new session should
+   *  open on what is running now, so this is never persisted. */
+  subagentsHistoryOpen: boolean;
+  /** Subagent ids whose failure card the user has waved off. Failures hold
+   *  the pane until acknowledged; the acknowledgement itself is per-session
+   *  (the run is over next launch), so this is transient too. */
+  dismissedSubagentAttention: string[];
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   /** Activate a pane. Also opens it (and clears any dismissal) so every
@@ -260,6 +268,8 @@ interface UIStore {
   clearExpandProjectRequest: (projectPath: string) => void;
   requestEnterSubagent: (threadId: string, subagentId: string) => void;
   clearSubagentEnterRequest: () => void;
+  setSubagentsHistoryOpen: (open: boolean) => void;
+  dismissSubagentAttention: (id: string) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -300,6 +310,8 @@ export const useUIStore = create<UIStore>()(
       sidebarToggleFn: null,
       expandProjectRequest: null,
       subagentEnterRequest: null,
+      subagentsHistoryOpen: false,
+      dismissedSubagentAttention: [],
 
       getRightPanelTab: (workspaceId) =>
         get().rightPanelTabs[workspaceId] ?? null,
@@ -599,6 +611,15 @@ export const useUIStore = create<UIStore>()(
         })),
 
       clearSubagentEnterRequest: () => set({ subagentEnterRequest: null }),
+
+      setSubagentsHistoryOpen: (open) => set({ subagentsHistoryOpen: open }),
+
+      dismissSubagentAttention: (id) =>
+        set((s) =>
+          s.dismissedSubagentAttention.includes(id)
+            ? s
+            : { dismissedSubagentAttention: [...s.dismissedSubagentAttention, id] },
+        ),
     }),
     {
       name: "codemux-ui",
