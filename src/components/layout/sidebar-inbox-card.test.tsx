@@ -42,6 +42,13 @@ vi.mock("@/tauri/commands", () => ({
 
 vi.mock("@/stores/hosts-store", () => ({ useHosts: () => [] }));
 
+// These tests exercise the row's actions and appearance. Keep userEvent's
+// incidental pointer/focus events from starting real Radix hover timers that
+// can outlive teardown; hover behavior has its own workspace-hover-card tests.
+vi.mock("./workspace-hover-card", () => ({
+  WorkspaceHoverCard: ({ children }: { children: React.ReactNode }) => children,
+}));
+
 function appStoreState() {
   return {
     appState: {
