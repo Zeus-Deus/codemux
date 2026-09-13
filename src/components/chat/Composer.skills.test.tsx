@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -23,7 +24,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
 });
 
 import { Composer } from "./Composer";
-import { listChatSlashCommands, listSkills } from "@/tauri/commands";
+import { listChatSlashCommands, listSkills, startSkillsWatcher } from "@/tauri/commands";
 import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useSkillsStore } from "@/stores/skills-store";
 
@@ -117,6 +118,7 @@ function resetSkillsStore() {
     adapterErrors: [],
     loadedAt: 0,
     includePlugins: true,
+    disabledIds: [],
     inventoryCache: {},
     activeContextKey: null,
     inFlightContexts: {},
@@ -129,6 +131,7 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
   beforeEach(() => {
     resetSkillsStore();
     listSkillsMock.mockReset();
+    vi.mocked(startSkillsWatcher).mockClear();
     // Provider command discovery rides the same popup-open trigger as
     // skills; resolve it empty so skills-focused assertions (footer
     // tone, group contents) aren't perturbed by the COMMANDS group.
@@ -163,6 +166,39 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     });
     expect(queryByTestId("slash-item-skill:ui")).not.toBeNull();
     expect(getByText("SKILLS")).toBeInTheDocument();
+  });
+
+  it("retries a first scan invalidated while the draft popup stays open", async () => {
+    let finishOld!: (skills: Skill[]) => void;
+    listSkillsMock
+      .mockReturnValueOnce(new Promise<Skill[]>((resolve) => { finishOld = resolve; }))
+      .mockResolvedValueOnce([makeSkill({ id: "fresh", name: "fresh-skill" })]);
+    const { container, queryByTestId } = renderComposer({ isDraft: true });
+    type(getTextarea(container), "/");
+    expect(listSkillsMock).toHaveBeenCalledTimes(1);
+
+    act(() => useSkillsStore.getState().invalidate());
+    await waitFor(() => expect(queryByTestId("slash-item-skill:fresh")).not.toBeNull());
+    expect(listSkillsMock).toHaveBeenCalledTimes(2);
+    expect(startSkillsWatcher).toHaveBeenCalledTimes(1);
+    await act(async () => { finishOld([makeSkill({ id: "stale" })]); });
+    expect(queryByTestId("slash-item-skill:stale")).toBeNull();
+    expect(queryByTestId("slash-item-skill:fresh")).not.toBeNull();
+  });
+
+  it("keeps project skills scoped when another mounted composer changes the active inventory", async () => {
+    listSkillsMock.mockImplementation(async (cwd: string) => [
+      makeSkill({ id: cwd === "/project-a" ? "a" : "b", scope: "project" }),
+    ]);
+    const { container, queryByTestId, rerender } = renderComposer({ cwd: "/project-a" });
+    type(getTextarea(container), "/");
+    await waitFor(() => expect(queryByTestId("slash-item-skill:a")).not.toBeNull());
+    await act(async () => { await useSkillsStore.getState().loadSkills("/project-b"); });
+    expect(queryByTestId("slash-item-skill:a")).not.toBeNull();
+    expect(queryByTestId("slash-item-skill:b")).toBeNull();
+    rerender(<TooltipProvider><Composer {...baseProps()} cwd="/project-b" /></TooltipProvider>);
+    expect(queryByTestId("slash-item-skill:a")).toBeNull();
+    await waitFor(() => expect(queryByTestId("slash-item-skill:b")).not.toBeNull());
   });
 
   it("filters skills as the user types (/codemux-r → only codemux-release)", async () => {
@@ -296,6 +332,7 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
       loading: false,
       error: null,
       loadedAt: Date.now(),
+      activeContextKey: JSON.stringify(["/home/user/project", true]),
       includePlugins: true,
     });
 
@@ -322,6 +359,7 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
       loading: false,
       error: null,
       loadedAt: Date.now(),
+      activeContextKey: JSON.stringify(["/home/user/project", true]),
       includePlugins: true,
     });
 

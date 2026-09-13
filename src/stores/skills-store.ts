@@ -281,6 +281,8 @@ export const useSkillsStore = create<SkillsState>()(
   ),
 );
 
+const EMPTY_SKILLS: Skill[] = [];
+
 /**
  * Selector returning skills the user has NOT disabled. Used by every
  * surface that should respect the user's enable/disable choice — the
@@ -288,9 +290,19 @@ export const useSkillsStore = create<SkillsState>()(
  * The Settings UI uses `state.skills` directly so disabled skills can
  * still render (greyed) with their toggle to switch back on.
  */
-export const selectActiveSkills = (s: SkillsState): Skill[] => {
-  if (s.disabledIds.length === 0) return s.skills;
-  return s.skills.filter(
+export const selectActiveSkills = (
+  s: SkillsState,
+  projectRoot?: string | null,
+): Skill[] => {
+  const contextKey = JSON.stringify([projectRoot, s.includePlugins]);
+  // Mounted composers can belong to different projects. Never borrow
+  // another composer's active inventory, including before the load effect
+  // runs after a project switch.
+  const skills = projectRoot === undefined || s.activeContextKey === contextKey
+    ? s.skills
+    : s.inventoryCache[contextKey]?.skills ?? EMPTY_SKILLS;
+  if (s.disabledIds.length === 0) return skills;
+  return skills.filter(
     (skill) => !s.disabledIds.includes(skill.preferenceId ?? skill.id),
   );
 };

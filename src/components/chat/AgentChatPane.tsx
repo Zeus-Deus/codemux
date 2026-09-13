@@ -575,7 +575,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // `selectActiveSkills` filters out user-disabled skills so a
   // disabled `/release` token in the textarea is treated as plain
   // prose, not silently injected.
-  const skillsRegistry = useSkillsStore(selectActiveSkills);
+  const skillsRegistry = useSkillsStore(
+    useMemo(() => (s) => selectActiveSkills(s, cwd), [cwd]),
+  );
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const removeUserMessageByNonce = useAgentChatStore(

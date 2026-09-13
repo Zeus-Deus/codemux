@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ struct CacheEntry {
 #[derive(Default)]
 pub struct SkillInventoryService {
     cache: Mutex<HashMap<(Option<PathBuf>, bool), CacheEntry>>,
+    generation: AtomicU64,
 }
 
 impl SkillInventoryService {
@@ -57,6 +59,7 @@ impl SkillInventoryService {
         let canonical_cwd =
             cwd.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         let key = (canonical_cwd.clone(), include_plugins);
+        let generation = self.generation.load(Ordering::SeqCst);
         if !force {
             if let Some(hit) = self.cache.lock().await.get(&key) {
                 if hit.loaded_at.elapsed() < CACHE_TTL {
@@ -105,18 +108,25 @@ impl SkillInventoryService {
 
         stabilize_preference_ids(&mut inventory.skills, canonical_cwd.as_deref());
         sort_skills(&mut inventory.skills);
-        self.cache.lock().await.insert(
-            key,
-            CacheEntry {
-                loaded_at: Instant::now(),
-                inventory: inventory.clone(),
-            },
-        );
+        let mut cache = self.cache.lock().await;
+        // A filesystem change during a provider probe invalidates this
+        // snapshot. Do not let its late completion refill the fresh cache.
+        if generation == self.generation.load(Ordering::SeqCst) {
+            cache.insert(
+                key,
+                CacheEntry {
+                    loaded_at: Instant::now(),
+                    inventory: inventory.clone(),
+                },
+            );
+        }
         Ok(inventory)
     }
 
     pub async fn invalidate(&self) {
-        self.cache.lock().await.clear();
+        let mut cache = self.cache.lock().await;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cache.clear();
     }
 
     pub async fn resolve(

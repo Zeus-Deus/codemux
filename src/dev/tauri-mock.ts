@@ -3282,7 +3282,18 @@ const handlers: Record<string, Handler> = {
           },
         ]
       : [],
-  list_skills: () => MOCK_SKILL_INVENTORY,
+  list_skills: (a) => {
+    const cwd = String(a.projectRoot ?? "");
+    const inCodemux = cwd === `${MOCK_HOME_DIR}/projects/codemux`
+      || cwd.startsWith(`${MOCK_HOME_DIR}/projects/codemux/`)
+      || cwd.startsWith(`${MOCK_HOME_DIR}/.codemux/worktrees/codemux/`);
+    return {
+      ...MOCK_SKILL_INVENTORY,
+      skills: MOCK_SKILL_INVENTORY.skills.filter(
+        (skill) => skill.scope !== "project" || inCodemux,
+      ),
+    };
+  },
   agent_chat_list_messages: (a) => mockThreadPayloads(a.threadId as string),
   // Cursor read (Phase 3). The mock's transcripts are generated and
   // stable per thread, so a row id is just "index + 1" within the

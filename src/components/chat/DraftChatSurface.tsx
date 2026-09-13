@@ -279,13 +279,13 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const displayCwd = useMemo(() => {
     switch (draft.target.kind) {
       case "home":
-        return null; // LocationControl owns this slot
+        return appHomeDir;
       case "project":
         return draft.target.projectPath;
       case "existing_workspace":
         return existingWorkspaceCwd;
     }
-  }, [draft.target, existingWorkspaceCwd]);
+  }, [draft.target, existingWorkspaceCwd, appHomeDir]);
 
   // Session history is workspace-scoped. A brand-new Home/project draft has
   // no workspace identity yet, so `@session:` stays unavailable until the
@@ -400,7 +400,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // skills registry. Same parser the live pane uses; bodies are
     // injected as a per-turn prefix by `materializeAndSend`.
     const sourceSkills = skillsForProvider(
-      selectActiveSkills(useSkillsStore.getState()),
+      selectActiveSkills(useSkillsStore.getState(), cwdForSession),
       currentDraft.provider,
     );
     const skillSelection = resolveSkillSelection(text, sourceSkills);

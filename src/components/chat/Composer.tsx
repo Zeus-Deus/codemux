@@ -612,12 +612,16 @@ export function Composer({
   // `selectActiveSkills` already filters out disabled ids — Composer
   // never sees disabled skills, so highlight + picker + send-time
   // injection all stay consistent.
-  const discoveredSkills = useSkillsStore(selectActiveSkills);
+  const discoveredSkills = useSkillsStore(
+    useMemo(() => (s) => selectActiveSkills(s, cwd ?? null), [cwd]),
+  );
   const skills = useMemo(
     () => skillsForProvider(discoveredSkills, provider),
     [discoveredSkills, provider],
   );
   const loadSkills = useSkillsStore((s) => s.loadSkills);
+  const skillsGeneration = useSkillsStore((s) => s.cacheGeneration);
+  const includePluginSkills = useSkillsStore((s) => s.includePlugins);
   const skillsLoading = useSkillsStore((s) => s.loading);
   const skillsLoaded = useSkillsStore((s) => s.loaded);
   const skillsError = useSkillsStore((s) => s.error);
@@ -777,15 +781,25 @@ export function Composer({
   useEffect(() => {
     if (!slashOpen) return;
     void loadSkills(cwd ?? null);
-    void startSkillsWatcher(cwd ?? null, useSkillsStore.getState().includePlugins).catch(
+  }, [slashOpen, cwd, loadSkills, skillsGeneration]);
+
+  // Do not restart the watcher when its events invalidate discovery. The
+  // load effect above retries even while the popup stays open.
+  useEffect(() => {
+    if (!slashOpen) return;
+    void startSkillsWatcher(cwd ?? null, includePluginSkills).catch(
       (error) => console.warn("[skills] watcher failed to start:", error),
     );
+  }, [slashOpen, cwd, includePluginSkills]);
+
+  useEffect(() => {
+    if (!slashOpen) return;
     // Provider command discovery rides the same first-open trigger. Grok can
     // replace its ACP command snapshot while a session is running, so each
     // popup reopen asks the backend cache for the latest value. Other
     // providers retain the app-lifetime frontend cache.
     void loadProviderCommands(provider, cwd ?? null, provider === "grok");
-  }, [slashOpen, cwd, loadSkills, loadProviderCommands, provider]);
+  }, [slashOpen, cwd, loadProviderCommands, provider]);
 
   // ─── Mention popup: debounced file fetch ─────────────────────────
   // Fires on every query change while the popup is open. The 100ms

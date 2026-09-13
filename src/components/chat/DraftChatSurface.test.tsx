@@ -6,6 +6,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // ── Module mocks ──
 
 vi.mock("@/tauri/commands", () => ({
+  listSkills: vi.fn().mockResolvedValue({ skills: [], errors: [] }),
+  listChatSlashCommands: vi.fn().mockResolvedValue([]),
+  startSkillsWatcher: vi.fn().mockResolvedValue(0),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   // ProjectPicker reads these when its popover opens. Render-only
   // tests never trigger the popover, so these stay quiet.
@@ -184,7 +187,9 @@ import { DraftChatSurface } from "./DraftChatSurface";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { toast } from "@/lib/toast";
-import { agentChatGetSessionContext } from "@/tauri/commands";
+import { agentChatGetSessionContext, listSkills, listChatSlashCommands, type Skill } from "@/tauri/commands";
+import { useSkillsStore } from "@/stores/skills-store";
+import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
@@ -201,6 +206,12 @@ function resetStores() {
     activeDraftId: null,
   });
   useAgentChatStore.setState({ threads: {} });
+  useSkillsStore.setState({ skills: [], loaded: false, loading: false, error: null,
+    disabledIds: [], inventoryCache: {}, inFlightContexts: {}, activeContextKey: null,
+    includePlugins: true, cacheGeneration: 0 });
+  useProviderCommandsStore.getState().invalidate();
+  vi.mocked(listSkills).mockReset().mockResolvedValue({ skills: [], errors: [] });
+  vi.mocked(listChatSlashCommands).mockClear();
   // homeDir is normally hydrated at App mount; seed it here so the
   // DraftChatSurface's seed effect and submit-time home-cwd resolver
   // see a populated value straight away (they no longer roundtrip via
@@ -269,6 +280,48 @@ describe("DraftChatSurface", () => {
     vi.mocked(toast.error).mockReset();
     vi.mocked(markPaneReady).mockReset();
   });
+
+  it.each(["claude", "codex"] as const)(
+    "loads Home and selected-project skills before the first %s prompt",
+    async (provider) => {
+      const userSkill = { id: "user-skill", name: "user-skill", scope: "user", provider,
+        filePath: "/home/user/.agents/skills/user-skill/SKILL.md" } as Skill;
+      const projectSkill = { ...userSkill, id: "project-skill", name: "project-skill",
+        scope: "project", filePath: "/projects/foo/.agents/skills/project-skill/SKILL.md" } as Skill;
+      vi.mocked(listSkills).mockImplementation(async (cwd) => ({
+        skills: cwd === "/projects/foo" ? [userSkill, projectSkill] : [userSkill], errors: [],
+      }));
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateHomeDraft();
+      store.updateDraftConfig(draft.draftId, { provider, checkoutMode: "worktree" });
+      store.setActiveDraft(draft.draftId);
+      const { container, queryByTestId, getByTestId } = renderSurface();
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "/" } });
+      await vi.waitFor(() => expect(queryByTestId("slash-item-skill:user-skill")).not.toBeNull());
+      expect(queryByTestId("slash-item-skill:project-skill")).toBeNull();
+      expect(listSkills).toHaveBeenCalledWith("/home/user", true, false);
+      expect(listChatSlashCommands).toHaveBeenCalledWith(provider, "/home/user");
+
+      act(() => store.updateDraftTarget(draft.draftId, { kind: "project", projectPath: "/projects/foo" }));
+      await vi.waitFor(() => expect(queryByTestId("slash-item-skill:project-skill")).not.toBeNull());
+      expect(materializeAndSend).not.toHaveBeenCalled();
+      act(() => store.updateDraftTarget(draft.draftId, { kind: "project", projectPath: "/projects/bar" }));
+      expect(queryByTestId("slash-item-skill:project-skill")).toBeNull();
+      await vi.waitFor(() => expect(queryByTestId("slash-item-skill:user-skill")).not.toBeNull());
+      act(() => store.updateDraftTarget(draft.draftId, { kind: "project", projectPath: "/projects/foo" }));
+      await vi.waitFor(() => expect(queryByTestId("slash-item-skill:project-skill")).not.toBeNull());
+      fireEvent.click(getByTestId("slash-item-skill:project-skill"));
+      expect(useChatDraftStore.getState().draftsById[draft.draftId].inputDraft).toBe("/project-skill ");
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({ success: false, error: "test stops before session creation" });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await vi.waitFor(() => expect(materializeAndSend).toHaveBeenCalledOnce());
+      const call = vi.mocked(materializeAndSend).mock.calls[0];
+      expect(call[2]).toBe("/projects/foo");
+      expect(call[4]).toEqual(expect.objectContaining({ skillIds: ["project-skill"] }));
+      expect(call[8]).toBe("/projects/foo");
+    },
+  );
 
   describe("rendering", () => {
     it("renders nothing when no draft is active", () => {
