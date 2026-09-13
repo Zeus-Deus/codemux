@@ -27,7 +27,11 @@ import {
   X,
 } from "lucide-react";
 import { CommandDialog } from "@/components/ui/command";
-import { ThemeAnsiDots, ThemeCoins } from "@/components/settings/theme-swatches";
+import {
+  ThemeAnsiDots,
+  ThemeCoins,
+  ThemeSchemeBadge,
+} from "@/components/settings/theme-swatches";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import {
   useAppStore,
@@ -588,8 +592,15 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // one arrow key away from someone who only meant to switch workspaces.
   // A path query is asking "where", and a palette has no location.
   const themesEligible = searching && !commandsOnly && !query.pathMode;
+  // The scheme is part of a theme's name for search purposes: "light" is how
+  // you ask for the one light theme in a list that is otherwise all dark, and
+  // the row says the same word back.
   const matchedThemes = useMemo(
-    () => (themesEligible ? rankThemeGroup(themeRows, query, (r) => r.theme.id === OMARCHY_THEME_ID ? `Follow ${r.theme.label}` : r.theme.label) : []),
+    () =>
+      themesEligible
+        ? rankThemeGroup(themeRows, query, (r) =>
+            `${r.theme.id === OMARCHY_THEME_ID ? "Follow " : ""}${r.theme.label} ${r.theme.scheme}`)
+        : [],
     [themeRows, query, themesEligible],
   );
   const matchedThemeStudio = useMemo(
@@ -1178,8 +1189,10 @@ function HighlightedSearchText({ text, query }: { text: string; query: string })
 
 /**
  * A theme row. Everything on it is evidence rather than decoration: the two
- * discs are the theme's own surface and accent, and the four squares are the
- * ANSI hues the terminal and code blocks will pick up.
+ * discs are the theme's own surface and accent, the four squares are the ANSI
+ * hues the terminal and code blocks will pick up, and the badge says whether
+ * the app comes back light or dark — the one property of a theme you can't
+ * read off a 22px disc.
  */
 function ThemeItemRow({
   row,
@@ -1199,6 +1212,7 @@ function ThemeItemRow({
           <span className="ml-2 text-[11px] font-normal text-muted-foreground">Automatic · {row.theme.label.replace("Omarchy · ", "")}</span>
         )}
       </span>
+      <ThemeSchemeBadge scheme={row.theme.scheme} />
       {applied && (
         <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
           current

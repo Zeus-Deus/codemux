@@ -28,8 +28,6 @@ if (import.meta.env.DEV) {
     queryClient;
 }
 
-// The boot script restores the last palette, including its light/dark scheme.
-
 function dismissSplash() {
   const splash = document.getElementById("splash");
   if (!splash) return;

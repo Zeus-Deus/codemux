@@ -122,7 +122,10 @@ function AppMenuFooter({ version }: { version: string | null }) {
           onClick={action}
           title={updateVersion ? `Version ${updateVersion}` : undefined}
           className={cn(
-            "flex items-center gap-1.5 rounded-[5px] px-1 text-[10.5px] transition-colors hover:brightness-125",
+            // `tone` is a fixed status colour, so hover has to *deepen* it on
+            // a light rail and *lift* it on a dark one — a single
+            // `brightness-125` washes the label out to nothing on white.
+            "flex items-center gap-1.5 rounded-[5px] px-1 text-[10.5px] transition-colors hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >

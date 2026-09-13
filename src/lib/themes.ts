@@ -1,4 +1,5 @@
 import type { ThemeColors } from "@/tauri/types";
+import { syncWindowBackground } from "@/lib/window-background";
 
 export const THEME_FILE_VERSION = 1 as const;
 export const THEME_BOOT_STORAGE_KEY = "codemux:appearance-theme:v1";
@@ -57,10 +58,31 @@ export const ANSI_SLOTS = [
 export type AnsiSlot = (typeof ANSI_SLOTS)[number];
 export type AnsiPalette = Readonly<Record<AnsiSlot, string>>;
 
+/**
+ * Whether a palette paints dark ink on a light canvas or the reverse.
+ *
+ * This is derived from the background, never declared: a file that says
+ * `"dark"` over a white canvas is simply wrong about itself, and the
+ * palette is the thing the user actually sees.
+ */
+export type ThemeScheme = "light" | "dark";
+
+/**
+ * The luminance above which a canvas is a *light* canvas.
+ *
+ * 0.28 is the same threshold the generator used when it refused light
+ * backgrounds outright, kept so no existing dark theme changes classification.
+ */
+const LIGHT_SCHEME_LUMINANCE = 0.28;
+
+export function schemeForBackground(color: string): ThemeScheme {
+  return relativeLuminance(color) >= LIGHT_SCHEME_LUMINANCE ? "light" : "dark";
+}
+
 export interface ThemeDefinition {
   id: string;
   label: string;
-  scheme: "dark" | "light";
+  scheme: ThemeScheme;
   roles: ThemeRoleMap;
   ansi: AnsiPalette;
   radius?: string;
@@ -73,7 +95,7 @@ export interface ThemeFile {
   version: typeof THEME_FILE_VERSION;
   id: string;
   label: string;
-  scheme: "dark" | "light";
+  scheme: ThemeScheme;
   roles: Partial<Record<ThemeRole, string>>;
   ansi?: Partial<Record<AnsiSlot, string>>;
   radius?: string;
@@ -137,6 +159,36 @@ const DEFAULT_ANSI: AnsiPalette = {
   brightWhite: "#ffffff",
 };
 
+/**
+ * ANSI for a light terminal.
+ *
+ * The default foreground/background swap when the scheme does, but the named
+ * slots must not: `black` still has to be dark and `white` still has to be
+ * light, or every program that prints `\e[30m` becomes unreadable. Only the
+ * *lightness* of the coloured slots moves, down to roughly L 0.55 so each one
+ * clears 4:1 on a white canvas.
+ */
+const LIGHT_ANSI: AnsiPalette = {
+  black: "#1c1917",
+  red: "#c23f3f",
+  green: "#2f8f4e",
+  yellow: "#a86f00",
+  blue: "#2f6fd0",
+  magenta: "#9a4fbd",
+  cyan: "#1a7f8e",
+  white: "#d6d3d1",
+  brightBlack: "#78716c",
+  // "Bright" on a light canvas means *more present*, which is darker and a
+  // touch more saturated — a lighter variant would simply disappear.
+  brightRed: "#a83232",
+  brightGreen: "#25753f",
+  brightYellow: "#8a5a00",
+  brightBlue: "#2559ab",
+  brightMagenta: "#7f3f9c",
+  brightCyan: "#136774",
+  brightWhite: "#ffffff",
+};
+
 const DEFAULT_ROLES: ThemeRoleMap = {
   background: "oklch(0.147 0.004 49.25)",
   foreground: "oklch(0.985 0.001 106.423)",
@@ -181,6 +233,53 @@ export const BUILT_IN_THEMES: readonly ThemeDefinition[] = [
     scheme: "dark",
     roles: DEFAULT_ROLES,
     ansi: DEFAULT_ANSI,
+  },
+  {
+    /**
+     * Graphite's light twin: the shadcn stone light ramp Codemux already
+     * shipped (dead in `:root` because the runtime bridge always won) plus
+     * Graphite's ember brand.
+     *
+     * The brand accent is ember at L 0.58 rather than Graphite's 0.705 —
+     * `oklch(0.705 0.152 47)` only reaches 2.76:1 on white, and `brandAccent`
+     * has to work as inline code and as a status dot directly on the canvas.
+     * `oklch(0.58 0.152 47)` is the same hue and chroma at 4.55:1.
+     */
+    id: "graphite-light",
+    label: "Graphite Light",
+    scheme: "light",
+    roles: roles({
+      background: "oklch(1 0 0)",
+      foreground: "oklch(0.147 0.004 49.25)",
+      card: "oklch(1 0 0)",
+      cardForeground: "oklch(0.147 0.004 49.25)",
+      popover: "oklch(1 0 0)",
+      popoverForeground: "oklch(0.147 0.004 49.25)",
+      primary: "oklch(0.216 0.006 56.043)",
+      primaryForeground: "oklch(0.985 0.001 106.423)",
+      secondary: "oklch(0.97 0.001 106.424)",
+      secondaryForeground: "oklch(0.216 0.006 56.043)",
+      muted: "oklch(0.97 0.001 106.424)",
+      mutedForeground: "oklch(0.553 0.013 58.071)",
+      accent: "oklch(0.97 0.001 106.424)",
+      accentForeground: "oklch(0.216 0.006 56.043)",
+      border: "oklch(0.923 0.003 48.717)",
+      input: "oklch(0.923 0.003 48.717)",
+      ring: "oklch(0.709 0.01 56.259)",
+      // The rail still recedes, so on a white canvas it is the *darker*
+      // surface — the same inversion the dark themes make in the other
+      // direction.
+      sidebar: "oklch(0.972 0.001 106.4)",
+      sidebarForeground: "oklch(0.147 0.004 49.25)",
+      sidebarPrimary: "oklch(0.58 0.152 47)",
+      sidebarPrimaryForeground: "oklch(0.985 0.001 106.423)",
+      sidebarAccent: "oklch(0.955 0.002 106.4)",
+      sidebarAccentForeground: "oklch(0.216 0.006 56.043)",
+      sidebarBorder: "oklch(0.923 0.003 48.717)",
+      sidebarRing: "oklch(0.709 0.01 56.259)",
+      brandAccent: "oklch(0.58 0.152 47)",
+    }),
+    ansi: LIGHT_ANSI,
   },
   {
     id: "warm",
@@ -447,8 +546,25 @@ function readableOn(background: string, tintedHue?: number): string {
   return contrastRatio(light, background) >= contrastRatio(dark, background) ? light : dark;
 }
 
-function surface(canvas: Oklch, hue: number, chroma: number, delta: number): string {
-  return rgbToHex(oklchToRgb({ L: Math.min(0.96, canvas.L + delta), C: chroma, h: hue }));
+/**
+ * How far a light theme's surfaces travel compared with a dark one's.
+ *
+ * The deltas below were tuned against a near-black canvas, where there is a
+ * whole unit of headroom above. A white canvas has the same headroom below,
+ * but the eye reads a drop from white far more strongly than the same rise
+ * from black, so `input` at a literal `1.0 - 0.2` lands on a mid grey that
+ * looks like a disabled control. Scaling the light side keeps the *ordering*
+ * of the ramp identical while landing `border` and `input` near the values
+ * the shadcn stone light preset uses.
+ */
+const LIGHT_SURFACE_SCALE = 0.6;
+
+function surface(canvas: Oklch, hue: number, chroma: number, delta: number, scheme: ThemeScheme): string {
+  const L =
+    scheme === "dark"
+      ? Math.min(0.96, canvas.L + delta)
+      : Math.max(0.04, canvas.L - delta * LIGHT_SURFACE_SCALE);
+  return rgbToHex(oklchToRgb({ L, C: chroma, h: hue }));
 }
 
 function lighten(value: string, amount: number): string {
@@ -456,18 +572,57 @@ function lighten(value: string, amount: number): string {
   return rgbToHex(oklchToRgb({ ...color, L: Math.min(0.94, color.L + amount) }));
 }
 
-function deriveAnsi(background: string, foreground: string, accent: string): AnsiPalette {
+/** `lighten`'s mirror, with a floor so a "bright" slot never bottoms out at black. */
+function darken(value: string, amount: number): string {
+  const color = rgbToOklch(parseHex(normalizeColor(value) ?? "#ffffff")!);
+  return rgbToHex(oklchToRgb({ ...color, L: Math.max(0.12, color.L - amount) }));
+}
+
+function deriveAnsi(background: string, foreground: string, accent: string, scheme: ThemeScheme): AnsiPalette {
   const accentOklch = rgbToOklch(parseHex(accent)!);
   const chroma = Math.max(0.08, Math.min(0.17, accentOklch.C));
-  const hueColor = (hue: number, lightness = 0.7) => rgbToHex(oklchToRgb({ L: lightness, C: chroma, h: (hue + 360) % 360 }));
+  const hueColor = (hue: number, lightness: number) => rgbToHex(oklchToRgb({ L: lightness, C: chroma, h: (hue + 360) % 360 }));
+  if (scheme === "light") {
+    /**
+     * Only the terminal's *default* pair follows the scheme. The sixteen
+     * named slots do not: `black` stays dark and `white` stays light on a
+     * white canvas too, otherwise anything that hardcodes `\e[30m` (git,
+     * most TUIs) paints white-on-white. So `black` takes the theme's dark
+     * ink rather than the canvas, and `white`/`brightWhite` stay at the
+     * light end where their names promise they are.
+     */
+    const base = {
+      black: foreground,
+      red: "#c23f3f",
+      green: "#2f8f4e",
+      yellow: "#a86f00",
+      blue: hueColor(accentOklch.h, 0.5),
+      magenta: hueColor(accentOklch.h + 55, 0.5),
+      cyan: hueColor(accentOklch.h - 55, 0.5),
+      white: darken(background, 0.12),
+    };
+    return {
+      ...base,
+      brightBlack: darken(background, 0.45),
+      // Brights go *down* in lightness here: on a white canvas the more
+      // prominent version of a colour is the darker one.
+      brightRed: darken(base.red, 0.08),
+      brightGreen: darken(base.green, 0.06),
+      brightYellow: darken(base.yellow, 0.05),
+      brightBlue: darken(base.blue, 0.08),
+      brightMagenta: darken(base.magenta, 0.08),
+      brightCyan: darken(base.cyan, 0.08),
+      brightWhite: "#ffffff",
+    };
+  }
   const base = {
     black: background,
     red: "#dc6b6b",
     green: "#7ec699",
     yellow: "#e5c07b",
-    blue: hueColor(accentOklch.h),
-    magenta: hueColor(accentOklch.h + 55),
-    cyan: hueColor(accentOklch.h - 55),
+    blue: hueColor(accentOklch.h, 0.7),
+    magenta: hueColor(accentOklch.h + 55, 0.7),
+    cyan: hueColor(accentOklch.h - 55, 0.7),
     white: foreground,
   };
   return {
@@ -492,10 +647,14 @@ export function createGeneratedTheme(
   const background = normalizeColor(backgroundValue);
   const accent = normalizeColor(accentValue, background ?? "#000000");
   if (!background || !accent) throw new Error("Use a valid hex or OKLCH background and accent.");
-  if (relativeLuminance(background) >= 0.28) {
-    throw new Error("Light themes are not enabled yet. Choose a darker background.");
-  }
 
+  /**
+   * The canvas decides the scheme, and the scheme decides which way every
+   * derivation points: text is solved *away* from the background, surfaces
+   * step away from it, and the ANSI ramp is picked for the canvas it will be
+   * printed on.
+   */
+  const scheme = schemeForBackground(background);
   const canvas = rgbToOklch(parseHex(background)!);
   const accentColor = rgbToOklch(parseHex(accent)!);
 
@@ -516,51 +675,63 @@ export function createGeneratedTheme(
   const tint = Math.min(0.03, canvas.C);
   const surfaceChroma = (scale: number, ceiling: number) =>
     Math.min(ceiling, canvas.C * scale);
+  /** Text is solved towards the far end of the ramp from the canvas. */
+  const ink: "lighter" | "darker" = scheme === "dark" ? "lighter" : "darker";
+  const step = (chroma: number, delta: number) => surface(canvas, hue, chroma, delta, scheme);
 
-  const foreground = solveLightness({ L: 0.94, C: Math.min(0.02, canvas.C * 0.6), h: hue }, background, 7, "lighter");
-  const mutedForeground = solveLightness({ L: 0.65, C: tint, h: hue }, background, 4.7, "lighter");
+  const foreground = solveLightness(
+    { L: scheme === "dark" ? 0.94 : 0.22, C: Math.min(0.02, canvas.C * 0.6), h: hue },
+    background,
+    7,
+    ink,
+  );
+  // The seed is a *bound*, not the answer: the solver returns the least
+  // extreme lightness that still clears the target, so 0.55 lets muted text on
+  // a white canvas settle near the stone preset's own 4.8:1 rather than being
+  // dragged to body-text weight.
+  const mutedForeground = solveLightness({ L: scheme === "dark" ? 0.65 : 0.55, C: tint, h: hue }, background, 4.7, ink);
   // This one sits *on* the accent, so it is the accent's hue that has to
   // carry it.
   const accentForeground = readableOn(accent, accentColor.h);
-  const sidebar = surface(canvas, hue, tint * 1.2, 0.025);
-  const card = surface(canvas, hue, tint, 0.055);
-  const secondary = surface(canvas, hue, surfaceChroma(1.3, 0.06), 0.1);
-  const border = surface(canvas, hue, surfaceChroma(1.1, 0.05), 0.16);
-  const input = surface(canvas, hue, surfaceChroma(1.2, 0.055), 0.2);
+  const sidebar = step(tint * 1.2, 0.025);
+  const card = step(tint, 0.055);
+  const secondary = step(surfaceChroma(1.3, 0.06), 0.1);
+  const border = step(surfaceChroma(1.1, 0.05), 0.16);
+  const input = step(surfaceChroma(1.2, 0.055), 0.2);
   const themeRoles = roles({
     background,
     foreground,
     card,
     cardForeground: foreground,
-    popover: surface(canvas, hue, tint, 0.075),
+    popover: step(tint, 0.075),
     popoverForeground: foreground,
     primary: accent,
     primaryForeground: accentForeground,
     secondary,
-    secondaryForeground: solveLightness(rgbToOklch(parseHex(foreground)!), secondary, 4.6, "lighter"),
-    muted: surface(canvas, hue, tint, 0.075),
+    secondaryForeground: solveLightness(rgbToOklch(parseHex(foreground)!), secondary, 4.6, ink),
+    muted: step(tint, 0.075),
     mutedForeground,
-    accent: surface(canvas, hue, surfaceChroma(1.4, 0.07), 0.12),
+    accent: step(surfaceChroma(1.4, 0.07), 0.12),
     accentForeground: foreground,
     border,
     input,
-    ring: surface(canvas, hue, tint, 0.3),
+    ring: step(tint, 0.3),
     sidebar,
-    sidebarForeground: solveLightness(rgbToOklch(parseHex(foreground)!), sidebar, 4.6, "lighter"),
+    sidebarForeground: solveLightness(rgbToOklch(parseHex(foreground)!), sidebar, 4.6, ink),
     sidebarPrimary: accent,
     sidebarPrimaryForeground: accentForeground,
-    sidebarAccent: surface(canvas, hue, surfaceChroma(1.25, 0.055), 0.09),
+    sidebarAccent: step(surfaceChroma(1.25, 0.055), 0.09),
     sidebarAccentForeground: foreground,
-    sidebarBorder: surface(canvas, hue, surfaceChroma(1.0, 0.045), 0.13),
-    sidebarRing: surface(canvas, hue, tint, 0.3),
+    sidebarBorder: step(surfaceChroma(1.0, 0.045), 0.13),
+    sidebarRing: step(tint, 0.3),
     brandAccent: accent,
   });
   return {
     id,
     label: label.trim().slice(0, 48) || "Custom theme",
-    scheme: "dark",
+    scheme,
     roles: themeRoles,
-    ansi: deriveAnsi(background, foreground, accent),
+    ansi: deriveAnsi(background, foreground, accent, scheme),
     managed: true,
     seeds: { background, accent },
     source: "generated",
@@ -584,14 +755,7 @@ function validRadius(value: unknown): string | undefined {
 function completeThemeFile(file: ThemeFile): ThemeDefinition {
   const seedBackground = file.seeds?.background ?? file.roles.background ?? "#151110";
   const seedAccent = file.seeds?.accent ?? file.roles.brandAccent ?? file.roles.primary ?? "#e07850";
-  // Light system-theme copies carry a complete palette; never fill their
-  // missing roles with dark defaults or silently turn them into dark themes.
-  if (file.scheme === "light" && THEME_ROLES.some((role) => !normalizeColor(file.roles[role] ?? ""))) {
-    throw new Error("A light theme must include every surface color.");
-  }
-  const generated = file.scheme === "light"
-    ? { ...BUILT_IN_THEMES[0]!, scheme: "light" as const }
-    : createGeneratedTheme(file.label, seedBackground, seedAccent, file.id);
+  const generated = createGeneratedTheme(file.label, seedBackground, seedAccent, file.id);
   const themeRoles = { ...generated.roles };
   for (const role of THEME_ROLES) {
     const value = file.roles[role];
@@ -609,6 +773,10 @@ function completeThemeFile(file: ThemeFile): ThemeDefinition {
     ...generated,
     id: /^custom-[a-z0-9-]{1,48}$/.test(file.id) ? file.id : themeIdFromLabel(file.label),
     label: file.label.trim().slice(0, 48) || "Custom theme",
+    // `file.scheme` is advisory. A file that declares "dark" over a white
+    // canvas is wrong about itself, and the palette is what the user sees, so
+    // the background always wins.
+    scheme: schemeForBackground(themeRoles.background),
     roles: themeRoles,
     ansi: themeAnsi,
     radius: validRadius(file.radius),
@@ -624,7 +792,7 @@ export function parseCustomTheme(value: unknown): ThemeDefinition | null {
       version: THEME_FILE_VERSION,
       id: typeof value.id === "string" ? value.id : themeIdFromLabel(value.label),
       label: value.label,
-      scheme: value.scheme === "light" ? "light" : "dark",
+      scheme: value.scheme === "light" || value.scheme === "dark" ? value.scheme : "dark",
       roles: value.roles as Partial<Record<ThemeRole, string>>,
       ansi: isRecord(value.ansi) ? value.ansi as Partial<Record<AnsiSlot, string>> : undefined,
       radius: validRadius(value.radius),
@@ -730,7 +898,14 @@ function importShadcn(text: string, label: string): { theme: ThemeDefinition; ma
   imported.brandAccent = imported.sidebarPrimary;
   if (mapped.has("sidebarPrimary")) mapped.add("brandAccent");
   return {
-    theme: { ...generated, roles: imported, radius: validRadius(declarations.get("radius")), source: "shadcn", managed: false },
+    theme: {
+      ...generated,
+      scheme: schemeForBackground(imported.background),
+      roles: imported,
+      radius: validRadius(declarations.get("radius")),
+      source: "shadcn",
+      managed: false,
+    },
     mapped,
   };
 }
@@ -741,7 +916,21 @@ function importVsCode(
 ): { theme: ThemeDefinition; mapped: Set<ThemeRole> } {
   if (!isRecord(value.colors)) throw new Error("That VS Code theme has no colors map.");
   const colors = value.colors;
-  let importBackdrop = "#000000";
+
+  /**
+   * The manifest's own `type` — `"light" | "dark" | "hc" | "hcLight"`.
+   *
+   * It does **not** decide the scheme: `editor.background` does, because
+   * that is the canvas the user will actually look at and a file that
+   * mislabels itself is simply wrong about itself. What the declaration is
+   * good for is the one moment before the canvas is known: a translucent
+   * colour has to be composited over *something*, and on a light theme that
+   * something is white. Getting this wrong flattened `#ffffffcc` to a mid
+   * grey and made a white theme import as a dark one.
+   */
+  const declaredType = typeof value.type === "string" ? value.type.toLowerCase() : "";
+  const declaredLight = declaredType === "light" || declaredType === "hclight";
+  let importBackdrop = declaredLight ? "#ffffff" : "#000000";
   const pick = (...keys: string[]) => {
     for (const key of keys) {
       if (typeof colors[key] === "string") {
@@ -754,6 +943,9 @@ function importVsCode(
   const background = pick("editor.background", "editorPane.background");
   if (!background) throw new Error('That VS Code theme has no "editor.background" color.');
   importBackdrop = background;
+  /** The canvas decides, and every "away from the background" step follows it. */
+  const scheme = schemeForBackground(background);
+  const away: "lighter" | "darker" = scheme === "dark" ? "lighter" : "darker";
 
   /**
    * The theme's identity color.
@@ -766,7 +958,8 @@ function importVsCode(
    * Codemux's `brandAccent` has to work as inline code and as a status dot on
    * the canvas, so a candidate that can't clear 3:1 against the background
    * isn't usable no matter how deliberate it was; the terminal's blue/cyan
-   * are the reliable bright fallbacks, and failing those the pick is lifted
+   * are the reliable bright fallbacks, and failing those the pick is pushed
+   * away from the canvas — lighter on a dark theme, darker on a light one —
    * until it's legible.
    */
   const accentCandidates = [
@@ -781,7 +974,7 @@ function importVsCode(
   const legible = accentCandidates.find((value) => contrastRatio(value, background) >= 3);
   const accent =
     legible ??
-    (accentCandidates[0] ? solveLightness(rgbToOklch(parseHex(accentCandidates[0])!), background, 3, "lighter") : "#e07850");
+    solveLightness(rgbToOklch(parseHex(accentCandidates[0] ?? "#e07850")!), background, 3, away);
   const label = typeof value.name === "string" ? value.name : fallbackLabel;
   const generated = createGeneratedTheme(label, background, accent);
   const imported = { ...generated.roles };
@@ -824,14 +1017,24 @@ function importVsCode(
       ["brightBlue", "terminal.ansiBrightBlue"], ["brightMagenta", "terminal.ansiBrightMagenta"],
       ["brightCyan", "terminal.ansiBrightCyan"], ["brightWhite", "terminal.ansiBrightWhite"],
     ];
+    // A missing bright slot is the base hue made *more* prominent, which on a
+    // light canvas means darker, not lighter.
+    const emphasize = scheme === "dark" ? lighten : darken;
     for (const [slot, token] of brightTokens) {
       const selected = pick(token);
-      importedAnsi[slot] = selected ?? lighten(importedAnsi[slot.replace("bright", "").replace(/^./, (c) => c.toLowerCase()) as AnsiSlot] ?? generated.ansi[slot], 0.08);
+      importedAnsi[slot] = selected ?? emphasize(importedAnsi[slot.replace("bright", "").replace(/^./, (c) => c.toLowerCase()) as AnsiSlot] ?? generated.ansi[slot], 0.08);
     }
     finalAnsi = { ...generated.ansi, ...importedAnsi };
   }
   return {
-    theme: { ...generated, roles: imported, ansi: finalAnsi, source: "vscode", managed: false },
+    theme: {
+      ...generated,
+      scheme,
+      roles: imported,
+      ansi: finalAnsi,
+      source: "vscode",
+      managed: false,
+    },
     mapped,
   };
 }
@@ -881,6 +1084,10 @@ export const THEME_IMPORT_SOURCE_LABEL: Readonly<Record<ThemeImportSource, strin
 };
 
 export function resolveTheme(themeId: string | null | undefined, customThemes: readonly ThemeDefinition[] = []): ThemeDefinition {
+  // `"system"` and `"dark"` are the pre-palette appearance settings, still on
+  // disk for anyone who never opened the theme picker. They collapse to
+  // Graphite for now; a follow-up adds a real light/dark/system mode that will
+  // give `"system"` its own meaning back.
   const normalized = themeId === "system" || themeId === "dark" || !themeId ? "default" : themeId;
   return customThemes.find((theme) => theme.id === normalized) ?? BUILT_IN_THEMES.find((theme) => theme.id === normalized) ?? BUILT_IN_THEMES[0]!;
 }
@@ -903,13 +1110,18 @@ function notifyActiveTheme(theme: ThemeDefinition) {
 }
 
 function writeThemeVariables(root: HTMLElement, theme: ThemeDefinition) {
-  root.classList.toggle("dark", theme.scheme !== "light");
-  root.style.colorScheme = theme.scheme;
   for (const role of THEME_ROLES) root.style.setProperty(ROLE_VARIABLES[role], theme.roles[role]);
   for (const slot of ANSI_SLOTS) root.style.setProperty(ANSI_VARIABLES[slot], theme.ansi[slot]);
   if (theme.radius) root.style.setProperty("--cm-theme-radius", theme.radius);
   else root.style.removeProperty("--cm-theme-radius");
   root.dataset.themeId = theme.id;
+  // The palette owns the scheme. `.dark` still drives Tailwind's `dark:`
+  // variant and the handful of scheme-specific rules in globals.css;
+  // `color-scheme` is what makes native scrollbars, form controls, and the
+  // window chrome follow along.
+  root.dataset.themeScheme = theme.scheme;
+  root.classList.toggle("dark", theme.scheme === "dark");
+  root.style.colorScheme = theme.scheme;
 }
 
 function persistBootTheme(theme: ThemeDefinition) {
@@ -937,18 +1149,33 @@ export function applyTheme(theme: ThemeDefinition, options: { animate?: boolean;
     void root.offsetHeight;
     requestAnimationFrame(() => root.classList.remove("no-transitions"));
   }
-  if (options.persist !== false) persistBootTheme(theme);
+  if (options.persist !== false) {
+    persistBootTheme(theme);
+    // Previews (`persist: false`) deliberately don't repaint the OS window:
+    // the palette they show is not the one the next launch will boot into.
+    const background = normalizeColor(theme.roles.background);
+    if (background) syncWindowBackground(background);
+  }
   notifyActiveTheme(theme);
 }
 
 export function themeToSyntaxColors(theme: ThemeDefinition): ThemeColors {
+  /**
+   * The selection pair is the canvas nudged one step, with the palette's ink
+   * on top — mirrored per scheme. On a dark canvas that is `brightBlack`
+   * (the background lightened) under `white`; on a light one it is `white`
+   * (the background darkened) under `black`. Taking the dark pairing on a
+   * light palette would put `white` on `brightBlack` at about 3:1, because
+   * both named slots keep their literal meaning whatever the canvas does.
+   */
+  const light = theme.scheme === "light";
   return {
     accent: normalizeColor(theme.roles.brandAccent) ?? theme.ansi.blue,
     cursor: normalizeColor(theme.roles.sidebarPrimary) ?? theme.ansi.blue,
     foreground: normalizeColor(theme.roles.foreground) ?? theme.ansi.white,
     background: normalizeColor(theme.roles.background) ?? theme.ansi.black,
-    selection_foreground: theme.ansi.white,
-    selection_background: theme.ansi.brightBlack,
+    selection_foreground: light ? theme.ansi.black : theme.ansi.white,
+    selection_background: light ? theme.ansi.white : theme.ansi.brightBlack,
     color0: theme.ansi.black,
     color1: theme.ansi.red,
     color2: theme.ansi.green,

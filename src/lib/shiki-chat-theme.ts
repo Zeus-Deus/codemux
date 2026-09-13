@@ -146,12 +146,19 @@ function themeId(base: ChatCodeThemeBase): string {
 }
 
 /**
- * Streamdown always renders a light/dark theme pair, and Shiki emits both a
- * `color` and a `--shiki-dark` value per token. The selected terminal ANSI
- * palette is a single palette, whether the shell is light or dark,
- * so both slots are filled with the same colors under
- * distinct names. Distinct names matter because Shiki registers themes by
- * name and the pair must not collide.
+ * Streamdown always renders a light/dark theme pair: Shiki emits the light
+ * slot's color inline and the dark slot's as a `--shiki-dark` custom
+ * property, and the markup picks between them with a `dark:` variant —
+ * which `globals.css` binds to the `.dark` class, i.e. to the active
+ * palette's scheme (see `applyTheme`). Nothing consults
+ * `prefers-color-scheme`.
+ *
+ * Both slots are therefore filled from the *same* palette. That is not a
+ * dark-only shortcut: the terminal ANSI palette is a single palette whatever
+ * the scheme, so whichever slot the class happens to select is the one the
+ * user's theme asked for, and switching between a light and a dark theme
+ * rebuilds the pair anyway. Only the names differ, because Shiki registers
+ * themes by name and the pair must not collide.
  *
  * The background is transparent so the code-block container's own token-based
  * surface shows through.

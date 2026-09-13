@@ -77,9 +77,12 @@ import {
 // Per-element override utilities. Each tunes one concern; the chain
 // is flat on purpose so future tweaks touch exactly one group.
 const proseClasses = [
-  // Base prose stack, scaled down for chat density. `prose-invert`
-  // under dark mode flips neutral tokens correctly via our shadcn
-  // token setup.
+  // Base prose stack, scaled down for chat density. `dark:prose-invert`
+  // now tracks the *palette's* scheme, not a pinned root class: `applyTheme`
+  // toggles `.dark` from the theme's canvas, so a light theme drops the
+  // inversion and gets the plugin's light neutral ramp. Everything the chat
+  // actually renders is pinned to a token below regardless, so the ramp only
+  // shows through as the inherited body colour.
   "prose prose-sm dark:prose-invert max-w-none",
   // Color tokens — map prose's neutral slots to shadcn tokens so
   // dark/light themes track the rest of the app.
@@ -116,7 +119,7 @@ const proseClasses = [
   // Tables — plugin-default spacing is loose; pull in for chat.
   "prose-table:my-3 prose-table:text-[0.9em]",
   "prose-th:px-3 prose-th:py-1.5 prose-th:bg-muted/60 prose-th:font-semibold prose-th:text-foreground prose-th:border prose-th:border-border/70",
-  "prose-td:px-3 prose-td:py-1.5 prose-td:align-top prose-td:border prose-td:border-border/60",
+  "prose-td:px-3 prose-td:py-1.5 prose-td:align-top prose-td:text-foreground prose-td:border prose-td:border-border/60",
   // Blockquote — neutral left rule, no italic accent.
   "prose-blockquote:not-italic prose-blockquote:font-normal prose-blockquote:border-l-2 prose-blockquote:pl-3 prose-blockquote:my-2",
   // Break long tokens (URLs, identifiers) rather than overflowing.

@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
 import { buildEditorTheme, buildEditorThemeSpec } from "./codemirror-theme";
-import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
 import type { ThemeColors } from "@/tauri/types";
 
 const palette: ThemeColors = {
@@ -33,6 +33,21 @@ const palette: ThemeColors = {
   color15: "#c0caf5",
 };
 
+/** Graphite Light's palette: the same ANSI shape over a white canvas. */
+const lightPalette: ThemeColors = {
+  ...palette,
+  accent: "#c2410c",
+  cursor: "#c2410c",
+  foreground: "#1c1917",
+  background: "#ffffff",
+  selection_foreground: "#1c1917",
+  selection_background: "#d6d3d1",
+  color0: "#1c1917",
+  color7: "#d6d3d1",
+  color8: "#78716c",
+  color15: "#ffffff",
+};
+
 const globalsCss = readFileSync(resolve(process.cwd(), "src/globals.css"), "utf8");
 
 describe("editor selection contract", () => {
@@ -51,9 +66,67 @@ describe("editor selection contract", () => {
 
   it("draws its own selection layer from the accent token", () => {
     const spec = buildEditorThemeSpec(palette);
-    expect(spec["&.cm-focused .cm-selectionBackground, .cm-selectionBackground"]).toEqual({
+    expect(spec["&.cm-editor .cm-selectionBackground"]).toEqual({
       backgroundColor: "var(--accent)",
     });
+  });
+
+  // CodeMirror's base theme paints the *focused* layer through a five-class
+  // selector. Without an equally qualified rule the editor keeps the stock
+  // lilac/slate selection and the palette never reaches the one state the
+  // user is actually in while selecting.
+  it("out-qualifies CodeMirror's own focused-selection default", () => {
+    const focused =
+      "&.cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground";
+    for (const theme of [palette, lightPalette]) {
+      const spec = buildEditorThemeSpec(theme);
+      expect(spec[focused]).toEqual(spec["&.cm-editor .cm-selectionBackground"]);
+    }
+  });
+});
+
+/** Reads the `dark` flag back off the built extension the way CodeMirror does. */
+function isDark(theme: ThemeColors): boolean {
+  return EditorState.create({ extensions: buildEditorTheme(theme) }).facet(
+    EditorView.darkTheme,
+  );
+}
+
+const selectionOf = (theme: ThemeColors) =>
+  (
+    buildEditorThemeSpec(theme)["&.cm-editor .cm-selectionBackground"] as Record<
+      string,
+      string
+    >
+  ).backgroundColor;
+
+describe("scheme", () => {
+  it("follows the palette's canvas rather than a hardcoded dark", () => {
+    expect(isDark(palette)).toBe(true);
+    expect(isDark(lightPalette)).toBe(false);
+  });
+
+  it("keeps the selection off the canvas on a light palette", () => {
+    // `--accent` on a light palette is stone-50 over white — a selection
+    // painted with it is invisible, so the light branch mixes ink into the
+    // canvas instead of reaching for the surface token.
+    expect(selectionOf(palette)).toBe("var(--accent)");
+    const light = selectionOf(lightPalette);
+    expect(light).not.toBe("var(--accent)");
+    expect(light).toContain("var(--foreground)");
+    expect(light).toContain("var(--background)");
+  });
+
+  it("washes the active line away from the canvas in both schemes", () => {
+    const activeLine = (theme: ThemeColors) =>
+      (buildEditorThemeSpec(theme)[".cm-activeLine"] as Record<string, string>)
+        .backgroundColor;
+    expect(activeLine(palette)).toBe(
+      "color-mix(in srgb, var(--accent) 15%, transparent)",
+    );
+    expect(activeLine(lightPalette)).toBe(
+      "color-mix(in srgb, var(--foreground) 4%, transparent)",
+    );
   });
 });
 

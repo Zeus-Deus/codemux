@@ -187,6 +187,26 @@ describe("ThemeStudio — turn 4 modal", () => {
     expect(document.documentElement.dataset.themeId).toBe("default");
   });
 
+  it("makes a light theme from a light background instead of refusing it", async () => {
+    openStudio({ mode: "generate" });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Background value" }), {
+      target: { value: "#fbfbfa" },
+    });
+
+    // The old copy told you to keep the background dark enough. A white
+    // canvas is now a light theme, not an error.
+    expect(screen.queryByText(/dark-only/)).toBeNull();
+    expect(screen.getByText("· light")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Save and apply/i }));
+    await waitFor(() => expect(mocks.updateSettings).toHaveBeenCalledTimes(1));
+    const saved = mocks.updateSettings.mock.calls[0]![0];
+    expect(saved.appearance.custom_themes[0].scheme).toBe("light");
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+    expect(document.documentElement.dataset.themeScheme).toBe("light");
+  });
+
   it("parses on paste — there is no Parse button", async () => {
     openStudio({ mode: "import" });
     // VS Code is reached by name, so its source shows the Marketplace search.

@@ -62,6 +62,18 @@ describe("Appearance theme row", () => {
     expect(mocks.settings.appearance.custom_themes).toEqual([]);
   });
 
+  it("says whether the applied theme is light or dark", () => {
+    mocks.settings.appearance.theme = "graphite-light";
+    render(<ThemeSettings />);
+    expect(screen.getByText("Graphite Light")).toBeInTheDocument();
+    expect(screen.getByText("light")).toBeInTheDocument();
+
+    cleanup();
+    mocks.settings.appearance.theme = "ember";
+    render(<ThemeSettings />);
+    expect(screen.getByText("dark")).toBeInTheDocument();
+  });
+
   it("hands Change to the palette, seeded with the theme query", () => {
     render(<ThemeSettings />);
     fireEvent.click(screen.getByRole("button", { name: /Change/ }));

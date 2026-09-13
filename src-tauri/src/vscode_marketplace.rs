@@ -9,10 +9,14 @@
 //!   and returns at most 12 hits that actually ship a `.vsix` asset.
 //! - [`vscode_marketplace_fetch_themes`] downloads one `.vsix` (a plain
 //!   ZIP), reads `extension/package.json`, and returns the raw JSONC text
-//!   of every *dark* colour theme it contributes.
+//!   of every colour theme it contributes.
 //!
-//! Codemux is dark-only, so `uiTheme` values of `vs` (light) are dropped
-//! here rather than shipped to the frontend to be filtered again.
+//! Light and dark themes both import. Each variant carries the `scheme`
+//! its manifest declares (`uiTheme`: `vs`/`hc-light` are light, `vs-dark`/
+//! `hc-black` are dark) so the picker can say which is which before the
+//! download is parsed. The frontend still derives the final scheme from the
+//! theme's own `editor.background` — a manifest that mislabels itself loses
+//! to the palette the user actually sees.
 //!
 //! Safety notes: the download is streamed with a hard 60 MB ceiling so a
 //! hostile or accidentally huge asset can't balloon memory, archive member
@@ -64,12 +68,25 @@ pub struct MarketplaceTheme {
     pub vsix_url: String,
 }
 
-/// One dark colour theme contributed by a downloaded extension.
+/// Whether a contributed theme paints on a light or a dark canvas.
+///
+/// Serializes as `"light"` / `"dark"`, matching `ThemeScheme` in
+/// `src/lib/themes.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeScheme {
+    Light,
+    Dark,
+}
+
+/// One colour theme contributed by a downloaded extension.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MarketplaceThemeVariant {
     pub label: String,
-    /// `vs-dark` or `hc-black`.
+    /// `vs`, `vs-dark`, `hc-black` or `hc-light`, verbatim from the manifest.
     pub ui_theme: String,
+    /// [`ui_theme`](Self::ui_theme) read as a scheme.
+    pub scheme: ThemeScheme,
     /// Raw JSONC text of the theme file (comments and trailing commas
     /// intact — the frontend parser tolerates both).
     pub content: String,
@@ -202,17 +219,28 @@ fn parse_extension_query(body: &str) -> Result<Vec<MarketplaceTheme>, String> {
 // package.json / contributes.themes
 // ---------------------------------------------------------------------------
 
-/// A `contributes.themes[]` entry that survived the dark-only filter.
+/// A usable `contributes.themes[]` entry.
 #[derive(Debug, Clone, PartialEq)]
 struct ThemeEntry {
     label: String,
     ui_theme: String,
+    scheme: ThemeScheme,
     /// Archive-relative path, already resolved to `extension/...`.
     archive_path: String,
 }
 
-fn is_dark_ui_theme(ui_theme: &str) -> bool {
-    matches!(ui_theme, "vs-dark" | "hc-black")
+/// Read a manifest `uiTheme` as a scheme.
+///
+/// The four values VS Code defines are the two base themes and their two
+/// high-contrast variants. Anything else (or nothing at all) is treated as
+/// dark: the field is required in practice, and dropping an entry over an
+/// unknown spelling would lose a theme the frontend can classify from its
+/// own background anyway.
+fn scheme_for_ui_theme(ui_theme: &str) -> ThemeScheme {
+    match ui_theme {
+        "vs" | "hc-light" => ThemeScheme::Light,
+        _ => ThemeScheme::Dark,
+    }
 }
 
 /// Turn a `contributes.themes[].path` into a path inside the `.vsix`.
@@ -246,9 +274,9 @@ fn resolve_theme_path(raw: &str) -> Result<String, String> {
 
 /// Pure parser for a VSIX `extension/package.json`.
 ///
-/// Returns the extension's human name (for error messages) plus its dark
-/// theme entries with archive-resolved paths. Entries with an unusable
-/// path are dropped rather than failing the whole import.
+/// Returns the extension's human name (for error messages) plus its theme
+/// entries with archive-resolved paths and their declared scheme. Entries
+/// with an unusable path are dropped rather than failing the whole import.
 fn parse_contributes_themes(package_json: &str) -> Result<(String, Vec<ThemeEntry>), String> {
     let value: serde_json::Value = serde_json::from_str(package_json)
         .map_err(|e| format!("The extension's package.json is not valid JSON: {e}"))?;
@@ -270,9 +298,6 @@ fn parse_contributes_themes(package_json: &str) -> Result<(String, Vec<ThemeEntr
     let mut entries = Vec::new();
     for theme in themes {
         let ui_theme = theme.get("uiTheme").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_dark_ui_theme(ui_theme) {
-            continue;
-        }
         let Some(path) = theme.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -289,6 +314,7 @@ fn parse_contributes_themes(package_json: &str) -> Result<(String, Vec<ThemeEntr
         entries.push(ThemeEntry {
             label,
             ui_theme: ui_theme.to_string(),
+            scheme: scheme_for_ui_theme(ui_theme),
             archive_path,
         });
     }
@@ -349,8 +375,8 @@ fn read_archive_text<R: Read + std::io::Seek>(
     String::from_utf8(buf).map_err(|_| format!("\"{path}\" is not valid UTF-8 text."))
 }
 
-/// Pull every dark colour theme out of an in-memory `.vsix`.
-fn extract_dark_themes(bytes: Vec<u8>) -> Result<Vec<MarketplaceThemeVariant>, String> {
+/// Pull every colour theme out of an in-memory `.vsix`.
+fn extract_themes(bytes: Vec<u8>) -> Result<Vec<MarketplaceThemeVariant>, String> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| format!("That download is not a valid .vsix package: {e}"))?;
@@ -360,7 +386,7 @@ fn extract_dark_themes(bytes: Vec<u8>) -> Result<Vec<MarketplaceThemeVariant>, S
 
     if entries.is_empty() {
         return Err(format!(
-            "\"{name}\" contributes no dark colour theme. Codemux only imports dark themes."
+            "\"{name}\" contributes no colour theme Codemux can read."
         ));
     }
 
@@ -370,6 +396,7 @@ fn extract_dark_themes(bytes: Vec<u8>) -> Result<Vec<MarketplaceThemeVariant>, S
             Ok(content) => variants.push(MarketplaceThemeVariant {
                 label: entry.label,
                 ui_theme: entry.ui_theme,
+                scheme: entry.scheme,
                 content,
             }),
             // One broken file shouldn't sink an extension that ships several.
@@ -379,7 +406,7 @@ fn extract_dark_themes(bytes: Vec<u8>) -> Result<Vec<MarketplaceThemeVariant>, S
 
     if variants.is_empty() {
         return Err(format!(
-            "\"{name}\" lists dark themes but none of their files could be read from the package."
+            "\"{name}\" lists colour themes but none of their files could be read from the package."
         ));
     }
     Ok(variants)
@@ -444,7 +471,7 @@ pub async fn vscode_marketplace_search(query: String) -> Result<Vec<MarketplaceT
     parse_extension_query(&text)
 }
 
-/// Download a `.vsix` and return its dark colour themes as raw JSONC.
+/// Download a `.vsix` and return its colour themes as raw JSONC.
 #[tauri::command]
 pub async fn vscode_marketplace_fetch_themes(
     vsix_url: String,
@@ -493,7 +520,7 @@ pub async fn vscode_marketplace_fetch_themes(
     }
 
     // `zip` is synchronous; keep it off the async runtime's worker threads.
-    tokio::task::spawn_blocking(move || extract_dark_themes(bytes))
+    tokio::task::spawn_blocking(move || extract_themes(bytes))
         .await
         .map_err(|e| format!("Theme extraction failed: {e}"))?
 }
@@ -660,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_dark_themes_only_from_package_json() {
+    fn parses_light_and_dark_themes_from_package_json() {
         let manifest = r#"{
           "name": "theme-dracula",
           "displayName": "Dracula Official",
@@ -675,21 +702,53 @@ mod tests {
         }"#;
         let (name, entries) = parse_contributes_themes(manifest).expect("parses");
         assert_eq!(name, "Dracula Official");
+        // The light variant is kept — only the zip-slip path is dropped.
         assert_eq!(
             entries,
             vec![
                 ThemeEntry {
                     label: "Dracula".to_string(),
                     ui_theme: "vs-dark".to_string(),
+                    scheme: ThemeScheme::Dark,
                     archive_path: "extension/theme/dracula.json".to_string(),
+                },
+                ThemeEntry {
+                    label: "Dracula Soft Light".to_string(),
+                    ui_theme: "vs".to_string(),
+                    scheme: ThemeScheme::Light,
+                    archive_path: "extension/theme/light.json".to_string(),
                 },
                 ThemeEntry {
                     label: "Dracula Contrast".to_string(),
                     ui_theme: "hc-black".to_string(),
+                    scheme: ThemeScheme::Dark,
                     archive_path: "extension/theme/hc.json".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_every_ui_theme_value_as_a_scheme() {
+        assert_eq!(scheme_for_ui_theme("vs"), ThemeScheme::Light);
+        assert_eq!(scheme_for_ui_theme("hc-light"), ThemeScheme::Light);
+        assert_eq!(scheme_for_ui_theme("vs-dark"), ThemeScheme::Dark);
+        assert_eq!(scheme_for_ui_theme("hc-black"), ThemeScheme::Dark);
+        // Missing or misspelled: kept as a dark theme rather than dropped.
+        assert_eq!(scheme_for_ui_theme(""), ThemeScheme::Dark);
+        assert_eq!(scheme_for_ui_theme("Vs-Dark"), ThemeScheme::Dark);
+    }
+
+    #[test]
+    fn serializes_scheme_as_the_frontend_spells_it() {
+        let json = serde_json::to_string(&MarketplaceThemeVariant {
+            label: "L".to_string(),
+            ui_theme: "vs".to_string(),
+            scheme: ThemeScheme::Light,
+            content: "{}".to_string(),
+        })
+        .expect("serializes");
+        assert!(json.contains(r#""scheme":"light""#), "{json}");
     }
 
     #[test]
@@ -698,13 +757,17 @@ mod tests {
             parse_contributes_themes(r#"{"name":"some-ext","contributes":{}}"#).expect("parses");
         assert_eq!(name, "some-ext");
         assert!(entries.is_empty());
+    }
 
+    #[test]
+    fn a_light_only_extension_still_imports() {
         let (_, entries) = parse_contributes_themes(
             r#"{"name":"light-only","contributes":{"themes":[
                 {"label":"L","uiTheme":"vs","path":"./l.json"}]}}"#,
         )
         .expect("parses");
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].scheme, ThemeScheme::Light);
     }
 
     #[test]
@@ -719,7 +782,7 @@ mod tests {
 
     #[test]
     fn rejects_non_zip_download() {
-        let err = extract_dark_themes(b"not a zip file at all".to_vec()).unwrap_err();
+        let err = extract_themes(b"not a zip file at all".to_vec()).unwrap_err();
         assert!(err.contains("not a valid .vsix package"), "{err}");
     }
 }

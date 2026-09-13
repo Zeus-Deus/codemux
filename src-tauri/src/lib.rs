@@ -166,6 +166,71 @@ fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
     }
 }
 
+/// Repaint the native window behind the webview.
+///
+/// `tauri.conf.json` can only state one `backgroundColor`, and it is what the
+/// OS paints from the moment the window maps until the webview hands over its
+/// first frame. That default is Graphite's near-black, so a user on a light
+/// palette got a black flash on every launch. The frontend calls this as soon
+/// as a theme is applied (`applyTheme` → `syncWindowBackground`), which for a
+/// persisted theme is during the first mount. This changes the current
+/// window only; before that first mount, a new process still uses the
+/// configured default background.
+///
+/// This sets both the native window and the webview's own base color, so the
+/// native fill matches the palette once the frontend applies it.
+#[tauri::command]
+fn set_window_background<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    color: String,
+) -> Result<(), String> {
+    let (r, g, b) = parse_hex_rgb(&color).ok_or_else(|| format!("not a #rrggbb color: {color}"))?;
+    let Some(window) = app.get_webview_window("main") else {
+        // Headless serve mode has no window; the caller is fire-and-forget.
+        return Ok(());
+    };
+    window
+        .set_background_color(Some(tauri::window::Color(r, g, b, 255)))
+        .map_err(|e| e.to_string())
+}
+
+/// `#rrggbb` (or `#rgb`) to a byte triple. The frontend normalizes OKLCH to
+/// hex before calling, so nothing else needs parsing here.
+fn parse_hex_rgb(value: &str) -> Option<(u8, u8, u8)> {
+    let hex = value.strip_prefix('#')?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let expanded;
+    let hex = match hex.len() {
+        3 => {
+            expanded = hex.chars().flat_map(|c| [c, c]).collect::<String>();
+            expanded.as_str()
+        }
+        6 => hex,
+        _ => return None,
+    };
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod window_background_tests {
+    use super::parse_hex_rgb;
+
+    #[test]
+    fn accepts_hex_and_rejects_malformed_colors_without_panicking() {
+        assert_eq!(parse_hex_rgb("#abc"), Some((170, 187, 204)));
+        assert_eq!(parse_hex_rgb("#12ABef"), Some((18, 171, 239)));
+        for invalid in ["#aé", "#€abc", "#zzzzzz", "#12345", "123456"] {
+            assert_eq!(parse_hex_rgb(invalid), None);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
@@ -2565,6 +2630,9 @@ fn build_core_app<R: tauri::Runtime>(
             // Which renderer this process ended up on, so the UI can drop
             // composited-only effects when running CPU-rendered.
             webview_tuning::get_renderer_mode,
+            // Native window background, so a light palette doesn't launch
+            // behind `tauri.conf.json`'s near-black default.
+            set_window_background,
             // VS Code Marketplace theme import (Settings → Theme).
             vscode_marketplace::vscode_marketplace_search,
             vscode_marketplace::vscode_marketplace_fetch_themes,

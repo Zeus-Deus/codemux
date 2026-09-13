@@ -19,6 +19,25 @@ interface PresetIconProps {
   className?: string;
 }
 
+/**
+ * Brand marks that ship as a bare white silhouette on transparency.
+ *
+ * Nothing in those files carries a second colour, so on a light canvas they
+ * paint white on white and the control simply is not there. An `<img>`-loaded
+ * SVG cannot inherit `currentColor`, so the scheme-correct reading of "white
+ * mark" is the inverted one: `invert(1)` leaves alpha alone and turns the
+ * silhouette near-black, which is the light-canvas artwork each of these
+ * brands publishes anyway. Marks that carry their own plate or brand hue
+ * (Claude, Grok, Gemini, …) are deliberately absent — inverting those would
+ * misrepresent the brand rather than rescue it.
+ */
+const WHITE_ONLY_MARKS = new Set(["codex", "copilot", "mastracode", "pi"]);
+
+/** Tailwind classes that flip a {@link WHITE_ONLY_MARKS} mark for the scheme. */
+export function whiteMarkClass(icon: string): string | undefined {
+  return WHITE_ONLY_MARKS.has(icon) ? "invert dark:invert-0" : undefined;
+}
+
 const ICON_MAP: Record<string, string> = {
   claude: claudeIcon,
   codex: codexIcon,
@@ -56,7 +75,7 @@ export function PresetIcon({ icon, className }: PresetIconProps) {
       <img
         src={src}
         alt=""
-        className={cn("shrink-0 object-contain", className)}
+        className={cn("shrink-0 object-contain", whiteMarkClass(icon), className)}
       />
     );
   }

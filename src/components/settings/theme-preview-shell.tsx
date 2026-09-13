@@ -16,6 +16,14 @@ import { normalizeColor, type ThemeDefinition } from "@/lib/themes";
  * place in the app where that is correct: the whole point is to render a
  * palette that is *not* the active one, so semantic utilities (which resolve
  * to the applied theme) cannot be used.
+ *
+ * It is also why nothing in here uses a `dark:` utility, and why nothing
+ * added here may. Tailwind's dark variant is `&:is(.dark *)` — it matches on
+ * an *ancestor*, so inside this container it would answer for the applied
+ * theme, not the previewed one, and a light theme previewed from a dark app
+ * would paint its dark branch. Inline styles have no such ambiguity.
+ * `color-scheme` is still set on the container so UA-painted parts of the
+ * subtree (scrollbars, any form control) match the theme being shown.
  */
 export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
   const c = useMemo(() => paletteOf(theme), [theme]);
@@ -23,7 +31,8 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
   return (
     <div
       className="flex h-full min-h-0 overflow-hidden rounded-[11px] border"
-      style={{ background: c.bg, borderColor: c.border }}
+      style={{ background: c.bg, borderColor: c.border, colorScheme: theme.scheme }}
+      data-theme-scheme={theme.scheme}
       aria-hidden="true"
     >
       {/* Sidebar */}
@@ -181,7 +190,13 @@ function paletteOf(theme: ThemeDefinition) {
     fg2: on(theme.roles.mutedForeground, "#aaaaaa"),
     fg3: on(theme.roles.ring, "#777777"),
     accent: on(theme.roles.brandAccent, "#e07850"),
-    terminal: theme.ansi.black,
+    // The canvas a terminal pane actually paints — `themeColorsToXtermTheme`
+    // hands xterm `background`, never `ansi.black`. The two coincide on a
+    // dark palette, which is why the slot went unnoticed; on a light one
+    // `ansi.black` stays dark on purpose (so `\e[30m` keeps meaning "dark"),
+    // and reading it here drew a black strip under a white theme and judged
+    // the light ANSI slots against a canvas they will never sit on.
+    terminal: bg,
     red: theme.ansi.red,
     green: theme.ansi.green,
     yellow: theme.ansi.yellow,

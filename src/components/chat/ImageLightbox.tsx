@@ -44,6 +44,13 @@ export function ImageLightbox({
 
         <div className="relative w-fit max-w-full">
           <DialogClose asChild>
+            {/* The lightbox is a dark stage in BOTH schemes, deliberately.
+                Everything here — the matte, the white hairline, the close
+                chip — sits on this component's own `bg-black/75` scrim, not
+                on the app surface, so it is judged against that scrim rather
+                than against the theme. The matte is lifted a hair off pure
+                black so a fully black PNG still reads as an image rather than
+                as a hole in the backdrop. */}
             <button
               type="button"
               aria-label="Close expanded image"

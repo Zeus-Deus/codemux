@@ -2978,6 +2978,69 @@ const MOCK_PROVIDER_OPERATIONS: Record<string, ProviderOperations> = {
   gitlab: { ...ALL_MOCK_OPERATIONS, request_changes: false, line_comments: false },
 };
 
+/** VS Code Marketplace fixtures for the theme import panel. */
+const MOCK_MARKETPLACE_THEMES = [
+  {
+    extension_id: "sdras.night-owl",
+    display_name: "Night Owl",
+    publisher: "sdras",
+    install_count: 3_412_000,
+    version: "2.1.1",
+    vsix_url: "https://example.test/night-owl.vsix",
+  },
+  {
+    extension_id: "github.github-vscode-theme",
+    display_name: "GitHub Theme",
+    publisher: "GitHub",
+    install_count: 9_100_000,
+    version: "6.3.4",
+    vsix_url: "https://example.test/github-theme.vsix",
+  },
+];
+
+const mockThemeFile = (name: string, type: "light" | "dark", colors: Record<string, string>) =>
+  JSON.stringify({ name, type, colors }, null, 2);
+
+const MOCK_MARKETPLACE_VARIANTS: Record<string, unknown[]> = {
+  "https://example.test/night-owl.vsix": [
+    {
+      label: "Night Owl",
+      ui_theme: "vs-dark",
+      scheme: "dark",
+      content: mockThemeFile("Night Owl", "dark", {
+        "editor.background": "#011627",
+        "editor.foreground": "#d6deeb",
+        "button.background": "#5f7e97",
+        "sideBar.background": "#011627",
+      }),
+    },
+  ],
+  "https://example.test/github-theme.vsix": [
+    {
+      label: "GitHub Dark",
+      ui_theme: "vs-dark",
+      scheme: "dark",
+      content: mockThemeFile("GitHub Dark", "dark", {
+        "editor.background": "#0d1117",
+        "editor.foreground": "#e6edf3",
+        "button.background": "#238636",
+        "sideBar.background": "#010409",
+      }),
+    },
+    {
+      label: "GitHub Light",
+      ui_theme: "vs",
+      scheme: "light",
+      content: mockThemeFile("GitHub Light", "light", {
+        "editor.background": "#ffffff",
+        "editor.foreground": "#1f2328",
+        "button.background": "#1f883d",
+        "sideBar.background": "#f6f8fa",
+      }),
+    },
+  ],
+};
+
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -3228,6 +3291,23 @@ const handlers: Record<string, Handler> = {
     ? { name: "Tokyo Night", scheme: "dark", colors: OMARCHY_THEME }
     : null,
   get_shell_appearance: () => SHELL_APPEARANCE,
+  // Repaints the native window behind the webview on the desktop. A browser
+  // has no such window, so this is a no-op here — present only to keep the
+  // "no handler" warning off the console on every theme change.
+  set_window_background: () => null,
+
+  // The Marketplace import panel, without the network. Two hits, and an
+  // extension that ships both a light and a dark variant — the case the
+  // scheme badge exists for. The variant bodies are real (if tiny) VS Code
+  // theme JSONC, so picking one goes through the same parser a paste does.
+  vscode_marketplace_search: (args: Args) => {
+    const query = String(args.query ?? "").toLowerCase();
+    return MOCK_MARKETPLACE_THEMES.filter((theme) =>
+      `${theme.display_name} ${theme.publisher}`.toLowerCase().includes(query),
+    );
+  },
+  vscode_marketplace_fetch_themes: (args: Args) =>
+    MOCK_MARKETPLACE_VARIANTS[String(args.vsixUrl ?? "")] ?? [],
 
   // ── Resource monitor ──
   get_resource_metrics: () => resourceMetrics(),
