@@ -51,15 +51,15 @@ vi.mock("@/stores/ui-store", () => ({
   ),
 }));
 
-// RunButton pulls its own dependencies (getProjectScripts / getWorkspaceConfig
-// / useActiveWorkspace). Mock the parts that would otherwise hit unmocked
-// modules so we can mount <PresetBar> without dragging in every store.
+// Keep the real app store for launchDraftWithPreset's directory lookup,
+// while pinning RunButton's workspace selectors to a stable fixture.
 //
 // RunButton now subscribes via the focused primitive
 // `useActiveWorkspaceProjectRoot` (perf fix — full-workspace selector
 // churns on every backend tick). Both exports must be mocked so tests
 // that reach for either get a consistent stub.
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useActiveWorkspace: () => ({
     workspace_id: "ws-1",
     project_root: "/home/user/myapp",

@@ -2,6 +2,7 @@ import { materializeWithPreset } from "./materialize";
 import type { MaterializeResult } from "./materialize";
 import { resolveSkillSelection, skillsForProvider } from "./skill-tokens";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore, type DraftId } from "@/stores/chat-draft-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import { refreshSkillSelectionForCwd } from "./skill-selection-refresh";
@@ -33,17 +34,26 @@ export async function launchDraftWithPreset(
   const draft = state.draftsById[draftId];
   if (!draft) return { success: false, error: "Draft no longer exists" };
   const chat = useAgentChatStore.getState();
+  const app = useAppStore.getState();
+  const target = draft.target;
+  const sourceCwd = (() => {
+    switch (target.kind) {
+      case "project":
+        return target.projectPath;
+      case "existing_workspace":
+        return app.appState?.workspaces.find(
+          (workspace) => workspace.workspace_id === target.workspaceId,
+        )?.cwd ?? null;
+      case "home":
+        return app.homeDir;
+    }
+  })();
+  const sourceSkills = selectActiveSkills(useSkillsStore.getState(), sourceCwd);
 
   const skillSelection = resolveSkillSelection(
     draft.inputDraft,
-    skillsForProvider(
-      selectActiveSkills(useSkillsStore.getState()),
-      draft.provider,
-    ),
+    skillsForProvider(sourceSkills, draft.provider),
   );
-  const sourceSkills = selectActiveSkills(useSkillsStore.getState());
-  const sourceCwd =
-    draft.target.kind === "project" ? draft.target.projectPath : null;
 
   const result = await materializeWithPreset(
     draft,

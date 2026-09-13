@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::paths::{enumerate_ancestor_project_paths, enumerate_scan_paths};
@@ -32,6 +32,13 @@ const DEBOUNCE_MS: u64 = 300;
 
 /// Tauri event name the frontend listens for.
 pub const SKILLS_CHANGED_EVENT: &str = "skills-changed";
+
+fn changes_inventory(event: &Event) -> bool {
+    // Linux reports opening a file as an Access event. Discovery itself
+    // reads SKILL.md files, so treating reads as changes cancels its own
+    // first load (and can repeatedly trigger cloud sync).
+    event.need_rescan() || !matches!(event.kind, EventKind::Access(_))
+}
 
 /// Holds the live watcher (None when not running) plus the debounce
 /// timestamp so multiple watch threads share a single window. Wrapped
@@ -76,7 +83,10 @@ impl SkillsWatcherState {
         let mut watcher = recommended_watcher(move |res: notify::Result<Event>| {
             // notify's callback runs on a background thread it owns;
             // we only do cheap work here (debounce check + emit).
-            if res.is_err() {
+            let Ok(event) = res else {
+                return;
+            };
+            if !changes_inventory(&event) {
                 return;
             }
             let now = Instant::now();
@@ -96,8 +106,10 @@ impl SkillsWatcherState {
                     .state::<crate::skills::inventory::SkillInventoryService>()
                     .invalidate()
                     .await;
+                // An open picker may refetch immediately on this event.
+                // Clear the backend cache before inviting that refetch.
+                let _ = app_for_invalidation.emit(SKILLS_CHANGED_EVENT, ());
             });
-            let _ = app_for_closure.emit(SKILLS_CHANGED_EVENT, ());
         })
         .map_err(|e| format!("create watcher: {e}"))?;
 
@@ -165,6 +177,27 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn reads_do_not_invalidate_skill_discovery() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
+        for kind in [
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            assert!(!changes_inventory(&Event::new(EventKind::Access(kind))));
+        }
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+        ] {
+            assert!(changes_inventory(&Event::new(kind)));
+        }
+    }
 
     // Walks the same enumeration `start` would call. Confirms missing
     // paths get filtered out before we ever ask `notify` to watch them
