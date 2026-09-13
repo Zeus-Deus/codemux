@@ -67,14 +67,30 @@ export const btnCardStrong = `${BASE} bg-card font-semibold text-foreground hove
 /** Ember tint — agent handoffs and secondary primaries. */
 export const btnEmber = `${BASE} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
 
-/** Ember solid — the one primary on a create/retry surface. */
-export const btnEmberSolid = `${BASE} bg-accent-ember font-semibold text-[#1a1512] hover:bg-accent-ember/90`;
+/**
+ * Ember solid — the one primary on a create/retry surface.
+ *
+ * `--accent-ember` is the *theme's* brand accent, so the ink on it cannot be
+ * a literal: a light palette picks a darker ember (Graphite Light lands on
+ * `oklch(0.58 …)`, where a near-black label only reaches 4:1). Every theme
+ * already ships the ink that belongs on that accent — `sidebarPrimary` is the
+ * brand accent and `sidebarPrimaryForeground` is `readableOn()` of it — so
+ * that pair is the token-relative version of what the literal was hand-picked
+ * to be.
+ */
+export const btnEmberSolid = `${BASE} bg-accent-ember font-semibold text-sidebar-primary-foreground hover:bg-accent-ember/90`;
 
 /** Green tint — Approve. A verdict, not a merge. */
 export const btnGreenTint = `${BASE} bg-status-open/15 font-semibold text-status-open hover:bg-status-open/25`;
 
-/** Green solid — Merge, and only Merge. */
-export const btnGreenSolid = `${BASE} bg-status-open font-semibold text-[#0e1a12] hover:bg-status-open/90`;
+/**
+ * Green solid — Merge, and only Merge.
+ *
+ * `--status-open` is fixed across palettes but differs by scheme (a deeper
+ * green on light), so its ink is the paired `--status-open-foreground` token
+ * rather than a literal.
+ */
+export const btnGreenSolid = `${BASE} bg-status-open font-semibold text-status-open-foreground hover:bg-status-open/90`;
 
 /**
  * Merge while blocked. Same box as {@link btnGreenSolid} — same height,

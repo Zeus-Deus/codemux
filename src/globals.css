@@ -72,6 +72,7 @@
     --color-accent-ember: var(--accent-ember);
     --color-accent-violet: var(--accent-violet);
     --color-status-open: var(--status-open);
+    --color-status-open-foreground: var(--status-open-foreground);
     --color-status-working: var(--status-working);
     --color-status-attention: var(--status-attention);
     --color-status-monitoring: var(--status-monitoring);
@@ -136,7 +137,15 @@
 /* Dark theme tokens — owned by the shadcn preset (b1HYEHloH, stone base,
  * near-white --primary). Re-applying the preset rewrites this block, so no
  * project-specific overrides live here — those go in the Codemux custom
- * token and runtime-theme layers below. */
+ * token and runtime-theme layers below.
+ *
+ * `.dark` is no longer pinned on <html>: the active palette owns it, so every
+ * `.dark`-scoped rule below (and every Tailwind `dark:` utility) genuinely
+ * toggles when a light theme is applied. The `:root` block above is the light
+ * counterpart, live for the same reason. Both are still outranked by the
+ * runtime bridge (`:root[data-theme-id]`) for the roles a theme defines —
+ * they only decide the roles the bridge does not carry, such as
+ * `--destructive`. */
 .dark {
     --background: oklch(0.147 0.004 49.25);
     --foreground: oklch(0.985 0.001 106.423);
@@ -195,7 +204,9 @@
  * NON-standard variables, so re-applying/switching the shadcn preset never
  * touches them. Never hardcode these colours in components: consume them as
  * the utilities mapped in @theme inline (text-status-open, bg-status-working,
- * text-accent-ember, …). Status tones are identical across palettes.
+ * text-accent-ember, …). Status tones are identical across palettes but
+ * differ by scheme: the `:root:not(.dark)` block below darkens them so they
+ * still pass as text on a light canvas.
  */
 :root,
 .dark {
@@ -209,6 +220,9 @@
   --selection-foreground: oklch(0.205 0.006 40);
   --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged             */
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
+  /* Ink for a solid --status-open fill (Merge, Approve). Dark ink on the
+   * bright dark-scheme green; flips to white on the deeper light-scheme one. */
+  --status-open-foreground: oklch(0.16 0.02 156);
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
   --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */
   /* cyan — an agent watching something in the background (CI, a tailed
@@ -229,6 +243,19 @@
    * value and survives preset re-apply. */
   --sidebar-primary: var(--accent-ember);
   --sidebar-primary-foreground: var(--primary-foreground);
+}
+
+/* Light scheme: the same hues, pulled down to ~L0.52–0.55 so every status
+ * tone clears 4.5:1 as text on a white canvas (the dark-scheme values sit at
+ * 1.7–3:1 there). Dots and bars inherit the same values and stay visible. */
+:root:not(.dark) {
+  --accent-violet:     oklch(0.55 0.15 290);
+  --status-open:       oklch(0.52 0.14 156);
+  --status-open-foreground: oklch(1 0 0);
+  --status-working:    oklch(0.55 0.12 80);
+  --status-attention:  oklch(0.55 0.19 22);
+  --status-monitoring: oklch(0.55 0.09 196);
+  --status-remote:     oklch(0.55 0.10 232);
 }
 
 /*

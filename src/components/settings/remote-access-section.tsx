@@ -468,7 +468,7 @@ function PendingRow({
         <Button
           type="button"
           size="sm"
-          className="h-7 gap-1.5 bg-status-open/90 text-white hover:bg-status-open"
+          className="h-7 gap-1.5 bg-status-open/90 text-status-open-foreground hover:bg-status-open"
           disabled={busy}
           onClick={onApprove}
         >

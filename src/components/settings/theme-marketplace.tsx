@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ThemeSchemeBadge } from "./theme-swatches";
 import {
   fetchMarketplaceThemes,
   searchMarketplaceThemes,
@@ -86,7 +87,7 @@ export function ThemeMarketplacePanel({
     fetchMarketplaceThemes(theme.vsix_url)
       .then((found) => {
         setVariants(found);
-        // A single dark variant is not a choice — take it.
+        // A single variant is not a choice — take it.
         if (found.length === 1) onPick(found[0]!.content, found[0]!.label);
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))
@@ -166,7 +167,10 @@ export function ThemeMarketplacePanel({
                         onClick={() => onPick(variant.content, variant.label)}
                         className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[11.5px] text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
                       >
-                        {variant.label}
+                        <span className="min-w-0 flex-1 truncate">{variant.label}</span>
+                        {/* What the manifest declared. The parser re-derives
+                            the real scheme once the file is read. */}
+                        <ThemeSchemeBadge scheme={variant.scheme} />
                       </button>
                     ))}
                   </div>
@@ -178,7 +182,8 @@ export function ThemeMarketplacePanel({
       )}
 
       <span className="text-[10.5px] leading-relaxed text-muted-foreground/70">
-        Dark variants only — Codemux themes are dark for now.
+        Light and dark variants both import — the theme's own background decides
+        which one Codemux ends up with.
       </span>
     </div>
   );

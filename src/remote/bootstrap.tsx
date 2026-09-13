@@ -139,6 +139,37 @@ export function dismissSplash(): void {
 
 // ── Standalone UI ───────────────────────────────────────────────────
 
+/**
+ * Colour fallbacks for the pre-app screens.
+ *
+ * These render before React mounts but *after* `globals.css` and the inline
+ * boot script in `index.html`, so the design tokens below normally resolve
+ * and the fallbacks are never used. They still must not assume a dark canvas:
+ * the boot script may have painted a stored *light* palette, and a stylesheet
+ * that failed to load would leave white-on-white. `--cm-boot-bg` /
+ * `--cm-boot-fg` are written by that inline script from whichever palette is
+ * stored (Graphite when nothing is), so chaining to them keeps every surface
+ * on the correct side of the canvas in either scheme.
+ */
+const BOOT_BG = "var(--background, var(--cm-boot-bg))";
+const BOOT_FG = "var(--foreground, var(--cm-boot-fg))";
+const BOOT_SURFACE = "var(--card, var(--cm-boot-bg))";
+const BOOT_MUTED_FG =
+  "var(--muted-foreground, color-mix(in srgb, var(--cm-boot-fg) 62%, transparent))";
+const BOOT_HAIRLINE =
+  "var(--border, color-mix(in srgb, var(--cm-boot-fg) 14%, transparent))";
+const BOOT_FIELD_BORDER =
+  "var(--input, color-mix(in srgb, var(--cm-boot-fg) 20%, transparent))";
+
+export const bootstrapColors = {
+  background: BOOT_BG,
+  foreground: BOOT_FG,
+  surface: BOOT_SURFACE,
+  mutedForeground: BOOT_MUTED_FG,
+  hairline: BOOT_HAIRLINE,
+  fieldBorder: BOOT_FIELD_BORDER,
+} as const;
+
 export const overlayStyle: React.CSSProperties = {
   position: "fixed",
   inset: 0,
@@ -147,16 +178,16 @@ export const overlayStyle: React.CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   padding: 24,
-  background: "var(--background, #0C0C0E)",
-  color: "var(--foreground, #e8e8e8)",
+  background: BOOT_BG,
+  color: BOOT_FG,
   fontFamily: "var(--font-sans, system-ui, -apple-system, sans-serif)",
 };
 
 export const cardStyle: React.CSSProperties = {
   width: "100%",
   maxWidth: 380,
-  background: "var(--card, #1a1a1c)",
-  border: "1px solid var(--border, rgba(255,255,255,0.1))",
+  background: BOOT_SURFACE,
+  border: `1px solid ${BOOT_HAIRLINE}`,
   borderRadius: 14,
   padding: 28,
   boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
@@ -167,9 +198,9 @@ export const inputStyle: React.CSSProperties = {
   boxSizing: "border-box",
   padding: "10px 12px",
   fontSize: 13,
-  color: "var(--foreground, #e8e8e8)",
-  background: "var(--background, #0C0C0E)",
-  border: "1px solid var(--input, rgba(255,255,255,0.15))",
+  color: BOOT_FG,
+  background: BOOT_BG,
+  border: `1px solid ${BOOT_FIELD_BORDER}`,
   borderRadius: 9,
   outline: "none",
 };
@@ -181,7 +212,11 @@ export const primaryButtonStyle = (busy: boolean): React.CSSProperties => ({
   fontSize: 13.5,
   fontWeight: 600,
   cursor: busy ? "default" : "pointer",
-  color: "#0a0a0a",
+  // Ink for the ember fill, not for the canvas — so it stays dark in both
+  // schemes. Ember is a mid-tone in every palette (it is solved for contrast
+  // on its own canvas, not against this label), and the same fixed dark ink
+  // is what `--selection-foreground` uses over the same colour.
+  color: "oklch(0.205 0.006 40)",
   background: "var(--accent-ember, oklch(0.705 0.152 47))",
   border: "none",
   borderRadius: 9,
@@ -192,7 +227,7 @@ export const errorStyle: React.CSSProperties = {
   marginTop: 12,
   fontSize: 12.5,
   lineHeight: 1.45,
-  color: "oklch(0.72 0.16 22)",
+  color: "var(--status-attention, oklch(0.685 0.17 22))",
 };
 
 export const switchLinkStyle: React.CSSProperties = {
@@ -201,7 +236,7 @@ export const switchLinkStyle: React.CSSProperties = {
   fontSize: 12,
   fontWeight: 500,
   cursor: "pointer",
-  color: "var(--muted-foreground, #9a9a97)",
+  color: BOOT_MUTED_FG,
   background: "transparent",
   border: "none",
   textAlign: "center",
@@ -250,7 +285,7 @@ function AccountForm(props: {
         style={{
           fontSize: 13,
           lineHeight: 1.5,
-          color: "var(--muted-foreground, #9a9a97)",
+          color: BOOT_MUTED_FG,
           marginBottom: 18,
         }}
       >
@@ -334,7 +369,7 @@ function CodeForm(props: {
         style={{
           fontSize: 13,
           lineHeight: 1.5,
-          color: "var(--muted-foreground, #9a9a97)",
+          color: BOOT_MUTED_FG,
           marginBottom: 18,
         }}
       >
@@ -410,7 +445,7 @@ function ConnectScreen(props: {
           style={{
             marginTop: 16,
             fontSize: 11.5,
-            color: "var(--muted-foreground, #9a9a97)",
+            color: BOOT_MUTED_FG,
             textAlign: "center",
           }}
         >
@@ -437,7 +472,7 @@ function ConnectingView(props: {
             height: 26,
             margin: "0 auto 18px",
             borderRadius: "50%",
-            border: "2.5px solid var(--border, rgba(255,255,255,0.15))",
+            border: `2.5px solid ${BOOT_HAIRLINE}`,
             borderTopColor: "var(--accent-ember, oklch(0.705 0.152 47))",
             animation: "codemux-remote-spin 0.8s linear infinite",
           }}
@@ -449,7 +484,7 @@ function ConnectingView(props: {
           style={{
             fontSize: 12.5,
             lineHeight: 1.5,
-            color: "var(--muted-foreground, #9a9a97)",
+            color: BOOT_MUTED_FG,
           }}
         >
           {props.waiting

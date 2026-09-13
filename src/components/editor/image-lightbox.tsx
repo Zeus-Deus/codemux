@@ -42,6 +42,10 @@ export function ImageLightbox({ src, alt, href, onClose }: ImageLightboxProps) {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [onClose]);
 
+  // A dark stage in BOTH schemes, deliberately: the scrim below covers the
+  // whole viewport, so the white chips and hairlines in here are read against
+  // *it*, never against the app surface. A light theme changes nothing about
+  // what the viewer is judged on.
   return createPortal(
     <div
       data-testid="image-lightbox"

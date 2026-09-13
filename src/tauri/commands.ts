@@ -3114,7 +3114,7 @@ export const webRemoteRequestUpdate = () =>
 
 // ── VS Code Marketplace theme import ─────────────────────────────────────
 
-/** A Marketplace extension that ships at least one dark colour theme.
+/** A Marketplace extension that ships at least one colour theme.
  *  snake_case because that is what the Rust side serializes — the repo's
  *  convention for frontend-facing command payloads (see `tauri/types.ts`). */
 export interface MarketplaceTheme {
@@ -3126,10 +3126,14 @@ export interface MarketplaceTheme {
   vsix_url: string;
 }
 
-/** One dark colour theme inside an extension, with its raw JSONC. */
+/** One colour theme inside an extension, with its raw JSONC. */
 export interface MarketplaceThemeVariant {
   label: string;
+  /** `vs`, `vs-dark`, `hc-black` or `hc-light`, verbatim from the manifest. */
   ui_theme: string;
+  /** What the manifest declares. The parser re-derives the real scheme from
+   *  the theme's own background once the JSONC is read. */
+  scheme: "light" | "dark";
   content: string;
 }
 

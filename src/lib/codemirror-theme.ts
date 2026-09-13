@@ -3,9 +3,26 @@ import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 import type { Extension } from "@codemirror/state";
 import type { ThemeColors } from "@/tauri/types";
+import { schemeForBackground, type ThemeScheme } from "@/lib/themes";
 
 /** Mirrors style-mod's `StyleSpec` (nested selectors + declarations). */
 type ThemeSpec = { [propOrSelector: string]: string | number | ThemeSpec | null };
+
+/**
+ * A translucent tint that always steps *away* from the canvas.
+ *
+ * `--accent` is a surface token, not a highlight: it sits one notch off the
+ * background, which on a dark palette means lighter (and reads as a tint) but
+ * on a light one means barely-off-white — stone-50 over white leaves nothing
+ * to see. Mixing ink into the canvas instead moves in whichever direction the
+ * scheme runs, at a lower percentage because ink at full strength carries far
+ * more weight than a neighbouring surface does.
+ */
+function wash(scheme: ThemeScheme, strength: number): string {
+  return scheme === "dark"
+    ? `color-mix(in srgb, var(--accent) ${strength}%, transparent)`
+    : `color-mix(in srgb, var(--foreground) ${Math.round(strength * 0.28)}%, transparent)`;
+}
 
 /**
  * Structural/chrome colors use CSS variables (same source as terminal panes)
@@ -16,6 +33,14 @@ type ThemeSpec = { [propOrSelector: string]: string | number | ThemeSpec | null 
  * in tests without mounting an editor.
  */
 export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSpec> {
+  const scheme = schemeForBackground(theme.background);
+  // Opaque, not a wash: `drawSelection()` stacks the selection layer over the
+  // active-line fill, and a translucent selection would read as two different
+  // colors on the caret's own line.
+  const selection =
+    scheme === "dark"
+      ? "var(--accent)"
+      : "color-mix(in srgb, var(--foreground) 16%, var(--background))";
   return {
     "&": {
       backgroundColor: "var(--background)",
@@ -30,8 +55,22 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
     ".cm-cursor, .cm-dropCursor": {
       borderLeftColor: "var(--sidebar-primary)",
     },
-    "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-      backgroundColor: "var(--accent)",
+    /*
+     * Two keys, and both are deliberately over-qualified. CodeMirror's own
+     * base theme paints the focused layer through
+     * `&light.cm-focused > .cm-scroller > .cm-selectionLayer
+     * .cm-selectionBackground` — five classes — so the obvious
+     * `&.cm-focused .cm-selectionBackground` loses on specificity and the
+     * editor silently keeps CodeMirror's stock lilac (light) or slate (dark)
+     * instead of the palette's colour. `&.cm-editor` adds the class the
+     * editor root always carries, which settles both rules on specificity
+     * rather than on stylesheet order.
+     */
+    "&.cm-editor .cm-selectionBackground": {
+      backgroundColor: selection,
+    },
+    "&.cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
+      backgroundColor: selection,
     },
     /*
      * Document lines opt out of the app's `:root::selection` foreground.
@@ -50,7 +89,7 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
       },
     },
     ".cm-activeLine": {
-      backgroundColor: "color-mix(in srgb, var(--accent) 15%, transparent)",
+      backgroundColor: wash(scheme, 15),
     },
     ".cm-gutters": {
       backgroundColor: "var(--background)",
@@ -58,7 +97,7 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
       borderRight: "none",
     },
     ".cm-activeLineGutter": {
-      backgroundColor: "color-mix(in srgb, var(--accent) 15%, transparent)",
+      backgroundColor: wash(scheme, 15),
       color: "var(--foreground)",
     },
     ".cm-lineNumbers .cm-gutterElement": {
@@ -92,7 +131,14 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
 }
 
 export function buildEditorTheme(theme: ThemeColors): Extension[] {
-  const editorTheme = EditorView.theme(buildEditorThemeSpec(theme), { dark: true });
+  // The palette's canvas decides the flag; CodeMirror's own base themes key
+  // their `&light`/`&dark` rules (matching brackets, special chars, the
+  // fallback caret) off it, and every extension reads it through
+  // `EditorView.darkTheme`.
+  const scheme = schemeForBackground(theme.background);
+  const editorTheme = EditorView.theme(buildEditorThemeSpec(theme), {
+    dark: scheme === "dark",
+  });
 
   const highlighting = syntaxHighlighting(
     HighlightStyle.define([
