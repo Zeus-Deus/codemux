@@ -244,6 +244,20 @@ describe("PaneTabStrip — overflow", () => {
     );
   });
 
+  // A count the user has to deal with reads the same whether or not its
+  // pane is in front — otherwise a failure dims itself the moment you look
+  // at another pane.
+  it("paints an attention badge on the attention token, active or not", () => {
+    renderStrip({
+      tabs: TABS.map((tab) =>
+        tab.id === "changes"
+          ? { ...tab, badge: 2, badgeTone: "attention" as const }
+          : tab,
+      ),
+    });
+    expect(screen.getByText("2")).toHaveClass("text-status-attention");
+  });
+
   it("collapses inactive tabs to icon + badge once the full row overflows", () => {
     const restore = stubScrollerOverflow(800, 400);
     try {

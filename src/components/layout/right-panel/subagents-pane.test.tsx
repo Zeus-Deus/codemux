@@ -12,7 +12,7 @@ import {
 import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
 import { useUIStore } from "@/stores/ui-store";
 
-import { SubagentsPane } from "./subagents-pane";
+import { COMPLETION_LINGER_MS, SubagentsPane } from "./subagents-pane";
 
 function subagent(overrides: Partial<SubagentView>): SubagentView {
   return {
@@ -33,7 +33,7 @@ function run(id: string, seq: number, subagents: SubagentView[]): ChatViewItem {
   return { kind: "subagent_run", id, seq, turn_id: `turn-${id}`, subagents };
 }
 
-/** One wave: the shape every pre-wave test used. */
+/** One wave: the shape every single-wave test uses. */
 function messages(subagents: SubagentView[]): ChatViewItem[] {
   return [
     prompt("u-1", 0, "Implement clipboard-paste fallback"),
@@ -87,24 +87,24 @@ function twoWaves(): ChatViewItem[] {
   ];
 }
 
-beforeEach(() => useUIStore.setState({ subagentEnterRequest: null }));
+beforeEach(() =>
+  useUIStore.setState({
+    subagentEnterRequest: null,
+    subagentsHistoryOpen: false,
+    dismissedSubagentAttention: [],
+  }),
+);
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
 });
 
-describe("SubagentsPane — grouped waves with result-first rows", () => {
-  it("shows aggregate progress and titles the wave by its agents' work", () => {
+describe("SubagentsPane — live list", () => {
+  it("shows only running agents, newest first, under the wave that spawned them", () => {
     render(
       <SubagentsPane
         threadId="thread-1"
         messages={messages([
-          subagent({
-            id: "live",
-            name: "Pricing audit",
-            model: "anthropic/claude-opus-4-8",
-            activity: "reading pricing.ts…",
-          }),
           subagent({
             id: "done",
             name: "Verification pass",
@@ -113,135 +113,56 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
             resultText: "All checks pass\nDetails follow",
             durationMs: 16_000,
           }),
+          subagent({
+            id: "live-a",
+            description: "Audit pricing",
+            model: "anthropic/claude-opus-4-8",
+            activity: "reading pricing.ts…",
+          }),
+          subagent({
+            id: "live-b",
+            description: "Trace the regression",
+            model: "anthropic/claude-opus-4-8",
+            activity: "grep applyRuntimeInfo",
+          }),
         ])}
       />,
     );
 
-    expect(screen.getByText("1 / 2")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute(
-      "aria-valuenow",
-      "1",
+    expect(screen.getByText("WORKING · 2")).toBeInTheDocument();
+    expect(screen.getByTestId("live-wave-title")).toHaveTextContent(
+      "Verification pass · Audit pricing · Trace the regression",
     );
-    const wave = screen.getByRole("region", {
-      name: "Pricing audit · Verification pass",
-    });
-    expect(wave).toHaveAttribute("data-wave-status", "running");
-    expect(screen.getByText("2 agents · 1 running")).toBeInTheDocument();
-    // The prompt is context above the wave, not its title.
-    expect(screen.getByTestId("wave-prompt")).toHaveTextContent(
-      "Implement clipboard-paste fallback",
-    );
-    // Both rows: name, model capsule, and the excerpt line.
-    expect(screen.getByText("Pricing audit")).toBeInTheDocument();
-    expect(screen.getByText("Verification pass")).toBeInTheDocument();
+    // Newest spawn first, and the settled row is not in the live list.
     expect(
-      screen.getByTitle("Model: anthropic/claude-opus-4-8"),
-    ).toHaveTextContent("anthropic/claude-opus-4-8");
-    expect(screen.getByTitle("Model: openai/gpt-5.4")).toHaveTextContent(
-      "openai/gpt-5.4",
-    );
+      screen
+        .getAllByTestId("live-row")
+        .map((row) => row.getAttribute("data-subagent-id")),
+    ).toEqual(["live-b", "live-a"]);
+    expect(screen.queryByText("Verification pass")).toBeNull();
+    expect(screen.queryByText("All checks pass")).toBeNull();
+
+    // Each live row: title, activity line and the model capsule.
+    expect(screen.getByText("Audit pricing")).toBeInTheDocument();
     expect(screen.getByText("reading pricing.ts…")).toBeInTheDocument();
-    expect(screen.getByText("All checks pass")).toBeInTheDocument();
+    expect(screen.getByText("grep applyRuntimeInfo")).toBeInTheDocument();
+    expect(
+      screen.getAllByTitle("Model: anthropic/claude-opus-4-8"),
+    ).toHaveLength(2);
+
+    // The lifetime counter and its progress bar are gone: this pane is
+    // about now, not about the thread's whole history.
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.queryByText("1 / 3")).toBeNull();
   });
 
-  it("falls back to 'Ran N subagents' for unlabeled agents and omits the divider without a prompt", () => {
+  it("numbers repeated titles inside a wave", () => {
     render(
       <SubagentsPane
         threadId="thread-1"
-        messages={[
-          run("run-1", 0, [
-            subagent({ id: "a", name: undefined, status: "completed" }),
-            subagent({ id: "b", name: undefined, status: "completed" }),
-          ]),
-        ]}
+        messages={messages([subagent({ id: "a" }), subagent({ id: "b" })])}
       />,
     );
-    expect(
-      screen.getByRole("region", { name: "Ran 2 subagents" }),
-    ).toBeInTheDocument();
-    expect(screen.queryByTestId("wave-prompt")).toBeNull();
-  });
-
-  it("shows the prompt once per turn, titling each of its waves by description", () => {
-    render(
-      <SubagentsPane
-        threadId="thread-1"
-        messages={[
-          prompt("u-1", 0, "Ship the footer button"),
-          run("run-1", 1, [
-            subagent({
-              id: "shots",
-              description: "Capture before screenshots",
-              status: "completed",
-            }),
-          ]),
-          run("run-2", 2, [
-            subagent({ id: "rust", description: "Update host status" }),
-            subagent({ id: "ts", description: "Wire the footer command" }),
-          ]),
-          prompt("u-2", 3, "Now review it"),
-          run("run-3", 4, [subagent({ id: "rev", name: "Review" })]),
-        ]}
-      />,
-    );
-    expect(
-      screen.getAllByTestId("wave-prompt").map((n) => n.textContent),
-    ).toEqual(["›Ship the footer button", "›Now review it"]);
-    expect(
-      screen.getAllByRole("region").map((r) => r.getAttribute("aria-label")),
-    ).toEqual([
-      "Capture before screenshots",
-      "Update host status · Wire the footer command",
-      "Review",
-    ]);
-  });
-
-  it("keeps the latest wave open, folds older ones, and toggles on click", () => {
-    render(<SubagentsPane threadId="thread-1" messages={twoWaves()} />);
-
-    const older = screen.getByRole("button", { name: /^Ran 2 subagents/ });
-    const newer = screen.getByRole("button", { name: /^Explore ×2/ });
-    expect(older).toHaveAttribute("aria-expanded", "false");
-    expect(newer).toHaveAttribute("aria-expanded", "true");
-    expect(
-      screen.queryByText("Patched session.ts, all 14 tests green"),
-    ).toBeNull();
-    expect(
-      screen.getByText(
-        "Root cause: applyRuntimeInfo never re-registers the tile delegate",
-      ),
-    ).toBeInTheDocument();
-
-    fireEvent.click(older);
-    expect(older).toHaveAttribute("aria-expanded", "true");
-    expect(
-      screen.getByText("Patched session.ts, all 14 tests green"),
-    ).toBeInTheDocument();
-
-    fireEvent.click(newer);
-    expect(newer).toHaveAttribute("aria-expanded", "false");
-    expect(
-      screen.queryByText(
-        "Root cause: applyRuntimeInfo never re-registers the tile delegate",
-      ),
-    ).toBeNull();
-  });
-
-  it("surfaces a failure on the wave header and numbers repeated names", () => {
-    render(<SubagentsPane threadId="thread-1" messages={twoWaves()} />);
-
-    const failedWave = screen.getByRole("region", { name: "Explore ×2" });
-    expect(failedWave).toHaveAttribute("data-wave-status", "failed");
-    expect(screen.getByText("2 agents · 1 failed")).toBeInTheDocument();
-    // Folded wave still reports its rollup, including tokens and a halt.
-    const olderWave = screen.getByRole("region", {
-      name: "Ran 2 subagents",
-    });
-    expect(olderWave).toHaveAttribute("data-wave-status", "stopped");
-    expect(
-      screen.getByText("2 agents · 1 stopped · Σ 640K tok"),
-    ).toBeInTheDocument();
-    // Two "Explore" rows → "Explore 1" / "Explore 2".
     expect(
       screen.getByRole("button", { name: "Open Explore 1 thread" }),
     ).toBeInTheDocument();
@@ -257,36 +178,10 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
         messages={messages([subagent({ model: undefined })])}
       />,
     );
-
     expect(container.querySelector("[data-subagent-model]")).toBeNull();
   });
 
-  it("keeps the header timer live while a sibling has failed", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(100_000));
-    render(
-      <SubagentsPane
-        threadId="thread-1"
-        messages={messages([
-          subagent({ id: "a", status: "failed", durationMs: 5_000 }),
-          subagent({ id: "b", status: "running", startedAt: 90_000 }),
-        ])}
-      />,
-    );
-
-    const wave = screen.getByRole("region", { name: "Explore ×2" });
-    // The failure still wins the header glyph...
-    expect(wave).toHaveAttribute("data-wave-status", "failed");
-    // ...but the elapsed label follows the agent that is still running.
-    const header = within(wave).getByRole("button", { expanded: true });
-    const elapsed = within(header).getByText("0m 10s");
-    act(() => {
-      vi.advanceTimersByTime(3000);
-    });
-    expect(elapsed).toHaveTextContent("0m 13s");
-  });
-
-  it("opens a subagent thread from its row", () => {
+  it("opens a subagent thread from a live row", () => {
     render(
       <SubagentsPane
         threadId="thread-1"
@@ -300,5 +195,309 @@ describe("SubagentsPane — grouped waves with result-first rows", () => {
       threadId: "thread-1",
       subagentId: "sub-42",
     });
+  });
+});
+
+describe("SubagentsPane — completion linger", () => {
+  it("holds a just-finished row for 8s, pauses on hover, then collapses it out", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(100_000));
+    const { rerender } = render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({
+            id: "live",
+            description: "Audit pricing",
+            startedAt: 90_000,
+          }),
+        ])}
+      />,
+    );
+    expect(screen.getByTestId("live-row")).not.toHaveAttribute("data-linger");
+
+    act(() => {
+      rerender(
+        <SubagentsPane
+          threadId="thread-1"
+          messages={messages([
+            subagent({
+              id: "live",
+              description: "Audit pricing",
+              status: "completed",
+              startedAt: 90_000,
+              finishedAt: 100_000,
+              resultText: "Pricing table matches the plan\nmore detail",
+            }),
+          ])}
+        />,
+      );
+    });
+
+    // Still in place — with a settled glyph and its report's first line.
+    const row = screen.getByTestId("live-row");
+    expect(row).toHaveAttribute("data-linger", "hold");
+    expect(
+      within(row).getByText("Pricing table matches the plan"),
+    ).toBeInTheDocument();
+    expect(row.querySelector('[data-row-glyph="completed"]')).not.toBeNull();
+
+    act(() => {
+      vi.advanceTimersByTime(COMPLETION_LINGER_MS - 1);
+    });
+    expect(screen.getByTestId("live-row")).toHaveAttribute(
+      "data-linger",
+      "hold",
+    );
+
+    // Hovering the row is exactly when it must not disappear.
+    fireEvent.mouseEnter(screen.getByTestId("live-row"));
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(screen.getByTestId("live-row")).toHaveAttribute(
+      "data-linger",
+      "hold",
+    );
+
+    // Leaving restarts a fresh hold rather than resuming the old one.
+    fireEvent.mouseLeave(screen.getByTestId("live-row"));
+    act(() => {
+      vi.advanceTimersByTime(COMPLETION_LINGER_MS - 1);
+    });
+    expect(screen.getByTestId("live-row")).toHaveAttribute(
+      "data-linger",
+      "hold",
+    );
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(screen.getByTestId("live-row")).toHaveAttribute(
+      "data-linger",
+      "collapsing",
+    );
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(screen.queryByTestId("live-row")).toBeNull();
+  });
+
+  it("does not linger rows that were already settled when the pane mounted", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(200_000));
+    render(<SubagentsPane threadId="thread-1" messages={twoWaves()} />);
+    expect(screen.queryByTestId("live-row")).toBeNull();
+    expect(
+      screen
+        .getAllByTestId("receipt-row")
+        .some((row) => row.hasAttribute("data-linger")),
+    ).toBe(false);
+  });
+});
+
+describe("SubagentsPane — needs attention", () => {
+  it("holds a failure above the live list until it is dismissed", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(300_000));
+    render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({
+            id: "boom",
+            description: "Fetch the changelog",
+            model: "opus",
+            status: "failed",
+            resultText: "Failed — sandbox denied network access during fetch",
+            durationMs: 185_000,
+          }),
+          subagent({ id: "live", description: "Audit pricing" }),
+        ])}
+      />,
+    );
+
+    const card = screen.getByTestId("attention-card");
+    expect(screen.getByText("NEEDS ATTENTION · 1")).toBeInTheDocument();
+    expect(card).toHaveClass("border-status-attention/25");
+    expect(card.querySelector('[data-row-glyph="failed"]')).not.toBeNull();
+    expect(
+      within(card).getByText(
+        "Failed — sandbox denied network access during fetch",
+      ),
+    ).toBeInTheDocument();
+    expect(within(card).getByTitle("Model: opus")).toBeInTheDocument();
+    expect(within(card).getByText("3m 05s")).toBeInTheDocument();
+
+    // A failure never times itself out.
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(screen.getByTestId("attention-card")).toBeInTheDocument();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Open thread" }));
+    expect(useUIStore.getState().subagentEnterRequest).toMatchObject({
+      threadId: "thread-1",
+      subagentId: "boom",
+    });
+
+    fireEvent.click(within(card).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByTestId("attention-card")).toBeNull();
+    expect(useUIStore.getState().dismissedSubagentAttention).toEqual(["boom"]);
+  });
+});
+
+describe("SubagentsPane — idle receipt", () => {
+  it("reads back the last wave instead of going blank", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_000_000));
+    render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({
+            id: "impl",
+            description: "Patch the session store",
+            status: "completed",
+            startedAt: 600_000,
+            finishedAt: 760_000,
+            resultText: "Patched session.ts, all 14 tests green\nmore detail",
+          }),
+        ])}
+      />,
+    );
+
+    expect(screen.queryByText(/^WORKING/)).toBeNull();
+    expect(screen.getByTestId("receipt-title")).toHaveTextContent(
+      "Patch the session store",
+    );
+    expect(
+      screen.getByText("Patched session.ts, all 14 tests green"),
+    ).toBeInTheDocument();
+    // 1_000_000 - 760_000 = 240s → 4m.
+    expect(screen.getByText("settled 4m ago")).toBeInTheDocument();
+  });
+
+  it("keeps the empty state when the thread has never spawned an agent", () => {
+    render(<SubagentsPane threadId="thread-1" messages={[]} />);
+    expect(
+      screen.getByText("No subagents in this thread yet."),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("SubagentsPane — elapsed", () => {
+  it("freezes a settled row's clock and keeps a running one ticking", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(100_000));
+    const { unmount } = render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({
+            id: "done",
+            description: "Patch the session store",
+            status: "completed",
+            startedAt: 40_000,
+            finishedAt: 70_000,
+          }),
+        ])}
+      />,
+    );
+    const frozen = within(screen.getByTestId("receipt-row")).getByText(
+      "0m 30s",
+    );
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(frozen).toHaveTextContent("0m 30s");
+    unmount();
+
+    render(
+      <SubagentsPane
+        threadId="thread-1"
+        messages={messages([
+          subagent({
+            id: "live",
+            description: "Audit pricing",
+            startedAt: 95_000,
+          }),
+        ])}
+      />,
+    );
+    const live = within(screen.getByTestId("live-row")).getByText("0m 10s");
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+    expect(live).toHaveTextContent("0m 13s");
+  });
+});
+
+describe("SubagentsPane — history", () => {
+  function openHistory(messages: ChatViewItem[]) {
+    useUIStore.setState({ subagentsHistoryOpen: true });
+    return render(<SubagentsPane threadId="thread-1" messages={messages} />);
+  }
+
+  it("lists every turn's waves newest first behind a breadcrumb", () => {
+    openHistory(twoWaves());
+
+    expect(
+      screen.getByRole("button", { name: "Back to Subagents" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("History")).toBeInTheDocument();
+    expect(
+      screen.getAllByTestId("wave-prompt").map((n) => n.textContent),
+    ).toEqual(["›Issue analysis", "›Implement + verify"]);
+    expect(screen.getAllByTestId("history-row")).toHaveLength(4);
+  });
+
+  it("filters the record down to one outcome at a time", () => {
+    openHistory(twoWaves());
+    const filters = screen.getByRole("group", { name: "History filter" });
+    const chip = (name: string) =>
+      within(filters).getByRole("button", { name });
+    expect(chip("All")).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(chip("Failed"));
+    expect(chip("Failed")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByTestId("history-row")).toHaveLength(1);
+    expect(
+      screen.getByText("Failed — sandbox denied network access during fetch"),
+    ).toBeInTheDocument();
+    // The turn with nothing matching drops its divider too.
+    expect(
+      screen.getAllByTestId("wave-prompt").map((n) => n.textContent),
+    ).toEqual(["›Issue analysis"]);
+
+    fireEvent.click(chip("Stopped"));
+    expect(screen.getAllByTestId("history-row")).toHaveLength(1);
+    expect(
+      screen.getByText("Stopped — superseded by wave 2 findings"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(chip("Done"));
+    expect(screen.getAllByTestId("history-row")).toHaveLength(2);
+    expect(
+      screen.getByText("Patched session.ts, all 14 tests green"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Root cause: applyRuntimeInfo never re-registers the tile delegate",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("opens a thread from a history row and returns to the live list", () => {
+    openHistory(twoWaves());
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open Explore 2 thread" }),
+    );
+    expect(useUIStore.getState().subagentEnterRequest).toMatchObject({
+      threadId: "thread-1",
+      subagentId: "explore-2",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to Subagents" }));
+    expect(useUIStore.getState().subagentsHistoryOpen).toBe(false);
   });
 });
