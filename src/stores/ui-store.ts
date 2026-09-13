@@ -37,7 +37,7 @@ export const RIGHT_PANEL_EMPTY = "empty";
 /** What the Theme Studio should open on — one of its two tabs, or an
  *  existing custom theme to reopen. */
 export type ThemeStudioRequest =
-  { mode: "generate" } | { mode: "import" } | { editThemeId: string };
+  { mode: "generate"; copyTheme?: import("@/lib/themes").ThemeDefinition } | { mode: "import" } | { editThemeId: string };
 
 /** A pane id in the right-panel deck. `doc:<absolute path>` panes are
  *  opened per file, so the id carries its own payload — that keeps the

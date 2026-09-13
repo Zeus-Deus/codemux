@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
     settings: {
       appearance: { theme: "default", custom_themes: [] as unknown[] },
     },
-    updateSetting: vi.fn().mockResolvedValue(undefined),
+    updateSettings: vi.fn().mockResolvedValue(undefined),
   },
   app: {
     appState: null as unknown,
@@ -74,6 +74,7 @@ vi.mock("@/lib/perf/instrumented-activate", () => ({
   activateWorkspaceInteraction: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/tauri/commands", () => ({
+  dbSetSetting: vi.fn().mockResolvedValue(undefined),
   agentChatSearch: mocks.backend.agentChatSearch,
   createBrowserPane: vi.fn(),
   cyclePane: vi.fn(),
@@ -88,6 +89,10 @@ vi.mock("@/lib/agent-chat/conversation-search", () => ({
 
 import { CommandPalette } from "./command-palette";
 import { BUILT_IN_THEMES, applyTheme } from "@/lib/themes";
+import { useOmarchyStore } from "@/stores/omarchy-store";
+import { useSettingsStore } from "@/stores/settings-store";
+import { omarchyToTheme } from "@/lib/omarchy-theme";
+import { fallbackTheme } from "@/hooks/use-theme-colors";
 
 const GRAPHITE = BUILT_IN_THEMES[0]!;
 const EMBER = BUILT_IN_THEMES.find((t) => t.id === "ember")!;
@@ -117,6 +122,8 @@ Element.prototype.scrollTo ??= () => {};
 Element.prototype.scrollIntoView ??= () => {};
 
 beforeEach(() => {
+  useSettingsStore.setState({ settings: { "appearance.theme_source": "manual" }, loaded: true });
+  useOmarchyStore.setState({ theme: null, loaded: true });
   vi.clearAllMocks();
   mocks.synced.settings.appearance.theme = "default";
   mocks.synced.settings.appearance.custom_themes = [];
@@ -130,6 +137,42 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("command palette — theme picker", () => {
+  it("can leave Omarchy and return without syncing a machine-specific theme id", async () => {
+    const desktop = omarchyToTheme({ name: "Tokyo Night", scheme: "dark", colors: fallbackTheme });
+    useOmarchyStore.setState({ theme: desktop });
+    useSettingsStore.setState({ settings: { "appearance.theme_source": "omarchy" } });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "ember");
+    await user.click(screen.getByText("Ember"));
+    expect(useSettingsStore.getState().settings["appearance.theme_source"]).toBe("manual");
+    expect(mocks.synced.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ appearance: expect.objectContaining({ theme: "ember" }) }));
+    cleanup();
+    mocks.synced.updateSettings.mockClear();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "omarchy");
+    await user.click(screen.getByText("Follow Omarchy"));
+    expect(useSettingsStore.getState().settings["appearance.theme_source"]).toBe("omarchy");
+    expect(mocks.synced.updateSettings).not.toHaveBeenCalled();
+    expect(liveThemeId()).toBe("omarchy");
+  });
+
+  it("keeps a preview during desktop changes and cancels to the newest desktop palette", async () => {
+    const desktop = omarchyToTheme({ name: "Tokyo Night", scheme: "dark", colors: fallbackTheme });
+    useOmarchyStore.setState({ theme: desktop });
+    useSettingsStore.setState({ settings: { "appearance.theme_source": "omarchy" } });
+    const user = userEvent.setup();
+    renderPalette();
+    await user.type(screen.getByRole("combobox"), "ember");
+    expect(liveThemeId()).toBe("ember");
+    const next = omarchyToTheme({ name: "New palette", scheme: "dark", colors: { ...fallbackTheme, accent: "#ff9900" } });
+    act(() => useOmarchyStore.setState({ theme: next }));
+    expect(liveThemeId()).toBe("ember");
+    cleanup();
+    expect(liveThemeId()).toBe("omarchy");
+    expect(liveAccent()).toBe("#ff9900");
+  });
+
   it("keeps themes out of the resting list", () => {
     renderPalette();
     expect(screen.queryByText("Themes")).not.toBeInTheDocument();
@@ -172,7 +215,7 @@ describe("command palette — theme picker", () => {
     // Highlighting Ember is enough — no click, no Enter.
     await waitFor(() => expect(liveThemeId()).toBe("ember"));
     expect(liveAccent()).toBe(EMBER.roles.brandAccent);
-    expect(mocks.synced.updateSetting).not.toHaveBeenCalled();
+    expect(mocks.synced.updateSettings).not.toHaveBeenCalled();
   });
 
   it("tags the applied theme as current, whatever is being previewed", async () => {
@@ -229,7 +272,7 @@ describe("command palette — theme picker", () => {
 
     await user.keyboard("{Enter}");
 
-    expect(mocks.synced.updateSetting).toHaveBeenCalledWith("appearance", "theme", "ember");
+    expect(mocks.synced.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ appearance: expect.objectContaining({ theme: "ember" }) }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
     // The commit must survive the close — the revert path has to stand down.
     cleanup();

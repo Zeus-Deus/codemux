@@ -19,11 +19,17 @@ vi.mock("@/stores/synced-settings-store", () => {
 import { ThemeSettings } from "./theme-settings";
 import { createGeneratedTheme } from "@/lib/themes";
 import { useUIStore } from "@/stores/ui-store";
+import { useOmarchyStore } from "@/stores/omarchy-store";
+import { useSettingsStore } from "@/stores/settings-store";
+import { omarchyToTheme } from "@/lib/omarchy-theme";
+import { fallbackTheme } from "@/hooks/use-theme-colors";
 
 describe("Appearance theme row", () => {
   afterEach(cleanup);
 
   beforeEach(() => {
+    useOmarchyStore.setState({ loaded: true, theme: null });
+    useSettingsStore.setState({ loaded: true, settings: {} });
     mocks.settings.appearance.theme = "default";
     mocks.settings.appearance.custom_themes = [];
     useUIStore.setState({
@@ -41,6 +47,19 @@ describe("Appearance theme row", () => {
     expect(screen.getByText("Ember")).toBeInTheDocument();
     expect(screen.queryByText("Graphite")).not.toBeInTheDocument();
     expect(screen.queryByText("Abyss")).not.toBeInTheDocument();
+  });
+
+
+  it("names the live desktop and opens an independent copy for customization", () => {
+    const theme = omarchyToTheme({ name: "Tokyo Night", scheme: "dark", colors: fallbackTheme });
+    useOmarchyStore.setState({ theme });
+    useSettingsStore.setState({ settings: { "appearance.theme_source": "omarchy" } });
+    render(<ThemeSettings />);
+    expect(screen.getByText("Omarchy · Tokyo Night")).toBeInTheDocument();
+    expect(screen.getByText(/Following this desktop/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Customize a copy" }));
+    expect(useUIStore.getState().themeStudio).toMatchObject({ mode: "generate", copyTheme: theme });
+    expect(mocks.settings.appearance.custom_themes).toEqual([]);
   });
 
   it("says whether the applied theme is light or dark", () => {

@@ -2753,6 +2753,17 @@ const SHELL_APPEARANCE: ShellAppearance = {
   font_family: "'JetBrains Mono Variable', monospace",
 };
 
+// Opt-in desktop palette for Appearance previews (?omarchy=dark). Keep the
+// fixture distinct from the mock terminal's amber default.
+const OMARCHY_THEME: ThemeColors = {
+  accent: "#7aa2f7", cursor: "#c0caf5", foreground: "#c0caf5", background: "#1a1b26",
+  selection_foreground: "#c0caf5", selection_background: "#283457",
+  color0: "#15161e", color1: "#f7768e", color2: "#9ece6a", color3: "#e0af68",
+  color4: "#7aa2f7", color5: "#bb9af7", color6: "#7dcfff", color7: "#a9b1d6",
+  color8: "#414868", color9: "#f7768e", color10: "#9ece6a", color11: "#e0af68",
+  color12: "#7aa2f7", color13: "#bb9af7", color14: "#7dcfff", color15: "#c0caf5",
+};
+
 function resourceMetrics(): ResourceMetricsSnapshot {
   return {
     app: {
@@ -3276,6 +3287,9 @@ const handlers: Record<string, Handler> = {
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
+  get_omarchy_theme: () => new URLSearchParams(location.search).get("omarchy") === "dark"
+    ? { name: "Tokyo Night", scheme: "dark", colors: OMARCHY_THEME }
+    : null,
   get_shell_appearance: () => SHELL_APPEARANCE,
   // Repaints the native window behind the webview on the desktop. A browser
   // has no such window, so this is a no-op here — present only to keep the

@@ -1,5 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/tauri/commands", async (original) => ({
+  ...await original<typeof import("@/tauri/commands")>(),
+  dbSetSetting: vi.fn().mockResolvedValue(undefined),
+}));
 
 const mocks = vi.hoisted(() => {
   const settings = {

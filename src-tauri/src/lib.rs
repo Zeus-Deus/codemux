@@ -2250,6 +2250,7 @@ fn build_core_app<R: tauri::Runtime>(
         .invoke_handler(tauri::generate_handler![
             diagnostics::get_performance_diagnostics,
             commands::get_current_theme,
+            commands::get_omarchy_theme,
             commands::get_shell_appearance,
             commands::get_app_state,
             commands::create_workspace,

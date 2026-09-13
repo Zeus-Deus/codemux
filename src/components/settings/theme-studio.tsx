@@ -15,7 +15,6 @@ import {
   normalizeColor,
   parseCustomThemes,
   parseCustomTheme,
-  resolveTheme,
   serializeTheme,
   THEME_IMPORT_SOURCE_LABEL,
   THEME_ROLES,
@@ -25,6 +24,7 @@ import {
   type ThemeRole,
 } from "@/lib/themes";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { useAppTheme, setThemeSource } from "@/hooks/use-app-theme";
 import { useUIStore, type ThemeStudioRequest } from "@/stores/ui-store";
 import { ThemePreviewShell } from "./theme-preview-shell";
 import { ThemeImportSourcePicker, type ThemeImportSourceKind } from "./theme-import-sources";
@@ -100,14 +100,25 @@ function StudioBody({
   const customPayloads = useSyncedSettingsStore(
     (state) => state.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS,
   );
-  const themeId = useSyncedSettingsStore((state) => state.settings?.appearance?.theme ?? "default");
+  const { theme: activeTheme } = useAppTheme();
   const updateSettings = useSyncedSettingsStore((state) => state.updateSettings);
   const customThemes = useMemo(() => parseCustomThemes(customPayloads), [customPayloads]);
-  const activeTheme = useMemo(() => resolveTheme(themeId, customThemes), [themeId, customThemes]);
 
   // Seeded once per open — the Dialog remounts this body for every request,
   // so the request is genuinely initial state rather than a prop to re-sync.
   const seed = useMemo(() => {
+    if ("copyTheme" in request && request.copyTheme) {
+      const copy = request.copyTheme;
+      return {
+        editingThemeId: null,
+        tab: "generate" as StudioTab,
+        label: `${copy.label} copy`,
+        background: copy.roles.background,
+        accent: copy.roles.brandAccent,
+        roleDraft: { ...copy, id: `custom-omarchy-${Date.now().toString(36)}`, source: "json" as const },
+        rolesOpen: true,
+      };
+    }
     const editing = "editThemeId" in request
       ? customThemes.find((theme) => theme.id === request.editThemeId) ?? null
       : null;
@@ -215,6 +226,7 @@ function StudioBody({
       appearance: { ...settings.appearance, custom_themes: next, theme: candidate.id },
     }).catch(console.error);
     applyTheme(candidate);
+    setThemeSource("manual");
     onClose();
   };
 
