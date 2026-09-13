@@ -355,6 +355,35 @@ describe("AttachmentChip", () => {
       expect(getByRole("status").className).toContain("rounded-full");
     });
 
+    it("opens the shared lightbox when the preview chip is pressed", () => {
+      stubObjectUrls();
+      const { getByTestId } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={vi.fn()} />,
+      );
+      fireEvent.click(getByTestId("attachment-chip-preview-trigger"));
+      const expanded = getByTestId("attachment-chip-lightbox-image");
+      expect(expanded).toHaveAttribute("src", "blob:mock-1");
+      expect(expanded).toHaveAttribute("alt", "pasted-image.png");
+    });
+
+    it("does not open the lightbox when the remove button is pressed", () => {
+      stubObjectUrls();
+      const onRemove = vi.fn();
+      const { getByLabelText, queryByTestId } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={onRemove} />,
+      );
+      fireEvent.click(getByLabelText("Remove pasted-image.png"));
+      expect(onRemove).toHaveBeenCalledWith("att-1");
+      expect(queryByTestId("attachment-chip-lightbox-image")).toBeNull();
+    });
+
+    it("offers no zoom target for non-image chips", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+      );
+      expect(queryByTestId("attachment-chip-preview-trigger")).toBeNull();
+    });
+
     it("keeps the icon while the bytes are still resolving", () => {
       stubObjectUrls();
       const { getByTestId, queryByTestId } = render(

@@ -19,6 +19,10 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  IMAGE_LIGHTBOX_MEDIA_CLASS,
+  ImageLightbox,
+} from "@/components/chat/ImageLightbox";
 import { cn } from "@/lib/utils";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { utilitySummaryFallbackLabel } from "@/lib/agent-chat/session-handoff";
@@ -217,6 +221,10 @@ export function AttachmentChip({
   // bad image degrades to the icon rather than a broken-image glyph.
   const previewUrl = useImagePreviewUrl(attachment);
   const [previewFailed, setPreviewFailed] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  // Controlled so the hover preview can be forced shut while the lightbox
+  // is up — otherwise the tooltip floats over the expanded image.
+  const [tooltipOpen, setTooltipOpen] = useState(false);
   const showPreview =
     previewUrl !== null && !previewFailed && !metadata.isLoading;
 
@@ -251,18 +259,37 @@ export function AttachmentChip({
           data-testid="attachment-chip-spinner"
         />
       ) : showPreview ? (
-        <img
-          src={previewUrl}
-          alt=""
-          aria-hidden
-          data-testid="attachment-chip-thumbnail"
-          className="h-[22px] w-[30px] shrink-0 rounded-[3px] border border-foreground/10 object-cover"
-          onError={() => setPreviewFailed(true)}
-        />
+        // A staged image is inspectable before it is sent: thumbnail and
+        // label together are one zoom target that opens the same lightbox
+        // the transcript uses, so a paste can be checked without sending it
+        // first. The 30px thumbnail alone would be too small a hit area.
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setLightboxOpen(true);
+          }}
+          aria-label={`Expand ${metadata.label}`}
+          title="Click to expand"
+          data-testid="attachment-chip-preview-trigger"
+          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-[3px] outline-none focus-visible:ring-1 focus-visible:ring-current"
+        >
+          <img
+            src={previewUrl}
+            alt=""
+            aria-hidden
+            data-testid="attachment-chip-thumbnail"
+            className="h-[22px] w-[30px] shrink-0 rounded-[3px] border border-foreground/10 object-cover"
+            onError={() => setPreviewFailed(true)}
+          />
+          <span className="truncate max-w-[200px]">{metadata.label}</span>
+        </button>
       ) : (
         <Icon className="h-3 w-3" aria-hidden />
       )}
-      <span className="truncate max-w-[200px]">{metadata.label}</span>
+      {!showPreview && (
+        <span className="truncate max-w-[200px]">{metadata.label}</span>
+      )}
       {attachment.kind === "session" &&
         !metadata.isLoading &&
         metadata.handoffKind && (
@@ -326,12 +353,30 @@ export function AttachmentChip({
       >
         <X className="h-2.5 w-2.5" />
       </button>
+      {/* Portals its content, so it costs the chip row no layout. */}
+      {showPreview && previewUrl && (
+        <ImageLightbox
+          open={lightboxOpen}
+          onOpenChange={setLightboxOpen}
+          title={metadata.label}
+        >
+          <img
+            src={previewUrl}
+            alt={metadata.label}
+            data-testid="attachment-chip-lightbox-image"
+            className={IMAGE_LIGHTBOX_MEDIA_CLASS}
+          />
+        </ImageLightbox>
+      )}
     </div>
   );
 
   return (
     <TooltipProvider delayDuration={250}>
-      <Tooltip>
+      <Tooltip
+        open={tooltipOpen && !lightboxOpen}
+        onOpenChange={setTooltipOpen}
+      >
         <TooltipTrigger asChild>{chip}</TooltipTrigger>
         <TooltipContent
           side="top"
@@ -376,6 +421,9 @@ export function AttachmentChip({
               })}{" "}
               KB
             </div>
+          )}
+          {showPreview && (
+            <div className="text-[10px] opacity-60">Click to expand</div>
           )}
           {attachment.kind === "session" && (
             <>
