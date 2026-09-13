@@ -1,18 +1,16 @@
+pub mod omarchy;
 pub mod workspace_config;
 
-use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellAppearance {
     pub font_family: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThemeColors {
     pub accent: String,
     pub cursor: String,
@@ -67,20 +65,10 @@ impl Default for ThemeColors {
     }
 }
 
-pub fn get_omarchy_theme_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config/omarchy/current/theme/colors.toml"))
-}
-
 pub fn read_theme_colors() -> Result<ThemeColors, String> {
-    let path = get_omarchy_theme_path()
-        .ok_or_else(|| "Could not determine home directory for Omarchy theme lookup".to_string())?;
-    let contents =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read theme file: {}", e))?;
-
-    let theme: ThemeColors =
-        toml::from_str(&contents).map_err(|e| format!("Failed to parse theme file: {}", e))?;
-
-    Ok(theme)
+    omarchy::read_theme(&omarchy::theme_paths())
+        .map(|theme| theme.colors)
+        .ok_or_else(|| "No valid Omarchy palette found".into())
 }
 
 pub fn read_theme_colors_or_default() -> ThemeColors {
@@ -187,49 +175,14 @@ fn clean_font_value(value: &str) -> String {
 }
 
 pub fn watch_theme_file<R: tauri::Runtime>(app_handle: tauri::AppHandle<R>) {
-    std::thread::spawn(move || {
-        let (tx, rx) = channel();
-        let mut watcher = match notify::RecommendedWatcher::new(tx, Config::default()) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                eprintln!("[codemux::theme] Failed to create watcher: {error}");
-                return;
-            }
-        };
-
-        let Some(theme_path) = get_omarchy_theme_path() else {
-            eprintln!("[codemux::theme] Home directory unavailable, skipping theme watching");
-            return;
-        };
-
-        let watch_target = if theme_path.exists() {
-            theme_path.clone()
-        } else {
-            theme_path
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or(theme_path.clone())
-        };
-
-        if let Err(error) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "[codemux::theme] Failed to watch theme path {}: {error}",
-                watch_target.display()
-            );
-            return;
+    let emitter = app_handle.clone();
+    match omarchy::watch(omarchy::theme_paths(), move |theme| {
+        let _ = emitter.emit("theme-changed", &theme.colors);
+        let _ = emitter.emit("omarchy-theme-changed", &theme);
+    }) {
+        Ok(watcher) => {
+            app_handle.manage(std::sync::Mutex::new(watcher));
         }
-
-        for res in rx {
-            match res {
-                Ok(_event) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let theme = read_theme_colors_or_default();
-                    if let Err(error) = app_handle.emit("theme-changed", theme) {
-                        eprintln!("[codemux::theme] Failed to emit theme change event: {error}");
-                    }
-                }
-                Err(error) => eprintln!("[codemux::theme] Watch error: {error:?}"),
-            }
-        }
-    });
+        Err(error) => log::warn!("Could not watch Omarchy theme: {error}"),
+    }
 }

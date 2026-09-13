@@ -59,6 +59,8 @@
         root.style.setProperty("--cm-boot-fg", bootRoles.foreground);
         if (!complete) return;
         root.dataset.themeId = typeof stored.id === "string" ? stored.id : "default";
+        root.classList.toggle("dark", stored.scheme !== "light");
+        root.style.colorScheme = stored.scheme === "light" ? "light" : "dark";
         for (const [role, variable] of Object.entries(roleVariables)) {
           root.style.setProperty(variable, stored.roles[role]);
         }

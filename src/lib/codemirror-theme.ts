@@ -3,6 +3,7 @@ import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 import type { Extension } from "@codemirror/state";
 import type { ThemeColors } from "@/tauri/types";
+import { relativeLuminance } from "./themes";
 
 /** Mirrors style-mod's `StyleSpec` (nested selectors + declarations). */
 type ThemeSpec = { [propOrSelector: string]: string | number | ThemeSpec | null };
@@ -92,7 +93,7 @@ export function buildEditorThemeSpec(theme: ThemeColors): Record<string, ThemeSp
 }
 
 export function buildEditorTheme(theme: ThemeColors): Extension[] {
-  const editorTheme = EditorView.theme(buildEditorThemeSpec(theme), { dark: true });
+  const editorTheme = EditorView.theme(buildEditorThemeSpec(theme), { dark: relativeLuminance(theme.background) < 0.45 });
 
   const highlighting = syntaxHighlighting(
     HighlightStyle.define([

@@ -147,10 +147,9 @@ function themeId(base: ChatCodeThemeBase): string {
 
 /**
  * Streamdown always renders a light/dark theme pair, and Shiki emits both a
- * `color` and a `--shiki-dark` value per token. The app shell is dark-only
- * (`main.tsx` pins `.dark` on the root) and the terminal ANSI palette is a
- * single palette — the CodeMirror editor theme likewise hardcodes
- * `{ dark: true }` — so both slots are filled with the same colors under
+ * `color` and a `--shiki-dark` value per token. The selected terminal ANSI
+ * palette is a single palette, whether the shell is light or dark,
+ * so both slots are filled with the same colors under
  * distinct names. Distinct names matter because Shiki registers themes by
  * name and the pair must not collide.
  *

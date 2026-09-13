@@ -3,7 +3,9 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { buildEditorThemeSpec } from "./codemirror-theme";
+import { buildEditorTheme, buildEditorThemeSpec } from "./codemirror-theme";
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import type { ThemeColors } from "@/tauri/types";
 
 const palette: ThemeColors = {
@@ -34,6 +36,10 @@ const palette: ThemeColors = {
 const globalsCss = readFileSync(resolve(process.cwd(), "src/globals.css"), "utf8");
 
 describe("editor selection contract", () => {
+  it("uses light editor defaults for a light desktop palette", () => {
+    const state = EditorState.create({ extensions: buildEditorTheme({ ...palette, background: "#eff1f5" }) });
+    expect(state.facet(EditorView.darkTheme)).toBe(false);
+  });
   it("keeps syntax colors on selected code instead of the app selection ink", () => {
     const line = buildEditorThemeSpec(palette)[".cm-line"] as Record<string, Record<string, string>>;
 

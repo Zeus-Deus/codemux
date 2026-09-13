@@ -71,10 +71,11 @@ import {
   applyTheme,
   BUILT_IN_THEMES,
   parseCustomThemes,
-  resolveTheme,
   type ThemeDefinition,
 } from "@/lib/themes";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { useAppTheme, setThemeSource } from "@/hooks/use-app-theme";
+import { OMARCHY_THEME_ID } from "@/lib/omarchy-theme";
 import { openConversationSearchResult } from "@/lib/agent-chat/conversation-search";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
@@ -346,13 +347,11 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const now = useCoarseClock(true);
 
   const openThemeStudio = useUIStore((s) => s.openThemeStudio);
-  const syncedThemeId = useSyncedSettingsStore(
-    (s) => s.settings?.appearance?.theme ?? "default",
-  );
+  const { theme: appliedTheme, omarchy } = useAppTheme();
   const customThemePayloads = useSyncedSettingsStore(
     (s) => s.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS,
   );
-  const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
+  const updateSyncedSettings = useSyncedSettingsStore((s) => s.updateSettings);
 
   const settled = useSidebarInboxStore((s) => s.settled);
   const snoozed = useSidebarInboxStore((s) => s.snoozed);
@@ -451,16 +450,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
     [customThemePayloads],
   );
   const allThemes = useMemo(
-    () => [...BUILT_IN_THEMES, ...customThemes],
-    [customThemes],
+    () => [...(omarchy ? [omarchy] : []), ...BUILT_IN_THEMES, ...customThemes],
+    [customThemes, omarchy],
   );
-  /** What the app is wearing for real — the row tagged `current`, and what Esc
-   *  (or arrowing off the theme list) puts back. */
-  const appliedTheme = useMemo(
-    () => resolveTheme(syncedThemeId, customThemes),
-    [syncedThemeId, customThemes],
-  );
-
   const themeRows = useMemo<ThemeRow[]>(
     () =>
       allThemes.map((theme) => ({
@@ -597,7 +589,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // A path query is asking "where", and a palette has no location.
   const themesEligible = searching && !commandsOnly && !query.pathMode;
   const matchedThemes = useMemo(
-    () => (themesEligible ? rankThemeGroup(themeRows, query, (r) => r.theme.label) : []),
+    () => (themesEligible ? rankThemeGroup(themeRows, query, (r) => r.theme.id === OMARCHY_THEME_ID ? `Follow ${r.theme.label}` : r.theme.label) : []),
     [themeRows, query, themesEligible],
   );
   const matchedThemeStudio = useMemo(
@@ -723,7 +715,14 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   const keepTheme = (theme: ThemeDefinition) => {
     committedRef.current = true;
     applyTheme(theme);
-    updateSyncedSetting("appearance", "theme", theme.id).catch(console.error);
+    if (theme.id === OMARCHY_THEME_ID) {
+      setThemeSource("omarchy");
+    } else {
+      // The full-settings write persists offline too, matching Theme Studio.
+      const settings = useSyncedSettingsStore.getState().settings;
+      updateSyncedSettings({ ...settings, appearance: { ...settings.appearance, theme: theme.id } }).catch(console.error);
+      setThemeSource("manual");
+    }
     close();
   };
 
@@ -925,7 +924,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <FooterHint keys="esc" label={`back to ${appliedTheme.label}`} />
             <span className="flex-1" />
             <span className="font-mono text-[10px] text-muted-foreground/70">
-              syncs to your account
+              {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
             </span>
           </>
         ) : (
@@ -1195,7 +1194,10 @@ function ThemeItemRow({
     <PaletteItem value={row.key} onSelect={onSelect}>
       <ThemeCoins theme={row.theme} size={22} />
       <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground/90">
-        {row.theme.label}
+        {row.theme.id === OMARCHY_THEME_ID ? "Follow Omarchy" : row.theme.label}
+        {row.theme.id === OMARCHY_THEME_ID && (
+          <span className="ml-2 text-[11px] font-normal text-muted-foreground">Automatic · {row.theme.label.replace("Omarchy · ", "")}</span>
+        )}
       </span>
       {applied && (
         <span className="flex-none font-mono text-[11px] text-muted-foreground/70">

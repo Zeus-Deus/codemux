@@ -60,7 +60,7 @@ export type AnsiPalette = Readonly<Record<AnsiSlot, string>>;
 export interface ThemeDefinition {
   id: string;
   label: string;
-  scheme: "dark";
+  scheme: "dark" | "light";
   roles: ThemeRoleMap;
   ansi: AnsiPalette;
   radius?: string;
@@ -73,7 +73,7 @@ export interface ThemeFile {
   version: typeof THEME_FILE_VERSION;
   id: string;
   label: string;
-  scheme: "dark";
+  scheme: "dark" | "light";
   roles: Partial<Record<ThemeRole, string>>;
   ansi?: Partial<Record<AnsiSlot, string>>;
   radius?: string;
@@ -584,7 +584,14 @@ function validRadius(value: unknown): string | undefined {
 function completeThemeFile(file: ThemeFile): ThemeDefinition {
   const seedBackground = file.seeds?.background ?? file.roles.background ?? "#151110";
   const seedAccent = file.seeds?.accent ?? file.roles.brandAccent ?? file.roles.primary ?? "#e07850";
-  const generated = createGeneratedTheme(file.label, seedBackground, seedAccent, file.id);
+  // Light system-theme copies carry a complete palette; never fill their
+  // missing roles with dark defaults or silently turn them into dark themes.
+  if (file.scheme === "light" && THEME_ROLES.some((role) => !normalizeColor(file.roles[role] ?? ""))) {
+    throw new Error("A light theme must include every surface color.");
+  }
+  const generated = file.scheme === "light"
+    ? { ...BUILT_IN_THEMES[0]!, scheme: "light" as const }
+    : createGeneratedTheme(file.label, seedBackground, seedAccent, file.id);
   const themeRoles = { ...generated.roles };
   for (const role of THEME_ROLES) {
     const value = file.roles[role];
@@ -617,7 +624,7 @@ export function parseCustomTheme(value: unknown): ThemeDefinition | null {
       version: THEME_FILE_VERSION,
       id: typeof value.id === "string" ? value.id : themeIdFromLabel(value.label),
       label: value.label,
-      scheme: "dark",
+      scheme: value.scheme === "light" ? "light" : "dark",
       roles: value.roles as Partial<Record<ThemeRole, string>>,
       ansi: isRecord(value.ansi) ? value.ansi as Partial<Record<AnsiSlot, string>> : undefined,
       radius: validRadius(value.radius),
@@ -649,7 +656,7 @@ export function serializeTheme(theme: ThemeDefinition): string {
     version: THEME_FILE_VERSION,
     id: theme.id,
     label: theme.label,
-    scheme: "dark",
+    scheme: theme.scheme,
     roles: theme.roles,
     ansi: theme.ansi,
     radius: theme.radius,
@@ -896,6 +903,8 @@ function notifyActiveTheme(theme: ThemeDefinition) {
 }
 
 function writeThemeVariables(root: HTMLElement, theme: ThemeDefinition) {
+  root.classList.toggle("dark", theme.scheme !== "light");
+  root.style.colorScheme = theme.scheme;
   for (const role of THEME_ROLES) root.style.setProperty(ROLE_VARIABLES[role], theme.roles[role]);
   for (const slot of ANSI_SLOTS) root.style.setProperty(ANSI_VARIABLES[slot], theme.ansi[slot]);
   if (theme.radius) root.style.setProperty("--cm-theme-radius", theme.radius);
@@ -907,6 +916,7 @@ function persistBootTheme(theme: ThemeDefinition) {
   try {
     window.localStorage.setItem(THEME_BOOT_STORAGE_KEY, JSON.stringify({
       id: theme.id,
+      scheme: theme.scheme,
       roles: theme.roles,
       ansi: theme.ansi,
       radius: theme.radius ?? null,

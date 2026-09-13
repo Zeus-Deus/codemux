@@ -218,6 +218,11 @@ pub fn get_current_theme() -> Result<ThemeColors, String> {
 }
 
 #[tauri::command]
+pub fn get_omarchy_theme() -> Option<crate::config::omarchy::OmarchyTheme> {
+    crate::config::omarchy::read_theme(&crate::config::omarchy::theme_paths())
+}
+
+#[tauri::command]
 pub fn get_shell_appearance() -> Result<ShellAppearance, String> {
     Ok(read_shell_appearance_or_default())
 }

@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { parseCustomThemes, resolveTheme } from "@/lib/themes";
+import { parseCustomThemes } from "@/lib/themes";
+import { useAppTheme } from "@/hooks/use-app-theme";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { ThemeCoins } from "./theme-swatches";
@@ -17,7 +18,7 @@ const EMPTY_THEME_PAYLOADS: unknown[] = [];
  * studio on the current theme.
  */
 export function ThemeSettings() {
-  const themeId = useSyncedSettingsStore((state) => state.settings?.appearance?.theme ?? "default");
+  const { theme: activeTheme, source, omarchy } = useAppTheme();
   const customPayloads = useSyncedSettingsStore(
     (state) => state.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS,
   );
@@ -25,7 +26,7 @@ export function ThemeSettings() {
   const openThemeStudio = useUIStore((state) => state.openThemeStudio);
 
   const customThemes = useMemo(() => parseCustomThemes(customPayloads), [customPayloads]);
-  const activeTheme = useMemo(() => resolveTheme(themeId, customThemes), [themeId, customThemes]);
+
   const isCustom = customThemes.some((theme) => theme.id === activeTheme.id);
 
   return (
@@ -34,7 +35,9 @@ export function ThemeSettings() {
       <div className="min-w-0 flex-1 space-y-0.5">
         <p className="truncate text-[13px] font-semibold text-foreground">{activeTheme.label}</p>
         <p className="text-[11.5px] text-muted-foreground/80">
-          Shell, terminal, code and editor. Synced to your account.
+          {source === "omarchy"
+            ? omarchy ? "Following this desktop’s theme. Changes apply automatically." : "Omarchy is unavailable. Using your saved theme until it returns."
+            : "Shell, terminal, code and editor. Synced to your account."}
         </p>
       </div>
       <Button
@@ -53,10 +56,12 @@ export function ThemeSettings() {
         size="sm"
         className="h-[30px] flex-none text-[11.5px]"
         onClick={() =>
-          openThemeStudio(isCustom ? { editThemeId: activeTheme.id } : { mode: "generate" })
+          openThemeStudio(source === "omarchy" && omarchy
+            ? { mode: "generate", copyTheme: activeTheme }
+            : isCustom ? { editThemeId: activeTheme.id } : { mode: "generate" })
         }
       >
-        Customize
+        {source === "omarchy" && omarchy ? "Customize a copy" : "Customize"}
       </Button>
     </div>
   );

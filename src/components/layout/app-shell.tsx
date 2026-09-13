@@ -10,7 +10,9 @@ import {
 import {
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
-import { applyTheme, parseCustomThemes, resolveTheme } from "@/lib/themes";
+import { applyTheme } from "@/lib/themes";
+import { useAppTheme, setThemeSource } from "@/hooks/use-app-theme";
+import { useOmarchyStore } from "@/stores/omarchy-store";
 import { applyTypography, resolveTypographySettings } from "@/lib/typography";
 import { SidebarProvider, SidebarInset, useSidebar } from "@/components/ui/sidebar";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
@@ -60,8 +62,6 @@ const BrowserPeekOverlay = lazy(() =>
   import("@/components/browser/BrowserPeekOverlay").then((module) => ({ default: module.BrowserPeekOverlay })),
 );
 
-const EMPTY_THEME_PAYLOADS: unknown[] = [];
-
 export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
@@ -89,29 +89,17 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   // Appearance uses the synced theme id and payloads. Density stays local: it
   // controls layout rhythm rather than the color system.
   const syncedThemeId = useSyncedSettingsStore((s) => s.settings?.appearance?.theme ?? "default");
-  const customThemePayloads = useSyncedSettingsStore((s) => s.settings?.appearance?.custom_themes ?? EMPTY_THEME_PAYLOADS);
+
   const typographyAppearance = useSyncedSettingsStore((s) => s.settings?.appearance);
   const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
   const legacyPalette = useSettingsStore((s) => s.settings["appearance.palette"]);
   const density = useSettingsStore(selectDensity);
-  const customThemes = useMemo(
-    () => parseCustomThemes(customThemePayloads),
-    [customThemePayloads],
-  );
+  const { theme: activeTheme, discovered, source, savedSource } = useAppTheme();
   // Both stores must have answered before the synced theme id means anything:
   // until then `syncedThemeId` is the DEFAULT_SETTINGS placeholder ("default")
   // and `legacyPalette` is undefined, so acting on either would be acting on a
   // value the user never chose.
-  const appearanceReady = settingsLoaded && !syncedLoading;
-  const effectiveThemeId =
-    legacyPalette === "warm" &&
-    (syncedThemeId === "system" || syncedThemeId === "dark" || syncedThemeId === "default")
-      ? "warm"
-      : syncedThemeId;
-  const activeTheme = useMemo(
-    () => resolveTheme(effectiveThemeId, customThemes),
-    [effectiveThemeId, customThemes],
-  );
+  const appearanceReady = settingsLoaded && !syncedLoading && discovered;
   const typography = useMemo(
     () => resolveTypographySettings(typographyAppearance),
     [typographyAppearance],
@@ -119,7 +107,12 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
 
   useEffect(() => {
     useSettingsStore.getState().load();
+    void useOmarchyStore.getState().load();
   }, []);
+
+  useEffect(() => {
+    if (appearanceReady && !savedSource) setThemeSource(source);
+  }, [appearanceReady, savedSource, source]);
 
   // The inline boot script already painted the last applied theme, so until the
   // stores load there is nothing to do: applying here would repaint the shell
@@ -130,12 +123,14 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   useLayoutEffect(() => {
     const root = document.documentElement;
     if (appearanceReady) {
-      applyTheme(activeTheme);
+      // The palette owns its preview until it closes; desktop updates must
+      // not repaint over the user's highlighted choice.
+      if (!commandPaletteOpen) applyTheme(activeTheme);
       applyTypography(root, typography);
     }
     delete root.dataset.pal;
     root.dataset.density = density;
-  }, [activeTheme, density, appearanceReady, typography]);
+  }, [activeTheme, density, appearanceReady, typography, commandPaletteOpen]);
 
   // One-time migration from the machine-local Cool/Warm axis to the unified,
   // synced theme id. Only an explicitly stored legacy value participates, and
