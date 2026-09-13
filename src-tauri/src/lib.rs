@@ -173,12 +173,12 @@ fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
 /// first frame. That default is Graphite's near-black, so a user on a light
 /// palette got a black flash on every launch. The frontend calls this as soon
 /// as a theme is applied (`applyTheme` → `syncWindowBackground`), which for a
-/// persisted theme is during the first mount — the window then carries the
-/// right color into the *next* launch as well, because the value survives on
-/// the window, not just in the frame.
+/// persisted theme is during the first mount. This changes the current
+/// window only; before that first mount, a new process still uses the
+/// configured default background.
 ///
 /// This sets both the native window and the webview's own base color, so the
-/// gap between "window mapped" and "document painted" is covered too.
+/// native fill matches the palette once the frontend applies it.
 #[tauri::command]
 fn set_window_background<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -198,6 +198,9 @@ fn set_window_background<R: tauri::Runtime>(
 /// hex before calling, so nothing else needs parsing here.
 fn parse_hex_rgb(value: &str) -> Option<(u8, u8, u8)> {
     let hex = value.strip_prefix('#')?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     let expanded;
     let hex = match hex.len() {
         3 => {
@@ -212,6 +215,20 @@ fn parse_hex_rgb(value: &str) -> Option<(u8, u8, u8)> {
         u8::from_str_radix(&hex[2..4], 16).ok()?,
         u8::from_str_radix(&hex[4..6], 16).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod window_background_tests {
+    use super::parse_hex_rgb;
+
+    #[test]
+    fn accepts_hex_and_rejects_malformed_colors_without_panicking() {
+        assert_eq!(parse_hex_rgb("#abc"), Some((170, 187, 204)));
+        assert_eq!(parse_hex_rgb("#12ABef"), Some((18, 171, 239)));
+        for invalid in ["#aé", "#€abc", "#zzzzzz", "#12345", "123456"] {
+            assert_eq!(parse_hex_rgb(invalid), None);
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
