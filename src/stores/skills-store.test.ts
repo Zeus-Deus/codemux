@@ -291,6 +291,19 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     expect(useSkillsStore.getState().disabledIds).toEqual([]);
   });
 
+  it("selects cached skills for the requested cwd and respects disabled preferences", async () => {
+    const user = makeSkill("user");
+    const project = { ...makeSkill("project"), scope: "project" as const };
+    listSkillsMock.mockResolvedValueOnce([user]).mockResolvedValueOnce([user, project]);
+    await useSkillsStore.getState().loadSkills(null);
+    await useSkillsStore.getState().loadSkills("/project-a");
+    expect(selectActiveSkills(useSkillsStore.getState(), null)).toEqual([user]);
+    expect(selectActiveSkills(useSkillsStore.getState(), "/project-b")).toEqual([]);
+    useSkillsStore.getState().toggleSkillDisabled(user.id);
+    expect(selectActiveSkills(useSkillsStore.getState(), null)).toEqual([]);
+    expect(selectActiveSkills(useSkillsStore.getState(), "/project-a")).toEqual([project]);
+  });
+
   it("selectActiveSkills returns all skills when nothing is disabled", () => {
     useSkillsStore.setState({
       skills: [makeSkill("a"), makeSkill("b")],

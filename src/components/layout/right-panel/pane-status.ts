@@ -34,6 +34,10 @@ export interface DeckStatusInput {
    *  back; `agentDriven` is its `is_active` flag, which the backend raises
    *  while an agent is driving the browser. */
   browser: { docked: boolean; url: string | null; agentDriven: boolean } | null;
+  /** The Subagents pane's own two figures: how many agents are live right
+   *  now, and how many have settled in this thread. The pane itself is
+   *  live-first and prints no lifetime count, so the foot carries it. */
+  subagents: { running: number; finished: number } | null;
 }
 
 function plural(count: number, word: string): string {
@@ -63,6 +67,15 @@ export function deckStatusLine(input: DeckStatusInput): string {
     const { prNumber, state } = input.review;
     if (prNumber == null) return "no pull request";
     return state ? `PR #${prNumber} · ${state.toLowerCase()}` : `PR #${prNumber}`;
+  }
+
+  if (activePane === "subagents" && input.subagents) {
+    const { running, finished } = input.subagents;
+    if (running > 0) {
+      return `${running} running · ${finished} finished this thread`;
+    }
+    const head = "No agents running";
+    return finished === 0 ? head : `${head} · ${finished} finished this thread`;
   }
 
   if (activePane === "browser" && input.browser) {

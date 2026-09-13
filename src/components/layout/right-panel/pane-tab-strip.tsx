@@ -83,6 +83,10 @@ export interface DeckTab {
   badge?: ReactNode;
   /** Tint the badge with the theme accent while this pane is active. */
   accentBadgeWhenActive?: boolean;
+  /** Paint the badge in the attention token regardless of active state —
+   *  a count the user is being asked to deal with (a failed subagent) has
+   *  to read the same whether or not its pane happens to be in front. */
+  badgeTone?: "attention";
   testId?: string;
 }
 
@@ -124,9 +128,11 @@ function DeckTabChip({
     <span
       className={cn(
         "font-mono text-[9.5px] tabular-nums",
-        active && tab.accentBadgeWhenActive
-          ? "text-accent-ember"
-          : "text-foreground/38",
+        tab.badgeTone === "attention"
+          ? "text-status-attention"
+          : active && tab.accentBadgeWhenActive
+            ? "text-accent-ember"
+            : "text-foreground/38",
       )}
     >
       {tab.badge}

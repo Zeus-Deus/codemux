@@ -12,6 +12,7 @@ function input(overrides: Partial<DeckStatusInput> = {}): DeckStatusInput {
     review: null,
     diff: null,
     browser: null,
+    subagents: null,
     ...overrides,
   };
 }
@@ -89,6 +90,30 @@ describe("deckStatusLine", () => {
         input({ activePane: "review", review: { prNumber: 256, state: "OPEN" } }),
       ),
     ).toBe("PR #256 · open");
+  });
+
+  // The Subagents pane is live-first and prints no lifetime count of its
+  // own, so the foot is where "how many have finished in this thread" is
+  // answered.
+  it("reports the subagents pane's live and finished counts", () => {
+    expect(
+      deckStatusLine(
+        input({ activePane: "subagents", subagents: { running: 3, finished: 7 } }),
+      ),
+    ).toBe("3 running · 7 finished this thread");
+  });
+
+  it("says nothing is running rather than printing a zero", () => {
+    expect(
+      deckStatusLine(
+        input({ activePane: "subagents", subagents: { running: 0, finished: 0 } }),
+      ),
+    ).toBe("No agents running");
+    expect(
+      deckStatusLine(
+        input({ activePane: "subagents", subagents: { running: 0, finished: 4 } }),
+      ),
+    ).toBe("No agents running · 4 finished this thread");
   });
 
   // Panes with no numbers of their own fall back to the deck's shape,

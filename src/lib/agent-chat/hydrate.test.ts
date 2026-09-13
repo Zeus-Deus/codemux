@@ -10,7 +10,11 @@ import {
   replayTimed,
 } from "./hydrate";
 import { applyEvent, createEmptyThreadState } from "./reducer";
-import { findSubagentView, runningSubagentEntries } from "./subagents";
+import {
+  findSubagentView,
+  runningSubagentEntries,
+  subagentElapsedMs,
+} from "./subagents";
 import type {
   ChatThreadState,
   PermissionRequestItem,
@@ -633,6 +637,47 @@ describe("replayPayloads", () => {
     expect(sub?.statusAssumed).toBe(true);
     // Never resurrects a live spinner in the docked bar.
     expect(runningSubagentEntries(state.messages)).toHaveLength(0);
+  });
+
+  it("stamps the forced settle with the last persisted row time, not mount time", () => {
+    // A thread rebuilt from disk has real timestamps for when it started
+    // and for when it stopped producing — mount time is neither. Stamping
+    // `Date.now()` here is what made a run that died last week report a
+    // week of "elapsed" the moment its workspace was reopened.
+    const state = replayTimed([
+      {
+        event: JSON.parse(user("delegate")) as ProviderRuntimeEvent,
+        createdAtMs: 1_000_000,
+      },
+      {
+        event: {
+          type: "subagent_updated",
+          thread_id: "t",
+          subagent: {
+            subagent_id: "s1",
+            status: "running",
+            name: "Explore",
+          },
+        } as ProviderRuntimeEvent,
+        createdAtMs: 1_060_000,
+      },
+      {
+        event: {
+          type: "item_completed",
+          thread_id: "t",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text: "still going" },
+        } as ProviderRuntimeEvent,
+        createdAtMs: 1_100_000,
+      },
+      // No terminal snapshot — the forced settle below owns this row.
+    ]);
+    const sub = findSubagentView(state.messages, "s1");
+    expect(sub?.status).toBe("interrupted");
+    expect(sub?.startedAt).toBe(1_060_000);
+    expect(sub?.finishedAt).toBe(1_100_000);
+    // Reopened twelve days later, the readout is still the run's length.
+    expect(subagentElapsedMs(sub!, 1_100_000 + 12 * 86_400_000)).toBe(40_000);
   });
 
   it("self-heals: a running snapshot then a parent tool_result hydrates as completed (not interrupted)", () => {

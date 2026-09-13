@@ -8,32 +8,41 @@ import {
   describeToolCall,
   findSubagentView,
   formatElapsed,
+  formatSettledAgo,
   hasRunningSubagents,
   interruptRunningSubagents,
   isDone,
   isMonitorTask,
+  matchesHistoryFilter,
   mergeSnapshot,
   mergeStatus,
+  needsAttention,
   newSubagentView,
   recentToolCalls,
   replaceTranscriptItem,
   runningSubagentEntries,
   settleSubagentsForToolResult,
   subagentActivityLine,
+  subagentDeckSummary,
   subagentElapsedMs,
   subagentGroupRollup,
+  subagentHistoryGroups,
   subagentLatestOutput,
   subagentMetaLine,
   subagentOrdinal,
-  subagentStatusLabel,
   subagentOrdinals,
+  subagentPaneModel,
+  subagentRowTitle,
+  subagentStatusLabel,
   subagentToolCount,
+  subagentWaves,
+  subagentWaveSettledAt,
   subagentWaveStatus,
   subagentWaveTitle,
-  subagentWaves,
   toneIndexForId,
   transcriptIndex,
 } from "./subagents";
+import type { SubagentWave } from "./subagents";
 import type {
   ChatViewItem,
   SubagentRunItem,
@@ -788,11 +797,36 @@ describe("subagentGroupRollup", () => {
   });
 
   it("derives elapsed from the start stamp when no duration was reported", () => {
-    const rollup = subagentGroupRollup(
-      [view({ id: "a", status: "completed", startedAt: 1_000 })],
+    // Still running: the clock is the end of the span.
+    const live = subagentGroupRollup(
+      [view({ id: "a", status: "running", startedAt: 1_000 })],
       6_000,
     );
-    expect(rollup.elapsedMs).toBe(5_000);
+    expect(live.elapsedMs).toBe(5_000);
+    // Settled: the settle stamp is, so a finished group stops growing.
+    const settled = subagentGroupRollup(
+      [
+        view({
+          id: "a",
+          status: "completed",
+          startedAt: 1_000,
+          finishedAt: 6_000,
+        }),
+      ],
+      9e12,
+    );
+    expect(settled.elapsedMs).toBe(5_000);
+  });
+
+  it("reports no elapsed for a settled row that was never stamped", () => {
+    // A hydrated tombstone: `startedAt` is real (the persisted row time)
+    // but nothing recorded when it stopped. Counting from `startedAt` to
+    // now would report days of elapsed for a run that took a minute.
+    const rollup = subagentGroupRollup(
+      [view({ id: "a", status: "completed", startedAt: 1_000 })],
+      9e12,
+    );
+    expect(rollup.elapsedMs).toBeNull();
   });
 });
 
@@ -895,7 +929,7 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
     ]);
   });
 
-  it("titles a wave by description, then name, then type; unlabeled waves fall back to a count", () => {
+  it("titles a wave by description, then name, then type; unlabeled waves still name themselves", () => {
     expect(
       subagentWaveTitle({
         id: "w",
@@ -915,7 +949,7 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
         prompt: null,
         subagents: [sub("a", { name: undefined })],
       }),
-    ).toBe("Ran 1 subagent");
+    ).toBe("Subagent");
   });
 
   it("blank prompts and empty cards are skipped", () => {
@@ -929,10 +963,7 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
       [null, null],
       [null, null],
     ]);
-    expect(waves.map(subagentWaveTitle)).toEqual([
-      "Ran 1 subagent",
-      "Ran 2 subagents",
-    ]);
+    expect(waves.map(subagentWaveTitle)).toEqual(["Subagent", "Subagent \u00d72"]);
   });
 
   it("keeps a re-reported id in its first wave with the latest view", () => {
@@ -1005,5 +1036,402 @@ describe("subagentWaves — spawn-wave grouping for the pane", () => {
       ["c", 2],
       ["d", null],
     ]);
+  });
+});
+
+describe("subagentElapsedMs — freezing a settled row", () => {
+  it("ticks with the clock while the row runs", () => {
+    const v = view({ status: "running", startedAt: 1_000 });
+    expect(subagentElapsedMs(v, 3_000)).toBe(2_000);
+    expect(subagentElapsedMs(v, 61_000)).toBe(60_000);
+  });
+
+  it("freezes a settled row at its settle stamp, whatever the clock says", () => {
+    const v = view({ status: "completed", startedAt: 1_000, finishedAt: 4_000 });
+    expect(subagentElapsedMs(v, 4_000)).toBe(3_000);
+    expect(subagentElapsedMs(v, 9e12)).toBe(3_000);
+  });
+
+  it("reports nothing for a settled row with neither duration nor stamp", () => {
+    // The regression this whole stamp exists for: such a row used to
+    // derive `now - startedAt` forever, so a thread reopened days later
+    // showed its finished agents at "18295m".
+    const v = view({ status: "completed", startedAt: 1_000 });
+    expect(subagentElapsedMs(v, 9e12)).toBeNull();
+    expect(subagentElapsedMs(view({ status: "interrupted" }), 9e12)).toBeNull();
+  });
+
+  it("lets the provider's own duration win over both", () => {
+    const v = view({
+      status: "completed",
+      startedAt: 1_000,
+      finishedAt: 4_000,
+      durationMs: 52_000,
+    });
+    expect(subagentElapsedMs(v, 9e12)).toBe(52_000);
+  });
+});
+
+describe("mergeSnapshot — finishedAt stamping", () => {
+  const snap = (
+    status: SubagentSnapshot["status"],
+    extra: Record<string, unknown> = {},
+  ): SubagentSnapshot =>
+    ({ subagent_id: "s1", status, ...extra }) as SubagentSnapshot;
+
+  it("stamps the settle time when a terminal snapshot lands with a clock", () => {
+    const next = mergeSnapshot(
+      view({ status: "running", startedAt: 1_000 }),
+      snap("completed"),
+      4_000,
+    );
+    expect(next.finishedAt).toBe(4_000);
+    expect(subagentElapsedMs(next, 9e12)).toBe(3_000);
+  });
+
+  it("leaves the key off entirely when no clock is supplied", () => {
+    // Shape guarantee: callers without a clock (hand-built fixtures, the
+    // pure-merge tests) must keep producing the exact same view object.
+    const next = mergeSnapshot(
+      view({ status: "running", startedAt: 1_000 }),
+      snap("completed"),
+    );
+    expect("finishedAt" in next).toBe(false);
+  });
+
+  it("adds no key when the row was already settled or is still running", () => {
+    expect(
+      "finishedAt" in
+        mergeSnapshot(view({ status: "running" }), snap("running"), 4_000),
+    ).toBe(false);
+    expect(
+      "finishedAt" in
+        mergeSnapshot(view({ status: "completed" }), snap("completed"), 4_000),
+    ).toBe(false);
+  });
+
+  it("never overwrites a stamp the first settle already wrote", () => {
+    const settled = view({
+      status: "completed",
+      startedAt: 1_000,
+      finishedAt: 4_000,
+    });
+    const again = mergeSnapshot(settled, snap("failed"), 90_000);
+    expect(again.finishedAt).toBe(4_000);
+  });
+
+  it("clears the stamp when a real running snapshot revives the row", () => {
+    // Only an ASSUMED settle is revivable, so this is the forced-settle
+    // shape: interrupted at 4s, then the provider proves it is still alive.
+    const settled: SubagentView = {
+      ...view({ status: "interrupted", startedAt: 1_000 }),
+      statusAssumed: true,
+      finishedAt: 4_000,
+    };
+    const revived = mergeSnapshot(settled, snap("running"), 9_000);
+    expect(revived.status).toBe("running");
+    expect("finishedAt" in revived).toBe(false);
+    // …and the next real settle stamps afresh.
+    const resettled = mergeSnapshot(revived, snap("completed"), 12_000);
+    expect(resettled.finishedAt).toBe(12_000);
+  });
+});
+
+describe("forced settles — finishedAt stamping", () => {
+  function card(subs: SubagentView[]): SubagentRunItem {
+    return {
+      kind: "subagent_run",
+      id: "run-1",
+      seq: 0,
+      turn_id: "t",
+      subagents: subs,
+    };
+  }
+
+  it("settleSubagentsForToolResult stamps when given a clock, and not otherwise", () => {
+    const messages: ChatViewItem[] = [
+      card([view({ id: "tool-a", status: "running", startedAt: 1_000 })]),
+    ];
+    const stamped = settleSubagentsForToolResult(
+      messages,
+      "tool-a",
+      false,
+      4_000,
+    );
+    const row = (stamped[0] as SubagentRunItem).subagents[0];
+    expect(row.finishedAt).toBe(4_000);
+    expect(subagentElapsedMs(row, 9e12)).toBe(3_000);
+
+    const unstamped = settleSubagentsForToolResult(messages, "tool-a", false);
+    expect(
+      "finishedAt" in (unstamped[0] as SubagentRunItem).subagents[0],
+    ).toBe(false);
+  });
+
+  it("interruptRunningSubagents stamps when given a clock, and not otherwise", () => {
+    const messages: ChatViewItem[] = [
+      card([
+        view({ id: "a", status: "running", startedAt: 1_000 }),
+        view({ id: "b", status: "completed" }),
+      ]),
+    ];
+    const stamped = interruptRunningSubagents(messages, 4_000);
+    const subs = (stamped[0] as SubagentRunItem).subagents;
+    expect(subs[0].finishedAt).toBe(4_000);
+    // The already-settled row is untouched — no retroactive stamp.
+    expect("finishedAt" in subs[1]).toBe(false);
+
+    expect(
+      "finishedAt" in (interruptRunningSubagents(messages)[0] as SubagentRunItem)
+        .subagents[0],
+    ).toBe(false);
+  });
+});
+
+describe("live-first pane model", () => {
+  const sub = (id: string, over: Partial<SubagentView> = {}): SubagentView => ({
+    id,
+    status: "completed",
+    items: [],
+    toneIndex: 0,
+    ...over,
+  });
+  const wave = (
+    id: string,
+    promptId: string | null,
+    subagents: SubagentView[],
+  ): SubagentWave => ({
+    id,
+    promptId,
+    prompt: promptId == null ? null : `prompt ${promptId}`,
+    subagents,
+  });
+
+  it("titles a row by description, then name, then type, first line only", () => {
+    expect(subagentRowTitle(sub("a", { description: "Audit hosts\nmore" }))).toBe(
+      "Audit hosts",
+    );
+    expect(
+      subagentRowTitle(sub("a", { name: "Explore", agentType: "general" })),
+    ).toBe("Explore");
+    expect(subagentRowTitle(sub("a", { agentType: "general" }))).toBe("general");
+    expect(subagentRowTitle(sub("a"))).toBe("Subagent");
+  });
+
+  it("flags only the settled-without-a-result statuses as needing attention", () => {
+    expect(needsAttention(sub("a", { status: "failed" }))).toBe(true);
+    expect(needsAttention(sub("a", { status: "stopped" }))).toBe(true);
+    expect(needsAttention(sub("a", { status: "interrupted" }))).toBe(true);
+    expect(needsAttention(sub("a", { status: "completed" }))).toBe(false);
+    expect(needsAttention(sub("a", { status: "running" }))).toBe(false);
+  });
+
+  it("orders running rows newest-first and heads them with the newest running wave", () => {
+    const waves = [
+      wave("w1", "u1", [sub("a", { status: "running" })]),
+      wave("w2", "u2", [
+        sub("b", { status: "completed" }),
+        sub("c", { status: "running" }),
+        sub("d", { status: "pending" }),
+      ]),
+    ];
+    const model = subagentPaneModel(waves);
+    expect(model.running.map((s) => s.id)).toEqual(["d", "c", "a"]);
+    expect(model.currentWave?.id).toBe("w2");
+    expect(model.lastWave?.id).toBe("w2");
+    expect(model.finishedCount).toBe(1);
+  });
+
+  it("collects attention rows from the focused turn only, newest first", () => {
+    const waves = [
+      // An older turn's failure belongs to History, not the live pane.
+      wave("w0", "u0", [sub("old", { status: "failed" })]),
+      wave("w1", "u1", [sub("a", { status: "failed" })]),
+      wave("w2", "u1", [
+        sub("b", { status: "stopped" }),
+        sub("c", { status: "running" }),
+      ]),
+    ];
+    const model = subagentPaneModel(waves);
+    expect(model.currentWave?.id).toBe("w2");
+    expect(model.attention.map((s) => s.id)).toEqual(["b", "a"]);
+  });
+
+  it("focuses the last wave when nothing runs, and drops dismissed rows", () => {
+    const waves = [
+      wave("w1", "u1", [sub("a", { status: "failed" })]),
+      wave("w2", "u2", [
+        sub("b", { status: "failed" }),
+        sub("c", { status: "interrupted" }),
+      ]),
+    ];
+    expect(subagentPaneModel(waves).currentWave).toBeNull();
+    expect(subagentPaneModel(waves).attention.map((s) => s.id)).toEqual([
+      "c",
+      "b",
+    ]);
+    expect(
+      subagentPaneModel(waves, new Set(["c"])).attention.map((s) => s.id),
+    ).toEqual(["b"]);
+  });
+
+  it("keeps prompt-less waves from chaining with one another", () => {
+    // Two hydrated cards with no prompt are not one turn; only the focused
+    // wave's own failures surface.
+    const waves = [
+      wave("w1", null, [sub("a", { status: "failed" })]),
+      wave("w2", null, [sub("b", { status: "failed" })]),
+    ];
+    expect(subagentPaneModel(waves).attention.map((s) => s.id)).toEqual(["b"]);
+  });
+
+  it("returns an empty model for a thread with no waves", () => {
+    expect(subagentPaneModel([])).toEqual({
+      running: [],
+      currentWave: null,
+      attention: [],
+      lastWave: null,
+      finishedCount: 0,
+    });
+  });
+
+  it("reports when a wave settled — the latest stamp, or nothing while it runs", () => {
+    expect(
+      subagentWaveSettledAt(
+        wave("w", "u", [
+          sub("a", { finishedAt: 5_000 }),
+          sub("b", { status: "running" }),
+        ]),
+      ),
+    ).toBeNull();
+    expect(
+      subagentWaveSettledAt(
+        wave("w", "u", [
+          sub("a", { finishedAt: 5_000 }),
+          sub("b", { finishedAt: 9_000 }),
+        ]),
+      ),
+    ).toBe(9_000);
+    // Settled but never stamped (a pre-stamp transcript): no receipt.
+    expect(subagentWaveSettledAt(wave("w", "u", [sub("a")]))).toBeNull();
+  });
+
+  it("formats the settled-ago receipt at each threshold", () => {
+    expect(formatSettledAgo(0)).toBe("settled just now");
+    expect(formatSettledAgo(59_000)).toBe("settled just now");
+    expect(formatSettledAgo(60_000)).toBe("settled 1m ago");
+    expect(formatSettledAgo(59 * 60_000)).toBe("settled 59m ago");
+    expect(formatSettledAgo(60 * 60_000)).toBe("settled 1h ago");
+    expect(formatSettledAgo(23 * 3_600_000)).toBe("settled 23h ago");
+    expect(formatSettledAgo(50 * 3_600_000)).toBe("settled 2d ago");
+  });
+});
+
+describe("subagent history sub-view", () => {
+  const sub = (id: string, over: Partial<SubagentView> = {}): SubagentView => ({
+    id,
+    status: "completed",
+    items: [],
+    toneIndex: 0,
+    ...over,
+  });
+  const wave = (
+    id: string,
+    promptId: string | null,
+    subagents: SubagentView[],
+  ): SubagentWave => ({
+    id,
+    promptId,
+    prompt: promptId == null ? null : `prompt ${promptId}`,
+    subagents,
+  });
+
+  it("filters by outcome, counting an interrupted row as stopped", () => {
+    const rows = [
+      sub("done", { status: "completed" }),
+      sub("bad", { status: "failed" }),
+      sub("halt", { status: "stopped" }),
+      sub("cut", { status: "interrupted" }),
+    ];
+    const ids = (filter: Parameters<typeof matchesHistoryFilter>[1]) =>
+      rows.filter((r) => matchesHistoryFilter(r, filter)).map((r) => r.id);
+    expect(ids("all")).toEqual(["done", "bad", "halt", "cut"]);
+    expect(ids("done")).toEqual(["done"]);
+    expect(ids("failed")).toEqual(["bad"]);
+    expect(ids("stopped")).toEqual(["halt", "cut"]);
+  });
+
+  it("groups newest-first, folding consecutive waves from one prompt", () => {
+    const groups = subagentHistoryGroups([
+      wave("w1", "u1", [sub("a")]),
+      wave("w2", "u2", [sub("b")]),
+      wave("w3", "u2", [sub("c")]),
+      wave("w4", "u3", [sub("d")]),
+    ]);
+    expect(groups.map((g) => [g.promptId, g.waves.map((w) => w.id)])).toEqual([
+      ["u3", ["w4"]],
+      ["u2", ["w3", "w2"]],
+      ["u1", ["w1"]],
+    ]);
+  });
+
+  it("keeps prompt-less waves standalone instead of borrowing a neighbour", () => {
+    const groups = subagentHistoryGroups([
+      wave("w1", null, [sub("a")]),
+      wave("w2", null, [sub("b")]),
+    ]);
+    expect(groups.map((g) => g.waves.map((w) => w.id))).toEqual([
+      ["w2"],
+      ["w1"],
+    ]);
+  });
+});
+
+describe("subagentDeckSummary", () => {
+  const sub = (id: string, over: Partial<SubagentView> = {}): SubagentView => ({
+    id,
+    status: "completed",
+    items: [],
+    toneIndex: 0,
+    ...over,
+  });
+  const card = (
+    id: string,
+    seq: number,
+    subagents: SubagentView[],
+  ): ChatViewItem => ({
+    kind: "subagent_run",
+    id,
+    seq,
+    turn_id: null,
+    subagents,
+  });
+
+  it("counts groups, running, focused-turn attention and finished rows", () => {
+    const messages: ChatViewItem[] = [
+      { kind: "user_message", id: "u1", seq: 0, text: "Ship it" },
+      card("c1", 1, [sub("a"), sub("b", { status: "failed" })]),
+      card("c2", 2, [sub("c", { status: "running" })]),
+    ];
+    expect(subagentDeckSummary(messages)).toEqual({
+      groups: 2,
+      running: 1,
+      attention: 1,
+      finished: 2,
+    });
+    // A dismissed row leaves the badge but stays counted as finished.
+    expect(subagentDeckSummary(messages, new Set(["b"]))).toMatchObject({
+      attention: 0,
+      finished: 2,
+    });
+  });
+
+  it("reports an all-zero summary for a thread with no subagent cards", () => {
+    expect(subagentDeckSummary([])).toEqual({
+      groups: 0,
+      running: 0,
+      attention: 0,
+      finished: 0,
+    });
   });
 });

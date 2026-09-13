@@ -1901,31 +1901,48 @@ export function SidebarInbox() {
                 />
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent side="bottom" align="start" className="w-[248px]">
-              <DropdownMenuItem
-                onClick={() => setFilter(null)}
-                aria-label="All projects"
-                className={cn(
-                  "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
-                  filter === null && "bg-foreground/[0.08] text-foreground",
-                )}
-              >
-                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1 truncate">All projects</span>
-                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                  {projectCounts.total}
-                </span>
-              </DropdownMenuItem>
-              {projectGroups.map((group) => (
-                <ProjectFilterItem
-                  key={group.projectPath}
-                  name={group.projectName}
-                  path={group.projectPath}
-                  count={projectCounts.map.get(group.projectPath) ?? 0}
-                  active={filter === group.projectPath}
-                  onSelect={() => setFilter(group.projectPath)}
-                />
-              ))}
+            {/* Capped at a menu-sized panel rather than growing with the
+                project count: past a dozen or so projects an uncapped menu
+                stretches to the window edge and reads as clipped. The cap is
+                whichever is smaller — a comfortable ~9 rows, or whatever room
+                Radix actually has — so the same panel behaves in a short
+                window. */}
+            <DropdownMenuContent
+              side="bottom"
+              align="start"
+              className="flex max-h-[min(21rem,var(--radix-dropdown-menu-content-available-height))] w-[248px] flex-col overflow-y-hidden p-0"
+            >
+              {/* "All projects" is the reset, so it stays pinned above the
+                  scroll area — scrolling to the top to clear a filter is the
+                  kind of small tax that makes a long list feel like work. */}
+              <div className="shrink-0 border-b border-border/60 p-1.5">
+                <DropdownMenuItem
+                  onClick={() => setFilter(null)}
+                  aria-label="All projects"
+                  className={cn(
+                    "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
+                    filter === null && "bg-foreground/[0.08] text-foreground",
+                  )}
+                >
+                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate">All projects</span>
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                    {projectCounts.total}
+                  </span>
+                </DropdownMenuItem>
+              </div>
+              <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+                {projectGroups.map((group) => (
+                  <ProjectFilterItem
+                    key={group.projectPath}
+                    name={group.projectName}
+                    path={group.projectPath}
+                    count={projectCounts.map.get(group.projectPath) ?? 0}
+                    active={filter === group.projectPath}
+                    onSelect={() => setFilter(group.projectPath)}
+                  />
+                ))}
+              </div>
             </DropdownMenuContent>
           </DropdownMenu>
           <DropdownMenu>

@@ -263,6 +263,10 @@ export interface SubagentView {
    *  drives the elapsed-time fallback when the provider sends no
    *  `durationMs`. */
   startedAt?: number;
+  /** Wall-clock ms (injected clock) when the row settled — stamped by a
+   *  real terminal snapshot or by an inferred settle. Freezes the elapsed
+   *  readout: a settled row must never keep counting from `startedAt`. */
+  finishedAt?: number;
   /** The subagent's own transcript, built with the shared reducer
    *  item-builders so every existing renderer works in the drill-in. */
   items: ChatViewItem[];
