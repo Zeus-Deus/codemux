@@ -419,6 +419,43 @@ export function buildProviderCommands({
     }));
 }
 
+/** What the goal row's actions send. Both are plain text through the normal
+ *  send path; Codemux never drives the provider's goal loop itself. */
+export interface GoalPhrases {
+  /** Sent by Resume, and shown verbatim in the row's `sends` box. */
+  resume: string;
+  /** Sent by Clear goal. */
+  clear: string;
+}
+
+/**
+ * The resume / clear phrases for the provider's goal command, sitting next
+ * to the provider commands they belong to.
+ *
+ * A provider that advertises its own `goal` command gets that command's
+ * subcommands (`/goal resume`, `/goal clear`). Anything else gets the goal
+ * restated as a plain continue instruction. That is a guess, which is why
+ * the row shows the literal text before it goes and lets the user edit it.
+ * Clear keeps `/goal clear` either way: it is the turn Codemux records as
+ * "no goal", so it has to reach the transcript for the clear to persist.
+ */
+export function buildGoalPhrases({
+  commands,
+  goalText,
+}: {
+  /** The provider's live-discovered commands (see `buildProviderCommands`). */
+  commands: readonly ProviderSlashCommand[];
+  goalText: string;
+}): GoalPhrases {
+  const native = commands.some((c) => c.name.toLowerCase() === "goal");
+  return {
+    resume: native
+      ? "/goal resume"
+      : `Continue working toward this goal: ${goalText}`,
+    clear: "/goal clear",
+  };
+}
+
 /** Cycle order for Shift+Tab: default → plan → ask → debug → default. */
 export const MODE_CYCLE_ORDER: ChatMode[] = [
   "default",

@@ -16,7 +16,7 @@ import type {
   SubagentView,
 } from "@/lib/agent-chat/types";
 
-import { ComposerStrip } from "./ComposerStrip";
+import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
   queuedMessages,
   queuedOccupant,
@@ -443,5 +443,164 @@ describe("ComposerStrip — session error", () => {
       />,
     );
     expect(screen.queryByTestId("composer-strip")).toBeNull();
+  });
+});
+
+describe("ComposerStrip — goal", () => {
+  function stripGoal(
+    overrides: Partial<StripGoal> = {},
+    status: "standing" | "interrupted" = "standing",
+  ): StripGoal {
+    return {
+      goal: {
+        text: "Migrate the importer to the streaming parser and keep the old path behind a flag",
+        setAt: Date.now() - 4 * 60_000,
+        sourceMessageId: "user-1",
+        status,
+      },
+      resumePhrase: "/goal resume",
+      onResume: vi.fn(),
+      onEditResume: vi.fn(),
+      onClear: vi.fn(),
+      onCopy: vi.fn(),
+      onJump: vi.fn(),
+      stopped: null,
+      ...overrides,
+    };
+  }
+
+  const goalRow = () => screen.getByTestId("composer-strip-goal");
+  const twoQueued = () =>
+    queuedOccupant(queuedMessages([queuedMsg("q-1", "a"), queuedMsg("q-2", "b")]));
+
+  it("standing: label, truncated text, age and an up chevron; no Resume", () => {
+    render(<ComposerStrip occupants={[]} goal={stripGoal()} />);
+    const row = goalRow();
+    expect(row).toHaveAttribute("data-status", "standing");
+    expect(within(row).getByText("Goal")).toBeInTheDocument();
+    expect(within(row).getByText(/Migrate the importer/).className).toContain("truncate");
+    expect(screen.getByTestId("composer-strip-goal-age")).toHaveTextContent("4m");
+    expect(screen.getByRole("button", { name: "Show goal" })).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-goal-resume")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-goal-edge")).toBeNull();
+    // Resting height is one strip row.
+    expect(row.firstElementChild?.className).toContain("h-[34px]");
+  });
+
+  it("contention: the goal keeps the row, the rest count into +n, and the drill-in lists them", () => {
+    render(<ComposerStrip goal={stripGoal()} occupants={[twoQueued()]} />);
+    expect(screen.getByTestId("composer-strip")).toHaveAttribute("data-lead", "goal");
+    expect(rows()).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Show goal" })).toBeNull();
+    fireEvent.click(screen.getByTestId("composer-strip-goal-more"));
+    expect(screen.getByTestId("composer-strip-goal-details")).toBeInTheDocument();
+    expect(rows()).toHaveLength(0);
+    const others = screen.getByTestId("composer-strip-goal-others");
+    expect(others).toHaveTextContent("2 messages queued");
+    fireEvent.click(others);
+    expect(rows()).toHaveLength(2);
+  });
+
+  it("interrupted: amber edge, Resume and the overflow; never folded under another occupant", () => {
+    const onResume = vi.fn();
+    render(
+      <ComposerStrip
+        goal={stripGoal({ onResume }, "interrupted")}
+        occupants={[sessionErrorOccupant([errorNotice("Session error: gone")], false)]}
+      />,
+    );
+    expect(within(goalRow()).getByText("Goal interrupted")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-goal-tint")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-goal-edge")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-sweep")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-goal-age")).toBeNull();
+    expect(screen.getByTestId("composer-strip-goal-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-goal-more")).toHaveTextContent("+1");
+    expect(rows()).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("composer-strip-goal-resume"));
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("standing opened: set-time meta, Copy / Clear / Hide, then the text and Jump", () => {
+    const goal = stripGoal();
+    render(<ComposerStrip occupants={[]} goal={goal} />);
+    fireEvent.click(screen.getByTestId("composer-strip-goal-toggle"));
+    expect(screen.getByTestId("composer-strip-goal-meta").textContent).toMatch(
+      /^set \d{2}:\d{2} · 4m ago$/,
+    );
+    const details = screen.getByTestId("composer-strip-goal-details");
+    expect(details.className).toContain("pl-9");
+    expect(details).toHaveTextContent(goal.goal.text);
+    expect(screen.queryByTestId("composer-strip-goal-sends")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Jump to message" }));
+    expect(goal.onJump).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(goal.onCopy).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(goal.onClear).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
+    expect(screen.queryByTestId("composer-strip-goal-details")).toBeNull();
+  });
+
+  it("interrupted opened: where it stopped and the literal text Resume will send", () => {
+    const onJumpToLast = vi.fn();
+    const goal = stripGoal(
+      {
+        stopped: {
+          at: Date.now() - 3 * 3_600_000,
+          after: "Pinned the renderer scale factor",
+          onJump: onJumpToLast,
+        },
+      },
+      "interrupted",
+    );
+    render(<ComposerStrip occupants={[]} goal={goal} />);
+    fireEvent.click(screen.getByTestId("composer-strip-goal-toggle"));
+    expect(screen.getByTestId("composer-strip-goal-meta").textContent).toMatch(
+      /^stopped \d{2}:\d{2} · idle 3h$/,
+    );
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    const details = screen.getByTestId("composer-strip-goal-details");
+    expect(details).toHaveTextContent('stopped after "Pinned the renderer scale factor"');
+
+    const sends = screen.getByTestId("composer-strip-goal-sends");
+    expect(sends).toHaveTextContent("/goal resume");
+    fireEvent.click(within(sends).getByRole("button", { name: "edit before sending" }));
+    expect(goal.onEditResume).toHaveBeenCalledTimes(1);
+    expect(goal.onResume).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Jump to last activity" }));
+    expect(onJumpToLast).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("composer-strip-goal-details")).toBeNull();
+  });
+
+  it("the overflow holds Copy goal text, Jump to message and Clear goal", async () => {
+    const goal = stripGoal({}, "interrupted");
+    render(<ComposerStrip occupants={[]} goal={goal} />);
+    const trigger = screen.getByTestId("composer-strip-goal-menu");
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    const items = await screen.findAllByRole("menuitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "Copy goal text",
+      "Jump to message",
+      "Clear goal",
+    ]);
+    fireEvent.click(items[2]!);
+    expect(goal.onClear).toHaveBeenCalledTimes(1);
+  });
+
+  it("never shows a turn count, cap, percentage or verdict", () => {
+    for (const status of ["standing", "interrupted"] as const) {
+      const { unmount } = render(
+        <ComposerStrip occupants={[twoQueued()]} goal={stripGoal({}, status)} />,
+      );
+      fireEvent.click(screen.getByTestId("composer-strip-goal-toggle"));
+      const text = screen.getByTestId("composer-strip").textContent ?? "";
+      expect(text).not.toMatch(/\d+\s*\/\s*\d+|%|turn \d|pass|fail|complete/i);
+      unmount();
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  buildGoalPhrases,
   buildModeCommands,
   buildModelCommand,
   buildProviderCommands,
@@ -391,6 +392,29 @@ describe("parseMentionQuery", () => {
     expect(parseMentionQuery("user:zeus")).toEqual({
       category: "file",
       filter: "user:zeus",
+    });
+  });
+});
+
+describe("buildGoalPhrases", () => {
+  it("uses the provider's own /goal subcommands when it advertises one", () => {
+    expect(
+      buildGoalPhrases({
+        commands: [{ name: "goal", description: "Set a goal", argumentHint: "" }],
+        goalText: "ship it",
+      }),
+    ).toEqual({ resume: "/goal resume", clear: "/goal clear" });
+  });
+
+  it("falls back to restating the goal when the provider has no /goal", () => {
+    expect(
+      buildGoalPhrases({
+        commands: [{ name: "compact", description: "", argumentHint: "" }],
+        goalText: "ship it",
+      }),
+    ).toEqual({
+      resume: "Continue working toward this goal: ship it",
+      clear: "/goal clear",
     });
   });
 });

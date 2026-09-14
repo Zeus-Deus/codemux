@@ -47,6 +47,12 @@ interface Props {
     nonce: number;
   } | null;
   onConversationSearchJumpHandled?: (nonce: number) => void;
+  /** Scroll to one transcript row by item id (the goal row's Jump). */
+  messageJumpRequest?: {
+    itemId: string;
+    turnId?: string | null;
+    nonce: number;
+  } | null;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -97,6 +103,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   subagentJumpRequest,
   conversationSearchJumpRequest,
   onConversationSearchJumpHandled,
+  messageJumpRequest,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -141,6 +148,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         subagentJumpRequest={subagentJumpRequest}
         conversationSearchJumpRequest={conversationSearchJumpRequest}
         onConversationSearchJumpHandled={onConversationSearchJumpHandled}
+        messageJumpRequest={messageJumpRequest}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}

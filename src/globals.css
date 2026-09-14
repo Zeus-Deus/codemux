@@ -74,6 +74,7 @@
     --color-status-open: var(--status-open);
     --color-status-open-foreground: var(--status-open-foreground);
     --color-status-working: var(--status-working);
+    --color-status-working-foreground: var(--status-working-foreground);
     --color-status-attention: var(--status-attention);
     --color-status-monitoring: var(--status-monitoring);
     --color-status-remote: var(--status-remote);
@@ -224,6 +225,9 @@
    * bright dark-scheme green; flips to white on the deeper light-scheme one. */
   --status-open-foreground: oklch(0.16 0.02 156);
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
+  /* Ink for a solid --status-working fill (the goal row's Resume). Same
+   * pattern as --status-open-foreground: dark ink on the bright amber. */
+  --status-working-foreground: oklch(0.2 0.03 80);
   --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */
   /* cyan — an agent watching something in the background (CI, a tailed
    * process, a PR poll). Cool and low-chroma on purpose: monitoring is calm
@@ -253,6 +257,7 @@
   --status-open:       oklch(0.52 0.14 156);
   --status-open-foreground: oklch(1 0 0);
   --status-working:    oklch(0.55 0.12 80);
+  --status-working-foreground: oklch(1 0 0);
   --status-attention:  oklch(0.55 0.19 22);
   --status-monitoring: oklch(0.55 0.09 196);
   --status-remote:     oklch(0.55 0.10 232);
