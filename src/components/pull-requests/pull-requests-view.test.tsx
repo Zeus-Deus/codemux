@@ -16,10 +16,31 @@ import type { PrRow } from "@/lib/pr-overview";
 const overview: {
   rows: PrRow[];
   viewerByRoot: Map<string, string | null>;
+  stateFilter?: string;
 } = { rows: [], viewerByRoot: new Map() };
 
+const lookup = vi.hoisted(() => {
+  const ui = {
+    pendingPrSelection: null as { projectRoot: string; number: number; url?: string } | null,
+  };
+  const clearPendingPrSelection = vi.fn(() => {
+    ui.pendingPrSelection = null;
+  });
+  const queryClient = { fetchQuery: vi.fn() };
+  return { ui, clearPendingPrSelection, queryClient };
+});
+
+vi.mock("@tanstack/react-query", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tanstack/react-query")>()),
+  useQueryClient: () => lookup.queryClient,
+}));
+
 vi.mock("@/lib/pr-overview-query", () => ({
-  usePrOverview: () => ({
+  prOverviewKey: (root: string) => ["prs", "overview", root],
+  prHistoryKey: (root: string, state: string) => ["prs", "history", root, state],
+  usePrOverview: (_enabled: boolean, stateFilter: string) => {
+    overview.stateFilter = stateFilter;
+    return {
     rows: overview.rows,
     viewerByRoot: overview.viewerByRoot,
     failures: [],
@@ -31,7 +52,8 @@ vi.mock("@/lib/pr-overview-query", () => ({
     refreshFailed: false,
     isLoading: false,
     refresh: vi.fn(),
-  }),
+    };
+  },
 }));
 
 vi.mock("./pr-detail-column", () => ({
@@ -55,21 +77,27 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 const mockSetShowPullRequests = vi.fn();
-vi.mock("@/stores/ui-store", () => ({
-  useUIStore: (selector: (s: Record<string, unknown>) => unknown) =>
-    selector({
-      setShowPullRequests: mockSetShowPullRequests,
-      pendingPrSelection: null,
-      clearPendingPrSelection: vi.fn(),
-      markPrBadgeSeen: vi.fn(),
-    }),
-}));
+vi.mock("@/stores/ui-store", () => {
+  const state = () => ({
+    setShowPullRequests: mockSetShowPullRequests,
+    pendingPrSelection: lookup.ui.pendingPrSelection,
+    clearPendingPrSelection: lookup.clearPendingPrSelection,
+    markPrBadgeSeen: vi.fn(),
+  });
+  return {
+    useUIStore: Object.assign(
+      (selector: (s: Record<string, unknown>) => unknown) => selector(state()),
+      { getState: state },
+    ),
+  };
+});
 
 vi.mock("@/stores/app-store", () => ({
   useAppStore: (selector: (s: Record<string, unknown>) => unknown) =>
     selector({ appState: { workspaces: [] } }),
 }));
 
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { PullRequestsView } from "./pull-requests-view";
 
 const ROOT = "/home/dev/projects/codemux";
@@ -109,6 +137,10 @@ function renderView(rows: PrRow[]) {
 
 beforeEach(() => {
   mockSetShowPullRequests.mockClear();
+  lookup.ui.pendingPrSelection = null;
+  lookup.clearPendingPrSelection.mockClear();
+  lookup.queryClient.fetchQuery.mockReset();
+  vi.mocked(openUrl).mockClear();
 });
 
 afterEach(() => {
@@ -201,5 +233,36 @@ describe("a pull request that leaves the list", () => {
       expect(screen.getByTestId("pr-detail")).toBeInTheDocument(),
     );
     expect(screen.queryByText(/Pick a pull request/)).toBeNull();
+  });
+});
+
+describe("a link to a pull request the list doesn't hold", () => {
+  const url = "https://github.com/example/codemux/pull/353";
+
+  it("widens to the history when that is where it lives", async () => {
+    // Already merged: absent from the open list, present in the history.
+    lookup.queryClient.fetchQuery
+      .mockResolvedValueOnce({ items: [], viewer: "mock-dev" })
+      .mockResolvedValueOnce([{ number: 353 }]);
+    lookup.ui.pendingPrSelection = { projectRoot: ROOT, number: 353, url };
+
+    renderView([row({ number: 1 })]);
+
+    await waitFor(() => expect(overview.stateFilter).toBe("all"));
+    expect(openUrl).not.toHaveBeenCalled();
+    expect(lookup.clearPendingPrSelection).not.toHaveBeenCalled();
+  });
+
+  it("hands the link to the browser once neither list has it", async () => {
+    lookup.queryClient.fetchQuery
+      .mockResolvedValueOnce({ items: [], viewer: "mock-dev" })
+      .mockResolvedValueOnce([]);
+    lookup.ui.pendingPrSelection = { projectRoot: ROOT, number: 353, url };
+
+    renderView([row({ number: 1 })]);
+
+    await waitFor(() => expect(openUrl).toHaveBeenCalledWith(url));
+    expect(lookup.clearPendingPrSelection).toHaveBeenCalled();
+    expect(lookup.queryClient.fetchQuery).toHaveBeenCalledTimes(2);
   });
 });

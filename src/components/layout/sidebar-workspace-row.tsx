@@ -65,7 +65,7 @@ import {
   MenuKeycap,
 } from "@/components/ui/menu-chrome";
 import { useProjectAppearance } from "./use-project-appearance";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "@/lib/open-url";
 import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
   archiveWorkspace,
@@ -1122,9 +1122,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   const provider = providerForWorkspace(workspace);
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (workspace.pr_url) {
-      openUrl(workspace.pr_url).catch(console.error);
-    }
+    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event: e });
   };
 
   const hasDiff = workspace.git_additions > 0 || workspace.git_deletions > 0;
@@ -1311,6 +1309,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         <button
                           type="button"
                           onClick={handlePrClick}
+                          onAuxClick={(e) => {
+                            if (e.button === 1) handlePrClick(e);
+                          }}
                           disabled={!workspace.pr_url}
                           aria-label={
                             workspace.pr_number
