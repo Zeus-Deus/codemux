@@ -31,22 +31,17 @@ import {
   publishTitlebarContentUnder,
   registerTitlebarTranscript,
 } from "@/lib/titlebar-content-under";
-import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
-import { useAppStore } from "@/stores/app-store";
-import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import type { AgentChatTurnCheckpointRecord } from "@/tauri/commands";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
-import { BackgroundBrowserChip } from "./BackgroundBrowserChip";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
-import { SubagentWorkLogRow } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserInputAnswer } from "./UserInputAnswer";
@@ -76,7 +71,7 @@ import {
   type SendScrollMode,
 } from "./send-scroll-state";
 import type {
-  ActivityStep,
+  WorkEntry,
   SlotBody,
   TranscriptSlot,
 } from "./transcript-slots";
@@ -207,19 +202,6 @@ export const MessageList = memo(function MessageList({
   workspaceId,
   cwd,
 }: Props) {
-  // GUI-mode background browser session for this pane's workspace. Gated on
-  // the same predicate the backend's `browser_automation` handler uses to
-  // suppress pane creation: Agent Chat beta on.
-  // `workspaceId` is absent for legacy/non-workspace-scoped callers, so
-  // the chip never renders there — byte-identical output preserved.
-  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  const backgroundBrowserSession = useAppStore((s) =>
-    selectBackgroundBrowserSession(s.appState, workspaceId),
-  );
-  const showBrowserChip =
-    !!workspaceId &&
-    enableAgentChat &&
-    !!backgroundBrowserSession;
   const fileLinkContext = useMemo(
     () => ({ workspaceId, cwd }),
     [cwd, workspaceId],
@@ -289,7 +271,6 @@ export const MessageList = memo(function MessageList({
   const tailBody = slots.length > 0 ? slots[slots.length - 1].body : null;
   const tailIsWorkingActivity =
     tailBody?.kind === "activity" && tailBody.working;
-  const tailIsSubagentStretch = tailBody?.kind === "subagent_stretch";
   // `shouldShowThinkingIndicator` steps back for a running tool / streaming
   // block on the assumption that the row renders its own live affordance.
   // That assumption fails when the row is not on screen at all — folded
@@ -1007,8 +988,8 @@ export const MessageList = memo(function MessageList({
     if (!cardId) return -1;
     return slots.findIndex(
       (slot) =>
-        slot.body.kind === "subagent_stretch" &&
-        slot.body.runs.some((run) => run.id === cardId),
+        slot.body.kind === "activity" &&
+        slot.body.items.some((entry) => entry.id === cardId),
     );
   }, [slots, subagentJumpRequest?.cardId]);
 
@@ -1173,15 +1154,6 @@ export const MessageList = memo(function MessageList({
   const listFooter = useMemo(
     () => (
       <div className={cn(CHAT_COLUMN, "pb-[30px]")}>
-        {showBrowserChip && backgroundBrowserSession && workspaceId && (
-          <div className="mt-[13px]">
-            <BackgroundBrowserChip
-              session={backgroundBrowserSession}
-              workspaceId={workspaceId}
-              showLabel={!tailIsSubagentStretch}
-            />
-          </div>
-        )}
         {stalled && streaming && (
           <div className="mt-[13px]">
             <RunStalledNotice silentForSecs={stalled.silentForSecs} />
@@ -1199,17 +1171,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [
-      backgroundBrowserSession,
-      interrupted,
-      ordered,
-      showBrowserChip,
-      showLiveMarker,
-      stalled,
-      streaming,
-      tailIsSubagentStretch,
-      workspaceId,
-    ],
+    [interrupted, ordered, showLiveMarker, stalled, streaming],
   );
 
   return (
@@ -1399,9 +1361,7 @@ function slotBodyContains(body: SlotBody, id: string): boolean {
     case "item":
       return body.item.id === id;
     case "activity":
-      return body.items.some((step) => step.id === id);
-    case "subagent_stretch":
-      return body.runs.some((run) => run.id === id);
+      return body.items.some((entry) => entry.id === id);
     case "turn_fold":
       return false;
   }
@@ -1498,7 +1458,6 @@ function transcriptSlotsAreEqual(
 function transcriptSlotType(slot: TranscriptSlot): string {
   if (slot.body.kind === "activity") return "activity";
   if (slot.body.kind === "turn_fold") return "turn_fold";
-  if (slot.body.kind === "subagent_stretch") return "subagent_stretch";
   return slot.body.item.kind;
 }
 
@@ -1579,9 +1538,8 @@ function ItemRow({
     );
   }
 
-  // Canonical subagent runs are merged into `subagent_stretch` slots before
-  // this leaf. Keep the exhaustive fallback inert in case a hand-built slot
-  // reaches this layer.
+  // Subagent runs render inside activity slots before this leaf. Keep the
+  // exhaustive fallback inert in case a hand-built slot reaches this layer.
   if (item.kind === "subagent_run") {
     return null;
   }
@@ -1753,11 +1711,15 @@ function renderAssistantBody(
 function ActivityRow({
   items,
   working,
+  workspaceId,
 }: {
-  items: ActivityStep[];
+  items: WorkEntry[];
   working: boolean;
+  workspaceId?: string | null;
 }) {
-  return <ActivityBlock items={items} working={working} />;
+  return (
+    <ActivityBlock items={items} working={working} workspaceId={workspaceId} />
+  );
 }
 
 function TurnFoldRow({
@@ -1807,7 +1769,6 @@ function TurnFoldRow({
 // stable slot key keeps the scroller row from remounting.)
 const ItemRowMemo = memo(ItemRow);
 const ActivityRowMemo = memo(ActivityRow);
-const SubagentWorkLogRowMemo = memo(SubagentWorkLogRow);
 
 /**
  * Whole-row wrapper (level-1 memo — see the comment above the leaf memos). It
@@ -1855,13 +1816,11 @@ function SlotRow({
       ? "mt-2"
       : slot.body.kind === "turn_fold"
         ? "mt-4"
-        : slot.body.kind === "subagent_stretch"
-          ? "mt-2"
-          : slot.body.item.kind === "user_message"
-            ? "mt-5"
-            : slot.turnStart
-              ? "mt-4"
-              : "mt-2.5";
+        : slot.body.item.kind === "user_message"
+          ? "mt-5"
+          : slot.turnStart
+            ? "mt-4"
+            : "mt-2.5";
   return (
     <div
       data-message-id={slot.messageId}
@@ -1871,6 +1830,7 @@ function SlotRow({
         <ActivityRowMemo
           items={slot.body.items}
           working={slot.body.working}
+          workspaceId={workspaceId}
         />
       ) : slot.body.kind === "turn_fold" ? (
         <TurnFoldRow
@@ -1879,11 +1839,6 @@ function SlotRow({
           expanded={slot.body.expanded}
           failedCount={slot.body.failedCount}
           onToggleTurnFold={onToggleTurnFold}
-        />
-      ) : slot.body.kind === "subagent_stretch" ? (
-        <SubagentWorkLogRowMemo
-          runs={slot.body.runs}
-          workspaceId={workspaceId}
         />
       ) : (
         <ItemRowMemo

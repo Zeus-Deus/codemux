@@ -2326,6 +2326,193 @@ function streamMockSubagents(
   return turnId;
 }
 
+/** A long uninterrupted stretch of mechanical work: tool bursts separated by
+ *  subagent spawns, a background browser opening mid-turn, then a long
+ *  running command held for `holdMs` so the live work log can be inspected.
+ *  A prompt containing "work log" triggers it. */
+function streamMockWorkLog(
+  threadId: string = MOCK_CHAT_THREAD_ID,
+  opts: { intervalMs?: number; holdMs?: number } = {},
+): string {
+  const turnId = `live-worklog-${++mockChatTurnSeq}`;
+  const intervalMs = Math.max(40, opts.intervalMs ?? 160);
+  const holdMs = Math.max(0, opts.holdMs ?? 90_000);
+  const send = (event: unknown) => emitChatEvent(threadId, event);
+  let toolSeq = 0;
+  const frames: Array<() => void> = [];
+  const tools = (steps: Array<[string, Record<string, unknown>, string]>) => {
+    for (const [toolName, input, content] of steps) {
+      const toolUseId = `${turnId}-tool-${toolSeq++}`;
+      frames.push(() =>
+        send({
+          type: "item_completed",
+          thread_id: threadId,
+          turn_id: turnId,
+          item: { kind: "tool_use", tool_name: toolName, tool_use_id: toolUseId, input },
+        }),
+      );
+      frames.push(() =>
+        send({
+          type: "item_completed",
+          thread_id: threadId,
+          turn_id: turnId,
+          item: { kind: "tool_result", tool_use_id: toolUseId, content, is_error: false },
+        }),
+      );
+    }
+  };
+  const subagents = (
+    wave: Array<{ id: string; name: string; tools: number; ms: number }>,
+  ) => {
+    for (const sub of wave) {
+      frames.push(() =>
+        send({
+          type: "subagent_updated",
+          thread_id: threadId,
+          subagent: { subagent_id: sub.id, name: sub.name, agent_type: "general-purpose", status: "running" },
+        }),
+      );
+    }
+    for (const sub of wave) {
+      frames.push(() =>
+        send({
+          type: "subagent_updated",
+          thread_id: threadId,
+          subagent: {
+            subagent_id: sub.id,
+            status: "completed",
+            result_text: `${sub.name} finished`,
+            tool_use_count: sub.tools,
+            duration_ms: sub.ms,
+          },
+        }),
+      );
+    }
+  };
+  const bash = (command: string, out = "ok"): [string, Record<string, unknown>, string] =>
+    ["Bash", { command }, out];
+  const read = (file_path: string): [string, Record<string, unknown>, string] =>
+    ["Read", { file_path }, "// contents"];
+
+  frames.push(() =>
+    send({
+      type: "session_state_changed",
+      thread_id: threadId,
+      status: { status: "running", active_turn: turnId },
+    }),
+  );
+  tools([
+    read("src/components/layout/sidebar-inbox-card.tsx"),
+    ["Grep", { pattern: "unread", path: "src/components/layout" }, "sidebar-inbox-card.tsx:42: unread"],
+    ["Edit", { file_path: "src/components/layout/sidebar-inbox-card.tsx", old_string: "dot", new_string: "" }, "Applied edit"],
+    bash("npm run check"),
+    bash("npm run test -- src/components/layout/sidebar-inbox-card.test.tsx"),
+  ]);
+  subagents([
+    { id: `${turnId}-review`, name: "review diff", tools: 6, ms: 22_000 },
+    { id: `${turnId}-verify`, name: "verify tests", tools: 4, ms: 18_000 },
+  ]);
+  tools([
+    read("src/components/layout/sidebar-inbox.tsx"),
+    bash("git status --short"),
+    bash("npm run dev -- --port 1421 --strictPort false"),
+  ]);
+  subagents([{ id: `${turnId}-mock`, name: "mock data audit", tools: 3, ms: 9_000 }]);
+  tools([
+    bash("codemux browser open http://localhost:1421/ 2>&1 | tail -5"),
+    bash("codemux browser snapshot --dom"),
+  ]);
+  frames.push(() => {
+    const workspaceId = appState.active_workspace_id;
+    if (!workspaceId) return;
+    const existing = appState.agent_browser_sessions.find(
+      (session) => session.workspace_id === workspaceId,
+    );
+    const fields = {
+      current_url: "http://localhost:1421/",
+      is_active: true,
+      pane_id: null,
+      browser_id: null,
+      user_dismissed: false,
+      right_panel_docked: false,
+    };
+    if (existing) {
+      Object.assign(existing, fields);
+    } else {
+      appState.agent_browser_sessions.push({
+        session_id: `agent-browser-${workspaceId}`,
+        workspace_id: workspaceId,
+        cli_session_name: "devmock-worklog",
+        stream_url: "ws://127.0.0.1:9777",
+        ...fields,
+      });
+    }
+    emitAppState();
+  });
+  subagents([{ id: `${turnId}-shots`, name: "screenshot pass", tools: 5, ms: 25_000 }]);
+  tools([
+    read("src/components/layout/sidebar-inbox-card.test.tsx"),
+    bash("codemux browser screenshot"),
+  ]);
+  const heldId = `${turnId}-tool-held`;
+  frames.push(() =>
+    send({
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "tool_use",
+        tool_name: "Bash",
+        tool_use_id: heldId,
+        input: { command: "npm run test -- src/components/layout/sidebar-inbox-card.test.tsx" },
+      },
+    }),
+  );
+
+  const finish = () => {
+    send({
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: { kind: "tool_result", tool_use_id: heldId, content: "161 passed", is_error: false },
+    });
+    send({
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: { kind: "assistant_text", text: "Everything checks out — the work log stayed on one line." },
+    });
+    send({
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    });
+    send({
+      type: "session_state_changed",
+      thread_id: threadId,
+      status: { status: "ready" },
+    });
+    chatActiveTurns.delete(threadId);
+    chatTurnTimers.delete(threadId);
+    drainChatQueue(threadId);
+  };
+
+  chatActiveTurns.add(threadId);
+  let i = 0;
+  const timer = window.setInterval(() => {
+    const frame = frames[i++];
+    if (frame) frame();
+    if (i < frames.length) return;
+    window.clearInterval(timer);
+    const hold = window.setTimeout(finish, holdMs);
+    chatTurnTimers.set(threadId, hold);
+  }, intervalMs);
+  chatTurnTimers.set(threadId, timer);
+  return turnId;
+}
+
 /** Background-wait lifecycle, replayed from a real transcript: the agent
  *  launches a delegated subagent plus a background shell job, yields with
  *  "waiting on…" prose, and the provider emits a SUCCESSFUL `turn_completed`
@@ -2592,6 +2779,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
       streamBackgroundWait: typeof streamMockBackgroundWait;
+      streamWorkLog: typeof streamMockWorkLog;
       streamRunStalled: typeof streamMockRunStalled;
       interruptRun: typeof interruptMockRun;
       sessionError: typeof sessionErrorMockRun;
@@ -2603,6 +2791,7 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
   streamBackgroundWait: streamMockBackgroundWait,
+  streamWorkLog: streamMockWorkLog,
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
   sessionError: sessionErrorMockRun,
@@ -3876,7 +4065,9 @@ const handlers: Record<string, Handler> = {
     // lifecycle (interim turn ends) instead of the plain streaming reply.
     const turnId = /\bbackground\b/i.test(input.text)
       ? streamMockBackgroundWait(threadId)
-      : streamMockChatReply(threadId);
+      : /\bwork log\b/i.test(input.text)
+        ? streamMockWorkLog(threadId)
+        : streamMockChatReply(threadId);
     return { turn_id: turnId, queued_id: null };
   },
   agent_chat_cancel_queued_turn: (a) => {

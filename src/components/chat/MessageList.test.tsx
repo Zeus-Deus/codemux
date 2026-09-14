@@ -674,18 +674,18 @@ describe("MessageList activity blocks", () => {
     ];
     renderList(messages);
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByText("+2 previous tool calls")).toBeInTheDocument();
+    expect(screen.getByText("3 tools")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
 
-    fireEvent.click(screen.getByText("+2 previous tool calls"));
+    fireEvent.click(screen.getByText("/c"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByText("Show fewer work entries")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Work log/ })).toBeInTheDocument();
   });
 
   it("keeps a lone successful observational call silent", () => {
     renderList([readCall(0, "/only")]);
-    expect(screen.queryByText(/previous tool call/)).toBeNull();
+    expect(screen.queryByText("1 tool")).toBeNull();
     expect(screen.queryByText("Details")).toBeNull();
     expect(screen.queryByText("read")).toBeNull();
     expect(screen.queryByText("/only")).toBeNull();
@@ -713,7 +713,7 @@ describe("MessageList activity blocks", () => {
     expect(container.querySelector('canvas[data-orb-state="working"]')).not.toBeNull();
     expect(screen.getByText("run")).toBeInTheDocument();
     expect(screen.getByText("cargo test")).toBeInTheDocument();
-    expect(screen.getByText("+1 previous tool call")).toBeInTheDocument();
+    expect(screen.getByText("2 tools")).toBeInTheDocument();
   });
 
   it("a non-tool row breaks the run into two independent activity blocks", () => {
@@ -732,7 +732,7 @@ describe("MessageList activity blocks", () => {
       readCall(4, "/y1"),
     ];
     renderList(messages);
-    expect(screen.getAllByText("+1 previous tool call")).toHaveLength(2);
+    expect(screen.getAllByText("2 tools")).toHaveLength(2);
     expect(screen.getByText("between bursts")).toBeInTheDocument();
   });
 
@@ -762,7 +762,7 @@ describe("MessageList activity blocks", () => {
     renderList([readCall(0, "/a"), readCall(1, "/b"), pending, approval]);
     // Two completed reads stay in one compact log; the gated Bash call stays
     // a standalone actionable card with its approval footer visible.
-    expect(screen.getByText("+1 previous tool call")).toBeInTheDocument();
+    expect(screen.getByText("2 tools")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
   });
@@ -972,79 +972,25 @@ function setAppStateForBrowserChip(
   });
 }
 
-describe("MessageList background browser chip", () => {
+describe("MessageList background browser", () => {
   afterEach(() => {
     useAppStore.setState({ appState: null });
     useFeatureFlags.setState({ enableAgentChat: false });
   });
 
-  it("renders the compact work-log browser event and current URL when the workspace has a live background session (GUI mode on)", () => {
+  it("leaves a live background browser to the context row instead of adding a transcript row", () => {
     useFeatureFlags.setState({ enableAgentChat: true });
     setAppStateForBrowserChip({}, [makeBackgroundSession()]);
     render(
       <MessageList
-        messages={[readCall(0, "/a")]}
+        messages={[readCall(0, "/a"), readCall(1, "/b")]}
         workspaceId="ws-1"
         {...noopHandlers}
       />,
     );
-    expect(screen.getByText("Opened the browser")).toBeInTheDocument();
-    expect(screen.getByText("work log")).toBeInTheDocument();
-    expect(
-      screen.getByText(/https:\/\/example\.com\/dashboard/),
-    ).toBeInTheDocument();
-  });
-
-  it("does not render the chip when the Agent Chat beta flag is off (flag-off byte-identical path)", () => {
-    useFeatureFlags.setState({ enableAgentChat: false });
-    setAppStateForBrowserChip({}, [makeBackgroundSession()]);
-    render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-1"
-        {...noopHandlers}
-      />,
-    );
-    expect(screen.queryByText("Browser opened in background")).toBeNull();
-  });
-
-  it("does not render the chip once the session is attached to a pane (promoted, no longer background)", () => {
-    useFeatureFlags.setState({ enableAgentChat: true });
-    setAppStateForBrowserChip({}, [
-      makeBackgroundSession({ pane_id: "pane-1", browser_id: "browser-1" }),
-    ]);
-    render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-1"
-        {...noopHandlers}
-      />,
-    );
-    expect(screen.queryByText("Browser opened in background")).toBeNull();
-  });
-
-  it("does not render the chip without a workspaceId prop, even with a matching session in state", () => {
-    useFeatureFlags.setState({ enableAgentChat: true });
-    setAppStateForBrowserChip({}, [makeBackgroundSession()]);
-    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
-    expect(screen.queryByText("Browser opened in background")).toBeNull();
-  });
-
-  it("does not render the chip once the session is inactive (browser closed — is_active false)", () => {
-    // Backs the close-action wiring: control.rs flips `is_active` to false
-    // on a successful `close`, and the chip must stop showing entirely
-    // (LIVE badge included) instead of blinking forever.
-    useFeatureFlags.setState({ enableAgentChat: true });
-    setAppStateForBrowserChip({}, [makeBackgroundSession({ is_active: false })]);
-    render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-1"
-        {...noopHandlers}
-      />,
-    );
-    expect(screen.queryByText("Browser opened in background")).toBeNull();
-    expect(screen.queryByText("Live")).toBeNull();
+    expect(screen.getByText("2 tools")).toBeInTheDocument();
+    expect(screen.queryByText("Opened the browser")).toBeNull();
+    expect(screen.queryByText(/example\.com\/dashboard/)).toBeNull();
   });
 });
 
