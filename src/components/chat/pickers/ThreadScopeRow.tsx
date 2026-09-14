@@ -498,7 +498,7 @@ function LocationControl({
             initials-style queries win and the Active/Settled split
             survives a search. cmdk still owns highlight + Enter. */}
         <Command shouldFilter={false} loop>
-          <div className="px-2.5 pb-1 pt-2 font-mono text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <div className="px-2.5 pb-1 pt-2 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
             Run in
           </div>
           <CommandInput
@@ -512,7 +512,7 @@ function LocationControl({
             onWheel={(e) => e.stopPropagation()}
           >
             {noMatches && (
-              <div className="px-2 py-3 text-center text-[12px] text-muted-foreground">
+              <div className="px-2 py-3 text-center text-body-sm text-muted-foreground">
                 No projects match “{query.trim()}”
               </div>
             )}
@@ -555,7 +555,7 @@ function LocationControl({
                   <CommandItem
                     value="show-all-settled-projects"
                     onSelect={() => setSettledExpanded(true)}
-                    className="gap-2 rounded-lg px-2 py-1.5 text-[12px] text-muted-foreground"
+                    className="gap-2 rounded-lg px-2 py-1.5 text-body-sm text-muted-foreground"
                   >
                     <ChevronDown className="size-3.5 shrink-0" />
                     Show {hiddenSettledCount} more
@@ -577,7 +577,7 @@ function LocationControl({
                   handleSelectProject(result.path);
                 }
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
             >
               <FolderPlus className="size-3.5" />
               Open another project…
@@ -627,7 +627,7 @@ function CheckoutControl({
         side="top"
         onOpenAutoFocus={focusCmdkOnOpen}
       >
-        <div className="px-2 pb-1 pt-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+        <div className="px-2 pb-1 pt-1 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
           Where should the agent work?
         </div>
         <button
@@ -645,7 +645,7 @@ function CheckoutControl({
                 <Check className="size-3.5 shrink-0 text-accent-ember" />
               )}
             </span>
-            <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">
+            <span className="mt-0.5 block text-label leading-snug text-muted-foreground">
               Work directly in the project's checked-out branch. No new
               worktree.
             </span>
@@ -666,7 +666,7 @@ function CheckoutControl({
                 <Check className="size-3.5 shrink-0 text-accent-ember" />
               )}
             </span>
-            <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">
+            <span className="mt-0.5 block text-label leading-snug text-muted-foreground">
               Branch off in an isolated worktree, so the agent can't touch
               your working copy.
             </span>
@@ -683,10 +683,10 @@ function CheckoutControl({
                 onKeyDown={(e) => e.stopPropagation()}
                 placeholder="name — leave empty to auto-name"
                 aria-label="Worktree name"
-                className="flex-1 min-w-0 bg-transparent font-mono text-[12px] text-foreground outline-none placeholder:text-muted-foreground/60"
+                className="flex-1 min-w-0 bg-transparent font-mono text-body-sm text-foreground outline-none placeholder:text-muted-foreground/60"
               />
             </div>
-            <div className="mt-1.5 flex items-start gap-1.5 px-0.5 text-[11px] leading-snug text-muted-foreground">
+            <div className="mt-1.5 flex items-start gap-1.5 px-0.5 text-label leading-snug text-muted-foreground">
               <Sparkle className="mt-px size-3 shrink-0 text-status-remote" />
               <span>
                 Empty → CodeMux names it from your first message, like the
@@ -866,7 +866,7 @@ function BranchControl({
               )}
               onClick={() => setFilterMode("all")}
             >
-              All <span className="text-[10px] opacity-60">{allCount}</span>
+              All <span className="text-caption opacity-60">{allCount}</span>
             </button>
             <button
               type="button"
@@ -879,7 +879,7 @@ function BranchControl({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-[10px] opacity-60">{worktreeCount}</span>
+              <span className="text-caption opacity-60">{worktreeCount}</span>
             </button>
           </div>
           <CommandList
@@ -915,11 +915,11 @@ function BranchControl({
                         {branch.name}
                       </span>
                       {hasWorktree && (
-                        <span className="shrink-0 rounded bg-status-working/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-status-working">
+                        <span className="shrink-0 rounded bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
                           WORKTREE
                         </span>
                       )}
-                      <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70">
+                      <span className="shrink-0 font-mono text-label text-muted-foreground/70">
                         {formatRelativeTime(branch.last_commit_unix)}
                       </span>
                     </CommandItem>

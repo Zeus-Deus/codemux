@@ -56,7 +56,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
           setOpen((v) => !v);
         }}
         aria-expanded={open}
-        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
       >
         <span className="flex size-5 shrink-0 items-center justify-center">
           {live ? (
@@ -87,7 +87,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
       </button>
       {open && item.text.length > 0 && (
         <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
-          <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+          <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
             {item.text}
           </p>
         </div>

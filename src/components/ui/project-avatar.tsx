@@ -25,8 +25,8 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 const SIZE_CLASSES = {
-  sm: "size-3.5 text-[8px] border",
-  md: "size-5 text-[10px] border",
+  sm: "size-3.5 text-[0.5625rem] border",
+  md: "size-5 text-caption border",
   lg: "size-6 text-xs border-[1.5px]",
 } as const;
 

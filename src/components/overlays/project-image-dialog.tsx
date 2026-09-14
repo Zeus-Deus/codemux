@@ -86,7 +86,7 @@ export function ProjectImageDialog({
               <div className="text-sm text-foreground truncate">
                 {projectName}
               </div>
-              <div className="flex items-center gap-1 text-[11px] text-muted-foreground/70 mt-0.5">
+              <div className="flex items-center gap-1 text-label text-muted-foreground/70 mt-0.5">
                 {isWebsite && (
                   <>
                     <Globe className="h-3 w-3 shrink-0" />
@@ -123,7 +123,7 @@ export function ProjectImageDialog({
                 if (e.key === "Enter") handleSave();
               }}
             />
-            <p className="text-[11px] text-muted-foreground/70 leading-snug">
+            <p className="text-label text-muted-foreground/70 leading-snug">
               Paste a direct image URL, or any website to use its favicon.
             </p>
           </div>

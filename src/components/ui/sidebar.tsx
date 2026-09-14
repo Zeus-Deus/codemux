@@ -31,6 +31,25 @@ const SIDEBAR_WIDTH_MOBILE = "18rem"
 // little breathing room for the status dot / notification badge that overlays
 // its top-right corner. Matches the reference rail width.
 const SIDEBAR_WIDTH_ICON = "3.25rem"
+// 288px default (was 256): the inbox card's mono meta line (branch ·
+// ↑ahead · +/− · PR chip · remote/notifs) needs the extra room.
+const SIDEBAR_WIDTH_DEFAULT = 288
+const SIDEBAR_WIDTH_STORAGE_KEY = "codemux.sidebar.width"
+
+function clampSidebarWidth(width: number): number {
+  return Math.round(Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, width)))
+}
+
+/** The last dragged width, so a relaunch keeps the sidebar where it was left. */
+function readStoredSidebarWidth(): number {
+  try {
+    const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY))
+    if (Number.isFinite(stored) && stored > 0) return clampSidebarWidth(stored)
+  } catch {
+    // Fall through to the default when storage is unavailable.
+  }
+  return SIDEBAR_WIDTH_DEFAULT
+}
 
 type SidebarContextProps = {
   state: "expanded" | "collapsed"
@@ -70,9 +89,7 @@ function SidebarProvider({
 }) {
   const isMobile = useIsMobile()
   const [openMobile, setOpenMobile] = React.useState(false)
-  // 288px default (was 256): the inbox card's mono meta line (branch ·
-  // ↑ahead · +/− · PR chip · remote/notifs) needs the extra room.
-  const [widthPx, setWidthPx] = React.useState(288)
+  const [widthPx, setWidthPx] = React.useState(readStoredSidebarWidth)
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
@@ -99,7 +116,14 @@ function SidebarProvider({
   }, [isMobile, setOpen, setOpenMobile])
 
   const setSidebarWidth = React.useCallback((width: number) => {
-    setWidthPx(Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, width)))
+    const clamped = clampSidebarWidth(width)
+    setWidthPx(clamped)
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(clamped))
+    } catch {
+      // Storage can be unavailable (private mode, quota); the width just
+      // won't survive a relaunch.
+    }
   }, [])
 
   const sidebarWidth = `${widthPx}px`

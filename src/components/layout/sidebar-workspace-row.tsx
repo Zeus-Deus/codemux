@@ -352,7 +352,7 @@ function MenuProjectAvatar({ project }: { project: MenuProject }) {
       imageUrl={appearance.imageUrl}
       cacheBust={appearance.imageVersion}
       shape="square"
-      className="size-[23px] rounded-[7px] text-[10.5px] font-semibold"
+      className="size-[23px] rounded-[7px] text-label font-semibold"
     />
   );
 }
@@ -386,21 +386,21 @@ function WorkspaceMenuHeader({
         <ProjectAvatar
           name={workspace.title}
           shape="square"
-          className="size-[23px] rounded-[7px] text-[10.5px] font-semibold"
+          className="size-[23px] rounded-[7px] text-label font-semibold"
         />
       )}
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[12.5px] font-semibold tracking-[-0.01em] text-foreground">
+        <span className="truncate text-body font-semibold tracking-[-0.01em] text-foreground">
           {workspace.title}
         </span>
         {project && (
-          <span className="truncate font-mono text-[9.5px] text-muted-foreground/70">
+          <span className="truncate font-mono text-caption text-muted-foreground/70">
             {project.name}
           </span>
         )}
       </span>
       {hasStats && (
-        <span className="flex shrink-0 gap-1.5 font-mono text-[9.5px] tabular-nums">
+        <span className="flex shrink-0 gap-1.5 font-mono text-caption tabular-nums">
           {additions > 0 && (
             <span className="text-status-open/80">+{additions}</span>
           )}
@@ -450,7 +450,7 @@ function MoveToDeviceSubmenu({
           <Check className="size-3 shrink-0 text-accent-ember" />
         </div>
         {hosts.length === 0 ? (
-          <p className="px-[9px] pt-2 pb-1.5 text-[11px] leading-snug text-muted-foreground/70">
+          <p className="px-[9px] pt-2 pb-1.5 text-label leading-snug text-muted-foreground/70">
             No other devices signed in.
           </p>
         ) : (
@@ -463,7 +463,7 @@ function MoveToDeviceSubmenu({
               <Server />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate">{host.name}</span>
-                <span className="truncate font-mono text-[9.5px] text-muted-foreground/70">
+                <span className="truncate font-mono text-caption text-muted-foreground/70">
                   {host.dirty ? "not synced yet" : host.ssh_target}
                 </span>
               </span>
@@ -1381,9 +1381,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   className={cn(
                   "truncate leading-tight",
                   isCard
-                    ? "text-[13px] font-semibold text-foreground"
+                    ? "text-body font-semibold text-foreground"
                     : cn(
-                        "text-[13px]",
+                        "text-body",
                         isActive
                           ? "text-foreground font-medium"
                           : "text-foreground/85",
@@ -1442,7 +1442,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                             type="button"
                             onClick={(e) => e.stopPropagation()}
                             aria-label={`${shippedCount} shipped`}
-                            className="flex items-center gap-1 font-mono text-[11px] leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
+                            className="flex items-center gap-1 font-mono text-label leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
                           >
                             <span className="text-status-open">✓</span>
                             {shippedCount} shipped
@@ -1453,7 +1453,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           align="start"
                           className="w-64 p-2"
                         >
-                          <div className="mb-1.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground/70">
+                          <div className="mb-1.5 font-mono text-caption uppercase tracking-wide text-muted-foreground/70">
                             Shipped from this workspace
                           </div>
                           <ul className="space-y-1">
@@ -1480,7 +1480,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         opacity decays over ~1h, then it disappears. */}
                     {showSettledCheck && (
                       <span
-                        className="text-status-open text-[11px] leading-none tabular-nums select-none"
+                        className="text-status-open text-label leading-none tabular-nums select-none"
                         style={{ opacity: settledOpacity }}
                         aria-label="Recently finished"
                       >
@@ -1490,7 +1490,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     {sidebarElapsedSec !== null && (
                       <span
                         title="Push/pull in progress — large workspaces can take a while."
-                        className="rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                        className="rounded-full bg-muted/60 px-1.5 py-0 text-caption font-medium tabular-nums leading-[14px] text-muted-foreground/85"
                       >
                         {sidebarElapsedSec}s
                       </span>
@@ -1498,7 +1498,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     {workspace.notification_count > 0 && (
                       <Badge
                         variant="outline"
-                        className="text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px] transition-opacity group-hover/row:opacity-0"
+                        className="text-caption tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px] transition-opacity group-hover/row:opacity-0"
                       >
                         {workspace.notification_count}
                       </Badge>
@@ -1512,17 +1512,17 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   so this uses the derived-status fallback with a local
                   elapsed clock. */}
               {isWorking && (
-                <div className="truncate text-[11px] text-muted-foreground leading-tight mt-0.5">
+                <div className="truncate text-label text-muted-foreground leading-tight mt-0.5">
                   Working · {statusElapsed}
                 </div>
               )}
               {isPermission && (
-                <div className="truncate text-[11px] text-status-attention leading-tight mt-0.5">
+                <div className="truncate text-label text-status-attention leading-tight mt-0.5">
                   {permissionBlockerText(workspace)} · {statusElapsed}
                 </div>
               )}
               {reviewExpanded && (
-                <div className="truncate text-[11px] leading-tight mt-0.5">
+                <div className="truncate text-label leading-tight mt-0.5">
                   <span className="text-status-open font-medium">Done</span>
                   <span className="text-muted-foreground">
                     {prOpen
@@ -1539,7 +1539,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               {showGitLine && (
                 <div className={cn(
                   "flex items-center gap-1.5 font-mono leading-tight text-muted-foreground/60",
-                  isWorking ? "text-[10px] mt-1" : "text-[11px] mt-0.5",
+                  isWorking ? "text-caption mt-1" : "text-label mt-0.5",
                 )}>
                   {workspace.git_branch && (
                     <span className="truncate min-w-0">{workspace.git_branch}</span>
@@ -1549,12 +1549,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       tunnel (reconnecting / circuit-open). A healthy or local
                       workspace shows nothing here. */}
                   {tunnelKind === "reconnecting" && (
-                    <span className="shrink-0 rounded px-1 text-[10px] leading-[14px] text-warning bg-warning/15">
+                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-warning bg-warning/15">
                       Reconnecting…
                     </span>
                   )}
                   {tunnelKind === "lost" && (
-                    <span className="shrink-0 rounded px-1 text-[10px] leading-[14px] text-danger bg-danger/15">
+                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-danger bg-danger/15">
                       Connection lost — re-push
                     </span>
                   )}

@@ -947,12 +947,12 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
             {status === "error" ? (
               <>
                 <Globe className="h-3 w-3 text-destructive" />
-                <span className="text-[11px] text-destructive">{errorMsg || "Stream disconnected"}</span>
+                <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>
               </>
             ) : (
               <>
                 <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                <span className="text-[11px] text-muted-foreground">Reconnecting…</span>
+                <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}
           </div>

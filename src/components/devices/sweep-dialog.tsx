@@ -125,15 +125,15 @@ export function SweepDialog({ open, onOpenChange, candidates, knownBytes }: Prop
     <Dialog open={open} onOpenChange={(next) => !running && onOpenChange(next)}>
       <DialogContent className="sm:max-w-[380px]" showCloseButton={false}>
         <DialogHeader>
-          <DialogTitle className="text-[14px]">
+          <DialogTitle className="text-body-lg">
             Sweep {count} settled {count === 1 ? "workspace" : "workspaces"}
             {knownBytes !== null && knownBytes > 0 && (
-              <span className="ml-1.5 font-mono text-[11px] font-normal text-muted-foreground">
+              <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground">
                 ~{formatBytes(knownBytes)}
               </span>
             )}
           </DialogTitle>
-          <DialogDescription className="text-[12.5px] leading-relaxed">
+          <DialogDescription className="text-body leading-relaxed">
             Removes their worktrees from disk; branches are kept. Worktrees
             with uncommitted or unpushed work are skipped.
           </DialogDescription>

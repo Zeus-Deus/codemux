@@ -1155,7 +1155,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 {/* Linked issue chip */}
                 {linkedIssue && (
                   <span
-                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 py-0.5 pl-1 pr-1 text-[11px] text-foreground"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 py-0.5 pl-1 pr-1 text-label text-foreground"
                     title={`#${linkedIssue.number} ${linkedIssue.title}`}
                   >
                     <span
@@ -1204,7 +1204,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 already has a workspace. Offer to open it instead of the
                 silent submit-time dedup that drops the typed message. */}
             {existingWorkspaceForBranch && (
-              <div className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+              <div className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-label text-muted-foreground">
                 <span className="min-w-0 truncate">
                   {linkedIssue
                     ? `Issue #${linkedIssue.number} already has a workspace.`
@@ -1234,7 +1234,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-foreground transition-colors outline-none hover:bg-muted"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-foreground transition-colors outline-none hover:bg-muted"
                   >
                     {selectedAgent ? (
                       <>
@@ -1496,7 +1496,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             />
           )}
 
-          <span className="ml-auto text-[10px] text-muted-foreground/40 select-none">
+          <span className="ml-auto text-caption text-muted-foreground/40 select-none">
             Ctrl+Enter to create
           </span>
         </div>

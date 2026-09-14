@@ -185,7 +185,7 @@ export const UserMessage = memo(function UserMessage({
                 </button>
               ) : null}
             </div>
-            <span className="inline-flex h-4 items-center gap-1 text-[10px] font-medium text-muted-foreground/55">
+            <span className="inline-flex h-4 items-center gap-1 text-caption font-medium text-muted-foreground/55">
               <span className="h-1 w-1 rounded-full bg-muted-foreground/45" aria-hidden />
               Queued
             </span>

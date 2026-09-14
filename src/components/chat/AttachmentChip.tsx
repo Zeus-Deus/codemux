@@ -294,20 +294,20 @@ export function AttachmentChip({
         !metadata.isLoading &&
         metadata.handoffKind && (
           <span
-            className="border-l border-current/15 pl-1.5 text-[9px] font-medium uppercase tracking-[0.08em] opacity-70"
+            className="border-l border-current/15 pl-1.5 text-micro font-medium uppercase tracking-[0.08em] opacity-70"
             data-testid="session-handoff-kind"
           >
             {metadata.handoffKind === "summary" ? "Summary" : "Direct"}
           </span>
         )}
       {lineCountLabel && (
-        <span className="text-[10px] opacity-70" aria-hidden>
+        <span className="text-caption opacity-70" aria-hidden>
           {lineCountLabel}
         </span>
       )}
       {truncationLabel && (
         <span
-          className="text-[9px] opacity-60"
+          className="text-micro opacity-60"
           aria-hidden
           data-testid="attachment-chip-truncation"
         >
@@ -316,7 +316,7 @@ export function AttachmentChip({
       )}
       {metadata.error && (
         <span
-          className="text-destructive text-[10px]"
+          className="text-destructive text-caption"
           aria-label={`error: ${metadata.error}`}
           title={metadata.error}
         >
@@ -394,10 +394,10 @@ export function AttachmentChip({
               className="mb-1 max-h-[180px] max-w-[260px] rounded border border-foreground/10 object-contain"
             />
           )}
-          <div className="font-mono text-[11px] truncate max-w-[260px]">
+          <div className="font-mono text-label truncate max-w-[260px]">
             {metadata.label}
           </div>
-          <div className="text-[10px] opacity-80">
+          <div className="text-caption opacity-80">
             {metadata.isLoading
               ? "Resolving…"
               : tokenEstimate > 0
@@ -406,7 +406,7 @@ export function AttachmentChip({
           </div>
           {attachment.kind === "file" &&
             typeof metadata.lineCount === "number" && (
-            <div className="text-[10px] opacity-70">
+            <div className="text-caption opacity-70">
               {metadata.lineCount.toLocaleString()} lines
               {typeof metadata.bytes === "number"
                 ? ` · ${metadata.bytes.toLocaleString()} bytes`
@@ -415,7 +415,7 @@ export function AttachmentChip({
           )}
           {attachment.kind === "image" &&
             typeof metadata.bytes === "number" && (
-            <div className="text-[10px] opacity-70">
+            <div className="text-caption opacity-70">
               {(metadata.bytes / 1024).toLocaleString(undefined, {
                 maximumFractionDigits: 1,
               })}{" "}
@@ -423,11 +423,11 @@ export function AttachmentChip({
             </div>
           )}
           {showPreview && (
-            <div className="text-[10px] opacity-60">Click to expand</div>
+            <div className="text-caption opacity-60">Click to expand</div>
           )}
           {attachment.kind === "session" && (
             <>
-              <div className="text-[10px] opacity-80">
+              <div className="text-caption opacity-80">
                 {metadata.sourceProvider
                   ? sessionProviderLabel(metadata.sourceProvider)
                   : "Agent chat"}
@@ -436,14 +436,14 @@ export function AttachmentChip({
                   ? ` · ${metadata.includedMessageCount}/${metadata.messageCount} messages`
                   : ""}
               </div>
-              <div className="text-[10px] opacity-70">
+              <div className="text-caption opacity-70">
                 {metadata.handoffKind === "summary"
                   ? `Utility summary${metadata.summaryCached ? " · cached" : ""}`
                   : utilitySummaryFallbackLabel(metadata.summaryError)}
               </div>
               {metadata.handoffKind === "summary" &&
                 metadata.summarizerModel && (
-                  <div className="max-w-[280px] truncate font-mono text-[9px] opacity-60">
+                  <div className="max-w-[280px] truncate font-mono text-micro opacity-60">
                     {metadata.summarizerModel}
                     {metadata.summarizerEffort
                       ? ` · ${metadata.summarizerEffort}`
@@ -451,7 +451,7 @@ export function AttachmentChip({
                   </div>
                 )}
               {metadata.fullHistoryAvailable && (
-                <div className="text-[10px] opacity-70">
+                <div className="text-caption opacity-70">
                   Full visible history available on demand
                 </div>
               )}

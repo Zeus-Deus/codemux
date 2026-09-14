@@ -403,10 +403,10 @@ export function AutomationsSection() {
             <CalendarClock className="size-6 text-muted-foreground/70" />
           </div>
           <div className="space-y-1.5">
-            <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
+            <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
               No automations yet
             </h3>
-            <p className="text-[13px] leading-relaxed text-muted-foreground/80">
+            <p className="text-body leading-relaxed text-muted-foreground/80">
               Run an agent on a schedule — triage issues each morning,
               sweep stale branches nightly, post a weekly summary. It runs
               on the host you choose, even with your laptop closed.
@@ -416,13 +416,13 @@ export function AutomationsSection() {
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 gap-1.5 text-[13px]"
+            className="h-8 gap-1.5 text-body"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
             New automation
           </Button>
-          {error && <p className="text-[12px] text-destructive">{error}</p>}
+          {error && <p className="text-body-sm text-destructive">{error}</p>}
         </div>
       </div>
     );
@@ -433,16 +433,16 @@ export function AutomationsSection() {
       {/* Sidebar */}
       <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
         <div className="mb-3 flex items-end justify-between gap-2">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+          <p className="text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
             Automations
           </p>
-          <span className="text-[11px] text-muted-foreground/60 tabular-nums">
+          <span className="text-label text-muted-foreground/60 tabular-nums">
             {automations.length}
           </span>
         </div>
 
         {automations.length === 0 && draft === null && (
-          <div className="rounded-lg border border-dashed border-border/60 p-3 text-[12px] text-muted-foreground/80 leading-relaxed">
+          <div className="rounded-lg border border-dashed border-border/60 p-3 text-body-sm text-muted-foreground/80 leading-relaxed">
             No automations yet. Create one to run an agent on a schedule.
           </div>
         )}
@@ -485,7 +485,7 @@ export function AutomationsSection() {
                     <span className="flex items-center gap-1.5">
                       <span
                         className={cn(
-                          "min-w-0 flex-1 truncate text-[13px] transition-colors",
+                          "min-w-0 flex-1 truncate text-body transition-colors",
                           active
                             ? "text-foreground"
                             : "text-muted-foreground group-hover/row:text-foreground",
@@ -500,7 +500,7 @@ export function AutomationsSection() {
                         />
                       )}
                     </span>
-                    <span className="mt-0.5 block truncate text-[11px] text-muted-foreground/55">
+                    <span className="mt-0.5 block truncate text-label text-muted-foreground/55">
                       {describeSchedule(automation.schedule)}
                     </span>
                   </span>
@@ -515,7 +515,7 @@ export function AutomationsSection() {
             type="button"
             variant="ghost"
             size="sm"
-            className="w-full justify-start gap-2 h-8 px-2.5 text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+            className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -527,7 +527,7 @@ export function AutomationsSection() {
       {/* Detail */}
       <div className="flex-1 min-w-0">
         {error && (
-          <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[12px] text-destructive leading-relaxed">
+          <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-body-sm text-destructive leading-relaxed">
             {error}
           </div>
         )}
@@ -549,7 +549,7 @@ export function AutomationsSection() {
               <div className="mx-auto size-12 rounded-full bg-muted/40 border border-border/40 flex items-center justify-center">
                 <CalendarClock className="size-5 text-muted-foreground/60" />
               </div>
-              <p className="text-[13px] text-muted-foreground/80">
+              <p className="text-body text-muted-foreground/80">
                 Select an automation, or create a new one.
               </p>
             </div>
@@ -599,12 +599,12 @@ function AutomationDetail({
     <div className="space-y-6">
       <div>
         <div className="mb-1 flex items-center gap-2">
-          <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
+          <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
             {automation.name}
           </h3>
           <span
             className={cn(
-              "rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider border",
+              "rounded-full px-2 py-0.5 text-caption font-medium uppercase tracking-wider border",
               automation.enabled
                 ? "bg-success/15 border-success/30 text-success"
                 : "bg-muted border-border/50 text-muted-foreground",
@@ -613,12 +613,12 @@ function AutomationDetail({
             {automation.enabled ? "Enabled" : "Paused"}
           </span>
           {automation.dirty && (
-            <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-warning">
+            <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-caption font-medium uppercase tracking-wider text-warning">
               Pending sync
             </span>
           )}
         </div>
-        <p className="text-[12px] text-muted-foreground/85">
+        <p className="text-body-sm text-muted-foreground/85">
           {describeSchedule(automation.schedule)} · {agentLabel} · {hostLabel}
         </p>
       </div>
@@ -635,10 +635,10 @@ function AutomationDetail({
       </div>
 
       <div className="space-y-1.5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+        <p className="text-label font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
           Prompt
         </p>
-        <div className="select-text rounded-lg border border-border/60 bg-muted/30 p-3 text-[13px] text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
+        <div className="select-text rounded-lg border border-border/60 bg-muted/30 p-3 text-body text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
           {automation.prompt}
         </div>
       </div>
@@ -651,7 +651,7 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-[12px]"
+            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onEdit}
           >
@@ -662,7 +662,7 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-[12px]"
+            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onToggleEnabled}
           >
@@ -683,7 +683,7 @@ function AutomationDetail({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-[12px] text-destructive hover:bg-destructive/10 hover:text-destructive"
+          className="h-8 gap-1.5 text-body-sm text-destructive hover:bg-destructive/10 hover:text-destructive"
           disabled={busy}
           onClick={onDelete}
         >
@@ -698,10 +698,10 @@ function AutomationDetail({
 function FactCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
-      <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+      <p className="text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
         {label}
       </p>
-      <p className="mt-1 text-[13px] text-foreground/90 tabular-nums">{value}</p>
+      <p className="mt-1 text-body text-foreground/90 tabular-nums">{value}</p>
     </div>
   );
 }
@@ -749,19 +749,19 @@ function RunHistory({ automationId }: { automationId: number }) {
   return (
     <div className="space-y-1.5">
       <div className="flex items-baseline justify-between">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+        <p className="text-label font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
           Run history
         </p>
         {runs.length > 0 && (
-          <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+          <span className="text-label text-muted-foreground/50 tabular-nums">
             {runs.length}
           </span>
         )}
       </div>
       {loading ? (
-        <p className="py-2 text-[12px] text-muted-foreground/70">Loading…</p>
+        <p className="py-2 text-body-sm text-muted-foreground/70">Loading…</p>
       ) : runs.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-[12px] text-muted-foreground/70">
+        <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-body-sm text-muted-foreground/70">
           No runs yet. The next fire will appear here.
         </p>
       ) : (
@@ -772,25 +772,25 @@ function RunHistory({ automationId }: { automationId: number }) {
               title={run.error ?? undefined}
               className="flex items-center gap-2.5 px-3 py-2"
             >
-              <span className="shrink-0 font-mono text-[12px] tabular-nums text-muted-foreground/80">
+              <span className="shrink-0 font-mono text-body-sm tabular-nums text-muted-foreground/80">
                 {formatStamp(run.scheduled_for)}
               </span>
               {run.pr_url ? (
                 <button
                   type="button"
                   onClick={() => void openUrl(run.pr_url as string)}
-                  className="min-w-0 truncate text-left text-[11px] text-foreground/70 hover:text-foreground hover:underline"
+                  className="min-w-0 truncate text-left text-label text-foreground/70 hover:text-foreground hover:underline"
                 >
                   Pull request ↗
                 </button>
               ) : run.branch ? (
-                <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/55">
+                <span className="min-w-0 truncate font-mono text-label text-muted-foreground/55">
                   {run.branch}
                 </span>
               ) : null}
               <span
                 className={cn(
-                  "ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",
+                  "ml-auto shrink-0 rounded px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
                   RUN_STATUS_BADGE[run.status] ?? "bg-muted text-muted-foreground",
                 )}
               >
@@ -839,7 +839,7 @@ function AutomationForm({
 
   return (
     <div className="space-y-5">
-      <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
+      <h3 className="text-body-lg font-semibold tracking-tight text-foreground">
         {creating ? "New automation" : "Edit automation"}
       </h3>
 
@@ -848,7 +848,7 @@ function AutomationForm({
           value={draft.name}
           onChange={(e) => patch({ name: e.target.value })}
           placeholder="Daily issue triage"
-          className="h-9 text-[13px]"
+          className="h-9 text-body"
           autoFocus
         />
       </Field>
@@ -858,7 +858,7 @@ function AutomationForm({
           value={draft.prompt}
           onChange={(e) => patch({ prompt: e.target.value })}
           placeholder="Review newly opened issues and add labels…"
-          className="min-h-24 text-[13px]"
+          className="min-h-24 text-body"
         />
       </Field>
 
@@ -867,7 +867,7 @@ function AutomationForm({
       <div className="grid grid-cols-2 gap-4">
         <Field label="Agent">
           <Select value={draft.agent} onValueChange={(v) => patch({ agent: v })}>
-            <SelectTrigger className="h-9 text-[13px]">
+            <SelectTrigger className="h-9 text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -887,7 +887,7 @@ function AutomationForm({
               patch({ hostId: v === "local" ? null : Number(v) })
             }
           >
-            <SelectTrigger className="h-9 text-[13px]">
+            <SelectTrigger className="h-9 text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -915,7 +915,7 @@ function AutomationForm({
           <Input
             value={draft.timezone}
             onChange={(e) => patch({ timezone: e.target.value })}
-            className="h-9 text-[13px] font-mono"
+            className="h-9 text-body font-mono"
           />
         </Field>
         <Field label="Keep last N runs" hint="Older run worktrees are pruned.">
@@ -927,14 +927,14 @@ function AutomationForm({
             onChange={(e) =>
               patch({ retentionLimit: Number(e.target.value) || 10 })
             }
-            className="h-9 text-[13px] tabular-nums"
+            className="h-9 text-body tabular-nums"
           />
         </Field>
       </div>
 
       <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
         {!canSave && (
-          <span className="mr-auto text-[11px] text-muted-foreground/60">
+          <span className="mr-auto text-label text-muted-foreground/60">
             Name, prompt and project are required.
           </span>
         )}
@@ -942,7 +942,7 @@ function AutomationForm({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-[12px]"
+          className="h-8 gap-1.5 text-body-sm"
           disabled={busy}
           onClick={onCancel}
         >
@@ -953,7 +953,7 @@ function AutomationForm({
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 gap-1.5 text-[12px]"
+          className="h-8 gap-1.5 text-body-sm"
           disabled={busy || !canSave}
           onClick={onSave}
         >
@@ -995,7 +995,7 @@ function ScheduleField({
         <Textarea
           value={draft.rawSchedule}
           onChange={(e) => patch({ rawSchedule: e.target.value })}
-          className="min-h-20 text-[12px] font-mono"
+          className="min-h-20 text-body-sm font-mono"
           placeholder={"DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY"}
         />
       ) : (
@@ -1004,7 +1004,7 @@ function ScheduleField({
             value={draft.builder.frequency}
             onValueChange={(v) => patchBuilder({ frequency: v as Frequency })}
           >
-            <SelectTrigger className="h-9 w-32 text-[13px]">
+            <SelectTrigger className="h-9 w-32 text-body">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -1019,7 +1019,7 @@ function ScheduleField({
               value={draft.builder.weekday}
               onValueChange={(v) => patchBuilder({ weekday: v })}
             >
-              <SelectTrigger className="h-9 w-36 text-[13px]">
+              <SelectTrigger className="h-9 w-36 text-body">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1041,10 +1041,10 @@ function ScheduleField({
               const [h, m] = e.target.value.split(":");
               patchBuilder({ hour: Number(h) || 0, minute: Number(m) || 0 });
             }}
-            className="h-9 w-28 text-[13px] tabular-nums"
+            className="h-9 w-28 text-body tabular-nums"
           />
           {draft.builder.frequency === "HOURLY" && (
-            <span className="text-[12px] text-muted-foreground/70">
+            <span className="text-body-sm text-muted-foreground/70">
               past each hour
             </span>
           )}
@@ -1052,12 +1052,12 @@ function ScheduleField({
       )}
 
       <div className="mt-1.5 flex items-center justify-between gap-3">
-        <span className="min-w-0 truncate text-[11px] text-muted-foreground/60">
+        <span className="min-w-0 truncate text-label text-muted-foreground/60">
           Runs {describeSchedule(composed).toLowerCase()}
         </span>
         <button
           type="button"
-          className="shrink-0 text-[11px] text-muted-foreground/70 hover:text-foreground transition-colors"
+          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors"
           onClick={() => {
             if (draft.rawMode) {
               patch({ rawMode: false });
@@ -1107,7 +1107,7 @@ function ProjectField({
           }
         }}
       >
-        <SelectTrigger className="h-9 text-[13px]">
+        <SelectTrigger className="h-9 text-body">
           <SelectValue placeholder="Choose a project…" />
         </SelectTrigger>
         {/* `popper` + a capped height keeps the menu anchored under
@@ -1127,7 +1127,7 @@ function ProjectField({
           value={draft.projectPath}
           onChange={(e) => patch({ projectPath: e.target.value })}
           placeholder="/home/you/code/my-repo"
-          className="mt-1.5 h-9 text-[13px] font-mono"
+          className="mt-1.5 h-9 text-body font-mono"
         />
       )}
     </Field>
@@ -1173,7 +1173,7 @@ function RepoAccessRow({
   if (hostId === null) return null;
 
   return (
-    <div className="flex items-start gap-2 text-[12px] leading-relaxed">
+    <div className="flex items-start gap-2 text-body-sm leading-relaxed">
       {checking ? (
         <>
           <Loader2 className="mt-0.5 size-3 shrink-0 animate-spin text-muted-foreground/60" />
@@ -1222,10 +1222,10 @@ function Field({
 }) {
   return (
     <div className="space-y-1.5">
-      <Label className="text-[13px] font-medium text-foreground">{label}</Label>
+      <Label className="text-body font-medium text-foreground">{label}</Label>
       {children}
       {hint && (
-        <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
+        <p className="text-label text-muted-foreground/70 leading-relaxed">
           {hint}
         </p>
       )}

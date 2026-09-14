@@ -86,10 +86,10 @@ export function UtilityAgentSetting() {
                 className="h-4 w-4 shrink-0"
               />
               <div className="min-w-0 text-left leading-tight">
-                <div className="truncate text-[11px] font-medium text-foreground">
+                <div className="truncate text-label font-medium text-foreground">
                   {auto.model}
                 </div>
-                <div className="text-[9px] uppercase tracking-[0.1em] text-muted-foreground/65">
+                <div className="text-micro uppercase tracking-[0.1em] text-muted-foreground/65">
                   {auto.effort
                     ? `${auto.effort} reasoning`
                     : "fast utility pass"}
@@ -98,7 +98,7 @@ export function UtilityAgentSetting() {
               <Sparkles className="ml-auto h-3.5 w-3.5 text-primary/70" />
             </>
           ) : (
-            <span className="text-[11px] text-warning">
+            <span className="text-label text-warning">
               No inexpensive model found — choose Custom
             </span>
           )}

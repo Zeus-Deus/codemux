@@ -205,10 +205,10 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
             aria-hidden
           />
         </span>
-        <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+        <span className="shrink-0 whitespace-nowrap text-body-sm font-semibold text-foreground/80">
           Subagents finished
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           all tasks complete · results are in the thread
         </span>
       </div>
@@ -248,10 +248,10 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
           className="rise-in absolute right-0 bottom-full left-0 z-50 mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
         >
           <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2.5">
-            <span className="whitespace-nowrap text-[12px] font-bold text-foreground">
+            <span className="whitespace-nowrap text-body-sm font-bold text-foreground">
               {count} subagents running
             </span>
-            <span className="text-[11px] text-muted-foreground">
+            <span className="text-label text-muted-foreground">
               across this thread · tap one to jump
             </span>
           </div>
@@ -297,17 +297,17 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
               below owns its own activity-matched orb. */}
           <AgentOrb size={20} aria-hidden />
         </span>
-        <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+        <span className="shrink-0 whitespace-nowrap text-body-sm font-semibold text-foreground/80">
           {count} subagent{count === 1 ? "" : "s"} running
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           {runningActivityLabel(entries)}
         </span>
         <TickingText
-          className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
+          className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
           compute={(now) => elapsedLabel(primary.subagent, now)}
         />
-        <span className="flex shrink-0 items-center gap-1 text-[11px] font-semibold text-foreground/80">
+        <span className="flex shrink-0 items-center gap-1 text-label font-semibold text-foreground/80">
           {multi ? (open ? "Hide" : "Show all") : "View"}
           {multi ? (
             <ChevronDown
@@ -380,18 +380,18 @@ function SubagentActivityBarRow({
       <span className="flex h-5 w-5 shrink-0 items-center justify-center">
         <AgentOrb size={20} {...subagentOrbActivity(subagent)} aria-hidden />
       </span>
-      <span className="w-20 shrink-0 truncate text-[12px] font-bold text-foreground">
+      <span className="w-20 shrink-0 truncate text-body-sm font-bold text-foreground">
         {name}
       </span>
-      <span className="shimmer min-w-0 flex-1 truncate font-mono text-[11px]">
+      <span className="shimmer min-w-0 flex-1 truncate font-mono text-label">
         {activity}
       </span>
       <TickingText
-        className="shrink-0 font-mono text-[10px] text-muted-foreground"
+        className="shrink-0 font-mono text-caption text-muted-foreground"
         compute={(now) => elapsedLabel(subagent, now)}
       />
       {fromLabel && (
-        <span className="shrink-0 text-[10px] font-semibold text-muted-foreground">
+        <span className="shrink-0 text-caption font-semibold text-muted-foreground">
           from {fromLabel}
         </span>
       )}

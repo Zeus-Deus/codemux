@@ -345,10 +345,10 @@ export function QuestionForm({
                 active question — every Item is mounted at all times, so
                 a per-item eyebrow would duplicate it. */}
             <div className="flex items-center gap-2">
-              <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
+              <span className="text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
                 {active.header || "Input requested"}
               </span>
-              <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-[10px] text-muted-foreground/70">
+              <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-caption text-muted-foreground/70">
                 {qi + 1} of {questions.length}
               </QuestionnaireProgress>
             </div>
@@ -365,7 +365,7 @@ export function QuestionForm({
                   {q.question}
                 </QuestionnaireTitle>
                 {q.multiSelect && (
-                  <QuestionnaireDescription className="text-[11px] text-muted-foreground/70">
+                  <QuestionnaireDescription className="text-label text-muted-foreground/70">
                     Select one or more.
                   </QuestionnaireDescription>
                 )}
@@ -403,7 +403,7 @@ export function QuestionForm({
                   />
                 )}
 
-                <QuestionnaireError className="text-[11px]" />
+                <QuestionnaireError className="text-label" />
               </QuestionnaireItem>
             ))}
 
@@ -423,7 +423,7 @@ export function QuestionForm({
                 </QuestionnairePrevious>
                 <div
                   data-testid="aq-hints"
-                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground/60"
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-muted-foreground/60"
                 >
                   <span>
                     <Kbd>←</Kbd> <Kbd>→</Kbd> navigate
@@ -523,10 +523,10 @@ function OptionChoice({
         className="w-80"
         data-testid={`aq-option-preview-${questionIndex}-${optionIndex}`}
       >
-        <p className="mb-1 text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
+        <p className="mb-1 text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
           Preview
         </p>
-        <pre className="whitespace-pre-wrap break-words font-mono text-[12px] leading-5 text-foreground">
+        <pre className="whitespace-pre-wrap break-words font-mono text-body-sm leading-5 text-foreground">
           {preview}
         </pre>
       </HoverCardContent>
@@ -590,7 +590,7 @@ function OtherRow({
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-[10px] text-muted-foreground/80">
+    <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
       {children}
     </kbd>
   );

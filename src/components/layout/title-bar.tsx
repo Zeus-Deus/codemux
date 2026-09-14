@@ -211,7 +211,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             <DropdownMenuGroup key={group.id}>
               {groupIdx > 0 && <DropdownMenuSeparator />}
               {showGroupLabels && (
-                <DropdownMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                <DropdownMenuLabel className="text-caption font-medium uppercase tracking-wide text-muted-foreground/70">
                   {group.label}
                 </DropdownMenuLabel>
               )}
@@ -223,7 +223,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
                   <EditorIcon id={editor.id} className="h-4 w-4" />
                   <span>{editor.name}</span>
                   {editor.id === defaultEditorId && (
-                    <span className="ml-auto text-[10px] text-muted-foreground">
+                    <span className="ml-auto text-caption text-muted-foreground">
                       default
                     </span>
                   )}
@@ -517,7 +517,13 @@ interface TitleBarProps {
   onToggleSidebar: () => void;
 }
 
-const CHAT_READING_COLUMN_MAX_WIDTH = 792;
+/** `CHAT_COLUMN`'s `max-w-[49.5rem]`, in rem so it follows the interface size. */
+const CHAT_READING_COLUMN_MAX_WIDTH_REM = 49.5;
+
+function chatReadingColumnMaxWidthPx(): number {
+  const rootFontSize = Number.parseFloat(getComputedStyle(document.documentElement).fontSize);
+  return CHAT_READING_COLUMN_MAX_WIDTH_REM * (Number.isFinite(rootFontSize) ? rootFontSize : 16);
+}
 
 /**
  * Any measured sidebar width at or below this is the collapsed icon rail
@@ -573,7 +579,7 @@ function useTitlebarChatOverlap(enabled: boolean, transcriptVersion: number) {
         const transcriptRect = transcript.getBoundingClientRect();
         if (transcriptRect.width <= 0 || transcriptRect.height <= 0) return false;
         const columnWidth = Math.min(
-          CHAT_READING_COLUMN_MAX_WIDTH,
+          chatReadingColumnMaxWidthPx(),
           transcriptRect.width,
         );
         const columnLeft =

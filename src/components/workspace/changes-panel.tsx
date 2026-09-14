@@ -183,11 +183,11 @@ function FileRow({
           <span className="truncate text-xs text-foreground min-w-0 flex-1">
             {name}
             {dir && (
-              <span className="ml-1 text-[10px] text-muted-foreground/40">{dir}</span>
+              <span className="ml-1 text-caption text-muted-foreground/40">{dir}</span>
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-[10px] tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
@@ -241,7 +241,7 @@ function FileSection({
   if (files.length === 0) return null;
   return (
     <div className="mb-2">
-      <div className="flex items-center px-2.5 h-5 text-[10px] font-medium tracking-wider uppercase text-muted-foreground/60">
+      <div className="flex items-center px-2.5 h-5 text-caption font-medium tracking-wider uppercase text-muted-foreground/60">
         <span>{label}</span>
         <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
       </div>
@@ -268,11 +268,11 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
   const ahead = info.ahead ?? 0;
   const behind = info.behind ?? 0;
   return (
-    <div className="flex items-center gap-1.5 px-2.5 h-7 text-[11px] text-muted-foreground/80 border-b border-border/40">
+    <div className="flex items-center gap-1.5 px-2.5 h-7 text-label text-muted-foreground/80 border-b border-border/40">
       <GitBranch className="size-3 shrink-0" />
       <span className="truncate font-mono text-foreground/90">{info.branch}</span>
       {(ahead > 0 || behind > 0) && (
-        <span className="ml-auto flex items-center gap-1.5 tabular-nums text-[10px]">
+        <span className="ml-auto flex items-center gap-1.5 tabular-nums text-caption">
           {behind > 0 && (
             <span className="flex items-center gap-0.5 text-warning">
               <ArrowDown className="size-2.5" />
@@ -288,7 +288,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
         </span>
       )}
       {!info.has_upstream && (
-        <span className="ml-auto text-[10px] italic text-muted-foreground/60">no remote</span>
+        <span className="ml-auto text-caption italic text-muted-foreground/60">no remote</span>
       )}
     </div>
   );
@@ -654,9 +654,9 @@ export function ChangesPanel({
         <div className="flex items-center gap-2 px-2.5 py-2 bg-warning/10 border-b border-warning/30">
           <GitMerge className="size-3.5 text-warning shrink-0" />
           <div className="flex-1 min-w-0">
-            <p className="text-[11px] font-medium text-foreground">Merge in progress</p>
+            <p className="text-label font-medium text-foreground">Merge in progress</p>
             {conflicted.length > 0 && (
-              <p className="text-[10px] text-muted-foreground">
+              <p className="text-caption text-muted-foreground">
                 {conflicted.length} conflict{conflicted.length === 1 ? "" : "s"} to resolve
               </p>
             )}
@@ -664,7 +664,7 @@ export function ChangesPanel({
           <Button
             variant="ghost"
             size="xs"
-            className="h-6 text-[10px] text-muted-foreground hover:text-foreground"
+            className="h-6 text-caption text-muted-foreground hover:text-foreground"
             onClick={handleAbortMerge}
             disabled={busy !== null}
           >
@@ -674,7 +674,7 @@ export function ChangesPanel({
             <Button
               size="xs"
               variant="ghost"
-              className="h-6 text-[10px] bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+              className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
               onClick={handleContinueMerge}
               disabled={busy !== null}
             >
@@ -690,13 +690,13 @@ export function ChangesPanel({
             showNoGit ? (
               <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-muted-foreground/70">
                 <GitBranch className="size-4 opacity-50" />
-                <p className="text-[11px]">
+                <p className="text-label">
                   Not a git repository — changes can&apos;t be tracked
                 </p>
                 <Button
                   size="xs"
                   variant="ghost"
-                  className="h-6 text-[10px] bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                  className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
                   onClick={async () => {
                     await initialize();
                     refresh();
@@ -709,7 +709,7 @@ export function ChangesPanel({
             ) : (
               <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-muted-foreground/70">
                 <Check className="size-4 opacity-50" />
-                <p className="text-[11px]">Working tree clean</p>
+                <p className="text-label">Working tree clean</p>
               </div>
             )
           ) : (
@@ -762,7 +762,7 @@ export function ChangesPanel({
           <div className="rounded-md border border-border/60 bg-background overflow-hidden">
             <div className="flex items-start gap-2 px-2.5 py-2 border-l-2 border-l-primary/70">
               <Sparkles className="size-3 text-primary/80 mt-0.5 shrink-0" />
-              <p className="select-text flex-1 text-[11px] leading-snug text-foreground whitespace-pre-wrap break-words">
+              <p className="select-text flex-1 text-label leading-snug text-foreground whitespace-pre-wrap break-words">
                 {generatedMsg}
               </p>
             </div>
@@ -770,7 +770,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-[10px] flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
@@ -779,7 +779,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-[10px] text-muted-foreground hover:text-foreground"
+                className="h-6 text-caption text-muted-foreground hover:text-foreground"
                 onClick={() => {
                   const msg = consumeMessage(workspace.workspace_id) ?? generatedMsg;
                   setEditedMsg(msg);
@@ -810,7 +810,7 @@ export function ChangesPanel({
               value={editedMsg}
               onChange={(e) => setEditedMsg(e.target.value)}
               placeholder="Commit message"
-              className="text-[11px] leading-snug resize-none border-0 rounded-none min-h-16 focus-visible:ring-0"
+              className="text-label leading-snug resize-none border-0 rounded-none min-h-16 focus-visible:ring-0"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                   e.preventDefault();
@@ -822,7 +822,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-[10px] flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
@@ -936,7 +936,7 @@ function SmartCommitButton({
 
   if (!primary) {
     return (
-      <div className="text-[10px] text-muted-foreground/60 text-center py-1">
+      <div className="text-caption text-muted-foreground/60 text-center py-1">
         Resolve or abort the merge above.
       </div>
     );
@@ -997,11 +997,11 @@ function SmartCommitButton({
           )}
           <DropdownMenuItem onClick={onPush}>
             <ArrowUp className="size-3 mr-2" />
-            Push {ahead > 0 && <span className="ml-auto text-[10px] tabular-nums text-foreground/70">{ahead}</span>}
+            Push {ahead > 0 && <span className="ml-auto text-caption tabular-nums text-foreground/70">{ahead}</span>}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={onPull}>
             <ArrowDown className="size-3 mr-2" />
-            Pull {behind > 0 && <span className="ml-auto text-[10px] tabular-nums text-foreground/70">{behind}</span>}
+            Pull {behind > 0 && <span className="ml-auto text-caption tabular-nums text-foreground/70">{behind}</span>}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={onSync}>
             <ArrowUpDown className="size-3 mr-2" />

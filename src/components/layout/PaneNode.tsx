@@ -352,7 +352,7 @@ function PaneNodeImpl({
                   head to keep the meaningful tail. */}
               {cwdHint && (
                 <span
-                  className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/70"
+                  className="min-w-0 truncate font-mono text-label text-muted-foreground/70"
                   title={cwdHint.full}
                   data-pane-cwd={cwdHint.full}
                 >

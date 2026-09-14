@@ -71,7 +71,7 @@ function TitlebarPinToggle({
       {!pinned && (
         <span
           data-testid={`launcher-destination-${presetId}`}
-          className="font-mono text-[10px] tracking-[0.02em] text-muted-foreground/70 transition-opacity group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
+          className="font-mono text-caption tracking-[0.02em] text-muted-foreground/70 transition-opacity group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
         >
           {destination}
         </span>
@@ -124,7 +124,7 @@ function PresetPinnedBadge({ presetId }: { presetId: string }) {
   return (
     <span
       data-testid={`launcher-preset-pinned-${presetId}`}
-      className="shrink-0 font-mono text-[9px] font-semibold tracking-[0.09em] text-muted-foreground/70"
+      className="shrink-0 font-mono text-micro font-semibold tracking-[0.09em] text-muted-foreground/70"
     >
       PINNED
     </span>
@@ -132,10 +132,10 @@ function PresetPinnedBadge({ presetId }: { presetId: string }) {
 }
 
 const LAUNCHER_ITEM_CLASS =
-  "h-[30px] rounded-[7px] px-2 py-0 text-[12.5px]";
+  "h-[30px] rounded-[7px] px-2 py-0 text-body";
 
 const LAUNCHER_GROUP_CLASS =
-  "**:[[cmdk-group-heading]]:font-mono **:[[cmdk-group-heading]]:text-[10px] **:[[cmdk-group-heading]]:font-semibold **:[[cmdk-group-heading]]:tracking-[0.09em] **:[[cmdk-group-heading]]:uppercase";
+  "**:[[cmdk-group-heading]]:font-mono **:[[cmdk-group-heading]]:text-caption **:[[cmdk-group-heading]]:font-semibold **:[[cmdk-group-heading]]:tracking-[0.09em] **:[[cmdk-group-heading]]:uppercase";
 
 function LauncherDestination({
   presetId,
@@ -147,7 +147,7 @@ function LauncherDestination({
   return (
     <span
       data-testid={`launcher-destination-${presetId}`}
-      className="ml-auto shrink-0 font-mono text-[10px] tracking-[0.02em] text-muted-foreground/70"
+      className="ml-auto shrink-0 font-mono text-caption tracking-[0.02em] text-muted-foreground/70"
     >
       {children}
     </span>
@@ -262,7 +262,7 @@ function LauncherFooter({ onSelect }: { onSelect: () => void }) {
         value="manage presets"
         onSelect={onSelect}
         showCheckmark={false}
-        className="h-[34px] rounded-[7px] px-2 py-0 text-[12.5px]"
+        className="h-[34px] rounded-[7px] px-2 py-0 text-body"
       >
         <Settings className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="flex-1 text-muted-foreground">Manage presets…</span>

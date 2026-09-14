@@ -103,7 +103,7 @@ export function PermissionModePicker({
                       <span className="text-xs text-foreground truncate">
                         {mode.label}
                       </span>
-                      <span className="text-[11px] text-muted-foreground/80 truncate">
+                      <span className="text-label text-muted-foreground/80 truncate">
                         {mode.description}
                       </span>
                     </div>

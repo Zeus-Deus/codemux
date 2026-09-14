@@ -168,15 +168,17 @@ function flush() {
  * Geometry-affecting classes on the primary slot.
  *
  * Binding rule 1 says these must not change between states — only
- * colour may. `text-[#…]` is a colour and is filtered out; `text-[11px]`
- * is a font size and therefore geometry, so it stays.
+ * colour may. `text-[#…]` is a colour and is filtered out; arbitrary and
+ * named UI sizes (`text-[0.75rem]`, `text-label`) are font sizes and
+ * therefore geometry, so they stay.
  */
 function primaryGeometry(): string {
   const el = screen.getByTestId("review-primary-action");
   return Array.from(el.classList)
     .filter(
       (c) =>
-        /^(h-|px-|py-|w-|min-w-|rounded-|gap-|text-\[)/.test(c) && !c.startsWith("text-[#"),
+        (/^(h-|px-|py-|w-|min-w-|rounded-|gap-|text-\[)/.test(c) && !c.startsWith("text-[#")) ||
+        /^text-(micro|caption|label|body-sm|body|body-lg)$/.test(c),
     )
     .sort()
     .join(" ");

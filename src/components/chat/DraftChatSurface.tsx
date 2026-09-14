@@ -1262,7 +1262,7 @@ function DraftPendingConversation({
                 aria-hidden
               />
             </span>
-            <span className="shimmer text-[13px] font-semibold">
+            <span className="shimmer text-body font-semibold">
               {PHASE_LABEL[pending.phase]}
             </span>
           </div>

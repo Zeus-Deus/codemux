@@ -832,7 +832,7 @@ function ModelRow({
         <div className="text-xs font-medium leading-snug">
           <span className="truncate">{model.label}</span>
         </div>
-        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground/70">
+        <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
           <ProviderLogo provider={provider} className="h-2.5 w-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
@@ -843,7 +843,7 @@ function ModelRow({
         <kbd
           aria-hidden
           data-testid="model-row-jump-chip"
-          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground"
+          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-caption font-medium text-muted-foreground"
         >
           {jumpLabel}
         </kbd>
@@ -851,7 +851,7 @@ function ModelRow({
       {model.is_free ? (
         <span
           data-testid="model-row-free-badge"
-          className="mt-0.5 shrink-0 self-start rounded border border-status-open/35 bg-status-open/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
+          className="mt-0.5 shrink-0 self-start rounded border border-status-open/35 bg-status-open/15 px-1 py-px text-micro font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
           aria-label="Free model"
         >
           Free

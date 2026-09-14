@@ -46,7 +46,7 @@ export function ThemeSchemeBadge({
   return (
     <span
       className={cn(
-        "flex-none rounded-full border border-border/70 px-1.5 py-px font-mono text-[9px] tracking-[0.06em] text-muted-foreground/70 uppercase",
+        "flex-none rounded-full border border-border/70 px-1.5 py-px font-mono text-micro tracking-[0.06em] text-muted-foreground/70 uppercase",
         className,
       )}
     >

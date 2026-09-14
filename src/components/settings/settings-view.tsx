@@ -172,9 +172,9 @@ function SettingRow({ label, description, children }: {
   return (
     <div className="flex items-center justify-between gap-8 py-4">
       <div className="min-w-0 space-y-1">
-        <p className="text-[14px] leading-tight font-semibold text-foreground">{label}</p>
+        <p className="text-body-lg leading-tight font-semibold text-foreground">{label}</p>
         {description && (
-          <p className="text-[12px] leading-relaxed text-muted-foreground/80">{description}</p>
+          <p className="text-body-sm leading-relaxed text-muted-foreground/80">{description}</p>
         )}
       </div>
       <div className="shrink-0">{children}</div>
@@ -185,8 +185,8 @@ function SettingRow({ label, description, children }: {
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
     <div className="mb-7">
-      <h2 className="text-[21px] font-bold tracking-tight text-foreground">{title}</h2>
-      <p className="text-[14px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
+      <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">{title}</h2>
+      <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
     </div>
   );
 }
@@ -252,19 +252,19 @@ function FormField({
       <div className="space-y-1">
         <label
           htmlFor={htmlFor}
-          className="text-[13px] font-medium text-foreground leading-none block"
+          className="text-body font-medium text-foreground leading-none block"
         >
           {label}
         </label>
         {helper && (
-          <p className="text-[12px] text-muted-foreground/85 leading-relaxed">
+          <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
             {helper}
           </p>
         )}
       </div>
       {children}
       {caption && (
-        <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
+        <p className="text-label text-muted-foreground/70 leading-relaxed">
           {caption}
         </p>
       )}
@@ -290,10 +290,10 @@ function OrbPreviewRow({
       <span className="flex size-5 shrink-0 items-center justify-center">
         <AgentOrb size={20} {...activity} aria-hidden />
       </span>
-      <span className="flex-1 truncate text-[13px] font-semibold text-foreground">
+      <span className="flex-1 truncate text-body font-semibold text-foreground">
         {label}
       </span>
-      <span className="font-mono text-[11px] text-muted-foreground">{elapsed}</span>
+      <span className="font-mono text-label text-muted-foreground">{elapsed}</span>
     </div>
   );
 }
@@ -310,7 +310,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-[13px] font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
           ? "bg-foreground/[0.09] text-foreground"
           : "text-muted-foreground/90 hover:bg-foreground/[0.06] hover:text-foreground",
@@ -464,7 +464,7 @@ function BrowserSection() {
       {message && (
         <SettingsCard className="mt-4 flex items-start gap-3 border-border/50 bg-muted/40">
           <div className="size-1.5 rounded-full bg-success shrink-0 mt-1.5" />
-          <p className="text-[12px] text-muted-foreground/90 leading-relaxed">{message}</p>
+          <p className="text-body-sm text-muted-foreground/90 leading-relaxed">{message}</p>
         </SettingsCard>
       )}
     </div>
@@ -474,7 +474,7 @@ function BrowserSection() {
 // Trigger styling that makes the launch model/reasoning pickers render as
 // full-width form fields matching the editor's Select dropdowns, instead of
 // the composer's rounded-full pills. tailwind-merge lets these override the
-// pickers' built-in pill classes (rounded-full, text-[11px], etc.).
+// pickers' built-in pill classes (rounded-full, text-label, etc.).
 const LAUNCH_FIELD_TRIGGER =
   "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-sm font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
 
@@ -1021,7 +1021,7 @@ function PresetEditorSheet({
 
           {/* Advanced section */}
           <div className="space-y-5 border-t border-border/40 pt-5">
-            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground/80">
+            <p className="text-label font-semibold uppercase tracking-[0.16em] text-muted-foreground/80">
               Advanced
             </p>
 
@@ -1195,7 +1195,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 text-[11px] text-muted-foreground"
+          className="h-8 text-label text-muted-foreground"
           onClick={() => {
             setAiCommitMessageCli(null).catch(console.error);
             storeSet("ai_commit_message_cli", "");
@@ -1206,7 +1206,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
           Use default
         </Button>
       ) : (
-        <span className="flex items-center gap-1 whitespace-nowrap text-[11px] text-muted-foreground">
+        <span className="flex items-center gap-1 whitespace-nowrap text-label text-muted-foreground">
           <Sparkles className="h-3.5 w-3.5 text-primary/70" />
           Utility agent
         </span>
@@ -1460,7 +1460,7 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="select-text font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
+                    <span className="select-text font-mono text-body text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
@@ -1486,8 +1486,8 @@ export function SettingsView() {
                 <SubsectionHeader title="Session" />
                 <SettingsCard className="flex items-center justify-between gap-4 border-destructive/25 bg-destructive/[0.07]">
                   <div className="min-w-0">
-                    <p className="text-[14px] font-semibold text-foreground">Sign out of Codemux</p>
-                    <p className="text-[12px] text-muted-foreground/80 mt-0.5">
+                    <p className="text-body-lg font-semibold text-foreground">Sign out of Codemux</p>
+                    <p className="text-body-sm text-muted-foreground/80 mt-0.5">
                       You'll need to sign in again to sync settings and use cloud features.
                     </p>
                   </div>
@@ -1525,7 +1525,7 @@ export function SettingsView() {
             <TypographySettings />
             <div className="mt-10 space-y-1">
               <SettingRow label="Border radius" description="Fixed across themes so a palette can't change the geometry.">
-                <span className="font-mono text-[12px] text-muted-foreground">{liveRadius}</span>
+                <span className="font-mono text-body-sm text-muted-foreground">{liveRadius}</span>
               </SettingRow>
               <Separator />
               <SettingRow
@@ -1648,7 +1648,7 @@ export function SettingsView() {
                   different things, so the toggle's effect is visible: with
                   it on they animate differently, with it off they match. */}
               <div className="mt-4">
-                <p className="mb-1.5 font-mono text-[10px] font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
+                <p className="mb-1.5 font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
                   Preview
                 </p>
                 <div className="flex max-w-[300px] flex-col gap-0.5 rounded-[11px] border border-border/60 bg-muted/30 p-1.5">
@@ -1712,11 +1712,11 @@ export function SettingsView() {
                       key={ed.id}
                       className="flex items-center justify-between gap-4 px-4 py-2.5"
                     >
-                      <span className="flex items-center gap-2 text-[13px] text-foreground">
+                      <span className="flex items-center gap-2 text-body text-foreground">
                         <EditorIcon id={ed.id} className="h-4 w-4" />
                         {ed.name}
                       </span>
-                      <code className="text-[11px] text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded border border-border/40">
+                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded border border-border/40">
                         {ed.command}
                       </code>
                     </div>
@@ -1742,7 +1742,7 @@ export function SettingsView() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 text-[12px] text-muted-foreground"
+                  className="h-8 text-body-sm text-muted-foreground"
                   onClick={() => setActiveSection("appearance")}
                 >
                   Open Appearance
@@ -1837,11 +1837,11 @@ export function SettingsView() {
                   </SortableContext>
                 </DndContext>
               ) : (
-                <p className="text-[13px] text-muted-foreground">Loading presets…</p>
+                <p className="text-body text-muted-foreground">Loading presets…</p>
               )}
             </SectionGroup>
 
-            <p className="text-[12px] text-muted-foreground/70 leading-relaxed mt-8">
+            <p className="text-body-sm text-muted-foreground/70 leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
               <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">
                 Learn how to configure it for your tools
@@ -2137,8 +2137,8 @@ export function SettingsView() {
             {hasConfigFile && (
               <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
-                <p className="text-[12px] text-muted-foreground/90 leading-relaxed">
-                  A <code className="font-mono text-[11px] bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemux/config.json</code> file was found.
+                <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
+                  A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemux/config.json</code> file was found.
                   File-based configuration takes precedence over these settings.
                 </p>
               </SettingsCard>
@@ -2150,23 +2150,23 @@ export function SettingsView() {
                 helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
                 caption={
                   <>
-                    Create a <code className="font-mono text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file
+                    Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file
                     in your project root to share patterns with your team. When empty, defaults to{" "}
-                    <code className="font-mono text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
+                    <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
                     <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">Learn more</a>
                   </>
                 }
               >
                 {hasIncludeFile && (
                   <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
-                    <p className="text-[12px] text-muted-foreground/90 leading-relaxed">
-                      This project has a <code className="font-mono text-[11px] bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file —
+                    <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
+                      This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
                     </p>
                   </SettingsCard>
                 )}
                 <Textarea
-                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
@@ -2179,7 +2179,7 @@ export function SettingsView() {
                 helper="Runs when a new workspace is created. One command per line."
               >
                 <Textarea
-                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
                   onChange={(e) => setSetupScripts(e.target.value)}
@@ -2192,7 +2192,7 @@ export function SettingsView() {
                 helper="Runs when a workspace is deleted. One command per line."
               >
                 <Textarea
-                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-body min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
                   onChange={(e) => setTeardownScripts(e.target.value)}
@@ -2205,12 +2205,12 @@ export function SettingsView() {
                 helper={
                   <>
                     A command to start your dev server, triggered via{" "}
-                    <kbd className="text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded font-mono">Ctrl+Shift+G</kbd>.
+                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded font-mono">Ctrl+Shift+G</kbd>.
                   </>
                 }
               >
                 <Input
-                  className="font-mono text-[13px] h-9"
+                  className="font-mono text-body h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   onChange={(e) => setRunCommand(e.target.value)}
@@ -2230,8 +2230,8 @@ export function SettingsView() {
                     key={name}
                     className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] items-center gap-4 px-4 py-2"
                   >
-                    <code className="font-mono text-[12px] text-foreground/90 truncate">{name}</code>
-                    <span className="text-[12px] text-muted-foreground/85 truncate">{desc}</span>
+                    <code className="font-mono text-body-sm text-foreground/90 truncate">{name}</code>
+                    <span className="text-body-sm text-muted-foreground/85 truncate">{desc}</span>
                   </div>
                 ))}
               </SettingsCard>
@@ -2362,7 +2362,7 @@ export function SettingsView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <div className="flex items-center gap-2 text-[14px]">
+        <div className="flex items-center gap-2 text-body-lg">
           <span className="font-semibold tracking-tight text-foreground">Settings</span>
           {activeLabel && (
             <>
@@ -2385,7 +2385,7 @@ export function SettingsView() {
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
-                <p className="px-4 pb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+                <p className="px-4 pb-1.5 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
                   {group.label}
                 </p>
                 <div className="space-y-px px-3">
@@ -2490,15 +2490,15 @@ function SortablePresetRow({
       </span>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-[13px] font-medium truncate text-foreground">{preset.name}</span>
+          <span className="text-body font-medium truncate text-foreground">{preset.name}</span>
           {preset.is_builtin && (
-            <Badge variant="secondary" className="text-[9px] px-1.5 py-0 h-4 font-normal uppercase tracking-wider">
+            <Badge variant="secondary" className="text-micro px-1.5 py-0 h-4 font-normal uppercase tracking-wider">
               built-in
             </Badge>
           )}
         </div>
         {preset.commands.length > 0 && (
-          <code className="text-[11px] text-muted-foreground/70 font-mono truncate block mt-0.5">
+          <code className="text-label text-muted-foreground/70 font-mono truncate block mt-0.5">
             {preset.commands[0]}
           </code>
         )}

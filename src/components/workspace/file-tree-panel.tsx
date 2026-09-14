@@ -118,7 +118,7 @@ const TreeNode = memo(function TreeNode({
             ))}
             {children.length === 0 && (
               <p
-                className="py-0.5 text-[10px] italic text-foreground/30"
+                className="py-0.5 text-caption italic text-foreground/30"
                 style={{ paddingLeft: indentOf(depth + 1) }}
               >
                 empty

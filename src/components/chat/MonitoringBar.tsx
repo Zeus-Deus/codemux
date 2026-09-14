@@ -85,7 +85,7 @@ export const MonitoringBar = memo(function MonitoringBar({
           className="size-2 shrink-0 rounded-full bg-status-monitoring"
           aria-hidden
         />
-        <span className="shrink-0 whitespace-nowrap text-[13px] font-bold text-foreground">
+        <span className="shrink-0 whitespace-nowrap text-body font-bold text-foreground">
           Monitoring in the background
         </span>
         {reason ? (
@@ -96,7 +96,7 @@ export const MonitoringBar = memo(function MonitoringBar({
             />
             <span
               data-testid="monitoring-bar-reason"
-              className="min-w-0 flex-1 truncate font-mono text-[12px] text-muted-foreground"
+              className="min-w-0 flex-1 truncate font-mono text-body-sm text-muted-foreground"
             >
               {reason}
             </span>
@@ -110,7 +110,7 @@ export const MonitoringBar = memo(function MonitoringBar({
           size="sm"
           disabled={stopping}
           onClick={handleStop}
-          className="h-[30px] shrink-0 px-2.5 text-[11px] font-semibold"
+          className="h-[30px] shrink-0 px-2.5 text-label font-semibold"
         >
           {stopping ? "Stopping…" : "Stop"}
         </Button>

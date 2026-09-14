@@ -1128,7 +1128,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
             <div className="status-indicator relative size-4 shrink-0">
               <div className="spinner absolute inset-0 rounded-full border-2 border-muted border-t-primary animate-spin" />
               <div
-                className="warning absolute inset-0 rounded-full bg-destructive/90 hidden items-center justify-center text-[10px] font-bold text-destructive-foreground"
+                className="warning absolute inset-0 rounded-full bg-destructive/90 hidden items-center justify-center text-caption font-bold text-destructive-foreground"
                 aria-hidden
               >
                 !

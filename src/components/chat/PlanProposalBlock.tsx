@@ -101,7 +101,7 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
       )}
 
       {allowedPrompts.length > 0 && (
-        <div className="text-[11px] text-muted-foreground/80 space-y-0.5">
+        <div className="text-label text-muted-foreground/80 space-y-0.5">
           <div className="text-muted-foreground">Will run:</div>
           {allowedPrompts.map((p, i) => (
             <div key={i} className="font-mono">

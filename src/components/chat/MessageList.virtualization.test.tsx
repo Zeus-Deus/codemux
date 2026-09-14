@@ -174,11 +174,11 @@ describe("MessageList virtualization & memoization", () => {
     expect(lastListProps.current?.className).toContain(
       "[scrollbar-gutter:stable_both-edges]",
     );
-    const rails = document.querySelectorAll(`.${CSS.escape("max-w-[792px]")}`);
+    const rails = document.querySelectorAll(`.${CSS.escape("max-w-[49.5rem]")}`);
     // Header, the single row, and the footer.
     expect(rails).toHaveLength(3);
     for (const rail of rails) {
-      expect(rail).toHaveClass("mx-auto", "w-full", "max-w-[792px]", "px-4");
+      expect(rail).toHaveClass("mx-auto", "w-full", "max-w-[49.5rem]", "px-4");
     }
   });
 

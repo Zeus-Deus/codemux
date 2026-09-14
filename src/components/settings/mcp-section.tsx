@@ -242,7 +242,7 @@ function ServerGroup({
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {sourceHeading(source)}
         </h3>
-        <span className="text-[10px] text-muted-foreground/70">
+        <span className="text-caption text-muted-foreground/70">
           {servers.length} server{servers.length === 1 ? "" : "s"}
         </span>
       </header>
@@ -327,7 +327,7 @@ function ServerRow({
             <Tooltip>
               <TooltipTrigger asChild>
                 <span
-                  className="text-[10px] text-muted-foreground cursor-help"
+                  className="text-caption text-muted-foreground cursor-help"
                   data-testid={`mcp-row-${server.id}-disambig`}
                 >
                   · {sourceHeading(server.sources[0])}
@@ -340,19 +340,19 @@ function ServerRow({
             </Tooltip>
           )}
           {server.sources.includes("codemux") && (
-            <Badge variant="secondary" className="text-[10px]">
+            <Badge variant="secondary" className="text-caption">
               always on
             </Badge>
           )}
           {server.transport === "http" && (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge variant="outline" className="text-caption">
               HTTP
             </Badge>
           )}
           <McpStatusBadge runtime={runtime} disabled={disabled} server={server} />
           {additionalSources.length > 0 && (
             <span
-              className="text-[10px] text-muted-foreground/80"
+              className="text-caption text-muted-foreground/80"
               data-testid={`mcp-row-${server.id}-extra-sources`}
             >
               also: {additionalSources.map(sourceHeading).join(", ")}
@@ -414,7 +414,7 @@ function McpStatusBadge({
   if (disabled) {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-muted-foreground/80"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="disabled"
       >
@@ -427,7 +427,7 @@ function McpStatusBadge({
   if (!runtime || runtime.status.kind === "discovered") {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-muted-foreground/80"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="discovered"
       >
@@ -443,7 +443,7 @@ function McpStatusBadge({
     const slow = elapsedMs > SLOW_START_THRESHOLD_MS;
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-muted-foreground"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground"
         data-testid={`mcp-row-${server.id}-status`}
         data-status={slow ? "starting-slow" : "starting"}
       >
@@ -456,7 +456,7 @@ function McpStatusBadge({
   if (runtime.status.kind === "running") {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-status-open dark:text-status-open"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-status-open dark:text-status-open"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="running"
       >
@@ -472,7 +472,7 @@ function McpStatusBadge({
       <Tooltip>
         <TooltipTrigger asChild>
           <span
-            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-destructive"
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-destructive"
             data-testid={`mcp-row-${server.id}-status`}
             data-status="errored"
           >
@@ -480,7 +480,7 @@ function McpStatusBadge({
             errored
           </span>
         </TooltipTrigger>
-        <TooltipContent className="max-w-md whitespace-pre-wrap font-mono text-[10px]">
+        <TooltipContent className="max-w-md whitespace-pre-wrap font-mono text-caption">
           {runtime.errorMessage ?? "MCP server error"}
           {tail ? `\n\n${tail}` : ""}
         </TooltipContent>
@@ -491,7 +491,7 @@ function McpStatusBadge({
   // stopped
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-muted-foreground/80"
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-caption text-muted-foreground/80"
       data-testid={`mcp-row-${server.id}-status`}
       data-status="stopped"
     >

@@ -138,7 +138,7 @@ export function ComposerCommandMenu({
             placeholder={placeholder}
             data-testid="composer-command-search"
             className={cn(
-              "flex-1 bg-transparent text-[13px] text-foreground",
+              "flex-1 bg-transparent text-body text-foreground",
               "outline-none placeholder:text-muted-foreground",
             )}
           />
@@ -157,7 +157,7 @@ export function ComposerCommandMenu({
                   "**:[[cmdk-group-heading]]:px-2",
                   "**:[[cmdk-group-heading]]:pt-2 **:[[cmdk-group-heading]]:pb-1",
                   "**:[[cmdk-group-heading]]:font-mono",
-                  "**:[[cmdk-group-heading]]:text-[10px]",
+                  "**:[[cmdk-group-heading]]:text-caption",
                   "**:[[cmdk-group-heading]]:font-semibold",
                   "**:[[cmdk-group-heading]]:uppercase",
                   "**:[[cmdk-group-heading]]:tracking-[0.09em]",
@@ -211,11 +211,11 @@ export function ComposerCommandMenu({
                         )}
                       </span>
                       <span className="flex min-w-0 flex-1 flex-col gap-px">
-                        <span className="truncate text-[13px] font-semibold leading-tight text-foreground">
+                        <span className="truncate text-body font-semibold leading-tight text-foreground">
                           {item.label}
                         </span>
                         {item.description && (
-                          <span className="truncate text-[11px] leading-tight text-muted-foreground">
+                          <span className="truncate text-label leading-tight text-muted-foreground">
                             {item.description}
                           </span>
                         )}
@@ -240,7 +240,7 @@ export function ComposerCommandMenu({
                           {item.rightAdornment}
                         </span>
                       ) : item.command ? (
-                        <span className="ml-auto shrink-0 rounded-[5px] bg-foreground/[0.06] px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                        <span className="ml-auto shrink-0 rounded-[5px] bg-foreground/[0.06] px-1.5 py-0.5 font-mono text-label text-muted-foreground">
                           {item.command}
                         </span>
                       ) : null}
@@ -255,7 +255,7 @@ export function ComposerCommandMenu({
               data-testid="slash-popup-footer"
               data-tone={footerNote.tone}
               className={cn(
-                "border-t border-border/40 px-3 py-2 text-[11px]",
+                "border-t border-border/40 px-3 py-2 text-label",
                 footerNote.tone === "error"
                   ? "text-destructive"
                   : "text-muted-foreground/80",

@@ -53,14 +53,14 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
         <AgentOrb size={20} {...activity} aria-hidden />
       </span>
       <span className="flex min-w-0 items-baseline gap-1.5">
-        <span className="shimmer text-[13px] font-semibold">{label}</span>
+        <span className="shimmer text-body font-semibold">{label}</span>
         {startedAt != null && (
           // Populated imperatively by the effect; render nothing when no
           // turn start is derivable (e.g. hydrated old transcripts) so the
           // marker never shows a bogus number.
           <span
             ref={elapsedRef}
-            className="font-mono text-[11px] tabular-nums text-muted-foreground"
+            className="font-mono text-label tabular-nums text-muted-foreground"
             aria-hidden
           />
         )}

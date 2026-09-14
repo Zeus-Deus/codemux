@@ -88,6 +88,23 @@
     --radius-4xl: calc(var(--radius) + 22px);
 }
 
+/*
+ * UI type scale. Every size is rem so the interface size setting (and its
+ * Ctrl+= / Ctrl+- shortcuts) scales the whole app, not just the few surfaces
+ * that happened to use Tailwind's stock `text-xs`/`text-sm`. Values are for the
+ * default 16px root. The floor is 10px: anything smaller is unreadable on a
+ * 1x desktop display. No `--line-height` companions on purpose — these only set
+ * the size and leave line-height to the element or its `leading-*` utility.
+ */
+@theme {
+    --text-micro: 0.625rem;   /* 10px — tight badges and keycaps */
+    --text-caption: 0.6875rem; /* 11px — mono meta, uppercase eyebrows */
+    --text-label: 0.75rem;    /* 12px — secondary labels, counts */
+    --text-body-sm: 0.8125rem; /* 13px — dense rows, menus */
+    --text-body: 0.875rem;    /* 14px — primary UI text */
+    --text-body-lg: 0.9375rem; /* 15px — emphasized UI text */
+}
+
 :root {
     /* Keep the runtime choices one level below Tailwind's theme names.
      * `@theme inline` then compiles font-sans/font-mono utilities against
@@ -592,8 +609,8 @@ body.pane-resizing iframe {
 .markdown-rendered-inline li { margin: 0.15em 0; }
 /* Doubled class beats the document-scale `.markdown-rendered code`
  * rules below, which otherwise win on source order. */
-.markdown-rendered.markdown-rendered-inline pre { font-size: 12.5px; padding: 0.5em 0.6em; margin: 0.5em 0; }
-.markdown-rendered.markdown-rendered-inline code { font-size: 13px; }
+.markdown-rendered.markdown-rendered-inline pre { font-size: var(--font-size-code); padding: 0.5em 0.6em; margin: 0.5em 0; }
+.markdown-rendered.markdown-rendered-inline code { font-size: var(--font-size-code); }
 
 .markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3,
 .markdown-rendered h4, .markdown-rendered h5, .markdown-rendered h6 {
@@ -640,7 +657,7 @@ body.pane-resizing iframe {
 .markdown-rendered pre code {
   background: none;
   padding: 0;
-  font-size: 13px;
+  font-size: var(--font-size-code);
   line-height: 1.5;
 }
 .markdown-rendered hr {
@@ -652,7 +669,7 @@ body.pane-resizing iframe {
   border-collapse: collapse;
   margin: 0.75em 0;
   width: 100%;
-  font-size: 13px;
+  font-size: var(--text-body);
 }
 .markdown-rendered th, .markdown-rendered td {
   border: 1px solid var(--border);
@@ -713,7 +730,7 @@ body.pane-resizing iframe {
   gap: 0.4rem;
   border-radius: 3px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-label);
   line-height: 1;
 }
 

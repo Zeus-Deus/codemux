@@ -145,11 +145,11 @@ export function ContextUsageMeter({
 
         <PopoverContent side="top" align="end" className="w-64 p-3">
           <div className="flex items-baseline justify-between gap-2">
-            <span className="text-[11px] font-medium text-muted-foreground">
+            <span className="text-label font-medium text-muted-foreground">
               Context Window
             </span>
             <span
-              className="font-mono text-[11px] tabular-nums text-foreground"
+              className="font-mono text-label tabular-nums text-foreground"
               data-testid="context-usage-readout"
             >
               {readout}
@@ -180,17 +180,17 @@ export function ContextUsageMeter({
               className="mt-2.5 flex items-baseline justify-between gap-2"
               data-testid="context-usage-total-processed"
             >
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-label text-muted-foreground">
                 Total processed
               </span>
-              <span className="font-mono text-[11px] tabular-nums text-foreground">
+              <span className="font-mono text-label tabular-nums text-foreground">
                 {formatContextTokens(totalProcessedTokens)}
               </span>
             </div>
           )}
 
           {compactsAutomatically && (
-            <p className="mt-2.5 text-[11px] leading-snug text-muted-foreground">
+            <p className="mt-2.5 text-label leading-snug text-muted-foreground">
               {providerLabel ?? "The agent"} automatically compacts its context
               when needed.
             </p>
