@@ -1553,10 +1553,11 @@ describe("SidebarInbox — settle / un-settle", () => {
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
     // The grid tracks are the row's only column widths — 56px fits a 4-digit
-    // ref like `#1234`, 64px fits the hover-revealed Un-settle button. The
-    // slots themselves must not restate either number, or the two copies drift.
+    // ref like `#1234`, 48px fits the age label and the text-only Un-settle
+    // button. The slots themselves must not restate either number, or the two
+    // copies drift.
     expect(row.className).toContain(
-      "grid-cols-[auto_minmax(0,1fr)_56px_64px]",
+      "grid-cols-[auto_minmax(0,1fr)_56px_48px]",
     );
     const prSlot = row.querySelector("[data-settled-pr-slot]") as HTMLElement;
     const metaSlot = row.querySelector(

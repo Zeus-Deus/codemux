@@ -8,7 +8,6 @@ import {
   FolderOpen,
   FolderPlus,
   Loader2,
-  Undo2,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
@@ -577,11 +576,12 @@ const SettledRow = memo(function SettledRow({
         // carry no widths of their own. Both fixed tracks are measured, not
         // guessed: the PR badge is `px-1` (8px) + a 12px icon + a 4px gap + a
         // 10px JetBrains Mono ref, which is 6px per glyph, so `#1234` needs
-        // 54px and 56px leaves it a hair of slack. The meta track holds the
-        // hover-revealed Un-settle button (62.7px at 10.5px DM Sans semibold
-        // with its 10px glyph and gap), so 64px keeps that control inside its
-        // own column instead of reaching left across the PR badge's hit area.
-        "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_56px_64px] items-center gap-2 rounded-lg px-2",
+        // 54px and 56px leaves it a hair of slack. The meta track is sized to
+        // the age label, not to the hover control: the widest common label
+        // (`14h19m`, six 6.6px glyphs) is ~40px, and the text-only Un-settle
+        // button is ~49px, so 48px fits both without leaving a wide gutter
+        // between the PR badge and the age at rest.
+        "group/settled grid h-[30px] cursor-pointer grid-cols-[auto_minmax(0,1fr)_56px_48px] items-center gap-2 rounded-lg px-2",
         // Same off-screen containment as the cards (see `SidebarInboxCard`):
         // the Settled shelf is the list that actually grows without bound, and
         // paging only limits what is *rendered*, not what the forced-visible
@@ -706,7 +706,8 @@ const SettledRow = memo(function SettledRow({
             // read as a second object competing with the row rather than as the
             // row's own affordance. The word stays — this is the one control on
             // the shelf that changes a lifecycle, and an undo arrow alone is too
-            // close to "go back" to be trusted with it.
+            // close to "go back" to be trusted with it. The word alone is also
+            // what lets the meta column stay as narrow as the age label.
             // Filling the slot (`inset-0`, right-aligned content) makes the
             // control's hit area exactly its own column — never a pixel of it
             // over the PR badge next door.
@@ -716,7 +717,6 @@ const SettledRow = memo(function SettledRow({
             "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
           )}
         >
-          <Undo2 className="size-2.5" strokeWidth={1.7} />
           Un-settle
         </button>
       </div>
