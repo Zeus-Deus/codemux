@@ -17,7 +17,7 @@ import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER } from "./footer-trigger";
+import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
 import { refreshProviderCapabilitiesForIntent } from "@/stores/provider-capabilities-store";
 
 // The model list + default-model / label helpers moved to
@@ -68,6 +68,8 @@ interface Props {
    *  `/model` slash command fires. `0` / `undefined` means "no
    *  request yet"; any increment pops the picker open. */
   openSignal?: number;
+  /** Narrow composer: show only the model's leaf name. */
+  leafLabel?: boolean;
 }
 
 export function ModelPicker({
@@ -76,6 +78,7 @@ export function ModelPicker({
   onChange,
   disabled,
   openSignal,
+  leafLabel = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const list = modelsForProvider(provider);
@@ -109,7 +112,9 @@ export function ModelPicker({
         >
           <ProviderLogo provider={provider} className="h-4 w-4" />
           <span className="max-w-[140px] truncate">
-            {modelLabel(provider, current)}
+            {leafLabel
+              ? leafModelName(modelLabel(provider, current))
+              : modelLabel(provider, current)}
           </span>
           <ChevronDown
             className="-mx-0.5 h-3.5 w-3.5 opacity-70"

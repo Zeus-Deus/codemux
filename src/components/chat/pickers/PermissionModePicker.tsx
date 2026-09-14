@@ -40,6 +40,9 @@ interface Props {
    *  footer) so the pipe disappears together with the control when the
    *  capability gate hides it — no orphaned separators. */
   withSeparator?: boolean;
+  /** Narrow composer: keep the lock icon, drop the text label (kept as
+   *  the tooltip and accessible name). */
+  iconOnly?: boolean;
 }
 
 function modeLabel(modes: PermissionModeOption[], value: string): string {
@@ -52,6 +55,7 @@ export function PermissionModePicker({
   onChange,
   disabled,
   withSeparator,
+  iconOnly = false,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -74,9 +78,17 @@ export function PermissionModePicker({
       )}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
+          <button
+            type="button"
+            disabled={disabled}
+            className={FOOTER_TRIGGER}
+            aria-label={iconOnly ? `Access: ${label}` : undefined}
+            title={iconOnly ? `Access: ${label}` : undefined}
+          >
             <Lock className="h-4 w-4" />
-            <span className="max-w-[140px] truncate">{label}</span>
+            {!iconOnly && (
+              <span className="max-w-[140px] truncate">{label}</span>
+            )}
             <ChevronDown className="h-3 w-3 opacity-50" />
           </button>
         </PopoverTrigger>

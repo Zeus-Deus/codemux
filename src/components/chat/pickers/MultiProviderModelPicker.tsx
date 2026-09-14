@@ -42,7 +42,7 @@ import type {
 
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER } from "./footer-trigger";
+import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -191,6 +191,9 @@ interface Props {
    *  `/model` slash command fires. `0` / `undefined` means "no
    *  request yet"; any increment pops the picker open. */
   openSignal?: number;
+  /** Narrow composer: drop the sub-provider prefix and show only the
+   *  model's leaf name. */
+  leafLabel?: boolean;
 }
 
 interface ResolvedRow {
@@ -219,6 +222,7 @@ export function MultiProviderModelPicker({
   disabled,
   allowedProviders,
   openSignal,
+  leafLabel = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
@@ -453,7 +457,9 @@ export function MultiProviderModelPicker({
         >
           <ProviderLogo provider={provider} className="h-4 w-4" />
           <span className="max-w-[180px] truncate">
-            {triggerSubtitle ? (
+            {leafLabel ? (
+              leafModelName(triggerLabel)
+            ) : triggerSubtitle ? (
               <>
                 <span className="opacity-70">{triggerSubtitle}</span>
                 <span aria-hidden className="mx-1 opacity-40">

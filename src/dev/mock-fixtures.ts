@@ -535,8 +535,8 @@ const wsCodemuxChatLive = (() => {
 export const MOCK_MONITORING_THREAD_ID = "thread-mock-monitoring";
 
 /** Reason string the seeded monitoring pane carries, as if an agent had run
- *  `codemux monitor start --reason "…"`. Surfaces in the docked
- *  `MonitoringBar` title and proves the reason plumbing end to end. */
+ *  `codemux monitor start --reason "…"`. Surfaces in the composer strip's
+ *  monitoring row and proves the reason plumbing end to end. */
 export const MOCK_MONITORING_REASON = "CI checks on PR #482";
 
 /** Monitoring demo: a chat agent that

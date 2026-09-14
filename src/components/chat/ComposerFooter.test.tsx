@@ -98,18 +98,56 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(btn).toBeInTheDocument();
   });
 
-  it("the + button matches the Send button shape (h-8 w-8 circle)", () => {
+  it("the + button matches the Send button shape (34px circle)", () => {
     renderFooter({ onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");
     const send = screen.getByRole("button", { name: "Send" });
     // Both share the same fixed circle dimensions; identical shape
     // is what makes them read as a visual pair.
-    expect(attach.className).toContain("h-8");
-    expect(attach.className).toContain("w-8");
+    expect(attach.className).toContain("h-[34px]");
+    expect(attach.className).toContain("w-[34px]");
     expect(attach.className).toContain("rounded-full");
-    expect(send.className).toContain("h-8");
-    expect(send.className).toContain("w-8");
+    expect(send.className).toContain("h-[34px]");
+    expect(send.className).toContain("w-[34px]");
     expect(send.className).toContain("rounded-full");
+  });
+
+  it("pins attach left and the session controls + send right, around a flexible gap", () => {
+    renderFooter({ onAttachClick: vi.fn(), gap: <span>gap text</span> });
+    const row = screen.getByTestId("composer-controls-row");
+    const gap = screen.getByTestId("composer-gap");
+    const attach = screen.getByTestId("composer-attach-button");
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(row.className).toContain("h-[42px]");
+    expect(gap.className).toContain("flex-1");
+    expect(gap).toHaveTextContent("gap text");
+    expect(row.firstElementChild).toBe(attach);
+    expect(attach.nextElementSibling).toBe(gap);
+    expect(gap.nextElementSibling).toContain(send);
+    expect(gap.nextElementSibling).toContain(
+      screen.getByRole("button", { name: /Full access/i }),
+    );
+  });
+
+  it("drops the context ring when told to (collapsed pill)", () => {
+    renderFooter({
+      contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
+      showContextMeter: false,
+    });
+    expect(screen.queryByTestId("context-usage-trigger")).toBeNull();
+  });
+
+  it("width ladder: access goes icon-only, then both leave the row", () => {
+    const { rerender } = renderFooter({ accessIconOnly: true });
+    const access = screen.getByRole("button", { name: /Access: Full access/i });
+    expect(access).not.toHaveTextContent("Full access");
+
+    rerender(
+      <TooltipProvider>
+        <ComposerFooter {...baseProps()} configInMenu />
+      </TooltipProvider>,
+    );
+    expect(screen.queryByRole("button", { name: /Full access/i })).toBeNull();
   });
 
   it("the + button is hidden when onAttachClick is omitted (back-compat)", () => {
@@ -252,35 +290,35 @@ describe("ComposerFooter — context-window meter", () => {
     expect(screen.queryByTestId("context-usage-trigger")).toBeNull();
   });
 
-  it("renders the meter immediately before the Send button", () => {
+  it("renders the meter at the gap's trailing edge, outside the pinned right cluster", () => {
     renderFooter({
       contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
     });
     const meter = screen.getByTestId("context-usage-trigger");
+    const gap = screen.getByTestId("composer-gap");
     const send = screen.getByRole("button", { name: "Send" });
-    expect(meter).toBeInTheDocument();
-    // Same cluster, meter first — the readout is passed on the way to
-    // the send control.
-    expect(meter.parentElement).toBe(send.parentElement);
-    expect(meter.nextElementSibling).toBe(send);
     expect(meter).toHaveAttribute("aria-label", "Context window 22% used");
+    // Inside the gap, so showing / hiding it never moves the controls.
+    expect(gap.contains(meter)).toBe(true);
+    expect(gap.contains(send)).toBe(false);
   });
 
-  it("sits before the Stop button while streaming", () => {
+  it("stays out of the right cluster while streaming", () => {
     renderFooter({
       streaming: true,
       contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
     });
     const meter = screen.getByTestId("context-usage-trigger");
     const stop = screen.getByRole("button", { name: "Stop" });
-    expect(meter.nextElementSibling).toBe(stop);
+    expect(screen.getByTestId("composer-gap").contains(meter)).toBe(true);
+    expect(stop.parentElement?.contains(meter)).toBe(false);
   });
 
   it("matches the send button's circle shape", () => {
     renderFooter({ contextUsage: { used_tokens: 1_000, max_tokens: 200_000 } });
     const meter = screen.getByTestId("context-usage-trigger");
-    expect(meter.className).toContain("h-8");
-    expect(meter.className).toContain("w-8");
+    expect(meter.className).toContain("h-[34px]");
+    expect(meter.className).toContain("w-[34px]");
     expect(meter.className).toContain("rounded-full");
   });
 

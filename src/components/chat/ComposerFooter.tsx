@@ -6,6 +6,7 @@ import {
   Plus,
   Square,
 } from "lucide-react";
+import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -21,6 +22,11 @@ import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
+
+/** 34px circle shared by attach / send / stop so the row's two ends sit on
+ *  one optical baseline, concentric with the 44px pill (5px inset). */
+const ROUND_CONTROL =
+  "inline-flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-full";
 
 interface Props {
   provider: AgentChatProviderKind;
@@ -40,11 +46,8 @@ interface Props {
    *  the draft surface to avoid exposing a no-op Stop affordance
    *  mid-materialise. Defaults to true (existing behaviour). */
   showStopButton?: boolean;
-  /** Active composer mode. The footer no longer renders a mode
-   *  selector or pill (both moved out of the footer in Stage 3
-   *  refactor — modes live in the `+` popup, pill renders above the
-   *  textarea); the value is still needed here to disable the
-   *  permission picker when a mode commandeers permissions. */
+  /** Active composer mode. Needed here to disable the permission picker
+   *  when a mode pill commandeers permissions. */
   mode: ChatMode;
   onProviderModelChange: (
     provider: AgentChatProviderKind,
@@ -62,31 +65,44 @@ interface Props {
    *  attachment affordance. This lets an active provider turn keep accepting
    *  queued follow-ups while its native session configuration is frozen. */
   configurationDisabled?: boolean;
-  /** Step 8 Stage 3 — toggles the attach popup. Optional so existing
-   *  call sites keep compiling; when omitted the `+` button is hidden. */
+  /** Toggles the attach popup. When omitted the `+` button is hidden. */
   onAttachClick?: () => void;
-  /** Whether the attach popup is currently open. Drives the button's
-   *  pressed visual state. */
+  /** Whether the attach popup is currently open. */
   attachOpen?: boolean;
-  /** Imperative model-picker open request from the composer's
-   *  `/model` slash command. Forwarded to whichever picker variant
-   *  renders. Optional; omitted by call sites that predate `/model`. */
+  /** Imperative model-picker open request from `/model`. */
   modelPickerOpenSignal?: number;
-  /** Latest context-window occupancy for the thread. Optional and
-   *  defaulting to `null`: surfaces without a live session (the draft
-   *  surface) simply never pass it, and the meter stays unrendered so
-   *  the footer's right cluster keeps its current geometry. */
+  /** Latest context-window occupancy for the thread. `null` renders no
+   *  meter. */
   contextUsage?: ContextUsageSnapshot | null;
-  /** Capability-registry window size, used to paint the meter before
-   *  the provider's first usage report arrives. */
   contextUsageSeedMaxTokens?: number | null;
-  /** Display name of the agent for the meter's auto-compaction note. */
   contextUsageProviderLabel?: string | null;
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
+  /** Content for the flexible gap between the attach button and the
+   *  right-pinned controls: the placeholder while the pill is collapsed,
+   *  "Enter to queue" while expanded. */
+  gap?: ReactNode;
+  /** Pointer-down on the gap — the composer focuses its textarea. */
+  onGapPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  /** The context ring lives in the expanded card only. Defaults to true. */
+  showContextMeter?: boolean;
+  /** Width ladder: model label shortens to its leaf name. */
+  modelLeafLabel?: boolean;
+  /** Width ladder: effort drops its text label. */
+  effortIconOnly?: boolean;
+  /** Width ladder: access drops its text label. */
+  accessIconOnly?: boolean;
+  /** Width ladder: effort + access leave the row for the `+` menu. */
+  configInMenu?: boolean;
 }
 
+/**
+ * The composer's single controls row. Identical geometry in the collapsed
+ * pill and the expanded card, so nothing moves horizontally when the
+ * textarea opens above it: attach pinned left, model / effort / access and
+ * send pinned right, a flexible gap in between.
+ */
 export function ComposerFooter({
   provider,
   model,
@@ -122,108 +138,82 @@ export function ComposerFooter({
   tasks = null,
   tasksOpen = false,
   onTasksClick,
+  gap = null,
+  onGapPointerDown,
+  showContextMeter = true,
+  modelLeafLabel = false,
+  effortIconOnly = false,
+  accessIconOnly = false,
+  configInMenu = false,
 }: Props) {
   const modeIsActive = mode !== "default";
 
   return (
-    <div className="flex items-center gap-1.5 px-2 pb-2 pt-1">
-      <div className="flex flex-wrap items-center gap-1 min-w-0">
-        {onAttachClick && (
-          <button
-            type="button"
-            onClick={onAttachClick}
-            disabled={controlsDisabled}
-            data-testid="composer-attach-button"
-            data-open={attachOpen || undefined}
-            className={cn(
-              // Visually paired with the Send button: same circle
-              // diameter, same icon weight. Subtle muted fill so
-              // the bold filled Send still reads as the primary
-              // action on the right.
-              "inline-flex h-8 w-8 items-center justify-center rounded-full",
-              // Transparent base border keeps the circle diameter fixed
-              // (border-box) so the open state can add an ember border
-              // without a 1px layout shift.
-              "border border-transparent",
-              "bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
-              // Open (command menu showing): the ember active treatment
-              // — ember-tinted fill, ember border, ember icon — matches
-              // the redesign so the trigger reads as "armed".
-              "data-[open=true]:border-accent-ember/45 data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
-              "disabled:opacity-40 disabled:pointer-events-none",
-            )}
-            aria-label="Attach"
-            aria-expanded={attachOpen}
-            title="Attach (file, folder, mode, …)"
-          >
-            <Plus className="h-4 w-4" strokeWidth={2.25} />
-          </button>
-        )}
+    <div
+      data-testid="composer-controls-row"
+      className="flex h-[42px] shrink-0 items-center gap-1 px-1"
+    >
+      {onAttachClick && (
+        <button
+          type="button"
+          onClick={onAttachClick}
+          disabled={controlsDisabled}
+          data-testid="composer-attach-button"
+          data-open={attachOpen || undefined}
+          className={cn(
+            ROUND_CONTROL,
+            // Transparent base border keeps the diameter fixed so the open
+            // state's ember border causes no 1px shift.
+            "border border-transparent",
+            "bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
+            "data-[open=true]:border-accent-ember/45 data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
+            "disabled:opacity-40 disabled:pointer-events-none",
+          )}
+          aria-label="Attach"
+          aria-expanded={attachOpen}
+          title="Attach (file, folder, mode, …)"
+        >
+          <Plus className="h-4 w-4" strokeWidth={2.25} />
+        </button>
+      )}
 
-        {/* Step 12 Stage 4 — when the unified provider+model picker is
-            enabled (chat panes with `ENABLE_PROVIDER_PICKER`), render
-            the new `MultiProviderModelPicker` and skip the legacy
-            single-provider `ModelPicker`. `ModelPicker` remains as the
-            fallback for callers that deliberately disable the unified
-            provider surface. */}
-        {showProviderPicker ? (
-          <MultiProviderModelPicker
-            provider={provider}
-            model={model}
-            onProviderModelChange={onProviderModelChange}
-            disabled={configurationDisabled}
-            openSignal={modelPickerOpenSignal}
-          />
-        ) : (
-          <ModelPicker
-            provider={provider}
-            value={model}
-            onChange={onModelChange}
-            disabled={configurationDisabled}
-            openSignal={modelPickerOpenSignal}
-          />
+      <div
+        data-testid="composer-gap"
+        onPointerDown={onGapPointerDown}
+        className="flex h-full min-w-0 flex-1 cursor-text items-center gap-2 pl-2"
+      >
+        <div className="flex min-w-0 flex-1 items-center">{gap}</div>
+        {/* The ring rides the gap's trailing edge rather than the right
+            cluster, so it can appear in the expanded card without nudging
+            the pinned controls off their collapsed x positions. Its own
+            clicks must not fall through to the gap's focus handler. */}
+        {showContextMeter && (
+          <div
+            className="flex shrink-0 items-center"
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <ContextUsageMeter
+              usage={contextUsage}
+              seedMaxTokens={contextUsageSeedMaxTokens}
+              providerLabel={contextUsageProviderLabel}
+            />
+          </div>
         )}
-        <ReasoningPicker
-          model={activeModel}
-          effortValue={effort}
-          contextWindowValue={contextWindow}
-          labelMap={effortLabelMap}
-          ultrathinkInBodyText={ultrathinkInBodyText}
-          fastMode={fastMode}
-          onEffortChange={onEffortChange}
-          onContextWindowChange={onContextWindowChange}
-          onFastModeChange={onFastModeChange}
-          disabled={configurationDisabled}
-          withSeparator
-        />
-        {/* Permission picker stays visible when a mode pill is
-            active — kept on-screen for discoverability — but goes
-            disabled so users can't override the pill's setting and
-            create a conflicting state. The pill still commandeers
-            the live SDK permissionMode; this control re-enables the
-            moment the pill is removed. */}
-        <PermissionModePicker
-          modes={permissionModes}
-          value={permissionMode}
-          onChange={onPermissionModeChange}
-          disabled={configurationDisabled || modeIsActive}
-          withSeparator
-        />
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1">
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
-            <span className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
-            {/* Same slot, but the control reports run state instead of
-                reading as a setting: amber + spinner while a step is in
-                flight, green + check when the plan is complete, muted
-                checklist glyph before the run starts. Keep its state
-                treatment borderless like the other footer controls. */}
+            {/* Reports run state rather than reading as a setting: amber +
+                spinner while a step is in flight, green + check when the
+                plan is complete, muted checklist before the run starts. */}
             <button
               type="button"
               onClick={onTasksClick}
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
               className={cn(
-                "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-sm font-medium leading-none transition-colors",
+                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-sm font-medium leading-none transition-colors",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -246,39 +236,64 @@ export function ComposerFooter({
                 {tasks.completed}/{tasks.total}
               </span>
             </button>
+            <span className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
           </>
         )}
-        {/* Host (Local / Remote) is a *workspace* property, not a
-            chat-session property: pushing a workspace to a remote
-            via right-click ships every pane it contains together —
-            terminals, browsers, and the chat pane. A pill in this
-            row would sit next to per-session controls (model,
-            effort, permission) and teach the wrong mental model.
-            When agent-chat-on-remote ships, the natural place for
-            the DevicePicker is `DraftChatSurface`'s zone1Override
-            (alongside the project + worktree pickers) — that's where
-            "where will this materialize" decisions already live. */}
-      </div>
-      {/* Right cluster: ambient context-window readout sits immediately
-          left of the send/stop control, so "how full is the window" is
-          read on the way to pressing send. */}
-      <div className="ml-auto flex items-center gap-1">
-        <ContextUsageMeter
-          usage={contextUsage}
-          seedMaxTokens={contextUsageSeedMaxTokens}
-          providerLabel={contextUsageProviderLabel}
-        />
+
+        {showProviderPicker ? (
+          <MultiProviderModelPicker
+            provider={provider}
+            model={model}
+            onProviderModelChange={onProviderModelChange}
+            disabled={configurationDisabled}
+            openSignal={modelPickerOpenSignal}
+            leafLabel={modelLeafLabel}
+          />
+        ) : (
+          <ModelPicker
+            provider={provider}
+            value={model}
+            onChange={onModelChange}
+            disabled={configurationDisabled}
+            openSignal={modelPickerOpenSignal}
+            leafLabel={modelLeafLabel}
+          />
+        )}
+        {!configInMenu && (
+          <>
+            <ReasoningPicker
+              model={activeModel}
+              effortValue={effort}
+              contextWindowValue={contextWindow}
+              labelMap={effortLabelMap}
+              ultrathinkInBodyText={ultrathinkInBodyText}
+              fastMode={fastMode}
+              onEffortChange={onEffortChange}
+              onContextWindowChange={onContextWindowChange}
+              onFastModeChange={onFastModeChange}
+              disabled={configurationDisabled}
+              withSeparator
+              iconOnly={effortIconOnly}
+            />
+            {/* Stays visible while a mode pill is active (discoverability)
+                but disabled, so it can't fight the pill's setting. */}
+            <PermissionModePicker
+              modes={permissionModes}
+              value={permissionMode}
+              onChange={onPermissionModeChange}
+              disabled={configurationDisabled || modeIsActive}
+              withSeparator
+              iconOnly={accessIconOnly}
+            />
+          </>
+        )}
+
         {streaming && showStopButton ? (
           <button
             type="button"
             onClick={onStop}
             className={cn(
-              // Streaming interrupt: a saturated red circle (design's
-              // `color-mix(red 85%, fg)`) so the stop affordance reads
-              // as the one destructive action in the row. Distinct from
-              // the neutral near-white Send so an in-flight turn is
-              // obvious at a glance.
-              "inline-flex h-8 w-8 items-center justify-center rounded-full",
+              ROUND_CONTROL,
               "bg-destructive/90 text-destructive-foreground shadow-xs shadow-destructive/25",
               "transition-all duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
@@ -293,10 +308,7 @@ export function ComposerFooter({
             onClick={onSubmit}
             disabled={!canSubmit || streaming}
             className={cn(
-              // Primary action: near-white filled circle with a soft
-              // tinted glow, a 150ms hover lift (scale) and a plain
-              // opacity fade when there's nothing to send.
-              "inline-flex h-8 w-8 items-center justify-center rounded-full",
+              ROUND_CONTROL,
               "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
               "transition-all duration-150 hover:scale-105 hover:bg-primary active:scale-100",
               "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",

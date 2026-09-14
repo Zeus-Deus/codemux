@@ -1842,7 +1842,7 @@ const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
     workflowCompleteEnvelopes(MOCK_WORKFLOW_COMPLETE_THREAD_ID),
   // Not a workflow, but it rides the same seeded-thread machinery: a
   // finished turn plus a live watch loop, so the pane settles to the calm
-  // `monitoring` status and the docked MonitoringBar is reachable.
+  // `monitoring` status and the composer strip's monitoring row is reachable.
   [MOCK_MONITORING_THREAD_ID]: () =>
     monitoringEnvelopes(MOCK_MONITORING_THREAD_ID),
 };
@@ -3930,9 +3930,9 @@ const handlers: Record<string, Handler> = {
     const { threadId } = a as { threadId: string };
     return interruptMockChatTurn(threadId);
   },
-  // The docked MonitoringBar's Stop. Mirrors the real backend closely
+  // The composer strip's monitoring Stop. Mirrors the real backend closely
   // enough to be demoable: clear the pane's `monitoring` status + its
-  // manual-monitor reason, then re-emit so the bar unmounts and the
+  // manual-monitor reason, then re-emit so the row leaves and the
   // sidebar badge clears in one frame.
   agent_chat_stop_monitoring: (a) => {
     // `threadId` is nullable: a pane can be flagged monitoring with no chat

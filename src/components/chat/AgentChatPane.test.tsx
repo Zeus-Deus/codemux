@@ -208,7 +208,7 @@ vi.mock("./Composer", () => ({
   Composer: ({
     zone1Override,
     belowComposerSlot,
-    topStripSlot,
+    stripSlot,
     onSubmit,
     onStop,
     onContinueRun,
@@ -231,7 +231,7 @@ vi.mock("./Composer", () => ({
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
-    topStripSlot?: React.ReactNode;
+    stripSlot?: React.ReactNode;
     onSubmit: () => void;
     onStop: () => void;
     onContinueRun?: () => void;
@@ -270,10 +270,10 @@ vi.mock("./Composer", () => ({
         value={draft}
         onChange={(event) => onDraftChange(event.currentTarget.value)}
       />
-      {/* The running-subagents strip is welded inside the real composer's
-          top edge, so the mock has to render the slot for the pane's
-          drill-in visibility rule to be observable. */}
-      <div data-testid="composer-top-strip">{topStripSlot}</div>
+      {/* The real composer docks the strip above its pill, so the mock
+          has to render the slot for the pane's drill-in visibility rule to
+          be observable. */}
+      <div data-testid="composer-top-strip">{stripSlot}</div>
       <div data-testid="zone1">{zone1Override}</div>
       <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
@@ -1243,24 +1243,20 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
 
   it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", () => {
     const { container } = render(<AgentChatPane pane={pane} />);
-    // Orchestrator mode: one live subagent — the strip is up, and it is
-    // mounted inside the composer rather than docked above it.
+    // Orchestrator mode: one live subagent — the strip is up, handed to
+    // the composer through its strip slot.
+    const runningRow =
+      '[data-testid="composer-strip-row"][data-kind="running"]';
     expect(
-      container.querySelector(
-        '[data-testid="composer-top-strip"] [data-testid="subagent-activity-bar"]',
-      ),
+      container.querySelector(`[data-testid="composer-top-strip"] ${runningRow}`),
     ).not.toBeNull();
 
     fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
     // Design: the strip only shows in the conversation view.
-    expect(
-      container.querySelector('[data-testid="subagent-activity-bar"]'),
-    ).toBeNull();
+    expect(container.querySelector('[data-testid="composer-strip"]')).toBeNull();
 
     fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      container.querySelector('[data-testid="subagent-activity-bar"]'),
-    ).not.toBeNull();
+    expect(container.querySelector(runningRow)).not.toBeNull();
   });
 });
 

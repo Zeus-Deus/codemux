@@ -138,8 +138,14 @@ import {
 } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
-import { MonitoringBar } from "./MonitoringBar";
-import { SubagentActivityBar } from "./SubagentActivityBar";
+import { ComposerStrip } from "./ComposerStrip";
+import {
+  queuedMessages,
+  queuedOccupant,
+  sessionErrorOccupant,
+  useMonitoringOccupant,
+  useSubagentOccupant,
+} from "./use-composer-strip-occupants";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
@@ -3461,6 +3467,118 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       />
     ) : null;
 
+  // ── Composer strip ──
+  // One strip above the pill for everything pending: session error,
+  // monitoring, running / just-finished subagents, queued follow-ups. The
+  // strip picks the lead occupant; these only describe what exists.
+  const subagentOccupant = useSubagentOccupant({
+    messages,
+    threadId,
+    streaming: transcriptStreaming,
+    onJump: handleJumpToSubagentCard,
+  });
+  const monitoringOccupant = useMonitoringOccupant({
+    monitoring: !!isMonitoring,
+    reason: monitoringReason,
+    threadId,
+    onStop: handleStopMonitoring,
+  });
+  const queued = useMemo(() => queuedMessages(messages), [messages]);
+  const errorOccupant = useMemo(
+    () => sessionErrorOccupant(messages, transcriptStreaming),
+    [messages, transcriptStreaming],
+  );
+  // Hidden in a subagent drill-in: the design only shows it in the
+  // conversation view. Keyed by thread so the open list never leaks
+  // across a thread switch.
+  const stripEl = enteredSubagent ? null : (
+    <ComposerStrip
+      key={threadId ?? "no-thread"}
+      occupants={[
+        errorOccupant,
+        monitoringOccupant,
+        subagentOccupant,
+        queuedOccupant(queued, handleCancelQueued),
+      ]}
+    />
+  );
+
+  // A file drag anywhere over the pane turns a collapsed composer pill into
+  // a drop target. Counted, so crossing child elements doesn't flicker.
+  const [paneDragDepth, setPaneDragDepth] = useState(0);
+  const handlePaneDragEnter = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    setPaneDragDepth((depth) => depth + 1);
+  }, []);
+  const handlePaneDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    setPaneDragDepth((depth) => Math.max(0, depth - 1));
+  }, []);
+  const resetPaneDrag = useCallback(() => setPaneDragDepth(0), []);
+  useEffect(() => {
+    if (paneDragDepth === 0) return;
+    window.addEventListener("dragend", resetPaneDrag);
+    window.addEventListener("drop", resetPaneDrag);
+    return () => {
+      window.removeEventListener("dragend", resetPaneDrag);
+      window.removeEventListener("drop", resetPaneDrag);
+    };
+  }, [paneDragDepth, resetPaneDrag]);
+
+  // Pin the transcript across composer height changes (the pill expanding,
+  // the strip opening): the content just above the composer stays put
+  // instead of sliding under it, and a reader at the live edge stays there.
+  const paneRootRef = useRef<HTMLDivElement | null>(null);
+  const composerRegionRef = useRef<HTMLDivElement | null>(null);
+  const hasTranscript = messages.length > 0 && !enteredSubagent;
+  useEffect(() => {
+    if (!hasTranscript) return;
+    const region = composerRegionRef.current;
+    const root = paneRootRef.current;
+    if (!region || !root || typeof ResizeObserver === "undefined") return;
+
+    let viewport: HTMLElement | null = null;
+    // Geometry as of the last scroll: by the time the observer fires, the
+    // viewport has already resized and the browser may have clamped it.
+    let prevTop = 0;
+    let prevClient = 0;
+    const snapshot = () => {
+      if (!viewport) return;
+      prevTop = viewport.scrollTop;
+      prevClient = viewport.clientHeight;
+    };
+    const bind = () => {
+      const next = root.querySelector<HTMLElement>(
+        "[data-transcript-viewport]",
+      );
+      if (next === viewport) return;
+      viewport?.removeEventListener("scroll", snapshot);
+      viewport = next;
+      viewport?.addEventListener("scroll", snapshot, { passive: true });
+      snapshot();
+    };
+
+    let lastHeight = region.getBoundingClientRect().height;
+    bind();
+    const observer = new ResizeObserver(() => {
+      const height = region.getBoundingClientRect().height;
+      const delta = height - lastHeight;
+      lastHeight = height;
+      bind();
+      if (!viewport || delta === 0) return;
+      const wasAtEnd = prevTop >= viewport.scrollHeight - prevClient - 2;
+      viewport.scrollTop = wasAtEnd
+        ? viewport.scrollHeight
+        : Math.max(0, prevTop + delta);
+      snapshot();
+    });
+    observer.observe(region);
+    return () => {
+      observer.disconnect();
+      viewport?.removeEventListener("scroll", snapshot);
+    };
+  }, [hasTranscript]);
+
   const composerEl = (
     <Composer
       draft={draft}
@@ -3481,19 +3599,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
-      // Running-subagents strip, welded flush inside the composer's top
-      // edge. Hidden in a subagent drill-in (the design only shows it in
-      // the conversation view) and null while nothing is running.
-      topStripSlot={
-        enteredSubagent ? null : (
-          <SubagentActivityBar
-            messages={messages}
-            threadId={threadId}
-            streaming={transcriptStreaming}
-            onJump={handleJumpToSubagentCard}
-          />
-        )
-      }
+      stripSlot={stripEl}
+      hasQueuedMessage={queued.length > 0}
+      paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
       onTasksClick={handleTasksClick}
@@ -3582,7 +3690,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   return (
     <div
+      ref={paneRootRef}
       className="relative flex h-full w-full flex-col bg-background"
+      onDragEnter={handlePaneDragEnter}
+      onDragLeave={handlePaneDragLeave}
+      onDropCapture={resetPaneDrag}
       onFocusCapture={() => observeProviderRuntimeIntent(provider)}
       onKeyDownCapture={() => observeProviderRuntimeIntent(provider)}
       onPointerDownCapture={() => observeProviderRuntimeIntent(provider)}
@@ -3640,27 +3752,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               cwd={cwd}
             />
           )}
-          {/* The running-subagents strip used to dock here, between the
-              transcript and the composer; it now lives inside the
-              composer's top edge (see `topStripSlot` above). What stays
-              is the opposite temperature: the strip is progress you wait
-              on, this is a watch loop you can end. The two are mutually
-              exclusive in practice — a thread with live agent tasks
-              reports `working`, not `monitoring`. */}
-          {!enteredSubagent && (
-            <div className="pt-2.5">
-              <MonitoringBar
-                monitoring={!!isMonitoring}
-                reason={monitoringReason}
-                threadId={threadId}
-                onStop={handleStopMonitoring}
-              />
-            </div>
-          )}
           {/* Composer region (design D10): groups the whole composer
-              column — AskUserQuestion panel, debug banner, and the
-              composer card — below the scrolling transcript. */}
-          <div className="pt-3.5">
+              column — AskUserQuestion panel, debug banner, the strip and
+              the composer pill — below the scrolling transcript. Observed
+              to pin the transcript while it changes height. */}
+          <div ref={composerRegionRef} className="pt-3.5">
             {pendingInputPanelEl}
             {threadId && (
               <AsyncQuestionPanel

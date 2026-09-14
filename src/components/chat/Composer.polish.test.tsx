@@ -106,7 +106,9 @@ describe("Composer Stage 7 polish", () => {
       const wrapper = getByTestId("composer-wrapper");
 
       expect(wrapper.className).not.toContain("focus-within:border-");
-      expect(wrapper.className).toContain("focus-within:bg-muted/60");
+      expect(wrapper.className).toContain(
+        "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))]",
+      );
       expect(wrapper.className).toContain(
         "focus-within:shadow-[0_16px_38px_-14px]",
       );
