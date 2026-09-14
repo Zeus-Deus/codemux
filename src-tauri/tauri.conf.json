@@ -14,8 +14,9 @@
       {
         "title": "Codemux",
         "label": "main",
-        "width": 800,
-        "height": 600,
+        "width": 1280,
+        "height": 800,
+        "center": true,
         "backgroundColor": "#09090b",
         "decorations": false,
         "windowClassname": "com.codemux.app"

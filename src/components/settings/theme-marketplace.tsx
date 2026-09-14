@@ -96,7 +96,7 @@ export function ThemeMarketplacePanel({
 
   return (
     <div className="flex flex-col gap-[7px]">
-      <span className="text-[11.5px] font-semibold text-muted-foreground">
+      <span className="text-body-sm font-semibold text-muted-foreground">
         Search the Marketplace
       </span>
 
@@ -107,19 +107,19 @@ export function ThemeMarketplacePanel({
           onChange={(event) => setQuery(event.target.value)}
           placeholder="tokyo night"
           aria-label="Search the VS Code Marketplace"
-          className="min-w-0 flex-1 bg-transparent text-[12px] text-foreground outline-none placeholder:text-muted-foreground/60"
+          className="min-w-0 flex-1 bg-transparent text-body-sm text-foreground outline-none placeholder:text-muted-foreground/60"
         />
         {searching && <Loader2 className="size-3 flex-none animate-spin text-muted-foreground" />}
       </label>
 
       {error && (
-        <p className="rounded-lg border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive">
+        <p className="rounded-lg border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-label leading-relaxed text-destructive">
           {error}
         </p>
       )}
 
       {results?.length === 0 && !searching && (
-        <p className="text-[10.5px] text-muted-foreground/70">
+        <p className="text-label text-muted-foreground/70">
           Nothing on the Marketplace matches{" "}
           <span className="font-mono text-foreground">{query.trim()}</span>.
         </p>
@@ -140,10 +140,10 @@ export function ThemeMarketplacePanel({
                   )}
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[11.5px] font-semibold text-foreground">
+                    <span className="block truncate text-body-sm font-semibold text-foreground">
                       {theme.display_name}
                     </span>
-                    <span className="block truncate text-[10px] text-muted-foreground">
+                    <span className="block truncate text-caption text-muted-foreground">
                       {theme.publisher} · {formatInstalls(theme.install_count)} installs
                     </span>
                   </span>
@@ -151,7 +151,7 @@ export function ThemeMarketplacePanel({
                     <Loader2 className="size-3 flex-none animate-spin text-muted-foreground" />
                   )}
                   {open && variants && (
-                    <span className="flex-none font-mono text-[10px] text-muted-foreground">
+                    <span className="flex-none font-mono text-caption text-muted-foreground">
                       {variants.length} variant{variants.length === 1 ? "" : "s"}
                     </span>
                   )}
@@ -165,7 +165,7 @@ export function ThemeMarketplacePanel({
                         key={variant.label}
                         type="button"
                         onClick={() => onPick(variant.content, variant.label)}
-                        className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-[11.5px] text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                        className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
                       >
                         <span className="min-w-0 flex-1 truncate">{variant.label}</span>
                         {/* What the manifest declared. The parser re-derives
@@ -181,7 +181,7 @@ export function ThemeMarketplacePanel({
         </div>
       )}
 
-      <span className="text-[10.5px] leading-relaxed text-muted-foreground/70">
+      <span className="text-label leading-relaxed text-muted-foreground/70">
         Light and dark variants both import — the theme's own background decides
         which one Codemux ends up with.
       </span>

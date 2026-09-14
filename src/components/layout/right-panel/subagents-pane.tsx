@@ -140,7 +140,7 @@ export function SubagentsPane({
   if (waves.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-6 text-center">
-        <p className="text-[11px] text-muted-foreground/70">
+        <p className="text-label text-muted-foreground/70">
           No subagents in this thread yet.
         </p>
       </div>
@@ -207,13 +207,13 @@ export function SubagentsPane({
             <span
               data-testid="live-wave-title"
               title={subagentWaveTitle(liveWave)}
-              className="min-w-0 flex-1 truncate text-[11.5px] font-semibold text-foreground"
+              className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground"
             >
               {subagentWaveTitle(liveWave)}
             </span>
             <TickingText
               active={model.running.length > 0}
-              className="shrink-0 font-mono text-[9.5px] tabular-nums text-muted-foreground"
+              className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
               compute={(now) => {
                 const ms = subagentGroupRollup(
                   liveWave.subagents,
@@ -458,20 +458,20 @@ function SubagentRow({
       >
         <span className="flex w-full items-center gap-2">
           <RowGlyph view={view} />
-          <span className="min-w-0 flex-1 truncate text-[11.5px] font-semibold text-foreground">
+          <span className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground">
             {title}
           </span>
           <SubagentModelBadge model={view.model} />
           <TickingText
             active={running}
-            className="shrink-0 font-mono text-[9.5px] tabular-nums text-muted-foreground"
+            className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
             compute={(now) => elapsedLabel(view, now)}
           />
         </span>
         <span
           data-subagent-excerpt
           title={activity}
-          className="w-full truncate pl-7 font-mono text-[9.5px] leading-[1.45] text-muted-foreground"
+          className="w-full truncate pl-7 font-mono text-caption leading-[1.45] text-muted-foreground"
         >
           {activity}
         </span>
@@ -507,19 +507,19 @@ function AttentionCard({
     >
       <div className="flex w-full items-center gap-2">
         <RowGlyph view={view} />
-        <span className="min-w-0 flex-1 truncate text-[11.5px] font-semibold text-foreground">
+        <span className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground">
           {title}
         </span>
         <SubagentModelBadge model={view.model} />
         <TickingText
           active={false}
-          className="shrink-0 font-mono text-[9.5px] tabular-nums text-muted-foreground"
+          className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
           compute={(now) => elapsedLabel(view, now)}
         />
       </div>
       <p
         title={activity}
-        className="mt-0.5 truncate pl-7 font-mono text-[9.5px] leading-[1.45] text-status-attention/85"
+        className="mt-0.5 truncate pl-7 font-mono text-caption leading-[1.45] text-status-attention/85"
       >
         {activity}
       </p>
@@ -547,7 +547,7 @@ function CardAction({
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="rounded-[5px] px-1.5 py-px font-mono text-[9.5px] text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-default disabled:opacity-50"
+      className="rounded-[5px] px-1.5 py-px font-mono text-caption text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-default disabled:opacity-50"
     >
       {children}
     </button>
@@ -575,12 +575,12 @@ function IdleReceipt({
         <span
           data-testid="receipt-title"
           title={subagentWaveTitle(wave)}
-          className="min-w-0 flex-1 truncate text-[11.5px] font-semibold text-foreground"
+          className="min-w-0 flex-1 truncate text-body-sm font-semibold text-foreground"
         >
           {subagentWaveTitle(wave)}
         </span>
         {settledAt != null && (
-          <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">
+          <span className="shrink-0 font-mono text-caption text-muted-foreground">
             {formatSettledAgo(now - settledAt)}
           </span>
         )}
@@ -626,7 +626,7 @@ function HistoryView({
 
   return (
     <div className="flex flex-col gap-2.5">
-      <div className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+      <div className="flex items-center gap-1 font-mono text-caption text-muted-foreground">
         <button
           type="button"
           onClick={onBack}
@@ -649,7 +649,7 @@ function HistoryView({
             aria-pressed={filter === id}
             onClick={() => setFilter(id)}
             className={cn(
-              "rounded-[5px] px-1.5 py-px font-mono text-[9.5px]",
+              "rounded-[5px] px-1.5 py-px font-mono text-caption",
               filter === id
                 ? "bg-foreground/[0.08] text-foreground"
                 : "text-muted-foreground hover:bg-foreground/[0.04]",
@@ -681,7 +681,7 @@ function HistoryView({
                   data-wave-status={subagentWaveStatus(wave.subagents)}
                   className="flex flex-col gap-1 rounded-[10px] bg-foreground/[0.03] px-1.5 py-1.5"
                 >
-                  <span className="truncate px-1 text-[11.5px] font-semibold text-foreground">
+                  <span className="truncate px-1 text-body-sm font-semibold text-foreground">
                     {subagentWaveTitle(wave)}
                   </span>
                   {rows.map((view) => (
@@ -710,7 +710,7 @@ function PromptDivider({ text }: { text: string }) {
     <p
       data-testid="wave-prompt"
       title={text}
-      className="mt-2 truncate px-1 text-[10px] text-muted-foreground/80 first:mt-0"
+      className="mt-2 truncate px-1 text-caption text-muted-foreground/80 first:mt-0"
     >
       <span className="mr-1 text-muted-foreground/50" aria-hidden>
         ›
@@ -724,7 +724,7 @@ function PromptDivider({ text }: { text: string }) {
 
 function SectionHeader({ label }: { label: string }) {
   return (
-    <span className="shrink-0 font-mono text-[9.5px] tracking-[0.14em] text-muted-foreground/70 uppercase">
+    <span className="shrink-0 font-mono text-caption tracking-[0.14em] text-muted-foreground/70 uppercase">
       {label}
     </span>
   );
@@ -744,7 +744,7 @@ function SubagentModelBadge({ model }: { model?: string }) {
     <span
       data-subagent-model={value}
       title={`Model: ${value}`}
-      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 px-1.5 font-mono text-[8px] text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
+      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 px-1.5 font-mono text-[0.5625rem] text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
     >
       <span
         className="size-1 shrink-0 rounded-full bg-accent-ember/75"

@@ -46,7 +46,7 @@ export const UserInputAnswer = memo(function UserInputAnswer({
           {lines.map((line, i) => (
             <div key={i} className="flex flex-col gap-0.5">
               {showHeaders && line.header ? (
-                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="text-label font-medium uppercase tracking-wide text-muted-foreground">
                   {line.header}
                 </div>
               ) : null}

@@ -323,7 +323,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 className="text-xs gap-3"
               >
                 <span>For this project</span>
-                <span className="ml-auto text-[10px] text-muted-foreground">
+                <span className="ml-auto text-caption text-muted-foreground">
                   .claude/settings.local.json
                 </span>
               </DropdownMenuItem>
@@ -332,7 +332,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 className="text-xs gap-3"
               >
                 <span>For all projects</span>
-                <span className="ml-auto text-[10px] text-muted-foreground">
+                <span className="ml-auto text-caption text-muted-foreground">
                   ~/.claude/settings.json
                 </span>
               </DropdownMenuItem>

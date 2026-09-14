@@ -66,7 +66,7 @@ export function IssueDetailPopover({
           type="button"
           className={cn(
             variant === "chip"
-              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-semibold text-foreground/80 transition-colors hover:bg-muted"
+              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors hover:bg-muted"
               : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors",
           )}
           onClick={(e) => e.stopPropagation()}
@@ -81,7 +81,7 @@ export function IssueDetailPopover({
           <span
             className={cn(
               "tabular-nums",
-              variant === "chip" ? "text-[11px]" : "text-[10px]",
+              variant === "chip" ? "text-label" : "text-caption",
             )}
           >
             {variant === "chip" ? `Issue #${issue.number}` : `#${issue.number}`}
@@ -140,13 +140,13 @@ export function IssueDetailPopover({
                   <Badge
                     key={label}
                     variant="secondary"
-                    className="text-[10px] px-1.5 py-0"
+                    className="text-caption px-1.5 py-0"
                   >
                     {label}
                   </Badge>
                 ))}
                 {fullIssue.assignees.length > 0 && (
-                  <span className="text-[10px] text-muted-foreground">
+                  <span className="text-caption text-muted-foreground">
                     {fullIssue.assignees.join(", ")}
                   </span>
                 )}

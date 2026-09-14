@@ -100,8 +100,8 @@ export function WorkflowAgentDetail({
           <CheckCircle2 className={cn("h-4 w-4 shrink-0", tone.text)} strokeWidth={1.8} aria-hidden />
         )}
         <div className="min-w-0 flex-1">
-          <div className="truncate font-mono text-[12px] font-semibold text-foreground">{label}</div>
-          <div className="truncate text-[11px] text-muted-foreground">
+          <div className="truncate font-mono text-body-sm font-semibold text-foreground">{label}</div>
+          <div className="truncate text-label text-muted-foreground">
             Phase {phaseIndex} · {phaseTitle} · agent {agentIndex} of {agentsInPhase}
             {agent.model ? ` · ${agent.model}` : ""}
           </div>
@@ -109,7 +109,7 @@ export function WorkflowAgentDetail({
         {badge && (
           <span
             className={cn(
-              "shrink-0 rounded-[5px] px-2 py-0.5 text-[10px] font-bold uppercase",
+              "shrink-0 rounded-[5px] px-2 py-0.5 text-caption font-bold uppercase",
               tone.chipBg,
             )}
           >
@@ -120,7 +120,7 @@ export function WorkflowAgentDetail({
 
       <section>
         <SectionLabel>Prompt</SectionLabel>
-        <div className="break-words rounded-[9px] border border-border/60 bg-muted/30 px-2.5 py-2.5 text-[12px] leading-[1.55] text-foreground/90">
+        <div className="break-words rounded-[9px] border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90">
           {derivePrompt(agent)}
         </div>
       </section>
@@ -128,7 +128,7 @@ export function WorkflowAgentDetail({
       <section>
         <SectionLabel>Recent tool calls</SectionLabel>
         {tools.length === 0 ? (
-          <div className="px-1 text-[11px] text-muted-foreground">No tool activity yet.</div>
+          <div className="px-1 text-label text-muted-foreground">No tool activity yet.</div>
         ) : (
           <div className="flex flex-col gap-0.5">
             {tools.map((tool) => {
@@ -136,7 +136,7 @@ export function WorkflowAgentDetail({
               return (
                 <div
                   key={tool.id}
-                  className="flex min-w-0 items-center gap-2.5 px-0.5 py-1 font-mono text-[11px]"
+                  className="flex min-w-0 items-center gap-2.5 px-0.5 py-1 font-mono text-label"
                 >
                   <span className="shrink-0 text-muted-foreground/70">{d.verb}</span>
                   <span className="min-w-0 flex-1 truncate text-foreground/80">{d.target}</span>
@@ -151,13 +151,13 @@ export function WorkflowAgentDetail({
       <section>
         <SectionLabel>Result</SectionLabel>
         {running ? (
-          <div className="rounded-[9px] border border-border/60 bg-muted/30 px-2.5 py-2.5 text-[12px] text-muted-foreground">
-            <span className="shimmer font-mono text-[12px]">{subagentActivityLine(agent)}</span>
+          <div className="rounded-[9px] border border-border/60 bg-muted/30 px-2.5 py-2.5 text-body-sm text-muted-foreground">
+            <span className="shimmer font-mono text-body-sm">{subagentActivityLine(agent)}</span>
           </div>
         ) : (
           <div
             className={cn(
-              "break-words rounded-[9px] border px-2.5 py-2.5 text-[12px] leading-[1.55] text-foreground/90",
+              "break-words rounded-[9px] border px-2.5 py-2.5 text-body-sm leading-[1.55] text-foreground/90",
               badge?.tone === "red" ? cn(tone.softBg, tone.border) : "border-border/60 bg-muted/30",
             )}
           >
@@ -169,7 +169,7 @@ export function WorkflowAgentDetail({
       <div className="flex gap-2 pt-1">
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button variant="outline" size="sm" className="text-[12px]" disabled>
+            <Button variant="outline" size="sm" className="text-body-sm" disabled>
               Restart agent
             </Button>
           </TooltipTrigger>
@@ -180,7 +180,7 @@ export function WorkflowAgentDetail({
             type="button"
             variant="ghost"
             size="sm"
-            className="text-[12px] text-muted-foreground hover:text-foreground"
+            className="text-body-sm text-muted-foreground hover:text-foreground"
             onClick={() => {
               openEditorTab(workspace.workspace_id, workspace.tabs, label).catch(console.error);
             }}
@@ -195,7 +195,7 @@ export function WorkflowAgentDetail({
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+    <div className="mb-1.5 font-mono text-caption font-semibold uppercase tracking-wider text-muted-foreground">
       {children}
     </div>
   );

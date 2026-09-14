@@ -42,7 +42,7 @@ export function AutomationsView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <span className="text-[13px] font-medium text-foreground">
+        <span className="text-body font-medium text-foreground">
           Automations
         </span>
       </div>

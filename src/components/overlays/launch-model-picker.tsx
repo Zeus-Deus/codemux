@@ -212,7 +212,7 @@ export function LaunchModelPicker({
             {model.label}
           </span>
           {model.subProvider ? (
-            <span className="truncate text-[10px] text-muted-foreground/70">
+            <span className="truncate text-caption text-muted-foreground/70">
               {model.subProvider}
             </span>
           ) : null}
@@ -256,7 +256,7 @@ export function LaunchModelPicker({
           type="button"
           aria-label="Select model"
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground",
+            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground",
             triggerClassName,
           )}
         >

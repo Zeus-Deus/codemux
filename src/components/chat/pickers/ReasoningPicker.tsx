@@ -220,7 +220,7 @@ export function ReasoningPicker({
         >
         <Command>
           {hasEffortSection && ultrathinkInBodyText ? (
-            <div className="px-3 pt-2 pb-1 text-[11px] text-muted-foreground/80">
+            <div className="px-3 pt-2 pb-1 text-label text-muted-foreground/80">
               Your prompt contains &quot;ultrathink&quot; in the text. Remove
               it to change effort.
             </div>
@@ -255,7 +255,7 @@ export function ReasoningPicker({
                           ) : null}
                         </span>
                         {description ? (
-                          <span className="text-[11px] text-muted-foreground/80 truncate">
+                          <span className="text-label text-muted-foreground/80 truncate">
                             {description}
                           </span>
                         ) : null}
@@ -330,7 +330,7 @@ export function ReasoningPicker({
                         (default)
                       </span>
                     </span>
-                    <span className="text-[11px] text-muted-foreground/80">
+                    <span className="text-label text-muted-foreground/80">
                       Normal speed and usage rate
                     </span>
                   </div>
@@ -348,7 +348,7 @@ export function ReasoningPicker({
                 >
                   <div className="flex min-w-0 flex-1 flex-col">
                     <span className="text-xs text-foreground">Fast</span>
-                    <span className="text-[11px] text-muted-foreground/80">
+                    <span className="text-label text-muted-foreground/80">
                       Faster output at a premium usage rate
                     </span>
                   </div>

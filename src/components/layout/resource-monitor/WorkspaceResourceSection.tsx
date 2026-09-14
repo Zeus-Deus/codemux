@@ -146,12 +146,12 @@ export function WorkspaceResourceSection({
                 <ChevronDown className="h-3 w-3" />
               )}
             </span>
-            <span className="text-[11px] font-semibold uppercase tracking-[0.04em] truncate min-w-0 text-muted-foreground">
+            <span className="text-label font-semibold uppercase tracking-[0.04em] truncate min-w-0 text-muted-foreground">
               {project.projectName}
             </span>
             <UsageSeverityBadge severity={projectSeverity} />
           </div>
-          <div className={cn(METRIC_COLS, "text-[12px] text-foreground/90")}>
+          <div className={cn(METRIC_COLS, "text-body-sm text-foreground/90")}>
             <span className={CPU_COL}>{formatCpu(project.cpu)}</span>
             <span className={MEM_COL}>{formatMemory(project.memory)}</span>
           </div>
@@ -190,13 +190,13 @@ export function WorkspaceResourceSection({
                     className="flex-1 min-w-0 flex items-center justify-between py-1.5 pr-3.5 pl-1 text-left"
                   >
                     <div className="flex items-center gap-1.5 min-w-0 mr-2">
-                      <span className="text-[12px] text-foreground truncate min-w-0">
+                      <span className="text-body-sm text-foreground truncate min-w-0">
                         {workspace.workspace_name}
                       </span>
                       <UsageSeverityBadge severity={workspaceSeverity} />
                     </div>
                     <div
-                      className={cn(METRIC_COLS, "text-[12px] text-foreground/85")}
+                      className={cn(METRIC_COLS, "text-body-sm text-foreground/85")}
                     >
                       <span className={CPU_COL}>{formatCpu(workspace.cpu)}</span>
                       <span className={MEM_COL}>
@@ -219,7 +219,7 @@ export function WorkspaceResourceSection({
                       >
                         <div className="flex items-center gap-1.5 min-w-0 mr-2">
                           <span className="h-1 w-1 shrink-0 rounded-full bg-muted-foreground/40" />
-                          <span className="text-[11px] text-muted-foreground truncate min-w-0">
+                          <span className="text-label text-muted-foreground truncate min-w-0">
                             {getSessionName(session)}
                           </span>
                           <UsageSeverityBadge severity={sessionSeverity} />
@@ -227,7 +227,7 @@ export function WorkspaceResourceSection({
                         <div
                           className={cn(
                             METRIC_COLS,
-                            "text-[11px] text-muted-foreground/80",
+                            "text-label text-muted-foreground/80",
                           )}
                         >
                           <span className={CPU_COL}>

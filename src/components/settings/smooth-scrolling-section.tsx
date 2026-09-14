@@ -33,10 +33,10 @@ export function SmoothScrollingSection() {
     <section className="mt-10 first:mt-0">
       <div className="mb-3 flex items-end justify-between gap-4">
         <div className="min-w-0">
-          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+          <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
             Scrolling
           </p>
-          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
+          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
             How the mouse wheel moves content in this webview.
           </p>
         </div>
@@ -44,10 +44,10 @@ export function SmoothScrollingSection() {
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-8 py-4">
           <div className="space-y-1 min-w-0">
-            <p className="text-[14px] font-semibold leading-tight text-foreground">
+            <p className="text-body-lg font-semibold leading-tight text-foreground">
               Smooth scrolling
             </p>
-            <p className="text-[12px] text-muted-foreground/80 leading-relaxed">
+            <p className="text-body-sm text-muted-foreground/80 leading-relaxed">
               Animate mouse-wheel scrolling instead of jumping straight to the
               new position. Off by default: with a high-resolution or free-spin
               wheel the animation falls behind, so scrolling faster makes the

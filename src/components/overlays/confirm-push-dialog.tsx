@@ -82,10 +82,10 @@ export function ConfirmPushDialog({
         className="sm:max-w-[420px] bg-popover p-0 gap-0 overflow-hidden"
       >
         <DialogHeader className="px-5 pt-4 pb-2">
-          <DialogTitle className="text-[14px] font-semibold">
+          <DialogTitle className="text-body-lg font-semibold">
             Push to {host.name}?
           </DialogTitle>
-          <DialogDescription className="text-[12px] text-muted-foreground/80">
+          <DialogDescription className="text-body-sm text-muted-foreground/80">
             Send{" "}
             <span className="font-medium text-foreground">{workspaceTitle}</span>{" "}
             to {host.name}.
@@ -93,7 +93,7 @@ export function ConfirmPushDialog({
         </DialogHeader>
 
         <div className="px-5 pb-4 space-y-3">
-          <ul className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-muted-foreground/85 leading-relaxed space-y-1">
+          <ul className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
             <li>
               • Copies the workspace files to{" "}
               <span className="font-medium text-foreground/90">
@@ -118,7 +118,7 @@ export function ConfirmPushDialog({
               onChange={(e) => setDontAskAgain(e.target.checked)}
               className="rounded border-border"
             />
-            <span className="text-[12px] text-muted-foreground">
+            <span className="text-body-sm text-muted-foreground">
               Don't ask again for {host.name}
             </span>
           </label>
@@ -127,7 +127,7 @@ export function ConfirmPushDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-[12px]"
+              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
             >
               Cancel
@@ -135,7 +135,7 @@ export function ConfirmPushDialog({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 gap-1.5 px-3 text-[12px]"
+              className="h-7 gap-1.5 px-3 text-body-sm"
               onClick={handleConfirm}
             >
               <ArrowUpRight className="size-3" />

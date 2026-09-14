@@ -378,7 +378,7 @@ function ProjectFilterItem({
     >
       <ProjectMiniAvatar name={name} path={path} />
       <span className="min-w-0 flex-1 truncate">{name}</span>
-      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+      <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
         {count}
       </span>
     </DropdownMenuItem>
@@ -418,11 +418,11 @@ function ShelfHeader({
           !collapsed && "rotate-90",
         )}
       />
-      <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-muted-foreground/70">
+      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
         {label}
       </span>
       {showCount && (
-        <span className="font-mono text-[10px] tabular-nums text-muted-foreground/70">
+        <span className="font-mono text-caption tabular-nums text-muted-foreground/70">
           ({count})
         </span>
       )}
@@ -447,7 +447,7 @@ function WrappingUpDivider() {
       data-wrapping-up-divider
       className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
-      <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-muted-foreground/70">
+      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
         Wrapping up
       </span>
       <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
@@ -641,7 +641,7 @@ const SettledRow = memo(function SettledRow({
                 : `${provider.nounTitle} — ${prState}`
             }
             className={cn(
-              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 font-mono text-[10px] font-medium",
+              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 font-mono text-caption font-medium",
               "transition-colors duration-150",
               // Held one step brighter than the avatar's /40: `#87` is this
               // control's only label, so the badge has to stay legible at rest
@@ -692,7 +692,7 @@ const SettledRow = memo(function SettledRow({
         className="relative h-5 overflow-hidden whitespace-nowrap"
       >
         {time && (
-          <span className="absolute inset-y-0 right-0 flex items-center font-mono text-[11px] tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
+          <span className="absolute inset-y-0 right-0 flex items-center font-mono text-label tabular-nums text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
             {time}
           </span>
         )}
@@ -715,7 +715,7 @@ const SettledRow = memo(function SettledRow({
             // control's hit area exactly its own column — never a pixel of it
             // over the PR badge next door.
             "absolute inset-0 hidden items-center justify-end gap-1 border-none bg-transparent p-0",
-            "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+            "text-label font-semibold text-muted-foreground transition-colors duration-150",
             "hover:text-foreground",
             "group-hover/settled:inline-flex group-focus-within/settled:inline-flex",
           )}
@@ -836,7 +836,7 @@ const SnoozeRow = memo(function SnoozeRow({
             a mistake. */}
         <span
           aria-label={`Wakes in ${timeUntil}`}
-          className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
+          className="shrink-0 font-mono text-label tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
         >
           {timeUntil}
         </span>
@@ -849,7 +849,7 @@ const SnoozeRow = memo(function SnoozeRow({
           aria-label={`Wake "${workspace.title}" now`}
           className={cn(
             "hidden h-[19px] shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-[7px]",
-            "text-[10px] font-semibold text-muted-foreground transition-colors duration-150",
+            "text-caption font-semibold text-muted-foreground transition-colors duration-150",
             "hover:border-muted-foreground/50 hover:text-foreground",
             "group-hover/snoozed:inline-flex group-focus-within/snoozed:inline-flex",
           )}
@@ -1929,7 +1929,7 @@ export function SidebarInbox() {
                 >
                   <Folder className="size-3.5 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1 truncate">All projects</span>
-                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                  <span className="shrink-0 text-caption tabular-nums text-muted-foreground">
                     {projectCounts.total}
                   </span>
                 </DropdownMenuItem>
@@ -1973,7 +1973,7 @@ export function SidebarInbox() {
                     <span className="flex-1">Open project</span>
                     <MenuKeycap actionId="openProject" />
                   </span>
-                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                  <span className="text-label leading-snug text-muted-foreground/70">
                     Pick a repo already on this machine
                   </span>
                 </span>
@@ -1987,7 +1987,7 @@ export function SidebarInbox() {
                   <span className="flex items-center gap-2">
                     <span className="flex-1">New project</span>
                   </span>
-                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                  <span className="text-label leading-snug text-muted-foreground/70">
                     Clone from a Git remote
                   </span>
                 </span>
@@ -2149,7 +2149,7 @@ export function SidebarInbox() {
                     onClick={() =>
                       setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
                     }
-                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-[11px] text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-label text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
                   >
                     {`Show ${next} more (${settledHidden} hidden)`}
                   </button>
@@ -2212,7 +2212,7 @@ export function SidebarInbox() {
                       className="gap-4 text-xs"
                     >
                       <span className="flex-1">{preset.label}</span>
-                      <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                      <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">
                         {preset.whenLabel}
                       </span>
                     </DropdownMenuItem>

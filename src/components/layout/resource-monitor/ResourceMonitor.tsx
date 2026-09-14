@@ -184,7 +184,7 @@ export function ResourceMonitor({
       <PopoverContent align="start" className="w-[28rem] p-0 overflow-hidden">
         <div className="px-3.5 pt-3 pb-3 border-b border-border/60">
           <div className="flex items-center justify-between">
-            <h4 className="text-[13px] font-medium tracking-tight text-foreground">
+            <h4 className="text-body font-medium tracking-tight text-foreground">
               Resources
             </h4>
             <div className="flex items-center gap-0.5">
@@ -192,7 +192,7 @@ export function ResourceMonitor({
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex items-center gap-1 h-6 px-1.5 rounded text-[11px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                    className="flex items-center gap-1 h-6 px-1.5 rounded text-label text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
                     aria-label="Sort workspaces"
                   >
                     <ArrowDownNarrowWide className="h-3.5 w-3.5" />
@@ -300,13 +300,13 @@ export function ResourceMonitor({
           )}
 
           {snapshot && snapshot.workspaces.length === 0 && (
-            <div className="px-3.5 py-6 text-center text-[11px] text-muted-foreground">
+            <div className="px-3.5 py-6 text-center text-label text-muted-foreground">
               No active terminal sessions
             </div>
           )}
 
           {!snapshot && (
-            <div className="px-3.5 py-6 text-center text-[11px] text-muted-foreground">
+            <div className="px-3.5 py-6 text-center text-label text-muted-foreground">
               Loading…
             </div>
           )}

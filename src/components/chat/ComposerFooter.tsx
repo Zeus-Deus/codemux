@@ -242,7 +242,7 @@ export function ComposerFooter({
               {!modelLeafLabel && (
                 <>
                   <span>Tasks</span>
-                  <span className="text-[11px] tabular-nums opacity-70">
+                  <span className="text-label tabular-nums opacity-70">
                     {tasks.completed}/{tasks.total}
                   </span>
                 </>

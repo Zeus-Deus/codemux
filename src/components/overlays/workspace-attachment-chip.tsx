@@ -53,7 +53,7 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
 
   return (
     <span
-      className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 py-0.5 pl-1 pr-1 text-[11px] text-foreground"
+      className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 py-0.5 pl-1 pr-1 text-label text-foreground"
       title={path}
     >
       {showThumb ? (

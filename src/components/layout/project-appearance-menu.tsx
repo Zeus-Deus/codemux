@@ -132,13 +132,13 @@ export function ProjectAppearanceMenu({
             )}
             style={selected ? { backgroundColor: selected.value } : undefined}
           />
-          <span className="text-[11.5px] text-muted-foreground">
+          <span className="text-body-sm text-muted-foreground">
             {selected?.name ?? "Default"}
           </span>
           <span className="flex-1" />
           {/* Says out loud what the submenu title only implies: this is a
               project setting reached from one workspace's row. */}
-          <span className="font-mono text-[9.5px] text-muted-foreground/60">
+          <span className="font-mono text-caption text-muted-foreground/60">
             applies to all workspaces
           </span>
         </div>

@@ -25,7 +25,7 @@ import {
 export const WORK_LOG_HISTORY_WINDOW = 10;
 
 const ROW_CLASS =
-  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
+  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
 
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
@@ -195,7 +195,7 @@ function CollapsedLine({
         )}
       </span>
       <span className="shrink-0 text-muted-foreground/65">{verb}</span>
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
         {summary}
       </span>
       <TotalsLabel totals={totals} />
@@ -210,7 +210,7 @@ function CollapsedLine({
 function TotalsLabel({ totals }: { totals: WorkLogTotals }) {
   if (!totals.label && totals.failed === 0) return null;
   return (
-    <span className="shrink-0 font-mono text-[10px] text-muted-foreground/55">
+    <span className="shrink-0 font-mono text-caption text-muted-foreground/55">
       {totals.label}
       {totals.failed > 0 ? (
         <span className="text-status-attention">
@@ -252,13 +252,13 @@ function StepRow({
           )}
         </span>
         <span className="shrink-0 text-muted-foreground/65">{view.verb}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           {view.summary}
         </span>
         {view.meta && !live ? (
           <span
             className={cn(
-              "shrink-0 font-mono text-[10px] text-muted-foreground/55",
+              "shrink-0 font-mono text-caption text-muted-foreground/55",
               view.status === "error" && "text-status-attention",
             )}
           >
@@ -276,7 +276,7 @@ function StepRow({
       {expanded && (
         <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
           {step.kind === "reasoning" ? (
-            <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+            <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
               {step.text}
             </p>
           ) : (
@@ -324,15 +324,15 @@ function SubagentRunRow({
         {live ? <AgentOrb size={20} aria-hidden /> : <StepGlyph status={status} />}
       </span>
       <span className="shrink-0 text-muted-foreground/65">agents</span>
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
         {subagentPreview(run.subagents)}
       </span>
       <TickingText
         active={status === "running"}
-        className="shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground/55"
+        className="shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground/55"
         compute={(now) => subagentRunMeta(run, now)}
       />
-      <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-medium text-foreground/70">
+      <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-foreground/70">
         View
         <ChevronRight
           className="size-3 transition-transform group-hover/subagents:translate-x-0.5"

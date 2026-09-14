@@ -33,7 +33,7 @@ export function ThemeImportSourcePicker({
 }) {
   return (
     <div className="flex flex-col gap-[7px]">
-      <span className="text-[11.5px] font-semibold text-muted-foreground">
+      <span className="text-body-sm font-semibold text-muted-foreground">
         Where is it from?
       </span>
       <div
@@ -65,7 +65,7 @@ export function ThemeImportSourcePicker({
               />
               <span
                 className={cn(
-                  "flex-1 truncate text-[12px]",
+                  "flex-1 truncate text-body-sm",
                   selected ? "font-semibold text-foreground" : "text-muted-foreground",
                 )}
               >

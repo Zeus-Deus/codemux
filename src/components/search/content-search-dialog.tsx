@@ -175,7 +175,7 @@ export function ContentSearchDialog() {
               <Regex className="h-3.5 w-3.5" />
             </Button>
             {results.length > 0 && (
-              <span className="ml-2 text-[11px] text-muted-foreground">
+              <span className="ml-2 text-label text-muted-foreground">
                 {results.length} result{results.length !== 1 ? "s" : ""} in {fileCount} file{fileCount !== 1 ? "s" : ""}
               </span>
             )}
@@ -205,7 +205,7 @@ export function ContentSearchDialog() {
                 <button
                   key={`${match.file_path}:${match.line_number}:${idx}`}
                   data-match-index={idx}
-                  className={`flex w-full items-baseline gap-2 rounded px-2 py-0.5 text-left font-mono text-[12px] ${
+                  className={`flex w-full items-baseline gap-2 rounded px-2 py-0.5 text-left font-mono text-body-sm ${
                     idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50"
                   }`}
                   onClick={() => openFile(match.file_path)}
@@ -230,7 +230,7 @@ export function ContentSearchDialog() {
                 <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-card z-10">
                   <FileCode className="h-3 w-3 shrink-0 text-muted-foreground" />
                   <span className="text-xs text-muted-foreground truncate">{group.filePath}</span>
-                  <span className="text-[10px] text-muted-foreground/50 shrink-0">
+                  <span className="text-caption text-muted-foreground/50 shrink-0">
                     ({group.matches.length})
                   </span>
                 </div>

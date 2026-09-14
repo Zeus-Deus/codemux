@@ -127,7 +127,7 @@ function DeckTabChip({
   const badge = tab.badge != null && (
     <span
       className={cn(
-        "font-mono text-[9.5px] tabular-nums",
+        "font-mono text-caption tabular-nums",
         tab.badgeTone === "attention"
           ? "text-status-attention"
           : active && tab.accentBadgeWhenActive
@@ -179,7 +179,7 @@ function DeckTabChip({
         // second row to do it in.
         title={tab.label}
         className={cn(
-          "flex h-full min-w-0 items-center whitespace-nowrap text-[12px]",
+          "flex h-full min-w-0 items-center whitespace-nowrap text-body-sm",
           compact
             ? "gap-[5px] px-[8px]"
             : cn(
@@ -497,7 +497,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           align="start"
           className="w-[206px] rounded-[11px] p-[5px] [&_[role=menuitem]]:whitespace-nowrap"
         >
-          <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-[9px] tracking-[0.13em] text-muted-foreground">
+          <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
             OPEN PANE
           </DropdownMenuLabel>
           {/* Same `surfaces` array the empty-panel picker renders as cards —
@@ -506,7 +506,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           {surfaces.map((surface) => (
             <DropdownMenuItem
               key={surface.id}
-              className="h-[30px] rounded-[7px] px-[9px] text-[12.5px] font-medium"
+              className="h-[30px] rounded-[7px] px-[9px] text-body font-medium"
               onClick={surface.onOpen}
             >
               <surface.icon className="size-[14px]" strokeWidth={1.5} />
@@ -515,13 +515,13 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           ))}
           <DropdownMenuSeparator className="mx-1 my-[5px]" />
           <DropdownMenuItem
-            className="h-[30px] rounded-[7px] px-[9px] text-[12.5px] font-medium"
+            className="h-[30px] rounded-[7px] px-[9px] text-body font-medium"
             onClick={onOpenFile}
           >
             <Search className="size-[14px]" strokeWidth={1.5} />
             Open file…
             {openFileKeys && (
-              <DropdownMenuShortcut className="font-mono text-[9.5px]">
+              <DropdownMenuShortcut className="font-mono text-caption">
                 {openFileKeys}
               </DropdownMenuShortcut>
             )}

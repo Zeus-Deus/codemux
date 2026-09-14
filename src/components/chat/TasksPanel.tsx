@@ -106,17 +106,17 @@ export function TasksPanel({
           <span
             data-testid="tasks-status-badge"
             className={cn(
-              "inline-flex items-center rounded-[5px] px-1.5 py-px font-mono text-[10px] font-semibold uppercase tracking-[0.09em]",
+              "inline-flex items-center rounded-[5px] px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
               BADGE_TONE[runState],
             )}
           >
             {RUN_STATE_LABEL[runState]}
           </span>
-          <span className="min-w-0 flex-1 font-mono text-[10.5px] tabular-nums text-muted-foreground">
+          <span className="min-w-0 flex-1 font-mono text-label tabular-nums text-muted-foreground">
             {completed}/{total} done
           </span>
           {updatedAt != null && (
-            <span className="shrink-0 font-mono text-[10.5px] tabular-nums text-muted-foreground">
+            <span className="shrink-0 font-mono text-label tabular-nums text-muted-foreground">
               {new Date(updatedAt).toLocaleTimeString([], {
                 hour: "numeric",
                 minute: "2-digit",
@@ -170,13 +170,13 @@ export function TasksPanel({
                   <span className="mt-[3px] flex size-4 shrink-0 items-center justify-center">
                     <StatusGlyph task={task} />
                   </span>
-                  <span className="mt-0.5 w-4 shrink-0 text-right font-mono text-[10px] tabular-nums leading-4 text-muted-foreground/70">
+                  <span className="mt-0.5 w-4 shrink-0 text-right font-mono text-caption tabular-nums leading-4 text-muted-foreground/70">
                     {index + 1}
                   </span>
                   <div className="min-w-0 flex-1">
                     <p
                       className={cn(
-                        "text-[13px] leading-5",
+                        "text-body leading-5",
                         task.status === "completed" &&
                           "text-muted-foreground line-through decoration-border",
                         task.status === "in_progress" && "text-foreground",
@@ -191,7 +191,7 @@ export function TasksPanel({
                       </p>
                     )}
                     {blockers.length > 0 && (
-                      <p className="mt-1 text-[11px] leading-relaxed text-status-working">
+                      <p className="mt-1 text-label leading-relaxed text-status-working">
                         Blocked by {blockers.join(", ")}
                       </p>
                     )}
@@ -244,7 +244,7 @@ export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
         type="button"
         onClick={handleCopy}
         data-testid="tasks-copy"
-        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-[11px] font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground"
       >
         {copied ? (
           <Check className="size-3" aria-hidden />
