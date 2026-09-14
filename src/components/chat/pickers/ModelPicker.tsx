@@ -108,16 +108,16 @@ export function ModelPicker({
         <button
           type="button"
           disabled={disabled}
-          className={cn(FOOTER_TRIGGER, "gap-1.5")}
+          className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-4 w-4" />
+          <ProviderLogo provider={provider} className="h-4 w-4 shrink-0" />
           <span className="max-w-[140px] truncate">
             {leafLabel
               ? leafModelName(modelLabel(provider, current))
               : modelLabel(provider, current)}
           </span>
           <ChevronDown
-            className="-mx-0.5 h-3.5 w-3.5 opacity-70"
+            className="-mx-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
             strokeWidth={2.25}
           />
         </button>

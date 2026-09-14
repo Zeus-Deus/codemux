@@ -150,6 +150,12 @@ export function ComposerCommandMenu({
         {headerSlot && (
           <div
             data-testid="composer-command-menu-config"
+            // Settings have their own buttons and portalled command menus.
+            // Keep their keys out of the outer cmdk root, which otherwise
+            // handles Enter by selecting the highlighted composer command.
+            onKeyDown={(e) => {
+              if (e.key !== "Escape" || e.defaultPrevented) e.stopPropagation();
+            }}
             className="flex items-center gap-0.5 border-b border-border/60 px-1.5 py-1"
           >
             {headerSlot}

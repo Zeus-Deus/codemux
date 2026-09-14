@@ -180,7 +180,9 @@ export function ComposerFooter({
       <div
         data-testid="composer-gap"
         onPointerDown={onGapPointerDown}
-        className="flex h-full min-w-0 flex-1 cursor-text items-center gap-2 pl-2"
+        // Reserve the meter's space even while collapsed, so it cannot
+        // overlap settings or shift them when the composer expands.
+        className="flex h-full min-w-[50px] flex-1 cursor-text items-center gap-2 pl-2"
       >
         <div className="flex min-w-0 flex-1 items-center">{gap}</div>
         {/* The ring rides the gap's trailing edge rather than the right
@@ -201,7 +203,7 @@ export function ComposerFooter({
         )}
       </div>
 
-      <div className="flex shrink-0 items-center gap-1">
+      <div className="flex min-w-0 items-center gap-1">
         {tasks && tasks.total > 0 && onTasksClick && (
           <>
             {/* Reports run state rather than reading as a setting: amber +
@@ -212,8 +214,14 @@ export function ComposerFooter({
               onClick={onTasksClick}
               data-testid="composer-tasks-toggle"
               aria-pressed={tasksOpen}
+              aria-label={
+                modelLeafLabel
+                  ? `Tasks: ${tasks.completed} of ${tasks.total} complete`
+                  : undefined
+              }
               className={cn(
                 "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-sm font-medium leading-none transition-colors",
+                modelLeafLabel && "w-[34px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
                   : tasks.completed === tasks.total
@@ -231,12 +239,16 @@ export function ComposerFooter({
               ) : (
                 <ListTodo className="size-3.5" aria-hidden />
               )}
-              <span>Tasks</span>
-              <span className="text-[11px] tabular-nums opacity-70">
-                {tasks.completed}/{tasks.total}
-              </span>
+              {!modelLeafLabel && (
+                <>
+                  <span>Tasks</span>
+                  <span className="text-[11px] tabular-nums opacity-70">
+                    {tasks.completed}/{tasks.total}
+                  </span>
+                </>
+              )}
             </button>
-            <span className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+            <span className="mx-0.5 h-4 w-px shrink-0 bg-border/50" aria-hidden />
           </>
         )}
 
