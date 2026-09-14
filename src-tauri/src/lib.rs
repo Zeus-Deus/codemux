@@ -87,6 +87,8 @@ pub mod trace;
 // WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
 // the startup crash sentinel that picks the renderer flags for this process.
 pub mod webview_tuning;
+// Reloads the main window when its WebKitGTK web process dies (Linux).
+pub mod webview_recovery;
 // VS Code Marketplace theme import — search the public gallery and pull the
 // dark colour themes out of a downloaded .vsix.
 pub mod vscode_marketplace;
@@ -732,6 +734,12 @@ fn build_core_app<R: tauri::Runtime>(
             // same setting up from the page-load hook, and the frontend can
             // flip it at runtime via the `set_smooth_scrolling` command.
             webview_tuning::refresh_all(&handle);
+
+            // A dead WebKit web process leaves the window blank while the
+            // backend and agents keep running. Reload the page instead.
+            if let Some(window) = app.get_webview_window("main") {
+                webview_recovery::install(&window);
+            }
 
             // Restore window size from SQLite
             {
