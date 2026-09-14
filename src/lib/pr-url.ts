@@ -21,7 +21,12 @@
  */
 
 import type { PrRow } from "@/lib/pr-overview";
-import { GITHUB_HOSTS, GITLAB_HOSTS, type ProviderKind } from "@/lib/source-control";
+import {
+  GITHUB_HOSTS,
+  GITLAB_HOSTS,
+  repoSlugFromUrl,
+  type ProviderKind,
+} from "@/lib/source-control";
 
 export interface ParsedPrUrl {
   kind: Extract<ProviderKind, "github" | "gitlab">;
@@ -128,4 +133,26 @@ export function resolvePrLink(parsed: ParsedPrUrl, rows: PrRow[] = indexedRows):
       (row) => row.number === parsed.number && (row.repo ?? "").toLowerCase() === slug,
     ) ?? null
   );
+}
+
+/**
+ * The open project that *is* this URL's repository, whether or not the
+ * last poll saw that particular pull request.
+ *
+ * The exact row wins, so two clones of one repository resolve to the one
+ * actually listing it. After that, any row from the same repository, then
+ * any workspace whose own pull-request URL names it — the second covers a
+ * project whose first overview poll hasn't landed yet.
+ */
+export function resolvePrRoot(
+  parsed: ParsedPrUrl,
+  rows: PrRow[] = indexedRows,
+  known: { url: string; projectRoot: string }[] = [],
+): string | null {
+  const exact = resolvePrLink(parsed, rows);
+  if (exact) return exact.projectRoot;
+  const slug = parsed.slug.toLowerCase();
+  const sameRepo = rows.find((row) => (row.repo ?? "").toLowerCase() === slug);
+  if (sameRepo) return sameRepo.projectRoot;
+  return known.find((k) => repoSlugFromUrl(k.url)?.toLowerCase() === slug)?.projectRoot ?? null;
 }

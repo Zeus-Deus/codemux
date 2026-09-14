@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { Button } from "@/components/ui/button";
 import { WindowChrome } from "@/components/layout/window-chrome";
@@ -10,7 +11,13 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { tzBodyLg, tzPageTitle } from "@/components/workspace/review/review-ui";
 import { badgeKeys, rowKey, type PrRow } from "@/lib/pr-overview";
-import { usePrOverview, type PrStateFilter } from "@/lib/pr-overview-query";
+import {
+  prHistoryKey,
+  prOverviewKey,
+  usePrOverview,
+  type PrStateFilter,
+} from "@/lib/pr-overview-query";
+import { listPrsOverview, listPullRequests } from "@/tauri/commands";
 import { escapeClaimedElsewhere } from "@/lib/escape-guard";
 import { PrList } from "./pr-list";
 import { PrTabStrip } from "./pr-tab-strip";
@@ -122,6 +129,61 @@ export function PullRequestsView() {
     openRow(row);
     clearPendingPrSelection();
   }, [pendingSelection, byKey, openRow, clearPendingPrSelection]);
+
+  // A link can name a pull request the list doesn't hold: one opened
+  // since the last poll, or one already merged out of the open filter.
+  // Ask that repository directly — open list first, then the history,
+  // widening the filter if that is where it lives — and only hand the
+  // link to the browser once neither has it. Whatever the fetch adds to
+  // the cache reaches `byKey`, and the effect above does the opening.
+  const queryClient = useQueryClient();
+  const lookedUp = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingSelection) {
+      lookedUp.current = null;
+      return;
+    }
+    const key = rowKey(pendingSelection);
+    if (byKey.has(key) || lookedUp.current === key) return;
+    lookedUp.current = key;
+
+    const selection = pendingSelection;
+    const { projectRoot, number, url } = selection;
+    const stillWanted = () => useUIStore.getState().pendingPrSelection === selection;
+    void (async () => {
+      const open = await queryClient
+        .fetchQuery({
+          queryKey: prOverviewKey(projectRoot),
+          queryFn: () => listPrsOverview(projectRoot),
+          staleTime: 0,
+        })
+        .catch(() => null);
+      if (!stillWanted() || open?.items.some((item) => item.number === number)) return;
+
+      const history = await queryClient
+        .fetchQuery({
+          queryKey: prHistoryKey(projectRoot, "all"),
+          queryFn: () => listPullRequests(projectRoot, "all"),
+          staleTime: 0,
+        })
+        .catch(() => null);
+      if (!stillWanted()) return;
+      if (history?.some((pr) => pr.number === number)) {
+        setStateFilter("all");
+        return;
+      }
+
+      clearPendingPrSelection();
+      if (!url) {
+        toast.error(`Couldn't find #${number}`);
+        return;
+      }
+      toast.info(`Opening #${number} in the browser`, {
+        description: "Codemux couldn't load it from the host.",
+      });
+      openUrl(url).catch((err) => toast.error(String(err)));
+    })();
+  }, [pendingSelection, byKey, queryClient, clearPendingPrSelection]);
 
   // First load lands on the first thing that wants something from you.
   useEffect(() => {

@@ -14,7 +14,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { externalWebLinkHost } from "@/lib/agent-chat/rich-links";
-import { openExternalUrl, routeForUrl } from "@/lib/open-url";
+import { openExternalUrl, routeForUrl, type LinkGesture } from "@/lib/open-url";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -65,6 +65,20 @@ export function ChatMarkdownLink({
   // so the label is not the only clue about where the agent pointed.
   const inertHref = !incomplete && !externalHref ? href : undefined;
 
+  const activate = (event: LinkGesture) => {
+    if (!externalHref) return;
+    // A pull request in a project you have open is not an external
+    // destination — it is a page of this app — so it opens without a
+    // dialog asking whether you meant to leave. A browser gesture
+    // (Ctrl/Cmd, Shift, middle click) sends that same known link to the
+    // browser, still without asking: it is your repository on its host.
+    if (routeForUrl(externalHref).kind === "in-app") {
+      void openExternalUrl(externalHref, { event });
+      return;
+    }
+    setConfirmationOpen(true);
+  };
+
   const link = (
     <a
       {...props}
@@ -85,22 +99,18 @@ export function ChatMarkdownLink({
         onClick?.(event);
         const handledByCaller = event.defaultPrevented;
         event.preventDefault();
-        if (handledByCaller || !externalHref) return;
-        // A pull request in a project you have open is not an external
-        // destination — it is a page of this app, so it opens without a
-        // dialog asking whether you meant to leave. Shift-click is a
-        // request for the browser and therefore still confirms.
-        if (routeForUrl(externalHref, { event }).kind === "in-app") {
-          void openExternalUrl(externalHref, { event });
-          return;
-        }
-        setConfirmationOpen(true);
+        if (handledByCaller) return;
+        activate(event);
       }}
       onAuxClick={(event) => {
         onAuxClick?.(event);
         // Middle click never fires `onClick`, so a live href would request a
-        // background navigation that skipped the confirmation entirely.
+        // background navigation that skipped the confirmation entirely. It
+        // goes through the same routing instead, as a browser gesture.
+        const handledByCaller = event.defaultPrevented;
         event.preventDefault();
+        if (handledByCaller || event.button !== 1) return;
+        activate(event);
       }}
     >
       {children}

@@ -33,6 +33,7 @@ import {
 } from "@/components/layout/right-panel/pane-registry";
 import { useEditorStore } from "@/stores/editor-store";
 import { useUIStore } from "@/stores/ui-store";
+import { _resetPrLinkIndex, publishPrLinkIndex } from "@/lib/pr-url";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CHAT_SELECTION_TEXT_ATTRIBUTE } from "@/lib/agent-chat/selection-safe-text";
 
@@ -136,9 +137,68 @@ describe("ChatMarkdown rich external links", () => {
     // fireEvent returns false once a handler called preventDefault.
     expect(fireEvent.click(link as HTMLAnchorElement)).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // Middle click asks the same question a click does.
     expect(middleClick(link as HTMLAnchorElement)).toBe(false);
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  describe("a pull request in a repository you have open", () => {
+    const url = "https://github.com/example/codemux/pull/353";
+    beforeEach(() => {
+      useUIStore.setState({ showPullRequests: false, pendingPrSelection: null });
+      publishPrLinkIndex([
+        {
+          number: 285,
+          title: "Fix the installer",
+          author: "mock-dev",
+          head_branch: "fix/installer",
+          is_draft: false,
+          additions: 1,
+          deletions: 1,
+          review_decision: null,
+          checks: null,
+          review_requested_from: [],
+          updated_at: null,
+          url: "https://github.com/example/codemux/pull/285",
+          projectRoot: "/home/dev/projects/codemux",
+          repo: "example/codemux",
+          providerKind: "github",
+        },
+      ]);
+    });
+    afterEach(() => _resetPrLinkIndex());
+
+    function prLink() {
+      const { container } = render(<ChatMarkdown>{`[PR](${url})`}</ChatMarkdown>);
+      return container.querySelector('[data-streamdown="link"]') as HTMLAnchorElement;
+    }
+
+    it("opens the Pull Requests page on click, without a dialog", () => {
+      fireEvent.click(prLink());
+
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(mocks.openUrl).not.toHaveBeenCalled();
+      expect(useUIStore.getState().showPullRequests).toBe(true);
+      expect(useUIStore.getState().pendingPrSelection).toMatchObject({ number: 353 });
+    });
+
+    it("opens the browser on ctrl-click, without a dialog", async () => {
+      fireEvent.click(prLink(), { ctrlKey: true });
+
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(url));
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+    });
+
+    it("opens the browser on middle click, without a dialog", async () => {
+      middleClick(prLink());
+
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(url));
+      expect(useUIStore.getState().showPullRequests).toBe(false);
+    });
   });
 
   it("does not open an external link when its confirmation is cancelled", () => {

@@ -9,7 +9,7 @@ import {
   PinOff,
   Terminal,
 } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import {
@@ -310,7 +310,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
+    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event: e });
   };
 
   // The official mark of each agent provider chatting in this workspace
@@ -853,6 +853,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   <button
                     type="button"
                     onClick={handlePrClick}
+                    onAuxClick={(e) => {
+                      if (e.button === 1) handlePrClick(e);
+                    }}
                     disabled={!workspace.pr_url}
                     aria-label={
                       workspace.pr_number
