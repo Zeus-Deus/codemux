@@ -355,32 +355,16 @@ export function SidebarFooterBar() {
       hasDevices,
     ),
   );
-  // Keep every destination directly reachable before spending space on a
-  // label. Only introduce overflow once the icon-only row also runs out of room.
-  const labeledCapacity = Math.floor((width - 16 - 30 - 82) / 30);
-  const showAutomationLabel =
-    !collapsed &&
-    availablePins.length <= labeledCapacity &&
-    availablePins.some((pin) => pin.id === "codemux.automations.open");
-  // Reserve space for the permanent menu, then the overflow trigger if needed.
+  // Every destination is an icon, so the row is one uniform strip. Reserve
+  // space for the permanent menu, then the overflow trigger if needed.
   const capacity = collapsed
     ? Math.max(1, Math.floor((height * 0.35) / 30) - 1)
-    : Math.max(
-        0,
-        Math.floor((width - 16 - 30 - (showAutomationLabel ? 82 : 0)) / 30),
-      );
+    : Math.max(0, Math.floor((width - 16 - 30) / 30));
   const visibleCount =
     availablePins.length > capacity ? Math.max(0, capacity - 1) : capacity;
   const visible = availablePins.slice(0, visibleCount);
   const overflow = availablePins.slice(visibleCount);
   const tooltipSide = collapsed ? "right" : "top";
-  // Labelled destinations read as the row's headline and stay left; every
-  // icon-only control belongs to one cluster hugging the app menu on the
-  // right, so the row never shows a hole between the icons and the gear.
-  const isLabeled = (pin: FooterPin) =>
-    showAutomationLabel && pin.id === "codemux.automations.open";
-  const leading = visible.filter(isLabeled);
-  const trailing = visible.filter((pin) => !isLabeled(pin));
 
   return (
     <>
@@ -394,69 +378,51 @@ export function SidebarFooterBar() {
             : "h-[42px] items-center px-2",
         )}
       >
-        {leading.map((pin) => (
-          <FooterDestination
-            key={pin.id}
-            pin={pin}
-            labeled
-            tooltipSide={tooltipSide}
-          />
+        {/* The app menu anchors the start of the row; destinations pack
+            beside it so the strip reads as one left-aligned group. */}
+        <AppMenu
+          tooltipSide={tooltipSide}
+          onCustomize={() => setCustomizing(true)}
+        />
+        {visible.map((pin) => (
+          <FooterDestination key={pin.id} pin={pin} tooltipSide={tooltipSide} />
         ))}
-        {/* `contents` keeps the collapsed rail a single vertical stack; only
-            the expanded row needs the cluster to be pushed right. */}
-        <div
-          className={
-            collapsed ? "contents" : "ml-auto flex items-center gap-0.5"
-          }
-        >
-          {trailing.map((pin) => (
-            <FooterDestination
-              key={pin.id}
-              pin={pin}
-              tooltipSide={tooltipSide}
-            />
-          ))}
-          {overflow.length > 0 && (
-            <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
-              <PopoverTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label="More footer destinations"
-                  title="More footer destinations"
-                  className="size-7 shrink-0 text-muted-foreground"
-                >
-                  <MoreHorizontal className="size-4" />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent
-                side={collapsed ? "right" : "top"}
-                align="start"
-                className="w-64 p-2"
+        {overflow.length > 0 && (
+          <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
+            <PopoverTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="More footer destinations"
+                title="More footer destinations"
+                className="size-7 shrink-0 text-muted-foreground"
               >
-                <p className="px-2 py-1 text-xs font-medium text-muted-foreground">
-                  Footer destinations
-                </p>
-                <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">
-                  {overflow.map((pin) => (
-                    <div key={pin.id} className="py-0.5">
-                      <FooterDestination
-                        pin={pin}
-                        labeled
-                        fullWidth
-                        tooltipSide="right"
-                      />
-                    </div>
-                  ))}
-                </div>
-              </PopoverContent>
-            </Popover>
-          )}
-          <AppMenu
-            tooltipSide={tooltipSide}
-            onCustomize={() => setCustomizing(true)}
-          />
-        </div>
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent
+              side={collapsed ? "right" : "top"}
+              align="start"
+              className="w-64 p-2"
+            >
+              <p className="px-2 py-1 text-xs font-medium text-muted-foreground">
+                Footer destinations
+              </p>
+              <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">
+                {overflow.map((pin) => (
+                  <div key={pin.id} className="py-0.5">
+                    <FooterDestination
+                      pin={pin}
+                      labeled
+                      fullWidth
+                      tooltipSide="right"
+                    />
+                  </div>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+        )}
       </div>
       {customizing && (
         <CustomizeFooterDialog
