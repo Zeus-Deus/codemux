@@ -306,7 +306,7 @@ describe("buildTranscriptSlots — settled turn presentation", () => {
   });
 });
 
-describe("buildTranscriptSlots — subagent work-log stretches", () => {
+describe("buildTranscriptSlots — subagent runs share the work log", () => {
   function subagentRun(seq: number): ChatViewItem {
     return {
       kind: "subagent_run",
@@ -324,20 +324,17 @@ describe("buildTranscriptSlots — subagent work-log stretches", () => {
     };
   }
 
-  it("renders a subagent_run as a one-run stretch", () => {
+  it("renders a lone subagent_run as a one-entry work log", () => {
     const slots = buildTranscriptSlots([subagentRun(0)]);
     expect(slots).toHaveLength(1);
-    expect(slots[0].body.kind).toBe("subagent_stretch");
-    expect(slots[0].messageId).toBe("subagent-stretch:run-0");
-    if (slots[0].body.kind === "subagent_stretch") {
-      expect(slots[0].body.runs).toHaveLength(1);
-    }
+    expect(slots[0].body.kind).toBe("activity");
+    expect(slots[0].messageId).toBe("run:run-0");
     // Assistant-side, but never a scroll anchor (not a user turn).
     expect(slots[0].side).toBe("assistant");
     expect(slots[0].scrollAnchor).toBe(false);
   });
 
-  it("breaks activity — the work-log row never folds into an activity block", () => {
+  it("keeps tool bursts on either side of a subagent run on one line", () => {
     const slots = buildTranscriptSlots([
       tool(0),
       tool(1),
@@ -345,14 +342,26 @@ describe("buildTranscriptSlots — subagent work-log stretches", () => {
       tool(3),
       tool(4),
     ]);
-    // The subagent stretch is a standalone slot that splits the two
-    // contiguous tool runs into separate Activity blocks (#124 renamed the
-    // folded slot kind `toolGroup` → `activity`).
-    expect(slots.map((s) => s.body.kind)).toEqual([
-      "activity",
-      "subagent_stretch",
-      "activity",
-    ]);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.items.map((entry) => entry.id)).toEqual([
+        "tc-0",
+        "tc-1",
+        "run-2",
+        "tc-3",
+        "tc-4",
+      ]);
+    }
+  });
+
+  it("marks the line working while a subagent run is the live tail", () => {
+    const slots = buildTranscriptSlots(
+      [userMsg(0), tool(1), subagentRun(2)],
+      true,
+    );
+    const line = slots.find((slot) => slot.body.kind === "activity");
+    expect(line?.body.kind === "activity" && line.body.working).toBe(true);
   });
 
   it("merges runs across invisible turn-ended markers", () => {
@@ -367,22 +376,22 @@ describe("buildTranscriptSlots — subagent work-log stretches", () => {
     const second = subagentRun(2);
     const slots = buildTranscriptSlots([first, ended, second]);
     expect(slots).toHaveLength(1);
-    expect(slots[0].body.kind).toBe("subagent_stretch");
-    if (slots[0].body.kind === "subagent_stretch") {
-      expect(slots[0].body.runs).toEqual([first, second]);
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.items).toEqual([first, second]);
     }
   });
 
-  it("splits stretches when visible prose lands between runs", () => {
+  it("splits the line when visible prose lands between runs", () => {
     const slots = buildTranscriptSlots([
       subagentRun(0),
       assistantMsg(1, "First pass is in."),
       subagentRun(2),
     ]);
     expect(slots.map((slot) => slot.body.kind)).toEqual([
-      "subagent_stretch",
+      "activity",
       "item",
-      "subagent_stretch",
+      "activity",
     ]);
   });
 });

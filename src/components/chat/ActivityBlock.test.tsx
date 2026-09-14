@@ -1,12 +1,19 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import type { ReasoningItem, ToolCallItem } from "@/lib/agent-chat/types";
+import type {
+  ReasoningItem,
+  SubagentRunItem,
+  SubagentView,
+  ToolCallItem,
+} from "@/lib/agent-chat/types";
+import { useUIStore } from "@/stores/ui-store";
 
 import { ActivityBlock } from "./ActivityBlock";
-import type { ActivityStep } from "./transcript-slots";
+import type { WorkEntry } from "./transcript-slots";
 
+beforeEach(() => useUIStore.setState({ rightPanelTabs: {} }));
 afterEach(() => cleanup());
 
 function read(seq: number, path: string, overrides: Partial<ToolCallItem> = {}): ToolCallItem {
@@ -51,63 +58,146 @@ function think(seq: number, text: string, overrides: Partial<ReasoningItem> = {}
   };
 }
 
-function renderBlock(items: ActivityStep[], working: boolean) {
-  return render(<ActivityBlock items={items} working={working} />);
+function subagent(overrides: Partial<SubagentView>): SubagentView {
+  return {
+    id: "s1",
+    name: "Subagent",
+    status: "completed",
+    items: [],
+    toneIndex: 0,
+    ...overrides,
+  };
 }
 
-describe("ActivityBlock — compact work log", () => {
-  it("shows only the newest action and one quiet history disclosure", () => {
+function subagentRun(seq: number, subagents: SubagentView[]): SubagentRunItem {
+  return { kind: "subagent_run", id: `run-${seq}`, seq, turn_id: "t1", subagents };
+}
+
+function renderBlock(items: WorkEntry[], working: boolean, workspaceId?: string) {
+  return render(
+    <ActivityBlock items={items} working={working} workspaceId={workspaceId} />,
+  );
+}
+
+/** The collapsed line is the only collapsed disclosure in the block. */
+function openLog(container: HTMLElement) {
+  const line = container.querySelector('button[aria-expanded="false"]');
+  if (!line) throw new Error("no collapsed work-log line");
+  fireEvent.click(line);
+}
+
+describe("ActivityBlock — one-line work log", () => {
+  it("collapses a stretch to the newest action plus totals", () => {
     renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
     expect(screen.getByText("run")).toBeInTheDocument();
     expect(screen.getByText("cargo test")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /\+1 previous tool call/ })).toBeInTheDocument();
+    expect(screen.getByText("2 tools")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
-    expect(screen.queryByText("Working")).toBeNull();
+    expect(screen.queryByText(/previous/)).toBeNull();
   });
 
-  it("restores previous rows without replacing the newest row", () => {
-    renderBlock([read(0, "/a"), bash(1, "cargo test", { status: "running" })], true);
-    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
+  it("opens the chronological history from the line and closes it again", () => {
+    const { container } = renderBlock(
+      [read(0, "/a"), bash(1, "cargo test", { status: "running" })],
+      true,
+    );
+    openLog(container);
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("cargo test")).toBeInTheDocument();
     expect(screen.getByText("done")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Show fewer work entries/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Work log/ }));
+    expect(screen.queryByText("/a")).toBeNull();
+    expect(screen.getByText("cargo test")).toBeInTheDocument();
   });
 
-  it("uses the same latest-first treatment after settlement", () => {
+  it("uses the same one-line treatment after settlement", () => {
     renderBlock([read(0, "/a"), read(1, "/b"), read(2, "/c")], false);
     expect(screen.getByText("/c")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /\+2 previous tool calls/ })).toBeInTheDocument();
+    expect(screen.getByText("3 tools")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
     expect(screen.queryByText("Explored the codebase")).toBeNull();
-    expect(screen.queryByText("Details")).toBeNull();
   });
 
-  it("reveals all rows in chronology and can compact them again", () => {
-    renderBlock([read(0, "/a"), read(1, "/b")], false);
-    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
+  it("renders a single entry as its own row without totals", () => {
+    renderBlock([read(0, "/only")], false);
+    expect(screen.getByText("/only")).toBeInTheDocument();
+    expect(screen.queryByText("1 tool")).toBeNull();
+  });
+
+  it("caps the opened history and reveals earlier entries on request", () => {
+    const items = Array.from({ length: 13 }, (_, i) => read(i, `/f${i}`));
+    const { container } = renderBlock(items, false);
+    openLog(container);
+    expect(screen.queryByText("/f0")).toBeNull();
+    expect(screen.getByText("/f3")).toBeInTheDocument();
+    expect(screen.getByText("/f12")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show 3 earlier" }));
+    expect(screen.getByText("/f0")).toBeInTheDocument();
+  });
+
+  it("flags failures in the totals while the line shows a later success", () => {
+    renderBlock([bash(0, "cargo test", { status: "error" }), read(1, "/fixed")], false);
+    expect(screen.getByText("/fixed")).toBeInTheDocument();
+    expect(screen.getByText(/1 failed/)).toBeInTheDocument();
+  });
+
+  it("folds the history back to one line when the work settles", () => {
+    const items = [read(0, "/a"), read(1, "/b")];
+    const { container, rerender } = renderBlock(items, true);
+    openLog(container);
     expect(screen.getByText("/a")).toBeInTheDocument();
-    expect(screen.getByText("/b")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Show fewer work entries/ }));
+    rerender(<ActivityBlock items={items} working={false} />);
     expect(screen.queryByText("/a")).toBeNull();
   });
+});
 
-  it("keeps a latest failure visible and flags a hidden earlier failure", () => {
-    const { rerender } = renderBlock(
-      [read(0, "/a"), bash(1, "cargo test", { status: "error" })],
+describe("ActivityBlock — subagent runs", () => {
+  const review = subagentRun(1, [
+    subagent({ id: "a", name: "review diff", toolUseCount: 6, durationMs: 22_000 }),
+    subagent({ id: "b", name: "verify tests", toolUseCount: 4, durationMs: 18_000 }),
+  ]);
+
+  it("keeps a subagent run on the same line instead of splitting the log", () => {
+    const { container } = renderBlock(
+      [read(0, "/a"), review, bash(2, "npm test")],
       false,
+      "ws-1",
     );
-    expect(screen.getByText("failed")).toBeInTheDocument();
-    rerender(
-      <ActivityBlock
-        items={[
-          bash(0, "cargo test", { status: "error" }),
-          read(1, "/fixed"),
-        ]}
-        working={false}
-      />,
+    expect(screen.getByText("npm test")).toBeInTheDocument();
+    expect(screen.getByText("2 tools · 2 subagents")).toBeInTheDocument();
+    expect(screen.queryByText(/work log · settled/)).toBeNull();
+    // Jump anchors stay mounted while the run is folded out of view.
+    expect(container.querySelector("[data-subagent-card='run-1']")).not.toBeNull();
+    expect(container.querySelector("[data-subagent-run-id='run-1']")).not.toBeNull();
+  });
+
+  it("lists the run in the history and opens the Subagents panel from it", () => {
+    const { container } = renderBlock(
+      [read(0, "/a"), review, bash(2, "npm test")],
+      false,
+      "ws-1",
     );
-    expect(screen.getByRole("button", { name: /\+1 previous tool call · 1 failed/ })).toBeInTheDocument();
+    openLog(container);
+    const row = screen.getByRole("button", { name: "View 2 subagents" });
+    expect(row).toHaveTextContent("review diff · verify tests");
+    expect(row).toHaveTextContent("10 tools · 0m 22s");
+    fireEvent.click(row);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("subagents");
+    expect(row).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("shows a live subagent run as the newest line with one orb", () => {
+    renderBlock(
+      [
+        read(0, "/a"),
+        subagentRun(1, [subagent({ id: "c", name: "screenshot pass", status: "running" })]),
+      ],
+      true,
+      "ws-1",
+    );
+    expect(screen.getByText("agents")).toBeInTheDocument();
+    expect(screen.getByText("screenshot pass")).toBeInTheDocument();
+    expect(document.querySelectorAll("canvas")).toHaveLength(1);
   });
 });
 
@@ -116,8 +206,8 @@ describe("ActivityBlock — step-row inline detail", () => {
     const withResult = read(0, "/a", {
       result_content: "hello world content",
     });
-    renderBlock([withResult, read(1, "/b")], false);
-    fireEvent.click(screen.getByRole("button", { name: /\+1 previous tool call/ }));
+    const { container } = renderBlock([withResult, read(1, "/b")], false);
+    openLog(container);
     // Detail hidden until the row is clicked.
     expect(screen.queryByText("hello world content")).toBeNull();
     fireEvent.click(screen.getByText("/a"));
@@ -125,8 +215,11 @@ describe("ActivityBlock — step-row inline detail", () => {
   });
 
   it("expands a thought's full text beneath a reasoning step row", () => {
-    renderBlock([think(0, "short first\nhidden detail line"), read(1, "/b")], false);
-    fireEvent.click(screen.getByRole("button", { name: /\+1 previous log entry/ }));
+    const { container } = renderBlock(
+      [think(0, "short first\nhidden detail line"), read(1, "/b")],
+      false,
+    );
+    openLog(container);
     expect(screen.queryByText(/hidden detail line/)).toBeNull();
     // Row shows only the first line; clicking reveals the full thought.
     fireEvent.click(screen.getByText("short first"));
@@ -172,11 +265,13 @@ describe("ActivityBlock — agent orb", () => {
     expect(orbState()).toBe("solving");
   });
 
-  it("renders exactly one orb for the whole block", () => {
-    renderBlock(
+  it("renders exactly one orb for the whole block, collapsed or open", () => {
+    const { container } = renderBlock(
       [read(0, "/a"), think(1, "hmm"), read(2, "/b", { status: "running" })],
       true,
     );
+    expect(document.querySelectorAll("canvas")).toHaveLength(1);
+    openLog(container);
     expect(document.querySelectorAll("canvas")).toHaveLength(1);
   });
 });

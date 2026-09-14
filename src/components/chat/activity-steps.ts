@@ -1,6 +1,16 @@
-import type { ReasoningItem, ToolCallItem } from "@/lib/agent-chat/types";
+import {
+  formatElapsed,
+  isRunning,
+  subagentGroupRollup,
+} from "@/lib/agent-chat/subagents";
+import type {
+  ReasoningItem,
+  SubagentRunItem,
+  SubagentView,
+  ToolCallItem,
+} from "@/lib/agent-chat/types";
 
-import type { ActivityStep } from "./transcript-slots";
+import type { ActivityStep, WorkEntry } from "./transcript-slots";
 import { computeLineDiff } from "./DiffView";
 import { describeToolCall } from "./ToolCallStatus";
 
@@ -91,6 +101,71 @@ export function stepMeta(step: ActivityStep): string {
 export function toStepView(step: ActivityStep): StepView {
   const { verb, summary } = describeStep(step);
   return { id: step.id, verb, summary, meta: stepMeta(step), status: stepStatus(step) };
+}
+
+export function isSubagentRun(entry: WorkEntry): entry is SubagentRunItem {
+  return entry.kind === "subagent_run";
+}
+
+export function subagentRunStatus(run: SubagentRunItem): StepStatus {
+  if (run.subagents.some(isRunning)) return "running";
+  if (run.subagents.some((subagent) => subagent.status === "failed")) {
+    return "error";
+  }
+  return "done";
+}
+
+/** Up to three distinct subagent names, e.g. `review diff · verify tests`. */
+export function subagentPreview(subagents: readonly SubagentView[]): string {
+  const labels: string[] = [];
+  for (const subagent of subagents) {
+    const label = (subagent.name ?? subagent.agentType)?.trim();
+    if (!label || labels.includes(label)) continue;
+    labels.push(label);
+    if (labels.length === 3) break;
+  }
+  return labels.length > 0 ? labels.join(" · ") : "working in parallel";
+}
+
+/** Row meta for a subagent run: `1 done · 2 active` while live, then
+ *  `9 tools · 1m 14s` once every subagent has settled. */
+export function subagentRunMeta(run: SubagentRunItem, now: number): string {
+  const rollup = subagentGroupRollup(run.subagents, now);
+  if (rollup.activeCount > 0) {
+    return `${rollup.doneCount} done · ${rollup.activeCount} active`;
+  }
+  const tools = `${rollup.toolCount} ${rollup.toolCount === 1 ? "tool" : "tools"}`;
+  return rollup.elapsedMs == null
+    ? tools
+    : `${tools} · ${formatElapsed(rollup.elapsedMs)}`;
+}
+
+export interface WorkLogTotals {
+  /** `12 tools · 3 subagents`; empty when neither is present. */
+  label: string;
+  failed: number;
+}
+
+/** Stretch-wide totals shown on the collapsed work-log line. */
+export function workLogTotals(entries: readonly WorkEntry[]): WorkLogTotals {
+  let tools = 0;
+  let subagents = 0;
+  let failed = 0;
+  for (const entry of entries) {
+    if (entry.kind === "tool_call") {
+      tools += 1;
+      if (entry.status === "error") failed += 1;
+    } else if (entry.kind === "subagent_run") {
+      subagents += entry.subagents.length;
+      failed += entry.subagents.filter((s) => s.status === "failed").length;
+    }
+  }
+  const parts: string[] = [];
+  if (tools > 0) parts.push(`${tools} ${tools === 1 ? "tool" : "tools"}`);
+  if (subagents > 0) {
+    parts.push(`${subagents} ${subagents === 1 ? "subagent" : "subagents"}`);
+  }
+  return { label: parts.join(" · "), failed };
 }
 
 /** Live one-liner for the working header: the currently running step
