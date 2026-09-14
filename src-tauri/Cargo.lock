@@ -1071,6 +1071,7 @@ dependencies = [
  "futures-util",
  "gag",
  "glob",
+ "gtk",
  "hkdf",
  "hostname",
  "if-addrs",
