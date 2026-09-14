@@ -130,36 +130,32 @@ describe("SidebarFooterBar — expanded", () => {
     setShowDevicesMock.mockClear();
   });
 
-  it("renders a labeled Automations button and no Workspaces button", () => {
+  it("renders Automations as an icon-only button and no Workspaces button", () => {
     const { container } = renderFooter(true);
 
     const automations = container.querySelector(
       'button[aria-label="Automations"]',
     ) as HTMLElement;
-    expect(automations).toHaveTextContent("Automations");
+    expect(automations).not.toHaveTextContent("Automations");
     expect(container.querySelector('button[aria-label="Workspaces"]')).toBeNull();
 
     fireEvent.click(automations);
     expect(setShowAutomationsMock).toHaveBeenCalledWith(true);
   });
 
-  it("keeps the icon destinations clustered with the menu on the right", () => {
+  it("starts the row with the menu and packs every destination beside it", () => {
     hosts = [host(1, "zeus")];
     statuses = { 1: status(1, { reachable: true }) };
     const { container } = renderFooter(true);
 
-    const menu = container.querySelector(
-      'button[aria-label="Menu"]',
+    const footer = container.querySelector(
+      '[data-testid="sidebar-footer"]',
     ) as HTMLElement;
-    const cluster = menu.parentElement as HTMLElement;
-    // The slack a labelled destination opens up belongs before the cluster,
-    // not as a hole between the last icon and the gear.
-    expect(cluster.className).toContain("ml-auto");
     expect(
-      cluster.querySelector('[data-testid="sidebar-devices"]'),
-    ).not.toBeNull();
-    // The labelled headline stays outside the cluster, on the left.
-    expect(cluster.querySelector('button[aria-label="Automations"]')).toBeNull();
+      Array.from(footer.children).map((el) => el.getAttribute("aria-label")),
+    ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Ports"]);
+    // Nothing pushes a group to the right, so the strip stays left-aligned.
+    expect(footer.querySelector(".ml-auto")).toBeNull();
   });
 
   it("hides the Devices button until a device is configured", () => {
@@ -335,10 +331,10 @@ describe("SidebarFooterBar — collapsed", () => {
   it("renders the icon rail without Workspaces or Devices when no device exists", () => {
     const { container } = renderFooter(false);
     expect(labels(container)).toEqual([
+      "Menu",
       "Automations",
       "Pull requests",
       "Ports",
-      "Menu",
     ]);
   });
 
@@ -346,22 +342,21 @@ describe("SidebarFooterBar — collapsed", () => {
     hosts = [host(1, "zeus")];
     const { container } = renderFooter(false);
     expect(labels(container)).toEqual([
+      "Menu",
       "Automations",
       "Devices",
       "Pull requests",
       "Ports",
-      "Menu",
     ]);
   });
 });
 
 
 describe("footer customization", () => {
-  it("drops the Automations label before introducing overflow and restores it when space returns", () => {
+  it("only introduces overflow once the icon row runs out of room", () => {
     hosts = [host(1, "test-device")];
     const { container } = renderFooter(true);
     const footer = within(container);
-    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
     expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
 
     act(() => {
@@ -369,16 +364,14 @@ describe("footer customization", () => {
         useFooterPinsStore.getState().togglePin(`codemux.settings.${id}`);
       }
     });
-    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
     expect(footer.getByRole("button", { name: "Settings · Shortcuts" })).toBeInTheDocument();
     expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
 
     act(() => useFooterPinsStore.setState({ pins: FOOTER_ACTIONS.map((action) => ({ id: action.id })) }));
-    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
     expect(footer.getByRole("button", { name: "More footer destinations" })).toBeInTheDocument();
 
     act(() => useFooterPinsStore.getState().reset());
-    expect(footer.getByRole("button", { name: "Automations" })).toHaveTextContent("Automations");
+    expect(footer.getByRole("button", { name: "Automations" })).not.toHaveTextContent("Automations");
     expect(footer.queryByRole("button", { name: "More footer destinations" })).toBeNull();
   });
 
