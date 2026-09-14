@@ -957,6 +957,9 @@ export const MessageList = memo(function MessageList({
   useEffect(() => {
     const viewport = listRef.current?.getScrollableNode();
     if (!viewport) return;
+    // Lets the owning pane find this viewport to pin its scroll position
+    // while the composer below changes height.
+    viewport.setAttribute("data-transcript-viewport", "");
     return registerTitlebarTranscript(viewport);
   }, []);
 

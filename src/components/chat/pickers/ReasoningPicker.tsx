@@ -62,6 +62,9 @@ interface Props {
    *  footer) so the pipe disappears together with the control when the
    *  capability gate hides it — no orphaned separators. */
   withSeparator?: boolean;
+  /** Narrow composer: keep the icon, drop the text label (the label stays
+   *  in the tooltip / accessible name). Ignored when there is no icon. */
+  iconOnly?: boolean;
 }
 
 function effortLabel(labelMap: Record<string, string>, id: string): string {
@@ -114,6 +117,7 @@ export function ReasoningPicker({
   onFastModeChange,
   disabled,
   withSeparator,
+  iconOnly = false,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -203,7 +207,9 @@ export function ReasoningPicker({
             ) : reasoningLabel ? (
               <Brain className="h-4 w-4" />
             ) : null}
-            <span className="max-w-[200px] truncate">{triggerLabel}</span>
+            {!(iconOnly && (fastMode || reasoningLabel)) && (
+              <span className="max-w-[200px] truncate">{triggerLabel}</span>
+            )}
             <ChevronDown className="h-3 w-3 opacity-50" />
           </button>
         </PopoverTrigger>

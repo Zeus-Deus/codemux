@@ -492,8 +492,8 @@ export function isLiveActivity(
   return streaming || !view.backgroundTask;
 }
 
-/** Count of currently-running subagents across the whole thread — feeds
- *  the docked {@link SubagentActivityBar}. `streaming` is the thread's
+/** Count of currently-running subagents across the whole thread.
+ *  `streaming` is the thread's
  *  live-run flag; see {@link isLiveActivity}. */
 export function countRunningSubagents(
   messages: ChatViewItem[],
@@ -531,7 +531,7 @@ export function subagentOrdinal(messages: ChatViewItem[], id: string): number {
 }
 
 /** One currently-running subagent, flattened out of its card, with enough
- *  context to render a docked-bar row and jump back to the card it came
+ *  context to render a composer-strip row and jump back to the card it came
  *  from. */
 export interface RunningSubagentEntry {
   subagent: SubagentView;
@@ -556,9 +556,9 @@ export function isMonitorTask(view: SubagentView): boolean {
 
 /** Every currently-running subagent across every `subagent_run` card in
  *  the thread, no matter which reply spawned it (design "one bar for the
- *  whole thread"). Feeds the docked {@link SubagentActivityBar}: its
- *  `.length` is the bar's count, and each entry carries the "from"
- *  label + jump target for the expand list.
+ *  whole thread"). Feeds the composer strip's subagent occupant: its
+ *  `.length` is the running count, and each entry carries the "from"
+ *  label + jump target for the opened list.
  *
  *  `streaming` is the thread's live-run flag, and watch loops never
  *  qualify at all — see {@link isLiveActivity} for both exclusions. */

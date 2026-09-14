@@ -1,0 +1,308 @@
+import { useEffect, useRef, useState } from "react";
+
+import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
+import {
+  formatElapsed,
+  runningSubagentEntries,
+  subagentActivityLine,
+  subagentElapsedMs,
+  type RunningSubagentEntry,
+} from "@/lib/agent-chat/subagents";
+import type {
+  ChatViewItem,
+  SubagentView,
+  UserMessageItem,
+} from "@/lib/agent-chat/types";
+import { resolveOrbState } from "@/lib/orb-state";
+
+import type { StripOccupant, StripRow } from "./ComposerStrip";
+
+/** How long the "just finished" row stays before it leaves the strip. */
+export const FINISHED_FLASH_MS = 2500;
+
+const JUMP_TITLE = "Jump to the Subagents card";
+
+/**
+ * Subagent occupant: running (one summary row, one row per subagent when
+ * the strip is open) and the 2.5s finished flash.
+ *
+ * Counts every live subagent across every `subagent_run` card. While the
+ * matching transcript row is on screen the occupant is withheld — the row
+ * is the primary live surface, and the strip is only the off-screen tether
+ * back to it. The finished flash plays only on an observed running → zero
+ * transition, never on mount or a thread switch.
+ */
+export function useSubagentOccupant({
+  messages,
+  threadId,
+  streaming,
+  onJump,
+}: {
+  messages: ChatViewItem[];
+  threadId: string | null;
+  /** The thread's live-run flag. Once the run is over, background provider
+   *  tasks stop counting as live, so the strip can't spin forever. */
+  streaming: boolean;
+  onJump: (cardId: string) => void;
+}): StripOccupant | null {
+  const entries = runningSubagentEntries(messages, streaming);
+  const count = entries.length;
+
+  const [finishedFlash, setFinishedFlash] = useState(false);
+  const [transcriptRowVisible, setTranscriptRowVisible] = useState(false);
+  const prevCountRef = useRef(count);
+  const prevThreadRef = useRef(threadId);
+  // By the time the >0 → 0 transition is observed `entries` is empty, so
+  // the flash's Jump targets the last card captured while something ran.
+  const lastRunningCardIdRef = useRef<string | null>(null);
+  if (count > 0) {
+    lastRunningCardIdRef.current = entries[entries.length - 1].cardId;
+  }
+
+  const runningCardIds = entries.map((entry) => entry.cardId).join("\u0000");
+  useEffect(() => {
+    if (count === 0 || typeof IntersectionObserver === "undefined") {
+      setTranscriptRowVisible(false);
+      return;
+    }
+
+    const ids = new Set(runningCardIds.split("\u0000"));
+    let observed: Element | null = null;
+    let intersection: IntersectionObserver | null = null;
+
+    const findRow = () => {
+      const marker = [...document.querySelectorAll("[data-subagent-run-id]")]
+        .find((node) => ids.has(node.getAttribute("data-subagent-run-id") ?? ""));
+      const row = marker?.closest("[data-subagent-card]") ?? null;
+      if (row === observed) return;
+      intersection?.disconnect();
+      observed = row;
+      if (!row) {
+        setTranscriptRowVisible(false);
+        return;
+      }
+      intersection = new IntersectionObserver(([entry]) => {
+        setTranscriptRowVisible(entry?.isIntersecting === true);
+      });
+      intersection.observe(row);
+    };
+
+    findRow();
+    const mutations = new MutationObserver(findRow);
+    mutations.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      intersection?.disconnect();
+      mutations.disconnect();
+    };
+  }, [count, runningCardIds]);
+
+  useEffect(() => {
+    if (threadId !== prevThreadRef.current) {
+      prevThreadRef.current = threadId;
+      prevCountRef.current = count;
+      lastRunningCardIdRef.current = null;
+      setFinishedFlash(false);
+      return;
+    }
+
+    const wasRunning = prevCountRef.current > 0;
+    prevCountRef.current = count;
+
+    if (wasRunning && count === 0) {
+      setFinishedFlash(true);
+      const timer = window.setTimeout(() => {
+        setFinishedFlash(false);
+      }, FINISHED_FLASH_MS);
+      return () => window.clearTimeout(timer);
+    }
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately
+    // keyed only on count/threadId; prevCountRef/prevThreadRef are refs.
+  }, [count, threadId]);
+
+  if (count === 0 && !finishedFlash) return null;
+  if (count > 0 && transcriptRowVisible) return null;
+
+  if (count === 0) {
+    const cardId = lastRunningCardIdRef.current;
+    const row: StripRow = {
+      id: "subagents-finished",
+      mark: { kind: "finished" },
+      label: "Subagents finished",
+      detail: "all tasks complete · results are in the thread",
+      action: cardId
+        ? { label: "Jump", title: JUMP_TITLE, onClick: () => onJump(cardId) }
+        : null,
+    };
+    return { kind: "finished", summary: row, rows: [row] };
+  }
+
+  const primary = entries[0];
+  const summary: StripRow = {
+    id: "subagents-running",
+    // This orb stands for the whole run, so it stays on the neutral
+    // working state; each opened row owns its own activity-matched orb.
+    mark: { kind: "orb" },
+    label: `${count} subagent${count === 1 ? "" : "s"} running`,
+    detail: runningActivityLabel(entries),
+    elapsed: (now) => elapsedLabel(primary.subagent, now),
+    action: {
+      label: "Jump",
+      title: JUMP_TITLE,
+      onClick: () => onJump(primary.cardId),
+    },
+  };
+  const rows = entries.map<StripRow>((entry) => {
+    const activity = subagentActivityLine(entry.subagent);
+    return {
+      id: `subagent:${entry.subagent.id}`,
+      mark: { kind: "orb", activity: subagentOrbActivity(entry.subagent) },
+      label: entry.subagent.name ?? entry.subagent.agentType ?? "Subagent",
+      detail: entry.fromLabel ? `${activity} · from ${entry.fromLabel}` : activity,
+      elapsed: (now) => elapsedLabel(entry.subagent, now),
+      action: {
+        label: "Jump",
+        title: JUMP_TITLE,
+        onClick: () => onJump(entry.cardId),
+      },
+    };
+  });
+  return { kind: "running", summary, rows, live: true };
+}
+
+/**
+ * Monitoring occupant: the pane reports `monitoring` (a settled thread
+ * whose only live tasks are watch loops, or `codemux monitor start`).
+ *
+ * Stop's pending state resolves on the status leaving `monitoring`, not on
+ * the command's promise — the recomputed status arrives as a separate
+ * app-state emit, so "Stopping…" ends when the stop is visibly true. It
+ * also unwinds on a thread switch and on a failed command.
+ */
+export function useMonitoringOccupant({
+  monitoring,
+  reason,
+  threadId,
+  onStop,
+}: {
+  monitoring: boolean;
+  reason?: string | null;
+  threadId: string | null;
+  onStop: () => void | Promise<void>;
+}): StripOccupant | null {
+  const [stopping, setStopping] = useState(false);
+  const prevThreadRef = useRef(threadId);
+
+  useEffect(() => {
+    if (threadId !== prevThreadRef.current) {
+      prevThreadRef.current = threadId;
+      setStopping(false);
+      return;
+    }
+    if (!monitoring) setStopping(false);
+  }, [threadId, monitoring]);
+
+  if (!monitoring) return null;
+
+  const handleStop = () => {
+    if (stopping) return;
+    setStopping(true);
+    void Promise.resolve(onStop()).catch((error) => {
+      console.error("[ComposerStrip] monitoring stop failed", error);
+      setStopping(false);
+    });
+  };
+
+  const row: StripRow = {
+    id: "monitoring",
+    mark: { kind: "monitoring" },
+    label: "Monitoring",
+    detail: reason || "watching in the background",
+    action: {
+      label: stopping ? "Stopping…" : "Stop",
+      disabled: stopping,
+      onClick: handleStop,
+    },
+  };
+  return { kind: "monitoring", summary: row, rows: [row] };
+}
+
+/** Follow-ups parked behind the active turn, oldest first. */
+export function queuedMessages(messages: ChatViewItem[]): UserMessageItem[] {
+  const queued: UserMessageItem[] = [];
+  for (const m of messages) {
+    if (m.kind === "user_message" && m.queued) queued.push(m);
+  }
+  return queued;
+}
+
+/** Queued-message occupant. Edit hands the text back to the composer
+ *  (cancelling the queued turn), exactly like the transcript's cancel. */
+export function queuedOccupant(
+  queued: UserMessageItem[],
+  onEdit?: (queuedId: string, text: string) => void,
+): StripOccupant | null {
+  if (queued.length === 0) return null;
+  const rows = queued.map<StripRow>((m) => {
+    const queuedId = m.queued!.queuedId;
+    return {
+      id: `queued:${queuedId}`,
+      mark: { kind: "queued" },
+      label: "Queued",
+      detail: m.text.replace(/\s+/g, " ").trim(),
+      action: onEdit
+        ? {
+            label: "Edit",
+            title: "Move this message back into the composer",
+            onClick: () => onEdit(queuedId, m.text),
+          }
+        : null,
+    };
+  });
+  return { kind: "queued", summary: rows[0], rows };
+}
+
+const SESSION_ERROR_PREFIX = /^Session error:\s*/;
+
+/** Session-error occupant: the thread's latest row (ignoring turn
+ *  boundaries) is a terminal runtime error and nothing has run since. */
+export function sessionErrorOccupant(
+  messages: ChatViewItem[],
+  streaming: boolean,
+): StripOccupant | null {
+  if (streaming) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.kind === "turn_ended") continue;
+    if (m.kind !== "runtime_notice" || m.severity !== "error") return null;
+    const row: StripRow = {
+      id: `error:${m.id}`,
+      mark: { kind: "error" },
+      label: "Session error",
+      detail: m.message.replace(SESSION_ERROR_PREFIX, ""),
+    };
+    return { kind: "error", summary: row, rows: [row] };
+  }
+  return null;
+}
+
+/**
+ * What kind of busy the run is, e.g. "solving · connecting" — the same
+ * orb-state vocabulary the rows animate, deduped and capped at three.
+ * Deliberately not gated on the "Match the orb to the activity" setting:
+ * that governs the animation, not what the app knows.
+ */
+function runningActivityLabel(entries: RunningSubagentEntry[]): string {
+  const states = new Set<string>();
+  for (const entry of entries) {
+    states.add(resolveOrbState(subagentOrbActivity(entry.subagent)));
+    if (states.size >= 3) break;
+  }
+  return [...states].join(" · ");
+}
+
+/** Empty when nothing is derivable, so no number is fabricated. */
+function elapsedLabel(subagent: SubagentView, now: number): string {
+  const ms = subagentElapsedMs(subagent, now);
+  return ms != null ? formatElapsed(ms) : "";
+}

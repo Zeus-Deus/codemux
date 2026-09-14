@@ -90,7 +90,7 @@ interface TitleBarTabsProps {
  * Workspace tabs merged into the title bar for GUI chrome. Each tab is a
  * compact pill; the active chat tab grows a chevron that opens the shared
  * session-history dropdown. Live subagent status no longer rides an
- * inline pill here — it lives in the docked `SubagentActivityBar` above
+ * inline pill here — it lives in the `ComposerStrip` docked above
  * the composer. Tabs stay backend-owned — activation/close/reorder go through
  * the existing commands. Reorder is a pointer-driven drag (see
  * `@/lib/tab-reorder`) rather than the legacy TabBar's HTML5 DnD.

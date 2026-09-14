@@ -100,7 +100,7 @@ export function ContextUsageMeter({
                   // Same circle diameter as the attach / send buttons
                   // so the footer's right cluster stays on one optical
                   // baseline.
-                  "inline-flex h-8 w-8 items-center justify-center rounded-full",
+                  "inline-flex h-[34px] w-[34px] items-center justify-center rounded-full",
                   "text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground",
                   "outline-none focus-visible:ring-1 focus-visible:ring-ring",
                   warning && "text-danger hover:text-danger",

@@ -97,6 +97,8 @@ import { AttachmentChip } from "./AttachmentChip";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
+import { PermissionModePicker } from "./pickers/PermissionModePicker";
+import { ReasoningPicker } from "./pickers/ReasoningPicker";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 
@@ -219,13 +221,22 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
-  /** Optional strip welded flush INSIDE the composer card's top edge —
-   *  the running-subagents strip (`SubagentActivityBar`). It lives inside
-   *  the card rather than docked above it so the composer keeps a single
-   *  border and radius; the slot's own element owns the matching top
-   *  corner radius and its hairline bottom border. `undefined`/`null`
-   *  (the default) renders nothing and leaves the card untouched. */
-  topStripSlot?: React.ReactNode;
+  /** Shared strip docked ABOVE the composer pill (`ComposerStrip`):
+   *  subagents, monitoring, queued messages, session errors. Detached from
+   *  the card in every state; its bottom seam tucks under the pill, which
+   *  is why the pill paints an opaque surface. `undefined`/`null` renders
+   *  nothing. */
+  stripSlot?: React.ReactNode;
+  /** Floor for the textarea box, padding included. Defaults to
+   *  {@link MIN_TEXTAREA_PX} when `isDraft` (a spacious prompt card) and
+   *  to a single line otherwise. */
+  minTextareaPx?: number;
+  /** A follow-up is parked behind the active turn — keeps the pill
+   *  expanded. */
+  hasQueuedMessage?: boolean;
+  /** A file drag is over the owning pane (not necessarily this card). A
+   *  collapsed pill grows into a 74px drop target. */
+  paneDragActive?: boolean;
   /** Latest context-window occupancy for the thread, forwarded to the
    *  footer's meter. Optional (defaults to `null`): the draft surface
    *  has no session yet, so it omits this and the meter stays hidden. */
@@ -332,11 +343,50 @@ interface Props {
 
 const MAX_ROWS_APPROX_PX = 20 + 10 * 20; // ~10 rows (200px of text + py-2.5)
 
-/** Resting height of the (empty) textarea box, padding included. Reserves
- *  ~4 lines of space so the idle composer reads as a spacious prompt card
- *  (140px tall with the 32px-control footer row) instead of a single-line
- *  strip. The auto-grow effect only ever grows past this, never below it. */
-const MIN_TEXTAREA_PX = 94;
+/** Draft-surface resting height of the (empty) textarea box, padding
+ *  included. Reserves ~4 lines so a new thread reads as a spacious prompt
+ *  card. A live thread's composer has no such floor: it rests as a 44px
+ *  pill and grows from a single line. The auto-grow effect only ever grows
+ *  past the floor, never below it. */
+export const MIN_TEXTAREA_PX = 94;
+
+/** The pill never collapses within this window after a send, so the card
+ *  doesn't snap shut under the message that was just sent. */
+const SEND_HOLD_MS = 400;
+
+/** What the controls row gives up as the pill narrows. */
+export interface ComposerWidthLadder {
+  /** < 620px: the model label shortens to its leaf name. */
+  leafModelLabel: boolean;
+  /** < 540px: access drops its text label. */
+  accessIconOnly: boolean;
+  /** < 500px: effort drops its text label too. */
+  effortIconOnly: boolean;
+  /** < 460px: effort + access move into the `+` menu. */
+  configInMenu: boolean;
+  /** < 400px: the pill never collapses. */
+  collapseDisabled: boolean;
+}
+
+/** `null` (not measured yet, or no layout — jsdom) reads as full width. */
+export function composerWidthLadder(width: number | null): ComposerWidthLadder {
+  if (width === null) {
+    return {
+      leafModelLabel: false,
+      accessIconOnly: false,
+      effortIconOnly: false,
+      configInMenu: false,
+      collapseDisabled: false,
+    };
+  }
+  return {
+    leafModelLabel: width < 620,
+    accessIconOnly: width < 540,
+    effortIconOnly: width < 500,
+    configInMenu: width < 460,
+    collapseDisabled: width < 400,
+  };
+}
 
 export function Composer({
   draft,
@@ -367,7 +417,10 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
-  topStripSlot,
+  stripSlot,
+  minTextareaPx,
+  hasQueuedMessage = false,
+  paneDragActive = false,
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
@@ -1028,6 +1081,8 @@ export function Composer({
       const target = e.target as HTMLElement | null;
       if (!target) return;
       if (
+        // Pickers hosted inside the `+` menu open portalled popovers.
+        target.closest("[data-radix-popper-content-wrapper]") ||
         target.closest('[data-testid="slash-command-popup"]') ||
         target.closest('[data-testid="composer-command-menu"]') ||
         target.closest('[data-testid="composer-issue-picker"]') ||
@@ -2328,6 +2383,58 @@ export function Composer({
   const [dragDepth, setDragDepth] = useState(0);
   const isDragging = dragDepth > 0;
 
+  // ─── Pill collapse ───────────────────────────────────────────────
+  // The width ladder keys on the pill's own width, so a split pane and a
+  // narrow window degrade the same way.
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const [pillWidth, setPillWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const el = wrapperRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const sync = () => {
+      const width = el.getBoundingClientRect().width;
+      setPillWidth(width > 0 ? Math.round(width) : null);
+    };
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  const ladder = composerWidthLadder(pillWidth);
+
+  const [focusWithin, setFocusWithin] = useState(false);
+  const handleWrapperFocus = useCallback(() => setFocusWithin(true), []);
+  const handleWrapperBlur = useCallback(
+    (e: React.FocusEvent<HTMLDivElement>) => {
+      const next = e.relatedTarget as Node | null;
+      if (next && e.currentTarget.contains(next)) return;
+      setFocusWithin(false);
+    },
+    [],
+  );
+
+  const [sendHold, setSendHold] = useState(false);
+  const sendHoldTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (sendHoldTimerRef.current !== null) {
+        window.clearTimeout(sendHoldTimerRef.current);
+      }
+    },
+    [],
+  );
+  const submit = useCallback(() => {
+    setSendHold(true);
+    if (sendHoldTimerRef.current !== null) {
+      window.clearTimeout(sendHoldTimerRef.current);
+    }
+    sendHoldTimerRef.current = window.setTimeout(() => {
+      sendHoldTimerRef.current = null;
+      setSendHold(false);
+    }, SEND_HOLD_MS);
+    onSubmit();
+  }, [onSubmit]);
+
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
   // own send RPC is in flight (`sending`) to avoid a double-send. The
@@ -2338,6 +2445,40 @@ export function Composer({
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
+
+  const continueChipVisible =
+    interrupted && !streaming && !sending && !!onContinueRun;
+  // Expansion commits in the same render that opens an autocomplete popup
+  // or the `+` menu, so a popup anchored to the card never measures the
+  // collapsed pill and then jumps.
+  const expanded =
+    isDraft ||
+    ladder.collapseDisabled ||
+    draft.length > 0 ||
+    focusWithin ||
+    stagedAttachments.length > 0 ||
+    mode !== "default" ||
+    hasQueuedMessage ||
+    slashOpen ||
+    mentionOpen ||
+    attachOpen ||
+    sendHold ||
+    !!errorMessage ||
+    continueChipVisible;
+  const dropTarget = !expanded && (paneDragActive || isDragging);
+  const textareaMinPx = minTextareaPx ?? (isDraft ? MIN_TEXTAREA_PX : 0);
+  const placeholderText =
+    sessionReady || sessionAwaitingIntent
+      ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
+      : "Starting session…";
+  const handleGapPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+    [],
+  );
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Shift+Tab cycles modes regardless of popup state. preventDefault
@@ -2449,7 +2590,7 @@ export function Composer({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (canSubmit) onSubmit();
+      if (canSubmit) submit();
     }
   };
 
@@ -2539,23 +2680,30 @@ export function Composer({
             {cwd}
           </div>
         ) : null}
+        {stripSlot ?? null}
         <div
+          ref={wrapperRef}
           data-testid="composer-wrapper"
+          data-expanded={expanded || undefined}
+          data-drop-target={dropTarget || undefined}
           data-dragging={isDragging || undefined}
+          onFocus={handleWrapperFocus}
+          onBlur={handleWrapperBlur}
           onDragOver={handleDragOver}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           className={cn(
-            "relative",
-            // Composer card: soft 20px radius, a hairline border on
-            // the slightly-elevated surface, and a deep low-opacity
-            // shadow so the card lifts off the pane background and
-            // the scope strip below reads as a layer tucked under it.
-            // The border deliberately stays identical at rest and on focus.
-            // Focus comes from the surface and elevation instead, avoiding a
-            // bright wireframe around this large rounded rectangle.
-            "rounded-[20px] border border-border/80 bg-muted/40",
+            // Stacks above the strip, whose 18px seam tucks under the pill.
+            "relative z-[1] flex flex-col",
+            // Composer pill / card: 22px radius in both states (a 44px
+            // pill is a stadium; the expanded card keeps the same corner),
+            // a hairline border, and a deep low-opacity shadow so the card
+            // lifts off the pane background. The border stays identical at
+            // rest and on focus — focus comes from surface and elevation.
+            // The surface is the muted tint pre-composited over the pane
+            // background: opaque, so the strip's seam never shows through.
+            "rounded-[22px] border border-border/80 bg-[color-mix(in_oklab,var(--muted)_40%,var(--background))]",
             // Geometry and color split so the tint stays a themeable
             // utility rather than a baked-in rgba literal.
             "shadow-[0_12px_28px_-18px] shadow-black/40",
@@ -2567,13 +2715,13 @@ export function Composer({
             // border shift) so the compositor only has work to do on
             // those changes.
             "transition-[box-shadow,border-color,background-color]",
-            "focus-within:bg-muted/60 focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
+            "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is
             // enough to confirm the drop target.
             isDragging &&
-              "border-foreground/40 bg-foreground/[0.04] ring-1 ring-foreground/40",
+              "border-foreground/40 bg-[color-mix(in_oklab,var(--foreground)_4%,var(--background))] ring-1 ring-foreground/40",
           )}
         >
           {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`
@@ -2686,6 +2834,31 @@ export function Composer({
               onEscape={handleAttachEscape}
               footerNote={attachPopupFooter}
               submode={attachSubmode}
+              headerSlot={
+                ladder.configInMenu && attachSubmode === "main" ? (
+                  <>
+                    <ReasoningPicker
+                      model={activeModel}
+                      effortValue={effort}
+                      contextWindowValue={contextWindow}
+                      labelMap={effortLabelMap}
+                      ultrathinkInBodyText={ultrathinkInBodyText}
+                      fastMode={fastMode}
+                      onEffortChange={onEffortChange}
+                      onContextWindowChange={onContextWindowChange}
+                      onFastModeChange={onFastModeChange}
+                      disabled={!configurationEnabled}
+                    />
+                    <PermissionModePicker
+                      modes={permissionModes}
+                      value={permissionMode}
+                      onChange={onPermissionModeChange}
+                      disabled={!configurationEnabled || mode !== "default"}
+                      withSeparator
+                    />
+                  </>
+                ) : null
+              }
               placeholder={
                 attachSubmode === "file"
                   ? "Filter files"
@@ -2699,345 +2872,351 @@ export function Composer({
               }
             />
           )}
-          {/* Flush top-edge strip (running subagents). First element in
-              flow order — everything above it is either `hidden` or
-              absolutely positioned — so it sits on the card's top edge. */}
-          {topStripSlot ?? null}
-          {errorMessage && (
-            <div
-              role="alert"
-              className="px-3 pt-2 text-[11px] text-destructive/90 leading-tight"
-            >
-              <span>Send failed: {errorMessage}. </span>
-              <span className="text-muted-foreground/80">
-                Press Enter to retry.
-              </span>
-            </div>
-          )}
-          {/* Step 8 Stage 3 refactor — strip above textarea hosts
-              the active mode pill + image attachment chips. File /
-              folder chips render INSIDE the textarea via the mirror
-              overlay below; images can't live inline as text so they
-              stay here. The mode pill moved out of the footer when
-              the `+ Mode` dropdown was retired in favour of the
-              unified `+` popup. */}
-          {(mode !== "default" ||
-            stagedAttachments.some(
-              (a) =>
-                a.kind === "image" ||
-                a.kind === "pr" ||
-                a.kind === "session",
-            ) ||
-            (interrupted && !streaming && !sending && !!onContinueRun)) && (
-            <div
-              data-testid="composer-attachment-strip"
-              className="flex flex-wrap gap-1.5 px-3 pt-2"
-            >
-              {/* Dead-run recovery (issue #154): a one-click chip that
-                  resumes the interrupted run. Amber-tinted, mirroring
-                  ModePill's shape. */}
-              {interrupted && !streaming && !sending && onContinueRun && (
-                <button
-                  type="button"
-                  data-testid="composer-continue-run-chip"
-                  onClick={onContinueRun}
-                  className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
-                >
-                  <RotateCw className="h-3 w-3" aria-hidden />
-                  <span>Continue run</span>
-                </button>
-              )}
-              {mode !== "default" && (
-                <ModePill
-                  mode={mode as ActivePillMode}
-                  onRemove={onModeRemove}
-                />
-              )}
-              {stagedAttachments
-                .filter(
-                  (a) =>
-                    a.kind === "image" ||
-                    a.kind === "pr" ||
-                    a.kind === "session",
-                )
-                .map((attachment) => (
-                  <AttachmentChip
-                    key={attachment.id}
-                    attachment={attachment}
-                    onRemove={(id) => {
-                      if (
-                        attachment.kind === "session" &&
-                        attachment.metadata.mentionToken
-                      ) {
-                        onDraftChange(
-                          removeSessionMentionToken(
-                            draft,
-                            attachment.metadata.mentionToken,
-                          ),
-                        );
-                      }
-                      onRemoveAttachment?.(id);
-                    }}
-                    onToggleExpand={
-                      attachment.kind === "pr" && onToggleExpandPr
-                        ? (id) => onToggleExpandPr(id)
-                        : undefined
-                    }
+          {/* Everything above the controls row collapses with the pill.
+              The textarea stays mounted — and focusable — inside a
+              zero-height box, so Tab or a click on the gap expands the
+              card in place without swapping DOM nodes. */}
+          <div
+            data-testid="composer-body"
+            data-collapsed={!expanded || undefined}
+            className={cn(!expanded && "h-0 overflow-hidden")}
+          >
+            {errorMessage && (
+              <div
+                role="alert"
+                className="px-3 pt-2 text-[11px] text-destructive/90 leading-tight"
+              >
+                <span>Send failed: {errorMessage}. </span>
+                <span className="text-muted-foreground/80">
+                  Press Enter to retry.
+                </span>
+              </div>
+            )}
+            {/* Step 8 Stage 3 refactor — strip above textarea hosts
+                the active mode pill + image attachment chips. File /
+                folder chips render INSIDE the textarea via the mirror
+                overlay below; images can't live inline as text so they
+                stay here. The mode pill moved out of the footer when
+                the `+ Mode` dropdown was retired in favour of the
+                unified `+` popup. */}
+            {(mode !== "default" ||
+              stagedAttachments.some(
+                (a) =>
+                  a.kind === "image" ||
+                  a.kind === "pr" ||
+                  a.kind === "session",
+              ) ||
+              (interrupted && !streaming && !sending && !!onContinueRun)) && (
+              <div
+                data-testid="composer-attachment-strip"
+                className="flex flex-wrap gap-1.5 px-3 pt-2"
+              >
+                {/* Dead-run recovery (issue #154): a one-click chip that
+                    resumes the interrupted run. Amber-tinted, mirroring
+                    ModePill's shape. */}
+                {interrupted && !streaming && !sending && onContinueRun && (
+                  <button
+                    type="button"
+                    data-testid="composer-continue-run-chip"
+                    onClick={onContinueRun}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
+                  >
+                    <RotateCw className="h-3 w-3" aria-hidden />
+                    <span>Continue run</span>
+                  </button>
+                )}
+                {mode !== "default" && (
+                  <ModePill
+                    mode={mode as ActivePillMode}
+                    onRemove={onModeRemove}
                   />
-                ))}
+                )}
+                {stagedAttachments
+                  .filter(
+                    (a) =>
+                      a.kind === "image" ||
+                      a.kind === "pr" ||
+                      a.kind === "session",
+                  )
+                  .map((attachment) => (
+                    <AttachmentChip
+                      key={attachment.id}
+                      attachment={attachment}
+                      onRemove={(id) => {
+                        if (
+                          attachment.kind === "session" &&
+                          attachment.metadata.mentionToken
+                        ) {
+                          onDraftChange(
+                            removeSessionMentionToken(
+                              draft,
+                              attachment.metadata.mentionToken,
+                            ),
+                          );
+                        }
+                        onRemoveAttachment?.(id);
+                      }}
+                      onToggleExpand={
+                        attachment.kind === "pr" && onToggleExpandPr
+                          ? (id) => onToggleExpandPr(id)
+                          : undefined
+                      }
+                    />
+                  ))}
+              </div>
+            )}
+            {/* Step 8 Stage 6 — soft 5MB warning. Non-blocking by
+                design: the user can still send, but a request that big
+                hits Anthropic's 32MB request cap fast and slows
+                response time noticeably. We show actual bytes so the
+                user can decide whether to compress before sending. */}
+            {showImageSizeWarning && (
+              <div
+                data-testid="composer-image-size-warning"
+                className="px-3 pt-1 text-[10px] text-warning"
+              >
+                Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
+                — consider reducing for faster requests
+              </div>
+            )}
+            {/* Step 8 Stage 7 — soft warning at the SOFT_LIMIT line so
+                the user can self-trim before the hard cap blocks the
+                next add. The hard-cap copy renders separately below. */}
+            {showCountSoftWarning && (
+              <div
+                data-testid="composer-attachment-count-warning"
+                className="px-3 pt-1 text-[10px] text-warning"
+              >
+                {stagedCount} attachments — consider trimming for cleaner prompts
+              </div>
+            )}
+            {showCountHardWarning && (
+              <div
+                data-testid="composer-attachment-count-hardcap"
+                className="px-3 pt-1 text-[10px] text-destructive"
+              >
+                {stagedCount} attachments — limit reached. Remove some to add
+                more.
+              </div>
+            )}
+            <div className="relative">
+              {/*
+                Mirror overlay: renders the same text as the textarea but
+                with `/skill-name` tokens wrapped in a colored span. The
+                textarea on top has transparent text + a visible caret, so
+                the user sees the highlighted mirror through the
+                transparent layer. Critical that the two layers share
+                identical padding/font/line-height so cursor and mirror
+                stay glued together at every position.
+              */}
+              <div
+                ref={mirrorRef}
+                aria-hidden
+                data-testid="composer-highlight-mirror"
+                className={cn(
+                  "pointer-events-none absolute inset-0 px-3 py-2.5",
+                  "whitespace-pre-wrap break-words",
+                  "conversation-text leading-relaxed text-foreground",
+                  // `overflow-y-auto` (rather than `overflow-hidden`) is
+                  // required so we can imperatively assign `scrollTop` —
+                  // setting `scrollTop` on a clipped element is a no-op in
+                  // some browsers. The mirror's own scrollbar is hidden
+                  // (next two utilities) so only the textarea's scrollbar
+                  // is ever visible to the user.
+                  "overflow-y-auto",
+                  "[scrollbar-width:none]",
+                  "[&::-webkit-scrollbar]:hidden",
+                )}
+              >
+                {highlightSegments.map((seg, i) => {
+                  if (seg.kind === "skill") {
+                    return (
+                      <span
+                        key={i}
+                        className="text-status-working dark:text-status-working"
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  if (seg.kind === "attachment") {
+                    // Inline chip rendering. Background fills the text
+                    // bounding box only — no padding tricks — so the
+                    // mirror's character widths stay glued to the
+                    // textarea's caret positions. Loading state dims
+                    // the chip; an unresolvable read renders red.
+                    return (
+                      <span
+                        key={i}
+                        data-testid={`composer-attachment-token-${seg.basename}`}
+                        data-loading={seg.isLoading || undefined}
+                        data-error={seg.hasError || undefined}
+                        className={cn(
+                          "rounded-sm bg-foreground/10 text-foreground",
+                          seg.isLoading && "opacity-60",
+                          seg.hasError &&
+                            "bg-destructive/15 text-destructive",
+                        )}
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  if (seg.kind === "session-attachment") {
+                    return (
+                      <span
+                        key={i}
+                        data-testid={`composer-session-token-${seg.ref}`}
+                        data-provider={seg.provider}
+                        data-loading={seg.isLoading || undefined}
+                        data-error={seg.hasError || undefined}
+                        className={cn(
+                          "rounded-sm bg-primary/10 text-primary",
+                          seg.isLoading && "opacity-60",
+                          seg.hasError &&
+                            "bg-destructive/15 text-destructive",
+                        )}
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  if (seg.kind === "issue-attachment") {
+                    // Stage 4 — state-coloured pill. Open issues use the
+                    // warning token (amber) to match the chip strip
+                    // directly above; closed issues use a muted neutral
+                    // so the eye isn't drawn to them. Error / loading
+                    // states override the same way file tokens do.
+                    return (
+                      <span
+                        key={i}
+                        data-testid={`composer-issue-token-${seg.ref}`}
+                        data-state={seg.state}
+                        data-loading={seg.isLoading || undefined}
+                        data-error={seg.hasError || undefined}
+                        className={cn(
+                          "rounded-sm",
+                          seg.state === "open"
+                            ? "bg-warning/15 text-warning"
+                            : "bg-foreground/10 text-muted-foreground",
+                          seg.isLoading && "opacity-60",
+                          seg.hasError &&
+                            "bg-destructive/15 text-destructive",
+                        )}
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  if (seg.kind === "pr-attachment") {
+                    // Stage 5 — PR pill. Four state branches, matching
+                    // the chip strip's colours so the inline token and
+                    // the staged chip read as the same thing.
+                    //   open    → primary blue   (active, mergeable)
+                    //   merged  → purple/chart-4 (canonical "merged" hue)
+                    //   closed  → muted          (unmerged, dropped)
+                    //   draft   → muted          (in-progress)
+                    const stateClass =
+                      seg.state === "open"
+                        ? "bg-primary/15 text-primary"
+                        : seg.state === "merged"
+                          ? "bg-chart-4/15 text-chart-4"
+                          : "bg-foreground/10 text-muted-foreground";
+                    return (
+                      <span
+                        key={i}
+                        data-testid={`composer-pr-token-${seg.ref}`}
+                        data-state={seg.state}
+                        data-loading={seg.isLoading || undefined}
+                        data-error={seg.hasError || undefined}
+                        className={cn(
+                          "rounded-sm",
+                          stateClass,
+                          seg.isLoading && "opacity-60",
+                          seg.hasError &&
+                            "bg-destructive/15 text-destructive",
+                        )}
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  return <Fragment key={i}>{seg.text}</Fragment>;
+                })}
+                {/* Trailing newline doesn't render unless followed by a
+                    glyph — pad with a zero-width space so the mirror's
+                    height matches the textarea's after a fresh Enter. */}
+                {draft.endsWith("\n") || draft === "" ? "​" : null}
+              </div>
+              <textarea
+                ref={textareaRef}
+                value={draft}
+                onChange={handleTextareaChange}
+                onSelect={handleSelect}
+                onScroll={handleTextareaScroll}
+                onKeyDown={handleKeyDown}
+                onPaste={handlePasteImage}
+                onCompositionStart={() => {
+                  composingRef.current = true;
+                }}
+                onCompositionEnd={(e) => {
+                  composingRef.current = false;
+                  // After composition ends, run detection on the now-final
+                  // value so popup state catches up with what was typed.
+                  const el = e.currentTarget;
+                  const cursor = el.selectionStart ?? el.value.length;
+                  const slashHit = findSlashAtCursor(el.value, cursor);
+                  const mentionHit = findMentionAtCursor(el.value, cursor);
+                  if (slashHit) {
+                    setSlashAnchor(slashHit);
+                    if (mentionAnchor) closeMention();
+                  } else if (mentionHit) {
+                    setMentionAnchor(mentionHit);
+                    if (slashAnchor) closeSlash();
+                  } else {
+                    closeSlash();
+                    closeMention();
+                  }
+                }}
+                placeholder={placeholderText}
+                rows={1}
+                className={cn(
+                  // `block` is load-bearing: a `<textarea>` defaults to
+                  // `inline-block`, so it sits on a line box and its
+                  // vertical position is resolved via baseline alignment.
+                  // The mirror behind it is an absolutely-positioned block
+                  // pinned to the container top. Baseline-aligned inline
+                  // boxes are computed differently across rendering engines
+                  // (notably WebKitGTK, which powers the desktop build) than
+                  // Chromium, which drifts the caret/selection off the
+                  // painted text. Forcing `block` pins the textarea to the
+                  // container top on every engine so the two layers stay
+                  // glued, and drops the phantom line-box descent that
+                  // otherwise made this box a few px too tall.
+                  "relative block w-full resize-none bg-transparent px-3 py-2.5",
+                  // Transparent text — the colored mirror behind shows
+                  // through. Caret stays visible via `caret-foreground`.
+                  "conversation-text leading-relaxed text-transparent caret-foreground",
+                  "placeholder:text-muted-foreground/60",
+                  "outline-none",
+                )}
+                // min-height (rather than a floor in the auto-grow effect)
+                // so the imperative `style.height` can never shrink the box
+                // below the resting size.
+                style={{
+                  minHeight: `${textareaMinPx}px`,
+                  maxHeight: `${MAX_ROWS_APPROX_PX}px`,
+                }}
+              />
             </div>
-          )}
-          {/* Step 8 Stage 6 — soft 5MB warning. Non-blocking by
-              design: the user can still send, but a request that big
-              hits Anthropic's 32MB request cap fast and slows
-              response time noticeably. We show actual bytes so the
-              user can decide whether to compress before sending. */}
-          {showImageSizeWarning && (
-            <div
-              data-testid="composer-image-size-warning"
-              className="px-3 pt-1 text-[10px] text-warning"
-            >
-              Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
-              — consider reducing for faster requests
-            </div>
-          )}
-          {/* Step 8 Stage 7 — soft warning at the SOFT_LIMIT line so
-              the user can self-trim before the hard cap blocks the
-              next add. The hard-cap copy renders separately below. */}
-          {showCountSoftWarning && (
-            <div
-              data-testid="composer-attachment-count-warning"
-              className="px-3 pt-1 text-[10px] text-warning"
-            >
-              {stagedCount} attachments — consider trimming for cleaner prompts
-            </div>
-          )}
-          {showCountHardWarning && (
-            <div
-              data-testid="composer-attachment-count-hardcap"
-              className="px-3 pt-1 text-[10px] text-destructive"
-            >
-              {stagedCount} attachments — limit reached. Remove some to add
-              more.
-            </div>
-          )}
-          <div className="relative">
-            {/*
-              Mirror overlay: renders the same text as the textarea but
-              with `/skill-name` tokens wrapped in a colored span. The
-              textarea on top has transparent text + a visible caret, so
-              the user sees the highlighted mirror through the
-              transparent layer. Critical that the two layers share
-              identical padding/font/line-height so cursor and mirror
-              stay glued together at every position.
-            */}
-            <div
-              ref={mirrorRef}
-              aria-hidden
-              data-testid="composer-highlight-mirror"
-              className={cn(
-                "pointer-events-none absolute inset-0 px-3 py-2.5",
-                "whitespace-pre-wrap break-words",
-                "conversation-text leading-relaxed text-foreground",
-                // `overflow-y-auto` (rather than `overflow-hidden`) is
-                // required so we can imperatively assign `scrollTop` —
-                // setting `scrollTop` on a clipped element is a no-op in
-                // some browsers. The mirror's own scrollbar is hidden
-                // (next two utilities) so only the textarea's scrollbar
-                // is ever visible to the user.
-                "overflow-y-auto",
-                "[scrollbar-width:none]",
-                "[&::-webkit-scrollbar]:hidden",
-              )}
-            >
-              {highlightSegments.map((seg, i) => {
-                if (seg.kind === "skill") {
-                  return (
-                    <span
-                      key={i}
-                      className="text-status-working dark:text-status-working"
-                    >
-                      {seg.text}
-                    </span>
-                  );
-                }
-                if (seg.kind === "attachment") {
-                  // Inline chip rendering. Background fills the text
-                  // bounding box only — no padding tricks — so the
-                  // mirror's character widths stay glued to the
-                  // textarea's caret positions. Loading state dims
-                  // the chip; an unresolvable read renders red.
-                  return (
-                    <span
-                      key={i}
-                      data-testid={`composer-attachment-token-${seg.basename}`}
-                      data-loading={seg.isLoading || undefined}
-                      data-error={seg.hasError || undefined}
-                      className={cn(
-                        "rounded-sm bg-foreground/10 text-foreground",
-                        seg.isLoading && "opacity-60",
-                        seg.hasError &&
-                          "bg-destructive/15 text-destructive",
-                      )}
-                    >
-                      {seg.text}
-                    </span>
-                  );
-                }
-                if (seg.kind === "session-attachment") {
-                  return (
-                    <span
-                      key={i}
-                      data-testid={`composer-session-token-${seg.ref}`}
-                      data-provider={seg.provider}
-                      data-loading={seg.isLoading || undefined}
-                      data-error={seg.hasError || undefined}
-                      className={cn(
-                        "rounded-sm bg-primary/10 text-primary",
-                        seg.isLoading && "opacity-60",
-                        seg.hasError &&
-                          "bg-destructive/15 text-destructive",
-                      )}
-                    >
-                      {seg.text}
-                    </span>
-                  );
-                }
-                if (seg.kind === "issue-attachment") {
-                  // Stage 4 — state-coloured pill. Open issues use the
-                  // warning token (amber) to match the chip strip
-                  // directly above; closed issues use a muted neutral
-                  // so the eye isn't drawn to them. Error / loading
-                  // states override the same way file tokens do.
-                  return (
-                    <span
-                      key={i}
-                      data-testid={`composer-issue-token-${seg.ref}`}
-                      data-state={seg.state}
-                      data-loading={seg.isLoading || undefined}
-                      data-error={seg.hasError || undefined}
-                      className={cn(
-                        "rounded-sm",
-                        seg.state === "open"
-                          ? "bg-warning/15 text-warning"
-                          : "bg-foreground/10 text-muted-foreground",
-                        seg.isLoading && "opacity-60",
-                        seg.hasError &&
-                          "bg-destructive/15 text-destructive",
-                      )}
-                    >
-                      {seg.text}
-                    </span>
-                  );
-                }
-                if (seg.kind === "pr-attachment") {
-                  // Stage 5 — PR pill. Four state branches, matching
-                  // the chip strip's colours so the inline token and
-                  // the staged chip read as the same thing.
-                  //   open    → primary blue   (active, mergeable)
-                  //   merged  → purple/chart-4 (canonical "merged" hue)
-                  //   closed  → muted          (unmerged, dropped)
-                  //   draft   → muted          (in-progress)
-                  const stateClass =
-                    seg.state === "open"
-                      ? "bg-primary/15 text-primary"
-                      : seg.state === "merged"
-                        ? "bg-chart-4/15 text-chart-4"
-                        : "bg-foreground/10 text-muted-foreground";
-                  return (
-                    <span
-                      key={i}
-                      data-testid={`composer-pr-token-${seg.ref}`}
-                      data-state={seg.state}
-                      data-loading={seg.isLoading || undefined}
-                      data-error={seg.hasError || undefined}
-                      className={cn(
-                        "rounded-sm",
-                        stateClass,
-                        seg.isLoading && "opacity-60",
-                        seg.hasError &&
-                          "bg-destructive/15 text-destructive",
-                      )}
-                    >
-                      {seg.text}
-                    </span>
-                  );
-                }
-                return <Fragment key={i}>{seg.text}</Fragment>;
-              })}
-              {/* Trailing newline doesn't render unless followed by a
-                  glyph — pad with a zero-width space so the mirror's
-                  height matches the textarea's after a fresh Enter. */}
-              {draft.endsWith("\n") || draft === "" ? "​" : null}
-            </div>
-            <textarea
-              ref={textareaRef}
-              value={draft}
-              onChange={handleTextareaChange}
-              onSelect={handleSelect}
-              onScroll={handleTextareaScroll}
-              onKeyDown={handleKeyDown}
-              onPaste={handlePasteImage}
-              onCompositionStart={() => {
-                composingRef.current = true;
-              }}
-              onCompositionEnd={(e) => {
-                composingRef.current = false;
-                // After composition ends, run detection on the now-final
-                // value so popup state catches up with what was typed.
-                const el = e.currentTarget;
-                const cursor = el.selectionStart ?? el.value.length;
-                const slashHit = findSlashAtCursor(el.value, cursor);
-                const mentionHit = findMentionAtCursor(el.value, cursor);
-                if (slashHit) {
-                  setSlashAnchor(slashHit);
-                  if (mentionAnchor) closeMention();
-                } else if (mentionHit) {
-                  setMentionAnchor(mentionHit);
-                  if (slashAnchor) closeSlash();
-                } else {
-                  closeSlash();
-                  closeMention();
-                }
-              }}
-              placeholder={
-                sessionReady || sessionAwaitingIntent
-                  ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
-                  : "Starting session…"
-              }
-              rows={1}
-              className={cn(
-                // `block` is load-bearing: a `<textarea>` defaults to
-                // `inline-block`, so it sits on a line box and its
-                // vertical position is resolved via baseline alignment.
-                // The mirror behind it is an absolutely-positioned block
-                // pinned to the container top. Baseline-aligned inline
-                // boxes are computed differently across rendering engines
-                // (notably WebKitGTK, which powers the desktop build) than
-                // Chromium, which drifts the caret/selection off the
-                // painted text. Forcing `block` pins the textarea to the
-                // container top on every engine so the two layers stay
-                // glued, and drops the phantom line-box descent that
-                // otherwise made this box a few px too tall.
-                "relative block w-full resize-none bg-transparent px-3 py-2.5",
-                // Transparent text — the colored mirror behind shows
-                // through. Caret stays visible via `caret-foreground`.
-                "conversation-text leading-relaxed text-transparent caret-foreground",
-                "placeholder:text-muted-foreground/60",
-                "outline-none",
-              )}
-              // min-height (rather than a floor in the auto-grow effect)
-              // so the imperative `style.height` can never shrink the box
-              // below the resting size.
-              style={{
-                minHeight: `${MIN_TEXTAREA_PX}px`,
-                maxHeight: `${MAX_ROWS_APPROX_PX}px`,
-              }}
-            />
           </div>
-          {showQueueHint ? (
-            <div className="px-3 pb-1 text-[11px] leading-none text-muted-foreground/70">
-              Enter to queue
+          {dropTarget ? (
+            // 30px band + 42px row + 2px border = the 74px drop target.
+            <div
+              data-testid="composer-drop-target"
+              className="flex h-[30px] shrink-0 items-end justify-center text-[11px] text-muted-foreground"
+            >
+              Drop images to attach
             </div>
           ) : null}
           <ComposerFooter
@@ -3062,7 +3241,7 @@ export function Composer({
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
             onFastModeChange={onFastModeChange}
-            onSubmit={onSubmit}
+            onSubmit={submit}
             onStop={onStop}
             controlsDisabled={!sessionReady}
             configurationDisabled={!configurationEnabled}
@@ -3075,6 +3254,26 @@ export function Composer({
             tasks={tasks}
             tasksOpen={tasksOpen}
             onTasksClick={onTasksClick}
+            gap={
+              !expanded ? (
+                <span
+                  aria-hidden
+                  className="conversation-text truncate leading-5 text-muted-foreground/60"
+                >
+                  {placeholderText}
+                </span>
+              ) : showQueueHint ? (
+                <span className="truncate text-[11px] leading-none text-muted-foreground/70">
+                  Enter to queue
+                </span>
+              ) : null
+            }
+            onGapPointerDown={handleGapPointerDown}
+            showContextMeter={expanded}
+            modelLeafLabel={ladder.leafModelLabel}
+            effortIconOnly={ladder.effortIconOnly}
+            accessIconOnly={ladder.accessIconOnly}
+            configInMenu={ladder.configInMenu}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches

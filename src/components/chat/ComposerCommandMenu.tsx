@@ -58,6 +58,9 @@ interface Props {
   /** Current submode key. Only used to re-focus the search input after
    *  a drill-in swaps the list under us. */
   submode: string;
+  /** Session-config controls that no longer fit the composer's controls
+   *  row at narrow widths (effort + access), shown under the search box. */
+  headerSlot?: React.ReactNode;
 }
 
 /**
@@ -82,6 +85,7 @@ export function ComposerCommandMenu({
   placeholder = "Search or type /",
   footerNote = null,
   submode,
+  headerSlot = null,
 }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -143,6 +147,20 @@ export function ComposerCommandMenu({
             )}
           />
         </div>
+        {headerSlot && (
+          <div
+            data-testid="composer-command-menu-config"
+            // Settings have their own buttons and portalled command menus.
+            // Keep their keys out of the outer cmdk root, which otherwise
+            // handles Enter by selecting the highlighted composer command.
+            onKeyDown={(e) => {
+              if (e.key !== "Escape" || e.defaultPrevented) e.stopPropagation();
+            }}
+            className="flex items-center gap-0.5 border-b border-border/60 px-1.5 py-1"
+          >
+            {headerSlot}
+          </div>
+        )}
         <CommandPrimitive.List className="max-h-[340px] overflow-x-hidden overflow-y-auto p-1.5 outline-none">
           {items.length === 0 ? (
             <div className="px-3 py-6 text-center text-xs text-muted-foreground">

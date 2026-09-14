@@ -42,7 +42,7 @@ import type {
 
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
-import { FOOTER_TRIGGER } from "./footer-trigger";
+import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -191,6 +191,9 @@ interface Props {
    *  `/model` slash command fires. `0` / `undefined` means "no
    *  request yet"; any increment pops the picker open. */
   openSignal?: number;
+  /** Narrow composer: drop the sub-provider prefix and show only the
+   *  model's leaf name. */
+  leafLabel?: boolean;
 }
 
 interface ResolvedRow {
@@ -219,6 +222,7 @@ export function MultiProviderModelPicker({
   disabled,
   allowedProviders,
   openSignal,
+  leafLabel = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
@@ -449,11 +453,13 @@ export function MultiProviderModelPicker({
           // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
           // in for a tinted dot. Hairline pipes between footer
           // controls — not per-pill borders — carry the separation.
-          className={cn(FOOTER_TRIGGER, "gap-1.5")}
+          className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-4 w-4" />
+          <ProviderLogo provider={provider} className="h-4 w-4 shrink-0" />
           <span className="max-w-[180px] truncate">
-            {triggerSubtitle ? (
+            {leafLabel ? (
+              leafModelName(triggerLabel)
+            ) : triggerSubtitle ? (
               <>
                 <span className="opacity-70">{triggerSubtitle}</span>
                 <span aria-hidden className="mx-1 opacity-40">
@@ -466,7 +472,7 @@ export function MultiProviderModelPicker({
             )}
           </span>
           <ChevronDown
-            className="-mx-0.5 h-3.5 w-3.5 opacity-70"
+            className="-mx-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
             strokeWidth={2.25}
           />
         </button>
