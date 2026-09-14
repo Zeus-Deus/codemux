@@ -84,6 +84,10 @@ interface UIStore {
    *  when their data appears. Closing one records it here so the auto-open
    *  effect doesn't immediately put it back. Reopening clears the record. */
   rightPanelDismissedPanes: Record<string, RightPanelTab[]>;
+  /** Left sidebar width in px, as last dragged. Persisted — lives here
+   *  rather than in `SidebarProvider` because full-screen pages (Settings,
+   *  Automations, …) unmount the provider. Clamped by the provider. */
+  sidebarWidth: number;
   rightPanelWidth: number;
   /** Measured width of the row the panel shares with the workspace content
    *  (`workspace-main.tsx` owns the measurement). Runtime-only, never
@@ -214,6 +218,7 @@ interface UIStore {
     workspaceId: string,
     order: readonly RightPanelTab[],
   ) => void;
+  setSidebarWidth: (width: number) => void;
   setRightPanelWidth: (width: number) => void;
   setRightPanelRowWidth: (width: number) => void;
   /** Toggle full-expand. No-op while the panel is collapsed. */
@@ -279,6 +284,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelLastTabs: {},
       rightPanelPanes: {},
       rightPanelDismissedPanes: {},
+      sidebarWidth: 288,
       rightPanelWidth: 320,
       rightPanelRowWidth: 0,
       rightPanelMaximized: false,
@@ -470,6 +476,8 @@ export const useUIStore = create<UIStore>()(
           ),
         }),
 
+      setSidebarWidth: (width) => set({ sidebarWidth: width }),
+
       setRightPanelRowWidth: (width) =>
         set((state) =>
           state.rightPanelRowWidth === width
@@ -629,6 +637,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelLastTabs: state.rightPanelLastTabs,
         rightPanelPanes: state.rightPanelPanes,
         rightPanelDismissedPanes: state.rightPanelDismissedPanes,
+        sidebarWidth: state.sidebarWidth,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
         lastModelSelections: state.lastModelSelections,

@@ -26,6 +26,9 @@ const SIDEBAR_COOKIE_NAME = "sidebar_state"
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 const SIDEBAR_WIDTH_MIN = 180
 const SIDEBAR_WIDTH_MAX = 400
+// 288px default (was 256): the inbox card's mono meta line (branch ·
+// ↑ahead · +/− · PR chip · remote/notifs) needs the extra room.
+const SIDEBAR_WIDTH_DEFAULT = 288
 const SIDEBAR_WIDTH_MOBILE = "18rem"
 // 52px icon rail — enough for a centered avatar/icon button (size-8) plus a
 // little breathing room for the status dot / notification badge that overlays
@@ -55,10 +58,17 @@ function useSidebar() {
   return context
 }
 
+function clampSidebarWidth(width: number) {
+  if (!Number.isFinite(width)) return SIDEBAR_WIDTH_DEFAULT
+  return Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, width))
+}
+
 function SidebarProvider({
   defaultOpen = true,
   open: openProp,
   onOpenChange: setOpenProp,
+  width: widthProp,
+  onWidthChange,
   className,
   style,
   children,
@@ -67,12 +77,15 @@ function SidebarProvider({
   defaultOpen?: boolean
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  /** Controlled width in px. Pass with `onWidthChange` so the width
+   *  survives the provider unmounting (e.g. full-screen Settings). */
+  width?: number
+  onWidthChange?: (width: number) => void
 }) {
   const isMobile = useIsMobile()
   const [openMobile, setOpenMobile] = React.useState(false)
-  // 288px default (was 256): the inbox card's mono meta line (branch ·
-  // ↑ahead · +/− · PR chip · remote/notifs) needs the extra room.
-  const [widthPx, setWidthPx] = React.useState(288)
+  const [_widthPx, _setWidthPx] = React.useState(SIDEBAR_WIDTH_DEFAULT)
+  const widthPx = clampSidebarWidth(widthProp ?? _widthPx)
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
@@ -98,9 +111,17 @@ function SidebarProvider({
     return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open)
   }, [isMobile, setOpen, setOpenMobile])
 
-  const setSidebarWidth = React.useCallback((width: number) => {
-    setWidthPx(Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, width)))
-  }, [])
+  const setSidebarWidth = React.useCallback(
+    (width: number) => {
+      const clamped = clampSidebarWidth(width)
+      if (onWidthChange) {
+        onWidthChange(clamped)
+      } else {
+        _setWidthPx(clamped)
+      }
+    },
+    [onWidthChange]
+  )
 
   const sidebarWidth = `${widthPx}px`
 
