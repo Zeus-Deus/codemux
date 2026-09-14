@@ -72,7 +72,7 @@ export const ActivityBlock = memo(function ActivityBlock({
           type="button"
           aria-expanded={showPrevious}
           onClick={() => setShowPrevious((current) => !current)}
-          className="flex w-full items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 text-foreground/80 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          className="flex w-full items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 text-foreground/80 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
         >
           <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground/65">
             <ChevronDown
@@ -119,7 +119,7 @@ function StepRow({
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-[12px] leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
       >
         <span className="flex size-5 shrink-0 items-center justify-center">
           {live ? (
@@ -129,13 +129,13 @@ function StepRow({
           )}
         </span>
         <span className="shrink-0 text-muted-foreground/65">{view.verb}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
           {view.summary}
         </span>
         {view.meta && !live ? (
           <span
             className={cn(
-              "shrink-0 font-mono text-[10px] text-muted-foreground/55",
+              "shrink-0 font-mono text-caption text-muted-foreground/55",
               view.status === "error" && "text-status-attention",
             )}
           >
@@ -153,7 +153,7 @@ function StepRow({
       {expanded && (
         <div className="ml-[10px] mt-0.5 border-l border-border/60 py-1.5 pl-3">
           {step.kind === "reasoning" ? (
-            <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
+            <p className="whitespace-pre-wrap break-words text-body italic leading-[1.6] text-muted-foreground">
               {step.text}
             </p>
           ) : (

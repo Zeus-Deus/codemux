@@ -556,7 +556,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                           placeholder="Add setup commands, one per line..."
                           className="h-full min-h-[220px] resize-none overflow-x-auto whitespace-pre font-mono text-xs"
                         />
-                        <div className="flex flex-wrap items-center gap-1.5 border-t px-1 pt-2 text-[11px] text-muted-foreground">
+                        <div className="flex flex-wrap items-center gap-1.5 border-t px-1 pt-2 text-label text-muted-foreground">
                           <span className="mr-1">Variables</span>
                           <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
                             $CODEMUX_ROOT_PATH

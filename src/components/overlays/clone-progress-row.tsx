@@ -41,7 +41,7 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
         )}
       </div>
 
-      <p className="min-h-4 truncate text-[11px] text-muted-foreground">
+      <p className="min-h-4 truncate text-label text-muted-foreground">
         {detail || "This can take a while on slow connections…"}
       </p>
     </div>

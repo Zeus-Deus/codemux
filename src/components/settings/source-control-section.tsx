@@ -123,7 +123,7 @@ function AccountValue({ account }: { account: string }) {
       onClick={() => setRevealed((v) => !v)}
       title={revealed ? "Hide account" : "Click to reveal account"}
       aria-label={revealed ? "Hide account name" : "Reveal account name"}
-      className="font-mono text-[12px] text-foreground/90 rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
+      className="font-mono text-body-sm text-foreground/90 rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
     >
       {revealed ? account : maskAccount(account)}
     </button>
@@ -168,10 +168,10 @@ function ProviderRow({
           className={cn("size-1.5 shrink-0 rounded-full", TONE_DOT[tone])}
         />
         <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="text-[13px] font-medium text-foreground truncate">
+        <span className="text-body font-medium text-foreground truncate">
           {provider.name}
         </span>
-        <span className="ml-auto shrink-0 text-[11px] text-muted-foreground/80">
+        <span className="ml-auto shrink-0 text-label text-muted-foreground/80">
           {statusLabel(row)}
         </span>
         {row.detail && (
@@ -195,7 +195,7 @@ function ProviderRow({
 
       {row.supported && row.cli_installed && (
         <div className="mt-1.5 pl-[1.375rem] flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="font-mono text-[11px] text-muted-foreground/70">
+          <span className="font-mono text-label text-muted-foreground/70">
             {row.cli_version ?? provider.cli}
           </span>
           {row.account && <AccountValue account={row.account} />}
@@ -203,13 +203,13 @@ function ProviderRow({
       )}
 
       {row.supported && servedFeatures(row, provider).length > 0 && (
-        <p className="mt-1.5 pl-[1.375rem] text-[11px] text-muted-foreground/70">
+        <p className="mt-1.5 pl-[1.375rem] text-label text-muted-foreground/70">
           Serves {formatList(servedFeatures(row, provider))}
         </p>
       )}
 
       {fixIt?.code && (
-        <p className="mt-1.5 pl-[1.375rem] text-[11px] text-muted-foreground/80">
+        <p className="mt-1.5 pl-[1.375rem] text-label text-muted-foreground/80">
           {fixIt.prefix}
           <code className="font-mono text-foreground/90 break-all">
             {fixIt.code}
@@ -218,7 +218,7 @@ function ProviderRow({
       )}
 
       {open && row.detail && (
-        <p className="mt-2 pl-[1.375rem] text-[11px] leading-relaxed text-muted-foreground/70 max-w-prose">
+        <p className="mt-2 pl-[1.375rem] text-label leading-relaxed text-muted-foreground/70 max-w-prose">
           {row.detail}
         </p>
       )}
@@ -307,7 +307,7 @@ function CustomHostsEditor() {
           data-testid={`custom-host-${host}`}
           className="group/host flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2"
         >
-          <span className="font-mono text-[12px] text-foreground truncate min-w-0 flex-1">
+          <span className="font-mono text-body-sm text-foreground truncate min-w-0 flex-1">
             {host}
           </span>
           <Select
@@ -317,7 +317,7 @@ function CustomHostsEditor() {
             }
           >
             <SelectTrigger
-              className="h-7 w-[7.5rem] shrink-0 text-[12px]"
+              className="h-7 w-[7.5rem] shrink-0 text-body-sm"
               aria-label={`Product for ${host}`}
             >
               <SelectValue />
@@ -348,7 +348,7 @@ function CustomHostsEditor() {
             <div className="space-y-1.5 min-w-[12rem] flex-1">
               <Label
                 htmlFor="custom-host-name"
-                className="text-[11px] text-muted-foreground/85 font-normal"
+                className="text-label text-muted-foreground/85 font-normal"
               >
                 Hostname
               </Label>
@@ -364,13 +364,13 @@ function CustomHostsEditor() {
                   if (e.key === "Enter") handleAdd();
                 }}
                 autoFocus
-                className="h-8 text-[13px] font-mono"
+                className="h-8 text-body font-mono"
               />
             </div>
             <div className="space-y-1.5">
               <Label
                 htmlFor="custom-host-kind"
-                className="text-[11px] text-muted-foreground/85 font-normal"
+                className="text-label text-muted-foreground/85 font-normal"
               >
                 Runs
               </Label>
@@ -380,7 +380,7 @@ function CustomHostsEditor() {
               >
                 <SelectTrigger
                   id="custom-host-kind"
-                  className="h-8 w-[7.5rem] text-[13px]"
+                  className="h-8 w-[7.5rem] text-body"
                 >
                   <SelectValue />
                 </SelectTrigger>
@@ -395,14 +395,14 @@ function CustomHostsEditor() {
             </div>
           </div>
           {error && (
-            <p className="text-[11px] text-destructive">{error}</p>
+            <p className="text-label text-destructive">{error}</p>
           )}
           <div className="flex justify-end gap-1.5">
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-[12px]"
+              className="h-7 px-3 text-body-sm"
               onClick={() => {
                 setAdding(false);
                 setDraftHost("");
@@ -415,7 +415,7 @@ function CustomHostsEditor() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-[12px]"
+              className="h-7 px-3 text-body-sm"
               onClick={handleAdd}
             >
               Add
@@ -428,7 +428,7 @@ function CustomHostsEditor() {
           variant="ghost"
           size="sm"
           onClick={() => setAdding(true)}
-          className="w-full justify-start gap-2 h-8 px-2.5 text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+          className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
         >
           <Plus className="size-3.5" />
           Add self-hosted server
@@ -512,14 +512,14 @@ export function SourceControlSection() {
       {error && (
         <p
           data-testid="source-control-error"
-          className="mb-3 rounded-md bg-destructive/10 px-3 py-2 text-[11px] text-destructive"
+          className="mb-3 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive"
         >
           Could not probe source control providers: {error}
         </p>
       )}
 
       {rows === null && scanning ? (
-        <div className="flex items-center gap-2 py-6 text-[13px] text-muted-foreground">
+        <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
           <Loader2 className="size-4 animate-spin" aria-hidden />
           Checking installed tooling…
         </div>
@@ -566,10 +566,10 @@ function PrLinkDestination() {
   return (
     <div className="flex items-center justify-between gap-8 py-4">
       <div className="min-w-0 space-y-1">
-        <p className="text-[14px] font-semibold leading-tight text-foreground">
+        <p className="text-body-lg font-semibold leading-tight text-foreground">
           Open pull request links in the browser
         </p>
-        <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
           Off, a link to a pull request in a project you have open goes to the Pull
           Requests page instead of your browser. Shift-click always goes to the
           browser either way.

@@ -375,13 +375,13 @@ export function EditorPane({
         {isMd && (
           <div className="flex items-center rounded-sm border border-border/50 overflow-hidden mr-1">
             <button
-              className={`px-1.5 py-0.5 text-[10px] transition-colors ${viewMode === "rendered" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-1.5 py-0.5 text-caption transition-colors ${viewMode === "rendered" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
               onClick={() => setViewMode("rendered")}
             >
               Rendered
             </button>
             <button
-              className={`px-1.5 py-0.5 text-[10px] transition-colors ${viewMode === "raw" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              className={`px-1.5 py-0.5 text-caption transition-colors ${viewMode === "raw" ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"}`}
               onClick={() => setViewMode("raw")}
             >
               Raw
@@ -390,7 +390,7 @@ export function EditorPane({
         )}
 
         {isDirty && viewMode === "raw" && (
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-caption text-muted-foreground">
             Ctrl+S to save
           </span>
         )}

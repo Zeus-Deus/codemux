@@ -130,7 +130,7 @@ export function CloneDialog() {
           {cloning && (
             <div className="rounded-md border border-border/50 bg-foreground/5 px-3 py-2.5">
               <CloneProgressRow progress={cloneProgress} />
-              <p className="mt-2 text-[11px] text-muted-foreground">
+              <p className="mt-2 text-label text-muted-foreground">
                 Cloning — this can take a while on slow connections…
               </p>
             </div>

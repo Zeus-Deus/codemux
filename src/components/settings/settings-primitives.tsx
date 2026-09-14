@@ -27,11 +27,11 @@ export function SubsectionHeader({
   return (
     <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
-        <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+        <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
           {title}
         </p>
         {description && (
-          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
+          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
             {description}
           </p>
         )}
@@ -82,8 +82,8 @@ export function SegmentedControl<T extends string>({
             className={cn(
               "rounded-md font-medium transition-colors",
               size === "sm"
-                ? "px-2.5 py-0.5 text-[11px]"
-                : "px-3 py-1 text-[12px]",
+                ? "px-2.5 py-0.5 text-label"
+                : "px-3 py-1 text-body-sm",
               active
                 ? "bg-foreground text-background"
                 : "text-muted-foreground hover:text-foreground",

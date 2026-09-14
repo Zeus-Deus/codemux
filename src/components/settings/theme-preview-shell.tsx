@@ -49,14 +49,14 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
             className="size-[5px] flex-none rounded-full"
             style={{ background: c.accent }}
           />
-          <span className="text-[10px] font-semibold" style={{ color: c.fg }}>
+          <span className="text-caption font-semibold" style={{ color: c.fg }}>
             auth-refactor
           </span>
         </span>
         {["web-scraper", "migrations"].map((name) => (
           <span
             key={name}
-            className="flex h-6 items-center px-[7px] text-[10px]"
+            className="flex h-6 items-center px-[7px] text-caption"
             style={{ color: c.fg2 }}
           >
             {name}
@@ -70,10 +70,10 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
           className="flex h-[30px] flex-none items-center gap-2.5 border-b px-3"
           style={{ background: c.bg2, borderColor: c.border }}
         >
-          <span className="text-[11px] font-semibold" style={{ color: c.fg }}>
+          <span className="text-label font-semibold" style={{ color: c.fg }}>
             auth-refactor
           </span>
-          <span className="font-mono text-[10px]" style={{ color: c.fg3 }}>
+          <span className="font-mono text-caption" style={{ color: c.fg3 }}>
             feat/oauth
           </span>
         </div>
@@ -81,13 +81,13 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
         {/* Chat */}
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-hidden p-4">
           <span
-            className="max-w-[56%] self-end rounded-[10px] px-[11px] py-2 text-[11px] leading-[1.55]"
+            className="max-w-[56%] self-end rounded-[10px] px-[11px] py-2 text-label leading-[1.55]"
             style={{ background: c.card, color: c.fg }}
           >
             Rename the callback and fix the imports
           </span>
           <span
-            className="max-w-[76%] text-[11px] leading-[1.65]"
+            className="max-w-[76%] text-label leading-[1.65]"
             style={{ color: c.fg2 }}
           >
             Renamed it and left a deprecated re-export so nothing downstream
@@ -107,19 +107,19 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
               className="flex h-[25px] items-center gap-2.5 border-b px-2.5"
               style={{ background: c.bg2, borderColor: c.border }}
             >
-              <span className="font-mono text-[10px]" style={{ color: c.fg2 }}>
+              <span className="font-mono text-caption" style={{ color: c.fg2 }}>
                 src/auth/callback.ts
               </span>
               <span className="flex-1" />
-              <span className="font-mono text-[10px]" style={{ color: c.red }}>
+              <span className="font-mono text-caption" style={{ color: c.red }}>
                 −1
               </span>
-              <span className="font-mono text-[10px]" style={{ color: c.green }}>
+              <span className="font-mono text-caption" style={{ color: c.green }}>
                 +2
               </span>
             </span>
             <span
-              className="flex flex-col py-1.5 font-mono text-[10.5px] leading-[1.85]"
+              className="flex flex-col py-1.5 font-mono text-label leading-[1.85]"
               style={{ color: c.fg3 }}
             >
               <span className="px-2.5">
@@ -146,7 +146,7 @@ export function ThemePreviewShell({ theme }: { theme: ThemeDefinition }) {
 
         {/* Terminal — proves the ANSI slots, not just the chrome */}
         <div
-          className="flex h-[104px] flex-none flex-col gap-[3px] border-t px-3.5 py-2.5 font-mono text-[10.5px] leading-[1.65]"
+          className="flex h-[110px] flex-none flex-col gap-[3px] border-t px-3.5 py-2.5 font-mono text-label leading-[1.65]"
           style={{ background: c.terminal, borderColor: c.border }}
         >
           <span>

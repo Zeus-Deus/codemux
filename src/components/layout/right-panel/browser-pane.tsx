@@ -78,7 +78,7 @@ export function RightPanelBrowserPane({
     return (
       <div
         data-testid="browser-pane-connecting"
-        className="flex h-full items-center justify-center px-6 text-center text-[11.5px] text-muted-foreground"
+        className="flex h-full items-center justify-center px-6 text-center text-body-sm text-muted-foreground"
       >
         Starting browser…
       </div>

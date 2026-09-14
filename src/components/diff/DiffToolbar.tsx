@@ -78,7 +78,7 @@ export function DiffToolbar({
               key={s}
               size="xs"
               variant={tab.section === s ? "secondary" : "ghost"}
-              className="h-5 px-1.5 text-[10px]"
+              className="h-5 px-1.5 text-caption"
               onClick={() => setSection(tabId, s)}
             >
               {s === "all" ? "All" : s === "against_base" ? (tab.baseBranch ? `vs ${tab.baseBranch}` : "Base") : s.charAt(0).toUpperCase() + s.slice(1)}
@@ -89,7 +89,7 @@ export function DiffToolbar({
 
       {/* Against-base indicator (shown outside focus mode too) */}
       {!tab.focusMode && tab.section === "against_base" && tab.baseBranch && (
-        <span className="text-[10px] text-muted-foreground mr-1">
+        <span className="text-caption text-muted-foreground mr-1">
           vs {tab.baseBranch}
         </span>
       )}
@@ -148,7 +148,7 @@ export function DiffToolbar({
       >
         <ChevronLeft className="h-3 w-3" />
       </Button>
-      <span className="text-[10px] tabular-nums text-muted-foreground min-w-[28px] text-center">
+      <span className="text-caption tabular-nums text-muted-foreground min-w-[28px] text-center">
         {fileCount > 0 ? `${fileIndex + 1}/${fileCount}` : "0/0"}
       </span>
       <Button

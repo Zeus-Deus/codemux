@@ -66,7 +66,7 @@ export const SubagentWorkLogRow = memo(function SubagentWorkLogRow({
         <span key={run.id} data-subagent-run-id={run.id} className="hidden" />
       ))}
 
-      <div className="mb-0.5 pl-0.5 font-mono text-[9px] leading-none lowercase tracking-[0.08em] text-muted-foreground/55">
+      <div className="mb-0.5 pl-0.5 font-mono text-micro leading-none lowercase tracking-[0.08em] text-muted-foreground/55">
         work log{anyRunning ? "" : " · settled"}
       </div>
       <button
@@ -92,18 +92,18 @@ export const SubagentWorkLogRow = memo(function SubagentWorkLogRow({
             />
           )}
         </span>
-        <span className="shrink-0 text-[12px] font-semibold text-foreground/85">
+        <span className="shrink-0 text-body-sm font-semibold text-foreground/85">
           Ran {subagents.length} subagent{subagents.length === 1 ? "" : "s"}
         </span>
 
         {anyRunning ? (
           <>
-            <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+            <span className="min-w-0 flex-1 truncate text-label text-muted-foreground">
               {subagentPreview(subagents)}
             </span>
             <TickingText
               active
-              className="hidden shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground sm:block"
+              className="hidden shrink-0 whitespace-nowrap font-mono text-caption text-muted-foreground sm:block"
               compute={(now) => liveRollupLabel(subagents, now)}
             />
           </>
@@ -111,14 +111,14 @@ export const SubagentWorkLogRow = memo(function SubagentWorkLogRow({
           <>
             <TickingText
               active={false}
-              className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground"
+              className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground"
               compute={(now) => settledRollupLabel(subagents, now)}
             />
             <TokenTotal subagents={subagents} />
           </>
         )}
 
-        <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-medium text-foreground/70">
+        <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-foreground/70">
           View
           <ChevronRight
             className="size-3 transition-transform group-hover/work-log:translate-x-0.5"
@@ -154,7 +154,7 @@ function TokenTotal({ subagents }: { subagents: readonly SubagentView[] }) {
   const total = subagentGroupRollup(subagents, 0).totalTokens;
   if (total == null) return null;
   return (
-    <span className="hidden shrink-0 font-mono text-[10px] text-muted-foreground sm:block">
+    <span className="hidden shrink-0 font-mono text-caption text-muted-foreground sm:block">
       Σ {formatCompactTokens(total)}
     </span>
   );

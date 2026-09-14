@@ -109,7 +109,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
 
   return (
     <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-[12px] border-t border-border/70 bg-background/50 px-3.5">
-      <span className="font-mono text-[10px] text-muted-foreground/70">
+      <span className="font-mono text-caption text-muted-foreground/70">
         Codemux {version ? `v${version}` : ""}
       </span>
       <span className="flex-1" />
@@ -125,14 +125,14 @@ function AppMenuFooter({ version }: { version: string | null }) {
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-[5px] px-1 text-[10.5px] transition-colors hover:brightness-90 dark:hover:brightness-125",
+            "flex items-center gap-1.5 rounded-[5px] px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
           {status}
         </button>
       ) : (
-        <span className={cn("flex items-center gap-1.5 text-[10.5px]", tone)}>
+        <span className={cn("flex items-center gap-1.5 text-label", tone)}>
           {status}
         </span>
       )}
@@ -301,7 +301,7 @@ function FooterDestination({
       aria-label={action.label}
       className={cn(
         "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-        labeled ? "gap-1.5 px-2 text-[12px]" : "w-7",
+        labeled ? "gap-1.5 px-2 text-body-sm" : "w-7",
         fullWidth && "w-full justify-start",
       )}
       onClick={() =>

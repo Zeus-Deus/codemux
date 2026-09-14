@@ -751,7 +751,7 @@ fn build_core_app<R: tauri::Runtime>(
                     if !too_small && !fills_monitor {
                         let _ = window.set_size(tauri::LogicalSize::new(w, h));
                     }
-                    // else: keep tauri.conf.json default (800×600)
+                    // else: keep tauri.conf.json default (1280×800)
                 }
 
                 // Restore position, but only if it falls within a visible monitor.

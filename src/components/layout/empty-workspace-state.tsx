@@ -23,7 +23,7 @@ import { markPaneReady } from "@/lib/perf/interaction-trace";
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded-md border border-border bg-muted px-1.5 text-[10px] font-mono text-muted-foreground">
+    <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded-md border border-border bg-muted px-1.5 text-caption font-mono text-muted-foreground">
       {children}
     </kbd>
   );

@@ -48,7 +48,7 @@ function SplitSideLine({
   flow?: boolean;
 }) {
   const rowHeight = flow ? "min-h-[22px]" : "min-h-[18px]";
-  const gutterSize = flow ? "text-[12px]" : "text-[11px]";
+  const gutterSize = flow ? "text-body-sm" : "text-label";
 
   if (!line) {
     return (
@@ -113,10 +113,10 @@ function SplitSideLine({
       </span>
       <span className="flex-1 min-w-0 pr-4">
         {style.isOursMarker && (
-          <span className="text-[9px] font-bold text-primary mr-2">OURS</span>
+          <span className="text-micro font-bold text-primary mr-2">OURS</span>
         )}
         {style.isTheirsMarker && (
-          <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>
+          <span className="text-micro font-bold text-accent-violet mr-2">THEIRS</span>
         )}
         {line.content}
       </span>

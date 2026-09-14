@@ -144,10 +144,10 @@ export function KeybindEditor() {
     <div>
       <div className="mb-8 flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <h2 className="text-[17px] font-semibold tracking-tight text-foreground">
+          <h2 className="text-[1.0625rem] font-semibold tracking-tight text-foreground">
             Keyboard Shortcuts
           </h2>
-          <p className="text-[13px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">
+          <p className="text-body text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">
             Click a shortcut to rebind it. Press Escape to cancel.
           </p>
         </div>
@@ -156,7 +156,7 @@ export function KeybindEditor() {
             variant="outline"
             size="sm"
             onClick={resetAll}
-            className="shrink-0 h-8 gap-1.5 text-[12px]"
+            className="shrink-0 h-8 gap-1.5 text-body-sm"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Reset all
@@ -170,7 +170,7 @@ export function KeybindEditor() {
           placeholder="Search shortcuts…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="h-9 pl-9 text-[13px]"
+          className="h-9 pl-9 text-body"
         />
       </div>
 
@@ -222,7 +222,7 @@ function CategoryGroup({
 }) {
   return (
     <Collapsible defaultOpen className="border-b border-border/40 last:border-b-0 pb-1.5">
-      <CollapsibleTrigger className="group flex items-center gap-1.5 w-full pt-5 pb-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60 hover:text-foreground transition-colors">
+      <CollapsibleTrigger className="group flex items-center gap-1.5 w-full pt-5 pb-2 text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60 hover:text-foreground transition-colors">
         <ChevronDown className="h-3 w-3 transition-transform duration-150 group-data-[state=closed]:-rotate-90 opacity-60" />
         {CATEGORY_LABELS[category]}
       </CollapsibleTrigger>
@@ -268,16 +268,16 @@ function KeybindRow({
   return (
     <div className="group/kb flex items-start justify-between gap-4 py-2 px-2 -mx-2 rounded-md hover:bg-muted/30 transition-colors">
       <div className="space-y-0.5 min-w-0 flex-1 pt-1">
-        <span className="text-[13px] text-foreground">{entry.label}</span>
+        <span className="text-body text-foreground">{entry.label}</span>
         {entry.description && (
-          <p className="text-[12px] text-muted-foreground/75 leading-relaxed">
+          <p className="text-body-sm text-muted-foreground/75 leading-relaxed">
             {entry.description}
           </p>
         )}
 
         {/* Recording timeout hint */}
         {isRecording && recordingTimedOut && !pendingConflict && (
-          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed">
+          <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed">
             Some shortcuts (e.g. Ctrl+W, Ctrl+T) are captured by the system and
             can't be recorded. Press Escape to cancel.
           </p>
@@ -289,7 +289,7 @@ function KeybindRow({
           return (
             <div className="space-y-1.5 mt-2 rounded-md border border-warning/30 bg-warning/10 px-2.5 py-2">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[12px] text-warning">
+                <span className="text-body-sm text-warning">
                   Already used by{" "}
                   <span className="font-medium">
                     {pendingConflict.conflictIds
@@ -301,7 +301,7 @@ function KeybindRow({
                   <Button
                     variant="outline"
                     size="sm"
-                    className="h-6 px-2 text-[11px]"
+                    className="h-6 px-2 text-label"
                     onClick={onConfirmConflict}
                   >
                     Override
@@ -309,7 +309,7 @@ function KeybindRow({
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 px-2 text-[11px]"
+                    className="h-6 px-2 text-label"
                     onClick={onCancelConflict}
                   >
                     Cancel
@@ -317,7 +317,7 @@ function KeybindRow({
                 </div>
               </div>
               {affectsCritical && (
-                <p className="text-[11px] text-warning/80">
+                <p className="text-label text-warning/80">
                   This will unbind a navigation shortcut. You can always reach settings from the menu.
                 </p>
               )}
@@ -343,7 +343,7 @@ function KeybindRow({
           ref={badgeRef}
           onClick={isRecording ? undefined : onStartRecording}
           className={cn(
-            "text-[12px] font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-all",
+            "text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-all",
             isRecording
               ? "border-primary/40 bg-primary/10 text-primary-foreground animate-pulse cursor-default"
               : isUnbound

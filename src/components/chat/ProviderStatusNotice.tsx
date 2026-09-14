@@ -55,7 +55,7 @@ export function ProviderStatusNotice({
         className={cn(
           // Shrinks to its content (capped) rather than filling the
           // column — a compact floating chip, not a full-width slab.
-          "pointer-events-auto relative isolate max-w-[440px] overflow-hidden rounded-lg border text-[12px] shadow-md",
+          "pointer-events-auto relative isolate max-w-[440px] overflow-hidden rounded-lg border text-body-sm shadow-md",
           isError
             ? "border-destructive/30 text-destructive"
             : "border-warning/30 text-warning",

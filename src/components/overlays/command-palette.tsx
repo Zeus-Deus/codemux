@@ -787,12 +787,12 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       <div className="flex h-[52px] flex-none items-center gap-2.5 border-b border-border/60 pr-3.5 pl-4">
         <Search className="size-[15px] shrink-0 text-muted-foreground/70" />
         {commandsOnly && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-[10px] tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Commands
           </span>
         )}
         {previewTheme && (
-          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-[10px] tracking-wide text-accent-ember">
+          <span className="flex h-[22px] flex-none items-center rounded-md bg-accent-ember/15 px-2 font-mono text-caption tracking-wide text-accent-ember">
             Themes
           </span>
         )}
@@ -803,7 +803,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/70">
+        <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc
         </kbd>
       </div>
@@ -816,7 +816,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
         >
           {totalShown === 0 && (
             <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
-              <span className="text-[13px] text-muted-foreground">
+              <span className="text-body text-muted-foreground">
                 {conversationSearching ? (
                   <span className="inline-flex items-center gap-2">
                     <LoaderCircle className="size-3.5 animate-spin" />
@@ -831,7 +831,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
                   </>
                 )}
               </span>
-              <span className="text-[11px] text-muted-foreground/70">
+              <span className="text-label text-muted-foreground/70">
                 Try a branch name, a repo, or{" "}
                 <span className="font-mono">{COMMAND_MODE_PREFIX}</span> for commands
               </span>
@@ -934,7 +934,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <FooterHint keys="↵" label="keep it" />
             <FooterHint keys="esc" label={`back to ${appliedTheme.label}`} />
             <span className="flex-1" />
-            <span className="font-mono text-[10px] text-muted-foreground/70">
+            <span className="font-mono text-caption text-muted-foreground/70">
               {previewTheme.id === OMARCHY_THEME_ID ? "follows this desktop" : "syncs to your account"}
             </span>
           </>
@@ -945,7 +945,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
             <FooterHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
             <span className="flex-1" />
-            <span className="font-mono text-[10px] text-muted-foreground/70">
+            <span className="font-mono text-caption text-muted-foreground/70">
               {resultCountLabel(totalShown)}
             </span>
           </>
@@ -974,11 +974,11 @@ function GroupHeader({
         !first && "mt-2",
       )}
     >
-      <span className="font-mono text-[10px] tracking-[0.15em] text-muted-foreground/70 uppercase">
+      <span className="font-mono text-caption tracking-[0.15em] text-muted-foreground/70 uppercase">
         {label}
       </span>
       <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-[10px] text-muted-foreground/50">{count}</span>
+      <span className="font-mono text-caption text-muted-foreground/50">{count}</span>
     </div>
   );
 }
@@ -1013,7 +1013,7 @@ function PaletteItem({
  *  row is selected — the palette's one moving part. */
 function EnterBadge() {
   return (
-    <span className="hidden flex-none rounded-[5px] border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-[10px] text-accent-ember group-data-selected/pal-row:inline-flex">
+    <span className="hidden flex-none rounded-[5px] border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
       ↵
     </span>
   );
@@ -1057,20 +1057,20 @@ function WorkspaceItem({
       <span className="flex min-w-0 flex-1 items-baseline gap-2.5">
         <span
           className={cn(
-            "truncate text-[13px] font-medium",
+            "truncate text-body font-medium",
             row.parked ? "text-muted-foreground" : "text-foreground/90",
           )}
         >
           {row.workspace.title}
         </span>
-        <span className="max-w-[220px] flex-none truncate font-mono text-[11px] text-muted-foreground/70">
+        <span className="max-w-[220px] flex-none truncate font-mono text-label text-muted-foreground/70">
           {workspaceRowSubtitle(row.workspace, row.projectName)}
         </span>
       </span>
       {row.status && (
         <span
           className={cn(
-            "flex flex-none items-center gap-1.5 text-[11px]",
+            "flex flex-none items-center gap-1.5 text-label",
             STATUS_TEXT_CLASS[row.status],
           )}
         >
@@ -1079,7 +1079,7 @@ function WorkspaceItem({
         </span>
       )}
       {!row.status && idleFor && (
-        <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
+        <span className="flex-none font-mono text-label text-muted-foreground/70">
           {idleFor}
         </span>
       )}
@@ -1101,14 +1101,14 @@ function ProjectItem({
     <PaletteItem value={row.key} onSelect={onSelect}>
       <RowAvatar name={row.group.projectName} path={row.group.projectPath} />
       <span className="flex min-w-0 flex-1 items-baseline gap-2.5">
-        <span className="truncate text-[13px] font-medium text-foreground/90">
+        <span className="truncate text-body font-medium text-foreground/90">
           {row.group.projectName}
         </span>
-        <span className="flex-none truncate font-mono text-[11px] text-muted-foreground/70">
+        <span className="flex-none truncate font-mono text-label text-muted-foreground/70">
           {shortenPath(row.group.projectPath, homeDir)}
         </span>
       </span>
-      <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
+      <span className="flex-none font-mono text-label text-muted-foreground/70">
         {row.activeCount > 0 ? `${row.activeCount} active` : "idle"}
       </span>
       <EnterBadge />
@@ -1144,16 +1144,16 @@ function ConversationItem({
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <span className="flex min-w-0 items-baseline gap-2">
-          <span className="truncate text-[12px] font-medium text-foreground/90">
+          <span className="truncate text-body-sm font-medium text-foreground/90">
             {row.session_title || "Untitled chat"}
           </span>
           {location && (
-            <span className="truncate font-mono text-[10px] text-muted-foreground/60">
+            <span className="truncate font-mono text-caption text-muted-foreground/60">
               {location}
             </span>
           )}
         </span>
-        <span className="flex min-w-0 items-baseline gap-1.5 text-[11px] text-muted-foreground">
+        <span className="flex min-w-0 items-baseline gap-1.5 text-label text-muted-foreground">
           <span className="flex-none font-medium text-muted-foreground/75">{roleLabel}</span>
           <span className="truncate">
             <HighlightedSearchText text={row.snippet} query={query} />
@@ -1206,15 +1206,15 @@ function ThemeItemRow({
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
       <ThemeCoins theme={row.theme} size={22} />
-      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground/90">
+      <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.theme.id === OMARCHY_THEME_ID ? "Follow Omarchy" : row.theme.label}
         {row.theme.id === OMARCHY_THEME_ID && (
-          <span className="ml-2 text-[11px] font-normal text-muted-foreground">Automatic · {row.theme.label.replace("Omarchy · ", "")}</span>
+          <span className="ml-2 text-label font-normal text-muted-foreground">Automatic · {row.theme.label.replace("Omarchy · ", "")}</span>
         )}
       </span>
       <ThemeSchemeBadge scheme={row.theme.scheme} />
       {applied && (
-        <span className="flex-none font-mono text-[11px] text-muted-foreground/70">
+        <span className="flex-none font-mono text-label text-muted-foreground/70">
           current
         </span>
       )}
@@ -1237,7 +1237,7 @@ function ThemeStudioItemRow({
       <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
-      <span className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
         {row.label}
       </span>
       <EnterBadge />
@@ -1252,11 +1252,11 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
       <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
-      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground/90">
+      <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.command.label}
       </span>
       {row.keys && (
-        <span className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground group-data-selected/pal-row:hidden">
+        <span className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
           {row.keys}
         </span>
       )}
@@ -1284,14 +1284,14 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
           )}
         />
       </span>
-      <span className="flex-none font-mono text-[11px] text-muted-foreground">
+      <span className="flex-none font-mono text-label text-muted-foreground">
         {providerRef(resolveProvider(row.providerKind), row.number)}
       </span>
-      <span className="min-w-0 flex-1 truncate text-[13px] text-foreground/90">
+      <span className="min-w-0 flex-1 truncate text-body text-foreground/90">
         {row.title}
       </span>
       {row.repo && (
-        <span className="flex-none truncate text-[11px] text-muted-foreground/70">
+        <span className="flex-none truncate text-label text-muted-foreground/70">
           {row.repo}
         </span>
       )}
@@ -1302,8 +1302,8 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
 
 function FooterHint({ keys, label }: { keys: string; label: string }) {
   return (
-    <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground/70">
-      <kbd className="rounded border border-border/60 px-1.5 py-px font-mono text-[10px] text-muted-foreground">
+    <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
+      <kbd className="rounded border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
         {keys}
       </kbd>
       {label}

@@ -36,7 +36,7 @@ export const BackgroundBrowserChip = memo(function BackgroundBrowserChip({
   return (
     <div className="min-w-0">
       {showLabel && (
-        <div className="mb-0.5 pl-0.5 font-mono text-[9px] leading-none lowercase tracking-[0.08em] text-muted-foreground/55">
+        <div className="mb-0.5 pl-0.5 font-mono text-micro leading-none lowercase tracking-[0.08em] text-muted-foreground/55">
           work log
         </div>
       )}
@@ -54,14 +54,14 @@ export const BackgroundBrowserChip = memo(function BackgroundBrowserChip({
             />
           )}
         </span>
-        <span className="shrink-0 text-[12px] font-semibold text-foreground/85">
+        <span className="shrink-0 text-body-sm font-semibold text-foreground/85">
           Opened the browser
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground">
           {session.current_url ?? "about:blank"}
           {live ? " · navigating" : ""}
         </span>
-        <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-medium text-foreground/70">
+        <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-foreground/70">
           View
           <ChevronRight
             className="size-3 transition-transform group-hover/browser:translate-x-0.5"

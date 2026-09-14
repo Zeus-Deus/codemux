@@ -307,7 +307,7 @@ export function TypographySettings() {
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-4 px-1">
-        <p className="max-w-xl text-[11px] leading-relaxed text-muted-foreground/65">
+        <p className="max-w-xl text-label leading-relaxed text-muted-foreground/65">
           Font names sync with your account. If a face is unavailable on another device, Codemux
           falls back safely without changing the saved choice.
         </p>
@@ -315,7 +315,7 @@ export function TypographySettings() {
           <button
             type="button"
             onClick={restoreDefaults}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
             <RotateCcw className="size-3" aria-hidden />
             Restore defaults
@@ -366,14 +366,14 @@ function TypographySurfaceCard({
           </div>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <p className="text-[13px] font-semibold text-foreground">{title}</p>
+              <p className="text-body font-semibold text-foreground">{title}</p>
               {linkedLabel ? (
-                <span className="rounded-full border border-border/55 bg-muted/35 px-2 py-0.5 font-mono text-[9px] text-muted-foreground/75">
+                <span className="rounded-full border border-border/55 bg-muted/35 px-2 py-0.5 font-mono text-micro text-muted-foreground/75">
                   {linkedLabel}
                 </span>
               ) : null}
             </div>
-            <p className="mt-0.5 max-w-md text-[11px] leading-relaxed text-muted-foreground/70">
+            <p className="mt-0.5 max-w-md text-label leading-relaxed text-muted-foreground/70">
               {description}
             </p>
           </div>
@@ -461,7 +461,7 @@ function FontFamilyPicker({
         <button
           type="button"
           aria-label={`Font family: ${display}`}
-          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-[12px] text-foreground transition-colors hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[190px] sm:flex-none"
+          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[190px] sm:flex-none"
         >
           <span className="min-w-0 truncate" style={{ fontFamily: fontStack(value, defaultStack) }}>
             {display}
@@ -483,7 +483,7 @@ function FontFamilyPicker({
                 <span className="min-w-0 flex-1 truncate" style={{ fontFamily: defaultStack }}>
                   {defaultFamily}
                 </span>
-                <span className="text-[9px] uppercase tracking-[0.08em] text-muted-foreground/55">
+                <span className="text-micro uppercase tracking-[0.08em] text-muted-foreground/55">
                   default
                 </span>
                 {value === null ? <Check className="size-3.5" aria-hidden /> : null}
@@ -505,12 +505,12 @@ function FontFamilyPicker({
                 >
                   {family}
                 </span>
-                <span className="font-mono text-[10px] text-muted-foreground/45">Ag 01</span>
+                <span className="font-mono text-caption text-muted-foreground/45">Ag 01</span>
                 {value === family ? <Check className="size-3.5" aria-hidden /> : null}
               </CommandItem>
             ))}
             {loading ? (
-              <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">
+              <div className="px-2 py-6 text-center text-label text-muted-foreground">
                 Reading fonts on this device…
               </div>
             ) : null}
@@ -535,7 +535,7 @@ function FontSizePicker({
 }) {
   return (
     <Select value={String(value)} onValueChange={(next) => onChange(Number(next))}>
-      <SelectTrigger className="h-8 w-[76px] bg-background/75 text-[12px]" aria-label={label}>
+      <SelectTrigger className="h-8 w-[76px] bg-background/75 text-body-sm" aria-label={label}>
         <SelectValue>{value}px</SelectValue>
       </SelectTrigger>
       <SelectContent align="end">

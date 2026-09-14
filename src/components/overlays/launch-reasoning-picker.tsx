@@ -133,7 +133,7 @@ export function LaunchReasoningPicker({
           aria-label="Select reasoning and context"
           disabled={disabled}
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground disabled:opacity-50",
+            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground disabled:opacity-50",
             triggerClassName,
           )}
         >

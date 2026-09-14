@@ -213,7 +213,7 @@ interface Props {
    *  scope in the Context Row below the composer instead). */
   zone1Override?: React.ReactNode;
   /** Thread Scope redesign — optional slot rendered BELOW the composer
-   *  card (inside the same max-w-[760px] column), under the footer.
+   *  card (inside the same shared chat column), under the footer.
    *  The draft surface uses this for `ThreadScopeRow` (location ·
    *  checkout · from-branch + the centered scope hint). `undefined`
    *  (the default) renders nothing — existing non-draft call sites are
@@ -1259,10 +1259,10 @@ export function Composer({
             stacked: true,
             rightAdornment: (
               <span className="flex h-full min-w-20 flex-col items-end justify-center leading-none">
-                <span className="text-[10px] font-medium text-foreground/70">
+                <span className="text-caption font-medium text-foreground/70">
                   {sessionProviderLabel(session.provider)}
                 </span>
-                <span className="mt-1 whitespace-nowrap font-mono text-[9px] text-muted-foreground/60">
+                <span className="mt-1 whitespace-nowrap font-mono text-micro text-muted-foreground/60">
                   {when}
                 </span>
               </span>
@@ -2535,7 +2535,7 @@ export function Composer({
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
-          <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
+          <div className="px-3 pb-1 text-label text-muted-foreground/70 truncate font-mono">
             {cwd}
           </div>
         ) : null}
@@ -2706,7 +2706,7 @@ export function Composer({
           {errorMessage && (
             <div
               role="alert"
-              className="px-3 pt-2 text-[11px] text-destructive/90 leading-tight"
+              className="px-3 pt-2 text-label text-destructive/90 leading-tight"
             >
               <span>Send failed: {errorMessage}. </span>
               <span className="text-muted-foreground/80">
@@ -2795,7 +2795,7 @@ export function Composer({
           {showImageSizeWarning && (
             <div
               data-testid="composer-image-size-warning"
-              className="px-3 pt-1 text-[10px] text-warning"
+              className="px-3 pt-1 text-caption text-warning"
             >
               Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
               — consider reducing for faster requests
@@ -2807,7 +2807,7 @@ export function Composer({
           {showCountSoftWarning && (
             <div
               data-testid="composer-attachment-count-warning"
-              className="px-3 pt-1 text-[10px] text-warning"
+              className="px-3 pt-1 text-caption text-warning"
             >
               {stagedCount} attachments — consider trimming for cleaner prompts
             </div>
@@ -2815,7 +2815,7 @@ export function Composer({
           {showCountHardWarning && (
             <div
               data-testid="composer-attachment-count-hardcap"
-              className="px-3 pt-1 text-[10px] text-destructive"
+              className="px-3 pt-1 text-caption text-destructive"
             >
               {stagedCount} attachments — limit reached. Remove some to add
               more.
@@ -3036,7 +3036,7 @@ export function Composer({
             />
           </div>
           {showQueueHint ? (
-            <div className="px-3 pb-1 text-[11px] leading-none text-muted-foreground/70">
+            <div className="px-3 pb-1 text-label leading-none text-muted-foreground/70">
               Enter to queue
             </div>
           ) : null}

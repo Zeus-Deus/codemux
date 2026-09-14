@@ -19,16 +19,16 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 /** One 32px menu row: 8px radius, 9px side padding, 10px gap, 13px label, and
  *  a 14px muted icon in the leading slot. */
 export const MENU_ROW =
-  "h-8 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-[13px] [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-8 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A row whose label wraps to a second, quieter description line. Taller than
  *  `MENU_ROW`, so the icon is top-aligned rather than centred. */
 export const MENU_ROW_TWO_LINE =
-  "items-start gap-2.5 rounded-[8px] px-[9px] py-2 text-[13px] [&>svg]:mt-0.5 [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "items-start gap-2.5 rounded-[8px] px-[9px] py-2 text-body [&>svg]:mt-0.5 [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A 36px row carrying a title plus a mono state line (the device list). */
 export const MENU_ROW_TWO_LINE_COMPACT =
-  "h-9 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-[13px] [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-9 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /**
  * The destructive tail row. Radix's highlight convention is a surface change,
@@ -54,11 +54,11 @@ export const MENU_SEPARATOR = "mx-[5px] my-1.5 h-px bg-border";
  * navigation skips it.
  */
 export const MENU_SECTION_LABEL =
-  "flex h-6 items-center px-[9px] font-mono text-[9px] font-normal uppercase tracking-[0.16em] text-muted-foreground/55";
+  "flex h-6 items-center px-[9px] font-mono text-micro font-normal uppercase tracking-[0.16em] text-muted-foreground/55";
 
 /** Trailing mono metadata on a row (a username, a device state, a hint). */
 export const MENU_ROW_META =
-  "ml-auto shrink-0 font-mono text-[9.5px] text-muted-foreground/60";
+  "ml-auto shrink-0 font-mono text-caption text-muted-foreground/60";
 
 const IS_MAC =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
@@ -134,7 +134,7 @@ export function MenuKeycap({ actionId, keys, className }: KeycapProps) {
       // the item is called, so it stays out of the row's accessible name.
       aria-hidden
       className={cn(
-        "ml-auto shrink-0 font-mono text-[9.5px] font-normal tracking-normal text-muted-foreground/70",
+        "ml-auto shrink-0 font-mono text-caption font-normal tracking-normal text-muted-foreground/70",
         className,
       )}
     >

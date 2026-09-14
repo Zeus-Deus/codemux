@@ -44,7 +44,7 @@ export function PaneStatusFoot({
         className="size-[5px] shrink-0 rounded-full bg-accent-ember"
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground">
         {status}
       </span>
       {action && (
@@ -54,7 +54,7 @@ export function PaneStatusFoot({
           onClick={action.onClick}
           aria-pressed={action.pressed}
           className={cn(
-            "shrink-0 rounded-[5px] px-1.5 py-px font-mono text-[10px] hover:bg-foreground/[0.06] hover:text-foreground",
+            "shrink-0 rounded-[5px] px-1.5 py-px font-mono text-caption hover:bg-foreground/[0.06] hover:text-foreground",
             action.pressed ? "text-foreground" : "text-muted-foreground",
           )}
         >
@@ -64,7 +64,7 @@ export function PaneStatusFoot({
       {tokens != null && tokens > 0 && (
         <span
           data-testid="right-panel-token-total"
-          className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground"
+          className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground"
           title="Tokens processed in this thread"
         >
           Σ {formatContextTokens(tokens)} tok

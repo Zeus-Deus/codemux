@@ -278,13 +278,13 @@ export function SidebarProjectGroup({
               />
             )}
 
-            <span className="flex-1 min-w-0 truncate text-foreground/90 text-[13px]">
+            <span className="flex-1 min-w-0 truncate text-foreground/90 text-body">
               {projectName}
             </span>
 
             {/* Count — visible at rest, fades on hover so the + can
                 take its slot without ever colliding. */}
-            <span className="text-[11px] text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
+            <span className="text-label text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
               {visibleCount}
             </span>
 

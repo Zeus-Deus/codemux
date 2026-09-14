@@ -312,7 +312,7 @@ export function UsageSection() {
       <div className="mb-6 flex items-end justify-between gap-4">
         <div className="min-w-0">
           <h2 className="text-base font-semibold tracking-tight">Usage</h2>
-          <p className="mt-1 text-[12px] text-muted-foreground">
+          <p className="mt-1 text-body-sm text-muted-foreground">
             {summary ? rangeLabel(summary) : "Loading…"} ·{" "}
             {refreshing ? "refreshing…" : "live"}
           </p>
@@ -364,7 +364,7 @@ export function UsageSection() {
           </div>
         )
       ) : summary.totals.total_tokens === 0 ? (
-        <div className="rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center text-[13px] text-muted-foreground">
+        <div className="rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center text-body text-muted-foreground">
           No agent activity in this period.
         </div>
       ) : (
@@ -518,7 +518,7 @@ function OverviewCard({
           {providers.map((provider) => (
             <span
               key={provider.provider}
-              className="inline-flex items-center gap-2 text-[11px]"
+              className="inline-flex items-center gap-2 text-label"
             >
               <span
                 className={cn(
@@ -538,7 +538,7 @@ function OverviewCard({
             </span>
           ))}
         </div>
-        <span className="font-mono text-[10px] text-muted-foreground/80">
+        <span className="font-mono text-caption text-muted-foreground/80">
           {metric === "cost"
             ? "API/list-price equivalent · not an invoice"
             : "input + output + cache read + cache write"}
@@ -559,18 +559,18 @@ function HeroStat({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
+      <span className="font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
         {label}
       </span>
       <span
         className={cn(
-          "select-text font-mono text-[22px] font-semibold leading-none tabular-nums tracking-tight xl:text-[27px]",
+          "select-text font-mono text-[1.375rem] font-semibold leading-none tabular-nums tracking-tight xl:text-[1.6875rem]",
           "text-foreground",
         )}
       >
         {value}
       </span>
-      <span className="text-[11px] text-muted-foreground">{note}</span>
+      <span className="text-label text-muted-foreground">{note}</span>
     </div>
   );
 }
@@ -627,13 +627,13 @@ function CompositionRow({ composition }: { composition: UsageComposition }) {
             i > 0 && "border-l border-border/60 pl-5",
           )}
         >
-          <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
+          <span className="font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
             {cell.label}
           </span>
-          <span className="select-text font-mono text-[15px] tabular-nums">
+          <span className="select-text font-mono text-body-lg tabular-nums">
             {cell.value}
           </span>
-          <span className="text-[10px] text-muted-foreground">{cell.note}</span>
+          <span className="text-caption text-muted-foreground">{cell.note}</span>
         </div>
       ))}
     </div>
@@ -666,7 +666,7 @@ function BreakdownCard({
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
       <div className="mb-3 flex items-center justify-between gap-4">
-        <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+        <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
           Breakdown
         </p>
         <SegmentedControl
@@ -707,7 +707,7 @@ function ModelRows({
 }) {
   if (models.length === 0) {
     return (
-      <p className="py-4 text-[12px] text-muted-foreground">No models yet.</p>
+      <p className="py-4 text-body-sm text-muted-foreground">No models yet.</p>
     );
   }
   return (
@@ -725,20 +725,20 @@ function ModelRows({
           ) : (
             <span className="h-3.5 w-3.5" aria-hidden />
           )}
-          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+          <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
             {m.model}
           </span>
-          <span className="w-[70px] shrink-0 select-text text-right font-mono text-[12px] tabular-nums">
+          <span className="w-[78px] shrink-0 select-text text-right font-mono text-body-sm tabular-nums">
             {/* An unpriced model has no cost to show — an em-dash is
                 honest where "$0.00" would read as free. */}
             {m.priced ? formatMoney(m.cost_usd) : "—"}
           </span>
-          <span className="w-[64px] shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+          <span className="w-[64px] shrink-0 text-right font-mono text-caption tabular-nums text-muted-foreground">
             {m.priced
               ? formatPercent(totalCost > 0 ? m.cost_usd / totalCost : 0)
               : `${formatPercent(totalTokens > 0 ? m.tokens / totalTokens : 0)} tok`}
           </span>
-          <span className="w-[64px] shrink-0 select-text text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+          <span className="w-[64px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
             {formatTokens(m.tokens)}
           </span>
         </div>
@@ -767,7 +767,7 @@ function DayRows({ summary }: { summary: UsageSummary }) {
 
   if (rows.length === 0) {
     return (
-      <p className="py-4 text-[12px] text-muted-foreground">
+      <p className="py-4 text-body-sm text-muted-foreground">
         No activity yet.
       </p>
     );
@@ -782,16 +782,16 @@ function DayRows({ summary }: { summary: UsageSummary }) {
             i > 0 && "border-t border-border/30",
           )}
         >
-          <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+          <span className="min-w-0 flex-1 truncate text-label text-muted-foreground">
             {r.label}
           </span>
-          <span className="w-[70px] shrink-0 select-text text-right font-mono text-[12px] tabular-nums">
+          <span className="w-[78px] shrink-0 select-text text-right font-mono text-body-sm tabular-nums">
             {formatMoney(r.cost)}
           </span>
-          <span className="w-[64px] shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+          <span className="w-[64px] shrink-0 text-right font-mono text-caption tabular-nums text-muted-foreground">
             {formatPercent(totalCost > 0 ? r.cost / totalCost : 0)}
           </span>
-          <span className="w-[64px] shrink-0 select-text text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+          <span className="w-[64px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
             {formatTokens(r.tokens)}
           </span>
         </div>
@@ -814,14 +814,14 @@ function CostConfidenceBlock({ confidence }: { confidence: CostConfidence }) {
   ];
   return (
     <div className="shrink-0 lg:w-[200px] lg:border-l lg:border-border/60 lg:pl-4">
-      <p className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+      <p className="mb-2 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
         Cost confidence
       </p>
       <div className="flex flex-col gap-1">
         {rows.map((r) => (
           <div key={r.label} className="flex items-baseline justify-between gap-3">
-            <span className="text-[11px] text-muted-foreground">{r.label}</span>
-            <span className="select-text font-mono text-[11px] tabular-nums">
+            <span className="text-label text-muted-foreground">{r.label}</span>
+            <span className="select-text font-mono text-label tabular-nums">
               {r.value}
             </span>
           </div>
@@ -842,19 +842,19 @@ function ProviderHistoryFooter({
 }) {
   return (
     <div className="flex items-baseline gap-4 px-1 pt-1">
-      <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-muted-foreground">
+      <p className="min-w-0 flex-1 text-label leading-relaxed text-muted-foreground">
         <span className="font-medium text-foreground">
           Includes {sessionCount.toLocaleString()} provider session
           {sessionCount === 1 ? "" : "s"}
         </span>{" "}
         from this machine&apos;s Claude Code, Codex, and OpenCode histories,
         regardless of which app launched them. Sources include{" "}
-        <span className="font-mono text-[10px]">~/.claude/projects</span>,{" "}
-        <span className="font-mono text-[10px]">~/.codex/sessions</span>, and
+        <span className="font-mono text-caption">~/.claude/projects</span>,{" "}
+        <span className="font-mono text-caption">~/.codex/sessions</span>, and
         OpenCode&apos;s local data directory. This machine only.
       </p>
       {busy && (
-        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+        <span className="shrink-0 font-mono text-caption text-muted-foreground">
           scanning…
         </span>
       )}
@@ -933,10 +933,10 @@ function ProviderLane({
             <span className="h-[18px] w-[18px]" aria-hidden />
           )}
           <span className="flex min-w-0 flex-col gap-0.5">
-            <span className="truncate text-[13px] font-medium">
+            <span className="truncate text-body font-medium">
               {seriesLabel(provider.provider)}
             </span>
-            <span className="truncate text-[10px] text-muted-foreground">
+            <span className="truncate text-caption text-muted-foreground">
               {quota?.plan_label ?? "Provider history"}
             </span>
           </span>
@@ -950,7 +950,7 @@ function ProviderLane({
           <span className="flex w-[168px] shrink-0 flex-col gap-1.5">
             {bars.map((w) => (
               <span key={w.kind} className="flex items-center gap-2">
-                <span className="w-8 shrink-0 text-[10px] text-muted-foreground">
+                <span className="w-9 shrink-0 text-caption text-muted-foreground">
                   {WINDOW_LABEL[w.kind]}
                 </span>
                 <span className="h-1 flex-1 overflow-hidden rounded-full bg-muted-foreground/20">
@@ -959,13 +959,13 @@ function ProviderLane({
                     style={{ width: `${Math.min(100, Math.max(0, w.used_pct))}%` }}
                   />
                 </span>
-                <span className="w-8 shrink-0 select-text text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+                <span className="w-8 shrink-0 select-text text-right font-mono text-caption tabular-nums text-muted-foreground">
                   {Math.round(w.used_pct)}%
                 </span>
               </span>
             ))}
             {note && (
-              <span className="truncate text-[10px] text-muted-foreground/80">
+              <span className="truncate text-caption text-muted-foreground/80">
                 {note}
               </span>
             )}
@@ -980,19 +980,19 @@ function ProviderLane({
         </span>
 
         <span className="flex w-[76px] shrink-0 flex-col gap-0.5 text-right">
-          <span className="select-text font-mono text-[13px] tabular-nums">
+          <span className="select-text font-mono text-body tabular-nums">
             {formatTokens(provider.tokens)}
           </span>
-          <span className="text-[10px] text-muted-foreground">tokens</span>
+          <span className="text-caption text-muted-foreground">tokens</span>
         </span>
 
         <span className="flex w-[96px] shrink-0 flex-col gap-0.5 text-right">
           <span
-            className="select-text font-mono text-[15px] font-semibold tabular-nums tracking-tight"
+            className="select-text font-mono text-body-lg font-semibold tabular-nums tracking-tight"
           >
             {formatMoney(provider.cost_usd)}
           </span>
-          <span className="text-[10px] text-muted-foreground">API equivalent</span>
+          <span className="text-caption text-muted-foreground">API equivalent</span>
         </span>
 
         <span className="shrink-0 text-muted-foreground" aria-hidden>
@@ -1014,17 +1014,17 @@ function ProviderLane({
                 key={model.model}
                 className="flex items-center gap-4 border-t border-border/30 py-1.5"
               >
-                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+                <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
                   {model.model}
                 </span>
-                <span className="w-[110px] shrink-0 text-[10px] text-muted-foreground">
+                <span className="w-[110px] shrink-0 text-caption text-muted-foreground">
                   {formatPercent(share)} of tokens
                   {model.subagent_tokens > 0 && " · subagents"}
                 </span>
-                <span className="w-[76px] shrink-0 select-text text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+                <span className="w-[76px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
                   {formatTokens(model.tokens)}
                 </span>
-                <span className="w-[96px] shrink-0 select-text text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+                <span className="w-[96px] shrink-0 select-text text-right font-mono text-label tabular-nums text-muted-foreground">
                   {formatMoney(model.cost_usd)}
                 </span>
                 <span className="w-3.5 shrink-0" aria-hidden />

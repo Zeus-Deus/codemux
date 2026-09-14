@@ -304,13 +304,13 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               shape="square"
               className="size-3.5"
             />
-            <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-muted-foreground">
+            <span className="min-w-0 flex-1 truncate text-label font-semibold text-muted-foreground">
               {row.project.name}
             </span>
             {row.attachmentCount > 0 && (
               <span
                 aria-label={`${row.attachmentCount} attachment${row.attachmentCount === 1 ? "" : "s"}`}
-                className="flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground/65"
+                className="flex shrink-0 items-center gap-0.5 text-caption tabular-nums text-muted-foreground/65"
               >
                 <Paperclip className="size-2.5" />
                 {row.attachmentCount}
@@ -332,7 +332,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               <X className="size-3" />
             </button>
           </div>
-          <div className="mt-1 truncate text-[12px] font-medium leading-4 text-foreground/90">
+          <div className="mt-1 truncate text-body-sm font-medium leading-4 text-foreground/90">
             {row.preview}
           </div>
         </div>

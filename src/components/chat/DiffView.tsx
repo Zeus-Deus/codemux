@@ -36,7 +36,7 @@ export function DiffView({
   return (
     <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-[13px] py-[9px]">
-        <span className="flex min-w-0 items-center gap-2 font-mono text-[12px] text-muted-foreground">
+        <span className="flex min-w-0 items-center gap-2 font-mono text-body-sm text-muted-foreground">
           {fileMeta ? (
             <MarkdownFileLink meta={fileMeta} variant="plain">
               {fileMeta.basename}
@@ -53,7 +53,7 @@ export function DiffView({
           )}
         </span>
         <span className="flex items-center gap-2.5">
-          <span className="font-mono text-[11px]">
+          <span className="font-mono text-label">
             <span className="text-status-open">+{added}</span>{" "}
             <span className="text-status-attention">−{removed}</span>
           </span>

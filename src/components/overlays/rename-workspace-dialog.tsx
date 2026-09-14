@@ -196,16 +196,16 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
         <div className="flex items-center gap-2.5 border-b border-border/70 py-[13px] pr-3.5 pl-4">
           <span
             aria-hidden
-            className="flex size-6 shrink-0 items-center justify-center rounded-[7px] bg-accent-ember/20 font-mono text-[10.5px] font-medium text-accent-ember"
+            className="flex size-6 shrink-0 items-center justify-center rounded-[7px] bg-accent-ember/20 font-mono text-label font-medium text-accent-ember"
           >
             W
           </span>
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <DialogTitle className="text-[13.5px] leading-tight font-semibold tracking-[-0.012em]">
+            <DialogTitle className="text-body-lg leading-tight font-semibold tracking-[-0.012em]">
               Rename workspace
             </DialogTitle>
             <DialogDescription
-              className="truncate font-mono text-[9.5px] leading-tight text-muted-foreground/70"
+              className="truncate font-mono text-caption leading-tight text-muted-foreground/70"
             >
               {contextLabel}
             </DialogDescription>
@@ -225,7 +225,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
           <div className="flex flex-col gap-[9px] px-4 pt-4 pb-3.5">
             <label
               htmlFor="rename-workspace-name"
-              className="font-mono text-[9px] leading-none tracking-[0.16em] text-muted-foreground/60 uppercase"
+              className="font-mono text-micro leading-none tracking-[0.16em] text-muted-foreground/60 uppercase"
             >
               Workspace name
             </label>
@@ -269,7 +269,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               )}
               <span
                 className={cn(
-                  "shrink-0 font-mono text-[9.5px] tabular-nums",
+                  "shrink-0 font-mono text-caption tabular-nums",
                   trimmedName.length > WORKSPACE_NAME_MAX_LENGTH
                     ? "text-status-attention"
                     : "text-muted-foreground/55",
@@ -281,7 +281,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <p
               id="rename-workspace-hint"
               className={cn(
-                "min-h-[15px] font-mono text-[10px] leading-[15px] text-pretty",
+                "min-h-[15px] font-mono text-caption leading-[15px] text-pretty",
                 showError
                   ? "text-status-attention"
                   : status.kind === "ready"
@@ -294,7 +294,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
           </div>
 
           <div className="flex items-center gap-2 border-t border-border/70 bg-muted/30 px-3 py-[11px]">
-            <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-[9.5px] text-muted-foreground/55">
+            <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-caption text-muted-foreground/55">
               <kbd className="rounded-[5px] border border-border/70 px-[5px] py-0.5 font-mono">
                 esc
               </kbd>
@@ -303,7 +303,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <DialogClose asChild>
               <button
                 type="button"
-                className="flex h-[31px] shrink-0 items-center rounded-lg px-[13px] text-[12.5px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex h-[31px] shrink-0 items-center rounded-lg px-[13px] text-body font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 Cancel
               </button>
@@ -313,7 +313,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               disabled={submitting}
               aria-disabled={!isDirty || isError}
               className={cn(
-                "flex h-[31px] shrink-0 items-center gap-2 rounded-lg pr-3 pl-[13px] text-[12.5px] font-semibold tracking-[-0.005em] transition-[background-color,opacity,filter] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "flex h-[31px] shrink-0 items-center gap-2 rounded-lg pr-3 pl-[13px] text-body font-semibold tracking-[-0.005em] transition-[background-color,opacity,filter] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 isDirty && !isError
                   // The ink on the brand accent comes from the palette, not
                   // from a literal: a light theme darkens its ember, and

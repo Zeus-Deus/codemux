@@ -344,7 +344,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   const stateCluster = (
     <span
       className={cn(
-        "flex shrink-0 items-center gap-1.5 text-[11px]",
+        "flex shrink-0 items-center gap-1.5 text-label",
         // The hover/focus swap: state hides, Snooze/Settle show. CSS-only so
         // no re-render churn on pointer moves. The state yields to the *wide*
         // actions only — a card that can't settle reveals nothing but the Pin
@@ -540,7 +540,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 />
                 <span
                   className={cn(
-                    "min-w-0 truncate text-[11px] font-semibold tracking-[0.01em] transition-colors duration-150",
+                    "min-w-0 truncate text-label font-semibold tracking-[0.01em] transition-colors duration-150",
                     visuallyReceded
                       ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/80 group-focus-within/card:text-muted-foreground/80"
                       : "text-muted-foreground/80",
@@ -589,7 +589,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={cn(
                       "flex shrink-0 items-center gap-0.5 rounded-full px-1.5",
                       "border border-status-open/25 bg-status-open/10",
-                      "text-[10px] font-semibold leading-[15px] text-status-open",
+                      "text-caption font-semibold leading-[15px] text-status-open",
                     )}
                   >
                     <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
@@ -676,7 +676,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           {/* The relative label says how far, never when.
                               "Next week" without this is a deferral the user
                               has to guess the length of. */}
-                          <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                          <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">
                             {preset.whenLabel}
                           </span>
                         </DropdownMenuItem>
@@ -698,7 +698,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         // only one whose glyph (a check) reads as a claim about
                         // the work rather than a verb the user is performing.
                         "flex shrink-0 items-center gap-1 border-none bg-transparent p-0",
-                        "text-[11px] font-semibold text-muted-foreground",
+                        "text-label font-semibold text-muted-foreground",
                         "transition-colors duration-150 hover:text-foreground",
                       )}
                     >
@@ -717,7 +717,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     aria-hidden="true"
                     className={cn(
                       "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
-                      "border border-border/80 bg-background/80 font-mono text-[10px] font-semibold leading-none tabular-nums text-foreground/80",
+                      "border border-border/80 bg-background/80 font-mono text-caption font-semibold leading-none tabular-nums text-foreground/80",
                       "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
                       "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
                     )}
@@ -745,7 +745,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 )}
                 <span
                   className={cn(
-                    "truncate text-[13px] leading-[1.35] transition-colors duration-150",
+                    "truncate text-body leading-[1.35] transition-colors duration-150",
                     visuallyReceded
                       ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
                       : "text-foreground",
@@ -781,7 +781,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
               {/* Blocker line — needs-you cards only */}
               {isNeeds && (
-                <div className="mt-0.5 truncate text-[11px] text-status-attention">
+                <div className="mt-0.5 truncate text-label text-status-attention">
                   {permissionBlockerText(workspace)}
                 </div>
               )}
@@ -806,7 +806,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               <div
                 data-meta-line
                 className={cn(
-                  "mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[11px] leading-tight transition-colors duration-150",
+                  "mt-[5px] flex min-w-0 items-center gap-2 font-mono text-label leading-tight transition-colors duration-150",
                   // Branch and ↑ahead inherit this, so one mute here covers
                   // the whole git-local run.
                   visuallyReceded
@@ -860,7 +860,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         : `${scProvider.nounTitle} — ${prState}`
                     }
                     className={cn(
-                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-[10px] font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(
@@ -952,7 +952,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-[10px] font-bold text-muted-foreground",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-caption font-bold text-muted-foreground",
                         "transition-opacity duration-150",
                         visuallyReceded &&
                           "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",

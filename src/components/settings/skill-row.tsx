@@ -88,7 +88,7 @@ export function SkillRow({
           {!enabled && (
             <span
               data-testid="skill-row-disabled-badge"
-              className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              className="rounded bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
             >
               Disabled
             </span>
@@ -109,7 +109,7 @@ export function SkillRow({
               </TooltipTrigger>
               <TooltipContent side="top">
                 Resolved from{" "}
-                <span className="font-mono text-[10px]">{skill.filePath}</span>
+                <span className="font-mono text-caption">{skill.filePath}</span>
               </TooltipContent>
             </Tooltip>
           )}
@@ -119,7 +119,7 @@ export function SkillRow({
             {skill.description}
           </p>
         )}
-        <p className="mt-0.5 truncate text-[11px] text-muted-foreground/80">
+        <p className="mt-0.5 truncate text-label text-muted-foreground/80">
           {status || "Unavailable"}
         </p>
       </div>

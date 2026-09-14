@@ -242,7 +242,7 @@ export function ComposerFooter({
                 <ListTodo className="size-3.5" aria-hidden />
               )}
               <span>Tasks</span>
-              <span className="text-[11px] tabular-nums opacity-70">
+              <span className="text-label tabular-nums opacity-70">
                 {tasks.completed}/{tasks.total}
               </span>
             </button>
