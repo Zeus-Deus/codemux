@@ -978,7 +978,7 @@ export function SidebarInbox() {
   // Opening a finished workspace clears its backend `review` status because
   // the result has been seen. Keep just enough session-local history to make
   // the inverse gesture honest: if the user later chooses "Mark unread", the
-  // green Done · review claim returns with the unread dot. Any new live status
+  // green Done · review claim returns with the bold unread title. Any new live status
   // retires that history, so an old completion can never mask fresh work.
   const restorableReviewIdsRef = useRef(new Set<string>());
   useEffect(() => {

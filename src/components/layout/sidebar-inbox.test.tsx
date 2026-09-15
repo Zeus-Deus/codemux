@@ -1882,8 +1882,8 @@ describe("SidebarInbox — wrapping-up tier", () => {
 
     expect(divider(container)).toBeNull();
     expect(
-      screen.getByLabelText('Unread — "PR open, unread"'),
-    ).toBeInTheDocument();
+      screen.getByText("PR open, unread").closest("[data-inbox-card]"),
+    ).toHaveAttribute("data-unread", "true");
   });
 
   it("returns an open-PR card to the top while its agent works, and back down when it goes idle", async () => {
@@ -2844,16 +2844,12 @@ describe("SidebarInbox — unread + woke markers", () => {
     ];
     await flushRender();
 
-    expect(
-      screen.getByLabelText('Unread — "New output"'),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText('Unread — "Already read"'),
-    ).not.toBeInTheDocument();
+    const cardFor = (title: string) =>
+      screen.getByText(title).closest("[data-inbox-card]");
+    expect(cardFor("New output")).toHaveAttribute("data-unread", "true");
+    expect(cardFor("Already read")).not.toHaveAttribute("data-unread");
     // No history is not news.
-    expect(
-      screen.queryByLabelText('Unread — "Never ran"'),
-    ).not.toBeInTheDocument();
+    expect(cardFor("Never ran")).not.toHaveAttribute("data-unread");
   });
 
   it("never marks the workspace you are looking at as unread", async () => {
@@ -2870,8 +2866,8 @@ describe("SidebarInbox — unread + woke markers", () => {
 
     // The visit is happening; the backend stamp just hasn't caught up.
     expect(
-      screen.queryByLabelText('Unread — "Open right now"'),
-    ).not.toBeInTheDocument();
+      screen.getByText("Open right now").closest("[data-inbox-card]"),
+    ).not.toHaveAttribute("data-unread");
   });
 
   it("restores Done · review when a completed workspace is marked unread", async () => {
@@ -2901,7 +2897,7 @@ describe("SidebarInbox — unread + woke markers", () => {
     ).not.toBeInTheDocument();
 
     // Once we move away, the explicit inverse gesture restores both claims:
-    // the orange unread dot and the green review-ready state.
+    // the unread marking and the green review-ready state.
     activeWorkspaceId = "ws-2";
     await rerenderInbox(rerender);
     fireEvent.contextMenu(completedCard());
@@ -2909,9 +2905,7 @@ describe("SidebarInbox — unread + woke markers", () => {
       await screen.findByRole("menuitem", { name: "Mark unread" }),
     );
 
-    expect(
-      within(completedCard()).getByLabelText('Unread — "Completed result"'),
-    ).toBeInTheDocument();
+    expect(completedCard()).toHaveAttribute("data-unread", "true");
     expect(
       within(completedCard()).getByText("Done · review"),
     ).toBeInTheDocument();
