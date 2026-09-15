@@ -1,7 +1,27 @@
-import { Check, ChevronDown, CircleAlert, Clock } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  CircleAlert,
+  Clock,
+  EllipsisVertical,
+} from "lucide-react";
 import { useEffect, useId, useState } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  formatClockTime,
+  formatGoalAge,
+  type ThreadGoal,
+} from "@/lib/agent-chat/goal";
 import type { OrbActivity } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
 
@@ -57,6 +77,31 @@ export interface StripOccupant {
   live?: boolean;
 }
 
+/**
+ * The thread's standing `/goal`. Every action is text: Resume and Clear
+ * send a phrase through the normal send path, Copy and Jump never send.
+ */
+export interface StripGoal {
+  goal: ThreadGoal;
+  /** The literal text Resume sends, shown in the `sends` box. */
+  resumePhrase: string;
+  onResume: () => void;
+  /** Put `resumePhrase` in the composer instead of sending it. */
+  onEditResume: () => void;
+  onClear: () => void;
+  onCopy: () => void;
+  /** Scroll to the turn that set the goal. `null` once that turn has left
+   *  the loaded transcript. */
+  onJump?: (() => void) | null;
+  /** Interrupted only: where the run stopped, read off the transcript. */
+  stopped?: {
+    at: number | null;
+    /** Opening words of the last reply, for `stopped after "…"`. */
+    after: string | null;
+    onJump: (() => void) | null;
+  } | null;
+}
+
 /** Rows are 34px; four fit before the list scrolls (4 × 34 + 3 × 3). */
 const OPEN_MAX_HEIGHT = "max-h-[145px]";
 
@@ -73,6 +118,42 @@ const SWEEP_STYLE = {
 const STRIP_CHIP =
   "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-[8px] bg-foreground/[0.05] px-2.5 text-[11px] font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09] hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
+// Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
+const GOAL_FOCUS = "outline-none focus-visible:ring-1 focus-visible:ring-ring";
+/** Quiet text action (Copy, Clear beside Resume). */
+const GOAL_CHIP = cn(
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-[6px] px-2 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  GOAL_FOCUS,
+);
+/** Clear when it is the strongest action in the row. */
+const GOAL_CHIP_OUTLINE = cn(
+  GOAL_CHIP,
+  "border border-foreground/[0.16] text-foreground/85",
+);
+/** Hide and the `+n` pill: filled, with a trailing chevron. */
+const GOAL_CHIP_FILLED = cn(
+  GOAL_CHIP,
+  "bg-foreground/[0.07] px-[7px] text-foreground/80 hover:bg-foreground/[0.11]",
+);
+/** The resting chevron and the overflow trigger: icon only, no fill. */
+const GOAL_ICON_BUTTON = cn(
+  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  GOAL_FOCUS,
+);
+/** Resume is the one solid control in the strip: an interrupted goal is the
+ *  only occupant that asks for a decision. */
+const GOAL_RESUME = cn(
+  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-[6px] bg-status-working px-2.5 text-[11px] font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
+  GOAL_FOCUS,
+);
+const GOAL_META =
+  "shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground";
+const GOAL_LINK = cn(
+  "inline-flex shrink-0 items-center gap-[5px] rounded-[4px] transition-colors hover:text-foreground",
+  GOAL_FOCUS,
+);
+const GOAL_MENU_ITEM = "h-[26px] rounded-[6px] px-2 py-0 text-[12px]";
+
 /**
  * The one strip docked above the composer pill. It mirrors the scope
  * strip's chin under the draft composer, flipped: inset 20px on each side
@@ -86,11 +167,18 @@ const STRIP_CHIP =
  * gives way, nothing floats. Only the user opens or closes it (the chip or
  * Escape); arrivals and completions never touch that state, and the list
  * emptying is the one automatic close.
+ *
+ * A goal outranks every occupant: it always holds the visible row and the
+ * rest count into its `+n`. Opening a goal-led strip drills into the goal
+ * rather than listing occupants; the drill-in names what else is pending,
+ * and that line opens the occupant list beneath it.
  */
 export function ComposerStrip({
   occupants,
+  goal = null,
 }: {
   occupants: ReadonlyArray<StripOccupant | null | undefined | false>;
+  goal?: StripGoal | null;
 }) {
   const present = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
@@ -99,36 +187,50 @@ export function ComposerStrip({
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
   const total = rows.length;
+  const hasGoal = goal !== null;
 
   const listId = useId();
   const [open, setOpen] = useState(false);
+  const [goalOpen, setGoalOpen] = useState(false);
 
   useEffect(() => {
     if (total === 0) setOpen(false);
   }, [total]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!hasGoal) setGoalOpen(false);
+  }, [hasGoal]);
+
+  const anyOpen = open || goalOpen;
+  useEffect(() => {
+    if (!anyOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
       // Anything that already consumed Escape (a composer popup closing)
       // keeps it.
       if (e.key !== "Escape" || e.defaultPrevented) return;
       e.preventDefault();
       setOpen(false);
+      setGoalOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open]);
+  }, [anyOpen]);
 
-  if (total === 0) return null;
+  if (total === 0 && !goal) return null;
 
   const lead = present[0];
-  const rest = total - 1;
-  const visible = open ? rows : [{ row: lead.summary, kind: lead.kind }];
-  const sweep = open ? present.some((o) => o.live) : lead.live === true;
+  const interrupted = goal?.goal.status === "interrupted";
+  // An interrupted goal draws a still amber edge instead; the two never
+  // share the top edge.
+  const sweep = interrupted
+    ? false
+    : open || goal
+      ? present.some((o) => o.live)
+      : lead.live === true;
 
+  const rest = total - 1;
   const toggle =
-    open || rest > 0 ? (
+    !goal && (open || rest > 0) ? (
       <button
         type="button"
         data-testid="composer-strip-toggle"
@@ -151,10 +253,24 @@ export function ComposerStrip({
     <div
       data-testid="composer-strip"
       data-open={open || undefined}
-      data-lead={lead.kind}
+      data-lead={goal ? "goal" : lead.kind}
       className="relative z-0 w-full px-5"
     >
       <div className="relative -mb-[18px] overflow-hidden rounded-t-[14px] border border-b-0 border-border/70 bg-muted/20 pb-[18px]">
+        {interrupted && (
+          <>
+            <span
+              data-testid="composer-strip-goal-tint"
+              className="pointer-events-none absolute inset-0 bg-[color-mix(in_oklch,var(--status-working)_6%,transparent)]"
+              aria-hidden
+            />
+            <span
+              data-testid="composer-strip-goal-edge"
+              className="pointer-events-none absolute top-0 left-[16%] h-px w-[30%] bg-gradient-to-r from-transparent via-status-working to-transparent"
+              aria-hidden
+            />
+          </>
+        )}
         {sweep && (
           <span
             data-testid="composer-strip-sweep"
@@ -163,26 +279,88 @@ export function ComposerStrip({
             aria-hidden
           />
         )}
-        <ul
-          id={listId}
-          aria-label="Pending activity"
-          className={cn(
-            "flex flex-col gap-[3px]",
-            open && `${OPEN_MAX_HEIGHT} overflow-y-auto [scrollbar-width:thin]`,
-          )}
-        >
-          {visible.map(({ row, kind }, index) => (
-            <StripRowView
-              key={row.id}
-              row={row}
-              kind={kind}
-              trailing={index === 0 ? toggle : null}
+        {goal ? (
+          <ul aria-label="Pending activity" className="relative flex flex-col">
+            <GoalRowView
+              strip={goal}
+              open={goalOpen}
+              onToggle={() => {
+                setGoalOpen((cur) => !cur);
+                setOpen(false);
+              }}
+              others={total}
+              summary={occupantSummary(present)}
+              listOpen={open}
+              listId={listId}
+              onToggleList={() => setOpen((cur) => !cur)}
             />
-          ))}
-        </ul>
+            {goalOpen && open && (
+              <li>
+                <ul
+                  id={listId}
+                  aria-label="Other activity"
+                  className={cn(
+                    "flex flex-col gap-[3px] overflow-y-auto [scrollbar-width:thin]",
+                    OPEN_MAX_HEIGHT,
+                  )}
+                >
+                  {rows.map(({ row, kind }) => (
+                    <StripRowView
+                      key={row.id}
+                      row={row}
+                      kind={kind}
+                      trailing={null}
+                    />
+                  ))}
+                </ul>
+              </li>
+            )}
+          </ul>
+        ) : (
+          <ul
+            id={listId}
+            aria-label="Pending activity"
+            className={cn(
+              "relative flex flex-col gap-[3px]",
+              open &&
+                `${OPEN_MAX_HEIGHT} overflow-y-auto [scrollbar-width:thin]`,
+            )}
+          >
+            {(open ? rows : [{ row: lead.summary, kind: lead.kind }]).map(
+              ({ row, kind }, index) => (
+                <StripRowView
+                  key={row.id}
+                  row={row}
+                  kind={kind}
+                  trailing={index === 0 ? toggle : null}
+                />
+              ),
+            )}
+          </ul>
+        )}
       </div>
     </div>
   );
+}
+
+/** "2 subagents running · 1 message queued", in strip priority order. */
+function occupantSummary(present: StripOccupant[]): string | null {
+  const parts = present.map((o) => {
+    const n = o.rows.length;
+    switch (o.kind) {
+      case "running":
+        return `${n} subagent${n === 1 ? "" : "s"} running`;
+      case "queued":
+        return `${n} message${n === 1 ? "" : "s"} queued`;
+      case "finished":
+        return "subagents finished";
+      case "monitoring":
+        return "monitoring";
+      case "error":
+        return "session error";
+    }
+  });
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function StripRowView({
@@ -233,6 +411,359 @@ function StripRowView({
       )}
       {trailing}
     </li>
+  );
+}
+
+/**
+ * The goal row. Collapsed it is one strip row, so a goal appearing never
+ * changes the strip's height. Green marks that a goal is standing, never
+ * how it is going: Codemux can't see the provider's loop, so the row shows
+ * only what the user set and when.
+ */
+function GoalRowView({
+  strip,
+  open,
+  onToggle,
+  others,
+  summary,
+  listOpen,
+  listId,
+  onToggleList,
+}: {
+  strip: StripGoal;
+  open: boolean;
+  onToggle: () => void;
+  /** Occupant rows counted into `+n`. */
+  others: number;
+  summary: string | null;
+  listOpen: boolean;
+  listId: string;
+  onToggleList: () => void;
+}) {
+  const { goal } = strip;
+  const interrupted = goal.status === "interrupted";
+  const detailsId = useId();
+  const setAt = goal.setAt;
+  const stopped = interrupted ? (strip.stopped ?? null) : null;
+  const stoppedAt = stopped?.at ?? null;
+
+  const jump = interrupted && stopped?.onJump
+    ? { label: "Jump to last activity", onClick: stopped.onJump }
+    : strip.onJump
+      ? { label: "Jump to message", onClick: strip.onJump }
+      : null;
+  const note = interrupted
+    ? stopped?.after
+      ? `stopped after "${stopped.after}"`
+      : "stopped before the run finished"
+    : null;
+
+  return (
+    <li
+      data-testid="composer-strip-goal"
+      data-kind="goal"
+      data-status={goal.status}
+      data-open={open || undefined}
+      className="flex shrink-0 flex-col"
+    >
+      <div className="flex h-[34px] items-center gap-2 px-2">
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          {interrupted ? (
+            <GoalPauseGlyph className="text-status-working" />
+          ) : (
+            <GoalTargetGlyph className="text-status-open" />
+          )}
+        </span>
+        <button
+          type="button"
+          data-testid="composer-strip-goal-toggle"
+          aria-expanded={open}
+          aria-controls={open ? detailsId : undefined}
+          onClick={onToggle}
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-2 self-stretch rounded-[6px] text-left",
+            GOAL_FOCUS,
+          )}
+        >
+          <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+            {interrupted ? "Goal interrupted" : "Goal"}
+          </span>
+          {!open ? (
+            <span
+              className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground"
+              title={goal.text}
+            >
+              {goal.text}
+            </span>
+          ) : interrupted ? (
+            stoppedAt !== null && (
+              <TickingText
+                testId="composer-strip-goal-meta"
+                className={GOAL_META}
+                compute={(now) =>
+                  `stopped ${formatClockTime(stoppedAt)} · idle ${formatGoalAge(now - stoppedAt)}`
+                }
+                intervalMs={15_000}
+              />
+            )
+          ) : (
+            <TickingText
+              testId="composer-strip-goal-meta"
+              className={GOAL_META}
+              compute={(now) =>
+                `set ${formatClockTime(setAt)} · ${formatGoalAge(now - setAt)} ago`
+              }
+              intervalMs={15_000}
+            />
+          )}
+        </button>
+        {open ? (
+          <>
+            {interrupted ? (
+              <button
+                type="button"
+                data-testid="composer-strip-goal-resume"
+                onClick={strip.onResume}
+                className={GOAL_RESUME}
+              >
+                Resume
+              </button>
+            ) : (
+              <button type="button" onClick={strip.onCopy} className={GOAL_CHIP}>
+                Copy
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={strip.onClear}
+              className={interrupted ? GOAL_CHIP : GOAL_CHIP_OUTLINE}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              onClick={onToggle}
+              className={GOAL_CHIP_FILLED}
+            >
+              Hide
+              <ChevronDown
+                className="size-[9px] opacity-60"
+                strokeWidth={2.2}
+                aria-hidden
+              />
+            </button>
+          </>
+        ) : (
+          <>
+            {interrupted ? (
+              <>
+                <button
+                  type="button"
+                  data-testid="composer-strip-goal-resume"
+                  title={`Sends “${strip.resumePhrase}”`}
+                  onClick={strip.onResume}
+                  className={GOAL_RESUME}
+                >
+                  Resume
+                </button>
+                <GoalOverflowMenu strip={strip} />
+              </>
+            ) : (
+              <TickingText
+                testId="composer-strip-goal-age"
+                className={GOAL_META}
+                compute={(now) => formatGoalAge(now - setAt)}
+                intervalMs={15_000}
+              />
+            )}
+            {others > 0 ? (
+              <button
+                type="button"
+                data-testid="composer-strip-goal-more"
+                aria-expanded={false}
+                aria-label={`Show goal and ${others} more`}
+                title={`Show goal and ${others} more`}
+                onClick={onToggle}
+                className={GOAL_CHIP_FILLED}
+              >
+                <span className="font-mono">+{others}</span>
+                <ChevronUp
+                  className="size-[9px] opacity-60"
+                  strokeWidth={2.2}
+                  aria-hidden
+                />
+              </button>
+            ) : (
+              !interrupted && (
+                <button
+                  type="button"
+                  aria-label="Show goal"
+                  title="Show goal"
+                  onClick={onToggle}
+                  className={GOAL_ICON_BUTTON}
+                >
+                  <ChevronUp className="size-2.5" strokeWidth={2} aria-hidden />
+                </button>
+              )
+            )}
+          </>
+        )}
+      </div>
+      {open && (
+        <div
+          id={detailsId}
+          data-testid="composer-strip-goal-details"
+          className="flex flex-col gap-[7px] pt-px pr-2.5 pb-[3px] pl-9"
+        >
+          <p className="max-h-[102px] overflow-y-auto whitespace-pre-wrap break-words text-[12px] leading-[1.55] text-foreground/[0.82] [scrollbar-width:thin]">
+            {goal.text}
+          </p>
+          {interrupted && (
+            <div
+              data-testid="composer-strip-goal-sends"
+              className="flex min-w-0 items-center gap-2 rounded-[8px] border border-border/70 bg-foreground/[0.02] px-[9px] py-1.5"
+            >
+              <span className="shrink-0 font-mono text-[10px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+                sends
+              </span>
+              <code
+                className="min-w-0 flex-1 truncate font-mono text-[11px] text-accent-ember"
+                title={strip.resumePhrase}
+              >
+                {strip.resumePhrase}
+              </code>
+              <button
+                type="button"
+                onClick={strip.onEditResume}
+                className={cn(
+                  "shrink-0 rounded-[4px] font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-foreground",
+                  GOAL_FOCUS,
+                )}
+              >
+                edit before sending
+              </button>
+            </div>
+          )}
+          {(jump || note || summary) && (
+            <div className="flex min-w-0 items-center gap-2.5 font-mono text-[10.5px] text-muted-foreground">
+              {jump && (
+                <button type="button" onClick={jump.onClick} className={GOAL_LINK}>
+                  {jump.label}
+                  <ChevronRight
+                    className="size-[9px]"
+                    strokeWidth={2.2}
+                    aria-hidden
+                  />
+                </button>
+              )}
+              {[note, summary]
+                .filter((part): part is string => !!part)
+                .map((part, index) => (
+                  <span
+                    key={part}
+                    className="flex min-w-0 items-center gap-2.5"
+                  >
+                    {(jump || index > 0) && (
+                      <span aria-hidden className="opacity-40">
+                        ·
+                      </span>
+                    )}
+                    {part === summary ? (
+                      <button
+                        type="button"
+                        data-testid="composer-strip-goal-others"
+                        aria-expanded={listOpen}
+                        aria-controls={listOpen ? listId : undefined}
+                        onClick={onToggleList}
+                        className={cn(
+                          "min-w-0 truncate rounded-[4px] text-left transition-colors hover:text-foreground",
+                          GOAL_FOCUS,
+                        )}
+                      >
+                        {part}
+                      </button>
+                    ) : (
+                      <span className="min-w-0 truncate">{part}</span>
+                    )}
+                  </span>
+                ))}
+            </div>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+function GoalOverflowMenu({ strip }: { strip: StripGoal }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          data-testid="composer-strip-goal-menu"
+          aria-label="Goal actions"
+          title="Goal actions"
+          className={GOAL_ICON_BUTTON}
+        >
+          <EllipsisVertical className="size-3" strokeWidth={2} aria-hidden />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" side="top" className="w-[168px] p-1">
+        <DropdownMenuItem className={GOAL_MENU_ITEM} onSelect={strip.onCopy}>
+          Copy goal text
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className={GOAL_MENU_ITEM}
+          disabled={!strip.onJump}
+          onSelect={() => strip.onJump?.()}
+        >
+          Jump to message
+        </DropdownMenuItem>
+        <DropdownMenuSeparator className="mx-1.5 my-[3px]" />
+        <DropdownMenuItem className={GOAL_MENU_ITEM} onSelect={strip.onClear}>
+          Clear goal
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Canvas-12 target: a ring with a filled centre. */
+function GoalTargetGlyph({ className }: { className?: string }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      className={className}
+      aria-hidden
+    >
+      <circle cx="8" cy="8" r="6" />
+      <circle cx="8" cy="8" r="2.4" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** Canvas-12 pause: the same ring with two bars. */
+function GoalPauseGlyph({ className }: { className?: string }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      className={className}
+      aria-hidden
+    >
+      <circle cx="8" cy="8" r="6" />
+      <path d="M6.4 5.8v4.4M9.6 5.8v4.4" strokeLinecap="round" />
+    </svg>
   );
 }
 

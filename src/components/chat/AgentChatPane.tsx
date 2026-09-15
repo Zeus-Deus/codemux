@@ -59,6 +59,13 @@ import { ATTACHMENT_HARD_LIMIT } from "@/lib/agent-chat/attachment-limits";
 import { metadataFromSessionContext } from "@/lib/agent-chat/session-handoff";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
+import { COPY_FAILED_MESSAGE, copyToClipboard } from "@/lib/clipboard";
+import { goalLastActivity, resolveThreadGoal } from "@/lib/agent-chat/goal";
+import { buildGoalPhrases } from "@/lib/agent-chat/slash-commands";
+import {
+  selectProviderCommands,
+  useProviderCommandsStore,
+} from "@/stores/provider-commands-store";
 import {
   findWorkspaceIdForPane,
   useAppStore,
@@ -138,7 +145,7 @@ import {
 } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
-import { ComposerStrip } from "./ComposerStrip";
+import { ComposerStrip, type StripGoal } from "./ComposerStrip";
 import {
   queuedMessages,
   queuedOccupant,
@@ -3488,12 +3495,117 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     () => sessionErrorOccupant(messages, transcriptStreaming),
     [messages, transcriptStreaming],
   );
+  // Goal row: the thread's standing `/goal`, recorded by the reducer from the
+  // user's own turn. It goes amber only when the run was cut off mid-turn —
+  // the same signal as the transcript's "Run interrupted" divider.
+  const storedGoal = useAgentChatStore((s) =>
+    threadId ? (s.threads[threadId]?.goal ?? null) : null,
+  );
+  const providerCommands = useProviderCommandsStore(
+    useMemo(() => selectProviderCommands(provider, cwd), [provider, cwd]),
+  ).commands;
+  const loadProviderCommands = useProviderCommandsStore((s) => s.loadCommands);
+  const hasGoal = storedGoal !== null;
+  useEffect(() => {
+    // Resume's phrase depends on whether the provider has its own `/goal`;
+    // otherwise the command list only loads when the slash popup opens.
+    if (hasGoal) void loadProviderCommands(provider, cwd);
+  }, [hasGoal, provider, cwd, loadProviderCommands]);
+  const [messageJumpRequest, setMessageJumpRequest] = useState<{
+    itemId: string;
+    turnId?: string | null;
+    nonce: number;
+  } | null>(null);
+  // Where an interrupted run stopped. Scanned only while the goal is cut off,
+  // so streaming deltas never pay for it.
+  const goalCutOff = storedGoal !== null && interrupted && !transcriptStreaming;
+  const goalLastRun = useMemo(
+    () => (goalCutOff ? goalLastActivity(messages) : null),
+    [goalCutOff, messages],
+  );
+  const goalSourceId = storedGoal?.sourceMessageId ?? null;
+  const goalSourceInTranscript = useMemo(
+    () => goalSourceId !== null && messages.some((m) => m.id === goalSourceId),
+    [messages, goalSourceId],
+  );
+  const stripGoal = useMemo<StripGoal | null>(() => {
+    const goal = resolveThreadGoal(
+      storedGoal,
+      interrupted && !transcriptStreaming,
+    );
+    if (!goal || !threadId) return null;
+    const phrases = buildGoalPhrases({
+      commands: providerCommands,
+      goalText: goal.text,
+    });
+    return {
+      goal,
+      resumePhrase: phrases.resume,
+      // Both send the way the Continue chip does: through the normal send
+      // path, leaving whatever the user is typing in place.
+      onResume: () => handleSubmit(phrases.resume, { continueRun: true }),
+      onClear: () => handleSubmit(phrases.clear, { continueRun: true }),
+      onEditResume: () => {
+        const current =
+          useAgentChatStore.getState().threads[threadId]?.inputDraft ?? "";
+        setInputDraft(
+          threadId,
+          current.trim() ? `${phrases.resume}\n\n${current}` : phrases.resume,
+        );
+        requestAnimationFrame(() => {
+          paneRootRef.current
+            ?.querySelector<HTMLTextAreaElement>(
+              '[data-testid="composer-wrapper"] textarea',
+            )
+            ?.focus();
+        });
+      },
+      onCopy: () => {
+        void copyToClipboard(goal.text).then((ok) => {
+          if (ok) toast.success("Goal copied");
+          else toast.error(COPY_FAILED_MESSAGE);
+        });
+      },
+      onJump: goalSourceInTranscript
+        ? () =>
+            setMessageJumpRequest((current) => ({
+              itemId: goal.sourceMessageId,
+              nonce: (current?.nonce ?? 0) + 1,
+            }))
+        : null,
+      stopped: goalLastRun
+        ? {
+            at: goalLastRun.at,
+            after: goalLastRun.snippet,
+            onJump: goalLastRun.itemId
+              ? () =>
+                  setMessageJumpRequest((current) => ({
+                    itemId: goalLastRun.itemId!,
+                    turnId: goalLastRun.turnId,
+                    nonce: (current?.nonce ?? 0) + 1,
+                  }))
+              : null,
+          }
+        : null,
+    };
+  }, [
+    storedGoal,
+    interrupted,
+    transcriptStreaming,
+    threadId,
+    providerCommands,
+    handleSubmit,
+    setInputDraft,
+    goalSourceInTranscript,
+    goalLastRun,
+  ]);
   // Hidden in a subagent drill-in: the design only shows it in the
   // conversation view. Keyed by thread so the open list never leaks
   // across a thread switch.
   const stripEl = enteredSubagent ? null : (
     <ComposerStrip
       key={threadId ?? "no-thread"}
+      goal={stripGoal}
       occupants={[
         errorOccupant,
         monitoringOccupant,
@@ -3737,6 +3849,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               subagentJumpRequest={subagentJumpRequest}
               conversationSearchJumpRequest={conversationSearchJumpRequest}
               onConversationSearchJumpHandled={clearConversationSearchJump}
+              messageJumpRequest={messageJumpRequest}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}

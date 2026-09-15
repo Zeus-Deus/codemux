@@ -733,6 +733,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Vitest globals are off, so Testing Library never auto-unmounts. Without
+  // this every test left its pane mounted — live subscriptions, listeners
+  // and all — and the file's heap climbed ~40MB per test until the worker
+  // ran out of memory in CI.
+  cleanup();
   useProviderRuntimeIntent.getState().reset();
 });
 

@@ -8,6 +8,7 @@ import {
 } from "@/lib/agent-chat/hydrate";
 import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
 import { adoptItemIds } from "@/lib/agent-chat/adopt-item-ids";
+import { remapGoalSource } from "@/lib/agent-chat/goal";
 import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
 import {
   applyEvent,
@@ -444,6 +445,9 @@ function replayIntoSlice(
     ...base,
     ...replayed,
     messages,
+    // Follow the goal's source turn onto its adopted id, or Jump would
+    // target a row key that no longer exists.
+    goal: remapGoalSource(replayed.goal, replayed.messages, messages),
     // Hydration is a fresh-start scenario — drop ephemeral turn-state
     // fields the live event stream owns.
     activeTurnId: null,
