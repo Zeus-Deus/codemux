@@ -988,6 +988,27 @@ body.pane-resizing iframe {
 .cm-blink {
   animation: cm-blink 1.3s ease-in-out infinite;
 }
+
+/* The "now" dot on a progress surface (sweep dialog): a slower, dimmer
+ * breath than `cm-blink`, since it sits beside a line of text that is
+ * already changing and must not compete with it. */
+@keyframes cm-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.cm-breathe {
+  animation: cm-breathe 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-breathe {
+    animation: none;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .cm-blink {
     animation: none;
