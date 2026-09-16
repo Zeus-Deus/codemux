@@ -89,6 +89,7 @@ import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN } from "./chat-column";
+import { randomUUID } from "@/lib/uuid";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -628,10 +629,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // a separate transfer step.
   const handleAttachFile = useCallback(
     (match: FileMatch) => {
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const filename = basename(match.path);
       addStagedAttachment(draft.threadId, {
         id,
@@ -688,10 +686,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         });
         return;
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const label = file.name || `pasted-image-${Date.now()}.png`;
       addStagedAttachment(draft.threadId, {
         id,
@@ -738,10 +733,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
    *  thread transition without a transfer step. */
   const handleAttachFolder = useCallback(
     (match: FolderMatch) => {
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const folderName = basename(match.path);
       addStagedAttachment(draft.threadId, {
         id,
@@ -784,10 +776,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const handleAttachIssue = useCallback(
     (summary: GitHubIssue) => {
       if (!displayCwd) return;
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const initialState = (
         summary.state.toLowerCase() === "closed" ? "closed" : "open"
       ) as "open" | "closed";
@@ -834,10 +823,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const handleAttachPr = useCallback(
     (summary: PullRequestInfo) => {
       if (!displayCwd) return;
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const upper = summary.state.toUpperCase();
       const initialState: "open" | "closed" | "merged" | "draft" =
         upper === "MERGED"

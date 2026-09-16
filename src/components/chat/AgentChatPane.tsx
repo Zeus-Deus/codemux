@@ -142,6 +142,7 @@ import { ProviderStatusNotice } from "./ProviderStatusNotice";
 import {
   formatProviderError,
   grokModelChangeRequiresRestart,
+  parsePaneAlreadyBound,
 } from "@/lib/agent-chat/provider-error";
 import { useProviderHealth } from "@/stores/provider-health-store";
 import { Composer } from "./Composer";
@@ -167,6 +168,7 @@ import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { RevertTurnDialog } from "./revert-turn-dialog";
+import { randomUUID } from "@/lib/uuid";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
 // passes the pane snapshot verbatim; nothing else imports this type.
@@ -1268,6 +1270,32 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // pane. Restoring an empty persisted pane during application startup must
   // not launch (and potentially leave behind) a provider child process.
   const startAttempted = useRef(false);
+  /**
+   * Follow the pane binding that won a start-session race.
+   *
+   * Every connected client reads one shared snapshot, so two of them can
+   * mount the same freshly created pane while it is still unbound and both
+   * try to start a session on it. The backend claims the pane before it
+   * spawns anything, so the loser's provider never ran — there is nothing
+   * to clean up and nothing worth toasting. Adopting the winner's thread
+   * (and provider, if it differs from what this pane assumed) is exactly
+   * what the `pane.thread_id` update would have done a beat later.
+   */
+  const adoptPaneBinding = useCallback(
+    (claim: { threadId: string; provider: AgentChatProviderKind | null }) => {
+      ensureThread(claim.threadId);
+      commitPendingSessionDraft(claim.threadId);
+      setThreadId(claim.threadId);
+      if (claim.provider !== null && claim.provider !== provider) {
+        setProvider(claim.provider);
+      }
+      // The pane is bound now, so the effect's `threadId` branch short
+      // circuits ahead of any restart — but clear the marker so a genuine
+      // later start (New Chat, a thread reset) isn't blocked by this race.
+      startAttempted.current = false;
+    },
+    [ensureThread, commitPendingSessionDraft, provider],
+  );
   // Tracks whether we've already attempted to recover a partial
   // materialise on this mount. Unlike `startAttempted` (which resets
   // on failure to allow a hot retry), recovery is a one-shot per
@@ -1275,9 +1303,118 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // user can retry by re-opening the workspace.
   const recoveryAttempted = useRef(false);
   useEffect(() => {
+    /**
+     * Finish a half-completed materialise: the draft got a workspace and a
+     * pane but never a session, so adopt its orphan thread id (which already
+     * holds the user's optimistic message) and start what step 3 missed.
+     *
+     * Shared by both entry points below, because such a draft can now reach
+     * this effect two ways. Panes are born bound to the draft's thread, so
+     * the usual shape is a pane already carrying `draft.threadId` with no
+     * session behind it; an older unbound pane still arrives with no binding
+     * at all. The work is identical — only the claim differs, and the
+     * backend accepts a claim whose expected thread is the binding the pane
+     * already has.
+     */
+    const startRecovery = (
+      draft: NonNullable<typeof recoveryDraft>,
+      startCwd: string,
+      expectedThread: string | null,
+    ) => {
+      recoveryAttempted.current = true;
+      startAttempted.current = true;
+      setStarting(true);
+      // OpenCode deliberately launches with a null permission mode;
+      // feeding it Claude's bypass token would persist invalid
+      // cross-provider configuration.
+      const recoveryMode =
+        provider === "opencode"
+          ? null
+          : (draft.permissionMode ?? providerDefaultPermissionMode);
+      const startInput = {
+        thread_id: draft.threadId,
+        cwd: startCwd,
+        model: draft.model,
+        resume_cursor: null,
+        permission_mode: recoveryMode,
+        effort: draft.effort,
+        context_window: draft.contextWindow,
+        fast_mode: draft.fastMode ?? false,
+        additional_directories: [],
+        env: null,
+      };
+      agentChatStartSession(pane.pane_id, provider, startInput, expectedThread)
+        .then((id) => {
+          // The provider just ran — retire any stale failure banner
+          // (no-op when nothing is bannered).
+          void useProviderHealth.getState().noteProviderSuccess(provider);
+          ensureThread(id);
+          commitPendingSessionDraft(id);
+          setThreadId(id);
+          if (draft.model !== null) {
+            setStoreModel(id, draft.model);
+          } else {
+            setStoreModel(id, defaultModelForProvider(provider));
+          }
+          if (recoveryMode !== null) {
+            setStorePermissionMode(id, recoveryMode);
+          }
+          setStoreEffort(id, draft.effort);
+          setStoreContextWindow(id, draft.contextWindow);
+          setStoreFastMode(id, draft.fastMode ?? false);
+          setSessionLaunchMode(id, recoveryMode);
+          // Mark the draft as promoted so subsequent mounts take the
+          // existing promotedDraftThreadId branch above instead of
+          // re-attempting recovery.
+          markDraftPromoted(draft.draftId, {
+            workspaceId: draft.workspaceId,
+            paneId: draft.paneId,
+            threadId: id,
+          });
+          // Sweep the now-promoted draft on the same 5s grace window
+          // the success path uses (DraftChatSurface.tsx, preset-bar.tsx).
+          const draftIdToClear = draft.draftId;
+          setTimeout(() => clearDraft(draftIdToClear), 5000);
+        })
+        .catch((err) => {
+          // Another client got to this pane first and the backend refused
+          // the claim without spawning anything. Its binding is the truth:
+          // adopt it instead of reporting a failure the user can't act on.
+          const claim = parsePaneAlreadyBound(err);
+          if (claim) {
+            adoptPaneBinding(claim);
+            return;
+          }
+          toast.error(
+            `Failed to recover chat session: ${formatProviderError(err)}`,
+          );
+          // A start failure is a strong provider-health signal — re-probe
+          // now (bypassing the TTL) so the status banner explains why.
+          void useProviderHealth.getState().refresh(provider, { force: true });
+          // Leave the draft in SendFailed state. The user can re-open
+          // the workspace to retry, or close it and start over.
+        })
+        .finally(() => setStarting(false));
+    };
+
     if (threadId) {
       ensureThread(threadId);
       commitPendingSessionDraft(threadId);
+      // A bound pane is normally a live session, but materialize binds the
+      // pane at create time — so a draft whose `start_session` failed leaves
+      // the pane bound to `draft.threadId` with nothing running behind it.
+      // That shape can only be recovered from here; the unbound branch below
+      // is unreachable once the pane carries a binding.
+      if (
+        providerRuntimeIntent &&
+        recoveryDraft &&
+        recoveryDraft.threadId === threadId &&
+        !recoveryAttempted.current &&
+        !starting &&
+        cwd
+      ) {
+        startRecovery(recoveryDraft, cwd, threadId);
+      }
       return;
     }
     // Stage C race fix: if a promoted draft owns this workspace, it
@@ -1297,72 +1434,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (recoveryDraft && !recoveryAttempted.current) {
       if (starting) return;
       if (!cwd) return;
-      recoveryAttempted.current = true;
-      startAttempted.current = true;
-      setStarting(true);
-      // OpenCode deliberately launches with a null permission mode;
-      // feeding it Claude's bypass token would persist invalid
-      // cross-provider configuration.
-      const recoveryMode =
-        provider === "opencode"
-          ? null
-          : (recoveryDraft.permissionMode ?? providerDefaultPermissionMode);
-      const startInput = {
-        thread_id: recoveryDraft.threadId,
-        cwd,
-        model: recoveryDraft.model,
-        resume_cursor: null,
-        permission_mode: recoveryMode,
-        effort: recoveryDraft.effort,
-        context_window: recoveryDraft.contextWindow,
-        fast_mode: recoveryDraft.fastMode ?? false,
-        additional_directories: [],
-        env: null,
-      };
-      agentChatStartSession(pane.pane_id, provider, startInput)
-        .then((id) => {
-          // The provider just ran — retire any stale failure banner
-          // (no-op when nothing is bannered).
-          void useProviderHealth.getState().noteProviderSuccess(provider);
-          ensureThread(id);
-          commitPendingSessionDraft(id);
-          setThreadId(id);
-          if (recoveryDraft.model !== null) {
-            setStoreModel(id, recoveryDraft.model);
-          } else {
-            setStoreModel(id, defaultModelForProvider(provider));
-          }
-          if (recoveryMode !== null) {
-            setStorePermissionMode(id, recoveryMode);
-          }
-          setStoreEffort(id, recoveryDraft.effort);
-          setStoreContextWindow(id, recoveryDraft.contextWindow);
-          setStoreFastMode(id, recoveryDraft.fastMode ?? false);
-          setSessionLaunchMode(id, recoveryMode);
-          // Mark the draft as promoted so subsequent mounts take the
-          // existing promotedDraftThreadId branch above instead of
-          // re-attempting recovery.
-          markDraftPromoted(recoveryDraft.draftId, {
-            workspaceId: recoveryDraft.workspaceId,
-            paneId: recoveryDraft.paneId,
-            threadId: id,
-          });
-          // Sweep the now-promoted draft on the same 5s grace window
-          // the success path uses (DraftChatSurface.tsx, preset-bar.tsx).
-          const draftIdToClear = recoveryDraft.draftId;
-          setTimeout(() => clearDraft(draftIdToClear), 5000);
-        })
-        .catch((err) => {
-          toast.error(
-            `Failed to recover chat session: ${formatProviderError(err)}`,
-          );
-          // A start failure is a strong provider-health signal — re-probe
-          // now (bypassing the TTL) so the status banner explains why.
-          void useProviderHealth.getState().refresh(provider, { force: true });
-          // Leave the draft in SendFailed state. The user can re-open
-          // the workspace to retry, or close it and start over.
-        })
-        .finally(() => setStarting(false));
+      startRecovery(recoveryDraft, cwd, null);
       return;
     }
     if (starting || startAttempted.current) return;
@@ -1401,6 +1473,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setSessionLaunchMode(id, startMode);
       })
       .catch((err) => {
+        // Claim lost: the pane is already bound to another client's
+        // thread and nothing was spawned. Follow that binding rather
+        // than toasting a race the user didn't cause. `adoptPaneBinding`
+        // clears `startAttempted` — the pane has a thread now, so the
+        // effect's `threadId` branch takes over, and the cleared marker
+        // only matters for a later deliberate start (New Chat, a reset).
+        const claim = parsePaneAlreadyBound(err);
+        if (claim) {
+          adoptPaneBinding(claim);
+          return;
+        }
         toast.error(
           `Failed to start chat session: ${formatProviderError(err)}`,
         );
@@ -1430,6 +1513,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     providerDefaultPermissionMode,
     markDraftPromoted,
     clearDraft,
+    adoptPaneBinding,
   ]);
 
   const handleSubmit = useCallback(
@@ -1637,10 +1721,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // event can reconcile THIS exact bubble (grey it out) instead of
       // duplicating it, and so an outright RPC failure can roll it back
       // (fixes the pre-queue orphan-bubble bug).
-      const clientNonce =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const clientNonce = randomUUID();
         appendUserMessage(
           threadId,
           plan.text,
@@ -1787,10 +1868,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
         return;
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const filename = basename(match.path);
       addStagedAttachment(threadId, {
         id,
@@ -1843,10 +1921,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
         return;
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const folderName = basename(match.path);
       addStagedAttachment(threadId, {
         id,
@@ -1897,10 +1972,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
         return;
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const initialState = (
         summary.state.toLowerCase() === "closed" ? "closed" : "open"
       ) as "open" | "closed";
@@ -1961,10 +2033,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         });
         return;
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const upper = summary.state.toUpperCase();
       const initialState: "open" | "closed" | "merged" | "draft" =
         upper === "MERGED"
@@ -2145,10 +2214,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           return;
         }
       }
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const label = file.name || `pasted-image-${Date.now()}.png`;
       addStagedAttachment(threadId, {
         id,
@@ -2436,19 +2502,27 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           console.warn("[agent-chat] stop_session during restart failed", err);
         }
         try {
-          const newId = await agentChatStartSession(pane.pane_id, provider, {
-            thread_id: threadId,
-            cwd: cwd ?? "",
-            model: nextModel,
-            resume_cursor: resumeCursor,
-            fresh_session: updates.freshSession ?? false,
-            permission_mode: nextMode,
-            effort: nextEffort,
-            context_window: nextContext,
-            fast_mode: nextFastMode,
-            additional_directories: [],
-            env: null,
-          });
+          // We stopped this pane's own session a moment ago, so name the
+          // thread it is bound to: the backend's claim check accepts the
+          // owner re-starting it and still refuses a rival client.
+          const newId = await agentChatStartSession(
+            pane.pane_id,
+            provider,
+            {
+              thread_id: threadId,
+              cwd: cwd ?? "",
+              model: nextModel,
+              resume_cursor: resumeCursor,
+              fresh_session: updates.freshSession ?? false,
+              permission_mode: nextMode,
+              effort: nextEffort,
+              context_window: nextContext,
+              fast_mode: nextFastMode,
+              additional_directories: [],
+              env: null,
+            },
+            threadId,
+          );
           if (newId !== threadId) {
             throw new Error(
               `Provider restart changed durable thread id from ${threadId} to ${newId}`,
@@ -3229,6 +3303,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               additional_directories: [],
               env: null,
             },
+            // This pane is ours and is bound to `oldThreadId`; the new
+            // adapter may hand back a different durable id, so the claim
+            // has to be made against the binding we are replacing.
+            oldThreadId,
           );
 
           if (startedThreadId !== oldThreadId) {
@@ -3252,18 +3330,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           // provider starts successfully. Best-effort rebuild the stopped
           // adapter so a failed switch leaves the existing chat usable.
           try {
-            await agentChatStartSession(pane.pane_id, oldProvider, {
-              thread_id: oldThreadId,
-              cwd,
-              model: currentSlice.model,
-              resume_cursor: currentSlice.resumeCursor,
-              permission_mode: oldLaunchMode,
-              effort: currentSlice.effort,
-              context_window: currentSlice.contextWindow,
-              fast_mode: currentSlice.fastMode ?? false,
-              additional_directories: [],
-              env: null,
-            });
+            await agentChatStartSession(
+              pane.pane_id,
+              oldProvider,
+              {
+                thread_id: oldThreadId,
+                cwd,
+                model: currentSlice.model,
+                resume_cursor: currentSlice.resumeCursor,
+                permission_mode: oldLaunchMode,
+                effort: currentSlice.effort,
+                context_window: currentSlice.contextWindow,
+                fast_mode: currentSlice.fastMode ?? false,
+                additional_directories: [],
+                env: null,
+              },
+              oldThreadId,
+            );
           } catch (recoveryError) {
             console.error(
               "[agent-chat] failed to recover previous provider after switch error",

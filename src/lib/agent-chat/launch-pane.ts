@@ -17,7 +17,10 @@ const DEFAULT_LAUNCH_PROVIDER: AgentChatProviderKind = "claude";
  * pane sits on "Starting session…" with disabled pickers until the user
  * touches it a second time.
  *
- * Same signature as `agentChatCreatePane`; arguments are forwarded as given.
+ * Same signature as `agentChatCreatePane`; arguments are forwarded as given
+ * — including the optional pre-minted `threadId`, which publishes the pane
+ * already bound so a second client cannot mount it unbound and start a
+ * rival session on it.
  */
 export function launchAgentChatPane(
   ...args: Parameters<typeof agentChatCreatePane>

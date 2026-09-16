@@ -61,6 +61,7 @@ import {
   DEFAULT_THREAD_PERMISSION_MODE,
   useAgentChatStore,
 } from "@/stores/agent-chat-store";
+import { toast } from "@/lib/toast";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -115,6 +116,8 @@ beforeEach(() => {
   vi.mocked(agentChatStopSession).mockClear();
   vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
   vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
+  vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.info).mockClear();
 });
 
 afterEach(() => {
@@ -304,5 +307,64 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
     expect((input as { permission_mode: string | null }).permission_mode).toBeNull();
     expect(newestSlice()!.sessionLaunchMode).toBeNull();
+  });
+});
+
+// ── Lost pane claims ──
+//
+// Both actions stop the pane's session and start a replacement under a
+// fresh thread id, naming the thread they expect to replace. Another
+// client can rebind the pane in that window; the backend then refuses the
+// claim WITHOUT spawning anything, so there is no failure to report — only
+// a new owner to follow.
+describe("useAgentChatSessionActions — a lost pane claim", () => {
+  const CLAIM_ERROR = JSON.stringify({
+    kind: "pane_already_bound",
+    pane_id: "pane-1",
+    thread_id: "thread-winner",
+    provider: "claude",
+  });
+
+  it("adopts the winning thread on New Chat instead of toasting the raw error", async () => {
+    vi.mocked(agentChatStartSession).mockRejectedValueOnce(CLAIM_ERROR);
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane()),
+    );
+
+    await result.current.handleNewChat();
+
+    expect(useAgentChatStore.getState().threads["thread-winner"]).toBeDefined();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    expect(vi.mocked(toast.info)).toHaveBeenCalledTimes(1);
+  });
+
+  it("adopts the winning thread on resume instead of toasting the raw error", async () => {
+    vi.mocked(agentChatStartSession).mockRejectedValueOnce(CLAIM_ERROR);
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane()),
+    );
+
+    await result.current.handleSelect(makeRecord());
+
+    expect(useAgentChatStore.getState().threads["thread-winner"]).toBeDefined();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    expect(vi.mocked(toast.info)).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a real start failure through formatProviderError", async () => {
+    // `pane_not_found: …` is the other claim rejection — a bare string the
+    // user cannot read. It must reach them as a sentence, not as the id.
+    vi.mocked(agentChatStartSession).mockRejectedValueOnce(
+      "pane_not_found: pane-1",
+    );
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane()),
+    );
+
+    await result.current.handleNewChat();
+
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      "Failed to start new chat: This chat pane was closed before the session could start.",
+    );
   });
 });

@@ -11,6 +11,7 @@ import { agentChatAnswerQuestion, type QuestionAction } from "@/tauri/commands";
 import { QuestionForm, type Question } from "./QuestionForm";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 import { cn } from "@/lib/utils";
+import { randomUUID } from "@/lib/uuid";
 
 const draftKey = (threadId: string, id: string) =>
   `codemux:question-draft:${threadId}:${id}`;
@@ -254,7 +255,7 @@ function QuestionCard({
                   void act(item.question.id, {
                     action: "answer",
                     answers: resolution.answers,
-                    submission_id: crypto.randomUUID(),
+                    submission_id: randomUUID(),
                     retry_unknown: true,
                   }).catch(() => {})
                 }
@@ -278,7 +279,7 @@ function QuestionCard({
         act(item.question.id, {
           action: "answer",
           answers,
-          submission_id: crypto.randomUUID(),
+          submission_id: randomUUID(),
         })
       }
     />

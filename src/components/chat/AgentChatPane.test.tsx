@@ -44,6 +44,9 @@ let currentDraftsById: Record<
 let workspaceIdForPaneOverride: string | null = "ws-home";
 const setShowNewWorkspaceDialogMock = vi.fn();
 const setActiveDraftMock = vi.fn();
+// The recovery path calls these on the draft it finishes materialising.
+const markDraftPromotedMock = vi.fn();
+const clearDraftMock = vi.fn();
 // Hoisted so the model-seed effect tests can observe whether (and
 // with what) setModel was called from inside AgentChatPane's mount.
 // Stable across selector calls — the agent-chat-store mock below
@@ -573,12 +576,16 @@ vi.mock("@/stores/chat-draft-store", () => ({
       selector({
         draftsById: currentDraftsById,
         setActiveDraft: setActiveDraftMock,
+        markPromoted: markDraftPromotedMock,
+        clearDraft: clearDraftMock,
       }),
     ),
     {
       getState: () => ({
         draftsById: currentDraftsById,
         setActiveDraft: setActiveDraftMock,
+        markPromoted: markDraftPromotedMock,
+        clearDraft: clearDraftMock,
       }),
     },
   ),
@@ -714,6 +721,7 @@ import {
 import { _resetProviderAuthCache, NO_OPERATIONS } from "@/lib/provider-auth";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
+import { toast } from "sonner";
 import type { ChatModelInfo } from "@/tauri/types";
 
 const pane = {
@@ -830,6 +838,8 @@ describe("AgentChatPane empty-state branch", () => {
     currentDraftsById = {};
     workspaceIdForPaneOverride = "ws-home";
     vi.mocked(agentChatStartSession).mockClear();
+    markDraftPromotedMock.mockClear();
+    clearDraftMock.mockClear();
   });
 
   it("renders ChatHomeLanding when messages.length === 0", () => {
@@ -1631,6 +1641,99 @@ describe("AgentChatPane Stage C race fix", () => {
     const paneWithThread = { ...paneNoThread, thread_id: "thread-x" };
     render(<AgentChatPane pane={paneWithThread} />);
     expect(agentChatStartSession).not.toHaveBeenCalled();
+  });
+
+  it("recovers a materialised draft whose session start failed even though the pane is already bound to its thread", async () => {
+    // Panes are born bound to the draft's thread now, so a materialise
+    // that got its pane but lost `start_session` leaves a BOUND pane with
+    // no session behind it. The bound branch used to return immediately,
+    // which made this draft unrecoverable — the unbound recovery branch it
+    // was written for can never be reached. The claim accepts a start
+    // whose expected thread is the pane's current binding, so recovery is
+    // the same call with that id named.
+    currentDraftsById = {
+      "draft-1": {
+        draftId: "draft-1",
+        threadId: "draft-thread-42",
+        promotedTo: null,
+        materializedTo: {
+          workspaceId: "ws-home",
+          paneId: "pane-new",
+          threadId: "draft-thread-42",
+        },
+      },
+    };
+    currentThreadsMap = {
+      "draft-thread-42": [{ kind: "user_message", id: "m1", text: "hello" }],
+    };
+    vi.mocked(agentChatStartSession).mockResolvedValueOnce("draft-thread-42");
+
+    render(
+      <AgentChatPane
+        pane={{ ...paneNoThread, thread_id: "draft-thread-42" }}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(agentChatStartSession).toHaveBeenCalledTimes(1),
+    );
+    expect(agentChatStartSession).toHaveBeenCalledWith(
+      "pane-new",
+      "claude",
+      expect.objectContaining({ thread_id: "draft-thread-42" }),
+      // The pane's own binding, so the backend's claim lets it through.
+      "draft-thread-42",
+    );
+    await waitFor(() =>
+      expect(markDraftPromotedMock).toHaveBeenCalledWith("draft-1", {
+        workspaceId: "ws-home",
+        paneId: "pane-new",
+        threadId: "draft-thread-42",
+      }),
+    );
+  });
+
+  it("adopts the bound thread when session start reports pane_already_bound instead of starting or toasting", async () => {
+    // Every client shares one backend and one app-state snapshot, so two
+    // of them can mount the same freshly created pane while it is still
+    // unbound and both reach the mint-and-start branch. The backend
+    // claims the pane BEFORE spawning, so the loser's provider never
+    // ran: there is nothing to report and nothing to retry. The winning
+    // binding rides along in the rejection — follow it.
+    currentDraftsById = {};
+    currentThreadsMap = {
+      "thread-winner": [{ kind: "user_message", id: "m1", text: "hello" }],
+    };
+    const errorToast = vi
+      .spyOn(toast, "error")
+      .mockImplementation(() => "" as unknown as string | number);
+    vi.mocked(agentChatStartSession).mockRejectedValueOnce(
+      JSON.stringify({
+        kind: "pane_already_bound",
+        pane_id: "pane-new",
+        thread_id: "thread-winner",
+        provider: "claude",
+      }),
+    );
+
+    const { container } = render(<AgentChatPane pane={paneNoThread} />);
+
+    // The claim was attempted exactly once and never retried.
+    await waitFor(() =>
+      expect(agentChatStartSession).toHaveBeenCalledTimes(1),
+    );
+    // The pane now renders the winner's thread, not an empty slice.
+    await waitFor(() => {
+      const transcript = container.querySelector(
+        '[data-testid="transcript"]',
+      ) as HTMLElement | null;
+      expect(transcript).not.toBeNull();
+      expect(transcript!.getAttribute("data-message-count")).toBe("1");
+    });
+    expect(agentChatStartSession).toHaveBeenCalledTimes(1);
+    // A race the user didn't cause and can't act on must stay silent.
+    expect(errorToast).not.toHaveBeenCalled();
+    errorToast.mockRestore();
   });
 
   it("syncs local threadId state when pane.thread_id transitions from null to set after mount", () => {
@@ -2517,6 +2620,10 @@ describe("AgentChatPane Grok live capability reconciliation", () => {
           fresh_session: true,
           effort: "low",
         }),
+        // We own this pane and just stopped its session: name the thread
+        // it is still bound to so the backend's claim check lets our own
+        // re-start through while still refusing another client's.
+        "thread-x",
       ),
     );
     expect(agentChatStopSession).toHaveBeenCalledWith("grok", "thread-x");
@@ -3019,6 +3126,8 @@ describe("AgentChatPane provider handoff", () => {
         effort: null,
         context_window: null,
       }),
+      // The handoff claims the pane against the binding it replaces.
+      "thread-x",
     );
     await waitFor(() =>
       expect(
@@ -3052,6 +3161,7 @@ describe("AgentChatPane provider handoff", () => {
         resume_cursor: { resume: "claude-sdk-session" },
         permission_mode: "bypassPermissions",
       }),
+      "thread-x",
     ]);
     expect(
       container.querySelector('[data-testid="composer"]'),

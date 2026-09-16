@@ -174,6 +174,11 @@ describe("materializeAndSend", () => {
         "ws-home",
         "claude",
         "/home/user",
+        null,
+        // The pane is published already bound to the draft's pre-minted
+        // thread, so no other client can mount it unbound and start a
+        // second session on it before `start_session` returns.
+        draft.threadId,
       );
       expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
     });
@@ -218,6 +223,8 @@ describe("materializeAndSend", () => {
         "ws-project",
         "claude",
         "/projects/foo",
+        null,
+        draft.threadId,
       );
       // A current-checkout workspace creates no branch, so nothing else
       // would ever name it — without this it keeps the backend default
@@ -287,6 +294,8 @@ describe("materializeAndSend", () => {
         "ws-42",
         "claude",
         "/ws/42/cwd",
+        null,
+        draft.threadId,
       );
     });
 
@@ -832,6 +841,8 @@ describe("materializeAndSend", () => {
         "ws-worktree",
         "claude",
         "/projects/foo-ai-named-branch",
+        null,
+        draft.threadId,
       );
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
@@ -1133,6 +1144,8 @@ describe("materializeAndSend", () => {
         "ws-worktree",
         "claude",
         "/projects/foo-ai-named-branch",
+        null,
+        draft.threadId,
       );
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
@@ -1398,6 +1411,8 @@ describe("materializeWithPreset", () => {
         "ws-project",
         "claude",
         "/projects/foo",
+        null,
+        draft.threadId,
       );
       expect(actions.ensureThread).toHaveBeenCalledWith(draft.threadId);
       expect(actions.appendUserMessage).toHaveBeenCalledWith(
@@ -1432,6 +1447,8 @@ describe("materializeWithPreset", () => {
         "ws-home",
         "claude",
         "/home/user",
+        null,
+        draft.threadId,
       );
     });
 

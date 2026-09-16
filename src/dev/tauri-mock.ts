@@ -502,6 +502,28 @@ function leafPaneIds(node: PaneNodeSnapshot): string[] {
   return node.children.flatMap(leafPaneIds);
 }
 
+/** Every leaf pane node under `node`, in tree order. */
+function leafPaneNodes(node: PaneNodeSnapshot): PaneNodeSnapshot[] {
+  if (node.kind !== "split") return [node];
+  return node.children.flatMap(leafPaneNodes);
+}
+
+/** The agent-chat pane node with this id, anywhere in the snapshot.
+ *  Returns undefined for synthetic pane ids the fixtures never
+ *  materialised (the mock's create-pane fallback mints those). */
+function findChatPaneNode(
+  paneId: unknown,
+): Extract<PaneNodeSnapshot, { kind: "agent_chat" }> | undefined {
+  for (const ws of appState.workspaces) {
+    for (const surface of ws.surfaces) {
+      for (const node of leafPaneNodes(surface.root)) {
+        if (node.kind === "agent_chat" && node.pane_id === paneId) return node;
+      }
+    }
+  }
+  return undefined;
+}
+
 // ── Event subsystem ─────────────────────────────────────────────────
 //
 // `@tauri-apps/api/event`'s `listen()` calls
@@ -4075,7 +4097,35 @@ const handlers: Record<string, Handler> = {
       }
     );
   },
-  agent_chat_start_session: (a) => (a.input as { thread_id: string }).thread_id,
+  // Claims the pane BEFORE "spawning", exactly as the backend does.
+  // Several clients share one snapshot, so a pane already bound to a
+  // different thread means somebody else won the race: refuse without
+  // starting anything and hand back the winning binding so the loser
+  // can adopt it. `expectedThread` lets a client that already owns the
+  // pane re-start it under a new thread id (restart, provider handoff,
+  // resume, New Chat).
+  agent_chat_start_session: (a) => {
+    const threadId = (a.input as { thread_id: string }).thread_id;
+    const expectedThread =
+      typeof a.expectedThread === "string" ? a.expectedThread : null;
+    const pane = findChatPaneNode(a.paneId);
+    if (pane) {
+      const bound = pane.thread_id;
+      if (bound && bound !== threadId && bound !== expectedThread) {
+        throw new Error(
+          JSON.stringify({
+            kind: "pane_already_bound",
+            pane_id: pane.pane_id,
+            thread_id: bound,
+            provider: pane.provider ?? "claude",
+          }),
+        );
+      }
+      pane.thread_id = threadId;
+      emitAppState();
+    }
+    return threadId;
+  },
   agent_chat_send_turn: (a) => {
     const input = a.input as {
       thread_id: string;
@@ -5747,12 +5797,49 @@ const handlers: Record<string, Handler> = {
     return tabId;
   },
   agent_chat_create_pane: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    const threadId = typeof a.threadId === "string" ? a.threadId : null;
+    // Idempotent on the pre-minted thread id: a pane here already bound
+    // to it is returned instead of duplicated, so two clients racing the
+    // same draft promotion land on one pane.
+    if (ws && threadId) {
+      for (const surface of ws.surfaces) {
+        for (const node of leafPaneNodes(surface.root)) {
+          if (node.kind === "agent_chat" && node.thread_id === threadId) {
+            // Reuse still has to put the pane on screen, exactly as the
+            // create path below does: a pane that already lives in another
+            // tab would otherwise resolve to something the caller cannot
+            // see. Mirrors the backend's create-or-reuse.
+            surface.active_pane_id = node.pane_id;
+            ws.active_surface_id = surface.surface_id;
+            const tab = ws.tabs.find(
+              (candidate) => candidate.surface_id === surface.surface_id,
+            );
+            if (tab) ws.active_tab_id = tab.tab_id;
+            appState = {
+              ...appState,
+              active_workspace_id: ws.workspace_id,
+            };
+            emitAppState();
+            return node.pane_id;
+          }
+        }
+      }
+    }
     // The deferred worktree workspace already carries a fresh
     // agent_chat pane (empty thread); bind the session to it. Falls
     // back to a synthetic id for any other workspace.
-    const ws = findWorkspace(a.workspaceId);
     const root = ws?.surfaces?.[0]?.root;
-    if (root && root.kind === "agent_chat") return root.pane_id;
+    if (root && root.kind === "agent_chat") {
+      // Publish it already bound when the caller pre-minted a thread id,
+      // so no client ever sees this pane unbound and starts a rival
+      // session on it.
+      if (threadId) {
+        root.thread_id = threadId;
+        emitAppState();
+      }
+      return root.pane_id;
+    }
     return `pane-mock-${Date.now()}`;
   },
 

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatProviderError,
   grokModelChangeRequiresRestart,
+  parsePaneAlreadyBound,
 } from "./provider-error";
 
 describe("formatProviderError", () => {
@@ -84,5 +85,89 @@ describe("formatProviderError", () => {
   it("passes through unknown JSON kinds verbatim", () => {
     const raw = JSON.stringify({ kind: "mystery", detail: "??" });
     expect(formatProviderError(raw)).toBe(raw);
+  });
+});
+
+describe("parsePaneAlreadyBound", () => {
+  const raw = JSON.stringify({
+    kind: "pane_already_bound",
+    pane_id: "pane-7",
+    thread_id: "thread-winner",
+    provider: "codex",
+  });
+
+  it("parses the winning binding out of a rejected claim", () => {
+    expect(parsePaneAlreadyBound(raw)).toEqual({
+      paneId: "pane-7",
+      threadId: "thread-winner",
+      provider: "codex",
+    });
+  });
+
+  it("accepts the rejection as an Error whose message is the JSON", () => {
+    // Tauri surfaces command rejections as strings, but anything that
+    // round-trips through a `catch` may arrive wrapped.
+    expect(parsePaneAlreadyBound(new Error(raw))).toEqual({
+      paneId: "pane-7",
+      threadId: "thread-winner",
+      provider: "codex",
+    });
+  });
+
+  it("reports a null provider when the kind is unknown to the UI", () => {
+    const claim = parsePaneAlreadyBound(
+      JSON.stringify({
+        kind: "pane_already_bound",
+        pane_id: "pane-7",
+        thread_id: "thread-winner",
+        provider: "some-future-cli",
+      }),
+    );
+    expect(claim).toEqual({
+      paneId: "pane-7",
+      threadId: "thread-winner",
+      provider: null,
+    });
+  });
+
+  it("returns null without the winning thread id — nothing to adopt", () => {
+    expect(
+      parsePaneAlreadyBound(
+        JSON.stringify({ kind: "pane_already_bound", pane_id: "pane-7" }),
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null for other provider errors and for plain strings", () => {
+    expect(
+      parsePaneAlreadyBound(
+        JSON.stringify({ kind: "not_installed", provider: "claude" }),
+      ),
+    ).toBeNull();
+    expect(parsePaneAlreadyBound("provider_not_configured: Claude")).toBeNull();
+    expect(parsePaneAlreadyBound(null)).toBeNull();
+  });
+});
+
+describe("formatProviderError — pane claim rejections", () => {
+  it("turns the bare pane_not_found string into a sentence", () => {
+    // The backend returns `pane_not_found: <pane id>` (not a wire error)
+    // when the claim runs against a pane that was closed mid-start.
+    expect(formatProviderError("pane_not_found: pane-7")).toBe(
+      "This chat pane was closed before the session could start.",
+    );
+  });
+
+  it("explains a lost claim for callers that cannot adopt the binding", () => {
+    expect(
+      formatProviderError(
+        JSON.stringify({
+          kind: "pane_already_bound",
+          pane_id: "pane-7",
+          thread_id: "thread-winner",
+          provider: "codex",
+        }),
+      ),
+    ).toBe("This chat pane is already running a session started elsewhere.");
   });
 });

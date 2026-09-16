@@ -40,6 +40,10 @@ vi.mock("@/tauri/commands", () => ({
 import { useEnsureDraftWhenEmpty } from "./use-ensure-draft-when-empty";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { agentChatCreatePane } from "@/tauri/commands";
+import {
+  noteLocalWorkspaceActivation,
+  resetLocalWorkspaceActivations,
+} from "@/lib/local-activation";
 
 const terminalSurface = {
   surface_id: "surf-1",
@@ -80,6 +84,9 @@ describe("useEnsureDraftWhenEmpty", () => {
     homeDirSnapshot = null;
     vi.mocked(agentChatCreatePane).mockClear();
     resetDraftStore();
+    // Locally-activated ids live in a module-level set for the whole
+    // session; clear it so tests don't inherit each other's claims.
+    resetLocalWorkspaceActivations();
   });
 
   it("does nothing while app state is still null", () => {
@@ -434,5 +441,95 @@ describe("useEnsureDraftWhenEmpty", () => {
     // cwd === homeDir → Home draft, no pane spawn.
     expect(useChatDraftStore.getState().activeDraftId).not.toBeNull();
     expect(agentChatCreatePane).not.toHaveBeenCalled();
+  });
+
+  it("does not spawn a pane for an empty project workspace that became active without a local activation", () => {
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    flagsLoaded = true;
+    homeDirSnapshot = "/home/user";
+    // First render adopts whatever is active at boot. Give it a
+    // workspace that already has a pane so nothing spawns here.
+    appStateSnapshot = {
+      active_workspace_id: "ws-mine",
+      workspaces: [
+        {
+          workspace_id: "ws-mine",
+          active_surface_id: "surf-1",
+          surfaces: [terminalSurface],
+          project_root: "/projects/mine",
+          cwd: "/projects/mine",
+        },
+      ],
+    };
+    const { rerender } = renderHook(() => useEnsureDraftWhenEmpty());
+    expect(agentChatCreatePane).not.toHaveBeenCalled();
+
+    // Another client (desktop window, remote web client) creates a
+    // workspace and switches to it. `active_workspace_id` is shared, so
+    // the switch lands in OUR snapshot too — but that client is already
+    // launching the pane. Spawning one from here duplicates it.
+    appStateSnapshot = {
+      active_workspace_id: "ws-theirs",
+      workspaces: [
+        {
+          workspace_id: "ws-theirs",
+          active_surface_id: "surf-empty",
+          surfaces: [emptySplitSurface],
+          project_root: "/projects/theirs",
+          cwd: "/projects/theirs",
+        },
+      ],
+    };
+    rerender();
+
+    expect(agentChatCreatePane).not.toHaveBeenCalled();
+    // And no consolation Home draft either — the workspace isn't ours
+    // to decide anything about.
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+  });
+
+  it("spawns for a post-boot workspace once THIS client records the activation", () => {
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    flagsLoaded = true;
+    homeDirSnapshot = "/home/user";
+    appStateSnapshot = {
+      active_workspace_id: "ws-mine",
+      workspaces: [
+        {
+          workspace_id: "ws-mine",
+          active_surface_id: "surf-1",
+          surfaces: [terminalSurface],
+          project_root: "/projects/mine",
+          cwd: "/projects/mine",
+        },
+      ],
+    };
+    const { rerender } = renderHook(() => useEnsureDraftWhenEmpty());
+
+    // The user clicked this workspace in OUR window — the one activation
+    // path records it before the snapshot catches up.
+    noteLocalWorkspaceActivation("ws-clicked");
+    appStateSnapshot = {
+      active_workspace_id: "ws-clicked",
+      workspaces: [
+        {
+          workspace_id: "ws-clicked",
+          active_surface_id: "surf-empty",
+          surfaces: [emptySplitSurface],
+          project_root: "/projects/clicked",
+          cwd: "/projects/clicked",
+        },
+      ],
+    };
+    rerender();
+
+    expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
+    expect(agentChatCreatePane).toHaveBeenCalledWith(
+      "ws-clicked",
+      "claude",
+      null,
+    );
   });
 });

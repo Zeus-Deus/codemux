@@ -96,7 +96,7 @@ fn feature_flag_on_create_pane_succeeds() {
     let workspace_id = snapshot.active_workspace_id.0;
 
     let pane_id = store
-        .create_agent_chat_pane(&workspace_id, None, None, None)
+        .create_agent_chat_pane(&workspace_id, None, None, None, None)
         .expect("create_agent_chat_pane should succeed when flag is on");
 
     let after = store.snapshot();
@@ -115,7 +115,7 @@ fn feature_flag_on_create_pane_succeeds() {
 fn create_pane_in_nonexistent_workspace_errors() {
     let store = AppStateStore::default();
     let err = store
-        .create_agent_chat_pane("ws-does-not-exist", None, None, None)
+        .create_agent_chat_pane("ws-does-not-exist", None, None, None, None)
         .expect_err("unknown workspace should error");
     assert!(
         err.contains("ws-does-not-exist"),
@@ -133,7 +133,7 @@ fn close_pane_is_idempotent() {
     let snapshot = store.snapshot();
     let workspace_id = snapshot.active_workspace_id.0;
     let pane_id = store
-        .create_agent_chat_pane(&workspace_id, None, None, None)
+        .create_agent_chat_pane(&workspace_id, None, None, None, None)
         .expect("create pane");
 
     // First close succeeds.
@@ -662,7 +662,7 @@ async fn event_bridge_emits_threadless_warnings_on_event_bus() {
 /// The pane must carry a thread id for the status walker to resolve it.
 fn bind_chat_pane(state: &AppStateStore, workspace_id: &str, thread: &str) -> String {
     let pane = state
-        .create_agent_chat_pane(workspace_id, None, None, None)
+        .create_agent_chat_pane(workspace_id, None, None, None, None)
         .expect("create_agent_chat_pane");
     state.set_agent_chat_thread_id(&pane.0, Some(thread.into()));
     pane.0
@@ -1893,7 +1893,7 @@ mod workspace_identity {
         let state = AppStateStore::default();
         let ws = state.create_workspace_at_path(PathBuf::from("/tmp/codemux-ws-identity"));
         let pane = state
-            .create_agent_chat_pane(&ws.0, None, None, None)
+            .create_agent_chat_pane(&ws.0, None, None, None, None)
             .expect("create_agent_chat_pane");
 
         let caller_env = HashMap::from([("KEEP_ME".to_string(), "1".to_string())]);

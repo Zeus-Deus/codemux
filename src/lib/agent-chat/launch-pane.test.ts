@@ -33,6 +33,20 @@ describe("launchAgentChatPane", () => {
     );
   });
 
+  it("forwards a pre-minted thread id so the pane is published already bound", async () => {
+    // Multi-client guard: an unbound pane is a window in which another
+    // client can mount it, see no thread, and start a rival session on
+    // it. Promotion passes the draft's thread id to close that window.
+    await launchAgentChatPane("ws-1", "claude", "/repo", null, "thread-abc");
+    expect(agentChatCreatePane).toHaveBeenCalledWith(
+      "ws-1",
+      "claude",
+      "/repo",
+      null,
+      "thread-abc",
+    );
+  });
+
   it("treats a null provider as the pane's Claude default", async () => {
     await launchAgentChatPane("ws-1", null, "/repo");
     expect(useProviderRuntimeIntent.getState().providers.claude).toBe(true);

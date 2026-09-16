@@ -90,6 +90,7 @@ import {
   useLaunchGeminiModels,
   useLaunchGeminiModelsInit,
 } from "@/stores/gemini-models-store";
+import { randomUUID } from "@/lib/uuid";
 
 const ISSUE_BODY_MAX_CHARS = 10_000;
 
@@ -777,7 +778,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     onOpenChange(false);
 
     // Generate a temporary ID for the pending workspace
-    const tempId = crypto.randomUUID();
+    const tempId = randomUUID();
     const displayName =
       workspaceName || prompt.slice(0, 40) || openExistingBranch || branchName || "New workspace";
 
