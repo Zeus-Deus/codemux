@@ -5,10 +5,18 @@ export const OMARCHY_THEME_ID = "omarchy";
 export const THEME_SOURCE_KEY = "appearance.theme_source";
 export type ThemeSource = "manual" | "omarchy";
 
+/** Omarchy's own shell shades; any may be absent from a palette. */
+export interface OmarchySurfaces {
+  dark_background?: string | null;
+  selection?: string | null;
+  muted?: string | null;
+}
+
 export interface OmarchyTheme {
   name: string;
   scheme: "dark" | "light";
   colors: ThemeColors;
+  surfaces?: OmarchySurfaces;
 }
 
 export function initialThemeSource(options: {
@@ -38,15 +46,36 @@ function readable(background: string, preferred: string): string {
   return contrastRatio(background, "#ffffff") > contrastRatio(background, "#000000") ? "#ffffff" : "#000000";
 }
 
-/** Keep the desktop's palette, deriving only the surfaces it doesn't specify. */
-export function omarchyToTheme({ name, scheme, colors: c }: OmarchyTheme): ThemeDefinition {
+/** First candidate stepping from `preferred` toward `ink` that reads on every surface. */
+function readableOn(surfaces: string[], preferred: string, ink: string): string {
+  for (let step = 0; step <= 10; step++) {
+    const candidate = mix(preferred, ink, step / 10);
+    if (surfaces.every((surface) => contrastRatio(surface, candidate) >= 4.5)) return candidate;
+  }
+  return readable(surfaces[0], ink);
+}
+
+/**
+ * Keep the desktop's palette and layer the shell the way Omarchy's own app
+ * themes do: a recessed sidebar (`dark_background`), selection-colored
+ * sidebar highlights, `muted` hairlines, and raised surfaces stepped toward
+ * an accent-tinted foreground. Missing shades fall back to derived ones.
+ */
+export function omarchyToTheme({ name, scheme, colors: c, surfaces = {} }: OmarchyTheme): ThemeDefinition {
+  const dark = scheme === "dark";
   const background = c.background;
   const foreground = readable(background, c.foreground);
-  const card = mix(background, foreground, 0.045);
-  const secondary = mix(background, foreground, 0.085);
-  const border = mix(background, foreground, 0.19);
+  const ink = mix(foreground, c.accent, 0.3);
+  const card = mix(background, ink, 0.05);
+  const popover = mix(background, ink, 0.09);
+  const secondary = mix(background, ink, 0.1);
+  const muted = mix(background, ink, 0.16);
+  const border = surfaces.muted ?? mix(background, foreground, 0.19);
   const accent = mix(background, c.accent, 0.18);
-  const mutedForeground = readable(background, mix(background, foreground, 0.72));
+  const sidebar = surfaces.dark_background ?? mix(background, dark ? "#000000" : foreground, dark ? 0.25 : 0.05);
+  const sidebarForeground = readableOn([sidebar], foreground, dark ? "#ffffff" : "#000000");
+  const sidebarAccent = surfaces.selection ?? mix(sidebar, c.accent, 0.18);
+  const mutedForeground = readableOn([background, sidebar], mix(background, foreground, 0.72), foreground);
   const primaryForeground = readable(c.accent, background);
   const ansi = Object.fromEntries(ANSI_SLOTS.map((slot, i) => [slot, c[`color${i}` as keyof ThemeColors]])) as unknown as AnsiPalette;
   return {
@@ -57,15 +86,15 @@ export function omarchyToTheme({ name, scheme, colors: c }: OmarchyTheme): Theme
     roles: {
       background, foreground,
       card, cardForeground: readable(card, foreground),
-      popover: card, popoverForeground: readable(card, foreground),
+      popover, popoverForeground: readable(popover, foreground),
       primary: c.accent, primaryForeground,
       secondary, secondaryForeground: readable(secondary, foreground),
-      muted: secondary, mutedForeground,
+      muted, mutedForeground,
       accent, accentForeground: readable(accent, foreground),
       border, input: border, ring: c.accent,
-      sidebar: background, sidebarForeground: foreground,
+      sidebar, sidebarForeground,
       sidebarPrimary: c.accent, sidebarPrimaryForeground: primaryForeground,
-      sidebarAccent: accent, sidebarAccentForeground: readable(accent, foreground),
+      sidebarAccent, sidebarAccentForeground: readable(sidebarAccent, sidebarForeground),
       sidebarBorder: border, sidebarRing: c.accent, brandAccent: c.accent,
     },
   };

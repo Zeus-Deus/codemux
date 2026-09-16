@@ -24,6 +24,15 @@ fn semantic_and_legacy_palettes_are_normalized() {
     assert_eq!(theme.scheme, "dark");
     assert_eq!(theme.colors.color1, "#f7768e");
     assert_eq!(theme.colors.cursor, "#c0caf5");
+    assert_eq!(theme.surfaces, OmarchySurfaces::default());
+    let shaded = parse_theme(
+        &format!("{DARK}dark_background = '#13141C'\nselection = '#292e42'\n"),
+        "tokyo-night",
+    )
+    .unwrap();
+    assert_eq!(shaded.surfaces.dark_background.as_deref(), Some("#13141c"));
+    assert_eq!(shaded.surfaces.selection.as_deref(), Some("#292e42"));
+    assert_eq!(shaded.surfaces.muted, None);
     let light = parse_theme(
         "background = '#eff1f5'\nforeground = '#4c4f69'\naccent = '#1e66f5'\nmode = 'light'",
         "latte",

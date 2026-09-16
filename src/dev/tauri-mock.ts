@@ -3516,7 +3516,10 @@ const handlers: Record<string, Handler> = {
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
   get_omarchy_theme: () => new URLSearchParams(location.search).get("omarchy") === "dark"
-    ? { name: "Tokyo Night", scheme: "dark", colors: OMARCHY_THEME }
+    ? {
+      name: "Tokyo Night", scheme: "dark", colors: OMARCHY_THEME,
+      surfaces: { dark_background: "#13141c", selection: "#292e42", muted: "#414868" },
+    }
     : null,
   get_shell_appearance: () => SHELL_APPEARANCE,
   // Repaints the native window behind the webview on the desktop. A browser

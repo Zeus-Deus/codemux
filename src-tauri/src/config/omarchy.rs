@@ -12,6 +12,15 @@ pub struct OmarchyTheme {
     pub name: String,
     pub scheme: String,
     pub colors: ThemeColors,
+    pub surfaces: OmarchySurfaces,
+}
+
+/// Omarchy's shell shades. Absent keys let the frontend derive a fallback.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct OmarchySurfaces {
+    pub dark_background: Option<String>,
+    pub selection: Option<String>,
+    pub muted: Option<String>,
 }
 
 pub fn theme_paths() -> Vec<PathBuf> {
@@ -95,6 +104,13 @@ pub fn parse_theme(contents: &str, name: &str) -> Result<OmarchyTheme, String> {
         fallback
             .map(str::to_owned)
             .ok_or_else(|| format!("Missing Omarchy color: {}", keys[0]))
+    };
+    // Cosmetic shades: an unusable value falls back instead of rejecting the palette.
+    let optional = |key: &str| values.get(key).and_then(toml::Value::as_str).and_then(hex);
+    let surfaces = OmarchySurfaces {
+        dark_background: optional("dark_background"),
+        selection: optional("selection"),
+        muted: optional("muted"),
     };
     let background = color(&["background", "bg"], None)?;
     let foreground = color(&["foreground", "fg"], None)?;
@@ -189,6 +205,7 @@ pub fn parse_theme(contents: &str, name: &str) -> Result<OmarchyTheme, String> {
         },
         scheme: scheme.into(),
         colors,
+        surfaces,
     })
 }
 

@@ -32,3 +32,24 @@ describe.each(["dark", "light"] as const)("%s Omarchy palette", (scheme) => {
     expect(copy?.roles).toEqual(theme.roles);
   });
 });
+
+it("layers the shell with Omarchy's own shades and derives them when absent", () => {
+  const colors = { ...fallbackTheme, background: "#1a1b26", foreground: "#a9b1d6", accent: "#7aa2f7" };
+  const surfaces = { dark_background: "#13141c", selection: "#292e42", muted: "#414868" };
+  const { roles } = omarchyToTheme({ name: "Tokyo Night", scheme: "dark", colors, surfaces });
+  expect(roles.sidebar).toBe(surfaces.dark_background);
+  expect(roles.sidebarAccent).toBe(surfaces.selection);
+  expect(roles.border).toBe(surfaces.muted);
+  for (const surface of [roles.background, roles.sidebar]) {
+    expect(contrastRatio(roles.mutedForeground, surface)).toBeGreaterThanOrEqual(4.5);
+  }
+  expect(contrastRatio(roles.sidebarAccentForeground, roles.sidebarAccent)).toBeGreaterThanOrEqual(4.5);
+  // Raised surfaces step away from the canvas in order: card < popover < muted.
+  const lift = (color: string) => contrastRatio(color, roles.background);
+  expect(lift(roles.card)).toBeLessThan(lift(roles.popover));
+  expect(lift(roles.popover)).toBeLessThan(lift(roles.muted));
+
+  const derived = omarchyToTheme({ name: "Bare", scheme: "dark", colors }).roles;
+  expect(derived.sidebar).not.toBe(derived.background);
+  expect(contrastRatio(derived.sidebar, "#000000")).toBeLessThan(contrastRatio(derived.background, "#000000"));
+});
