@@ -27,15 +27,18 @@
  *
  * **Overflow.** The deck grows: every file opened from the tree is another
  * tab, and a busy thread adds tasks, orchestration and subagents on top of
- * the three defaults. Rather than ellipsize every inactive label down to
- * an identical unreadable stub the moment the row gets tight, the strip
- * switches modes: once the full-label row would overflow, inactive tabs
- * collapse to icon + badge (the pinned-tab convention — the label lives in
- * the tooltip) and the active tab alone keeps its label. Whatever still
- * doesn't fit scrolls, with a soft fade on the clipped edge so the
- * overflow is visible without a scrollbar, and a plain vertical wheel pans
- * it. Tabs reorder by drag, same gesture as the titlebar tabs.
- */
+ * the three defaults. Tabs never shrink. Each one keeps its icon and a label
+ * that is capped and truncated, and the row scrolls sideways (a plain
+ * vertical wheel pans it) with a soft fade on whichever edge is clipped.
+ * Tabs reorder by drag, same gesture as the titlebar tabs.
+ *
+ * **Narrow panels.** In the titlebar band the row shares its width with the
+ * fixed top-right cluster and the native window buttons, which together take
+ * ~174px. At the panel's default width that left too little room for even
+ * one labelled tab. So when the tabs can't fit beside the band's fixed
+ * content, the row stacks: the band keeps the drag surface and the active
+ * pane's actions, and the tabs get their own full-width row directly below it.
+  */
 import {
   memo,
   useCallback,
@@ -93,22 +96,19 @@ export interface DeckTab {
 function DeckTabChip({
   tab,
   active,
-  compact,
   dragging,
-  inTitlebar,
+  onBackground,
   reorderProps,
   onSelect,
   onClose,
 }: {
   tab: DeckTab;
   active: boolean;
-  /** Icon-only: the strip has overflowed and this (inactive) tab gave up
-   *  its label. See the file header. */
-  compact: boolean;
   dragging: boolean;
-  /** Which surface the row is painted on, so the close affordance's mask
-   *  can match it — see its `bg-*` below. */
-  inTitlebar: boolean;
+  /** The row is painted on the panel's `bg-background` rather than
+   *  `bg-card`, so the close affordance's mask can match it. See its
+   *  `bg-*` below. */
+  onBackground: boolean;
   reorderProps: PillReorderHandlers;
   onSelect: () => void;
   onClose: () => void;
@@ -145,13 +145,10 @@ function DeckTabChip({
       {...reorderProps}
       data-testid={tab.testId}
       data-state={active ? "active" : "inactive"}
-      data-compact={compact ? "true" : undefined}
-      // Middle-click closes, as in every browser and editor tab strip —
-      // and it is the only close gesture a compact tab has, since an X
-      // overlaid on a 28px chip would be the thing you hit when aiming for
-      // the tab. The mousedown is cancelled too: on an overflowing strip
-      // a middle button-press would otherwise also engage the webview's
-      // autoscroll on its way to the close.
+      // Middle-click closes, as in every browser and editor tab strip. The
+      // mousedown is cancelled too: on an overflowing strip a middle
+      // button-press would otherwise also engage the webview's autoscroll
+      // on its way to the close.
       onMouseDown={(event) => {
         if (event.button === 1) event.preventDefault();
       }}
@@ -174,29 +171,20 @@ function DeckTabChip({
         type="button"
         onClick={onSelect}
         aria-pressed={active}
-        aria-label={compact ? tab.label : undefined}
-        // Compact tabs spell their name out on hover rather than earning a
-        // second row to do it in.
+        // The full name on hover, for labels the cap below truncates.
         title={tab.label}
         className={cn(
-          "flex h-full min-w-0 items-center whitespace-nowrap text-body-sm",
-          compact
-            ? "gap-[5px] px-[8px]"
-            : cn(
-                "gap-[7px] pl-[9px]",
-                // Room for the close affordance only where it is actually
-                // shown; an always-reserved slot per tab costs a whole
-                // label at this width.
-                active ? "pr-[20px]" : "pr-[9px]",
-              ),
+          "flex h-full min-w-0 items-center gap-[7px] whitespace-nowrap pl-[9px] text-body-sm",
+          // Room for the close affordance only where it is always shown.
+          // On inactive tabs it appears on hover, over the label's tail.
+          active ? "pr-[20px]" : "pr-[9px]",
         )}
       >
         <Icon className="size-[13px] shrink-0" strokeWidth={1.6} />
-        {!compact && <span className="truncate">{tab.label}</span>}
+        <span className="max-w-[140px] truncate">{tab.label}</span>
         {badge}
       </button>
-      {!compact && (
-        <button
+      <button
           type="button"
           data-no-drag
           aria-label={`Close ${tab.label}`}
@@ -215,13 +203,12 @@ function DeckTabChip({
                 // so it has to match whatever the row is painted on.
                 cn(
                   "opacity-0 group-hover/tab:opacity-70",
-                  inTitlebar ? "bg-background" : "bg-card",
+                  onBackground ? "bg-background" : "bg-card",
                 ),
           )}
         >
           <X className="size-[10px]" strokeWidth={1.8} />
         </button>
-      )}
     </div>
   );
 }
@@ -231,31 +218,21 @@ const EDGE_FADE_PX = 16;
 /** The drag gap's `min-w-4`: the part of it that can never be lent back to
  *  the tabs. */
 const DRAG_GAP_MIN_PX = 16;
+/** The row's `px-[7px]`. */
+const ROW_PADDING_PX = 7;
+/** The row's `gap-[2px]`. */
+const ROW_GAP_PX = 2;
+/** The `+` button: `size-[24px]` plus its `ml-[3px]`. */
+const ADD_BUTTON_PX = 27;
 
-/**
- * Decides between the full-label and the icon-only strip, and tracks which
- * edges have tabs hidden behind them.
- *
- * The two layouts have different widths, so "does it overflow?" cannot be
- * asked of the compact strip about the full one: the answer would flip
- * every frame. Instead the full strip's width is measured once whenever it
- * is laid out (`naturalWidth`), and the compact strip only lets go once
- * the room available — its own width plus whatever the drag gap next to it
- * could give back — covers that. Every change to the tab set (or to which
- * tab is active, since only that one keeps its label) re-runs the full
- * layout under `useLayoutEffect`, so the expanded frame is measured but
- * never painted.
- */
-function useDeckOverflow(
+/** Tracks which edges of the tab scroller have tabs hidden behind them. */
+function useEdgeFade(
   scrollerRef: React.RefObject<HTMLDivElement | null>,
-  gapRef: React.RefObject<HTMLDivElement | null>,
-  layoutKey: string,
+  contentRef: React.RefObject<HTMLDivElement | null>,
 ) {
-  const [compact, setCompact] = useState(false);
   const [edges, setEdges] = useState({ start: false, end: false });
-  const naturalWidthRef = useRef(0);
 
-  const measureEdges = useCallback(() => {
+  const measure = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const start = el.scrollLeft > 1;
@@ -265,50 +242,84 @@ function useDeckOverflow(
     );
   }, [scrollerRef]);
 
-  // A new tab set is measured from the full layout.
-  useLayoutEffect(() => {
-    setCompact(false);
-  }, [layoutKey]);
-
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
-    if (!compact) {
-      naturalWidthRef.current = el.scrollWidth;
-      if (el.scrollWidth > el.clientWidth + 1) {
-        setCompact(true);
-        return;
-      }
-    }
-    measureEdges();
-  }, [compact, layoutKey, measureEdges, scrollerRef]);
-
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    const onResize = () => {
-      const gap = gapRef.current;
-      const available =
-        el.clientWidth + Math.max(0, (gap?.clientWidth ?? 0) - DRAG_GAP_MIN_PX);
-      if (compact && available >= naturalWidthRef.current) setCompact(false);
-      else if (!compact && el.scrollWidth > el.clientWidth + 1)
-        setCompact(true);
-      measureEdges();
-    };
-    el.addEventListener("scroll", measureEdges, { passive: true });
+    measure();
+    el.addEventListener("scroll", measure, { passive: true });
     let observer: ResizeObserver | null = null;
     if (typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(onResize);
+      observer = new ResizeObserver(measure);
       observer.observe(el);
-      if (gapRef.current) observer.observe(gapRef.current);
+      if (contentRef.current) observer.observe(contentRef.current);
     }
     return () => {
-      el.removeEventListener("scroll", measureEdges);
+      el.removeEventListener("scroll", measure);
       observer?.disconnect();
     };
-  }, [compact, gapRef, measureEdges, scrollerRef]);
+  }, [contentRef, measure, scrollerRef]);
 
-  return { compact, edges };
+  return edges;
+}
+
+/**
+ * Whether the titlebar row has to stack its tabs below the band.
+ *
+ * Every input is independent of the layout it chooses: the tabs never
+ * shrink, so their natural width is the same in either layout, and so are
+ * the header's width and the actions' width. The answer can't flip-flop
+ * as a result of applying it.
+ */
+function useStackedTabs(
+  enabled: boolean,
+  reserve: number,
+  headerRef: React.RefObject<HTMLDivElement | null>,
+  contentRef: React.RefObject<HTMLDivElement | null>,
+  actionsRef: React.RefObject<HTMLDivElement | null>,
+  layoutKey: string,
+): boolean {
+  const [stacked, setStacked] = useState(false);
+
+  const measure = useCallback(() => {
+    const header = headerRef.current;
+    const content = contentRef.current;
+    // A header with no width hasn't been laid out (a hidden panel), so
+    // there is nothing to decide yet.
+    if (!enabled || !header || !content || header.clientWidth === 0) {
+      setStacked(false);
+      return;
+    }
+    const actions = actionsRef.current?.offsetWidth ?? 0;
+    const fixed =
+      ROW_PADDING_PX +
+      reserve +
+      ADD_BUTTON_PX +
+      DRAG_GAP_MIN_PX +
+      actions +
+      ROW_GAP_PX * (actions > 0 ? 3 : 2);
+    const room = header.clientWidth - fixed;
+    setStacked(content.scrollWidth > room);
+  }, [actionsRef, contentRef, enabled, headerRef, reserve]);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, layoutKey]);
+
+  useEffect(() => {
+    if (!enabled || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    for (const node of [
+      headerRef.current,
+      contentRef.current,
+      actionsRef.current,
+    ]) {
+      if (node) observer.observe(node);
+    }
+    return () => observer.disconnect();
+    // The actions node remounts when the layout flips; re-observe it.
+  }, [actionsRef, contentRef, enabled, headerRef, measure, stacked, layoutKey]);
+
+  return stacked;
 }
 
 function edgeMask(edges: { start: boolean; end: boolean }): string | undefined {
@@ -374,15 +385,16 @@ export const PaneTabStrip = memo(function PaneTabStrip({
   className,
 }: PaneTabStripProps) {
   const remoteClient = isRemoteClient();
+  const reserve = inTitlebar ? topRightReserve(remoteClient, true) : 0;
 
   const tabIds = tabs.map((tab) => tab.id);
   const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
     useTabReorder<HTMLDivElement>(tabIds, onReorder as (ids: string[]) => void);
 
-  // A plain vertical wheel pans the strip once it overflows — `overflow-x:
+  // A plain vertical wheel pans the strip once it overflows. `overflow-x:
   // auto` only answers to native horizontal input on its own. See
   // `@/lib/wheel`. The scroller is also the reorder hook's measurement
-  // container and the overflow hook's, so all three share one ref.
+  // container, so both share one ref.
   const attachWheelScroll = useHorizontalWheelScroll<HTMLDivElement>();
   const setScrollerNode = useCallback(
     (node: HTMLDivElement | null) => {
@@ -391,95 +403,61 @@ export const PaneTabStrip = memo(function PaneTabStrip({
     },
     [attachWheelScroll, containerRef],
   );
-  const gapRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
   const layoutKey = `${tabIds.join("|")}#${activeTab ?? ""}`;
-  // Where the strip was scrolled when its tab set (or active tab) last
-  // changed — read before the overflow hook below swaps in the full-label
-  // layout to measure it, so the offset is the one the user actually set.
-  const settledScrollLeftRef = useRef(0);
-  useLayoutEffect(() => {
-    settledScrollLeftRef.current = containerRef.current?.scrollLeft ?? 0;
-  }, [layoutKey, containerRef]);
-  const { compact, edges } = useDeckOverflow(containerRef, gapRef, layoutKey);
+  const stacked = useStackedTabs(
+    inTitlebar,
+    reserve,
+    headerRef,
+    contentRef,
+    actionsRef,
+    layoutKey,
+  );
+  const edges = useEdgeFade(containerRef, contentRef);
   const mask = edgeMask(edges);
 
-  // The active chip scrolls itself into view, but that runs against the
-  // full-label layout the strip measures and discards (passive effects
-  // flush before the collapse re-render), which leaves the compact strip
-  // sitting on a stale offset with its first icon under the fade. Once the
-  // layout has settled, put back the offset captured above — so a strip
-  // the user had panned stays where it was after activating a tab — and
-  // then nudge the active chip into view if it is still clipped. On the
-  // first collapse that offset is zero, so the strip re-seats from the start.
+  // Switching layouts remounts nothing in the scroller, but its width
+  // changes, so the active tab may have been pushed out of view.
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    el.scrollLeft = settledScrollLeftRef.current;
-    el.querySelector<HTMLElement>(
-      '[data-tab-id][data-state="active"]',
-    )?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-  }, [compact, containerRef]);
+    containerRef.current
+      ?.querySelector<HTMLElement>('[data-tab-id][data-state="active"]')
+      ?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [stacked, containerRef]);
 
-  return (
-    <div
-      data-testid="right-panel-tabs-header"
-      data-in-titlebar={inTitlebar ? "true" : undefined}
-      className={cn(
-        // One hairline under this row and nothing else between it and the
-        // pane body — the body starts flush.
-        "flex shrink-0 items-center gap-[2px] border-b border-border/60 px-[7px]",
-        // 40px when this row *is* the window band, so its seam lands exactly
-        // on the band's bottom edge and its controls sit on the same
-        // baseline as the sidebar toggle and the window buttons.
-        //
-        // And transparent, not `bg-card`. The titlebar is frameless — the
-        // sidebar, the workspace and the panel all reach the physical top
-        // edge and no cluster paints a surface of its own — so a filled row
-        // here drew a lighter grey slab across the panel's half of the band
-        // with a visible seam where the workspace's half ended. Letting the
-        // panel's own `bg-background` show through makes the band read as
-        // one continuous window edge. Under the legacy in-flow bar the row
-        // is ordinary panel chrome sitting below a real titlebar surface, so
-        // it keeps its card fill.
-        inTitlebar ? "h-10 bg-transparent" : "h-9 bg-card",
-        className,
-      )}
-      style={
-        inTitlebar
-          ? // Clear the fixed panel cluster and, on desktop, the native
-            // window buttons sitting above this row's right end.
-            { paddingRight: `${topRightReserve(remoteClient, true)}px` }
-          : undefined
-      }
-    >
-      {/* Tabs are the only part of the row allowed to compress or scroll:
-          the `+`, the pane actions and the panel controls stay reachable at
-          any panel width. */}
+  const tabRun = (
+    <>
       {/* `no-scrollbar` is referenced elsewhere in the tree but never
-          defined, so the hiding is spelled out here rather than trusted. */}
+          defined, so the hiding is spelled out here rather than trusted.
+          `scroll-px-4` keeps a tab scrolled into view clear of the fade. */}
       <div
         ref={setScrollerNode}
         data-testid="right-panel-tabs-scroll"
-        data-compact={compact ? "true" : undefined}
-        className="relative flex min-w-0 items-center gap-[2px] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="relative flex min-w-0 scroll-px-4 items-center overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
       >
+        <div
+          ref={contentRef}
+          data-testid="right-panel-tabs-content"
+          className="flex w-max shrink-0 items-center gap-[2px]"
+        >
+          {tabs.map((tab) => (
+            <DeckTabChip
+              key={tab.id}
+              tab={tab}
+              active={tab.id === activeTab}
+              dragging={dragTabId === tab.id}
+              onBackground={inTitlebar}
+              reorderProps={getPillProps(tab.id)}
+              onSelect={() => onSelect(tab.id)}
+              onClose={() => onClose(tab.id)}
+            />
+          ))}
+        </div>
         {dragTabId && dropIndicatorLeft !== null && (
           <TabDropIndicator left={dropIndicatorLeft} />
         )}
-        {tabs.map((tab) => (
-          <DeckTabChip
-            key={tab.id}
-            tab={tab}
-            active={tab.id === activeTab}
-            compact={compact && tab.id !== activeTab}
-            dragging={dragTabId === tab.id}
-            inTitlebar={inTitlebar}
-            reorderProps={getPillProps(tab.id)}
-            onSelect={() => onSelect(tab.id)}
-            onClose={() => onClose(tab.id)}
-          />
-        ))}
       </div>
 
       <DropdownMenu>
@@ -500,7 +478,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           <DropdownMenuLabel className="px-[9px] pb-[5px] pt-1.5 font-mono text-micro tracking-[0.13em] text-muted-foreground">
             OPEN PANE
           </DropdownMenuLabel>
-          {/* Same `surfaces` array the empty-panel picker renders as cards —
+          {/* Same `surfaces` array the empty-panel picker renders as cards,
               including Terminal, which is a *workspace* pane and routes to
               the action the main tab strip's "+" uses. */}
           {surfaces.map((surface) => (
@@ -528,33 +506,86 @@ export const PaneTabStrip = memo(function PaneTabStrip({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+    </>
+  );
 
-      {/* The gap between the tabs and the pane actions. While this row is
-          the window band it is also the panel's drag surface — the
-          titlebar's own full-width drag layer stops at the panel's left
-          edge so it can't swallow these controls, so without this the
-          panel's whole top edge would stop dragging the window. Desktop
-          only: `data-tauri-drag-region` does nothing in a browser, and the
-          bare spacer has no children to shadow. */}
+  // The gap between the tabs and the pane actions. While it sits in the
+  // window band it is also the panel's drag surface: the titlebar's own
+  // drag layer stops at the panel's left edge so it can't swallow these
+  // controls. Desktop only: `data-tauri-drag-region` does nothing in a
+  // browser, and the bare spacer has no children to shadow.
+  const dragGap = (inBand: boolean) => (
+    <div
+      data-testid="right-panel-drag-gap"
+      data-tauri-drag-region={inBand && !remoteClient ? true : undefined}
+      className="min-w-4 flex-1 self-stretch"
+    />
+  );
+
+  // The active pane's controls. The panel-level controls (expand, close)
+  // live in the fixed top-right cluster in GUI chrome, which the band's
+  // right padding clears.
+  const paneActions = actions != null && (
+    <div
+      ref={actionsRef}
+      data-testid="right-panel-pane-actions"
+      className="flex shrink-0 items-center gap-[2px]"
+    >
+      {actions}
+    </div>
+  );
+
+  const bandStyle = inTitlebar ? { paddingRight: `${reserve}px` } : undefined;
+
+  if (stacked) {
+    return (
       <div
-        ref={gapRef}
-        data-testid="right-panel-drag-gap"
-        data-tauri-drag-region={inTitlebar && !remoteClient ? true : undefined}
-        className="min-w-4 flex-1 self-stretch"
-      />
-
-      {/* Right slot: the active pane's controls. The panel-level controls
-          (expand, close) used to follow them behind a divider; in GUI
-          chrome they live in the fixed top-right cluster this row's padding
-          reserves, so they no longer move with the panel's edge. */}
-      {actions != null && (
+        ref={headerRef}
+        data-testid="right-panel-tabs-header"
+        data-in-titlebar="true"
+        data-stacked="true"
+        className={cn("flex shrink-0 flex-col", className)}
+      >
         <div
-          data-testid="right-panel-pane-actions"
-          className="flex shrink-0 items-center gap-[2px]"
+          className="flex h-10 items-center gap-[2px] px-[7px]"
+          style={bandStyle}
         >
-          {actions}
+          {dragGap(true)}
+          {paneActions}
         </div>
+        <div className="flex h-9 items-center gap-[2px] border-b border-border/60 px-[7px]">
+          {tabRun}
+          {dragGap(false)}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={headerRef}
+      data-testid="right-panel-tabs-header"
+      data-in-titlebar={inTitlebar ? "true" : undefined}
+      className={cn(
+        // One hairline under this row and nothing else between it and the
+        // pane body. The body starts flush.
+        "flex shrink-0 items-center gap-[2px] border-b border-border/60 px-[7px]",
+        // 40px when this row *is* the window band, so its seam lands exactly
+        // on the band's bottom edge and its controls sit on the same
+        // baseline as the sidebar toggle and the window buttons.
+        //
+        // Transparent, not `bg-card`: the titlebar is frameless, so a filled
+        // row here would draw a lighter slab across the panel's half of the
+        // band. Under the legacy in-flow bar the row is ordinary panel
+        // chrome below a real titlebar surface, so it keeps its card fill.
+        inTitlebar ? "h-10 bg-transparent" : "h-9 bg-card",
+        className,
       )}
+      style={bandStyle}
+    >
+      {tabRun}
+      {dragGap(inTitlebar)}
+      {paneActions}
       {!inTitlebar && (
         <>
           <div

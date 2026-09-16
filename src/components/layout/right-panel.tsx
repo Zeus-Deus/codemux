@@ -865,7 +865,8 @@ export const RightPanel = memo(function RightPanel({
   });
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden border-l border-border bg-background">
+    // No left border: the resize handle in `workspace-main.tsx` is the seam.
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       <PaneTabStrip
         inTitlebar={titlebarOverlay}
         tabs={tabs}

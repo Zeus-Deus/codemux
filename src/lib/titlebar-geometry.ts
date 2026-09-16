@@ -24,6 +24,13 @@
 export const TITLEBAR_BAND_HEIGHT = 40;
 
 /**
+ * How far the right panel's resize handle reaches left of the panel's edge
+ * (its 1px seam plus 2px of grab area over the workspace). The titlebar's
+ * drag layer stops this far short of the panel so it can't cover the handle.
+ */
+export const RIGHT_PANEL_RESIZER_REACH = 3;
+
+/**
  * Horizontal room the OS window buttons need at the top-right.
  *
  * Desktop only: the web remote client renders no window controls, so it
