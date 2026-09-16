@@ -16,10 +16,16 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "codemux_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only app: the Tauri template's `staticlib`/`cdylib` entries exist
+# for iOS/Android bundling, which we don't ship. Each of them forces an extra
+# full link of this 200k-line crate (plus a PDB on Windows) on every build,
+# and nothing in the repo consumes those artifacts. Keep just the rlib.
+crate-type = ["rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# `codegen` lets build.rs generate the app context (see build.rs for why the
+# proc-macro path made CI rebuild the whole crate twice).
+tauri-build = { version = "2", features = ["codegen"] }
 
 [dependencies]
 # The `test` feature exposes `tauri::test::MockRuntime` in normal (non-dev)

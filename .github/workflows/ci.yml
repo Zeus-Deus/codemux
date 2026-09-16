@@ -128,7 +128,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Heavy Rust job: this is the critical path. tauri-build validates
   # `externalBin`/`bundle.resources` at compile time, so every sidecar binary
-  # must be staged and the frontend `dist/` must exist before `cargo check` /
+  # must be staged and the frontend `dist/` must exist before
   # `cargo test`. That work lives here (and only here).
   # ---------------------------------------------------------------------------
   rust:
@@ -147,6 +147,14 @@ jobs:
     # passing test run is not cancelled while saving its cache. Test execution
     # has its own tighter limit below; Linux keeps the existing job ceiling.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
+    env:
+      # Full DWARF/PDB debuginfo is the default for dev/test builds and is a
+      # large share of Windows link time (one PDB per test executable) and of
+      # the Rust cache size. Line tables keep file:line in test-failure
+      # backtraces, which is all CI needs. Set on both profiles because the
+      # `test` profile inherits `dev` before env overrides are applied.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
     steps:
       - name: Checkout
@@ -167,8 +175,19 @@ jobs:
         # cached Docker images ~3 GB) frees ~25 GB in <30 s and avoids
         # pinning a third-party action. Windows runners have ~150 GB
         # free and don't need this.
+        #
+        # Current ubuntu-24.04 images ship with ~80 GB free, which makes the
+        # cleanup (~1.6 min) pure overhead, so it only runs when the runner is
+        # actually short on space. The threshold is well above the ~20 GB a
+        # full run needs, so the safety net still triggers on a smaller image.
         shell: bash
         run: |
+          avail_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "free space before cleanup: ${avail_gb} GB"
+          if [ "$avail_gb" -ge 40 ]; then
+            echo "plenty of space; skipping cleanup"
+            exit 0
+          fi
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -294,7 +313,7 @@ jobs:
             chmod +x "$DEST" 2>/dev/null || true
           fi
 
-      - name: Stage codemux-remote binary (placeholder for cargo check)
+      - name: Stage codemux-remote binary (placeholder for cargo test)
         shell: bash
         run: |
           # tauri.conf.json's `bundle.resources = ["binaries/codemux-remote-*"]`
@@ -321,9 +340,6 @@ jobs:
         # wants `dist/` to exist at compile time — build the frontend first.
         run: npm run build
 
-      - name: Cargo check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
-
       - name: Configure git identity and line endings for tests
         # Several tests in src-tauri/src/git.rs spin up a fixture repo and
         # shell out to `git commit`. GitHub runners have git installed but
@@ -347,12 +363,22 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
+      # No separate `cargo check` step: `cargo test` compiles every lib, bin
+      # and test target with full codegen, so a check pass catches nothing
+      # it wouldn't, and it sat serially on the critical path (~1.4 min on
+      # Windows). Nothing in the crate is gated on the `test-fixtures`
+      # feature, so the feature set difference doesn't matter either.
       - name: Cargo test (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Compile Windows tests
         if: matrix.os == 'windows-latest'
+        # This is the only cargo invocation that should compile anything on
+        # Windows; the `cargo test` step below must be a no-op rebuild-wise.
+        # That used to be false: `tauri::generate_context!()` wrote a cached
+        # icon into OUT_DIR mid-compile, so the second invocation rebuilt the
+        # whole crate (~6.5 min). build.rs now generates the context itself.
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
 
       - name: Provide Common Controls v6 manifests for Windows test executables
