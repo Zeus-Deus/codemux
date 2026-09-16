@@ -39,6 +39,11 @@ import {
   type WorkflowRunItem,
 } from "./types";
 import { mergeWorkflowSnapshot, newWorkflowRunItem } from "./workflows";
+import {
+  applyGoalFromUserMessage,
+  goalStateFromMessages,
+  parseGoalCommand,
+} from "./goal";
 
 /**
  * Seq offset for QUEUED user messages so they always sort to the very
@@ -1161,7 +1166,7 @@ function appendUserMessageLocal(
   };
   // Sending a new turn (including the one-click "Continue run") clears the
   // interrupted flag: the optimistic bubble is the user resuming the run.
-  return {
+  const appended: ChatThreadState = {
     ...next,
     interrupted: false,
     // A user turn with no completion after it is the definition of an
@@ -1172,6 +1177,9 @@ function appendUserMessageLocal(
     turnUnsettled: true,
     messages: appendItem(next.messages, item),
   };
+  // A `/goal` turn records the goal here, on the one path shared by the
+  // optimistic send, the live fan-out and hydrate replay.
+  return applyGoalFromUserMessage(appended, item, now());
 }
 
 /**
@@ -1227,9 +1235,16 @@ export function removeUserMessageByNonce(
       : state;
   }
   const messages = state.messages.filter((_, i) => i !== idx);
-  return restoreInterrupted
-    ? { ...state, interrupted: true, messages }
-    : { ...state, messages };
+  // A rolled-back `/goal <text>` or `/goal clear` never reached the provider,
+  // so rebuild the goal from the turns that did.
+  const removed = state.messages[idx] as UserMessageItem;
+  const command = parseGoalCommand(removed.text);
+  const goalFields =
+    command && command.kind !== "control"
+      ? goalStateFromMessages(messages)
+      : null;
+  const next = { ...state, ...goalFields, messages };
+  return restoreInterrupted ? { ...next, interrupted: true } : next;
 }
 
 /** Find a queued user bubble by its backend queued id. */
@@ -1264,7 +1279,7 @@ function promoteQueuedUserMessage(
     // moment the follow-up actually becomes the active provider turn.
     created_at: now(),
   };
-  return {
+  const dispatched: ChatThreadState = {
     ...next,
     // A dispatched follow-up means a live turn is starting — clear any
     // interrupted flag so the Continue chip / divider drop.
@@ -1283,6 +1298,9 @@ function promoteQueuedUserMessage(
     turnUnsettled: true,
     messages: replaceItem(next.messages, index, promoted),
   };
+  // A queued `/goal` counts once it actually dispatches. Idempotent on the
+  // item id, so a bubble whose send already recorded it adds nothing.
+  return applyGoalFromUserMessage(dispatched, promoted, now());
 }
 
 /**

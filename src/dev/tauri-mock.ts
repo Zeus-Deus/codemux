@@ -1790,6 +1790,45 @@ function mockChatTranscript(): string[] {
     usage: null,
   });
 
+  // `?goal=standing` / `?goal=interrupted` seed a `/goal` turn so the
+  // composer strip's goal row renders on open. `interrupted` ends the
+  // transcript on a user turn with no completion, which is what quitting
+  // mid-turn leaves behind, so hydrate flags the run interrupted.
+  const goalSeed = new URLSearchParams(location.search).get("goal");
+  if (goalSeed === "standing" || goalSeed === "interrupted") {
+    const goalTurnId = "seed-goal";
+    push({
+      type: "user_message",
+      thread_id: T,
+      client_nonce: "seed-nonce-goal",
+      text: "/goal Migrate the importer to the streaming parser, keep the legacy path behind a flag, and get the importer suite green",
+    });
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: goalTurnId,
+      item: {
+        kind: "assistant_text",
+        text: "Goal noted. Starting at the parser boundary.",
+      },
+    });
+    push({
+      type: "turn_completed",
+      thread_id: T,
+      turn_id: goalTurnId,
+      status: { kind: "success" },
+      usage: null,
+    });
+    if (goalSeed === "interrupted") {
+      push({
+        type: "user_message",
+        thread_id: T,
+        client_nonce: "seed-nonce-goal-interrupted",
+        text: "Keep going on the importer.",
+      });
+    }
+  }
+
   mockChatTranscriptCache = out;
   return out;
 }

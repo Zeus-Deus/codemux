@@ -1,4 +1,5 @@
 import type { UserQuestionSet, QuestionResolution } from "@/tauri/events";
+import type { GoalSnapshot } from "./goal";
 import type {
   ApprovalDecision,
   ContextUsageSnapshot,
@@ -464,6 +465,13 @@ export interface ChatThreadState {
    *  it never regresses when a later snapshot omits it. Persisted
    *  backend-side, so hydrate-replay restores it after a restart. */
   contextUsage: ContextUsageSnapshot | null;
+  /** The goal set by the latest `/goal <text>` turn, or `null` when none was
+   *  set or `/goal clear` came after it. Rebuilt by hydrate replay from the
+   *  persisted user turns, so it survives an app restart. */
+  goal: GoalSnapshot | null;
+  /** Goals this thread replaced or cleared, oldest first. Stored for a
+   *  future details view; nothing renders it yet. */
+  goalHistory: GoalSnapshot[];
 }
 
 export function emptyThreadState(): ChatThreadState {
@@ -478,6 +486,8 @@ export function emptyThreadState(): ChatThreadState {
     interrupted: false,
     turnUnsettled: false,
     contextUsage: null,
+    goal: null,
+    goalHistory: [],
   };
 }
 

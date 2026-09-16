@@ -128,6 +128,13 @@ interface Props {
     nonce: number;
   } | null;
   onConversationSearchJumpHandled?: (nonce: number) => void;
+  /** Scroll to one transcript row by item id (the goal row's Jump). */
+  messageJumpRequest?: {
+    itemId: string;
+    /** Falls back to this turn's fold when the item is folded away. */
+    turnId?: string | null;
+    nonce: number;
+  } | null;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
@@ -189,6 +196,7 @@ export const MessageList = memo(function MessageList({
   subagentJumpRequest,
   conversationSearchJumpRequest,
   onConversationSearchJumpHandled,
+  messageJumpRequest,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -1092,6 +1100,58 @@ export const MessageList = memo(function MessageList({
     conversationSearchTargetIndex,
     onConversationSearchJumpHandled,
   ]);
+
+  const messageJumpTargetIndex = useMemo(() => {
+    if (!messageJumpRequest) return -1;
+    const { itemId, turnId } = messageJumpRequest;
+    const exact = slots.findIndex(
+      (slot) => slot.body.kind === "item" && slot.body.item.id === itemId,
+    );
+    if (exact >= 0 || !turnId) return exact;
+    return slots.findIndex(
+      (slot) => slot.body.kind === "turn_fold" && slot.body.turnId === turnId,
+    );
+  }, [slots, messageJumpRequest]);
+
+  useEffect(() => {
+    if (!messageJumpRequest || messageJumpTargetIndex < 0) return;
+    cancelFollowForUserNavigation();
+    let cancelled = false;
+    let frame: number | undefined;
+    let timer: number | undefined;
+    let highlightedRow: HTMLElement | null = null;
+    void listRef.current
+      ?.scrollToIndex({
+        index: messageJumpTargetIndex,
+        animated: !prefersReducedMotion(),
+        viewOffset: 28,
+      })
+      .then(() => {
+        if (cancelled) return;
+        frame = requestAnimationFrame(() => {
+          if (cancelled) return;
+          const row = listRef.current
+            ?.getState()
+            .elementAtIndex(messageJumpTargetIndex);
+          if (!(row instanceof HTMLElement)) return;
+          row.classList.add("conversation-search-highlight");
+          highlightedRow = row;
+          timer = window.setTimeout(() => {
+            row.classList.remove("conversation-search-highlight");
+            highlightedRow = null;
+          }, 1200);
+        });
+      });
+    return () => {
+      cancelled = true;
+      if (frame != null) cancelAnimationFrame(frame);
+      if (timer != null) window.clearTimeout(timer);
+      highlightedRow?.classList.remove("conversation-search-highlight");
+    };
+    // Keyed on the request, not the index: a transcript that grows while
+    // the jump is animating must not re-run the scroll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cancelFollowForUserNavigation, messageJumpRequest]);
 
   const renderItem = useCallback(
     ({ item: slot }: { item: TranscriptSlot }) => (
