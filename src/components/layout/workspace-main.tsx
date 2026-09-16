@@ -42,6 +42,18 @@ const ProjectOnboarding = lazy(() =>
   })),
 );
 
+/**
+ * The seam between the workspace and the right panel, and the handle that
+ * resizes it.
+ *
+ * It is the only line at that edge: the panel draws no left border of its
+ * own, so there is one 1px seam instead of a border plus a separate
+ * invisible handle beside it. The grab area is 8px wide but deliberately
+ * lopsided: 2px over the workspace and 5px over the panel, so it doesn't
+ * steal the transcript scrollbar that sits against the seam. The titlebar's
+ * drag layer stops short of it (`RIGHT_PANEL_RESIZER_REACH`), so the seam
+ * also resizes from the top 40px.
+ */
 function RightPanelResizer() {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
   const handleRef = useRef<HTMLDivElement>(null);
@@ -49,6 +61,7 @@ function RightPanelResizer() {
 
   const startResize = useCallback(
     (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
       e.preventDefault();
       const handle = handleRef.current;
       if (handle) handle.dataset.dragging = "true";
@@ -60,12 +73,17 @@ function RightPanelResizer() {
       // The row the panel shares with the workspace content. Measured once
       // per drag: the clamp is relative to this, not to `window.innerWidth`,
       // because the separately-resizable left sidebar sits outside it.
-      const rowWidth =
-        handle?.parentElement?.getBoundingClientRect().width ??
-        window.innerWidth;
-      const rowRight =
-        handle?.parentElement?.getBoundingClientRect().right ??
-        window.innerWidth;
+      const rowRect = handle?.parentElement?.getBoundingClientRect();
+      const rowWidth = rowRect?.width ?? window.innerWidth;
+      const rowRight = rowRect?.right ?? window.innerWidth;
+
+      // Keep the resize cursor and suppress text selection for the whole
+      // drag, even when the pointer runs ahead of the 8px handle.
+      const body = document.body;
+      const prevCursor = body.style.cursor;
+      const prevUserSelect = body.style.userSelect;
+      body.style.cursor = "col-resize";
+      body.style.userSelect = "none";
 
       const onMove = (ev: PointerEvent) => {
         const width = clampRightPanelWidth(rowRight - ev.clientX, rowWidth);
@@ -82,8 +100,11 @@ function RightPanelResizer() {
       const onUp = () => {
         if (handle) handle.dataset.dragging = "false";
         cancelAnimationFrame(rafId.current);
+        body.style.cursor = prevCursor;
+        body.style.userSelect = prevUserSelect;
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
         // Commit to React state + persist to SQLite (single re-render)
         if (lastWidth > 0) {
           setRightPanelWidth(lastWidth);
@@ -93,6 +114,7 @@ function RightPanelResizer() {
 
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
     },
     [setRightPanelWidth],
   );
@@ -101,12 +123,22 @@ function RightPanelResizer() {
     <div
       ref={handleRef}
       data-testid="right-panel-resizer"
-      className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-foreground/20 data-[dragging=true]:bg-foreground/30 transition-colors"
+      className="group relative z-10 w-px shrink-0 bg-border"
       onPointerDown={startResize}
       role="separator"
       aria-orientation="vertical"
       aria-label="Resize right panel"
-    />
+    >
+      <div
+        aria-hidden
+        data-testid="right-panel-resizer-hit"
+        className="absolute inset-y-0 -left-[2px] w-[8px] cursor-col-resize"
+      />
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-y-0 left-1/2 w-[3px] -translate-x-1/2 bg-transparent transition-colors duration-100 group-hover:bg-foreground/25 group-data-[dragging=true]:bg-foreground/40"
+      />
+    </div>
   );
 }
 
@@ -325,6 +357,12 @@ export function WorkspaceMain() {
         )}
         <div
           data-testid="workspace-content-surface"
+          // A lone chat runs its transcript under the floating titlebar;
+          // fixed rows at the pane's top (the subagent breadcrumb) read
+          // this to start below the band instead.
+          data-under-titlebar={
+            enableAgentChat && isSoleRootChat ? "true" : undefined
+          }
           className={cn(
             "flex-1 min-h-0 overflow-hidden",
             enableAgentChat && !isSoleRootChat && "pt-10",

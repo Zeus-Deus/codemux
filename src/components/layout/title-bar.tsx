@@ -33,7 +33,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { groupEditors } from "@/lib/editor-groups";
 import { clampRightPanelWidth } from "@/lib/right-panel-width";
-import { panelClusterRight, topRightReserve } from "@/lib/titlebar-geometry";
+import {
+  RIGHT_PANEL_RESIZER_REACH,
+  panelClusterRight,
+  topRightReserve,
+} from "@/lib/titlebar-geometry";
 import { PaneActionButton } from "./right-panel/pane-actions";
 import {
   BAND_ACTIVE_FILL,
@@ -694,8 +698,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // reaches. Panel closed that is the whole remaining strip, so the panel
   // toggle and the native window buttons are lit by the same wash as the
   // actions. Panel open, the panel owns that strip and paints its own
-  // background, so the wash stays inside the workspace column.
-  const actionWashRightExtend = rightPanelOpen ? 28 : bandRightInset;
+  // background, so the wash stops at the panel's edge: the band ends 8px
+  // before it, and anything more would shade the panel's first tab.
+  const actionWashRightExtend = rightPanelOpen ? 8 : bandRightInset;
 
   if (!guiChrome && !draftGuiChrome) {
     return (
@@ -760,7 +765,11 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           data-testid="titlebar-drag-layer"
           data-tauri-drag-region
           className="pointer-events-auto absolute inset-y-0 left-0"
-          style={{ right: rightPanelOpen ? `${panelBandWidth}px` : 0 }}
+          style={{
+            right: rightPanelOpen
+              ? `${panelBandWidth + (panelMaximized ? 0 : RIGHT_PANEL_RESIZER_REACH)}px`
+              : 0,
+          }}
         />
       )}
 

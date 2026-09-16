@@ -1287,7 +1287,9 @@ export const MessageList = memo(function MessageList({
         // sits outside this scroller. Both edges keeps the column
         // concentric with the pane, so transcript and composer share the
         // same rails (see chat/chat-column.ts).
-        className="h-full min-h-0 overflow-x-hidden overscroll-y-contain [overflow-anchor:none] [scrollbar-gutter:stable_both-edges]"
+        // `thin-scrollbar`: the bar sits against the right panel's resize
+        // seam, and the platform's wide default read as a second divider.
+        className="thin-scrollbar h-full min-h-0 overflow-x-hidden overscroll-y-contain [overflow-anchor:none] [scrollbar-gutter:stable_both-edges]"
         style={fadeEnabled ? WS_FADE_STYLE : undefined}
         ListHeaderComponent={listHeader}
         ListFooterComponent={listFooter}

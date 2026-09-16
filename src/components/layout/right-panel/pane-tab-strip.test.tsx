@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { FileText, FolderTree, GitBranch } from "lucide-react";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
+
 import { PaneTabStrip, type DeckTab } from "./pane-tab-strip";
 
 const TABS: DeckTab[] = [
@@ -73,10 +75,16 @@ function stubRect(el: HTMLElement, left: number, width: number) {
   });
 }
 
-/** jsdom has no layout; make the strip report an overflowing one. */
-function stubScrollerOverflow(scrollWidth: number, clientWidth: number) {
-  const isScroller = (el: HTMLElement) =>
-    el.dataset?.testid === "right-panel-tabs-scroll";
+/**
+ * jsdom has no layout. Report widths per test id: `scrollWidth` for the
+ * scroller and the tab content, `clientWidth` for the scroller and header.
+ */
+function stubLayout(widths: {
+  header: number;
+  tabs: number;
+  scroller: number;
+}) {
+  const testId = (el: HTMLElement) => el.dataset?.testid;
   const proto = HTMLElement.prototype;
   const original = {
     scrollWidth: Object.getOwnPropertyDescriptor(
@@ -91,13 +99,20 @@ function stubScrollerOverflow(scrollWidth: number, clientWidth: number) {
   Object.defineProperty(proto, "scrollWidth", {
     configurable: true,
     get() {
-      return isScroller(this) ? scrollWidth : 0;
+      const id = testId(this);
+      return id === "right-panel-tabs-scroll" ||
+        id === "right-panel-tabs-content"
+        ? widths.tabs
+        : 0;
     },
   });
   Object.defineProperty(proto, "clientWidth", {
     configurable: true,
     get() {
-      return isScroller(this) ? clientWidth : 0;
+      const id = testId(this);
+      if (id === "right-panel-tabs-scroll") return widths.scroller;
+      if (id === "right-panel-tabs-header") return widths.header;
+      return 0;
     },
   });
   return () => {
@@ -239,8 +254,8 @@ describe("PaneTabStrip — overflow", () => {
     expect(screen.getByText("Files")).toBeInTheDocument();
     expect(screen.getByText("Changes")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
-    expect(screen.getByTestId("right-panel-tabs-scroll")).not.toHaveAttribute(
-      "data-compact",
+    expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveAttribute(
+      "data-stacked",
     );
   });
 
@@ -258,21 +273,15 @@ describe("PaneTabStrip — overflow", () => {
     expect(screen.getByText("2")).toHaveClass("text-status-attention");
   });
 
-  it("collapses inactive tabs to icon + badge once the full row overflows", () => {
-    const restore = stubScrollerOverflow(800, 400);
+  it("keeps every tab full-size and fades the clipped edge on overflow", () => {
+    const restore = stubLayout({ header: 2000, tabs: 800, scroller: 400 });
     try {
       renderStrip();
       const scroller = screen.getByTestId("right-panel-tabs-scroll");
-      expect(scroller).toHaveAttribute("data-compact", "true");
-      // The active tab keeps its label and its close button…
-      expect(screen.getByText("Files")).toBeInTheDocument();
-      expect(screen.getByLabelText("Close Files")).toBeInTheDocument();
-      // …the others drop to icon + badge, with the name on the button and
-      // no overlaid close affordance to mis-hit.
-      expect(screen.queryByText("Changes")).toBeNull();
-      expect(screen.getByLabelText("Changes")).toBeInTheDocument();
+      // Inactive tabs keep their labels and close affordances.
+      expect(screen.getByText("Changes")).toBeInTheDocument();
+      expect(screen.getByLabelText("Close Changes")).toBeInTheDocument();
       expect(screen.getByText("4")).toBeInTheDocument();
-      expect(screen.queryByLabelText("Close Changes")).toBeNull();
       // Content is clipped on the right, so that edge fades.
       expect(scroller.style.maskImage).toMatch(/transparent\)$/);
       expect(scroller.style.maskImage).toMatch(
@@ -283,38 +292,59 @@ describe("PaneTabStrip — overflow", () => {
     }
   });
 
-  it("keeps the compact strip's scroll offset when another tab is activated", () => {
-    const restore = stubScrollerOverflow(800, 400);
+  it("stacks the tabs below the band when they can't fit beside it", () => {
+    // A 360px panel: 174px of the band belongs to the fixed cluster and the
+    // window buttons, which leaves far less than 300px of tabs need.
+    const restore = stubLayout({ header: 360, tabs: 300, scroller: 300 });
     try {
-      const { rerender } = renderStrip();
-      const scroller = screen.getByTestId("right-panel-tabs-scroll");
-      expect(scroller).toHaveAttribute("data-compact", "true");
-      // The user has panned to the right…
-      Object.defineProperty(scroller, "scrollLeft", {
-        value: 300,
-        writable: true,
-        configurable: true,
-      });
-      // …and activating a tab re-measures the strip (full layout, then
-      // compact again). That bounce must not throw the offset away.
-      rerender(
-        <PaneTabStrip
-          tabs={TABS}
-          activeTab="changes"
-          onSelect={() => {}}
-          onClose={() => {}}
-          onReorder={() => {}}
-          surfaces={[]}
-          onOpenFile={() => {}}
-          openFileKeys=""
-          inTitlebar
-          onToggleExpand={() => {}}
-          expanded={false}
-          onCollapsePanel={() => {}}
-        />,
+      renderStrip({ actions: <button type="button">act</button> });
+      const header = screen.getByTestId("right-panel-tabs-header");
+      expect(header).toHaveAttribute("data-stacked", "true");
+      // The tabs, the pane actions and the `+` are all still there.
+      expect(screen.getByText("Files")).toBeInTheDocument();
+      expect(screen.getByText("act")).toBeInTheDocument();
+      expect(screen.getByTestId("right-panel-add-pane")).toBeInTheDocument();
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps one row in a wide panel", () => {
+    const restore = stubLayout({ header: 900, tabs: 300, scroller: 300 });
+    try {
+      renderStrip({ actions: <button type="button">act</button> });
+      expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveAttribute(
+        "data-stacked",
       );
-      expect(scroller).toHaveAttribute("data-compact", "true");
-      expect(scroller.scrollLeft).toBe(300);
+    } finally {
+      restore();
+    }
+  });
+
+  it("never stacks outside the titlebar band", () => {
+    const restore = stubLayout({ header: 200, tabs: 300, scroller: 100 });
+    try {
+      render(
+        <TooltipProvider>
+          <PaneTabStrip
+            tabs={TABS}
+            activeTab="files"
+            onSelect={() => {}}
+            onClose={() => {}}
+            onReorder={() => {}}
+            surfaces={[]}
+            onOpenFile={() => {}}
+            openFileKeys=""
+            inTitlebar={false}
+            onToggleExpand={() => {}}
+            expanded={false}
+            onCollapsePanel={() => {}}
+          />
+        </TooltipProvider>,
+      );
+      expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveAttribute(
+        "data-stacked",
+      );
     } finally {
       restore();
     }
