@@ -85,6 +85,10 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
   const browserPeekOpen = useBrowserPeekStore((s) => s.openWorkspaceId !== null);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Width lives in the persisted UI store: the full-screen pages below
+  // unmount `SidebarProvider`, which would otherwise reset it to default.
+  const sidebarWidth = useUIStore((s) => s.sidebarWidth);
+  const setSidebarWidth = useUIStore((s) => s.setSidebarWidth);
 
   // Appearance uses the synced theme id and payloads. Density stays local: it
   // controls layout rhythm rather than the color system.
@@ -279,6 +283,8 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
       <SidebarProvider
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
+        width={sidebarWidth}
+        onWidthChange={setSidebarWidth}
         className="flex-1 min-h-0"
       >
         <SidebarToggleBridge />

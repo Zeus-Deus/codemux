@@ -22,6 +22,7 @@ beforeEach(() => {
   useUIStore.setState({
     rightPanelTabs: {},
     rightPanelLastTabs: {},
+    sidebarWidth: 288,
     rightPanelWidth: 320,
     rightPanelMaximized: false,
     showNewWorkspaceDialog: false,
@@ -252,6 +253,15 @@ describe("ui-store — onboarding state", () => {
     it("still refuses a width below the panel minimum", () => {
       useUIStore.getState().setRightPanelWidth(10);
       expect(useUIStore.getState().rightPanelWidth).toBe(RIGHT_PANEL_MIN_WIDTH);
+    });
+
+    it("persists the left sidebar width", () => {
+      // The sidebar provider unmounts behind full-screen pages like
+      // Settings, so the dragged width has to outlive it.
+      useUIStore.getState().setSidebarWidth(340);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.sidebarWidth).toBe(340);
     });
 
     it("does not persist the measured row width", () => {
