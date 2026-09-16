@@ -127,8 +127,10 @@ interface UIStore {
   showDevices: boolean;
   showPullRequests: boolean;
   /** A pull request the page should select as it opens — set by the
-   *  palette, consumed and cleared by the page. Not persisted. */
-  pendingPrSelection: { projectRoot: string; number: number } | null;
+   *  palette or a link, consumed and cleared by the page. `url` is where
+   *  a link came from, so the page can hand it to the browser if the
+   *  host turns out not to know that number. Not persisted. */
+  pendingPrSelection: { projectRoot: string; number: number; url?: string } | null;
   /** Rows the badge has already shown the user. Keys, not a count, so a
    *  poll that re-reports the same review request doesn't re-raise a
    *  badge that was just cleared. Transient by design: a fresh session
@@ -237,7 +239,7 @@ interface UIStore {
   /** Open the Pull Requests page, optionally on a given pull request. */
   setShowPullRequests: (
     show: boolean,
-    select?: { projectRoot: string; number: number } | null,
+    select?: { projectRoot: string; number: number; url?: string } | null,
   ) => void;
   clearPendingPrSelection: () => void;
   /** Mark what the badge was counting as seen — called when the page

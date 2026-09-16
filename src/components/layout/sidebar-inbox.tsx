@@ -9,7 +9,7 @@ import {
   FolderPlus,
   Loader2,
 } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -529,7 +529,7 @@ const SettledRow = memo(function SettledRow({
 
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
+    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event: e });
   };
 
   return (
@@ -629,6 +629,9 @@ const SettledRow = memo(function SettledRow({
           <button
             type="button"
             onClick={handlePrClick}
+            onAuxClick={(e) => {
+              if (e.button === 1) handlePrClick(e);
+            }}
             disabled={!workspace.pr_url}
             aria-label={
               workspace.pr_number

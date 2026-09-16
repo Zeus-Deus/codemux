@@ -13,6 +13,7 @@ vi.mock("@/lib/toast", () => ({
 }));
 
 import { openExternalUrl } from "./open-url";
+import { useAppStore } from "@/stores/app-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -106,6 +107,7 @@ describe("openExternalUrl", () => {
     expect(useUIStore.getState().pendingPrSelection).toEqual({
       projectRoot: "/home/dev/projects/codemux",
       number: 285,
+      url: "https://github.com/example/codemux/pull/285",
     });
   });
 
@@ -129,6 +131,7 @@ describe("openExternalUrl", () => {
     expect(useUIStore.getState().pendingPrSelection).toEqual({
       projectRoot: "/home/dev/projects/vexis",
       number: 88,
+      url: "https://gitlab.example.com/acme/vexis/-/merge_requests/88",
     });
   });
 
@@ -142,6 +145,58 @@ describe("openExternalUrl", () => {
 
     expect(outcome).toBe("browser");
     expect(openUrl).toHaveBeenCalledWith("https://github.com/example/codemux/pull/285");
+    expect(useUIStore.getState().showPullRequests).toBe(false);
+  });
+
+  it("routes by repository when the last poll hasn't seen that pull request", async () => {
+    // #353 was opened after the watcher's last poll; #285 proves the repo is open.
+    publishPrLinkIndex([row()]);
+
+    const url = "https://github.com/example/codemux/pull/353";
+    const outcome = await openExternalUrl(url);
+
+    expect(outcome).toBe("in-app");
+    expect(openUrl).not.toHaveBeenCalled();
+    expect(useUIStore.getState().pendingPrSelection).toEqual({
+      projectRoot: "/home/dev/projects/codemux",
+      number: 353,
+      url,
+    });
+  });
+
+  it("knows a repository from a workspace's own pull request before any poll lands", async () => {
+    useAppStore.setState({
+      appState: {
+        workspaces: [
+          {
+            project_root: "/home/dev/projects/codemux",
+            cwd: "/home/dev/projects/codemux",
+            pr_url: "https://github.com/example/codemux/pull/12",
+          },
+        ],
+      } as never,
+    });
+
+    const outcome = await openExternalUrl("https://github.com/example/codemux/pull/353");
+
+    expect(outcome).toBe("in-app");
+    useAppStore.setState({ appState: null } as never);
+  });
+
+  it.each([
+    ["ctrl-click", { ctrlKey: true }],
+    ["cmd-click", { metaKey: true }],
+    ["middle click", { button: 1 }],
+  ])("%s keeps the browser, without a toast", async (_name, event) => {
+    publishPrLinkIndex([row()]);
+
+    const outcome = await openExternalUrl("https://github.com/example/codemux/pull/285", {
+      event,
+    });
+
+    expect(outcome).toBe("browser");
+    expect(openUrl).toHaveBeenCalledWith("https://github.com/example/codemux/pull/285");
+    expect(toastInfo).not.toHaveBeenCalled();
     expect(useUIStore.getState().showPullRequests).toBe(false);
   });
 

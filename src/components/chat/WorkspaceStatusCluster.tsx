@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import { AppWindow, ArrowDown, ChevronUp } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl, type LinkGesture } from "@/lib/open-url";
 import { cn } from "@/lib/utils";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -152,8 +152,11 @@ export function WorkspaceStatusCluster() {
     />
   ) : null;
 
-  const handlePrClick = () => {
-    if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
+  const handlePrClick = (event: LinkGesture) => {
+    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event });
+  };
+  const handlePrAuxClick = (event: MouseEvent<HTMLButtonElement>) => {
+    if (event.button === 1) handlePrClick(event);
   };
 
   const handleSync = async () => {
@@ -206,6 +209,7 @@ export function WorkspaceStatusCluster() {
             <button
               type="button"
               onClick={handlePrClick}
+              onAuxClick={handlePrAuxClick}
               disabled={!workspace.pr_url}
               aria-label={
                 workspace.pr_number
@@ -312,6 +316,7 @@ export function WorkspaceStatusCluster() {
                     <button
                       type="button"
                       onClick={handlePrClick}
+                      onAuxClick={handlePrAuxClick}
                       className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
                     >
                       View {provider.shortNoun}{" "}

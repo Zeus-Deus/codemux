@@ -27,10 +27,14 @@ vi.mock("@/stores/app-store", () => ({
   useHomeDir: () => mocks.homeDir,
   // `useBackgroundBrowserSession` (shared with the terminal header) reads
   // `agent_browser_sessions` off the app state via `useAppStore`.
-  useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
-    sel({
-      appState: { agent_browser_sessions: mocks.agentBrowserSessions },
-    }),
+  useAppStore: Object.assign(
+    (sel: (s: Record<string, unknown>) => unknown) =>
+      sel({
+        appState: { agent_browser_sessions: mocks.agentBrowserSessions },
+      }),
+    // The PR chip's link routing reads the workspace list outside React.
+    { getState: () => ({ appState: { workspaces: [] } }) },
+  ),
 }));
 vi.mock("@/stores/hosts-store", () => ({
   useHosts: () => mocks.hosts,

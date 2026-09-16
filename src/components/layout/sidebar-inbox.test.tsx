@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useUIStore } from "@/stores/ui-store";
 import type {
   AppStateSnapshot,
   PaneStatus,
@@ -1582,10 +1583,18 @@ describe("SidebarInbox — settle / un-settle", () => {
     });
     expect(pr).toHaveTextContent("#203");
     expect(pr.querySelector("svg")).not.toBeNull();
+    // Its repository is open, so a click opens the Pull Requests page...
+    useUIStore.setState({ showPullRequests: false, pendingPrSelection: null });
     fireEvent.click(pr);
-    expect(mockOpenUrl).toHaveBeenCalledWith(
-      "https://github.com/u/r/pull/203",
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    expect(useUIStore.getState().pendingPrSelection).toMatchObject({ number: 203 });
+    // ...and Ctrl-click asks for the browser.
+    useUIStore.setState({ showPullRequests: false, pendingPrSelection: null });
+    fireEvent.click(pr, { ctrlKey: true });
+    await vi.waitFor(() =>
+      expect(mockOpenUrl).toHaveBeenCalledWith("https://github.com/u/r/pull/203"),
     );
+    expect(useUIStore.getState().showPullRequests).toBe(false);
   });
 
   it("Enter on the PR badge does not also activate the settled row", async () => {
