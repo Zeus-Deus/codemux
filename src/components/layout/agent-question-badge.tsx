@@ -12,7 +12,7 @@ export function AgentQuestionBadge({ workspaceId }: { workspaceId: string }) {
     <span
       title={label}
       aria-label={label}
-      className="flex shrink-0 items-center gap-0.5 text-[10px] text-primary"
+      className="flex shrink-0 items-center gap-0.5 text-caption text-primary"
     >
       <MessageCircleQuestion className="size-3" />
       {count}

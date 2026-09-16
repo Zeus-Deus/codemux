@@ -143,7 +143,7 @@ export function BrowserPeekOverlay() {
           className="h-[7px] w-[7px] shrink-0 rounded-full bg-status-open"
           aria-hidden
         />
-        <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-[11px] text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate rounded-md border border-border px-2 py-1 font-mono text-label text-muted-foreground">
           {session.current_url ?? "about:blank"}
         </span>
         <Tooltip>

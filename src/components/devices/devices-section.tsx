@@ -155,10 +155,10 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
   return (
     <div className="flex items-center gap-2.5 rounded-[10px] bg-foreground/[0.035] px-3 py-2.5">
       <LaptopGlyph className="size-[13px] shrink-0 text-status-open" />
-      <span className="text-[12px] font-semibold text-foreground">
+      <span className="text-body-sm font-semibold text-foreground">
         This device
       </span>
-      <span className="truncate font-mono text-[10px] text-muted-foreground/70">
+      <span className="truncate font-mono text-caption text-muted-foreground/70">
         {workspaceCount} {workspaceCount === 1 ? "workspace" : "workspaces"} ·
         managed in the sidebar
       </span>
@@ -166,7 +166,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
         <button
           type="button"
           onClick={() => setSweepOpen(true)}
-          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-[7px] bg-status-working/[0.11] px-2.5 py-[5px] text-[11px] font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
+          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-[7px] bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
         >
           <Trash2 className="size-2.5" aria-hidden />
           Sweep {count} settled
@@ -269,7 +269,7 @@ function DeviceCardView({
           </span>
           <span className="flex min-w-0 flex-col gap-px">
             <span className="flex items-center gap-[7px]">
-              <span className="truncate text-[13px] font-bold text-foreground">
+              <span className="truncate text-body font-bold text-foreground">
                 {card.name}
               </span>
               <span
@@ -278,7 +278,7 @@ function DeviceCardView({
               />
               <span
                 title={card.statusDetail ?? undefined}
-                className={cn("truncate text-[10.5px]", TONE_TEXT[card.tone])}
+                className={cn("truncate text-label", TONE_TEXT[card.tone])}
               >
                 {card.statusLabel}
               </span>
@@ -287,7 +287,7 @@ function DeviceCardView({
                 line — that is the only thing worth reading about it. */}
             <span
               className={cn(
-                "truncate font-mono text-[9.5px]",
+                "truncate font-mono text-caption",
                 card.tone === "attention"
                   ? "text-status-working/80"
                   : "text-muted-foreground/70",
@@ -301,7 +301,7 @@ function DeviceCardView({
         </button>
 
         {card.remoteControlServing && (
-          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-status-open/10 px-2.5 py-1 text-[10.5px] font-semibold text-status-open">
+          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-status-open/10 px-2.5 py-1 text-label font-semibold text-status-open">
             <span aria-hidden className="size-[5px] rounded-full bg-status-open" />
             Remote Control serving
           </span>
@@ -314,7 +314,7 @@ function DeviceCardView({
             // it (`sidebarPrimary` is the brand accent, and its foreground is
             // solved against it) — a literal white only ever cleared 2.8:1 on
             // the dark ember and would not survive a light theme's darker one.
-            className="shrink-0 rounded-[7px] bg-accent-ember px-3 py-1.5 text-[11px] font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
+            className="shrink-0 rounded-[7px] bg-accent-ember px-3 py-1.5 text-label font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
           >
             Connect
           </button>
@@ -349,7 +349,7 @@ function DeviceCardView({
         </div>
       )}
       {expanded && rowCount === 0 && card.host && card.serverId && (
-        <p className="px-[13px] pb-3 text-[11px] text-muted-foreground/70">
+        <p className="px-[13px] pb-3 text-label text-muted-foreground/70">
           Nothing on {card.name} yet — push a workspace here from its menu in
           the sidebar.
         </p>
@@ -395,10 +395,10 @@ function ProjectCluster({
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
           <Folder className="size-[11px] shrink-0 text-muted-foreground/60" aria-hidden />
-          <span className="truncate font-mono text-[11px] font-semibold text-foreground/80">
+          <span className="truncate font-mono text-label font-semibold text-foreground/80">
             {project.name}
           </span>
-          <span className="font-mono text-[9.5px] text-muted-foreground/60">
+          <span className="font-mono text-caption text-muted-foreground/60">
             {project.rows.length}
           </span>
           {!expanded && (
@@ -414,7 +414,7 @@ function ProjectCluster({
             disabled={pulling}
             onClick={() => onPullProject(project.projectUid!, project.name)}
             title="Pull this project's repo root and all its worktrees to this device"
-            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-[10px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-60"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
               <Loader2 className="size-[9px] animate-spin" aria-hidden />
@@ -493,29 +493,29 @@ function WorkspaceRow({
         className="size-1.5 justify-self-center rounded-full bg-status-remote/70"
       />
       <span className="flex min-w-0 items-center">
-        <span className="truncate text-[12px] font-semibold text-foreground">
+        <span className="truncate text-body-sm font-semibold text-foreground">
           {sync.title}
         </span>
         {kindLabel && (
-          <span className="ml-1 shrink-0 rounded-full bg-foreground/[0.06] px-[7px] py-[2px] font-mono text-[9px] font-medium text-muted-foreground/70">
+          <span className="ml-1 shrink-0 rounded-full bg-foreground/[0.06] px-[7px] py-[2px] font-mono text-micro font-medium text-muted-foreground/70">
             {kindLabel}
           </span>
         )}
         {row.divergedLabel && (
           <span
             title={`Same branch has different commits on ${row.divergedLabel}`}
-            className="ml-1 shrink-0 rounded-full bg-status-working/[0.11] px-[7px] py-[2px] font-mono text-[9px] font-semibold text-status-working"
+            className="ml-1 shrink-0 rounded-full bg-status-working/[0.11] px-[7px] py-[2px] font-mono text-micro font-semibold text-status-working"
           >
             diverged
           </span>
         )}
       </span>
-      <span className="truncate font-mono text-[9.5px] text-muted-foreground/70">
+      <span className="truncate font-mono text-caption text-muted-foreground/70">
         {sync.git_branch ?? ""}
       </span>
       <span className="inline-flex items-center gap-1">
         {pullStartedAt !== null ? (
-          <span className="inline-flex items-center gap-1.5 px-2 text-[10px] font-semibold text-muted-foreground">
+          <span className="inline-flex items-center gap-1.5 px-2 text-caption font-semibold text-muted-foreground">
             <Loader2 className="size-3 animate-spin" aria-hidden />
             Pulling
             {elapsedSec !== null && (
@@ -555,7 +555,7 @@ function RowAction({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="rounded-md bg-foreground/[0.07] px-[9px] py-1 text-[10px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.11] hover:text-foreground disabled:opacity-60"
+      className="rounded-md bg-foreground/[0.07] px-[9px] py-1 text-caption font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.11] hover:text-foreground disabled:opacity-60"
     >
       {children}
     </button>
@@ -569,7 +569,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center justify-center gap-1.5 rounded-[10px] bg-foreground/[0.03] p-2.5 text-[11.5px] font-semibold text-muted-foreground/70 transition-colors hover:bg-foreground/[0.05] hover:text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 rounded-[10px] bg-foreground/[0.03] p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-foreground/[0.05] hover:text-muted-foreground"
     >
       <Plus className="size-2.5" aria-hidden strokeWidth={2.2} />
       Add device
@@ -580,8 +580,8 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
 function EmptyDevices() {
   return (
     <div className="px-6 py-8 text-center">
-      <p className="text-[13px] font-semibold text-foreground">No devices yet</p>
-      <p className="mx-auto mt-1.5 max-w-[420px] text-[12px] leading-relaxed text-muted-foreground/80">
+      <p className="text-body font-semibold text-foreground">No devices yet</p>
+      <p className="mx-auto mt-1.5 max-w-[420px] text-body-sm leading-relaxed text-muted-foreground/80">
         Add a device — your home desktop, an always-on box, or a cloud server
         — then push work to it from any workspace's menu.
       </p>

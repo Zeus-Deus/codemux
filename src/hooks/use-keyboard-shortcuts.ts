@@ -17,6 +17,7 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
+import { stepInterfaceSize } from "@/lib/typography";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
@@ -135,6 +136,21 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   // ── Toggle sidebar ──
   if (actionId === "toggleSidebar") {
     ui.sidebarToggleFn?.();
+    return true;
+  }
+
+  // ── Interface size (zoom) ──
+  // Steps the synced interface size rather than the webview zoom: every UI
+  // size is rem-based, so this scales the app while native child surfaces
+  // (browser panes, terminals) keep their real pixel geometry.
+  if (actionId === "zoomIn" || actionId === "zoomOut" || actionId === "zoomReset") {
+    const settings = useSyncedSettingsStore.getState();
+    const current = settings.settings.appearance.interface_font_size;
+    const step = actionId === "zoomIn" ? "in" : actionId === "zoomOut" ? "out" : "reset";
+    const next = stepInterfaceSize(current, step);
+    if (next !== current) {
+      void settings.updateSetting("appearance", "interface_font_size", next).catch(console.error);
+    }
     return true;
   }
 

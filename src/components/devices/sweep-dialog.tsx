@@ -199,15 +199,15 @@ export function SweepDialog({ open, onOpenChange, candidates, knownBytes }: Prop
         ) : (
           <>
             <DialogHeader>
-              <DialogTitle className="text-[14px]">
+              <DialogTitle className="text-body-lg">
                 Sweep {count} settled {count === 1 ? "workspace" : "workspaces"}
                 {knownBytes !== null && knownBytes > 0 && (
-                  <span className="ml-1.5 font-mono text-[11px] font-normal text-muted-foreground">
+                  <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground">
                     ~{formatBytes(knownBytes)}
                   </span>
                 )}
               </DialogTitle>
-              <DialogDescription className="text-[12.5px] leading-relaxed">
+              <DialogDescription className="text-body leading-relaxed">
                 Removes their worktrees from disk; branches are kept. Worktrees
                 with uncommitted or unpushed work are skipped.
               </DialogDescription>
@@ -279,7 +279,7 @@ function SweepProgressSurface({
         <div className="flex h-[18px] items-center gap-2.5">
           <DialogTitle
             className={cn(
-              "truncate text-[13px] leading-[18px] tracking-[-0.005em]",
+              "truncate text-body leading-[18px] tracking-[-0.005em]",
               settled && !stopped ? "text-status-open" : "text-foreground",
             )}
           >
@@ -290,7 +290,7 @@ function SweepProgressSurface({
                 : "Sweep complete"}
           </DialogTitle>
           {!settled && outcome.skipped > 0 && (
-            <span className="ml-auto shrink-0 whitespace-nowrap rounded-[5px] bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-[10px] leading-[13px] text-status-working">
+            <span className="ml-auto shrink-0 whitespace-nowrap rounded-[5px] bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-caption leading-[13px] text-status-working">
               {outcome.skipped} skipped
             </span>
           )}
@@ -303,18 +303,18 @@ function SweepProgressSurface({
 
       <div className="flex items-end gap-6 px-4 pt-2.5 pb-4">
         <div className="flex flex-col gap-[3px]">
-          <span className="font-mono text-[32px] leading-none font-medium tracking-[-0.02em] text-foreground tabular-nums">
+          <span className="font-mono text-[2rem] leading-none font-medium tracking-[-0.02em] text-foreground tabular-nums">
             {total - index}
           </span>
-          <span className="text-[10.5px] leading-[14px] text-muted-foreground">
+          <span className="text-label leading-[14px] text-muted-foreground">
             of {total} left
           </span>
         </div>
         <div className="flex flex-col gap-[3px] pb-0.5">
-          <span className="font-mono text-[20px] leading-[21px] text-status-working tabular-nums">
+          <span className="font-mono text-[1.25rem] leading-[21px] text-status-working tabular-nums">
             {formatBytes(outcome.freedBytes)}
           </span>
-          <span className="text-[10.5px] leading-[14px] text-muted-foreground">
+          <span className="text-label leading-[14px] text-muted-foreground">
             {settled ? "freed" : "freed so far"}
           </span>
         </div>
@@ -355,13 +355,13 @@ function SweepProgressSurface({
             settled ? "bg-status-open" : "cm-breathe bg-status-working",
           )}
         />
-        <span className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground">
+        <span className="min-w-0 truncate font-mono text-label text-muted-foreground">
           {nowLine}
         </span>
       </div>
 
       <DialogFooter className="mx-0 mb-0 flex-row items-center gap-3 py-2.5 pr-3 pl-4 sm:justify-between">
-        <span className="min-w-0 truncate text-[10.5px] text-muted-foreground">
+        <span className="min-w-0 truncate text-label text-muted-foreground">
           Branches kept · uncommitted work skipped
         </span>
         {settled ? (

@@ -33,11 +33,11 @@ export function ThemeSettings() {
     <div className="flex items-center gap-4 rounded-xl border border-border/60 bg-muted/30 px-4 py-3.5">
       <ThemeCoins theme={activeTheme} size={34} />
       <div className="min-w-0 flex-1 space-y-0.5">
-        <p className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
+        <p className="flex items-center gap-1.5 text-body font-semibold text-foreground">
           <span className="truncate">{activeTheme.label}</span>
           <ThemeSchemeBadge scheme={activeTheme.scheme} />
         </p>
-        <p className="text-[11.5px] text-muted-foreground/80">
+        <p className="text-body-sm text-muted-foreground/80">
           {source === "omarchy"
             ? omarchy ? "Following this desktop’s theme. Changes apply automatically." : "Omarchy is unavailable. Using your saved theme until it returns."
             : "Shell, terminal, code and editor. Synced to your account."}
@@ -47,17 +47,17 @@ export function ThemeSettings() {
         type="button"
         variant="outline"
         size="sm"
-        className="h-[30px] flex-none gap-1.5 text-[11.5px]"
+        className="h-[30px] flex-none gap-1.5 text-body-sm"
         onClick={() => openCommandPaletteWith("theme")}
       >
         Change
-        <span className="font-mono text-[10px] text-muted-foreground/70">⌘K</span>
+        <span className="font-mono text-caption text-muted-foreground/70">⌘K</span>
       </Button>
       <Button
         type="button"
         variant="outline"
         size="sm"
-        className="h-[30px] flex-none text-[11.5px]"
+        className="h-[30px] flex-none text-body-sm"
         onClick={() =>
           openThemeStudio(source === "omarchy" && omarchy
             ? { mode: "generate", copyTheme: activeTheme }

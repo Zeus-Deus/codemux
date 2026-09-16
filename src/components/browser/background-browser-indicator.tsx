@@ -78,7 +78,7 @@ export function BackgroundBrowserIndicator({
       type="button"
       onClick={() => openPeek(workspaceId)}
       aria-label="Browser running in background — view"
-      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 px-1.5 text-[11px] font-semibold text-status-remote transition-opacity hover:opacity-80"
+      className="inline-flex h-[26px] shrink-0 items-center gap-1.5 px-1.5 text-label font-semibold text-status-remote transition-opacity hover:opacity-80"
     >
       <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
       Browser

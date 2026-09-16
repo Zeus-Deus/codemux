@@ -47,10 +47,10 @@ export function DevicesView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <span className="text-[13px] font-bold tracking-tight text-foreground">
+        <span className="text-body font-bold tracking-tight text-foreground">
           Devices
         </span>
-        <span className="ml-auto hidden truncate text-[11px] text-muted-foreground/70 sm:inline">
+        <span className="ml-auto hidden truncate text-label text-muted-foreground/70 sm:inline">
           Remote Control lets you <em>use</em> another device — this page
           moves work <em>between</em> them.
         </span>

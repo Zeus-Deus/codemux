@@ -187,7 +187,7 @@ export function SkillsSection({ projectRoot }: Props) {
           </Label>
           <p className="mt-0.5 text-xs text-muted-foreground">
             Plugin skills come from{" "}
-            <code className="font-mono text-[11px]">~/.claude/plugins/</code>,
+            <code className="font-mono text-label">~/.claude/plugins/</code>,
             including marketplace and external installs.
           </p>
         </div>
@@ -298,7 +298,7 @@ function ConflictsSection({
         <h3 className="text-xs font-semibold uppercase tracking-wider text-status-working dark:text-status-working">
           Naming conflicts
         </h3>
-        <span className="text-[10px] text-muted-foreground/70">
+        <span className="text-caption text-muted-foreground/70">
           {entries.length} name{entries.length === 1 ? "" : "s"} clashing
         </span>
       </header>
@@ -408,7 +408,7 @@ function SkillsGroupSection({
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {heading}
         </h3>
-        <span className="text-[10px] text-muted-foreground/70">
+        <span className="text-caption text-muted-foreground/70">
           {skills.length} skill{skills.length === 1 ? "" : "s"}
         </span>
       </header>

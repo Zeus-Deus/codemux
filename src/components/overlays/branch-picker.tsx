@@ -254,7 +254,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("all")}
             >
               All{" "}
-              <span className="text-[10px] opacity-60">{allCount}</span>
+              <span className="text-caption opacity-60">{allCount}</span>
             </button>
             <button
               type="button"
@@ -267,7 +267,7 @@ export function BranchPicker({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-[10px] opacity-60">{worktreeCount}</span>
+              <span className="text-caption opacity-60">{worktreeCount}</span>
             </button>
           </div>}
 
@@ -354,7 +354,7 @@ export function BranchPicker({
                             // identical to every other row.
                             <Badge
                               variant="secondary"
-                              className="text-[9px] px-1 py-0 shrink-0"
+                              className="text-micro px-1 py-0 shrink-0"
                             >
                               checked out
                             </Badge>
@@ -362,7 +362,7 @@ export function BranchPicker({
                           {isDefault && (
                             <Badge
                               variant="secondary"
-                              className="text-[9px] px-1 py-0 shrink-0"
+                              className="text-micro px-1 py-0 shrink-0"
                             >
                               default
                             </Badge>
@@ -370,7 +370,7 @@ export function BranchPicker({
                           {hasPr && (
                             <Badge
                               variant="secondary"
-                              className="text-[9px] px-1 py-0 shrink-0 bg-accent-violet/15 text-accent-violet border-accent-violet/20"
+                              className="text-micro px-1 py-0 shrink-0 bg-accent-violet/15 text-accent-violet border-accent-violet/20"
                             >
                               PR
                             </Badge>
@@ -378,7 +378,7 @@ export function BranchPicker({
                           {hasOpenWorkspace && (
                             <Badge
                               variant="secondary"
-                              className="text-[9px] px-1 py-0 shrink-0 bg-success/10 text-success border-success/20"
+                              className="text-micro px-1 py-0 shrink-0 bg-success/10 text-success border-success/20"
                             >
                               active
                             </Badge>
@@ -386,7 +386,7 @@ export function BranchPicker({
 
                           {/* Timestamp — visible at rest, hidden on hover to make room for actions */}
                           {!alwaysShowActions && (
-                            <span className="text-[11px] text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden">
+                            <span className="text-label text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden">
                               {formatRelativeTime(branch.last_commit_unix)}
                             </span>
                           )}
@@ -398,7 +398,7 @@ export function BranchPicker({
                           )}>
                             <button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
+                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-label font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handlePrimaryAction(branch);
@@ -409,7 +409,7 @@ export function BranchPicker({
                             </button>
                             {!baseOnly && <button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors"
+                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-label font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors"
                               onClick={(e) => handleSecondaryAction(e, branch)}
                             >
                               {secondaryLabel}

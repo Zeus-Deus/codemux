@@ -21,17 +21,17 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
   return (
     <div className="flex shrink-0 items-center gap-2 border-b border-border/50 bg-card px-2 py-1">
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-primary">
+        <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 font-mono text-label font-semibold text-primary">
           {element.tag}
           {element.id && <span className="text-muted-foreground">#{element.id}</span>}
         </span>
         {element.classes.length > 0 && (
-          <span className="truncate text-[11px] text-muted-foreground">
+          <span className="truncate text-label text-muted-foreground">
             .{element.classes.join(".")}
           </span>
         )}
         <span
-          className="truncate font-mono text-[11px] text-muted-foreground/70"
+          className="truncate font-mono text-label text-muted-foreground/70"
           title={element.selector}
         >
           {element.selector}

@@ -258,7 +258,7 @@ export function WorkspaceHoverCardBody({
             shape="square"
             className="font-bold"
           />
-          <span className="min-w-0 flex-1 truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
+          <span className="min-w-0 flex-1 truncate text-label font-semibold tracking-[0.01em] text-muted-foreground/80">
             {repo.name}
           </span>
           {providers.map((p) => (
@@ -270,7 +270,7 @@ export function WorkspaceHoverCardBody({
           ))}
           <span
             className={cn(
-              "shrink-0 text-[11px] font-semibold",
+              "shrink-0 text-label font-semibold",
               status ? STATUS_TEXT_CLASS[status] : "text-muted-foreground/70",
             )}
           >
@@ -284,11 +284,11 @@ export function WorkspaceHoverCardBody({
         </div>
         {/* Full title — the row truncates it, so this is often the whole
             reason the user hovered. */}
-        <div className="mt-1 text-[13px] font-bold leading-[1.35] text-foreground">
+        <div className="mt-1 text-body font-bold leading-[1.35] text-foreground">
           {workspace.title}
         </div>
         {issue && (
-          <div className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+          <div className="mt-0.5 text-label leading-snug text-muted-foreground">
             <span className="font-mono">#{issue.number}</span> {issue.title}
           </div>
         )}
@@ -421,7 +421,7 @@ export function WorkspaceHoverCardBody({
       {/* Real path on disk, last: the least-scannable line, and the one users
           most often want to copy or confirm. Wraps rather than truncates. */}
       <div className="border-t px-3.5 py-2">
-        <div className="break-all font-mono text-[10px] leading-relaxed text-muted-foreground/70">
+        <div className="break-all font-mono text-caption leading-relaxed text-muted-foreground/70">
           {shortenPath(path, homeDir)}
         </div>
       </div>
@@ -462,12 +462,12 @@ function DetailRow({
     // So the label holds its width and the VALUE truncates — the reverse
     // would leave you reading "Bran…" next to the thing you came to see.
     <div className="flex items-center gap-3 rounded-md px-2 py-1.5">
-      <span className="shrink-0 text-[12px] text-muted-foreground">
+      <span className="shrink-0 text-body-sm text-muted-foreground">
         {label}
       </span>
       <span
         className={cn(
-          "min-w-0 flex-1 truncate text-right font-mono text-[11px] tabular-nums",
+          "min-w-0 flex-1 truncate text-right font-mono text-label tabular-nums",
           valueClassName ?? (muted ? "text-muted-foreground" : "text-foreground"),
         )}
       >

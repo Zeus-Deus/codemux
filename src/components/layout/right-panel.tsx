@@ -186,7 +186,7 @@ function ReviewTabBadge({
   return (
     <>
       {commentCount > 0 && (
-        <span className="font-mono text-[9.5px] tabular-nums">
+        <span className="font-mono text-caption tabular-nums">
           {commentCount}
         </span>
       )}
@@ -741,10 +741,10 @@ export const RightPanel = memo(function RightPanel({
       case "changes":
         actions = (
           <>
-            <span className="shrink-0 font-mono text-[10.5px] tabular-nums text-success">
+            <span className="shrink-0 font-mono text-label tabular-nums text-success">
               +{workspace.git_additions}
             </span>
-            <span className="shrink-0 font-mono text-[10.5px] tabular-nums text-danger">
+            <span className="shrink-0 font-mono text-label tabular-nums text-danger">
               −{workspace.git_deletions}
             </span>
             <DropdownMenu>

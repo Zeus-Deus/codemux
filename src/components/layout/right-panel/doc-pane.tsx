@@ -86,7 +86,7 @@ export function DocPane({
           <button
             type="button"
             onClick={onSearchFiles}
-            className="flex h-[31px] shrink-0 items-center gap-[7px] border-b border-border/60 px-2.5 text-[11.5px] text-muted-foreground transition-colors hover:bg-foreground/6 hover:text-foreground/80"
+            className="flex h-[31px] shrink-0 items-center gap-[7px] border-b border-border/60 px-2.5 text-body-sm text-muted-foreground transition-colors hover:bg-foreground/6 hover:text-foreground/80"
           >
             <Search className="size-3" strokeWidth={1.6} aria-hidden />
             Search files

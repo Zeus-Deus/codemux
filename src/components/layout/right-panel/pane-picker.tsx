@@ -29,10 +29,10 @@ export function PanePicker({ surfaces }: { surfaces: SurfaceAction[] }) {
     >
       <div className="w-full max-w-[520px]">
         <div className="mb-4 text-center">
-          <h3 className="text-[13px] font-medium text-foreground">
+          <h3 className="text-body font-medium text-foreground">
             Open a surface
           </h3>
-          <p className="mt-1 text-[11px] text-muted-foreground">
+          <p className="mt-1 text-label text-muted-foreground">
             Choose what to show in the right panel.
           </p>
         </div>
@@ -53,10 +53,10 @@ export function PanePicker({ surfaces }: { surfaces: SurfaceAction[] }) {
                 className="mb-2 size-[18px] text-foreground/70"
                 strokeWidth={1.5}
               />
-              <span className="text-[13px] font-medium text-foreground">
+              <span className="text-body font-medium text-foreground">
                 {surface.label}
               </span>
-              <span className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              <span className="mt-0.5 text-label leading-relaxed text-muted-foreground">
                 {surface.description}
               </span>
             </button>

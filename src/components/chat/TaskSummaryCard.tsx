@@ -62,7 +62,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
       </span>
       {interactive && (
         <>
-          <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+          <span className="shrink-0 font-mono text-label text-muted-foreground">
             Open in panel
           </span>
           <ChevronRight

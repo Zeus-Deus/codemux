@@ -158,7 +158,7 @@ export function MarkdownLocalImage({
           <span className="min-w-0 flex-1 truncate font-medium text-foreground">
             {children ?? caption}
           </span>
-          <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+          <span className="flex shrink-0 items-center gap-1 text-label text-muted-foreground">
             <Maximize2 className="size-3" aria-hidden />
             Expand
           </span>

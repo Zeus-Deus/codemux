@@ -15,7 +15,9 @@ export const TYPOGRAPHY_DEFAULTS = {
 } as const;
 
 export const TYPOGRAPHY_RANGES = {
-  interface: { min: 13, max: 19 },
+  // Every UI size is rem-based, so this one value scales the whole app. The
+  // ceiling leaves room for large, low-density displays.
+  interface: { min: 12, max: 22 },
   conversation: { min: 12, max: 20 },
   // Code shares the terminal ceiling: a pre-migration blob adopts its terminal
   // size as the code size, and that must not shrink a 20–22px choice.
@@ -182,6 +184,27 @@ export function resolveTerminalFontFamily(
 ): string {
   if (typography.terminalPreference || !legacyLocalFamily) return typography.terminalFamily;
   return legacyLocalFamily;
+}
+
+export type InterfaceZoomStep = "in" | "out" | "reset";
+
+/**
+ * The interface size one zoom shortcut step lands on. `current` is the raw
+ * stored value; it is clamped first so a hand-edited out-of-range size still
+ * steps predictably.
+ */
+export function stepInterfaceSize(current: unknown, step: InterfaceZoomStep): number {
+  if (step === "reset") return TYPOGRAPHY_DEFAULTS.interfaceSize;
+  const size = clampTypographySize(
+    current,
+    TYPOGRAPHY_RANGES.interface,
+    TYPOGRAPHY_DEFAULTS.interfaceSize,
+  );
+  return clampTypographySize(
+    size + (step === "in" ? 1 : -1),
+    TYPOGRAPHY_RANGES.interface,
+    TYPOGRAPHY_DEFAULTS.interfaceSize,
+  );
 }
 
 /** Apply the resolved contract once; every text renderer consumes these tokens. */

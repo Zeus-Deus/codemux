@@ -34,7 +34,7 @@ export function SubagentBreadcrumb({
       <button
         type="button"
         onClick={onBack}
-        className="flex h-[26px] items-center gap-1.5 rounded-[7px] px-2 text-[12px] font-semibold text-muted-foreground hover:bg-foreground/[0.08] hover:text-foreground"
+        className="flex h-[26px] items-center gap-1.5 rounded-[7px] px-2 text-body-sm font-semibold text-muted-foreground hover:bg-foreground/[0.08] hover:text-foreground"
       >
         <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
         Orchestrator
@@ -44,10 +44,10 @@ export function SubagentBreadcrumb({
         strokeWidth={1.5}
         aria-hidden
       />
-      <span className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+      <span className="flex items-center gap-2 text-body font-semibold text-foreground">
         <span
           className={cn(
-            "flex h-[19px] w-[19px] items-center justify-center rounded-md font-mono text-[10px]",
+            "flex h-[19px] w-[19px] items-center justify-center rounded-md font-mono text-caption",
             tone.chipBg,
           )}
         >
@@ -56,13 +56,13 @@ export function SubagentBreadcrumb({
         <span className="truncate">{name}</span>
       </span>
       {subagent.model && (
-        <span className="rounded-[5px] bg-foreground/[0.07] px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+        <span className="rounded-[5px] bg-foreground/[0.07] px-1.5 py-0.5 font-mono text-label text-muted-foreground">
           {subagent.model}
         </span>
       )}
       <span
         className={cn(
-          "ml-auto flex items-center gap-1.5 text-[11px] font-semibold",
+          "ml-auto flex items-center gap-1.5 text-label font-semibold",
           tone.text,
         )}
       >

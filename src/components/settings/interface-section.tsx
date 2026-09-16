@@ -92,10 +92,10 @@ export function InterfaceSection() {
   return (
     <div>
       <div className="mb-7">
-        <h2 className="text-[21px] font-bold tracking-tight text-foreground">
+        <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
           Interface
         </h2>
-        <p className="text-[14px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
+        <p className="text-body-lg text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
           Choose how Codemux presents agent sessions.
         </p>
       </div>

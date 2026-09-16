@@ -311,10 +311,10 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
         className="sm:max-w-[480px] bg-popover p-0 gap-0 overflow-hidden"
       >
         <DialogHeader className="px-5 pt-4 pb-2">
-          <DialogTitle className="text-[14px] font-semibold">
+          <DialogTitle className="text-body-lg font-semibold">
             Pull workspace to this device
           </DialogTitle>
-          <DialogDescription className="text-[12px] text-muted-foreground/80">
+          <DialogDescription className="text-body-sm text-muted-foreground/80">
             Bring{" "}
             <span className="font-medium text-foreground">
               {syncRow.title}
@@ -327,7 +327,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
           {previewError ? (
             <ErrorBlock message={previewError} />
           ) : !preview ? (
-            <div className="flex items-center gap-2 py-3 text-[12px] text-muted-foreground">
+            <div className="flex items-center gap-2 py-3 text-body-sm text-muted-foreground">
               <Loader2 className="size-3.5 animate-spin" />
               Checking…
             </div>
@@ -365,7 +365,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-[12px]"
+              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
               disabled={submitting}
             >
@@ -379,7 +379,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                 <Button
                   variant="secondary"
                   size="sm"
-                  className="h-7 gap-1.5 px-3 text-[12px]"
+                  className="h-7 gap-1.5 px-3 text-body-sm"
                   onClick={() => void handleSubmit()}
                   disabled={submitting}
                 >
@@ -413,7 +413,7 @@ function HostBackedAdoptionForm({
 }) {
   return (
     <>
-      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[13px] space-y-1.5">
+      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body space-y-1.5">
         <SummaryRow
           label="From"
           icon={<Cloud className="size-3 text-status-remote/80" />}
@@ -424,12 +424,12 @@ function HostBackedAdoptionForm({
           {remoteProjectName(syncRow) ?? "—"}
         </SummaryRow>
         <SummaryRow label="Branch">
-          <span className="font-mono text-[12px]">
+          <span className="font-mono text-body-sm">
             {syncRow.git_branch ?? "—"}
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-[11px] text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-muted-foreground/80 break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
@@ -438,7 +438,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-[12px] text-muted-foreground/75 hover:text-foreground transition-colors"
+        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />
@@ -449,7 +449,7 @@ function HostBackedAdoptionForm({
       </button>
 
       {disclosureOpen && (
-        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-[12px] text-muted-foreground/85 leading-relaxed space-y-1">
+        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-body-sm text-muted-foreground/85 leading-relaxed space-y-1">
           <li>
             • Copies the workspace files from{" "}
             <span className="font-medium text-foreground/90">
@@ -479,7 +479,7 @@ function HostNotConfiguredBlock({
   onClose: () => void;
 }) {
   return (
-    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-[12px] text-warning/95 leading-relaxed space-y-2">
+    <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2.5 text-body-sm text-warning/95 leading-relaxed space-y-2">
       <p>
         This workspace lives on a device you haven't configured here
         yet
@@ -498,7 +498,7 @@ function HostNotConfiguredBlock({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 px-2.5 text-[12px] gap-1.5 border-warning/30 hover:bg-warning/15"
+        className="h-7 px-2.5 text-body-sm gap-1.5 border-warning/30 hover:bg-warning/15"
         onClick={() => {
           onClose();
           // TODO: deep-link to Settings → Devices when that route lands.
@@ -520,14 +520,14 @@ function CloneFallbackBlock({
 }) {
   return (
     <>
-      <p className="text-[12px] text-muted-foreground/85 leading-relaxed">
+      <p className="text-body-sm text-muted-foreground/85 leading-relaxed">
         This workspace lives only on another device (no shared host).
         We'll clone it from git.
       </p>
 
-      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[13px] space-y-1.5">
+      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body space-y-1.5">
         <SummaryRow label="Clone from">
-          <span className="font-mono text-[12px] break-all">
+          <span className="font-mono text-body-sm break-all">
             {syncRow.project_remote ?? "—"}
           </span>
         </SummaryRow>
@@ -535,18 +535,18 @@ function CloneFallbackBlock({
           label="Branch"
           icon={<GitBranch className="size-3 text-muted-foreground/70" />}
         >
-          <span className="font-mono text-[12px]">
+          <span className="font-mono text-body-sm">
             {syncRow.git_branch ?? "main"}
           </span>
         </SummaryRow>
         <SummaryRow label="Will land">
-          <span className="font-mono text-[11px] text-muted-foreground/80 break-all">
+          <span className="font-mono text-label text-muted-foreground/80 break-all">
             {preview.suggested_path}
           </span>
         </SummaryRow>
       </dl>
 
-      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning/90 leading-relaxed">
+      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-body-sm text-warning/90 leading-relaxed">
         <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
         <div>
           <p className="font-medium text-warning">
@@ -566,7 +566,7 @@ function CloneFallbackBlock({
 
 function NoOptionsBlock() {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12px] text-muted-foreground/85 leading-relaxed">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed">
       We don't have a way to bring this workspace over yet — no shared
       host, no git remote URL. Open the device it lives on and push
       it to a shared device first, then pull from here.
@@ -576,9 +576,9 @@ function NoOptionsBlock() {
 
 function PathInUseBlock({ path }: { path: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-[12px] text-destructive/95 leading-relaxed">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-body-sm text-destructive/95 leading-relaxed">
       <p className="mb-1">A different workspace is already using:</p>
-      <p className="font-mono text-[11px] text-destructive/85 break-all">
+      <p className="font-mono text-label text-destructive/85 break-all">
         {path}
       </p>
       <p className="mt-2 text-destructive/85">
@@ -600,7 +600,7 @@ function SameBranchProjectBlock({
   // is "you have a logically-equivalent workspace open — same
   // branch of the same project — just at a different path."
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12px] text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
       <p>
         You already have this branch open on this device, just at a
         different path.
@@ -612,7 +612,7 @@ function SameBranchProjectBlock({
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-[12px]"
+        className="h-7 px-2.5 text-body-sm"
         onClick={onOpenExisting}
       >
         Open the existing workspace
@@ -623,12 +623,12 @@ function SameBranchProjectBlock({
 
 function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
   return (
-    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12px] text-muted-foreground/85 leading-relaxed space-y-2">
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-body-sm text-muted-foreground/85 leading-relaxed space-y-2">
       <p>You've already pulled this workspace to this device.</p>
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-[12px]"
+        className="h-7 px-2.5 text-body-sm"
         onClick={onOpen}
       >
         Open it
@@ -639,7 +639,7 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
 
 function ErrorBlock({ message }: { message: string }) {
   return (
-    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive/95">
+    <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-body-sm text-destructive/95">
       {message}
     </div>
   );
@@ -656,12 +656,12 @@ function SummaryRow({
 }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-[68px] shrink-0 text-[11px] uppercase tracking-wider text-muted-foreground/55">
+      <dt className="w-[68px] shrink-0 text-label uppercase tracking-wider text-muted-foreground/55">
         {label}
       </dt>
       <dd
         className={cn(
-          "min-w-0 flex-1 text-[12px] text-foreground/90 flex items-center gap-1",
+          "min-w-0 flex-1 text-body-sm text-foreground/90 flex items-center gap-1",
         )}
       >
         {icon}

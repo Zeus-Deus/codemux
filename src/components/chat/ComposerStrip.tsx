@@ -116,13 +116,13 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 const STRIP_CHIP =
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-[8px] bg-foreground/[0.05] px-2.5 text-[11px] font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09] hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-[8px] bg-foreground/[0.05] px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09] hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
 // Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
 const GOAL_FOCUS = "outline-none focus-visible:ring-1 focus-visible:ring-ring";
 /** Quiet text action (Copy, Clear beside Resume). */
 const GOAL_CHIP = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-[6px] px-2 text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-[6px] px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Clear when it is the strongest action in the row. */
@@ -143,16 +143,16 @@ const GOAL_ICON_BUTTON = cn(
 /** Resume is the one solid control in the strip: an interrupted goal is the
  *  only occupant that asks for a decision. */
 const GOAL_RESUME = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-[6px] bg-status-working px-2.5 text-[11px] font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
+  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-[6px] bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
   GOAL_FOCUS,
 );
 const GOAL_META =
-  "shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground";
+  "shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground";
 const GOAL_LINK = cn(
   "inline-flex shrink-0 items-center gap-[5px] rounded-[4px] transition-colors hover:text-foreground",
   GOAL_FOCUS,
 );
-const GOAL_MENU_ITEM = "h-[26px] rounded-[6px] px-2 py-0 text-[12px]";
+const GOAL_MENU_ITEM = "h-[26px] rounded-[6px] px-2 py-0 text-body-sm";
 
 /**
  * The one strip docked above the composer pill. It mirrors the scope
@@ -382,18 +382,18 @@ function StripRowView({
       <span className="flex size-5 shrink-0 items-center justify-center">
         <StripMarkView mark={row.mark} />
       </span>
-      <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+      <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
         {row.label}
       </span>
       <span
-        className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground"
+        className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
         title={row.detail ?? undefined}
       >
         {row.detail}
       </span>
       {row.elapsed && (
         <TickingText
-          className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
+          className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
           compute={row.elapsed}
         />
       )}
@@ -485,12 +485,12 @@ function GoalRowView({
             GOAL_FOCUS,
           )}
         >
-          <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground/80">
+          <span className="shrink-0 whitespace-nowrap text-body-sm font-semibold text-foreground/80">
             {interrupted ? "Goal interrupted" : "Goal"}
           </span>
           {!open ? (
             <span
-              className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground"
+              className="min-w-0 flex-1 truncate text-body-sm text-muted-foreground"
               title={goal.text}
             >
               {goal.text}
@@ -615,7 +615,7 @@ function GoalRowView({
           data-testid="composer-strip-goal-details"
           className="flex flex-col gap-[7px] pt-px pr-2.5 pb-[3px] pl-9"
         >
-          <p className="max-h-[102px] overflow-y-auto whitespace-pre-wrap break-words text-[12px] leading-[1.55] text-foreground/[0.82] [scrollbar-width:thin]">
+          <p className="max-h-[102px] overflow-y-auto whitespace-pre-wrap break-words text-body-sm leading-[1.55] text-foreground/[0.82] [scrollbar-width:thin]">
             {goal.text}
           </p>
           {interrupted && (
@@ -623,11 +623,11 @@ function GoalRowView({
               data-testid="composer-strip-goal-sends"
               className="flex min-w-0 items-center gap-2 rounded-[8px] border border-border/70 bg-foreground/[0.02] px-[9px] py-1.5"
             >
-              <span className="shrink-0 font-mono text-[10px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+              <span className="shrink-0 font-mono text-caption font-semibold tracking-[0.08em] text-muted-foreground uppercase">
                 sends
               </span>
               <code
-                className="min-w-0 flex-1 truncate font-mono text-[11px] text-accent-ember"
+                className="min-w-0 flex-1 truncate font-mono text-label text-accent-ember"
                 title={strip.resumePhrase}
               >
                 {strip.resumePhrase}
@@ -636,7 +636,7 @@ function GoalRowView({
                 type="button"
                 onClick={strip.onEditResume}
                 className={cn(
-                  "shrink-0 rounded-[4px] font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-foreground",
+                  "shrink-0 rounded-[4px] font-mono text-label text-muted-foreground transition-colors hover:text-foreground",
                   GOAL_FOCUS,
                 )}
               >
@@ -645,7 +645,7 @@ function GoalRowView({
             </div>
           )}
           {(jump || note || summary) && (
-            <div className="flex min-w-0 items-center gap-2.5 font-mono text-[10.5px] text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-2.5 font-mono text-label text-muted-foreground">
               {jump && (
                 <button type="button" onClick={jump.onClick} className={GOAL_LINK}>
                   {jump.label}

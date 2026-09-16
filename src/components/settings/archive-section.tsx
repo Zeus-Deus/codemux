@@ -247,29 +247,29 @@ function ArchivedEntryRow({
     <div className="flex items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 px-3.5 py-2.5">
       <div className="min-w-0 space-y-1">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="truncate text-[13px] font-medium text-foreground">
+          <span className="truncate text-body font-medium text-foreground">
             {entry.title}
           </span>
           {isRoot && (
-            <span className="shrink-0 rounded px-1.5 text-[10px] leading-[16px] text-muted-foreground bg-muted border border-border/60">
+            <span className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground bg-muted border border-border/60">
               repo root
             </span>
           )}
           {entry.git_branch && (
-            <span className="shrink-0 truncate max-w-48 rounded bg-muted px-1.5 font-mono text-[10px] leading-[16px] text-muted-foreground">
+            <span className="shrink-0 truncate max-w-48 rounded bg-muted px-1.5 font-mono text-caption leading-[16px] text-muted-foreground">
               {entry.git_branch}
             </span>
           )}
           {isStale && (
             <span
-              className="shrink-0 rounded px-1.5 text-[10px] leading-[16px] text-muted-foreground/60 bg-muted/60"
+              className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
               title="Archived more than 30 days ago"
             >
               stale
             </span>
           )}
         </div>
-        <p className="truncate text-[11px] text-muted-foreground/70">
+        <p className="truncate text-label text-muted-foreground/70">
           Archived {relativeTime(archivedDate)}
         </p>
       </div>
@@ -340,10 +340,10 @@ export function ArchiveSection() {
     return (
       <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
         <Archive className="h-5 w-5 text-muted-foreground/50" />
-        <p className="text-[13px] text-muted-foreground">
+        <p className="text-body text-muted-foreground">
           No archived workspaces
         </p>
-        <p className="text-[12px] text-muted-foreground/70 max-w-prose">
+        <p className="text-body-sm text-muted-foreground/70 max-w-prose">
           Archive a workspace from the sidebar to park it here without
           touching its files.
         </p>
@@ -356,7 +356,7 @@ export function ArchiveSection() {
       {groups.map((group, idx) => (
         <section key={group.path} className={cn(idx === 0 && "mt-0")}>
           <p
-            className="mb-3 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55"
+            className="mb-3 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55"
             title={group.path}
           >
             {group.label}

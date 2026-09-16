@@ -46,7 +46,7 @@ export function CompatibilityBadge({ level }: Props) {
       data-testid="compatibility-badge"
       data-level={level}
       className={cn(
-        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium",
         config.className,
       )}
     >

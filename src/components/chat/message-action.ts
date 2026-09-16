@@ -31,7 +31,7 @@ export const MESSAGE_GROUP_CLASS = "group/message";
  * pins itself visible on top of this; see the call sites.
  */
 export const MESSAGE_ACTION_CLASS = [
-  "flex items-center gap-0.5 rounded text-[10px] text-muted-foreground",
+  "flex items-center gap-0.5 rounded text-caption text-muted-foreground",
   "pointer-events-none opacity-0 transition-opacity",
   "hover:text-foreground",
   "group-hover/message:pointer-events-auto group-hover/message:opacity-100",

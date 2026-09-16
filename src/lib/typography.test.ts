@@ -9,7 +9,26 @@ import {
   quoteFontFamily,
   resolveTerminalFontFamily,
   resolveTypographySettings,
+  stepInterfaceSize,
 } from "./typography";
+
+describe("stepInterfaceSize", () => {
+  it("steps the interface size one pixel at a time", () => {
+    expect(stepInterfaceSize(16, "in")).toBe(17);
+    expect(stepInterfaceSize(16, "out")).toBe(15);
+  });
+
+  it("stops at the range bounds", () => {
+    expect(stepInterfaceSize(22, "in")).toBe(22);
+    expect(stepInterfaceSize(12, "out")).toBe(12);
+  });
+
+  it("resets to the default and recovers from unusable stored values", () => {
+    expect(stepInterfaceSize(20, "reset")).toBe(16);
+    expect(stepInterfaceSize(undefined, "in")).toBe(17);
+    expect(stepInterfaceSize(999, "out")).toBe(21);
+  });
+});
 
 describe("typography settings", () => {
   it("resolves the simple two-font model and preserves the existing 16/14 rhythm", () => {
@@ -62,7 +81,7 @@ describe("typography settings", () => {
 
     expect(resolved.terminalPreference).toBe("Hack");
     expect(resolved.codePreference).toBe("Hack");
-    expect(resolved.interfaceSize).toBe(19);
+    expect(resolved.interfaceSize).toBe(22);
     expect(resolved.conversationSize).toBe(14);
     expect(resolved.codeSize).toBe(10);
     expect(resolved.terminalSize).toBe(22);

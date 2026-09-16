@@ -101,7 +101,7 @@ export function BashToolBody({ item, input }: BodyProps) {
           <span className="text-muted-foreground/70">$ </span>
           {command}
           {description && (
-            <div className="mt-1 font-sans text-[11px] text-muted-foreground/80">
+            <div className="mt-1 font-sans text-label text-muted-foreground/80">
               {description}
             </div>
           )}
@@ -113,7 +113,7 @@ export function BashToolBody({ item, input }: BodyProps) {
             {tail}
           </pre>
           {tailHidden > 0 && (
-            <p className="border-t border-border/40 px-3 py-1 text-[11px] text-muted-foreground/70">
+            <p className="border-t border-border/40 px-3 py-1 text-label text-muted-foreground/70">
               + {tailHidden} earlier line{tailHidden === 1 ? "" : "s"} hidden
             </p>
           )}
@@ -127,7 +127,7 @@ export function BashToolBody({ item, input }: BodyProps) {
         // not a status billboard.
         <span
           aria-label={`Exit code ${exitCode}`}
-          className="font-mono text-[11px] text-destructive/80"
+          className="font-mono text-label text-destructive/80"
         >
           exit {exitCode}
         </span>
@@ -149,7 +149,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {path && (
-        <div className="select-text font-mono text-[12px] text-foreground">
+        <div className="select-text font-mono text-body-sm text-foreground">
           <ToolSourcePath path={path} line={offset ?? undefined} />
           {(offset != null || limit != null) && (
             <span className="ml-2 text-muted-foreground/70">
@@ -164,7 +164,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
             {preview}
           </pre>
           {totalLines > READ_PREVIEW_LINES && (
-            <p className="border-t border-border/40 px-3 py-1 text-[11px] text-muted-foreground/70">
+            <p className="border-t border-border/40 px-3 py-1 text-label text-muted-foreground/70">
               Read {totalLines} line{totalLines === 1 ? "" : "s"}
             </p>
           )}
@@ -185,7 +185,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {(pattern || path) && (
-        <div className="select-text font-mono text-[12px] text-foreground">
+        <div className="select-text font-mono text-body-sm text-foreground">
           {pattern && <span>{pattern}</span>}
           {path && (
             <span className="ml-2 text-muted-foreground/70">
@@ -196,14 +196,14 @@ export function GrepToolBody({ item, input }: BodyProps) {
       )}
       {matches.length > 0 ? (
         <div className="select-text rounded-md bg-muted/40 px-3 py-2 space-y-1">
-          <p className="text-[11px] text-muted-foreground/80">
+          <p className="text-label text-muted-foreground/80">
             {matches.length} match{matches.length === 1 ? "" : "es"}
           </p>
           <ul className="space-y-0.5">
             {visible.map((m, i) => (
               <li
                 key={i}
-                className="font-mono text-[12px] leading-5 text-foreground break-words"
+                className="font-mono text-body-sm leading-5 text-foreground break-words"
               >
                 <span className="text-muted-foreground/70">
                   <ToolSourcePath path={m.location} />
@@ -213,7 +213,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
             ))}
           </ul>
           {hidden > 0 && (
-            <p className="text-[11px] text-muted-foreground/70">
+            <p className="text-label text-muted-foreground/70">
               … + {hidden} more
             </p>
           )}
@@ -239,7 +239,7 @@ export function WebFetchToolBody({ item, input }: BodyProps) {
             href={url}
             target="_blank"
             rel="noopener noreferrer"
-            className="block break-all font-mono text-[12px] text-foreground underline-offset-4 hover:underline"
+            className="block break-all font-mono text-body-sm text-foreground underline-offset-4 hover:underline"
           >
             {url}
           </a>
@@ -247,16 +247,16 @@ export function WebFetchToolBody({ item, input }: BodyProps) {
           // Refuse to render non-http(s) URLs as links — `javascript:`,
           // `data:`, `file:`, etc. from a buggy or malicious tool result
           // are XSS vectors otherwise.
-          <span className="block break-all font-mono text-[12px] text-muted-foreground">
+          <span className="block break-all font-mono text-body-sm text-muted-foreground">
             {url}
           </span>
         )
       )}
       {title && (
-        <p className="select-text text-[12px] text-muted-foreground">{title}</p>
+        <p className="select-text text-body-sm text-muted-foreground">{title}</p>
       )}
       {prompt && (
-        <p className="select-text rounded-md bg-muted/40 px-3 py-2 text-[12px] text-foreground">
+        <p className="select-text rounded-md bg-muted/40 px-3 py-2 text-body-sm text-foreground">
           {prompt}
         </p>
       )}
@@ -302,7 +302,7 @@ export function EditToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-1">
       {path && (
-        <div className="select-text font-mono text-[12px] text-foreground">
+        <div className="select-text font-mono text-body-sm text-foreground">
           <ToolSourcePath path={path} />
         </div>
       )}
@@ -406,7 +406,7 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
         type="button"
         onClick={load}
         disabled={loading}
-        className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60"
+        className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-label text-muted-foreground hover:text-foreground disabled:opacity-60"
       >
         {loading
           ? "Loading…"

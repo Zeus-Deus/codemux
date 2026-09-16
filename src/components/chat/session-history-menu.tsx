@@ -149,7 +149,7 @@ export function SessionHistoryList({
       )}
       {buckets.map((bucket) => (
         <div key={bucket.key}>
-          <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/70">
+          <DropdownMenuLabel className="text-caption uppercase tracking-wider text-muted-foreground/70">
             {bucket.label}
           </DropdownMenuLabel>
           {bucket.sessions.map((session) => (

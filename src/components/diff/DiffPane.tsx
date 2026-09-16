@@ -162,7 +162,7 @@ export function DiffPane({ tabId, workspace, embedded = false }: Props) {
           <GitCompare className="h-8 w-8 opacity-30" />
           <p className="text-xs">Select a file to view changes</p>
           {filteredFiles.length > 0 && (
-            <p className="text-[10px] text-muted-foreground/60">
+            <p className="text-caption text-muted-foreground/60">
               {filteredFiles.length} file{filteredFiles.length !== 1 ? "s" : ""}{" "}
               with changes
             </p>

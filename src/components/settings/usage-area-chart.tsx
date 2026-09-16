@@ -355,14 +355,14 @@ export function UsageAreaChart({
               : { left: Math.min(hoverX + 12, Math.max(0, width - 180)) }
           }
         >
-          <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground">
+          <p className="mb-1.5 font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground">
             {hoveredPoint.subLabel}
           </p>
           <ul className="flex flex-col gap-1">
             {series.map((s) => (
               <li
                 key={s.key}
-                className="flex items-center justify-between gap-4 text-[11px]"
+                className="flex items-center justify-between gap-4 text-label"
               >
                 <span className="inline-flex items-center gap-2 text-foreground/85">
                   <span
@@ -379,7 +379,7 @@ export function UsageAreaChart({
             ))}
           </ul>
           {series.length > 1 && (
-            <p className="mt-1.5 flex items-center justify-between gap-4 border-t border-border/50 pt-1.5 text-[11px]">
+            <p className="mt-1.5 flex items-center justify-between gap-4 border-t border-border/50 pt-1.5 text-label">
               <span className="text-muted-foreground">{totalLabel}</span>
               <span className="font-mono font-semibold tabular-nums">
                 {formatValue(total)}

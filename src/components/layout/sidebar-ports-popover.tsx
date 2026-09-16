@@ -162,7 +162,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
               <Icon className="size-[18px]" />
               {labeled && "Ports"}
               {portCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-[9px] leading-[15px] text-primary-foreground font-semibold tabular-nums">
+                <span className="absolute -top-0.5 -right-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-primary text-micro leading-[15px] text-primary-foreground font-semibold tabular-nums">
                   {portCount}
                 </span>
               )}
@@ -196,7 +196,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                 <CommandGroup
                   key={group.key}
                   heading={
-                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground/70">
+                    <span className="text-caption uppercase tracking-wide text-muted-foreground/70">
                       {group.workspaceName}
                     </span>
                   }
@@ -212,12 +212,12 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                         {port.port}
                       </span>
                       <span
-                        className="truncate text-[11px] text-muted-foreground flex-1 min-w-0"
+                        className="truncate text-label text-muted-foreground flex-1 min-w-0"
                         title={port.label ?? port.process_name}
                       >
                         {port.label ?? port.process_name}
                       </span>
-                      <span className="text-[10px] text-muted-foreground/50 tabular-nums shrink-0 transition-opacity group-hover/port:opacity-0">
+                      <span className="text-caption text-muted-foreground/50 tabular-nums shrink-0 transition-opacity group-hover/port:opacity-0">
                         {port.source === "docker"
                           ? port.process_name
                           : `PID ${port.pid}`}

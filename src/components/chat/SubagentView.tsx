@@ -70,7 +70,7 @@ export function SubagentView({
       {/* Read-only banner */}
       <div
         className={cn(
-          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-[12px] text-muted-foreground",
+          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-body-sm text-muted-foreground",
           tone.softBg,
           tone.border,
         )}
@@ -108,7 +108,7 @@ export function SubagentView({
         {/* Live tail while running */}
         {running && (
           <div
-            className="mt-3 flex items-center gap-1.5 px-1 py-1 text-[12px] leading-5 text-muted-foreground"
+            className="mt-3 flex items-center gap-1.5 px-1 py-1 text-body-sm leading-5 text-muted-foreground"
           >
             <span className="flex h-5 w-5 shrink-0 items-center justify-center">
               <AgentOrb
@@ -117,7 +117,7 @@ export function SubagentView({
                 aria-hidden
               />
             </span>
-            <span className="min-w-0 truncate font-mono text-[11px]">
+            <span className="min-w-0 truncate font-mono text-label">
               {subagentActivityLine(subagent)}
             </span>
           </div>

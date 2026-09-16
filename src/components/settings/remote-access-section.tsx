@@ -130,7 +130,7 @@ function DeviceIcon({ kind, className }: { kind: DeviceKind; className?: string 
 
 function SubHeading({ children }: { children: React.ReactNode }) {
   return (
-    <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+    <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
       {children}
     </p>
   );
@@ -144,13 +144,13 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
     <div className="flex items-start gap-3 py-2.5">
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
-          <code className="truncate font-mono text-[13px] text-foreground">
+          <code className="truncate font-mono text-body text-foreground">
             {endpoint.url}
           </code>
           {endpoint.recommended && (
             <Badge
               variant="outline"
-              className="border-accent-ember/30 bg-accent-ember/10 text-[10px] font-medium text-accent-ember"
+              className="border-accent-ember/30 bg-accent-ember/10 text-caption font-medium text-accent-ember"
             >
               Recommended
             </Badge>
@@ -158,7 +158,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
           {hint.secure ? (
             <Badge
               variant="outline"
-              className="gap-1 border-status-open/30 bg-status-open/10 text-[10px] text-status-open"
+              className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
             >
               <ShieldCheck className="h-3 w-3" />
               {hint.badge}
@@ -166,14 +166,14 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
           ) : (
             <Badge
               variant="outline"
-              className="gap-1 border-status-working/30 bg-status-working/10 text-[10px] text-status-working"
+              className="gap-1 border-status-working/30 bg-status-working/10 text-caption text-status-working"
             >
               <ShieldAlert className="h-3 w-3" />
               {hint.badge}
             </Badge>
           )}
         </div>
-        <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+        <p className="text-body-sm leading-relaxed text-muted-foreground/80">
           {hint.detail}
         </p>
       </div>
@@ -204,7 +204,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
   if (group.collapsible) {
     return (
       <details className="group rounded-md border border-border/50 bg-muted/20 px-3 py-2">
-        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[13px] font-semibold text-foreground marker:content-none">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-body font-semibold text-foreground marker:content-none">
           <span className="text-muted-foreground/70 transition-transform group-open:rotate-90">
             ›
           </span>
@@ -214,7 +214,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
           </span>
         </summary>
         <div className="mt-1.5 space-y-1">
-          <p className="text-[12px] leading-relaxed text-muted-foreground/70">
+          <p className="text-body-sm leading-relaxed text-muted-foreground/70">
             {group.explanation}
           </p>
           <EndpointGroupRows endpoints={group.endpoints} />
@@ -224,10 +224,10 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
   }
   return (
     <div className="space-y-1">
-      <p className="text-[13px] font-semibold text-foreground">
+      <p className="text-body font-semibold text-foreground">
         {group.title}
       </p>
-      <p className="text-[12px] leading-relaxed text-muted-foreground/70">
+      <p className="text-body-sm leading-relaxed text-muted-foreground/70">
         {group.explanation}
       </p>
       <EndpointGroupRows endpoints={group.endpoints} />
@@ -311,7 +311,7 @@ function PairingPanel({
       type="button"
       onClick={() => setSelectedHost(e.host)}
       className={cn(
-        "rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
+        "rounded-full border px-2.5 py-1 text-label font-medium transition-colors",
         e.host === selectedHost
           ? "border-accent-ember/40 bg-accent-ember/10 text-accent-ember"
           : "border-border/60 text-muted-foreground hover:text-foreground",
@@ -341,7 +341,7 @@ function PairingPanel({
                 role="img"
               />
             ) : (
-              <span className="text-[11px] text-muted-foreground">No endpoint</span>
+              <span className="text-label text-muted-foreground">No endpoint</span>
             )}
           </div>
         </div>
@@ -349,19 +349,19 @@ function PairingPanel({
         <div className="min-w-0 flex-1 space-y-3">
           <div>
             <div className="flex items-center justify-between gap-2">
-              <p className="text-[13px] font-semibold text-foreground">
+              <p className="text-body font-semibold text-foreground">
                 Scan or share this link
               </p>
               <span
                 className={cn(
-                  "font-mono text-[12px] tabular-nums",
+                  "font-mono text-body-sm tabular-nums",
                   expired ? "text-status-attention" : "text-muted-foreground",
                 )}
               >
                 {expired ? "Expired" : `Expires in ${formatCountdown(remainingMs)}`}
               </span>
             </div>
-            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground/80">
+            <p className="mt-1 text-body-sm leading-relaxed text-muted-foreground/80">
               One-time link — it pairs a single device, then can't be reused.
               Open it on your phone or laptop to connect.
             </p>
@@ -380,7 +380,7 @@ function PairingPanel({
               )}
               {otherEndpoints.length > 0 && (
                 <details className="group">
-                  <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-[11px] font-medium text-muted-foreground marker:content-none hover:text-foreground">
+                  <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
                     <span className="transition-transform group-open:rotate-90">
                       ›
                     </span>
@@ -397,7 +397,7 @@ function PairingPanel({
           {fullUrl && (
             <div className="flex items-center gap-2 rounded-md border border-border/60 bg-background/60 px-2.5 py-1.5">
               <Link2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+              <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
                 {fullUrl}
               </code>
               <CopyButton text={fullUrl} label="Copy pairing link" />
@@ -444,19 +444,19 @@ function PendingRow({
       <DeviceIcon kind={d.kind} className="h-4 w-4 shrink-0 text-status-working" />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <p className="truncate text-[13px] font-semibold text-foreground">
+          <p className="truncate text-body font-semibold text-foreground">
             {d.title}
           </p>
           {session.source === "account" && (
             <Badge
               variant="outline"
-              className="border-border/60 text-[10px] text-muted-foreground/80"
+              className="border-border/60 text-caption text-muted-foreground/80"
             >
               Account
             </Badge>
           )}
         </div>
-        <p className="truncate text-[12px] text-muted-foreground/80">
+        <p className="truncate text-body-sm text-muted-foreground/80">
           {d.platform || "Unknown platform"} ·{" "}
           {session.source === "account"
             ? "signed in and awaiting approval"
@@ -510,28 +510,28 @@ function DeviceRow({
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <p className="truncate text-[13px] font-semibold text-foreground">
+          <p className="truncate text-body font-semibold text-foreground">
             {d.title}
           </p>
           <Badge
             variant="outline"
-            className="border-border/60 text-[10px] text-muted-foreground/80"
+            className="border-border/60 text-caption text-muted-foreground/80"
           >
             {isAccount ? "Account" : "Paired"}
           </Badge>
           {session.connected ? (
-            <span className="flex items-center gap-1 text-[11px] font-medium text-status-open">
+            <span className="flex items-center gap-1 text-label font-medium text-status-open">
               <span className="inline-block h-1.5 w-1.5 rounded-full bg-status-open" />
               Connected
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-[11px] text-muted-foreground/70">
+            <span className="flex items-center gap-1 text-label text-muted-foreground/70">
               <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
               Offline
             </span>
           )}
         </div>
-        <p className="truncate text-[12px] text-muted-foreground/80">
+        <p className="truncate text-body-sm text-muted-foreground/80">
           {d.platform || "Unknown platform"} ·{" "}
           {isAccount ? "signed in" : "paired"} {relativeTime(session.created_at)}{" "}
           · last seen {relativeTime(session.last_seen_at)}
@@ -1126,11 +1126,11 @@ export function RemoteAccessSection() {
       <div>
         <div className="flex items-center gap-2">
           <MonitorSmartphone className="size-4 text-accent-ember" />
-          <h2 className="text-[21px] font-bold tracking-tight text-foreground">
+          <h2 className="text-[1.3125rem] font-bold tracking-tight text-foreground">
             Remote Access
           </h2>
         </div>
-        <p className="mt-1.5 max-w-prose text-[14px] leading-relaxed text-muted-foreground/80">
+        <p className="mt-1.5 max-w-prose text-body-lg leading-relaxed text-muted-foreground/80">
           Open this desktop to a browser on another device — a laptop or phone
           on your network or mesh VPN — and drive the same projects, sessions,
           and agents from there.
@@ -1146,7 +1146,7 @@ export function RemoteAccessSection() {
               {running && (
                 <Badge
                   variant="outline"
-                  className="gap-1 border-status-open/30 bg-status-open/10 text-[10px] text-status-open"
+                  className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
                 >
                   <span className="inline-block h-1.5 w-1.5 rounded-full bg-status-open" />
                   Listening on {status?.port}
@@ -1187,7 +1187,7 @@ export function RemoteAccessSection() {
               rebindPhase.status === "cutoff" ? (
                 <div
                   role="status"
-                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
+                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
                 >
                   <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>{rebindPhase.message}</span>
@@ -1195,7 +1195,7 @@ export function RemoteAccessSection() {
               ) : (
                 <div
                   role="status"
-                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-[13px] text-status-working"
+                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
                 >
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                   <span>Applying change — reconnecting to this device…</span>
@@ -1208,7 +1208,7 @@ export function RemoteAccessSection() {
                 rebinds immediately (same drop-connections path as a port
                 change). */}
             <div className="space-y-2">
-              <p className="text-[13px] font-medium leading-none text-foreground">
+              <p className="text-body font-medium leading-none text-foreground">
                 Who can connect
               </p>
               <div
@@ -1227,7 +1227,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-60",
+                        "rounded-[7px] px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -1238,7 +1238,7 @@ export function RemoteAccessSection() {
                   );
                 })}
               </div>
-              <p className="text-[12px] leading-relaxed text-muted-foreground/85">
+              <p className="text-body-sm leading-relaxed text-muted-foreground/85">
                 {BIND_SCOPE_OPTIONS.find((o) => o.value === bindScope)?.detail}
               </p>
             </div>
@@ -1247,16 +1247,16 @@ export function RemoteAccessSection() {
               <div className="min-w-0 flex-1 space-y-1">
                 <label
                   htmlFor="web-remote-port"
-                  className="block text-[13px] font-medium leading-none text-foreground"
+                  className="block text-body font-medium leading-none text-foreground"
                 >
                   Port
                 </label>
-                <p className="text-[12px] leading-relaxed text-muted-foreground/85">
+                <p className="text-body-sm leading-relaxed text-muted-foreground/85">
                   The port the server binds. Changing it rebinds immediately and
                   invalidates any open pairing link.
                 </p>
                 {portDraft !== "" && !portValidation.valid && (
-                  <p className="text-[12px] text-status-attention">
+                  <p className="text-body-sm text-status-attention">
                     {portValidation.error}
                   </p>
                 )}
@@ -1293,10 +1293,10 @@ export function RemoteAccessSection() {
 
             <div className="flex items-center justify-between gap-8 border-t border-border/60 pt-4">
               <div className="min-w-0 space-y-1">
-                <p className="text-[13px] font-medium leading-tight text-foreground">
+                <p className="text-body font-medium leading-tight text-foreground">
                   Require approval for new devices
                 </p>
-                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                   When on, a device that opens a valid pairing link waits here
                   until you approve it. When off, a valid link connects right
                   away.
@@ -1317,10 +1317,10 @@ export function RemoteAccessSection() {
 
             <div className="flex items-center justify-between gap-8">
               <div className="min-w-0 space-y-1">
-                <p className="text-[13px] font-medium leading-tight text-foreground">
+                <p className="text-body font-medium leading-tight text-foreground">
                   Sign in with a Codemux account
                 </p>
-                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                   Let a browser that reaches this machine connect by signing into{" "}
                   <span className="font-medium text-foreground">
                     the same Codemux account
@@ -1340,7 +1340,7 @@ export function RemoteAccessSection() {
             {accountModeEnabled && !accountSignedIn && (
               <div
                 role="status"
-                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
               >
                 <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
                 <span>
@@ -1354,10 +1354,10 @@ export function RemoteAccessSection() {
             {accountModeEnabled && (
               <div className="flex items-center justify-between gap-8 border-t border-border/60 pt-4">
                 <div className="min-w-0 space-y-1">
-                  <p className="text-[13px] font-medium leading-tight text-foreground">
+                  <p className="text-body font-medium leading-tight text-foreground">
                     Trust browsers on my account without approval
                   </p>
-                  <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                  <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                     Off by default: a browser that signs in with your account
                     still waits for you to approve it here. Turn on to let it
                     connect immediately — only do this if your account is well
@@ -1382,10 +1382,10 @@ export function RemoteAccessSection() {
 
             <div className="flex items-center justify-between gap-8">
               <div className="min-w-0 space-y-1">
-                <p className="text-[13px] font-medium leading-tight text-foreground">
+                <p className="text-body font-medium leading-tight text-foreground">
                   Reach this device from any network
                 </p>
-                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                   Let a browser signed into{" "}
                   <span className="font-medium text-foreground">
                     the same Codemux account
@@ -1408,7 +1408,7 @@ export function RemoteAccessSection() {
             {relayModeEnabled && !accountSignedIn && (
               <div
                 role="status"
-                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
               >
                 <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
                 <span>
@@ -1422,13 +1422,13 @@ export function RemoteAccessSection() {
             {relayModeEnabled && accountSignedIn && (
               <div className="space-y-2 rounded-lg border border-border/60 bg-muted/30 px-3.5 py-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-[13px] font-semibold text-foreground">
+                  <p className="text-body font-semibold text-foreground">
                     Device registration
                   </p>
                   {relayRegistered ? (
                     <Badge
                       variant="outline"
-                      className="gap-1 border-status-open/30 bg-status-open/10 text-[10px] text-status-open"
+                      className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
                     >
                       <ShieldCheck className="h-3 w-3" />
                       Registered
@@ -1436,14 +1436,14 @@ export function RemoteAccessSection() {
                   ) : (
                     <Badge
                       variant="outline"
-                      className="gap-1 border-status-working/30 bg-status-working/10 text-[10px] text-status-working"
+                      className="gap-1 border-status-working/30 bg-status-working/10 text-caption text-status-working"
                     >
                       <ShieldAlert className="h-3 w-3" />
                       Not registered yet
                     </Badge>
                   )}
                 </div>
-                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                <p className="text-body-sm leading-relaxed text-muted-foreground/80">
                   {relayRegistered
                     ? "This device is listed with your account, so a browser signed into it can find and dial this machine from anywhere."
                     : "This device isn't listed with your account yet. Registration runs on its own and usually settles in a moment — until then, only the addresses above reach it."}
@@ -1451,10 +1451,10 @@ export function RemoteAccessSection() {
 
                 {relayDisplayName && (
                   <div className="flex items-center gap-2">
-                    <span className="shrink-0 text-[12px] text-muted-foreground/70">
+                    <span className="shrink-0 text-body-sm text-muted-foreground/70">
                       Registered as
                     </span>
-                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                    <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
                       {relayDisplayName}
                     </code>
                     <CopyButton
@@ -1466,10 +1466,10 @@ export function RemoteAccessSection() {
 
                 {relayNodeId && (
                   <div className="flex items-center gap-2">
-                    <span className="shrink-0 text-[12px] text-muted-foreground/70">
+                    <span className="shrink-0 text-body-sm text-muted-foreground/70">
                       Address
                     </span>
-                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                    <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
                       {relayNodeId}
                     </code>
                     <CopyButton text={relayNodeId} label="Copy device address" />
@@ -1477,13 +1477,13 @@ export function RemoteAccessSection() {
                 )}
 
                 {relayLastRegisteredAt && (
-                  <p className="text-[12px] text-muted-foreground/70">
+                  <p className="text-body-sm text-muted-foreground/70">
                     Last confirmed {relativeTime(relayLastRegisteredAt)}.
                   </p>
                 )}
 
                 {!relayRegistered && relayLastError && (
-                  <p className="text-[12px] leading-relaxed text-status-attention">
+                  <p className="text-body-sm leading-relaxed text-status-attention">
                     Last attempt failed: {relayLastError}
                   </p>
                 )}
@@ -1495,7 +1495,7 @@ export function RemoteAccessSection() {
           <section className="space-y-2">
             <SubHeading>Reachable at</SubHeading>
             {endpoints.length === 0 ? (
-              <p className="py-2 text-[13px] text-muted-foreground/70">
+              <p className="py-2 text-body text-muted-foreground/70">
                 {running
                   ? "No reachable endpoints found."
                   : "Starting the server…"}
@@ -1517,7 +1517,7 @@ export function RemoteAccessSection() {
               />
             ) : (
               <div className="flex items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 p-4">
-                <p className="text-[13px] leading-relaxed text-muted-foreground/85">
+                <p className="text-body leading-relaxed text-muted-foreground/85">
                   Create a one-time link, then scan its QR code or open it on the
                   other device to pair.
                 </p>
@@ -1542,7 +1542,7 @@ export function RemoteAccessSection() {
                 <SubHeading>Waiting for approval</SubHeading>
                 <Badge
                   variant="outline"
-                  className="border-status-working/30 bg-status-working/10 text-[10px] text-status-working"
+                  className="border-status-working/30 bg-status-working/10 text-caption text-status-working"
                 >
                   {pending.length}
                 </Badge>
@@ -1567,7 +1567,7 @@ export function RemoteAccessSection() {
               <div className="flex items-center gap-2">
                 <SubHeading>Paired devices</SubHeading>
                 {connectedCount > 0 && (
-                  <span className="text-[11px] font-medium text-status-open">
+                  <span className="text-label font-medium text-status-open">
                     {connectedCount} connected
                   </span>
                 )}
@@ -1587,7 +1587,7 @@ export function RemoteAccessSection() {
               )}
             </div>
             {approved.length === 0 ? (
-              <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-[13px] text-muted-foreground/70">
+              <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
                 <Server className="h-4 w-4" />
                 No devices paired yet. Create a pairing link above to connect
                 one.

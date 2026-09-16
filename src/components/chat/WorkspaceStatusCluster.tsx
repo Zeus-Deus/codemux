@@ -187,7 +187,7 @@ export function WorkspaceStatusCluster() {
           disabled={initializing}
           aria-label="Initialize a git repository in this project folder"
           title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
-          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
         >
           {initializing ? "Initializing…" : "Initialize Git"}
         </button>
@@ -197,7 +197,7 @@ export function WorkspaceStatusCluster() {
         <>
           {showBehind && (
             <span
-              className="inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-[11px] tabular-nums text-warning"
+              className="inline-flex h-[26px] items-center gap-1 rounded-md px-2 font-mono text-label tabular-nums text-warning"
               title={`${workspace.git_behind} commit${workspace.git_behind === 1 ? "" : "s"} behind`}
             >
               <ArrowDown className="size-3" />
@@ -222,7 +222,7 @@ export function WorkspaceStatusCluster() {
                   : undefined
               }
               className={cn(
-                "inline-flex h-[26px] shrink-0 items-center gap-1 px-1.5 font-mono text-[11px] font-semibold transition-opacity hover:enabled:opacity-80",
+                "inline-flex h-[26px] shrink-0 items-center gap-1 px-1.5 font-mono text-label font-semibold transition-opacity hover:enabled:opacity-80",
                 prStatusTextClass(prState),
                 !workspace.pr_url && "cursor-not-allowed opacity-60",
               )}
@@ -243,7 +243,7 @@ export function WorkspaceStatusCluster() {
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09]",
+                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09]",
                   open && "bg-foreground/[0.09]",
                 )}
               >
@@ -258,10 +258,10 @@ export function WorkspaceStatusCluster() {
               className="w-[290px] p-0"
             >
               <div className="border-b px-3.5 py-2.5">
-                <div className="truncate text-[13px] font-bold text-foreground">
+                <div className="truncate text-body font-bold text-foreground">
                   {workspace.title}
                 </div>
-                <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+                <div className="mt-0.5 truncate font-mono text-label text-muted-foreground">
                   {projectName} · {deviceLabel}
                 </div>
               </div>
@@ -317,7 +317,7 @@ export function WorkspaceStatusCluster() {
                       type="button"
                       onClick={handlePrClick}
                       onAuxClick={handlePrAuxClick}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
                     >
                       View {provider.shortNoun}{" "}
                       {providerRef(provider, workspace.pr_number)}
@@ -328,7 +328,7 @@ export function WorkspaceStatusCluster() {
                       type="button"
                       onClick={handleSync}
                       disabled={pulling}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {pulling ? "Syncing…" : `Sync ↓${workspace.git_behind}`}
                     </button>
@@ -362,12 +362,12 @@ function DetailRow({
 }) {
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-foreground/[0.05]">
-      <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate text-body-sm text-muted-foreground">
         {label}
       </span>
       <span
         className={cn(
-          "shrink-0 font-mono text-[11px] tabular-nums",
+          "shrink-0 font-mono text-label tabular-nums",
           valueClassName ?? (muted ? "text-muted-foreground" : "text-foreground"),
         )}
       >

@@ -191,7 +191,7 @@ function RuleGroup({
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {group.heading}
         </h3>
-        <p className="text-[11px] text-muted-foreground/70 font-mono mt-0.5">
+        <p className="text-label text-muted-foreground/70 font-mono mt-0.5">
           {group.filename}
         </p>
       </header>

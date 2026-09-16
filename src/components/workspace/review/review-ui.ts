@@ -22,25 +22,25 @@
  */
 
 /** Uppercase eyebrows and mono micro-labels. The floor — nothing below. */
-export const tzEyebrow = "text-[11px]";
+export const tzEyebrow = "text-label";
 /** Meta, captions, hints — the quiet line under a title. */
-export const tzMeta = "text-[12px]";
+export const tzMeta = "text-body-sm";
 /** Secondary meta and mono numbers, a hair up from {@link tzMeta}. */
-export const tzMetaNum = "text-[12px]";
+export const tzMetaNum = "text-body-sm";
 /** Buttons, body-small, bar sentences. */
-export const tzBody = "text-[13px]";
+export const tzBody = "text-body";
 /** Body copy and row meta that has to be read, not scanned. */
-export const tzBodyLg = "text-[13px]";
+export const tzBodyLg = "text-body";
 /** List/row titles. */
-export const tzRowTitle = "text-[13px]";
+export const tzRowTitle = "text-body";
 /** Section and panel headers. */
-export const tzPanelHeader = "text-[14px]";
+export const tzPanelHeader = "text-body-lg";
 /** The PR title in a panel. */
-export const tzPanelTitle = "text-[16px]";
+export const tzPanelTitle = "text-[1rem]";
 /** The PR title on the full-screen page, where there is room for it. */
-export const tzPageTitle = "text-[17px]";
+export const tzPageTitle = "text-[1.0625rem]";
 /** Check-log excerpts — mono, quieter than the diff it explains. */
-export const tzLog = "text-[12px]";
+export const tzLog = "text-body-sm";
 
 /*
  * Deliberately no token for the diff body.
@@ -55,7 +55,7 @@ export const tzLog = "text-[12px]";
 
 const BASE =
   "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md border-0 " +
-  "px-3.5 text-[13px] font-medium transition-colors outline-none " +
+  "px-3.5 text-body font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 /** Neutral secondary — sits on the bar's card background. */
@@ -112,7 +112,7 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
  */
 const BASE_XS =
   "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded border-0 " +
-  "px-2 text-[12px] font-medium transition-colors outline-none " +
+  "px-2 text-body-sm font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;

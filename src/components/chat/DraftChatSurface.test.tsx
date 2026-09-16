@@ -960,7 +960,7 @@ describe("DraftChatSurface", () => {
       ) as HTMLElement;
       const inner = card.parentElement as HTMLElement;
       const outer = inner.parentElement as HTMLElement;
-      expect(inner.className).toContain("max-w-[760px]");
+      expect(inner.className).toContain("max-w-[47.5rem]");
       expect(outer.className).toContain("px-4");
 
       // Nothing between the composer's own rails and the surface root

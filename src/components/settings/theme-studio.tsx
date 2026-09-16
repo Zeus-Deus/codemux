@@ -275,10 +275,10 @@ function StudioBody({
       {/* Header */}
       <div className="flex flex-none items-center gap-3.5 border-b border-border/60 px-[18px] py-4">
         <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <DialogTitle className="text-[14.5px] font-bold tracking-[-0.01em]">
+          <DialogTitle className="text-body-lg font-bold tracking-[-0.01em]">
             Customize theme
           </DialogTitle>
-          <span className="text-[11.5px] text-muted-foreground">{subtitle}</span>
+          <span className="text-body-sm text-muted-foreground">{subtitle}</span>
         </div>
         {!rolesOpen && (
           <div
@@ -294,7 +294,7 @@ function StudioBody({
                 aria-checked={tab === value}
                 onClick={() => setTab(value)}
                 className={cn(
-                  "inline-flex h-[26px] items-center rounded-[7px] px-3.5 text-[11.5px] font-semibold transition-colors",
+                  "inline-flex h-[26px] items-center rounded-[7px] px-3.5 text-body-sm font-semibold transition-colors",
                   tab === value
                     ? "bg-foreground text-background"
                     : "text-muted-foreground hover:text-foreground",
@@ -366,11 +366,11 @@ function StudioBody({
         {/* Live preview — the reason the modal is 1000px wide */}
         <div className="flex min-w-0 flex-1 flex-col gap-2.5 bg-background p-[18px]">
           <div className="flex flex-none items-center gap-2.5">
-            <span className="font-mono text-[9.5px] font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+            <span className="font-mono text-caption font-semibold tracking-[0.1em] text-muted-foreground uppercase">
               Live preview
             </span>
             <span className="h-px flex-1 bg-border/60" />
-            <span className="text-[11px] text-muted-foreground">
+            <span className="text-label text-muted-foreground">
               {tab === "import" && !rolesOpen
                 ? "updates as it parses"
                 : "the whole shell, not a swatch strip"}
@@ -384,7 +384,7 @@ function StudioBody({
 
       {/* Footer */}
       <div className="flex flex-none items-center gap-2.5 border-t border-border/60 bg-muted/30 px-[18px] py-3">
-        <span className="flex-1 text-[11px] text-muted-foreground">
+        <span className="flex-1 text-label text-muted-foreground">
           Applies to shell, terminal, code and editor.
         </span>
         {savedTheme && (
@@ -393,7 +393,7 @@ function StudioBody({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-[31px] gap-1.5 text-[11.5px]"
+              className="h-[31px] gap-1.5 text-body-sm"
               onClick={() => downloadTheme(savedTheme)}
             >
               <Download className="size-3" /> Export
@@ -410,13 +410,13 @@ function StudioBody({
             </Button>
           </>
         )}
-        <Button type="button" variant="outline" size="sm" className="h-[31px] text-[11.5px]" onClick={onClose}>
+        <Button type="button" variant="outline" size="sm" className="h-[31px] text-body-sm" onClick={onClose}>
           Cancel
         </Button>
         <Button
           type="button"
           size="sm"
-          className="h-[31px] gap-1.5 text-[11.5px] font-bold"
+          className="h-[31px] gap-1.5 text-body-sm font-bold"
           onClick={saveTheme}
           disabled={!candidate}
         >
@@ -461,7 +461,7 @@ function GenerateColumn({
       {theme ? (
         <SolvedRoles theme={theme} />
       ) : (
-        <p className="rounded-[9px] border border-warning/25 bg-warning/10 px-3 py-2 text-[11px] leading-relaxed text-warning">
+        <p className="rounded-[9px] border border-warning/25 bg-warning/10 px-3 py-2 text-label leading-relaxed text-warning">
           Use a valid hex or OKLCH background and accent. Either polarity works
           — the background's brightness is what makes the theme light or dark.
         </p>
@@ -489,12 +489,12 @@ function SolvedRoles({ theme }: { theme: ThemeDefinition }) {
     <div className="flex flex-col gap-2.5">
       <div className="flex items-baseline gap-2">
         <ColumnLabel>Solved roles</ColumnLabel>
-        <span className="font-mono text-[10px] text-muted-foreground">
+        <span className="font-mono text-caption text-muted-foreground">
           {THEME_ROLES.length} tokens
         </span>
         {/* Which way the palette was solved, decided by the background you
             typed rather than by a switch you have to find. */}
-        <span className="font-mono text-[10px] text-muted-foreground/70">
+        <span className="font-mono text-caption text-muted-foreground/70">
           · {theme.scheme}
         </span>
       </div>
@@ -530,7 +530,7 @@ function ContrastReadout({ theme }: { theme: ThemeDefinition }) {
       )}
     >
       <Check className={cn("size-3 flex-none", ok ? "text-status-open" : "text-warning")} />
-      <span className="text-[11px] text-muted-foreground">
+      <span className="text-label text-muted-foreground">
         Body text {body.toFixed(1)}:1 · accent on surface {accent.toFixed(1)}:1
       </span>
     </div>
@@ -587,26 +587,26 @@ function ImportColumn({
                 : "Paste the colour-theme JSON, or drop the file below."
             }
             aria-label="Theme source"
-            className="min-h-[132px] resize-none rounded-none border-0 bg-transparent font-mono text-[10.5px] leading-[1.7] shadow-none focus-visible:ring-0"
+            className="min-h-[132px] resize-none rounded-none border-0 bg-transparent font-mono text-label leading-[1.7] shadow-none focus-visible:ring-0"
           />
           <div className="flex items-center gap-2 border-t border-border/60 px-2.5 py-2">
             <Button
               type="button"
               variant="outline"
               size="sm"
-              className="h-[25px] gap-1.5 px-2.5 text-[10.5px]"
+              className="h-[25px] gap-1.5 px-2.5 text-label"
               onClick={onChooseFile}
             >
               <FileUp className="size-[11px]" /> Choose file
             </Button>
-            <span className="text-[10.5px] text-muted-foreground">or drop it here</span>
+            <span className="text-label text-muted-foreground">or drop it here</span>
           </div>
         </div>
       </div>
       )}
 
       {error && (
-        <p className="rounded-[10px] border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive">
+        <p className="rounded-[10px] border border-destructive/25 bg-destructive/10 px-2.5 py-2 text-label leading-relaxed text-destructive">
           {error}
         </p>
       )}
@@ -615,7 +615,7 @@ function ImportColumn({
         <>
           <div className="flex items-center gap-2.5 rounded-[10px] border border-status-open/25 bg-status-open/10 px-2.5 py-2.5">
             <Check className="size-3 flex-none text-status-open" />
-            <span className="flex-1 text-[11px] leading-relaxed text-muted-foreground">
+            <span className="flex-1 text-label leading-relaxed text-muted-foreground">
               Recognised a{" "}
               <span className="font-bold text-foreground">
                 {THEME_IMPORT_SOURCE_LABEL[result.source]}
@@ -659,14 +659,14 @@ function DerivedRoles({ result }: { result: ThemeImportResult }) {
             className="size-3.5 flex-none rounded"
             style={{ background: normalizeColor(result.theme.roles[role], backdrop) ?? backdrop }}
           />
-          <span className="flex-1 truncate text-[11px] text-muted-foreground">
+          <span className="flex-1 truncate text-label text-muted-foreground">
             {humanizeToken(role)}
           </span>
-          <span className="font-mono text-[10px] text-muted-foreground/70">derived</span>
+          <span className="font-mono text-caption text-muted-foreground/70">derived</span>
         </div>
       ))}
       {rest > 0 && (
-        <span className="text-[10.5px] text-muted-foreground/70">
+        <span className="text-label text-muted-foreground/70">
           and {rest} more — all listed under Edit roles by hand.
         </span>
       )}
@@ -697,7 +697,7 @@ function RoleEditorColumn({
       <button
         type="button"
         onClick={onBack}
-        className="inline-flex w-fit items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground transition-colors hover:text-foreground"
+        className="inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
       >
         <ChevronRight className="size-2.5 rotate-180" />
         Back
@@ -732,7 +732,7 @@ function RoleEditorColumn({
 // ── Shared bits ──────────────────────────────────────────────────────────
 
 function ColumnLabel({ children }: { children: React.ReactNode }) {
-  return <span className="text-[11.5px] font-semibold text-muted-foreground">{children}</span>;
+  return <span className="text-body-sm font-semibold text-muted-foreground">{children}</span>;
 }
 
 function NameField({ value, onChange }: { value: string; onChange: (value: string) => void }) {
@@ -744,7 +744,7 @@ function NameField({ value, onChange }: { value: string; onChange: (value: strin
         onChange={(event) => onChange(event.target.value)}
         maxLength={48}
         aria-label="Theme name"
-        className="h-[34px] rounded-[9px] text-[12.5px]"
+        className="h-[34px] rounded-[9px] text-body"
       />
     </label>
   );
@@ -768,12 +768,12 @@ function SeedRow({
         aria-label={`${label} color`}
         className="size-5 flex-none cursor-pointer rounded-md border-0 bg-transparent p-0"
       />
-      <span className="flex-1 text-[11.5px] text-muted-foreground">{label}</span>
+      <span className="flex-1 text-body-sm text-muted-foreground">{label}</span>
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
         aria-label={`${label} value`}
-        className="w-[76px] bg-transparent text-right font-mono text-[11.5px] text-foreground outline-none"
+        className="w-[76px] bg-transparent text-right font-mono text-body-sm text-foreground outline-none"
       />
     </label>
   );
@@ -797,12 +797,12 @@ function ColorRoleInput({
         className="h-5 w-6 shrink-0 cursor-pointer border-0 bg-transparent p-0"
         aria-label={`${label} color`}
       />
-      <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">{label}</span>
+      <span className="min-w-0 flex-1 truncate text-caption text-muted-foreground">{label}</span>
       <Input
         value={value}
         onChange={(event) => onChange(event.target.value)}
         aria-label={`${label} value`}
-        className="h-7 w-28 border-0 px-0 font-mono text-[10px] shadow-none focus-visible:ring-0"
+        className="h-7 w-28 border-0 px-0 font-mono text-caption shadow-none focus-visible:ring-0"
       />
     </label>
   );
@@ -813,7 +813,7 @@ function EditRolesLink({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="mt-auto inline-flex w-fit items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground transition-colors hover:text-foreground"
+      className="mt-auto inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
     >
       Edit roles by hand
       <ChevronRight className="size-2.5" />
