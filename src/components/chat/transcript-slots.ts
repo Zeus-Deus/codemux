@@ -14,6 +14,9 @@ import { isTaskSummaryTool } from "./TaskSummaryCard";
 /** A mechanical step rendered through the compact work log. */
 export type ActivityStep = ReasoningItem | ToolCallItem;
 
+/** Anything that shares one work-log line: steps and subagent runs. */
+export type WorkEntry = ActivityStep | SubagentRunItem;
+
 export interface TurnFoldBody {
   kind: "turn_fold";
   turnId: string;
@@ -25,8 +28,7 @@ export interface TurnFoldBody {
 
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
-  | { kind: "activity"; items: ActivityStep[]; working: boolean }
-  | { kind: "subagent_stretch"; runs: SubagentRunItem[] }
+  | { kind: "activity"; items: WorkEntry[]; working: boolean }
   | TurnFoldBody;
 
 export interface TranscriptSlot {
@@ -76,9 +78,8 @@ function isQuietObservationalTool(step: ActivityStep): boolean {
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
- * (`subagent_run` orchestration events are `kind: "subagent_run"`, not
- * `tool_call`, so they never satisfy this predicate. Contiguous spawn groups
- * are merged later into one work-log stretch.)
+ * (`subagent_run` items are not tool calls; the slot builder joins them into
+ * the same work-log line separately.)
  */
 function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
@@ -90,6 +91,10 @@ function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
 
 function isActivityStep(item: ChatViewItem): item is ActivityStep {
   return item.kind === "reasoning" || isGroupableTool(item);
+}
+
+function isWorkEntry(item: ChatViewItem): item is WorkEntry {
+  return item.kind === "subagent_run" || isActivityStep(item);
 }
 
 function splitTurns(messages: ChatViewItem[]): TurnSegment[] {
@@ -240,12 +245,12 @@ function buildPresentationEntries(
   messages: ChatViewItem[],
   streaming: boolean,
   expandedTurnIds: ReadonlySet<string>,
-): { entries: PresentationEntry[]; workingStepId: string | null } {
+): { entries: PresentationEntry[]; workingEntryId: string | null } {
   const segments = splitTurns(messages);
   const activeIndex = activeTurnIndex(segments, streaming);
   const pendingIds = pendingRequestIds(messages);
   const entries: PresentationEntry[] = [];
-  let workingStepId: string | null = null;
+  let workingEntryId: string | null = null;
 
   for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
     const segment = segments[segmentIndex];
@@ -255,7 +260,7 @@ function buildPresentationEntries(
       for (let i = segment.items.length - 1; i >= 0; i--) {
         const item = segment.items[i];
         if (item.kind === "turn_ended") continue;
-        if (isActivityStep(item)) workingStepId = item.id;
+        if (isWorkEntry(item)) workingEntryId = item.id;
         break;
       }
     }
@@ -296,7 +301,7 @@ function buildPresentationEntries(
     }
   }
 
-  return { entries, workingStepId };
+  return { entries, workingEntryId };
 }
 
 export function buildTranscriptSlots(
@@ -315,36 +320,43 @@ export function buildTranscriptSlots(
     }
   }
 
-  const { entries, workingStepId } = buildPresentationEntries(
+  const { entries, workingEntryId } = buildPresentationEntries(
     messages,
     streaming,
     expandedTurnIds,
   );
   const bodies: SlotBody[] = [];
-  let run: ActivityStep[] = [];
+  // One uninterrupted stretch of mechanical work. Subagent runs join the
+  // stretch instead of splitting it; prose, approvals, task checklists and
+  // any other visible row end it.
+  let run: WorkEntry[] = [];
   let runRevealed = false;
   const flush = () => {
     if (run.length === 0) return;
     const working =
-      workingStepId != null && run.some((step) => step.id === workingStepId);
+      workingEntryId != null && run.some((entry) => entry.id === workingEntryId);
     // A lone settled Read/Grep/Glob carries no signal — drop it rather than
     // leave a one-line work-log row behind. An in-flight one still surfaces,
     // and so does one the user pulled out of an expanded turn fold.
+    const only = run.length === 1 ? run[0] : null;
     if (
       !working &&
       !runRevealed &&
-      run.length === 1 &&
-      isQuietObservationalTool(run[0])
+      only != null &&
+      only.kind !== "subagent_run" &&
+      isQuietObservationalTool(only)
     ) {
       run = [];
       runRevealed = false;
       return;
     }
-    const hasTool = run.some((step) => step.kind === "tool_call");
-    if (hasTool) {
+    const hasWork = run.some(
+      (entry) => entry.kind === "tool_call" || entry.kind === "subagent_run",
+    );
+    if (hasWork) {
       bodies.push({ kind: "activity", items: run, working });
     } else {
-      for (const step of run) bodies.push({ kind: "item", item: step });
+      for (const entry of run) bodies.push({ kind: "item", item: entry });
     }
     run = [];
     runRevealed = false;
@@ -363,25 +375,14 @@ export function buildTranscriptSlots(
     ) {
       continue;
     }
-    if (isActivityStep(item)) {
+    // Non-error turn-ended markers were already dropped above, so they do not
+    // split a stretch either.
+    if (isWorkEntry(item)) {
       run.push(item);
       if (entry.revealed) runRevealed = true;
       continue;
     }
     flush();
-    if (item.kind === "subagent_run") {
-      // Consecutive spawn groups are one transcript event even when the
-      // reducer stores one canonical run per turn. Non-error turn-ended
-      // markers were already dropped above, so they do not split a stretch;
-      // prose, a visible tool/result, or any other rendered row does.
-      const tail = bodies[bodies.length - 1];
-      if (tail?.kind === "subagent_stretch") {
-        tail.runs.push(item);
-      } else {
-        bodies.push({ kind: "subagent_stretch", runs: [item] });
-      }
-      continue;
-    }
     bodies.push({ kind: "item", item });
   }
   flush();
@@ -455,13 +456,6 @@ function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
       a.items.every((item, index) => item === b.items[index])
     );
   }
-  if (a.kind === "subagent_stretch" && b.kind === "subagent_stretch") {
-    if (a.runs.length !== b.runs.length) return false;
-    for (let i = 0; i < a.runs.length; i++) {
-      if (a.runs[i] !== b.runs[i]) return false;
-    }
-    return true;
-  }
   return false;
 }
 
@@ -476,12 +470,6 @@ function slotIdentity(body: SlotBody): {
   }
   if (body.kind === "turn_fold") {
     const id = `turn-fold:${body.turnId}`;
-    return { key: id, messageId: id, scrollAnchor: false };
-  }
-  if (body.kind === "subagent_stretch") {
-    // The first canonical run anchors the visual stretch. Appending another
-    // turn updates this row in place instead of remounting it in LegendList.
-    const id = `subagent-stretch:${body.runs[0].id}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }
   return {

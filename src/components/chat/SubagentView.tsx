@@ -90,18 +90,14 @@ export function SubagentView({
         {slots.map((slot) => (
           <div key={slot.key} className={slot.turnStart ? "mt-4" : "mt-3"}>
             {slot.body.kind === "activity" ? (
-              <ActivityBlock items={slot.body.items} working={slot.body.working} />
+              <ActivityBlock
+                items={slot.body.items}
+                working={slot.body.working}
+                workspaceId={workspaceId}
+              />
             ) : slot.body.kind === "turn_fold" ? (
               <div className="border-b border-border/60 pb-2 text-xs text-muted-foreground">
                 {slot.body.label}
-              </div>
-            ) : slot.body.kind === "subagent_stretch" ? (
-              <div className="h-8 text-[11px] text-muted-foreground">
-                Ran {slot.body.runs.reduce(
-                  (count, run) => count + run.subagents.length,
-                  0,
-                )}{" "}
-                nested subagents
               </div>
             ) : (
               <SubItem item={slot.body.item} workspaceId={workspaceId} cwd={cwd} />
