@@ -286,19 +286,25 @@ describe("SidebarInboxCard — snooze affordance", () => {
 });
 
 describe("SidebarInboxCard — unread / woke", () => {
-  it("marks an unread card without borrowing the done-review green", () => {
-    const { container } = renderCard({ unread: true });
-    const dot = screen.getByLabelText('Unread — "Ship it"');
-    expect(dot.className).toContain("bg-accent-ember");
-    expect(container.querySelector(".font-bold")).toBeInTheDocument();
+  it("marks an unread card with a bold title and no extra dot", () => {
+    const { card } = renderCard({ unread: true });
+    expect(card).toHaveAttribute("data-unread", "true");
+    expect(screen.getByText("Ship it").className).toContain("font-bold");
+    expect(screen.getByText("Unread:")).toHaveClass("sr-only");
+    expect(card.querySelector(".rounded-full.bg-accent-ember")).toBeNull();
+
+    cleanup();
+    const read = renderCard();
+    expect(read.card).not.toHaveAttribute("data-unread");
+    expect(screen.getByText("Ship it").className).toContain("font-semibold");
   });
 
-  it("shows the woke pill alongside an unread dot", () => {
-    renderCard({ unread: true, woke: true });
+  it("shows the woke pill on an unread card", () => {
+    const { card } = renderCard({ unread: true, woke: true });
     expect(
       screen.getByLabelText('"Ship it" woke from snooze'),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('Unread — "Ship it"')).toBeInTheDocument();
+    expect(card).toHaveAttribute("data-unread", "true");
   });
 
   it("offers Mark unread only while the card is read", async () => {

@@ -485,6 +485,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               tabIndex={0}
               data-inbox-card={workspace.workspace_id}
               data-selected={selected || undefined}
+              data-unread={unread || undefined}
               onClick={handleClick}
               onKeyDown={(e) => {
                 // Same guard the settled and snoozed rows use: this card hosts
@@ -729,20 +730,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
               {/* Title line: work title + linked-issue chip */}
               <div className="mt-1 flex min-w-0 items-center gap-1.5">
-                {/* Unread dot. Deliberately ember and deliberately NOT on the
-                    eyebrow: "the agent finished and you haven't looked" is a
-                    different claim from "Done · review" (which a card keeps
-                    long after it has been read), so it must not borrow the
-                    green those states own, and it must survive a hover that
-                    swaps the eyebrow's right side out. */}
-                {unread && (
-                  <span
-                    role="img"
-                    aria-label={`Unread — "${workspace.title}"`}
-                    title="New agent output since you last opened this workspace"
-                    className="size-1.5 shrink-0 rounded-full bg-accent-ember"
-                  />
-                )}
+                {/* No visible unread dot: the eyebrow status and full-brightness
+                    card already say "look here", so unread is carried by the
+                    bolder title alone. Screen readers still get it spelled out. */}
+                {unread && <span className="sr-only">Unread: </span>}
                 <span
                   className={cn(
                     "truncate text-[13px] leading-[1.35] transition-colors duration-150",
@@ -750,8 +741,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
                       : "text-foreground",
                     // The extra weight is what makes an unread card readable
-                    // as unread at a glance down a scrolling list, where a
-                    // 6px dot alone is easy to sweep past.
+                    // as unread at a glance down a scrolling list.
                     unread ? "font-bold" : "font-semibold",
                   )}
                 >
