@@ -9,7 +9,7 @@
  * runs over the iroh pipe unchanged.
  *
  * The screens reuse the standalone pairing aesthetic (shared styles exported
- * from `bootstrap.tsx`) and the Stage-A password derivation
+ * from `bootstrap-ui.tsx`) and the Stage-A password derivation
  * (`deriveAuthSecret`), so the hosted flow looks and feels like the LAN pairing
  * flow it replaces.
  */
@@ -23,7 +23,7 @@ import {
   overlayStyle,
   primaryButtonStyle,
   switchLinkStyle,
-} from "./bootstrap";
+} from "./bootstrap-ui";
 import { deriveAuthSecret } from "./auth-derivation";
 import {
   DeviceRegistry,
