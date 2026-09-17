@@ -155,7 +155,7 @@ export function BrowserPeekOverlay() {
               aria-label="Open in side panel"
               className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
-              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+              <ExternalLink className="size-3.5" aria-hidden />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>
@@ -168,7 +168,7 @@ export function BrowserPeekOverlay() {
           aria-label="Close preview"
           className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
         >
-          <X className="h-3.5 w-3.5" aria-hidden />
+          <X className="size-3.5" aria-hidden />
         </button>
       </PanelHeader>
       <div className="min-h-0 flex-1">

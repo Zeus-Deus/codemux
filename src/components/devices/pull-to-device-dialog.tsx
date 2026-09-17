@@ -37,6 +37,7 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useHostsStore } from "@/stores/hosts-store";
 
 import { remoteProjectName } from "./use-device-cards";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -652,7 +653,7 @@ function SummaryRow({
 }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-[68px] shrink-0 text-label uppercase tracking-wider text-muted-foreground/55">
+      <dt className={cn(eyebrowVariants(), "w-[68px] shrink-0")}>
         {label}
       </dt>
       <dd

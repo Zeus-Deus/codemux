@@ -99,6 +99,7 @@ import {
   workspaceRowSubtitle,
   workspaceSearchText,
 } from "./command-palette-model";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   open: boolean;
@@ -974,9 +975,9 @@ function GroupHeader({
         !first && "mt-2",
       )}
     >
-      <span className="font-mono text-caption tracking-[0.15em] text-muted-foreground/70 uppercase">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       <span className="h-px flex-1 bg-border/60" />
       <span className="font-mono text-caption text-muted-foreground/50">{count}</span>
     </div>

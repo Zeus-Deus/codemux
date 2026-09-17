@@ -124,6 +124,7 @@ import { useDefaultBranch } from "./default-branch-cache";
 import { useDetectedEditors } from "@/stores/editor-discovery-store";
 import { computeSnoozePresets } from "./sidebar-snooze";
 import { useUIStore } from "@/stores/ui-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -215,7 +216,7 @@ export function DeleteWorktreeDialog({
 
         {(forceMessage !== null || hasWarnings) && (
           <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <AlertTriangle className="size-3.5 shrink-0" />
             {forceMessage ?? warningMessage}
           </div>
         )}
@@ -1105,15 +1106,15 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   );
   const sidebarElapsedSec = useElapsedSeconds(inFlightStartedAt);
   const icon = isPushOrPullInFlight ? (
-    <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
+    <Loader2 className="size-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
-    <Cloud className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <Cloud className="size-3.5 shrink-0 text-muted-foreground" />
   ) : isPrimary ? (
-    <Laptop className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <Laptop className="size-3.5 shrink-0 text-muted-foreground" />
   ) : showWorkspaceIconAsPr ? (
     <PrStatusIcon state={workspace.pr_state} size={3.5} />
   ) : (
-    <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
   );
 
   const prHumanState = humanizePrState(workspace.pr_state);
@@ -1407,7 +1408,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <BellOff
-                        className="h-3 w-3 shrink-0 text-muted-foreground/60"
+                        className="size-3 shrink-0 text-muted-foreground/60"
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
@@ -1452,9 +1453,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           align="start"
                           className="w-64 p-2"
                         >
-                          <div className="mb-1.5 font-mono text-caption uppercase tracking-wide text-muted-foreground/70">
+                          <Eyebrow className="mb-1.5">
                             Shipped from this workspace
-                          </div>
+                          </Eyebrow>
                           <ul className="space-y-1">
                             {shipped?.map((r) => (
                               <li
@@ -1624,7 +1625,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <BellOff
-                              className="h-3 w-3 text-muted-foreground/60"
+                              className="size-3 text-muted-foreground/60"
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>
@@ -1672,9 +1673,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               }
             >
               {isAttachOrRemote ? (
-                <X className="h-3.5 w-3.5" />
+                <X className="size-3.5" />
               ) : (
-                <Archive className="h-3.5 w-3.5" />
+                <Archive className="size-3.5" />
               )}
             </Button>
           </div>

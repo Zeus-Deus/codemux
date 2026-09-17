@@ -1,6 +1,7 @@
 import { useId, useLayoutEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** One line on the chart: a provider's per-bucket values under the
  *  active metric. `color` is any CSS color the SVG can paint with —
@@ -355,9 +356,9 @@ export function UsageAreaChart({
               : { left: Math.min(hoverX + 12, Math.max(0, width - 180)) }
           }
         >
-          <p className="mb-1.5 font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground">
+          <Eyebrow className="mb-1.5">
             {hoveredPoint.subLabel}
-          </p>
+          </Eyebrow>
           <ul className="flex flex-col gap-1">
             {series.map((s) => (
               <li
@@ -366,7 +367,7 @@ export function UsageAreaChart({
               >
                 <span className="inline-flex items-center gap-2 text-foreground/85">
                   <span
-                    className="h-2 w-2 shrink-0 rounded-sm"
+                    className="size-2 shrink-0 rounded-sm"
                     style={{ background: s.color, opacity: s.opacity ?? 1 }}
                     aria-hidden
                   />

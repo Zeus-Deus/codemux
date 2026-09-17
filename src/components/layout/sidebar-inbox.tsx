@@ -88,6 +88,7 @@ import {
   useFrozenActiveDraftRow,
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -414,13 +415,13 @@ function ShelfHeader({
       <ChevronRight
         aria-hidden="true"
         className={cn(
-          "size-2.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150",
           !collapsed && "rotate-90",
         )}
       />
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       {showCount && (
         <span className="font-mono text-caption tabular-nums text-muted-foreground/70">
           ({count})
@@ -447,9 +448,9 @@ function WrappingUpDivider() {
       data-wrapping-up-divider
       className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
+      <Eyebrow>
         Wrapping up
-      </span>
+      </Eyebrow>
       <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
     </div>
   );
@@ -827,7 +828,7 @@ const SnoozeRow = memo(function SnoozeRow({
         />
         <AlarmClock
           aria-hidden="true"
-          className="h-3 w-3 shrink-0 text-muted-foreground/60"
+          className="size-3 shrink-0 text-muted-foreground/60"
         />
         <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
@@ -856,7 +857,7 @@ const SnoozeRow = memo(function SnoozeRow({
             "group-hover/snoozed:inline-flex group-focus-within/snoozed:inline-flex",
           )}
         >
-          <AlarmClock className="h-2.5 w-2.5" />
+          <AlarmClock className="size-3" />
           Wake now
         </button>
       </div>
@@ -2057,9 +2058,9 @@ export function SidebarInbox() {
             )}
           >
             {pw.status === "creating" ? (
-              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
             ) : (
-              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+              <AlertCircle className="size-3.5 shrink-0 text-destructive" />
             )}
             <span className="truncate text-label text-muted-foreground">
               {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}

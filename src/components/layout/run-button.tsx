@@ -137,7 +137,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
                 BAND_CONTROL_HOVER,
               )}
             >
-              <ChevronDown className="h-3 w-3" />
+              <ChevronDown className="size-3" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>

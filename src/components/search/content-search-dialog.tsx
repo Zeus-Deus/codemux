@@ -163,7 +163,7 @@ export function ContentSearchDialog() {
               onClick={() => setCaseSensitive(!caseSensitive)}
               className={caseSensitive ? "bg-primary/20 text-primary" : ""}
             >
-              <CaseSensitive className="h-3.5 w-3.5" />
+              <CaseSensitive className="size-3.5" />
             </Button>
             <Button
               variant={useRegex ? "secondary" : "ghost"}
@@ -172,7 +172,7 @@ export function ContentSearchDialog() {
               onClick={() => setUseRegex(!useRegex)}
               className={useRegex ? "bg-primary/20 text-primary" : ""}
             >
-              <Regex className="h-3.5 w-3.5" />
+              <Regex className="size-3.5" />
             </Button>
             {results.length > 0 && (
               <span className="ml-2 text-label text-muted-foreground">
@@ -190,7 +190,7 @@ export function ContentSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (
@@ -228,7 +228,7 @@ export function ContentSearchDialog() {
             return (
               <div key={group.filePath} className="mb-1">
                 <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-card z-10">
-                  <FileCode className="h-3 w-3 shrink-0 text-muted-foreground" />
+                  <FileCode className="size-3 shrink-0 text-muted-foreground" />
                   <span className="text-label text-muted-foreground truncate">{group.filePath}</span>
                   <span className="text-caption text-muted-foreground/50 shrink-0">
                     ({group.matches.length})

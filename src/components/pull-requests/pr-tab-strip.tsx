@@ -108,7 +108,7 @@ export function PrTabStrip({
               }}
               className="hidden size-3 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground group-hover:flex"
             >
-              <X className="size-2.5" />
+              <X className="size-3" />
             </button>
           </span>
         );

@@ -248,7 +248,7 @@ export function WorkspaceStatusCluster() {
                 )}
               >
                 <AppWindow className="size-3.5" />
-                <ChevronUp className="size-2.5 opacity-50" />
+                <ChevronUp className="size-3 opacity-50" />
               </button>
             </PopoverTrigger>
             <PopoverContent

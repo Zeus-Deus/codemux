@@ -168,7 +168,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
           onClick={() => setSweepOpen(true)}
           className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
         >
-          <Trash2 className="size-2.5" aria-hidden />
+          <Trash2 className="size-3" aria-hidden />
           Sweep {count} settled
           {knownBytes !== null && knownBytes > 0 && (
             <span className="font-medium text-status-working/80">
@@ -571,7 +571,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-muted-foreground"
     >
-      <Plus className="size-2.5" aria-hidden strokeWidth={2.2} />
+      <Plus className="size-3" aria-hidden />
       Add device
     </button>
   );

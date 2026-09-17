@@ -45,12 +45,11 @@ export function SubagentBreadcrumb({
         onClick={onBack}
         className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-md px-2 text-body-sm font-semibold text-muted-foreground hover:bg-surface-2 hover:text-foreground"
       >
-        <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
+        <ChevronLeft className="size-3.5" aria-hidden />
         Orchestrator
       </button>
       <ChevronRight
-        className="h-3 w-3 shrink-0 text-muted-foreground/70"
-        strokeWidth={1.5}
+        className="size-3 shrink-0 text-muted-foreground/70"
         aria-hidden
       />
       <span className="flex min-w-0 items-center gap-2 text-body font-semibold text-foreground">
@@ -78,7 +77,7 @@ export function SubagentBreadcrumb({
         {isRunning(subagent) && (
           <span
             className={cn(
-              "cm-blink h-1.5 w-1.5 rounded-full",
+              "cm-blink size-1.5 rounded-full",
               subagent.status === "running"
                 ? "bg-status-working"
                 : "bg-muted-foreground",

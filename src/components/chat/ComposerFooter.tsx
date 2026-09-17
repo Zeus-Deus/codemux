@@ -173,7 +173,7 @@ export function ComposerFooter({
           aria-expanded={attachOpen}
           title="Attach (file, folder, mode, …)"
         >
-          <Plus className="h-4 w-4" strokeWidth={2.25} />
+          <Plus className="size-4" />
         </button>
       )}
 
@@ -312,7 +312,7 @@ export function ComposerFooter({
             aria-label="Stop"
             title="Stop"
           >
-            <Square className="h-3 w-3" fill="currentColor" />
+            <Square className="size-3" fill="currentColor" />
           </button>
         ) : (
           <button
@@ -328,7 +328,7 @@ export function ComposerFooter({
             aria-label="Send"
             title="Send"
           >
-            <ArrowUp className="h-4 w-4" strokeWidth={2.25} />
+            <ArrowUp className="size-4" />
           </button>
         )}
       </div>

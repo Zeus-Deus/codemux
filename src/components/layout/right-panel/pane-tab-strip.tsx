@@ -181,7 +181,7 @@ function DeckTabChip({
           active ? "pr-[20px]" : "pr-[9px]",
         )}
       >
-        <Icon className="size-[13px] shrink-0" strokeWidth={1.6} />
+        <Icon className="size-[13px] shrink-0" />
         <span className="max-w-[140px] truncate">{tab.label}</span>
         {badge}
       </button>
@@ -208,7 +208,7 @@ function DeckTabChip({
                 ),
           )}
         >
-          <X className="size-[10px]" strokeWidth={1.8} />
+          <X className="size-[10px]" />
         </button>
     </div>
   );
@@ -469,7 +469,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             data-testid="right-panel-add-pane"
             className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
           >
-            <Plus className="size-[13px]" strokeWidth={1.7} />
+            <Plus className="size-[13px]" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -488,7 +488,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
               className="h-[30px] rounded-md px-[9px] text-body font-medium"
               onClick={surface.onOpen}
             >
-              <surface.icon className="size-[14px]" strokeWidth={1.5} />
+              <surface.icon className="size-[14px]" />
               {surface.label}
             </DropdownMenuItem>
           ))}
@@ -497,7 +497,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             className="h-[30px] rounded-md px-[9px] text-body font-medium"
             onClick={onOpenFile}
           >
-            <Search className="size-[14px]" strokeWidth={1.5} />
+            <Search className="size-[14px]" />
             Open file…
             {openFileKeys && (
               <DropdownMenuShortcut className="font-mono text-caption">

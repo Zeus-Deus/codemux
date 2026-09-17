@@ -174,7 +174,7 @@ export function IssueDetailPopover({
                   className="w-full justify-center"
                   onClick={() => openUrl(fullIssue.url)}
                 >
-                  <ExternalLink className="h-3 w-3" />
+                  <ExternalLink className="size-3" />
                   Open on {provider.name}
                 </Button>
               )}

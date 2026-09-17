@@ -168,9 +168,9 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Send now"
                   title="Interrupt current work and send this message now — progress so far is kept"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
-                  <CornerDownLeft className="h-2.5 w-2.5" aria-hidden />
+                  <CornerDownLeft className="size-3" aria-hidden />
                 </button>
               ) : null}
               {onCancelQueued ? (
@@ -179,14 +179,14 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Cancel queued message"
                   title="Remove from queue and return to the composer"
                   onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                  className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
-                  <X className="h-2.5 w-2.5" aria-hidden />
+                  <X className="size-3" aria-hidden />
                 </button>
               ) : null}
             </div>
             <span className="inline-flex h-4 items-center gap-1 text-caption font-medium text-muted-foreground/55">
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/45" aria-hidden />
+              <span className="size-1 rounded-full bg-muted-foreground/45" aria-hidden />
               Queued
             </span>
           </div>
@@ -215,7 +215,7 @@ export const UserMessage = memo(function UserMessage({
                 )}
                 data-testid="revert-turn-button"
               >
-                <Undo2 className="h-3 w-3" aria-hidden />
+                <Undo2 className="size-3" aria-hidden />
                 {reverting ? "Reverting…" : "Revert"}
               </button>
             ) : null}
@@ -254,7 +254,7 @@ function ImageThumbnail({
         className="flex h-20 w-28 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
         aria-label="Image failed to load"
       >
-        <ImageOff className="h-5 w-5 opacity-40" aria-hidden />
+        <ImageOff className="size-5 opacity-40" aria-hidden />
       </div>
     );
   }
@@ -285,7 +285,7 @@ function LightboxImage({ image }: { image: UserMessageImage }) {
   if (failed || !src) {
     return (
       <div className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
-        <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
+        <ImageOff className="size-8 opacity-40" aria-hidden />
         <span className="text-label">Failed to load image</span>
       </div>
     );

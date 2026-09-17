@@ -14,7 +14,7 @@ export function UsageSeverityBadge({ severity }: UsageSeverityBadgeProps) {
       role="img"
       aria-label={severity === "high" ? "High usage" : "Elevated usage"}
       className={cn(
-        "h-1.5 w-1.5 shrink-0 rounded-full",
+        "size-1.5 shrink-0 rounded-full",
         severity === "high" ? "bg-danger" : "bg-warning",
       )}
     />

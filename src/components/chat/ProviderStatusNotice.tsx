@@ -76,7 +76,7 @@ export function ProviderStatusNotice({
           )}
         />
         <div className="flex items-center gap-2 py-1.5 pl-3 pr-1.5">
-          <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
           <div
             className="min-w-0 select-text line-clamp-2"
             title={report.message ?? undefined}
@@ -93,7 +93,7 @@ export function ProviderStatusNotice({
             onClick={() => dismiss(provider)}
             className="shrink-0 rounded-sm p-0.5 opacity-60 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           >
-            <X className="h-3.5 w-3.5" aria-hidden />
+            <X className="size-3.5" aria-hidden />
           </button>
         </div>
       </div>

@@ -336,7 +336,6 @@ function SubagentRunRow({
         View
         <ChevronRight
           className="size-3 transition-transform group-hover/subagents:translate-x-0.5"
-          strokeWidth={1.7}
           aria-hidden
         />
       </span>
@@ -349,13 +348,12 @@ function StepGlyph({ status }: { status: StepStatus }) {
     return (
       <LoaderCircle
         className="size-3 animate-spin text-muted-foreground/70"
-        strokeWidth={1.8}
         aria-hidden
       />
     );
   }
   if (status === "error") {
-    return <X className="size-3 text-status-attention" strokeWidth={2} aria-hidden />;
+    return <X className="size-3 text-status-attention" aria-hidden />;
   }
-  return <Check className="size-3 text-status-open" strokeWidth={2} aria-hidden />;
+  return <Check className="size-3 text-status-open" aria-hidden />;
 }

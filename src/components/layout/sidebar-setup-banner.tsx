@@ -116,7 +116,7 @@ export function SidebarSetupBanner() {
               className="shrink-0 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
               onClick={handleDismiss}
             >
-              <X className="h-3 w-3" />
+              <X className="size-3" />
             </Button>
           </div>
           <p className="text-label font-semibold text-foreground">Setup scripts</p>

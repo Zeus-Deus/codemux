@@ -761,7 +761,7 @@ export const RightPanel = memo(function RightPanel({
                       : "bg-surface-3 text-foreground",
                   )}
                 >
-                  <ListFilter className="size-[13px]" strokeWidth={1.6} />
+                  <ListFilter className="size-[13px]" />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">

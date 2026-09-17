@@ -32,18 +32,18 @@ import {
 
 function ReviewStateIcon({ state }: { state: string }) {
   if (state === "APPROVED")
-    return <ShieldCheck className="h-3 w-3 text-success shrink-0" />;
+    return <ShieldCheck className="size-3 text-success shrink-0" />;
   if (state === "CHANGES_REQUESTED")
-    return <ShieldAlert className="h-3 w-3 text-warning shrink-0" />;
+    return <ShieldAlert className="size-3 text-warning shrink-0" />;
   if (state === "PENDING")
-    return <Clock className="h-3 w-3 text-muted-foreground shrink-0" />;
-  return <MessageSquare className="h-3 w-3 text-muted-foreground shrink-0" />;
+    return <Clock className="size-3 text-muted-foreground shrink-0" />;
+  return <MessageSquare className="size-3 text-muted-foreground shrink-0" />;
 }
 
 function AuthorAvatar({ name }: { name: string }) {
   const initial = name ? name[0].toUpperCase() : "?";
   return (
-    <div className="h-5 w-5 rounded-full bg-muted flex items-center justify-center shrink-0">
+    <div className="size-5 rounded-full bg-muted flex items-center justify-center shrink-0">
       <span className={cn("font-medium text-muted-foreground", tzMeta)}>
         {initial}
       </span>
@@ -84,7 +84,7 @@ function CopyButton({ text }: { text: string }) {
       {copied ? (
         <span className={cn("text-success", tzEyebrow)}>ok</span>
       ) : (
-        <Copy className="h-3 w-3" />
+        <Copy className="size-3" />
       )}
     </Button>
   );
@@ -425,7 +425,7 @@ function ResolvedThread(props: ThreadProps) {
       >
         <ChevronRight
           className={cn(
-            "h-3 w-3 shrink-0 text-muted-foreground transition-transform",
+            "size-3 shrink-0 text-muted-foreground transition-transform",
             open && "rotate-90",
           )}
         />

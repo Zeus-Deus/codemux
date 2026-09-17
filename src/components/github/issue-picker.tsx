@@ -5,6 +5,7 @@ import { CircleDot, CircleCheck, Search, Loader2 } from "lucide-react";
 import { listGithubIssues, listGithubIssuesByPath } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 function IssueRow({
   issue,
@@ -222,9 +223,9 @@ export function IssuePickerPanel({
     <div onKeyDown={handleKeyDown} data-testid="issue-picker-panel">
       {/* Header */}
       <div className="flex items-center justify-between px-3 pt-2.5 pb-1">
-        <span className="text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Open Issues
-        </span>
+        </Eyebrow>
       </div>
 
       {/* Search */}
@@ -277,7 +278,7 @@ export function IssuePickerPanel({
         )}
         {serverSearching && displayIssues.length > 0 && (
           <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
-            <Loader2 className="h-3 w-3 animate-spin" />
+            <Loader2 className="size-3 animate-spin" />
             Searching...
           </div>
         )}

@@ -45,7 +45,7 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
           title="Copy Selector"
           onClick={copySelector}
         >
-          {copied ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
+          {copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
         </Button>
         <Button
           variant="ghost"
@@ -54,7 +54,7 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
           title="Tell Agent"
           onClick={() => onTellAgent(element.selector)}
         >
-          <Terminal className="h-3 w-3" />
+          <Terminal className="size-3" />
         </Button>
         <Button
           variant="ghost"
@@ -63,7 +63,7 @@ export function InspectorPanel({ element, onDismiss, onTellAgent }: Props) {
           title="Dismiss"
           onClick={onDismiss}
         >
-          <X className="h-3 w-3" />
+          <X className="size-3" />
         </Button>
       </div>
     </div>

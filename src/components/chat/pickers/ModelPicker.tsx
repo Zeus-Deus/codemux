@@ -110,15 +110,14 @@ export function ModelPicker({
           disabled={disabled}
           className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-4 w-4 shrink-0" />
+          <ProviderLogo provider={provider} className="size-4 shrink-0" />
           <span className="max-w-[140px] truncate">
             {leafLabel
               ? leafModelName(modelLabel(provider, current))
               : modelLabel(provider, current)}
           </span>
           <ChevronDown
-            className="-mx-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
-            strokeWidth={2.25}
+            className="-mx-0.5 size-3.5 shrink-0 opacity-70"
           />
         </button>
       </PopoverTrigger>
@@ -143,7 +142,7 @@ export function ModelPicker({
                 >
                   <ProviderLogo
                     provider={provider}
-                    className="h-3.5 w-3.5 shrink-0"
+                    className="size-3.5 shrink-0"
                   />
                   <div className="min-w-0 flex-1">
                     <div className="truncate">{model.label}</div>
@@ -158,7 +157,7 @@ export function ModelPicker({
                   </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 shrink-0 text-muted-foreground",
+                      "size-3.5 shrink-0 text-muted-foreground",
                       current === model.id ? "opacity-100" : "opacity-0",
                     )}
                   />

@@ -89,7 +89,7 @@ function TitlebarPinToggle({
           useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
         }}
         className={cn(
-          "flex h-5 w-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          "flex size-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
           pinned
             ? "text-accent-ember hover:text-accent-ember/80"
             : "absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 group-hover/command-item:opacity-100 group-data-selected/command-item:opacity-100 hover:text-foreground",
@@ -264,9 +264,9 @@ function LauncherFooter({ onSelect }: { onSelect: () => void }) {
         showCheckmark={false}
         className="h-[34px] rounded-md px-2 py-0 text-body"
       >
-        <Settings className="h-3.5 w-3.5 text-muted-foreground" />
+        <Settings className="size-3.5 text-muted-foreground" />
         <span className="flex-1 text-muted-foreground">Manage presets…</span>
-        <ExternalLink className="h-3 w-3 text-muted-foreground/70" />
+        <ExternalLink className="size-3 text-muted-foreground/70" />
       </CommandItem>
     </CommandGroup>
   );
@@ -369,14 +369,14 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
           aria-label="Launch an agent"
           data-testid="agent-launcher-trigger"
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors",
             BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"
               : "text-muted-foreground hover:bg-accent hover:text-foreground",
           )}
         >
-          <Plus className="h-4 w-4" />
+          <Plus className="size-4" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -413,7 +413,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                     showCheckmark={false}
                     className={LAUNCHER_ITEM_CLASS}
                   >
-                    <PresetIcon icon={preset.icon} className="h-4 w-4" />
+                    <PresetIcon icon={preset.icon} className="size-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     {preset.pinned && <PresetPinnedBadge presetId={preset.id} />}
                     <TitlebarPinToggle
@@ -441,7 +441,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                     showCheckmark={false}
                     className={LAUNCHER_ITEM_CLASS}
                   >
-                    <PresetIcon icon={preset.icon} className="h-4 w-4" />
+                    <PresetIcon icon={preset.icon} className="size-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     <TitlebarPinToggle
                       presetId={preset.id}
@@ -458,7 +458,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                 showCheckmark={false}
                 className={LAUNCHER_ITEM_CLASS}
               >
-                <Terminal className="h-4 w-4" />
+                <Terminal className="size-4" />
                 <span className="flex-1">Terminal</span>
               </CommandItem>
               <CommandItem
@@ -467,7 +467,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                 showCheckmark={false}
                 className={LAUNCHER_ITEM_CLASS}
               >
-                <Globe className="h-4 w-4" />
+                <Globe className="size-4" />
                 <span className="flex-1">Browser</span>
               </CommandItem>
             </CommandGroup>
@@ -533,7 +533,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           data-testid="draft-agent-launcher-trigger"
           disabled={draft.promoting}
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors",
             BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"
@@ -541,7 +541,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
             draft.promoting && "opacity-40 pointer-events-none",
           )}
         >
-          <Plus className="h-4 w-4" />
+          <Plus className="size-4" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -568,7 +568,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                     showCheckmark={false}
                     className={LAUNCHER_ITEM_CLASS}
                   >
-                    <PresetIcon icon={preset.icon} className="h-4 w-4" />
+                    <PresetIcon icon={preset.icon} className="size-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     <LauncherDestination presetId={`draft-${preset.id}`}>
                       in app
@@ -591,7 +591,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
                     showCheckmark={false}
                     className={LAUNCHER_ITEM_CLASS}
                   >
-                    <PresetIcon icon={preset.icon} className="h-4 w-4" />
+                    <PresetIcon icon={preset.icon} className="size-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     <LauncherDestination presetId={`draft-${preset.id}`}>
                       terminal
