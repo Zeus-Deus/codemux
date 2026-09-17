@@ -1149,7 +1149,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
     expect(row).not.toBeNull();
-    expect(row).toHaveClass("bg-foreground/[0.06]");
+    expect(row).toHaveAttribute("data-active", "true");
     expect(activateWorkspace).not.toHaveBeenCalled();
   });
 
@@ -2091,7 +2091,7 @@ describe("SidebarInbox — idle-clock seeding", () => {
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
     expect(row).not.toBeNull();
-    expect(row).toHaveClass("bg-foreground/[0.06]");
+    expect(row).toHaveAttribute("data-active", "true");
     expect(activateWorkspace).not.toHaveBeenCalled();
   });
 });
