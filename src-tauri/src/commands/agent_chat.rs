@@ -8080,6 +8080,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

@@ -57,6 +57,10 @@ impl SourceControlProvider for GitHubProvider {
         github::get_workspace_pr(repo_path)
     }
 
+    fn workspace_pull_requests(&self, repo_path: &Path) -> Result<Vec<PullRequestInfo>, String> {
+        github::get_workspace_prs(repo_path)
+    }
+
     fn list_pull_requests(
         &self,
         repo_path: &Path,

@@ -21,8 +21,8 @@ import {
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
-  PrStatusIcon,
   normalizePrState,
+  PrStatusIcon,
   prStatusRecededCardHoverClass,
   prStatusTextClass,
 } from "@/components/github/pr-status-icon";
@@ -40,6 +40,11 @@ import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import { providerForWorkspace, providerRef } from "@/lib/source-control";
+import {
+  prSetLabel,
+  prSetSummary,
+  workspacePrs,
+} from "@/lib/workspace-prs";
 
 export interface InboxRepo {
   name: string;
@@ -293,7 +298,20 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       ? workspace.linked_issue.title
       : workspace.title;
 
-  const prState = normalizePrState(workspace.pr_state);
+  // The workspace's whole PR set, not just the scalar head: an agent handed a
+  // multi-part plan lands a branch and a PR per concern, and a badge that names
+  // one of nine is worse than no badge — it reads as "this workspace made one
+  // PR". `prState` is the set's aggregate, so a stack with open work left still
+  // reads as open even once its earliest PRs have merged.
+  const prs = workspacePrs(workspace);
+  const prSummary = prSetSummary(prs);
+  // `?? normalizePrState(...)`: a stored state with no number is a real, if
+  // odd, association — the badge has always rendered as an icon alone there,
+  // and the set cannot represent it because a PR without a number is not a PR
+  // you can open. The scalar keeps answering for that one case.
+  const prState = prSummary.state ?? normalizePrState(workspace.pr_state);
+  const primaryPr = prs[0] ?? null;
+  const extraPrCount = prSummary.total - 1;
   // `scProvider` — the *hosting* product. Distinct from `providers`
   // above, which is the set of AI agent backends running in this
   // workspace's panes.
@@ -310,7 +328,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event: e });
+    if (primaryPr?.url) void openExternalUrl(primaryPr.url, { event: e });
   };
 
   // The official mark of each agent provider chatting in this workspace
@@ -846,12 +864,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     onAuxClick={(e) => {
                       if (e.button === 1) handlePrClick(e);
                     }}
-                    disabled={!workspace.pr_url}
-                    aria-label={
-                      workspace.pr_number
-                        ? `${scProvider.nounTitle} ${providerRef(scProvider, workspace.pr_number)} — ${prState}`
-                        : `${scProvider.nounTitle} — ${prState}`
-                    }
+                    disabled={!primaryPr?.url}
+                    aria-label={prSetLabel(scProvider, prs, prSummary, prState)}
                     className={cn(
                       "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
@@ -861,7 +875,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                             prStatusRecededCardHoverClass(prState),
                           )
                         : prStatusTextClass(prState),
-                      workspace.pr_url
+                      primaryPr?.url
                         ? "hover:bg-foreground/[0.055]"
                         : // `cursor-default`, not `pointer-events-none`: the
                           // chip is already `disabled`, so it swallows the
@@ -880,8 +894,15 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         visuallyReceded && "text-current",
                       )}
                     />
-                    {workspace.pr_number != null && (
-                      <span>{providerRef(scProvider, workspace.pr_number)}</span>
+                    {primaryPr && (
+                      <span>{providerRef(scProvider, primaryPr.number)}</span>
+                    )}
+                    {/* The rest of the set. Written as `+8` rather than a
+                        total like `9` because the number beside it is a
+                        specific PR the click opens — a bare count next to
+                        `#372` would read as part of that reference. */}
+                    {extraPrCount > 0 && (
+                      <span className="opacity-70">+{extraPrCount}</span>
                     )}
                   </button>
                 )}

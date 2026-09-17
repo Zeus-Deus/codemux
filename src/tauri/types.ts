@@ -835,6 +835,23 @@ export interface LinkedIssue {
   labels: string[];
 }
 
+/** One pull request a workspace owns.
+ *
+ *  A workspace produces a set of PRs, not one — an agent given a multi-part
+ *  plan routinely lands a branch and a PR per concern. See `lib/workspace-prs`
+ *  for the helpers that read this set. */
+export interface WorkspacePrRef {
+  number: number;
+  /** Display state, already collapsed by the backend so `DRAFT` is a state
+   *  here rather than a separate flag. */
+  state: string;
+  url: string;
+  head_branch?: string | null;
+  /** The branch this PR merges into. A PR whose base is another PR's head in
+   *  the same set is stacked on it. */
+  base_branch?: string | null;
+}
+
 export type GhStatus =
   | { status: "NotInstalled" }
   | { status: "NotAuthenticated" }
@@ -1089,6 +1106,12 @@ export interface WorkspaceSnapshot {
    *  Optional because older persisted snapshots have no such field; `null` /
    *  absent is read as the pre-field case and settles as before. */
   pr_head_branch?: string | null;
+  /** Every PR this workspace owns, primary first.
+   *
+   *  The `pr_*` scalars above are this list's head. An empty or absent list
+   *  means "no PRs found" — or, for a snapshot persisted before the field
+   *  existed, "read the scalars instead"; `workspacePrs()` handles both. */
+  prs?: WorkspacePrRef[];
   /** Which hosting product this checkout's remotes point at — `"github"`,
    *  `"gitlab"`, `"bitbucket"`, `"azure_devops"`. `null` when there is no
    *  remote or the host isn't recognised.

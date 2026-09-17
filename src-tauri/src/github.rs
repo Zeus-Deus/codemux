@@ -1651,6 +1651,229 @@ fn select_first_candidate_pr(
     })
 }
 
+/// Upper bound on worktree-owned branches considered in one sweep. A stack
+/// deep enough to exceed this is past the point where a sidebar pill is the
+/// right surface for it anyway.
+const WORKTREE_BRANCH_LIMIT: usize = 32;
+
+/// Repo-wide PR page size for the worktree-owned-branch list. Larger than
+/// [`FALLBACK_PR_LIST_LIMIT`] because this list must include history: the
+/// whole point of the set is to show that the early PRs of a stack merged
+/// while the later ones have not.
+const WORKTREE_PR_LIST_LIMIT: &str = "100";
+
+type WorktreePrListCache = Mutex<HashMap<String, (Instant, Arc<Vec<serde_json::Value>>)>>;
+static WORKTREE_PR_LIST_CACHE: OnceLock<WorktreePrListCache> = OnceLock::new();
+
+/// One repo-wide `gh pr list --state all`, memoized for
+/// [`FALLBACK_PR_LIST_TTL`].
+///
+/// Deliberately a second cache rather than widening [`fallback_pr_list`] to
+/// `--state all`: that list is capped at 50 rows, and on a busy repo the 50
+/// most recent PRs are mostly merged, so admitting history there would push
+/// the open PRs the side-branch fallback looks for off the end of the page.
+///
+/// It is only ever reached for a workspace that owns branches beyond its own
+/// checked-out one — the ordinary one-branch workspace never pays for it.
+fn worktree_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, String> {
+    let key = fallback_pr_list_key(repo_path);
+    let cache = WORKTREE_PR_LIST_CACHE.get_or_init(WorktreePrListCache::default);
+
+    memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
+        let output = run_gh_timed(
+            repo_path,
+            &[
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                WORKTREE_PR_LIST_LIMIT,
+                "--json",
+                BRANCH_PR_JSON_FIELDS,
+            ],
+            BRANCH_PR_LOOKUP_TIMEOUT,
+        )?;
+        let value: serde_json::Value =
+            serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+        Ok(Arc::new(value.as_array().cloned().unwrap_or_default()))
+    })
+}
+
+/// The branches this worktree owns, oldest commit first.
+///
+/// `refs/heads` is shared by every worktree of a repository, so "the local
+/// branches" is the wrong question — it would hand this workspace all 300+
+/// branches every other workspace ever made. The worktree-scoped question is
+/// asked through `HEAD`, which *is* per-worktree:
+///
+/// * `--merged HEAD` keeps only branches reachable from this checkout, and
+/// * `--no-merged <upstream default>` drops everything already shipped.
+///
+/// What survives is exactly the work this checkout is carrying and has not
+/// landed yet — for a stack, the whole chain, including branches that were
+/// created with `git branch` and never checked out. That last case is why the
+/// reflog fallback alone is not enough: it scans *checkouts*, and an agent
+/// cutting a branch per commit never checks any of them out.
+///
+/// Ordered by committer date so a stack comes back bottom-up, which is the
+/// order a reviewer reads it in.
+///
+/// Returns empty rather than guessing whenever the default branch is unknown
+/// or has no local ref to exclude against: with no exclusion the query
+/// degenerates to "every branch in the repo", and over-claiming another
+/// workspace's PRs is a worse failure than showing none.
+fn worktree_owned_branches(repo_path: &Path, lookup: &BranchPrLookup) -> Vec<String> {
+    let Some(default_branch) = lookup.default_branch.as_deref() else {
+        return Vec::new();
+    };
+    let remote_ref = format!("refs/remotes/origin/{default_branch}");
+    let exclude = if run_git_optional(
+        repo_path,
+        &["rev-parse", "--verify", "--quiet", &remote_ref],
+    )
+    .is_some()
+    {
+        format!("origin/{default_branch}")
+    } else if run_git_optional(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{default_branch}"),
+        ],
+    )
+    .is_some()
+    {
+        default_branch.to_string()
+    } else {
+        return Vec::new();
+    };
+
+    let Some(output) = run_git_optional(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--merged",
+            "HEAD",
+            "--no-merged",
+            &exclude,
+            "--sort=committerdate",
+            "--format=%(refname:short)",
+            "refs/heads/",
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .take(WORKTREE_BRANCH_LIMIT)
+        .collect()
+}
+
+/// Every PR this workspace owns, primary first.
+///
+/// A workspace produces a set, not a single PR: an agent handed a multi-part
+/// plan routinely lands a branch and a PR per concern. [`get_workspace_pr`]
+/// answers "which one PR best describes this workspace"; this answers "what
+/// has this workspace actually opened", which is what the sidebar needs in
+/// order to say *nine PRs, four merged* instead of naming one of them.
+///
+/// The primary is the current branch's own PR when it has one — branch
+/// identity still owns the badge — and otherwise the first still-open PR in
+/// the stack, falling back to the oldest. An already-merged bottom-of-stack
+/// is a poor summary of a stack that still has open work above it.
+///
+/// Error contract matches [`get_workspace_pr`] exactly: `Err` means the
+/// lookup could not answer and the stored set must be preserved, while an
+/// empty vector is the authoritative "this workspace has no PRs".
+pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<PullRequestInfo>, String> {
+    let lookup = resolve_branch_pr(repo_path)?;
+
+    let mut prs: Vec<PullRequestInfo> = Vec::new();
+    if let Some(pr) = lookup.pr.clone() {
+        prs.push(pr);
+    }
+
+    let owned: Vec<String> = worktree_owned_branches(repo_path, &lookup)
+        .into_iter()
+        .filter(|branch| branch != &lookup.branch)
+        .collect();
+
+    if !owned.is_empty() {
+        // A failure here must not erase the current branch's own answer, so
+        // the extra branches are best-effort: no rows means no extras.
+        if let Ok(rows) = worktree_pr_list(repo_path) {
+            let all: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
+            for branch in &owned {
+                let matching: Vec<PullRequestInfo> = all
+                    .iter()
+                    .filter(|pr| pr.head_branch.as_deref() == Some(branch.as_str()))
+                    .cloned()
+                    .collect();
+                if matching.is_empty() {
+                    continue;
+                }
+                let owner = resolve_branch_head_owner(repo_path, branch);
+                if let Some(pr) = select_branch_pr(matching, branch, owner.as_deref(), false) {
+                    if !prs.iter().any(|existing| existing.number == pr.number) {
+                        prs.push(pr);
+                    }
+                }
+            }
+        }
+    }
+
+    // Only when nothing at all was found does the weaker recently-checked-out
+    // fallback run, on the same terms as `get_workspace_pr`.
+    if prs.is_empty() && !lookup.is_default_branch() {
+        if let Some(pr) = get_side_branch_pr(repo_path, &lookup).unwrap_or(None) {
+            prs.push(pr);
+        }
+    }
+
+    promote_primary_pr(&mut prs, &lookup.branch);
+    Ok(prs)
+}
+
+/// Move the PR that should own the badge to the front of the set.
+///
+/// The current branch's PR wins outright; otherwise the first open one does.
+/// Order is otherwise preserved, so the rest of the stack stays bottom-up.
+fn promote_primary_pr(prs: &mut [PullRequestInfo], current_branch: &str) {
+    let primary = prs
+        .iter()
+        .position(|pr| pr.head_branch.as_deref() == Some(current_branch))
+        .or_else(|| prs.iter().position(|pr| !is_historical_pr_state(&pr.state)));
+    if let Some(index) = primary {
+        prs[..=index].rotate_right(1);
+    }
+}
+
+/// What a workspace-wide PR lookup should do to the stored set. Mirrors
+/// [`BranchPrOutcome`] arm for arm, for the same reason: an unanswerable
+/// lookup must never be mistaken for an authoritative empty set.
+#[derive(Debug, Clone)]
+pub enum WorkspacePrsOutcome {
+    Write(Vec<PullRequestInfo>),
+    Clear,
+    Preserve,
+}
+
+/// Single decision point shared by the poller and `refresh_workspace_pr`.
+pub fn workspace_prs_outcome(lookup: Result<Vec<PullRequestInfo>, String>) -> WorkspacePrsOutcome {
+    match lookup {
+        Ok(prs) if prs.is_empty() => WorkspacePrsOutcome::Clear,
+        Ok(prs) => WorkspacePrsOutcome::Write(prs),
+        Err(_) => WorkspacePrsOutcome::Preserve,
+    }
+}
+
 /// The PR a workspace should show a badge for.
 ///
 /// The current branch owns the association whenever it has one, in any state
@@ -5038,5 +5261,72 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         // rather than being read as "exhausted until the epoch".
         assert!(parse_rate_limit("not json at all").is_err());
         assert!(parse_rate_limit(r#"{"message":"Bad credentials"}"#).is_err());
+    }
+
+    fn numbers(prs: &[PullRequestInfo]) -> Vec<u32> {
+        prs.iter().map(|pr| pr.number).collect()
+    }
+
+    #[test]
+    fn primary_is_the_current_branchs_pr_even_when_merged() {
+        // Branch identity owns the badge. A workspace sitting on a branch
+        // whose PR already merged must keep naming that PR, not jump to an
+        // unrelated open one further down the stack.
+        let mut prs = vec![
+            branch_pr(10, "OPEN", "stack/a", "2026-01-01T00:00:00Z", None),
+            branch_pr(
+                11,
+                "MERGED",
+                "feature/current",
+                "2026-01-02T00:00:00Z",
+                None,
+            ),
+        ];
+        promote_primary_pr(&mut prs, "feature/current");
+        assert_eq!(numbers(&prs), vec![11, 10]);
+    }
+
+    #[test]
+    fn primary_falls_back_to_the_first_open_pr_in_the_stack() {
+        // No PR on the checked-out branch: the bottom of the stack has
+        // merged, so the first PR still carrying work is the better summary.
+        let mut prs = vec![
+            branch_pr(20, "MERGED", "stack/01", "2026-01-01T00:00:00Z", None),
+            branch_pr(21, "MERGED", "stack/02", "2026-01-02T00:00:00Z", None),
+            branch_pr(22, "OPEN", "stack/03", "2026-01-03T00:00:00Z", None),
+            branch_pr(23, "OPEN", "stack/04", "2026-01-04T00:00:00Z", None),
+        ];
+        promote_primary_pr(&mut prs, "workspace-branch");
+        // 22 promoted; the rest keep their bottom-up stack order.
+        assert_eq!(numbers(&prs), vec![22, 20, 21, 23]);
+    }
+
+    #[test]
+    fn primary_leaves_a_fully_merged_stack_alone() {
+        let mut prs = vec![
+            branch_pr(30, "MERGED", "stack/01", "2026-01-01T00:00:00Z", None),
+            branch_pr(31, "CLOSED", "stack/02", "2026-01-02T00:00:00Z", None),
+        ];
+        promote_primary_pr(&mut prs, "workspace-branch");
+        assert_eq!(numbers(&prs), vec![30, 31]);
+    }
+
+    #[test]
+    fn workspace_prs_outcome_separates_empty_from_unanswerable() {
+        // The distinction is load-bearing: a dropped network must preserve
+        // the stored set, while a successful empty answer must clear it.
+        assert!(matches!(
+            workspace_prs_outcome(Ok(Vec::new())),
+            WorkspacePrsOutcome::Clear
+        ));
+        assert!(matches!(
+            workspace_prs_outcome(Err("gh exploded".into())),
+            WorkspacePrsOutcome::Preserve
+        ));
+        let one = vec![branch_pr(40, "OPEN", "b", "2026-01-01T00:00:00Z", None)];
+        match workspace_prs_outcome(Ok(one)) {
+            WorkspacePrsOutcome::Write(prs) => assert_eq!(numbers(&prs), vec![40]),
+            other => panic!("expected Write, got {other:?}"),
+        }
     }
 }

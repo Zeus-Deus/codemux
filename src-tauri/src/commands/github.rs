@@ -693,7 +693,7 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
         // but the CLI can resolve.
         let detected = git_provider::detect_provider(Path::new(&cwd_for_pr));
         let lookup = git_provider::provider_for_detection_or_default(&detected)
-            .workspace_pull_request(Path::new(&cwd_for_pr));
+            .workspace_pull_requests(Path::new(&cwd_for_pr));
         (detected, lookup)
     })
     .await
@@ -707,20 +707,14 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
     // error (or detached HEAD) → leave the stored info untouched. A failed
     // lookup is deliberately not an `Err` back to the frontend: a manual
     // refresh during a rebase should be a no-op, not an error toast.
-    match crate::github::branch_pr_outcome(lookup) {
-        crate::github::BranchPrOutcome::Write(pr) => {
-            state.update_workspace_pr_info(
-                &workspace_id,
-                Some(pr.number),
-                Some(pr.display_state()),
-                Some(pr.url),
-                pr.head_branch,
-            );
+    match crate::github::workspace_prs_outcome(lookup) {
+        crate::github::WorkspacePrsOutcome::Write(prs) => {
+            state.update_workspace_prs(&workspace_id, crate::workspace_pr_rows(prs));
         }
-        crate::github::BranchPrOutcome::Clear => {
-            state.update_workspace_pr_info(&workspace_id, None, None, None, None);
+        crate::github::WorkspacePrsOutcome::Clear => {
+            state.update_workspace_prs(&workspace_id, Vec::new());
         }
-        crate::github::BranchPrOutcome::Preserve => {}
+        crate::github::WorkspacePrsOutcome::Preserve => {}
     }
     crate::state::emit_app_state(&app);
     Ok(())
