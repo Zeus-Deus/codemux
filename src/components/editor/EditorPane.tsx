@@ -19,6 +19,8 @@ import { MarkdownRendered } from "./MarkdownRendered";
 import { ImageViewer } from "./ImageViewer";
 import { VideoViewer } from "./VideoViewer";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
+import { PanelHeader } from "@/components/ui/panel-header";
+import { cn } from "@/lib/utils";
 
 interface Props {
   tabId: string;
@@ -343,11 +345,11 @@ export function EditorPane({
   if (errorMsg) {
     return (
       <div className="flex h-full w-full flex-col">
-        <div className={`${embedded ? "hidden" : "flex"} h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2`}>
+        <PanelHeader className={cn(embedded && "hidden", "gap-1 bg-card px-2")}>
           <span className="text-label font-mono text-muted-foreground truncate">
             {filePath}
           </span>
-        </div>
+        </PanelHeader>
         <div className="flex flex-1 items-center justify-center text-muted-foreground">
           <span className="text-label">{errorMsg}</span>
         </div>
@@ -362,7 +364,7 @@ export function EditorPane({
     <div className="flex h-full w-full flex-col">
       {/* Toolbar — suppressed in the deck, whose shared pane bar owns
           the path crumb and the source/wrap/copy controls. */}
-      <div className={`${embedded ? "hidden" : "flex"} h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2`}>
+      <PanelHeader className={cn(embedded && "hidden", "gap-1 bg-card px-2")}>
         <span className="text-label font-mono text-muted-foreground truncate min-w-0">
           {filePath}
         </span>
@@ -394,7 +396,7 @@ export function EditorPane({
             Ctrl+S to save
           </span>
         )}
-      </div>
+      </PanelHeader>
 
       {/* Image viewer — shown instead of the text editor for image files */}
       {isImage && <ImageViewer key={filePath} filePath={filePath} />}

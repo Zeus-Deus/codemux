@@ -15,6 +15,7 @@ import { useDiffStore, type DiffTabState } from "@/stores/diff-store";
 import { closeTab } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { TabSnapshot } from "@/tauri/types";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 interface Props {
   tabId: string;
@@ -50,7 +51,7 @@ export function DiffToolbar({
   };
 
   return (
-    <div className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2">
+    <PanelHeader className="gap-1 bg-card px-2">
       {/* File path */}
       <span className="text-label font-mono text-muted-foreground truncate min-w-0">
         {tab.filePath ?? "No file selected"}
@@ -184,6 +185,6 @@ export function DiffToolbar({
       >
         <X className="h-3 w-3" />
       </Button>
-    </div>
+    </PanelHeader>
   );
 }

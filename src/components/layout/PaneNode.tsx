@@ -17,6 +17,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 const TerminalPane = React.lazy(() =>
   import("@/components/terminal/TerminalPane").then((module) => ({
@@ -468,8 +469,8 @@ function PaneNodeImpl({
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
-        <header
-          className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
+        <PanelHeader
+          className={cn("gap-1 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex-1 truncate text-label text-muted-foreground">
@@ -486,7 +487,7 @@ function PaneNodeImpl({
               <X className="h-3.5 w-3.5" />
             </Button>
           </div>
-        </header>
+        </PanelHeader>
         <div className="flex-1 min-h-0 overflow-hidden">
           <LazyBoundary label="browser" className="h-full">
             <BrowserPane

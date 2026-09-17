@@ -72,6 +72,7 @@ import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { PanelHeader } from "@/components/ui/panel-header";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -268,7 +269,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
   const ahead = info.ahead ?? 0;
   const behind = info.behind ?? 0;
   return (
-    <div className="flex items-center gap-1.5 px-2.5 h-7 text-label text-muted-foreground/80 border-b border-border/40">
+    <PanelHeader className="gap-1.5 text-label text-muted-foreground/80">
       <GitBranch className="size-3 shrink-0" />
       <span className="truncate font-mono text-foreground/90">{info.branch}</span>
       {(ahead > 0 || behind > 0) && (
@@ -290,7 +291,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
       {!info.has_upstream && (
         <span className="ml-auto text-caption italic text-muted-foreground/60">no remote</span>
       )}
-    </div>
+    </PanelHeader>
   );
 }
 

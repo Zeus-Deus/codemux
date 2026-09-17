@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
 import { agentBrowserRun } from "@/tauri/commands";
 import { normalizeBrowserUrl, runBrowserNav } from "./browser-nav";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 interface Props {
   browserId: string;
@@ -47,7 +48,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
   };
 
   return (
-    <div className="flex h-7 shrink-0 items-center gap-0.5 border-b border-border/50 bg-card px-1">
+    <PanelHeader className="gap-0.5 bg-card px-1">
       <Button
         variant="ghost"
         size="icon-xs"
@@ -94,6 +95,6 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         placeholder="Enter URL..."
         className="h-6 flex-1 text-label bg-background border-none px-2"
       />
-    </div>
+    </PanelHeader>
   );
 }
