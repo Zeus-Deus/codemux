@@ -213,7 +213,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               size="xs"
               variant="ghost"
               tabIndex={-1}
-              className={cn("h-[22px] px-2 text-muted-foreground hover:text-foreground", tzMeta)}
+              className={cn("text-muted-foreground hover:text-foreground", tzMeta)}
               onClick={handleView}
               title={`View on ${provider.name}`}
             >
@@ -226,7 +226,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
                 variant="ghost"
                 tabIndex={-1}
                 className={cn(
-                  "h-[22px] px-2 text-muted-foreground hover:text-foreground",
+                  "text-muted-foreground hover:text-foreground",
                   tzMeta,
                 )}
                 onClick={handleCheckout}

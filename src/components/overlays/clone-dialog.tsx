@@ -113,7 +113,7 @@ export function CloneDialog() {
               <Button
                 variant="outline"
                 size="sm"
-                className="h-8 shrink-0"
+                className="shrink-0"
                 onClick={handlePickDir}
               >
                 <FolderOpen className="h-3.5 w-3.5" />

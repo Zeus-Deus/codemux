@@ -156,7 +156,7 @@ export function KeybindEditor() {
             variant="outline"
             size="sm"
             onClick={resetAll}
-            className="shrink-0 h-8 gap-1.5 text-body-sm"
+            className="shrink-0"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Reset all
@@ -300,16 +300,14 @@ function KeybindRow({
                 <div className="flex items-center gap-1 ml-auto">
                   <Button
                     variant="outline"
-                    size="sm"
-                    className="h-6 px-2 text-label"
+                    size="xs"
                     onClick={onConfirmConflict}
                   >
                     Override
                   </Button>
                   <Button
                     variant="ghost"
-                    size="sm"
-                    className="h-6 px-2 text-label"
+                    size="xs"
                     onClick={onCancelConflict}
                   >
                     Cancel

@@ -228,7 +228,7 @@ export function RemotePathPicker() {
             <Button
               variant="outline"
               size="sm"
-              className="h-8 shrink-0"
+              className="shrink-0"
               onClick={handleManualGo}
               disabled={loading}
             >
@@ -236,8 +236,8 @@ export function RemotePathPicker() {
             </Button>
             <Button
               variant="outline"
-              size="icon-sm"
-              className="h-8 w-8 shrink-0"
+              size="icon"
+              className="shrink-0"
               onClick={() => navigateTo(currentPath)}
               disabled={loading || !currentPath}
               aria-label="Refresh"

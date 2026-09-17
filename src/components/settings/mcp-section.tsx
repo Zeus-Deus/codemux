@@ -367,7 +367,7 @@ function ServerRow({
       <Button
         variant="ghost"
         size="sm"
-        className="h-7 px-2 text-label opacity-0 transition-opacity group-hover:opacity-100"
+        className="opacity-0 transition-opacity group-hover:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
@@ -378,7 +378,6 @@ function ServerRow({
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-2 text-label"
           onClick={() =>
             void restartMcpServerCmd(server.id).catch((err) =>
               console.warn(`[mcp] restart ${server.id} failed:`, err),

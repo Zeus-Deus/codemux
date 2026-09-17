@@ -31,9 +31,9 @@ export function DebugCleanupBanner({ onCleanup, busy = false }: Props) {
         <Bug className="size-3.5 text-danger" aria-hidden />
         <span>Debug markers detected in this project.</span>
         <Button
-          size="sm"
+          size="xs"
           variant="outline"
-          className="ml-auto h-6 text-label"
+          className="ml-auto"
           onClick={onCleanup}
           disabled={busy}
         >

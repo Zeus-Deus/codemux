@@ -169,7 +169,7 @@ export function WorkflowAgentDetail({
       <div className="flex gap-2 pt-1">
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button variant="outline" size="sm" className="text-body-sm" disabled>
+            <Button variant="outline" size="sm" disabled>
               Restart agent
             </Button>
           </TooltipTrigger>
@@ -180,7 +180,7 @@ export function WorkflowAgentDetail({
             type="button"
             variant="ghost"
             size="sm"
-            className="text-body-sm text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={() => {
               openEditorTab(workspace.workspace_id, workspace.tabs, label).catch(console.error);
             }}

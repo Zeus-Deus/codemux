@@ -381,7 +381,6 @@ export function SidebarProjectGroup({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-label"
               onClick={() => setShowCloseDialog(false)}
             >
               Cancel
@@ -389,7 +388,6 @@ export function SidebarProjectGroup({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-label"
               onClick={() => void handleArchiveProject()}
             >
               Archive Project

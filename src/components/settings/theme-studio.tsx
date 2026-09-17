@@ -393,7 +393,6 @@ function StudioBody({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-[31px] gap-1.5 text-body-sm"
               onClick={() => downloadTheme(savedTheme)}
             >
               <Download className="size-3" /> Export
@@ -410,13 +409,13 @@ function StudioBody({
             </Button>
           </>
         )}
-        <Button type="button" variant="outline" size="sm" className="h-[31px] text-body-sm" onClick={onClose}>
+        <Button type="button" variant="outline" size="sm" onClick={onClose}>
           Cancel
         </Button>
         <Button
           type="button"
           size="sm"
-          className="h-[31px] gap-1.5 text-body-sm font-bold"
+          className="font-bold"
           onClick={saveTheme}
           disabled={!candidate}
         >
@@ -594,7 +593,6 @@ function ImportColumn({
               type="button"
               variant="outline"
               size="sm"
-              className="h-[25px] gap-1.5 px-2.5 text-label"
               onClick={onChooseFile}
             >
               <FileUp className="size-[11px]" /> Choose file

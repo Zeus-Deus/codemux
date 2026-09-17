@@ -151,12 +151,12 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
           <PopoverTrigger asChild>
             <Button
               variant="ghost"
-              size="icon-xs"
+              size={labeled ? "sm" : "icon-sm"}
               aria-label="Ports"
               className={cn(
-                "relative h-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
+                "relative text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
                 portCount > 0 && "text-foreground",
-                labeled ? "w-full justify-start gap-2 px-2 text-label" : "w-7",
+                labeled ? "w-full justify-start gap-2 text-label" : "",
               )}
             >
               <Icon className="size-[18px]" />

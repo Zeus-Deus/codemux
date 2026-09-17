@@ -416,7 +416,6 @@ export function AutomationsSection() {
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 gap-1.5 text-body"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -515,7 +514,7 @@ export function AutomationsSection() {
             type="button"
             variant="ghost"
             size="sm"
-            className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+            className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -651,7 +650,6 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onEdit}
           >
@@ -662,7 +660,6 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onToggleEnabled}
           >
@@ -683,7 +680,7 @@ function AutomationDetail({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm text-destructive hover:bg-destructive/10 hover:text-destructive"
+          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
           disabled={busy}
           onClick={onDelete}
         >
@@ -942,7 +939,6 @@ function AutomationForm({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm"
           disabled={busy}
           onClick={onCancel}
         >
@@ -953,7 +949,6 @@ function AutomationForm({
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm"
           disabled={busy || !canSave}
           onClick={onSave}
         >
