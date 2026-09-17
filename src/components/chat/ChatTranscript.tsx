@@ -79,6 +79,9 @@ interface Props {
   workspaceId?: string | null;
   /** Active worktree root for resolving relative source references. */
   cwd?: string | null;
+  /** Forwarded to `MessageList`: transitions of "reader has left the live
+   *  edge", which dims the composer overlay. Must be stable. */
+  onReadingBackChange?: (readingBack: boolean) => void;
 }
 
 /**
@@ -117,6 +120,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   onEnterSubagent,
   workspaceId,
   cwd,
+  onReadingBackChange,
 }: Props) {
   const binding = useContext(TranscriptBindingContext);
   const cacheKey = binding && binding.workspaceId === workspaceId && binding.threadKey === threadKey &&
@@ -162,6 +166,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         onEnterSubagent={onEnterSubagent}
         workspaceId={workspaceId}
         cwd={cwd}
+        onReadingBackChange={onReadingBackChange}
       />
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The
