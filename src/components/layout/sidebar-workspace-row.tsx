@@ -204,7 +204,7 @@ export function DeleteWorktreeDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
-          <DialogTitle className="text-sm">
+          <DialogTitle className="text-body">
             Delete worktree &ldquo;{workspace.title}&rdquo;?
           </DialogTitle>
           <DialogDescription>
@@ -214,7 +214,7 @@ export function DeleteWorktreeDialog({
         </DialogHeader>
 
         {(forceMessage !== null || hasWarnings) && (
-          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             {forceMessage ?? warningMessage}
           </div>
@@ -227,7 +227,7 @@ export function DeleteWorktreeDialog({
             onChange={(e) => setDeleteBranch(e.target.checked)}
             className="rounded border-border"
           />
-          <span className="text-xs text-muted-foreground">
+          <span className="text-label text-muted-foreground">
             Also delete local branch
           </span>
         </label>
@@ -236,7 +236,7 @@ export function DeleteWorktreeDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-label"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -244,7 +244,7 @@ export function DeleteWorktreeDialog({
           <Button
             variant="destructive"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-label"
             onClick={() => void confirm()}
           >
             {forceMessage !== null ? "Force delete" : "Delete"}
@@ -1280,7 +1280,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
             onClick={handleActivate}
             onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleActivate(); }}
             className={cn(
-              "group/row mx-1.5 flex pl-[18px] pr-2 text-sm cursor-pointer relative transition-colors",
+              "group/row mx-1.5 flex pl-[18px] pr-2 text-body cursor-pointer relative transition-colors",
               // Cards (working / needs-you / done) gain a soft container and a
               // touch more vertical breathing room; idle rows keep today's
               // compact one-liner treatment.
@@ -1326,7 +1326,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           {icon}
                         </button>
                       </TooltipTrigger>
-                      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                      <TooltipContent side="bottom" sideOffset={4} className="text-label">
                         {prHumanState
                           ? `${prHumanState} ${provider.shortNoun}`
                           : provider.nounTitle}
@@ -1413,7 +1413,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
-                    <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                    <TooltipContent side="bottom" sideOffset={4} className="text-label">
                       Agent notifications muted
                     </TooltipContent>
                   </Tooltip>
@@ -1461,7 +1461,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                             {shipped?.map((r) => (
                               <li
                                 key={r.prNumber}
-                                className="flex items-baseline gap-1.5 text-xs"
+                                className="flex items-baseline gap-1.5 text-label"
                               >
                                 <span className="shrink-0 font-mono text-muted-foreground tabular-nums">
                                   #{r.issueNumber ?? r.prNumber}
@@ -1630,7 +1630,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>
-                          <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                          <TooltipContent side="bottom" sideOffset={4} className="text-label">
                             Agent notifications muted
                           </TooltipContent>
                         </Tooltip>

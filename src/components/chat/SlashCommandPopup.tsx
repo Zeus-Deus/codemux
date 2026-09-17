@@ -212,7 +212,7 @@ export function SlashCommandPopup({
             className="outline-none"
           >
           {items.length === 0 ? (
-            <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+            <div className="px-3 py-4 text-center text-label text-muted-foreground">
               No commands match
             </div>
           ) : (
@@ -253,7 +253,7 @@ export function SlashCommandPopup({
                       data-testid={`slash-item-${item.id}`}
                       data-disabled={disabled || undefined}
                       className={cn(
-                        "flex items-center gap-2 rounded px-2 py-1.5 text-sm",
+                        "flex items-center gap-2 rounded px-2 py-1.5 text-body",
                         item.stacked && "gap-2.5 py-2",
                         "cursor-pointer outline-none select-none",
                         "data-[selected=true]:bg-muted",
@@ -294,7 +294,7 @@ export function SlashCommandPopup({
                         <>
                       <span className="text-foreground">{item.label}</span>
                       {item.description && (
-                        <span className="truncate text-xs text-muted-foreground">
+                        <span className="truncate text-label text-muted-foreground">
                           {item.description}
                         </span>
                       )}

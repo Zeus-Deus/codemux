@@ -106,7 +106,7 @@ export function RemoteConnectionBanner() {
       role="status"
       aria-live="polite"
       className={cn(
-        "pointer-events-none fixed left-1/2 top-12 z-[2147483000] flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-semibold shadow-lg backdrop-blur",
+        "pointer-events-none fixed left-1/2 top-12 z-[2147483000] flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-2 rounded-full border px-3.5 py-1.5 text-label font-semibold shadow-lg backdrop-blur",
         offline
           ? "border-status-attention/40 bg-status-attention/15 text-status-attention"
           : "border-status-working/45 bg-status-working/15 text-status-working",

@@ -372,7 +372,7 @@ function ProjectFilterItem({
       onClick={onSelect}
       aria-label={name}
       className={cn(
-        "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
+        "h-8 gap-2 rounded-[7px] px-2 text-label font-semibold",
         active && "bg-foreground/[0.08] text-foreground",
       )}
     >
@@ -611,7 +611,7 @@ const SettledRow = memo(function SettledRow({
       />
       <span
         className={cn(
-          "min-w-0 truncate text-xs font-medium transition-colors duration-150",
+          "min-w-0 truncate text-label font-medium transition-colors duration-150",
           dimmed
             ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
             : "text-foreground",
@@ -829,7 +829,7 @@ const SnoozeRow = memo(function SnoozeRow({
           aria-hidden="true"
           className="h-3 w-3 shrink-0 text-muted-foreground/60"
         />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
         </span>
         {/* Same face as a settled row's age (`font-mono tabular-nums`): the two
@@ -1886,7 +1886,7 @@ export function SidebarInbox() {
                 data-project-filter
                 className={cn(
                   "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
-                  "border border-transparent bg-transparent text-xs font-semibold text-foreground/80",
+                  "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
                   "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
                 )}
               >
@@ -1925,7 +1925,7 @@ export function SidebarInbox() {
                   onClick={() => setFilter(null)}
                   aria-label="All projects"
                   className={cn(
-                    "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
+                    "h-8 gap-2 rounded-[7px] px-2 text-label font-semibold",
                     filter === null && "bg-foreground/[0.08] text-foreground",
                   )}
                 >
@@ -1955,7 +1955,7 @@ export function SidebarInbox() {
               <button
                 type="button"
                 aria-label="Add repository"
-                className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-sm leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
+                className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-body leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
               >
                 +
               </button>
@@ -2020,7 +2020,7 @@ export function SidebarInbox() {
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&
           filteredPending.length === 0 && (
-          <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+          <div className="px-2 py-6 text-center text-label text-muted-foreground">
             Nothing active
             {filterName && (
               <>
@@ -2052,7 +2052,7 @@ export function SidebarInbox() {
           <div
             key={pw.id}
             className={cn(
-              "flex items-center gap-2 px-2 py-2 text-sm",
+              "flex items-center gap-2 px-2 py-2 text-body",
               pw.status === "failed" ? "opacity-60" : "animate-pulse opacity-70",
             )}
           >
@@ -2061,7 +2061,7 @@ export function SidebarInbox() {
             ) : (
               <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
             )}
-            <span className="truncate text-xs text-muted-foreground">
+            <span className="truncate text-label text-muted-foreground">
               {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
             </span>
           </div>
@@ -2186,14 +2186,14 @@ export function SidebarInbox() {
                 guardrail, hiding them empties the menu; the disabled line
                 says why instead of leaving a blank popover. */}
             {!canBulkSettle && (
-              <DropdownMenuItem disabled className="text-xs">
+              <DropdownMenuItem disabled className="text-label">
                 {parkableSelection.length === 0
                   ? "Pinned workspaces must be unpinned first"
                   : "Selection includes working or blocked workspaces"}
               </DropdownMenuItem>
             )}
             {canBulkSettle && (
-              <DropdownMenuItem onClick={handleBulkSettle} className="text-xs">
+              <DropdownMenuItem onClick={handleBulkSettle} className="text-label">
                 {`Settle (${parkableSelection.length})`}
               </DropdownMenuItem>
             )}
@@ -2203,7 +2203,7 @@ export function SidebarInbox() {
                   if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now()));
                 }}
               >
-                <DropdownMenuSubTrigger className="text-xs">
+                <DropdownMenuSubTrigger className="text-label">
                   {`Snooze (${parkableSelection.length})`}
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent>
@@ -2211,7 +2211,7 @@ export function SidebarInbox() {
                     <DropdownMenuItem
                       key={preset.id}
                       onClick={() => handleBulkSnooze(preset.at)}
-                      className="gap-4 text-xs"
+                      className="gap-4 text-label"
                     >
                       <span className="flex-1">{preset.label}</span>
                       <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">

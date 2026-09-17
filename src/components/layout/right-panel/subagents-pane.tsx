@@ -744,7 +744,7 @@ function SubagentModelBadge({ model }: { model?: string }) {
     <span
       data-subagent-model={value}
       title={`Model: ${value}`}
-      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 px-1.5 font-mono text-[0.5625rem] text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
+      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 px-1.5 font-mono text-micro text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
     >
       <span
         className="size-1 shrink-0 rounded-full bg-accent-ember/75"

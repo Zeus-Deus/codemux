@@ -276,7 +276,7 @@ export function AttachmentChip({
         // each staged ref the card look the design applies to the
         // green issue chip; the per-kind tint below sets both fill and
         // border colour.
-        "inline-flex items-center border text-xs",
+        "inline-flex items-center border text-label",
         // With a thumbnail the chip drops the full pill radius and insets
         // the preview by 3px — a rounded rect reads as "this is a
         // picture", and a 22px-tall thumbnail inside a pill would poke

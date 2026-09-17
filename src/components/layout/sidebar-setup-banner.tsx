@@ -119,7 +119,7 @@ export function SidebarSetupBanner() {
               <X className="h-3 w-3" />
             </Button>
           </div>
-          <p className="text-xs font-semibold text-foreground">Setup scripts</p>
+          <p className="text-label font-semibold text-foreground">Setup scripts</p>
           <p className="text-label text-muted-foreground mt-0.5">
             Automate workspace setup for {projectName} with setup scripts
             and <code className="font-mono text-caption bg-muted/50 px-0.5 rounded">.codemuxinclude</code>
@@ -127,7 +127,7 @@ export function SidebarSetupBanner() {
           <Button
             variant="outline"
             size="sm"
-            className="w-full mt-2.5 h-7 text-xs"
+            className="w-full mt-2.5 h-7 text-label"
             onClick={handleConfigure}
           >
             Configure

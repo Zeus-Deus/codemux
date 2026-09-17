@@ -68,7 +68,7 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
             onNewChat={handleNewChat}
           />
         ) : (
-          <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
+          <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>
         )}
       </div>
       {/* Match the muted-at-rest / lift-on-hover dialect the rest of

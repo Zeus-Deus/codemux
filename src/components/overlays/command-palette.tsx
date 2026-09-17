@@ -801,7 +801,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           value={rawQuery}
           onValueChange={setRawQuery}
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
-          className="h-8 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
+          className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
         <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc

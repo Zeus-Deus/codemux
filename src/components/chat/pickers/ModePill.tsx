@@ -80,7 +80,7 @@ export function ModePill({ mode, onRemove, onClick }: Props) {
         // (ModelPicker, ReasoningPicker, PermissionModePicker) which
         // all use `px-2.5 py-1`. The colored `bg-*/15` fill stays —
         // that's the pill's status affordance.
-        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs",
+        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-label",
         config.bg,
         config.text,
       )}

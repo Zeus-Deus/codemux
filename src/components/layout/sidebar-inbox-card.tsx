@@ -668,7 +668,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       {snoozePresets.map((preset) => (
                         <DropdownMenuItem
                           key={preset.id}
-                          className="gap-4 text-xs"
+                          className="gap-4 text-label"
                           onSelect={() =>
                             onSnooze(workspace.workspace_id, preset.at)
                           }

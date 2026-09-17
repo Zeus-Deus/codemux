@@ -357,7 +357,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         <div className="mx-6 mt-6 rounded-lg border border-border/60 bg-card/50 p-4">
           <div className="flex items-start justify-between gap-4">
             <div className="space-y-2 min-w-0">
-              <p className="text-sm font-medium text-foreground">
+              <p className="text-body font-medium text-foreground">
                 {externalWorktrees.length} existing worktree
                 {externalWorktrees.length !== 1 ? "s" : ""} found
               </p>
@@ -367,7 +367,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   return (
                     <span
                       key={wt.path}
-                      className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-xs font-mono text-muted-foreground max-w-[180px]"
+                      className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-label font-mono text-muted-foreground max-w-[180px]"
                     >
                       <GitBranch className="h-3 w-3 shrink-0" />
                       <span className="truncate">{branch}</span>
@@ -375,7 +375,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   );
                 })}
                 {externalWorktrees.length > 5 && (
-                  <span className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                  <span className="inline-flex items-center rounded-md bg-muted px-2 py-0.5 text-label text-muted-foreground">
                     +{externalWorktrees.length - 5} more
                   </span>
                 )}
@@ -399,14 +399,14 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           <div className="w-full max-w-3xl space-y-6">
             {/* ── Header ── */}
             <div className="space-y-1.5">
-              <p className="text-xs uppercase tracking-wide text-muted-foreground">
+              <p className="text-label uppercase tracking-wide text-muted-foreground">
                 Step {step === "workspace" ? 1 : 2} of 2
               </p>
               <h1 className="text-2xl font-semibold text-foreground">
                 {step === "workspace" && "Create your first workspace"}
                 {step === "setup" && "Setup script"}
               </h1>
-              <p className="text-sm text-muted-foreground">
+              <p className="text-body text-muted-foreground">
                 {step === "workspace" &&
                   "Workspaces are isolated task environments backed by git worktrees."}
                 {step === "setup" &&
@@ -430,7 +430,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                 </div>
 
                 {/* Branch name — editable, with inline base branch picker */}
-                <div className="rounded-md border border-border/60 bg-card/40 px-3 py-1.5 text-sm">
+                <div className="rounded-md border border-border/60 bg-card/40 px-3 py-1.5 text-body">
                   <div className="flex items-center gap-2 text-muted-foreground">
                     <GitBranch className="h-3.5 w-3.5 shrink-0" />
                     <input
@@ -438,7 +438,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       value={generatedBranch}
                       onChange={(e) => handleBranchChange(e.target.value)}
                       placeholder="branch-name"
-                      className="flex-1 min-w-0 bg-transparent font-mono text-sm text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
+                      className="flex-1 min-w-0 bg-transparent font-mono text-body text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
                     />
                     <span className="text-muted-foreground/50 shrink-0">from</span>
                     <BranchPicker
@@ -491,10 +491,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                             )}
                           </div>
                           <div className="flex flex-col min-w-0">
-                            <span className="text-sm text-foreground">
+                            <span className="text-body text-foreground">
                               {action.label}
                             </span>
-                            <span className="text-xs text-muted-foreground font-mono truncate">
+                            <span className="text-label text-muted-foreground font-mono truncate">
                               {action.command}
                             </span>
                           </div>
@@ -504,7 +504,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     <button
                       type="button"
                       onClick={switchToCustom}
-                      className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                      className="text-label text-muted-foreground hover:text-foreground underline underline-offset-2"
                     >
                       Customize commands
                     </button>
@@ -514,7 +514,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                 {/* Mode B: No detection */}
                 {setupMode === "checklist" && actions.length === 0 && (
                   <div className="overflow-hidden rounded-lg border bg-card/40 p-6 text-center space-y-3">
-                    <p className="text-sm text-muted-foreground">
+                    <p className="text-body text-muted-foreground">
                       We couldn't detect a package manager or environment config.
                     </p>
                     <div className="flex items-center justify-center gap-2">
@@ -544,7 +544,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       <button
                         type="button"
                         onClick={() => setSetupMode("checklist")}
-                        className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                        className="text-label text-muted-foreground hover:text-foreground underline underline-offset-2"
                       >
                         Back to checklist
                       </button>
@@ -555,7 +555,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                           value={setupContent}
                           onChange={(e) => setSetupContent(e.target.value)}
                           placeholder="Add setup commands, one per line..."
-                          className="h-full min-h-[220px] resize-none overflow-x-auto whitespace-pre font-mono text-xs"
+                          className="h-full min-h-[220px] resize-none overflow-x-auto whitespace-pre font-mono text-label"
                         />
                         <div className="flex flex-wrap items-center gap-1.5 border-t px-1 pt-2 text-label text-muted-foreground">
                           <span className="mr-1">Variables</span>
@@ -576,7 +576,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   open={teardownOpen}
                   onOpenChange={setTeardownOpen}
                 >
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground/80 hover:text-muted-foreground transition-colors py-1">
+                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors py-1">
                     <ChevronDown
                       className={cn(
                         "h-3 w-3 transition-transform duration-200",
@@ -590,7 +590,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       value={teardownContent}
                       onChange={(e) => setTeardownContent(e.target.value)}
                       placeholder="docker compose down"
-                      className="min-h-20 font-mono text-xs"
+                      className="min-h-20 font-mono text-label"
                     />
                   </CollapsibleContent>
                 </Collapsible>

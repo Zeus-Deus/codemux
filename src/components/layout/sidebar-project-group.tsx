@@ -253,7 +253,7 @@ export function SidebarProjectGroup({
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
-            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-sm font-medium hover:bg-muted/40 transition-colors cursor-pointer rounded-lg"
+            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-body font-medium hover:bg-muted/40 transition-colors cursor-pointer rounded-lg"
             draggable={!!onProjectDragStart}
             onDragStart={onProjectDragStart}
             data-project-header-path={projectPath}
@@ -301,7 +301,7 @@ export function SidebarProjectGroup({
                   <Plus className="h-3.5 w-3.5 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+              <TooltipContent side="bottom" sideOffset={4} className="text-label">
                 {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
                 {newWsKeys ? ` · ${newWsKeys}` : ""}
               </TooltipContent>
@@ -367,7 +367,7 @@ export function SidebarProjectGroup({
       <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
         <DialogContent showCloseButton={false} className="max-w-[340px]">
           <DialogHeader>
-            <DialogTitle className="text-sm">
+            <DialogTitle className="text-body">
               Archive project &ldquo;{projectName}&rdquo;?
             </DialogTitle>
             <DialogDescription>
@@ -381,7 +381,7 @@ export function SidebarProjectGroup({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-xs"
+              className="h-7 px-3 text-label"
               onClick={() => setShowCloseDialog(false)}
             >
               Cancel
@@ -389,7 +389,7 @@ export function SidebarProjectGroup({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-xs"
+              className="h-7 px-3 text-label"
               onClick={() => void handleArchiveProject()}
             >
               Archive Project
@@ -423,7 +423,7 @@ export function SidebarProjectGroup({
         <div
           key={pw.id}
           className={cn(
-            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-sm",
+            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-body",
             pw.status === "failed" ? "opacity-60" : "opacity-70 animate-pulse",
           )}
         >
@@ -432,7 +432,7 @@ export function SidebarProjectGroup({
           ) : (
             <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
           )}
-          <span className="truncate text-muted-foreground text-xs">
+          <span className="truncate text-muted-foreground text-label">
             {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
           </span>
         </div>

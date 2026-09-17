@@ -1121,17 +1121,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             value={workspaceName}
             onChange={(e) => setWorkspaceName(e.target.value)}
             placeholder="Workspace name (optional)"
-            className="h-6 text-xs flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
+            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
           />
           {branchMode === "create_new" ? (
             <Input
               value={branchName}
               onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
               placeholder="branch name"
-              className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
+              className="h-6 text-label w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
             />
           ) : (
-            <span className="h-6 text-xs text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
+            <span className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
               on {openExistingBranch}
             </span>
           )}
@@ -1146,7 +1146,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               onChange={handleTextareaChange}
               onPaste={handlePasteImage}
               placeholder="What do you want to do?"
-              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
+              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-body px-4 pt-3 pb-1"
               rows={1}
             />
 
@@ -1259,7 +1259,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         setSelectedAgentId(p.id);
                         setLastSelectedAgentId(p.id);
                       }}
-                      className="text-xs gap-2"
+                      className="text-label gap-2"
                     >
                       <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
                       <span className="flex-1">{p.name}</span>

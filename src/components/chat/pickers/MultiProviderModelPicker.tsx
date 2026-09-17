@@ -525,7 +525,7 @@ export function MultiProviderModelPicker({
                 placeholder="Search models..."
                 value={query}
                 onValueChange={setQuery}
-                className="h-9 text-xs"
+                className="h-9 text-label"
               />
               {/* Override cmdk's default `no-scrollbar max-h-72` so the
                   list fills the popover and shows a real scrollbar
@@ -835,7 +835,7 @@ function ModelRow({
       )}
     >
       <div className="min-w-0 flex-1 text-left">
-        <div className="text-xs font-medium leading-snug">
+        <div className="text-label font-medium leading-snug">
           <span className="truncate">{model.label}</span>
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
@@ -918,7 +918,7 @@ function ModelListEmptyState({
   const trimmed = query.trim();
   if (trimmed.length > 0) {
     return (
-      <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+      <div className="px-4 py-6 text-center text-label text-muted-foreground">
         No models match{" "}
         <span className="font-medium text-foreground">"{trimmed}"</span>
       </div>
@@ -929,7 +929,7 @@ function ModelListEmptyState({
     // so an empty state here means the user just removed their last
     // favorite while the popover was open. Show a friendly cue.
     return (
-      <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+      <div className="px-4 py-6 text-center text-label text-muted-foreground">
         <p className="font-medium text-foreground">No favorites yet</p>
         <p className="mt-1">Click the star on any model row to favorite it.</p>
       </div>
@@ -939,7 +939,7 @@ function ModelListEmptyState({
     const parsed = parseProviderError(error);
     if (parsed?.kind === "not_installed") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">
             OpenCode not detected on your system
           </p>
@@ -962,7 +962,7 @@ function ModelListEmptyState({
     }
     if (error) {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           OpenCode harvest failed:{" "}
           <span className="text-foreground">{error}</span>
         </div>
@@ -970,7 +970,7 @@ function ModelListEmptyState({
     }
     if (caps && caps.models.length === 0) {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">No connected providers</p>
           <p className="mt-1">
             Run{" "}
@@ -985,7 +985,7 @@ function ModelListEmptyState({
     const parsed = parseProviderError(error);
     if (parsed?.kind === "not_installed") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">
             Codex not detected on your system
           </p>
@@ -1008,7 +1008,7 @@ function ModelListEmptyState({
     }
     if (parsed?.kind === "not_authenticated") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">Codex is not signed in</p>
           <p className="mt-1">
             Run <code className="rounded bg-muted px-1">codex login</code> in a
@@ -1019,7 +1019,7 @@ function ModelListEmptyState({
     }
     if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           Codex harvest failed:{" "}
           <span className="text-foreground">
             {parsed.detail ?? error ?? ""}
@@ -1032,7 +1032,7 @@ function ModelListEmptyState({
     const parsed = parseProviderError(error);
     if (parsed?.kind === "not_installed") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">
             Grok not detected on your system
           </p>
@@ -1045,7 +1045,7 @@ function ModelListEmptyState({
     }
     if (parsed?.kind === "not_authenticated") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">Grok is not signed in</p>
           <p className="mt-1">
             {parsed.detail ?? (
@@ -1064,7 +1064,7 @@ function ModelListEmptyState({
     }
     if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
       return (
-        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <div className="px-4 py-6 text-center text-label text-muted-foreground">
           Grok model discovery failed: {" "}
           <span className="text-foreground">
             {parsed.detail ?? error ?? ""}
@@ -1075,7 +1075,7 @@ function ModelListEmptyState({
   }
   if (caps && caps.models.length === 0) {
     return (
-      <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+      <div className="px-4 py-6 text-center text-label text-muted-foreground">
         No models available
       </div>
     );

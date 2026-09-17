@@ -161,7 +161,7 @@ export function LaunchModelPicker({
       data-checked={isSelected ? "true" : undefined}
       onSelect={onPick}
       className={cn(
-        "gap-2 text-xs",
+        "gap-2 text-label",
         isSelected && "bg-accent/70 data-[selected=true]:bg-accent/70",
       )}
     >
@@ -197,7 +197,7 @@ export function LaunchModelPicker({
           setOpen(false);
         }}
         className={cn(
-          "gap-2 text-xs",
+          "gap-2 text-label",
           isSelected && "bg-accent/70 data-[selected=true]:bg-accent/70",
         )}
       >
@@ -304,19 +304,19 @@ export function LaunchModelPicker({
             <CommandSeparator />
 
             {loading && models.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 Loading models…
               </div>
             ) : null}
 
             {!loading && models.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 No models available
               </div>
             ) : null}
 
             {models.length > 0 && filtered.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 No models match &quot;{query}&quot;
               </div>
             ) : null}

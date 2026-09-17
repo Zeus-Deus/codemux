@@ -1134,15 +1134,15 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
                 !
               </div>
             </div>
-            <h2 className="text-sm font-semibold text-foreground leading-tight">
+            <h2 className="text-body font-semibold text-foreground leading-tight">
               Terminal starting
             </h2>
           </div>
           <div className="px-5 py-4 space-y-2">
-            <p className="text-sm text-muted-foreground leading-relaxed">
+            <p className="text-body text-muted-foreground leading-relaxed">
               {statusRef.current.message ?? "Waiting for shell status..."}
             </p>
-            <span className="status-meta inline-block text-xs font-mono text-muted-foreground/70" />
+            <span className="status-meta inline-block text-label font-mono text-muted-foreground/70" />
           </div>
         </div>
       </div>

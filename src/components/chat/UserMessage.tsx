@@ -286,7 +286,7 @@ function LightboxImage({ image }: { image: UserMessageImage }) {
     return (
       <div className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
         <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
-        <span className="text-xs">Failed to load image</span>
+        <span className="text-label">Failed to load image</span>
       </div>
     );
   }

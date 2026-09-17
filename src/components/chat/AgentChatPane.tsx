@@ -3429,7 +3429,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // strip never changes shape across the first send.
     <div className={SCOPE_STRIP_INSET}>
       <div className={SCOPE_STRIP}>
-        <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-0.5 text-label font-medium text-muted-foreground">
           <span
             className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
             title={workspaceProjectRoot}

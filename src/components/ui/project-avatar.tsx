@@ -25,9 +25,9 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 const SIZE_CLASSES = {
-  sm: "size-3.5 text-[0.5625rem] border",
+  sm: "size-3.5 text-micro border",
   md: "size-5 text-caption border",
-  lg: "size-6 text-xs border-[1.5px]",
+  lg: "size-6 text-label border-[1.5px]",
 } as const;
 
 export function ProjectAvatar({

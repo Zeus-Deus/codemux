@@ -328,7 +328,7 @@ export function HostsSection() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+      <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
         Loading hosts…
       </div>

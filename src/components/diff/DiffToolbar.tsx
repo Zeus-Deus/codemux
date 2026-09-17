@@ -52,7 +52,7 @@ export function DiffToolbar({
   return (
     <div className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2">
       {/* File path */}
-      <span className="text-xs font-mono text-muted-foreground truncate min-w-0">
+      <span className="text-label font-mono text-muted-foreground truncate min-w-0">
         {tab.filePath ?? "No file selected"}
       </span>
 

@@ -142,7 +142,7 @@ function DeleteArchivedDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} className="max-w-[360px]">
         <DialogHeader>
-          <DialogTitle className="text-sm">
+          <DialogTitle className="text-body">
             {isRoot
               ? <>Remove &ldquo;{entry.title}&rdquo; from archive?</>
               : <>Delete &ldquo;{entry.title}&rdquo;?</>}
@@ -155,7 +155,7 @@ function DeleteArchivedDialog({
         </DialogHeader>
 
         {forceMessage !== null && (
-          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             {forceMessage}
           </div>
@@ -170,7 +170,7 @@ function DeleteArchivedDialog({
                 onChange={(e) => setDeleteWorktree(e.target.checked)}
                 className="rounded border-border"
               />
-              <span className="text-xs text-muted-foreground">
+              <span className="text-label text-muted-foreground">
                 Also delete worktree from disk
               </span>
             </label>
@@ -182,7 +182,7 @@ function DeleteArchivedDialog({
                   onChange={(e) => setDeleteBranch(e.target.checked)}
                   className="rounded border-border"
                 />
-                <span className="text-xs text-muted-foreground">
+                <span className="text-label text-muted-foreground">
                   Also delete local branch
                 </span>
               </label>
@@ -194,7 +194,7 @@ function DeleteArchivedDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-label"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -202,7 +202,7 @@ function DeleteArchivedDialog({
           <Button
             variant={isRoot ? "secondary" : "destructive"}
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-label"
             onClick={() => void confirm()}
           >
             {forceMessage !== null
@@ -278,7 +278,7 @@ function ArchivedEntryRow({
         <Button
           variant="secondary"
           size="sm"
-          className="h-7 px-2.5 text-xs"
+          className="h-7 px-2.5 text-label"
           disabled={unarchiving}
           onClick={() => void handleUnarchive()}
         >
@@ -289,7 +289,7 @@ function ArchivedEntryRow({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+            className="h-7 px-2.5 text-label text-muted-foreground hover:text-foreground"
             onClick={onDeleteRequest}
           >
             Remove from archive

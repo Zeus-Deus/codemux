@@ -180,7 +180,7 @@ function FileRow({
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
           </span>
-          <span className="truncate text-xs text-foreground min-w-0 flex-1">
+          <span className="truncate text-label text-foreground min-w-0 flex-1">
             {name}
             {dir && (
               <span className="ml-1 text-caption text-muted-foreground/40">{dir}</span>
@@ -214,7 +214,7 @@ function FileRow({
           </span>
         </div>
       </TooltipTrigger>
-      <TooltipContent side="left" className="text-xs">
+      <TooltipContent side="left" className="text-label">
         {file.path}
       </TooltipContent>
     </Tooltip>
@@ -956,7 +956,7 @@ function SmartCommitButton({
         size="sm"
         variant="ghost"
         className={cn(
-          "flex-1 h-8 text-xs gap-1.5 rounded-r-none border-r-0",
+          "flex-1 h-8 text-label gap-1.5 rounded-r-none border-r-0",
           fillCls,
         )}
         onClick={primary.action}

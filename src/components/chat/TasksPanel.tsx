@@ -148,7 +148,7 @@ export function TasksPanel({
           {/* One-line intent in the agent's words — what makes an old
               list legible when scrolling back. */}
           {snapshot.explanation && (
-            <p className="mx-1.5 mb-3 text-xs leading-relaxed text-muted-foreground">
+            <p className="mx-1.5 mb-3 text-label leading-relaxed text-muted-foreground">
               {snapshot.explanation}
             </p>
           )}
@@ -186,7 +186,7 @@ export function TasksPanel({
                       {task.title}
                     </p>
                     {task.detail && task.detail !== task.title && (
-                      <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                      <p className="mt-0.5 text-label leading-relaxed text-muted-foreground">
                         {task.detail}
                       </p>
                     )}

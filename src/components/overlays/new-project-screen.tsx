@@ -163,7 +163,7 @@ export function NewProjectScreen() {
 
           {/* Location */}
           <div>
-            <label className="block text-sm font-medium text-foreground mb-2">
+            <label className="block text-body font-medium text-foreground mb-2">
               Location
             </label>
             <div className="flex gap-2">
@@ -171,7 +171,7 @@ export function NewProjectScreen() {
                 value={parentDir}
                 onChange={(e) => setParentDir(e.target.value)}
                 placeholder="~/Projects"
-                className="flex-1 font-mono text-xs"
+                className="flex-1 font-mono text-label"
                 disabled={loading}
               />
               <Button
@@ -212,10 +212,10 @@ export function NewProjectScreen() {
                     )}
                   />
                   <div>
-                    <div className="text-sm font-medium text-foreground">
+                    <div className="text-body font-medium text-foreground">
                       {option.label}
                     </div>
-                    <div className="text-xs text-muted-foreground mt-0.5">
+                    <div className="text-label text-muted-foreground mt-0.5">
                       {option.description}
                     </div>
                   </div>
@@ -227,7 +227,7 @@ export function NewProjectScreen() {
           {/* Mode-specific fields */}
           {mode === "empty" && (
             <div>
-              <label className="block text-sm font-medium text-foreground mb-2">
+              <label className="block text-body font-medium text-foreground mb-2">
                 Repository Name
               </label>
               <Input
@@ -246,7 +246,7 @@ export function NewProjectScreen() {
           {mode === "clone" && (
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">
+                <label className="block text-body font-medium text-foreground mb-2">
                   Repository URL
                 </label>
                 <Input
@@ -261,7 +261,7 @@ export function NewProjectScreen() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">
+                <label className="block text-body font-medium text-foreground mb-2">
                   Repository Name
                 </label>
                 <Input
@@ -277,7 +277,7 @@ export function NewProjectScreen() {
           {/* Error */}
           {error && (
             <div className="flex items-start gap-2 rounded-md px-4 py-3 bg-destructive/10 border border-destructive/20">
-              <span className="flex-1 text-sm text-destructive">{error}</span>
+              <span className="flex-1 text-body text-destructive">{error}</span>
               <button
                 type="button"
                 onClick={() => setError(null)}
@@ -300,7 +300,7 @@ export function NewProjectScreen() {
           {/* Submit */}
           <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
             {cloning && (
-              <span className="mr-auto text-xs text-muted-foreground">
+              <span className="mr-auto text-label text-muted-foreground">
                 Cloning — this can take a while on slow connections…
               </span>
             )}
