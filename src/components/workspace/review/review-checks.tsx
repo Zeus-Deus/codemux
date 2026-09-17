@@ -231,7 +231,7 @@ function CheckRow({
         )}
         <ChevronDown
           className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
+            "size-3.5 shrink-0 text-muted-foreground transition-transform duration-150",
             expanded && "rotate-180",
           )}
         />

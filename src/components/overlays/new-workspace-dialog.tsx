@@ -1176,7 +1176,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label={`Remove issue #${linkedIssue.number}`}
-                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-foreground"
+                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                       onClick={() => {
                         setLinkedIssue(null);
                         if (branchAutoFilled) {
@@ -1216,7 +1216,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   onClick={() =>
                     handleOpenExistingWorkspace(existingWorkspaceForBranch)
                   }
-                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:bg-muted"
+                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors duration-150 hover:bg-muted"
                 >
                   Open it
                 </button>
@@ -1235,7 +1235,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-foreground transition-colors outline-none hover:bg-muted"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-foreground transition-colors duration-150 hover:bg-muted"
                   >
                     {selectedAgent ? (
                       <>
@@ -1323,7 +1323,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Attach files"
-                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
+                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                       onClick={async () => {
                         const files = await pickFiles("Attach files");
                         if (files.length > 0) {
@@ -1347,7 +1347,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link pull request"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                         onClick={() => {
                           setIssuePickerOpen(false);
                           setPrPickerOpen(true);
@@ -1367,7 +1367,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link issue"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                         onClick={() => {
                           setPrPickerOpen(false);
                           setIssuePickerOpen(true);
@@ -1386,7 +1386,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Create"
-                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 outline-none"
+                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
                       onClick={handleSubmit}
                       disabled={!projectDir}
                     >

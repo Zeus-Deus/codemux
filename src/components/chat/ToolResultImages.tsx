@@ -74,7 +74,7 @@ function ToolResultThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
     >
       <img
         src={image.src}

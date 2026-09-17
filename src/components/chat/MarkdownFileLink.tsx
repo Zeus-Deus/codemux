@@ -66,8 +66,8 @@ export const MarkdownFileLink = memo(function MarkdownFileLink({
       }}
       className={cn(
         variant === "inline"
-          ? "mx-px inline-flex max-w-full translate-y-px cursor-pointer items-center gap-1 align-baseline font-mono text-[0.86em] font-medium leading-[1.45] text-foreground/80 no-underline transition-colors hover:text-foreground focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          : "inline-flex min-w-0 max-w-full items-center gap-1 text-left text-inherit transition-colors hover:text-foreground focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+          ? "mx-px inline-flex max-w-full translate-y-px cursor-pointer items-center gap-1 align-baseline font-mono text-[0.86em] font-medium leading-[1.45] text-foreground/80 no-underline transition-colors duration-150 hover:text-foreground focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+          : "inline-flex min-w-0 max-w-full items-center gap-1 text-left text-inherit transition-colors duration-150 hover:text-foreground focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
         className,
       )}
     >

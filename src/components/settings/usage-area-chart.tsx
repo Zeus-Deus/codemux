@@ -333,7 +333,7 @@ export function UsageAreaChart({
               textAnchor={anchor}
               fontSize={TICK_LABEL_PX}
               className={cn(
-                "font-mono uppercase tracking-[0.06em] transition-[fill]",
+                "font-mono uppercase tracking-[0.06em] transition-[fill] duration-150",
               )}
               fill={hovered === i ? "var(--foreground)" : "var(--muted-foreground)"}
               fillOpacity={hovered === i ? 1 : 0.75}

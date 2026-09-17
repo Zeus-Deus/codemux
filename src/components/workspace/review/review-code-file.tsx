@@ -120,7 +120,7 @@ export function ReviewCodeFile({
           aria-pressed={viewed}
           onClick={onToggleViewed}
           className={cn(
-            "shrink-0 rounded-sm border-0 px-2 py-0.5 transition-colors",
+            "shrink-0 rounded-sm border-0 px-2 py-0.5 transition-colors duration-150",
             tzMetaNum,
             viewed
               ? "bg-status-open/15 font-semibold text-status-open"

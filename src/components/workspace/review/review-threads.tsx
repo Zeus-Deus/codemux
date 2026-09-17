@@ -77,7 +77,7 @@ function CopyButton({ text }: { text: string }) {
     <Button
       size="icon-xs"
       variant="ghost"
-      className="opacity-0 group-hover/comment:opacity-100 transition-opacity"
+      className="opacity-0 group-hover/comment:opacity-100 transition-opacity duration-150"
       onClick={handleCopy}
       title="Copy comment"
     >
@@ -210,7 +210,7 @@ function ThreadReplyBox({
         data-testid={`thread-reply-input-${threadId}`}
         aria-label="Reply to this thread"
         className={cn(
-          "w-full resize-none overflow-y-auto rounded-md border-0 bg-muted/40 px-2 py-1.5 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+          "w-full resize-none overflow-y-auto rounded-md border-0 bg-muted/40 px-2 py-1.5 leading-relaxed text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/60",
           tzBody,
         )}
       />
@@ -420,12 +420,12 @@ function ResolvedThread(props: ThreadProps) {
       <button
         type="button"
         data-testid={`thread-resolved-header-${thread.id}`}
-        className="flex w-full items-center gap-1.5 rounded-sm px-0.5 py-1 text-left transition-colors hover:bg-accent/30"
+        className="flex w-full items-center gap-1.5 rounded-sm px-0.5 py-1 text-left transition-colors duration-150 hover:bg-accent/30"
         onClick={() => setOpen((v) => !v)}
       >
         <ChevronRight
           className={cn(
-            "size-3 shrink-0 text-muted-foreground transition-transform",
+            "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
             open && "rotate-90",
           )}
         />

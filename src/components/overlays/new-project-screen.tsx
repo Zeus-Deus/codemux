@@ -199,7 +199,7 @@ export function NewProjectScreen() {
                     setError(null);
                   }}
                   className={cn(
-                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors",
+                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors duration-150",
                     selected
                       ? "border-foreground/50 bg-surface-2"
                       : "border-border/50 hover:border-border hover:bg-accent/30",
@@ -281,7 +281,7 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
-                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors"
+                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
                 <X className="size-3.5" />
               </button>

@@ -408,7 +408,7 @@ export function WorkspaceHoverCardBody({
               >
                 <Terminal
                   aria-hidden="true"
-                  className="size-3 shrink-0 animate-pulse"
+                  className="size-3 shrink-0 motion-safe:animate-pulse"
                 />
                 <span>{runningProcessCount} running</span>
               </span>

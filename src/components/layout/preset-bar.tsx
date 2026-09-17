@@ -390,8 +390,7 @@ function PresetBarImpl({
   return (
     <PanelHeader
       ref={scrollerRef}
-      className="bg-background px-2 gap-0.5 overflow-x-auto"
-      style={{ scrollbarWidth: "none" }}
+      className="no-scrollbar bg-background px-2 gap-0.5 overflow-x-auto"
     >
       {/* Settings gear */}
       <DropdownMenu>

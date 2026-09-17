@@ -177,7 +177,7 @@ function FileRow({
               onOpenDiff(file.path, staged);
             }
           }}
-          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors"
+          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors duration-150"
         >
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
@@ -189,7 +189,7 @@ function FileRow({
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>

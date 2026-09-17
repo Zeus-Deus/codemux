@@ -25,7 +25,7 @@ import {
 export const WORK_LOG_HISTORY_WINDOW = 10;
 
 const ROW_CLASS =
-  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
+  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
@@ -267,7 +267,7 @@ function StepRow({
         ) : null}
         <ChevronDown
           className={cn(
-            "size-3 shrink-0 text-muted-foreground/45 transition-transform",
+            "size-3 shrink-0 text-muted-foreground/45 transition-transform duration-150",
             expanded && "rotate-180",
           )}
           aria-hidden
@@ -335,7 +335,7 @@ function SubagentRunRow({
       <span className="flex shrink-0 items-center gap-0.5 text-caption font-medium text-foreground/70">
         View
         <ChevronRight
-          className="size-3 transition-transform group-hover/subagents:translate-x-0.5"
+          className="size-3 transition-transform duration-150 group-hover/subagents:translate-x-0.5"
           aria-hidden
         />
       </span>

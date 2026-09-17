@@ -124,7 +124,7 @@ export function ReviewHeader({
             <button
               type="button"
               className={cn(
-                "h-[30px] border-0 pl-2.5 pr-1.5 text-foreground/90 transition-colors hover:bg-accent/50 disabled:opacity-60",
+                "h-[30px] border-0 pl-2.5 pr-1.5 text-foreground/90 transition-colors duration-150 hover:bg-accent/50 disabled:opacity-60",
                 tzBody,
               )}
               data-testid="detail-checkout"
@@ -139,7 +139,7 @@ export function ReviewHeader({
                   type="button"
                   aria-label="Check out options"
                   className={cn(
-                    "h-[30px] border-0 pl-0.5 pr-2 text-muted-foreground transition-colors hover:bg-accent/50",
+                    "h-[30px] border-0 pl-0.5 pr-2 text-muted-foreground transition-colors duration-150 hover:bg-accent/50",
                     tzEyebrow,
                   )}
                 >
@@ -170,7 +170,7 @@ export function ReviewHeader({
             <button
               type="button"
               aria-label="Pull request actions"
-              className="flex size-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+              className="flex size-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
             >
               <MoreHorizontal className="size-3.5" />
             </button>

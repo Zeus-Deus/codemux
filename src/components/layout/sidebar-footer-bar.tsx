@@ -125,7 +125,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
+            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors duration-150 hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
@@ -407,7 +407,7 @@ export function SidebarFooterBar() {
               <p className="px-2 py-1 text-label font-medium text-muted-foreground">
                 Footer destinations
               </p>
-              <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">
+              <div className="thin-scrollbar [scrollbar-gutter:stable] max-h-[50vh] overflow-y-auto p-1">
                 {overflow.map((pin) => (
                   <div key={pin.id} className="py-0.5">
                     <FooterDestination

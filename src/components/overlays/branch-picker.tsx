@@ -212,7 +212,7 @@ export function BranchPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
+          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
         >
           {isOpenMode ? <CornerDownRight className="size-3" /> : <GitBranch className="size-3" />}
           <span className="max-w-[120px] truncate">{baseBranch}</span>
@@ -246,7 +246,7 @@ export function BranchPicker({
             <button
               type="button"
               className={cn(
-                "flex-1 px-2 py-1 text-label rounded-md transition-colors",
+                "flex-1 px-2 py-1 text-label rounded-md transition-colors duration-150",
                 filterMode === "all"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -254,12 +254,12 @@ export function BranchPicker({
               onClick={() => setFilterMode("all")}
             >
               All{" "}
-              <span className="text-caption opacity-60">{allCount}</span>
+              <span className="text-caption opacity-60 tabular-nums">{allCount}</span>
             </button>
             <button
               type="button"
               className={cn(
-                "flex-1 px-2 py-1 text-label rounded-md transition-colors",
+                "flex-1 px-2 py-1 text-label rounded-md transition-colors duration-150",
                 filterMode === "worktrees"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -267,12 +267,12 @@ export function BranchPicker({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-caption opacity-60">{worktreeCount}</span>
+              <span className="text-caption opacity-60 tabular-nums">{worktreeCount}</span>
             </button>
           </div>}
 
           <CommandList
-            className="max-h-[340px] overflow-y-auto [scrollbar-width:thin]"
+            className="max-h-[340px] overflow-y-auto thin-scrollbar [scrollbar-gutter:stable]"
             onWheel={(e) => e.stopPropagation()}
           >
             {loading ? (
@@ -398,7 +398,7 @@ export function BranchPicker({
                           )}>
                             <button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
+                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors duration-150"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handlePrimaryAction(branch);
@@ -409,7 +409,7 @@ export function BranchPicker({
                             </button>
                             {!baseOnly && <button
                               type="button"
-                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors"
+                              className="inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-label font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors duration-150"
                               onClick={(e) => handleSecondaryAction(e, branch)}
                             >
                               {secondaryLabel}

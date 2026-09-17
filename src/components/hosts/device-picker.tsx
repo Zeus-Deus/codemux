@@ -102,7 +102,7 @@ export function DevicePicker({
           // rendered taller than its neighbors. Match-by-string is
           // the most reliable diff guard.
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none",
+            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground",
             className,
           )}
         >

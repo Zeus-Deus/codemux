@@ -53,7 +53,7 @@ export function PaneActionButton({
             size === "titlebar"
               ? "size-7 rounded-[min(var(--radius-md),12px)]"
               : "size-6 rounded-md",
-            "transition-colors duration-[120ms]",
+            "transition-colors duration-100",
             "disabled:pointer-events-none disabled:opacity-40",
             active
               ? "bg-surface-3 text-foreground"

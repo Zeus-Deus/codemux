@@ -56,7 +56,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
           setOpen((v) => !v);
         }}
         aria-expanded={open}
-        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors duration-150 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
         <span className="flex size-5 shrink-0 items-center justify-center">
           {live ? (
@@ -78,7 +78,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         </span>
         <ChevronDown
           className={cn(
-            "size-3 shrink-0 text-muted-foreground/45 transition-transform",
+            "size-3 shrink-0 text-muted-foreground/45 transition-transform duration-150",
             open && "rotate-180",
           )}
           aria-hidden

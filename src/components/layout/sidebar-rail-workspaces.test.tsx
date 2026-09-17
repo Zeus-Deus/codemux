@@ -322,7 +322,7 @@ describe("SidebarRailWorkspaces", () => {
         .querySelector(`[data-rail-ws="${id}"]`)!
         .querySelector("span.rounded-full");
 
-    expect(dotIn("ws-1")).toHaveClass("bg-status-attention", "animate-pulse");
+    expect(dotIn("ws-1")).toHaveClass("bg-status-attention", "motion-safe:animate-pulse");
     expect(dotIn("ws-2")).toHaveClass("bg-status-working");
     expect(dotIn("ws-3")).toHaveClass("bg-status-open");
     // Idle workspace carries no dot.

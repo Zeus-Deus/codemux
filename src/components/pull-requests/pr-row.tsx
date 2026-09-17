@@ -268,7 +268,7 @@ function PrRowImpl({
               className={cn(
                 "invisible max-w-full shrink-0 truncate rounded-sm bg-card px-2 py-0.5 text-foreground/90",
                 tzMeta,
-                "transition-colors hover:bg-accent/60 disabled:opacity-60",
+                "transition-colors duration-150 hover:bg-accent/60 disabled:opacity-60",
                 "group-hover:visible group-data-[focused=true]:visible",
               )}
             >

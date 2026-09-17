@@ -470,7 +470,7 @@ function PaneNodeImpl({
         onPointerDown={handleActivate}
       >
         <PanelHeader
-          className={cn("gap-1 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
+          className={cn("gap-1 cursor-grab active:cursor-grabbing transition-colors duration-150", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex-1 truncate text-label text-muted-foreground">

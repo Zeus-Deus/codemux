@@ -73,14 +73,14 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
 // the band-wide control token, shared with the panel toggle and the 28px
 // icon buttons.
 const PILL_BASE = cn(
-  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-label transition-colors",
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-label transition-colors duration-150",
   BAND_CONTROL_RADIUS,
 );
 const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
 const PILL_INACTIVE =
   "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
 const CLOSE_BTN =
-  "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+  "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
 interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
@@ -149,8 +149,7 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   return (
     <div
       ref={setScrollerNode}
-      className="relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
-      style={{ scrollbarWidth: "none" }}
+      className="no-scrollbar relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
       data-testid="titlebar-tabs-scroll"
     >
       {dragTabId && dropIndicatorLeft !== null && (
@@ -319,7 +318,7 @@ function ActiveChatTab({
               {status && <StatusIndicator status={status} />}
               <ChevronDown
                 className={cn(
-                  "size-3 shrink-0 opacity-60 transition-transform",
+                  "size-3 shrink-0 opacity-60 transition-transform duration-150",
                   open && "rotate-180",
                 )}
               />

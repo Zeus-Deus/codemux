@@ -136,11 +136,11 @@ export function WorkspaceResourceSection({
         <button
           type="button"
           onClick={() => toggleProject(project.projectId)}
-          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-surface-2 transition-colors"
+          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-surface-2 transition-colors duration-150"
           aria-label={isProjectCollapsed ? "Expand project" : "Collapse project"}
         >
           <div className="flex items-center gap-1 min-w-0 mr-2">
-            <span className="flex items-center justify-center size-4 shrink-0 text-muted-foreground/70 group-hover:text-muted-foreground transition-colors">
+            <span className="flex items-center justify-center size-4 shrink-0 text-muted-foreground/70 group-hover:text-muted-foreground transition-colors duration-150">
               {isProjectCollapsed ? (
                 <ChevronRight className="size-3" />
               ) : (
@@ -166,12 +166,12 @@ export function WorkspaceResourceSection({
 
             return (
               <div key={workspace.workspace_id}>
-                <div className="group flex items-center hover:bg-surface-2 transition-colors">
+                <div className="group flex items-center hover:bg-surface-2 transition-colors duration-150">
                   {hasSessions ? (
                     <button
                       type="button"
                       onClick={() => toggleWorkspace(workspace.workspace_id)}
-                      className="flex items-center justify-center h-7 w-5 ml-3.5 shrink-0 text-muted-foreground/60 hover:text-muted-foreground transition-colors"
+                      className="flex items-center justify-center h-7 w-5 ml-3.5 shrink-0 text-muted-foreground/60 hover:text-muted-foreground transition-colors duration-150"
                       aria-label={
                         isCollapsed ? "Expand workspace" : "Collapse workspace"
                       }
@@ -216,7 +216,7 @@ export function WorkspaceResourceSection({
                         type="button"
                         key={session.session_id}
                         onClick={() => navigateToSession(session.session_id)}
-                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-surface-2 transition-colors text-left"
+                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-surface-2 transition-colors duration-150 text-left"
                       >
                         <div className="flex items-center gap-1.5 min-w-0 mr-2">
                           <span className="size-1 shrink-0 rounded-full bg-muted-foreground/40" />

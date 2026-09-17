@@ -368,7 +368,7 @@ function ServerRow({
       <Button
         variant="ghost"
         size="sm"
-        className="opacity-0 transition-opacity group-hover:opacity-100"
+        className="opacity-0 transition-opacity duration-150 group-hover:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
