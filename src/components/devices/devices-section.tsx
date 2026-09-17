@@ -153,7 +153,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
   const count = candidates.length;
 
   return (
-    <div className="flex items-center gap-2.5 rounded-lg bg-foreground/[0.035] px-3 py-2.5">
+    <div className="flex items-center gap-2.5 rounded-lg bg-surface-1 px-3 py-2.5">
       <LaptopGlyph className="size-[13px] shrink-0 text-status-open" />
       <span className="text-body-sm font-semibold text-foreground">
         This device
@@ -246,7 +246,7 @@ function DeviceCardView({
         "overflow-hidden rounded-lg",
         reachable
           ? "bg-card shadow-[0_3px_14px_rgba(0,0,0,0.28)]"
-          : "bg-foreground/[0.03] opacity-80",
+          : "bg-surface-1 opacity-80",
       )}
     >
       <div className="flex items-center gap-2.5 px-[13px] py-3">
@@ -262,7 +262,7 @@ function DeviceCardView({
               "flex size-7 shrink-0 items-center justify-center rounded-md",
               reachable
                 ? "bg-status-remote/[0.13] text-status-remote"
-                : "bg-foreground/[0.06] text-muted-foreground/70",
+                : "bg-surface-2 text-muted-foreground/70",
             )}
           >
             <DeviceGlyph className="size-[13px]" />
@@ -385,7 +385,7 @@ function ProjectCluster({
       <div
         className={cn(
           "flex items-center gap-1.5 rounded-lg px-1 py-1",
-          !expanded && "hover:bg-foreground/[0.04]",
+          !expanded && "hover:bg-surface-2",
         )}
       >
         <button
@@ -414,7 +414,7 @@ function ProjectCluster({
             disabled={pulling}
             onClick={() => onPullProject(project.projectUid!, project.name)}
             title="Pull this project's repo root and all its worktrees to this device"
-            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-60"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
               <Loader2 className="size-[9px] animate-spin" aria-hidden />
@@ -487,7 +487,7 @@ function WorkspaceRow({
         : null;
 
   return (
-    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-foreground/[0.05]">
+    <li className="grid h-8 grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg px-2 hover:bg-surface-2">
       <span
         aria-hidden
         className="size-1.5 justify-self-center rounded-full bg-status-remote/70"
@@ -497,7 +497,7 @@ function WorkspaceRow({
           {sync.title}
         </span>
         {kindLabel && (
-          <span className="ml-1 shrink-0 rounded-full bg-foreground/[0.06] px-[7px] py-[2px] font-mono text-micro font-medium text-muted-foreground/70">
+          <span className="ml-1 shrink-0 rounded-full bg-surface-2 px-[7px] py-[2px] font-mono text-micro font-medium text-muted-foreground/70">
             {kindLabel}
           </span>
         )}
@@ -555,7 +555,7 @@ function RowAction({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="rounded-md bg-foreground/[0.07] px-[9px] py-1 text-caption font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.11] hover:text-foreground disabled:opacity-60"
+      className="rounded-md bg-surface-2 px-[9px] py-1 text-caption font-semibold text-muted-foreground transition-colors hover:bg-surface-3 hover:text-foreground disabled:opacity-60"
     >
       {children}
     </button>
@@ -569,7 +569,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center justify-center gap-1.5 rounded-lg bg-foreground/[0.03] p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-foreground/[0.05] hover:text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-muted-foreground"
     >
       <Plus className="size-2.5" aria-hidden strokeWidth={2.2} />
       Add device

@@ -201,7 +201,7 @@ export function NewProjectScreen() {
                   className={cn(
                     "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors",
                     selected
-                      ? "border-foreground/50 bg-foreground/5"
+                      ? "border-foreground/50 bg-surface-2"
                       : "border-border/50 hover:border-border hover:bg-accent/30",
                   )}
                 >
@@ -292,7 +292,7 @@ export function NewProjectScreen() {
               with phase + percent + a determinate bar so a slow clone
               never looks hung. */}
           {cloning && (
-            <div className="rounded-md border border-border/50 bg-foreground/5 px-4 py-3">
+            <div className="rounded-md border border-border/50 bg-surface-2 px-4 py-3">
               <CloneProgressRow progress={cloneProgress} />
             </div>
           )}

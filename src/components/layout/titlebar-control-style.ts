@@ -33,4 +33,4 @@ export const BAND_CONTROL_HOVER =
  * 6% it separates the active tab from its neighbours without drawing a
  * box on top of the transcript showing through behind it.
  */
-export const BAND_ACTIVE_FILL = "bg-foreground/6";
+export const BAND_ACTIVE_FILL = "bg-surface-2";

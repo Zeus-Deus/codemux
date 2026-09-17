@@ -162,8 +162,8 @@ function DeckTabChip({
         "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
         "transition-colors duration-[120ms]",
         active
-          ? "bg-foreground/7 font-semibold text-foreground"
-          : "font-medium text-foreground/42 hover:bg-foreground/5 hover:text-foreground/70",
+          ? "bg-surface-3 font-semibold text-foreground"
+          : "font-medium text-foreground/42 hover:bg-surface-2 hover:text-foreground/70",
         dragging && "opacity-40",
       )}
     >
@@ -196,7 +196,7 @@ function DeckTabChip({
             // Overlays the tab's right edge rather than taking a layout
             // slot, so revealing it on hover doesn't shove the row around.
             "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-sm transition-opacity",
-            "hover:bg-foreground/15 focus-visible:opacity-100",
+            "hover:bg-surface-3 focus-visible:opacity-100",
             active
               ? "opacity-50 hover:opacity-100"
               : // Opaque on purpose: it masks the label it sits on top of,
@@ -466,7 +466,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             type="button"
             aria-label="Open pane"
             data-testid="right-panel-add-pane"
-            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground data-[state=open]:bg-foreground/12 data-[state=open]:text-foreground"
+            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
           >
             <Plus className="size-[13px]" strokeWidth={1.7} />
           </button>

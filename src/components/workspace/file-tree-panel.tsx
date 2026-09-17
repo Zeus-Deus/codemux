@@ -83,7 +83,7 @@ const TreeNode = memo(function TreeNode({
           type="button"
           className={cn(
             row,
-            "text-foreground/62 hover:bg-foreground/5 hover:text-foreground/80",
+            "text-foreground/62 hover:bg-surface-2 hover:text-foreground/80",
             entry.is_gitignored && "opacity-50",
           )}
           style={{ paddingLeft: indentOf(depth) }}
@@ -139,8 +139,8 @@ const TreeNode = memo(function TreeNode({
       className={cn(
         row,
         selected
-          ? "bg-foreground/8 text-foreground"
-          : "text-foreground/44 hover:bg-foreground/5 hover:text-foreground/70",
+          ? "bg-surface-3 text-foreground"
+          : "text-foreground/44 hover:bg-surface-2 hover:text-foreground/70",
         entry.is_gitignored && "opacity-50",
       )}
       style={{ paddingLeft: indentOf(depth) }}

@@ -326,7 +326,7 @@ function SweepProgressSurface({
         aria-valuemin={0}
         aria-valuemax={total}
         aria-valuenow={index}
-        className="relative flex h-0.5 bg-foreground/[0.07]"
+        className="relative flex h-0.5 bg-surface-2"
       >
         {!settled ? (
           <div

@@ -39,7 +39,7 @@ export function AssistantAvatar({ provider }: Props) {
           // Match the mark: ember wash for the ember-toned Claude mark,
           // a subtle neutral wash for the other provider marks.
           // Both token-based so they track the theme.
-          provider === "claude" ? "bg-accent-ember/15" : "bg-foreground/8",
+          provider === "claude" ? "bg-accent-ember/15" : "bg-surface-3",
         )}
       >
         <ProviderLogo provider={provider} className="h-[15px] w-[15px]" />

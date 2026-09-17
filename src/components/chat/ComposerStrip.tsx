@@ -121,28 +121,28 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 const STRIP_CHIP =
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-foreground/[0.05] px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09] hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
 // Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
 const GOAL_FOCUS = "outline-none focus-visible:ring-1 focus-visible:ring-ring";
 /** Quiet text action (Copy, Clear beside Resume). */
 const GOAL_CHIP = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Clear when it is the strongest action in the row. */
 const GOAL_CHIP_OUTLINE = cn(
   GOAL_CHIP,
-  "border border-foreground/[0.16] text-foreground/85",
+  "border border-hairline-strong text-foreground/85",
 );
 /** Hide and the `+n` pill: filled, with a trailing chevron. */
 const GOAL_CHIP_FILLED = cn(
   GOAL_CHIP,
-  "bg-foreground/[0.07] px-[7px] text-foreground/80 hover:bg-foreground/[0.11]",
+  "bg-surface-2 px-[7px] text-foreground/80 hover:bg-surface-3",
 );
 /** The resting chevron and the overflow trigger: icon only, no fill. */
 const GOAL_ICON_BUTTON = cn(
-  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Resume is the one solid control in the strip: an interrupted goal is the
@@ -629,7 +629,7 @@ function GoalRowView({
           {interrupted && (
             <div
               data-testid="composer-strip-goal-sends"
-              className="flex min-w-0 items-center gap-2 rounded-md border border-border/70 bg-foreground/[0.02] px-[9px] py-1.5"
+              className="flex min-w-0 items-center gap-2 rounded-md border border-border/70 bg-surface-1 px-[9px] py-1.5"
             >
               <span className="shrink-0 font-mono text-caption font-semibold tracking-[0.08em] text-muted-foreground uppercase">
                 sends

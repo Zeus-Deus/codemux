@@ -511,10 +511,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // the rise-in keyframe — with nothing here to fight it.
                 "transition-[color,background-color,border-color]",
                 isActive
-                  ? "border-border bg-foreground/[0.09]"
+                  ? "border-border bg-surface-3"
                   : isNeeds
-                    ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
-                    : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
+                    ? "border-status-attention/30 bg-transparent hover:bg-surface-2"
+                    : "border-transparent bg-transparent hover:bg-surface-2 focus-visible:border-border",
                 // Multi-select layers a ring over whatever the card already
                 // is, so "checked for a bulk action" never has to compete with
                 // "this is the workspace you're looking at" for the same
@@ -862,7 +862,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           )
                         : prStatusTextClass(prState),
                       workspace.pr_url
-                        ? "hover:bg-foreground/[0.055]"
+                        ? "hover:bg-surface-2"
                         : // `cursor-default`, not `pointer-events-none`: the
                           // chip is already `disabled`, so it swallows the
                           // click. Letting pointer events pass through instead
@@ -945,7 +945,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-caption font-bold text-muted-foreground",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
                         "transition-opacity duration-150",
                         visuallyReceded &&
                           "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",

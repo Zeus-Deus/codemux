@@ -69,7 +69,7 @@ export function SidebarActionRow() {
                 type="button"
                 aria-label="New agent"
                 onClick={handleNewAgent}
-                className="flex size-7 items-center justify-center rounded-lg border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+                className="flex size-7 items-center justify-center rounded-lg border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
               >
                 <SquarePen className="size-[13px]" />
               </button>
@@ -85,7 +85,7 @@ export function SidebarActionRow() {
                 type="button"
                 aria-label="Search"
                 onClick={() => setShowCommandPalette(true)}
-                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.04] hover:text-foreground"
+                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
               >
                 <SearchIcon className="size-3.5" />
               </button>
@@ -119,7 +119,7 @@ export function SidebarActionRow() {
           type="button"
           aria-label="Search"
           onClick={() => setShowCommandPalette(true)}
-          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-md border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
+          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-md border border-border/60 bg-surface-1 px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
         >
           <SearchIcon className="h-3.5 w-3.5 shrink-0" />
           <span className="flex-1 text-left text-label">Search</span>
@@ -135,7 +135,7 @@ export function SidebarActionRow() {
               type="button"
               aria-label="New agent"
               onClick={handleNewAgent}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+              className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
             >
               <SquarePen className="size-[15px]" />
             </button>

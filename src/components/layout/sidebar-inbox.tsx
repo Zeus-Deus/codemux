@@ -373,7 +373,7 @@ function ProjectFilterItem({
       aria-label={name}
       className={cn(
         "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-        active && "bg-foreground/[0.08] text-foreground",
+        active && "bg-surface-3 text-foreground",
       )}
     >
       <ProjectMiniAvatar name={name} path={path} />
@@ -590,9 +590,9 @@ const SettledRow = memo(function SettledRow({
         // height is the literal `h-[30px]` above and it carries no margin — so
         // scroll position can't drift as rows are realised.
         "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
-        "outline-none transition-colors duration-150 hover:bg-foreground/[0.045] focus-visible:bg-foreground/[0.045]",
-        isActive && "bg-foreground/[0.06]",
-        selected && "bg-foreground/[0.09] ring-1 ring-inset ring-border",
+        "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
+        isActive && "bg-surface-3",
+        selected && "bg-surface-3 ring-1 ring-inset ring-border",
         justSettled && "rise-in",
       )}
     >
@@ -656,7 +656,7 @@ const SettledRow = memo(function SettledRow({
                   )
                 : prStatusTextClass(prState),
               workspace.pr_url
-                ? "hover:bg-foreground/[0.055]"
+                ? "hover:bg-surface-2"
                 : "cursor-default opacity-65",
             )}
           >
@@ -811,9 +811,9 @@ const SnoozeRow = memo(function SnoozeRow({
           // Identical silhouette to a settled row, so identical containment
           // hint — 30px exactly, no margin.
           "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
-          "outline-none transition-colors duration-150 hover:bg-foreground/[0.045] focus-visible:bg-foreground/[0.045]",
-          isActive && "bg-foreground/[0.06]",
-          selected && "bg-foreground/[0.09] ring-1 ring-inset ring-border",
+          "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
+          isActive && "bg-surface-3",
+          selected && "bg-surface-3 ring-1 ring-inset ring-border",
         )}
       >
         <ProjectAvatar
@@ -1887,7 +1887,7 @@ export function SidebarInbox() {
                 className={cn(
                   "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
                   "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
-                  "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
+                  "transition-colors duration-150 hover:border-border/60 hover:bg-surface-2",
                 )}
               >
                 {filter === null ? (
@@ -1926,7 +1926,7 @@ export function SidebarInbox() {
                   aria-label="All projects"
                   className={cn(
                     "h-8 gap-2 rounded-md px-2 text-label font-semibold",
-                    filter === null && "bg-foreground/[0.08] text-foreground",
+                    filter === null && "bg-surface-3 text-foreground",
                   )}
                 >
                   <Folder className="size-3.5 shrink-0 text-muted-foreground" />

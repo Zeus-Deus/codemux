@@ -301,8 +301,9 @@ describe("SidebarRailWorkspaces", () => {
       b.getAttribute("data-rail-ws"),
     );
     expect(ids).toEqual(["ws-3", "ws-1"]);
-    expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
   });
 
@@ -374,8 +375,9 @@ describe("SidebarRailWorkspaces", () => {
     pendingActiveWorkspaceId = "ws-brand-new";
     const { container } = await renderRail();
 
-    expect(container.querySelector('[data-rail-ws="ws-1"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-1"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
   });
 

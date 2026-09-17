@@ -187,7 +187,7 @@ export function WorkspaceStatusCluster() {
           disabled={initializing}
           aria-label="Initialize a git repository in this project folder"
           title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
-          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-label font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
         >
           {initializing ? "Initializing…" : "Initialize Git"}
         </button>
@@ -243,8 +243,8 @@ export function WorkspaceStatusCluster() {
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09]",
-                  open && "bg-foreground/[0.09]",
+                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-body-sm font-semibold text-foreground/80 outline-none transition-colors hover:bg-surface-2",
+                  open && "bg-surface-3",
                 )}
               >
                 <AppWindow className="size-3.5" />
@@ -317,7 +317,7 @@ export function WorkspaceStatusCluster() {
                       type="button"
                       onClick={handlePrClick}
                       onAuxClick={handlePrAuxClick}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-surface-2"
                     >
                       View {provider.shortNoun}{" "}
                       {providerRef(provider, workspace.pr_number)}
@@ -328,7 +328,7 @@ export function WorkspaceStatusCluster() {
                       type="button"
                       onClick={handleSync}
                       disabled={pulling}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-body-sm font-semibold text-foreground transition-colors hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {pulling ? "Syncing…" : `Sync ↓${workspace.git_behind}`}
                     </button>
@@ -361,7 +361,7 @@ function DetailRow({
   muted?: boolean;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-foreground/[0.05]">
+    <div className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-surface-2">
       <span className="min-w-0 flex-1 truncate text-body-sm text-muted-foreground">
         {label}
       </span>

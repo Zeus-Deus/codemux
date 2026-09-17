@@ -30,7 +30,7 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
         )}
       </div>
 
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-3">
         {determinate ? (
           <div
             className="h-full rounded-full bg-foreground transition-[width] duration-300 ease-out"

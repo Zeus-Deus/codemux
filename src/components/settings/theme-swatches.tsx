@@ -15,7 +15,7 @@ export function ThemeCoins({ theme, size }: { theme: ThemeDefinition; size: numb
     // dark page. `foreground` flips with the page, so both stay drawn.
     <span className="flex flex-none items-center" aria-hidden="true">
       <span
-        className="rounded-full border border-foreground/15"
+        className="rounded-full border border-hairline-strong"
         style={{ ...disc, background: theme.roles.card }}
       />
       <span

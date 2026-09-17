@@ -126,7 +126,7 @@ export function TasksPanel({
           )}
         </div>
         <div
-          className="h-[3px] overflow-hidden rounded-full bg-foreground/12"
+          className="h-[3px] overflow-hidden rounded-full bg-surface-3"
           role="progressbar"
           aria-label="Task progress"
           aria-valuemin={0}
@@ -164,7 +164,7 @@ export function TasksPanel({
                     "flex items-start gap-2 rounded-lg px-2 py-1.5 transition-colors",
                     task.status === "in_progress" && "bg-status-working/8",
                     task.status === "completed" && "bg-status-open/8",
-                    task.status === "pending" && "hover:bg-foreground/4",
+                    task.status === "pending" && "hover:bg-surface-2",
                   )}
                 >
                   <span className="mt-[3px] flex size-4 shrink-0 items-center justify-center">
@@ -244,7 +244,7 @@ export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
         type="button"
         onClick={handleCopy}
         data-testid="tasks-copy"
-        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-foreground/8 hover:text-foreground"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground"
       >
         {copied ? (
           <Check className="size-3" aria-hidden />

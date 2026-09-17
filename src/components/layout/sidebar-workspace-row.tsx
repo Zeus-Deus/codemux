@@ -866,7 +866,7 @@ export function WorkspaceContextMenuItems({
             "ml-auto flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors",
             workspace.notifications_muted
               ? "justify-end bg-accent-ember/70"
-              : "bg-foreground/15",
+              : "bg-surface-3",
           )}
         >
           <span
