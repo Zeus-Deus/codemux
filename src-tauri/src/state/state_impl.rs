@@ -2119,7 +2119,8 @@ impl AppStateStore {
     /// [`create_agent_chat_pane`](Self::create_agent_chat_pane) plus a flag
     /// telling the caller whether a pane node was actually inserted. `false`
     /// means an existing pane already owned `thread_id` and was returned
-    /// as-is, so the command layer can skip a redundant `app-state` emit.
+    /// as-is. It does NOT mean the snapshot is unchanged: reuse still
+    /// activates the pane it returns, so callers must publish either way.
     pub fn create_or_reuse_agent_chat_pane(
         &self,
         workspace_id: &str,

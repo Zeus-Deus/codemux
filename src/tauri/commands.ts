@@ -2,7 +2,10 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
-import { noteLocalWorkspaceActivation } from "@/lib/local-activation";
+import {
+  noteLocalActivationFallback,
+  noteLocalWorkspaceActivation,
+} from "@/lib/local-activation";
 
 export { Channel };
 import type {
@@ -407,8 +410,18 @@ export const setWorkspaceMuted = (workspaceId: string, muted: boolean) =>
 export const setWorkspacePinned = (workspaceId: string, pinned: boolean) =>
   invoke<void>("set_workspace_pinned", { workspaceId, pinned });
 
-export const closeWorkspace = (workspaceId: string, forceDelete: boolean) =>
-  invoke<string>("close_workspace", { workspaceId, forceDelete });
+/** Close a workspace. Resolves with the workspace the backend fell back
+ *  to (empty when nothing is left).
+ *
+ *  Removing the active workspace makes the BACKEND pick the next one, so
+ *  no `activateWorkspace` records it. Marking the fallback here — before
+ *  the invoke, so the app-state event can't arrive first — keeps the
+ *  workspace we land on counted as ours to fill. Same for the archive and
+ *  worktree variants below, which route through the same close impl. */
+export const closeWorkspace = (workspaceId: string, forceDelete: boolean) => {
+  noteLocalActivationFallback();
+  return invoke<string>("close_workspace", { workspaceId, forceDelete });
+};
 
 export const cycleWorkspace = (step: number) =>
   invoke<string>("cycle_workspace", { step });
@@ -550,8 +563,10 @@ export const closeWorkspaceWithWorktree = (
   removeWorktree: boolean,
   deleteBranch: boolean,
   forceDelete: boolean,
-) =>
-  invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
+) => {
+  noteLocalActivationFallback();
+  return invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
+};
 
 // ── Workspace archive ──
 //
@@ -562,8 +577,10 @@ export const closeWorkspaceWithWorktree = (
 
 /** Archive a workspace. Resolves with the new archive entry's id, which
  *  `unarchiveWorkspace` accepts to restore it. */
-export const archiveWorkspace = (workspaceId: string) =>
-  invoke<string>("archive_workspace", { workspaceId });
+export const archiveWorkspace = (workspaceId: string) => {
+  noteLocalActivationFallback();
+  return invoke<string>("archive_workspace", { workspaceId });
+};
 
 /** Restore an archived workspace. Resolves with the restored workspace id;
  *  the backend also activates it. Rejects (entry kept) when nothing is

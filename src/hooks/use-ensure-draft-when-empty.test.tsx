@@ -41,6 +41,7 @@ import { useEnsureDraftWhenEmpty } from "./use-ensure-draft-when-empty";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { agentChatCreatePane } from "@/tauri/commands";
 import {
+  noteLocalActivationFallback,
   noteLocalWorkspaceActivation,
   resetLocalWorkspaceActivations,
 } from "@/lib/local-activation";
@@ -528,6 +529,52 @@ describe("useEnsureDraftWhenEmpty", () => {
     expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
     expect(agentChatCreatePane).toHaveBeenCalledWith(
       "ws-clicked",
+      "claude",
+      null,
+    );
+  });
+
+  it("spawns for the workspace the backend fell back to after THIS client closed one", () => {
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    flagsLoaded = true;
+    homeDirSnapshot = "/home/user";
+    appStateSnapshot = {
+      active_workspace_id: "ws-mine",
+      workspaces: [
+        {
+          workspace_id: "ws-mine",
+          active_surface_id: "surf-1",
+          surfaces: [terminalSurface],
+          project_root: "/projects/mine",
+          cwd: "/projects/mine",
+        },
+      ],
+    };
+    const { rerender } = renderHook(() => useEnsureDraftWhenEmpty());
+
+    // Closing or archiving the active workspace never calls
+    // `activateWorkspace`: the backend picks the next workspace itself.
+    // The command wrapper leaves this marker so the fallback still counts
+    // as ours.
+    noteLocalActivationFallback();
+    appStateSnapshot = {
+      active_workspace_id: "ws-fallback",
+      workspaces: [
+        {
+          workspace_id: "ws-fallback",
+          active_surface_id: "surf-empty",
+          surfaces: [emptySplitSurface],
+          project_root: "/projects/fallback",
+          cwd: "/projects/fallback",
+        },
+      ],
+    };
+    rerender();
+
+    expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
+    expect(agentChatCreatePane).toHaveBeenCalledWith(
+      "ws-fallback",
       "claude",
       null,
     );

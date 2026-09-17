@@ -481,16 +481,12 @@ pub fn agent_chat_create_pane<R: Runtime>(
     thread_id: Option<String>,
 ) -> Result<String, String> {
     feature_flag_on(&observability)?;
-    let (pane_id, created) = state.create_or_reuse_agent_chat_pane(
-        &workspace_id,
-        provider,
-        cwd,
-        launch_mode,
-        thread_id,
-    )?;
-    if created {
-        crate::state::emit_app_state(&app);
-    }
+    let pane_id =
+        state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode, thread_id)?;
+    // Emit either way: reusing an existing pane still moves the active
+    // pane, tab, surface and workspace onto it, and those moves reach the
+    // clients only through this emit.
+    crate::state::emit_app_state(&app);
     Ok(pane_id.0)
 }
 
@@ -826,6 +822,24 @@ pub async fn agent_chat_start_session<R: Runtime>(
             }
         }
     }
+    let requested_thread_id = input.thread_id.0.clone();
+    // Nothing to start when this pane already runs the requested thread.
+    // A materialised draft is only marked promoted once its FIRST TURN
+    // lands, so a draft whose turn failed keeps asking its (already bound,
+    // already running) pane to start the session again on every mount —
+    // which the adapters reject as a double start. Report the live session
+    // instead.
+    let pane_already_runs_thread = {
+        let state: State<'_, AppStateStore> = app.state();
+        state
+            .agent_chat_pane_thread(&pane_id)
+            .is_some_and(|(bound_provider, bound_thread)| {
+                bound_provider == provider && bound_thread == requested_thread_id
+            })
+    };
+    if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
+        return Ok(input.thread_id);
+    }
     // Claim the pane BEFORE anything spawns. Desktop and remote clients
     // share one backend, so between "create pane" and "start session" a
     // second client can mount the pane and auto-start its own thread on it.
@@ -833,7 +847,6 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // session's CLI child. The claim is a compare-and-set under the state
     // lock, and the emit right after it publishes the binding to every
     // client while the provider is still starting — so nobody else tries.
-    let requested_thread_id = input.thread_id.0.clone();
     let claim = {
         let state: State<'_, AppStateStore> = app.state();
         state
@@ -904,15 +917,29 @@ pub async fn agent_chat_start_session<R: Runtime>(
             // The claim outlived its reason to exist: put the pane back the
             // way we found it so it is not advertised as owned by a thread
             // that has no session behind it.
-            let state: State<'_, AppStateStore> = app.state();
             // Compare-and-set: a no-op when another client has already
             // rebound the pane, and then its emit is the current truth.
-            if state.release_agent_chat_pane_claim(
-                &pane_id,
-                provider,
-                &requested_thread_id,
-                claim.previous.clone(),
-            ) {
+            //
+            // Two cases the compare-and-set alone cannot see, because the
+            // claim accepts an idempotent re-claim of the SAME thread and so
+            // leaves the binding reading exactly what we would roll back:
+            // a claim that changed nothing has nothing to undo, and a thread
+            // that now has a live session behind it belongs to whichever
+            // client started it — restoring the old binding over that would
+            // strand a running CLI child.
+            let thread_taken_over = impl_
+                .has_session(&ThreadId(requested_thread_id.clone()))
+                .await;
+            let state: State<'_, AppStateStore> = app.state();
+            if claim.changed
+                && !thread_taken_over
+                && state.release_agent_chat_pane_claim(
+                    &pane_id,
+                    provider,
+                    &requested_thread_id,
+                    claim.previous.clone(),
+                )
+            {
                 crate::state::emit_app_state(&app);
             }
             return Err(provider_err(error));

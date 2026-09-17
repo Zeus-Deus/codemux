@@ -5,6 +5,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { hasAnyPane } from "@/lib/pane-tree";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
 import {
+  adoptLocalFallbackActivation,
   noteLocalWorkspaceActivation,
   wasActivatedLocally,
 } from "@/lib/local-activation";
@@ -120,6 +121,14 @@ export function useEnsureDraftWhenEmpty() {
         noteLocalWorkspaceActivation(appState.active_workspace_id);
       }
     }
+
+    // Closing or archiving a workspace from THIS client hands the backend
+    // the job of picking the next active one, so there is no activation to
+    // observe — only the marker the close/archive command left behind. The
+    // workspace that fallback lands on is ours to fill like any other we
+    // navigated to. Consumed on this first snapshot after the command no
+    // matter where we landed, so it never outlives the fallback it marks.
+    adoptLocalFallbackActivation(appState.active_workspace_id);
 
     const activeWs = appState.workspaces.find(
       (w) => w.workspace_id === appState.active_workspace_id,

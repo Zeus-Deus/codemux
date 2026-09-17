@@ -8,8 +8,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { activateWorkspace } from "./commands";
 import {
+  activateWorkspace,
+  archiveWorkspace,
+  closeWorkspace,
+  closeWorkspaceWithWorktree,
+} from "./commands";
+import {
+  adoptLocalFallbackActivation,
   resetLocalWorkspaceActivations,
   wasActivatedLocally,
 } from "@/lib/local-activation";
@@ -40,5 +46,29 @@ describe("activateWorkspace", () => {
   it("does not record workspaces this client never activated", async () => {
     await activateWorkspace("ws-1");
     expect(wasActivatedLocally("ws-2")).toBe(false);
+  });
+});
+
+describe("workspace removal commands", () => {
+  // Removing the active workspace lets the BACKEND choose the next one, so
+  // there is no activation to record — only this marker, which keeps the
+  // workspace we land on counted as ours to fill.
+  it.each([
+    ["closeWorkspace", () => closeWorkspace("ws-1", false)],
+    [
+      "closeWorkspaceWithWorktree",
+      () => closeWorkspaceWithWorktree("ws-1", true, false, false),
+    ],
+    ["archiveWorkspace", () => archiveWorkspace("ws-1")],
+  ])("%s marks the backend's fallback activation as local", async (_, run) => {
+    await run();
+
+    expect(adoptLocalFallbackActivation("ws-fallback")).toBe(true);
+    expect(wasActivatedLocally("ws-fallback")).toBe(true);
+  });
+
+  it("does not adopt an activation when nothing was closed", () => {
+    expect(adoptLocalFallbackActivation("ws-theirs")).toBe(false);
+    expect(wasActivatedLocally("ws-theirs")).toBe(false);
   });
 });
