@@ -128,7 +128,7 @@ export function MarkdownLocalImage({
 
   return (
     <span
-      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-xl border border-border/70 bg-card shadow-sm"
+      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-lg border border-border/70 bg-card shadow-sm"
       data-chat-local-image
     >
       <button

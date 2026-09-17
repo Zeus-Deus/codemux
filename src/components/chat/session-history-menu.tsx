@@ -208,7 +208,7 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
         aria-label="Delete chat"
         data-session-delete
         data-testid={`session-delete-${session.thread_id}`}
-        className="rounded p-1 opacity-0 transition-opacity hover:bg-destructive/20 group-hover/row:opacity-100"
+        className="rounded-sm p-1 opacity-0 transition-opacity hover:bg-destructive/20 group-hover/row:opacity-100"
         onClick={(e) => {
           e.stopPropagation();
           e.preventDefault();

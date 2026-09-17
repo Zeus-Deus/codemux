@@ -168,7 +168,7 @@ function DeleteArchivedDialog({
                 type="checkbox"
                 checked={deleteWorktree}
                 onChange={(e) => setDeleteWorktree(e.target.checked)}
-                className="rounded border-border"
+                className="rounded-sm border-border"
               />
               <span className="text-label text-muted-foreground">
                 Also delete worktree from disk
@@ -180,7 +180,7 @@ function DeleteArchivedDialog({
                   type="checkbox"
                   checked={deleteBranch}
                   onChange={(e) => setDeleteBranch(e.target.checked)}
-                  className="rounded border-border"
+                  className="rounded-sm border-border"
                 />
                 <span className="text-label text-muted-foreground">
                   Also delete local branch
@@ -251,18 +251,18 @@ function ArchivedEntryRow({
             {entry.title}
           </span>
           {isRoot && (
-            <span className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground bg-muted border border-border/60">
+            <span className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-muted-foreground bg-muted border border-border/60">
               repo root
             </span>
           )}
           {entry.git_branch && (
-            <span className="shrink-0 truncate max-w-48 rounded bg-muted px-1.5 font-mono text-caption leading-[16px] text-muted-foreground">
+            <span className="shrink-0 truncate max-w-48 rounded-sm bg-muted px-1.5 font-mono text-caption leading-[16px] text-muted-foreground">
               {entry.git_branch}
             </span>
           )}
           {isStale && (
             <span
-              className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
+              className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
               title="Archived more than 30 days ago"
             >
               stale

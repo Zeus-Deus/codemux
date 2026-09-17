@@ -663,7 +663,7 @@ function ProviderRail({
                     aria-label="Favorites"
                     aria-pressed={selected === "favorites"}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
                       "hover:bg-muted",
                       selected === "favorites" &&
                         "bg-background text-foreground shadow-sm",
@@ -718,7 +718,7 @@ function ProviderRail({
                     aria-label={p.label}
                     aria-pressed={isSelected}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
                       "hover:bg-muted",
                       isSelected && "bg-background text-foreground shadow-sm",
                       isUnavailable &&
@@ -857,7 +857,7 @@ function ModelRow({
       {model.is_free ? (
         <span
           data-testid="model-row-free-badge"
-          className="mt-0.5 shrink-0 self-start rounded border border-status-open/35 bg-status-open/15 px-1 py-px text-micro font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
+          className="mt-0.5 shrink-0 self-start rounded-sm border border-status-open/35 bg-status-open/15 px-1 py-px text-micro font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
           aria-label="Free model"
         >
           Free
@@ -889,7 +889,7 @@ function ModelRow({
           // Always visible (not hover-revealed): a dim outline star on
           // every row keeps the favoriting affordance discoverable and
           // the row layout stable.
-          "shrink-0 rounded p-1 transition-colors hover:bg-accent",
+          "shrink-0 rounded-sm p-1 transition-colors hover:bg-accent",
           isFavorite
             ? "text-status-working"
             : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",
@@ -944,7 +944,7 @@ function ModelListEmptyState({
             OpenCode not detected on your system
           </p>
           <p className="mt-1">
-            Install the <code className="rounded bg-muted px-1">opencode</code>{" "}
+            Install the <code className="rounded-sm bg-muted px-1">opencode</code>{" "}
             CLI to access federated model providers.
           </p>
           <p className="mt-2">
@@ -974,7 +974,7 @@ function ModelListEmptyState({
           <p className="font-medium text-foreground">No connected providers</p>
           <p className="mt-1">
             Run{" "}
-            <code className="rounded bg-muted px-1">opencode auth login</code>{" "}
+            <code className="rounded-sm bg-muted px-1">opencode auth login</code>{" "}
             to configure upstream credentials.
           </p>
         </div>
@@ -990,7 +990,7 @@ function ModelListEmptyState({
             Codex not detected on your system
           </p>
           <p className="mt-1">
-            Install the <code className="rounded bg-muted px-1">codex</code> CLI
+            Install the <code className="rounded-sm bg-muted px-1">codex</code> CLI
             and ensure it is on your PATH.
           </p>
           <p className="mt-2">
@@ -1011,7 +1011,7 @@ function ModelListEmptyState({
         <div className="px-4 py-6 text-center text-label text-muted-foreground">
           <p className="font-medium text-foreground">Codex is not signed in</p>
           <p className="mt-1">
-            Run <code className="rounded bg-muted px-1">codex login</code> in a
+            Run <code className="rounded-sm bg-muted px-1">codex login</code> in a
             terminal and try again.
           </p>
         </div>
@@ -1037,7 +1037,7 @@ function ModelListEmptyState({
             Grok not detected on your system
           </p>
           <p className="mt-1">
-            Install the <code className="rounded bg-muted px-1">grok</code> CLI
+            Install the <code className="rounded-sm bg-muted px-1">grok</code> CLI
             and ensure it is on your PATH.
           </p>
         </div>
@@ -1051,10 +1051,10 @@ function ModelListEmptyState({
             {parsed.detail ?? (
               <>
                 Run{" "}
-                <code className="rounded bg-muted px-1">
+                <code className="rounded-sm bg-muted px-1">
                   grok login --device-auth
                 </code>{" "}
-                or set <code className="rounded bg-muted px-1">XAI_API_KEY</code>
+                or set <code className="rounded-sm bg-muted px-1">XAI_API_KEY</code>
                 , then try again.
               </>
             )}

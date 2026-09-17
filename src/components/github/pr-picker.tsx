@@ -86,8 +86,8 @@ function SkeletonRow() {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
       <div className="size-3.5 rounded-full bg-muted animate-pulse shrink-0" />
-      <div className="h-3 w-8 rounded bg-muted animate-pulse shrink-0" />
-      <div className="h-3 flex-1 rounded bg-muted animate-pulse" />
+      <div className="h-3 w-8 rounded-sm bg-muted animate-pulse shrink-0" />
+      <div className="h-3 flex-1 rounded-sm bg-muted animate-pulse" />
     </div>
   );
 }

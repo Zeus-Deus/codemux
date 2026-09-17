@@ -534,7 +534,7 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                   size="md"
                   shape="square"
                 />
-                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded bg-sidebar text-accent-ember">
+                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded-sm bg-sidebar text-accent-ember">
                   <SquarePen className="size-2.5" />
                 </span>
               </button>

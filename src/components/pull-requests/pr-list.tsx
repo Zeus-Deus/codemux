@@ -272,14 +272,14 @@ export function PrList({
             applyPendingOrder();
             onRefresh();
           }}
-          className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
         >
           <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
         </button>
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5 border-b border-border/40 px-3 py-2">
-        <span className="flex flex-1 items-center gap-1.5 rounded-[7px] bg-muted/40 px-2 py-1">
+        <span className="flex flex-1 items-center gap-1.5 rounded-md bg-muted/40 px-2 py-1">
           <Search className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             value={query}
@@ -298,7 +298,7 @@ export function PrList({
               type="button"
               data-testid="pr-state-filter"
               className={cn(
-                "flex shrink-0 items-center gap-1 rounded-[7px] bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors hover:bg-accent/50",
+                "flex shrink-0 items-center gap-1 rounded-md bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors hover:bg-accent/50",
                 tzBody,
               )}
             >

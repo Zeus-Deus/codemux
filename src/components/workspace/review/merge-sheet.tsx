@@ -158,7 +158,7 @@ export function MergeSheet({
           >
             <span
               className={cn(
-                "flex size-3.5 shrink-0 items-center justify-center rounded-[3px]",
+                "flex size-3.5 shrink-0 items-center justify-center rounded-sm",
                 deleteBranch
                   ? "bg-status-open/20 text-status-open ring-1 ring-status-open"
                   : "bg-muted ring-1 ring-border",

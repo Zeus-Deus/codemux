@@ -281,7 +281,7 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
-                className="shrink-0 rounded p-0.5 text-destructive/70 hover:text-destructive transition-colors"
+                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors"
               >
                 <X className="h-3.5 w-3.5" />
               </button>

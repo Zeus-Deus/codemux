@@ -181,7 +181,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
           inputRef.current?.select();
         }}
         className={cn(
-          "top-[46%] flex w-[436px] max-w-[calc(100vw-48px)] flex-col gap-0 overflow-hidden rounded-[14px] border border-border bg-popover p-0 text-popover-foreground ring-0",
+          "top-[46%] flex w-[436px] max-w-[calc(100vw-48px)] flex-col gap-0 overflow-hidden rounded-lg border border-border bg-popover p-0 text-popover-foreground ring-0",
           // Same elevation language as `.cm-menu-surface`: the cast shadow
           // stays literal black (a shadow is an absence of light, not a
           // themed surface) but its alpha is scheme-aware, because a plume
@@ -196,7 +196,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
         <div className="flex items-center gap-2.5 border-b border-border/70 py-[13px] pr-3.5 pl-4">
           <span
             aria-hidden
-            className="flex size-6 shrink-0 items-center justify-center rounded-[7px] bg-accent-ember/20 font-mono text-label font-medium text-accent-ember"
+            className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-ember/20 font-mono text-label font-medium text-accent-ember"
           >
             W
           </span>
@@ -214,7 +214,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <button
               type="button"
               aria-label="Close rename workspace dialog"
-              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X className="size-3" strokeWidth={1.6} />
             </button>
@@ -232,7 +232,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <div
               ref={fieldRef}
               className={cn(
-                "flex h-10 items-center gap-[9px] rounded-[9px] border bg-background/70 px-[11px] transition-[border-color,box-shadow] duration-100",
+                "flex h-10 items-center gap-[9px] rounded-md border bg-background/70 px-[11px] transition-[border-color,box-shadow] duration-100",
                 showError
                   ? "border-status-attention/60 shadow-[0_0_0_3px_color-mix(in_oklch,var(--status-attention)_14%,transparent)]"
                   : "border-accent-ember/55 shadow-[0_0_0_3px_color-mix(in_oklch,var(--accent-ember)_13%,transparent)]",
@@ -262,7 +262,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
                     setTouched(true);
                     inputRef.current?.focus();
                   }}
-                  className="flex size-[18px] shrink-0 items-center justify-center rounded-[5px] text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="flex size-[18px] shrink-0 items-center justify-center rounded-sm text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <X className="size-2.5" strokeWidth={1.8} />
                 </button>
@@ -295,7 +295,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
 
           <div className="flex items-center gap-2 border-t border-border/70 bg-muted/30 px-3 py-[11px]">
             <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-caption text-muted-foreground/55">
-              <kbd className="rounded-[5px] border border-border/70 px-[5px] py-0.5 font-mono">
+              <kbd className="rounded-sm border border-border/70 px-[5px] py-0.5 font-mono">
                 esc
               </kbd>
               <span>cancel</span>

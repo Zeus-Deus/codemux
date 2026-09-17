@@ -153,7 +153,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
   const count = candidates.length;
 
   return (
-    <div className="flex items-center gap-2.5 rounded-[10px] bg-foreground/[0.035] px-3 py-2.5">
+    <div className="flex items-center gap-2.5 rounded-lg bg-foreground/[0.035] px-3 py-2.5">
       <LaptopGlyph className="size-[13px] shrink-0 text-status-open" />
       <span className="text-body-sm font-semibold text-foreground">
         This device
@@ -166,7 +166,7 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
         <button
           type="button"
           onClick={() => setSweepOpen(true)}
-          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-[7px] bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
+          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
         >
           <Trash2 className="size-2.5" aria-hidden />
           Sweep {count} settled
@@ -243,7 +243,7 @@ function DeviceCardView({
     <section
       aria-label={card.name}
       className={cn(
-        "overflow-hidden rounded-xl",
+        "overflow-hidden rounded-lg",
         reachable
           ? "bg-card shadow-[0_3px_14px_rgba(0,0,0,0.28)]"
           : "bg-foreground/[0.03] opacity-80",
@@ -259,7 +259,7 @@ function DeviceCardView({
         >
           <span
             className={cn(
-              "flex size-7 shrink-0 items-center justify-center rounded-[9px]",
+              "flex size-7 shrink-0 items-center justify-center rounded-md",
               reachable
                 ? "bg-status-remote/[0.13] text-status-remote"
                 : "bg-foreground/[0.06] text-muted-foreground/70",
@@ -314,7 +314,7 @@ function DeviceCardView({
             // it (`sidebarPrimary` is the brand accent, and its foreground is
             // solved against it) — a literal white only ever cleared 2.8:1 on
             // the dark ember and would not survive a light theme's darker one.
-            className="shrink-0 rounded-[7px] bg-accent-ember px-3 py-1.5 text-label font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
+            className="shrink-0 rounded-md bg-accent-ember px-3 py-1.5 text-label font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
           >
             Connect
           </button>
@@ -569,7 +569,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center justify-center gap-1.5 rounded-[10px] bg-foreground/[0.03] p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-foreground/[0.05] hover:text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 rounded-lg bg-foreground/[0.03] p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-foreground/[0.05] hover:text-muted-foreground"
     >
       <Plus className="size-2.5" aria-hidden strokeWidth={2.2} />
       Add device

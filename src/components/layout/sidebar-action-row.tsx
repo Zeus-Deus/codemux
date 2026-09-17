@@ -107,7 +107,7 @@ export function SidebarActionRow() {
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
       {/* Same insets + gap as the project-filter row below, and every control
-          in both rows is h-8 / rounded-[7px], so the two read as equal rows. */}
+          in both rows is h-8 / rounded-md, so the two read as equal rows. */}
       <div
         data-testid="sidebar-action-row-expanded"
         className={cn(
@@ -119,12 +119,12 @@ export function SidebarActionRow() {
           type="button"
           aria-label="Search"
           onClick={() => setShowCommandPalette(true)}
-          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-[7px] border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
+          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-md border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
         >
           <SearchIcon className="h-3.5 w-3.5 shrink-0" />
           <span className="flex-1 text-left text-label">Search</span>
           {paletteKeys && (
-            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-caption">
+            <kbd className="rounded-sm border border-border/60 px-1 py-px font-mono text-caption">
               {paletteKeys}
             </kbd>
           )}
@@ -135,7 +135,7 @@ export function SidebarActionRow() {
               type="button"
               aria-label="New agent"
               onClick={handleNewAgent}
-              className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+              className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
             >
               <SquarePen className="size-[15px]" />
             </button>

@@ -54,7 +54,7 @@ export function PaneStatusFoot({
           onClick={action.onClick}
           aria-pressed={action.pressed}
           className={cn(
-            "shrink-0 rounded-[5px] px-1.5 py-px font-mono text-caption hover:bg-foreground/[0.06] hover:text-foreground",
+            "shrink-0 rounded-sm px-1.5 py-px font-mono text-caption hover:bg-foreground/[0.06] hover:text-foreground",
             action.pressed ? "text-foreground" : "text-muted-foreground",
           )}
         >

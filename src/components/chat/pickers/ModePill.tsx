@@ -98,7 +98,7 @@ export function ModePill({ mode, onRemove, onClick }: Props) {
           e.stopPropagation();
           onRemove();
         }}
-        className="ml-0.5 rounded p-0.5 hover:bg-foreground/10"
+        className="ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10"
         aria-label={`Remove ${config.label} mode`}
       >
         <X className="h-2.5 w-2.5" />

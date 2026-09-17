@@ -192,7 +192,7 @@ export function ResourceMonitor({
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex items-center gap-1 h-6 px-1.5 rounded text-label text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                    className="flex items-center gap-1 h-6 px-1.5 rounded-sm text-label text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
                     aria-label="Sort workspaces"
                   >
                     <ArrowDownNarrowWide className="h-3.5 w-3.5" />
@@ -221,7 +221,7 @@ export function ResourceMonitor({
               <button
                 type="button"
                 onClick={() => refetch()}
-                className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                className="h-6 w-6 inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
                 aria-label="Refresh metrics"
               >
                 <RefreshCw

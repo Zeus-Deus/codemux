@@ -54,7 +54,7 @@ export function RemoteConnectionChip({ compact = false }: { compact?: boolean })
           aria-label={tooltip}
           className={cn(
             "flex min-w-0 shrink items-center gap-1.5 border border-status-remote/30 bg-status-remote/10 font-medium text-status-remote",
-            compact ? "h-7 rounded-[7px] px-2 text-label" : "h-6 rounded-md px-2 text-label",
+            compact ? "h-7 rounded-md px-2 text-label" : "h-6 rounded-md px-2 text-label",
           )}
         >
           <span

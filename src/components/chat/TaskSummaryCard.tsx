@@ -41,7 +41,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
       disabled={!interactive}
       data-testid="task-receipt"
       className={cn(
-        "flex w-full items-center gap-2.5 rounded-[11px] border border-border/60 bg-foreground/[0.025] px-3 py-2 text-left transition-colors",
+        "flex w-full items-center gap-2.5 rounded-lg border border-border/60 bg-foreground/[0.025] px-3 py-2 text-left transition-colors",
         interactive
           ? "cursor-pointer hover:border-border hover:bg-foreground/[0.05]"
           : "cursor-default",

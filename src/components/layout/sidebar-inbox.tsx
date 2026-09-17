@@ -372,7 +372,7 @@ function ProjectFilterItem({
       onClick={onSelect}
       aria-label={name}
       className={cn(
-        "h-8 gap-2 rounded-[7px] px-2 text-label font-semibold",
+        "h-8 gap-2 rounded-md px-2 text-label font-semibold",
         active && "bg-foreground/[0.08] text-foreground",
       )}
     >
@@ -642,7 +642,7 @@ const SettledRow = memo(function SettledRow({
                 : `${provider.nounTitle} — ${prState}`
             }
             className={cn(
-              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 font-mono text-caption font-medium",
+              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded-sm px-1 font-mono text-caption font-medium",
               "transition-colors duration-150",
               // Held one step brighter than the avatar's /40: `#87` is this
               // control's only label, so the badge has to stay legible at rest
@@ -1885,7 +1885,7 @@ export function SidebarInbox() {
                 aria-label="Filter by project"
                 data-project-filter
                 className={cn(
-                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
+                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
                   "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
                   "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
                 )}
@@ -1925,7 +1925,7 @@ export function SidebarInbox() {
                   onClick={() => setFilter(null)}
                   aria-label="All projects"
                   className={cn(
-                    "h-8 gap-2 rounded-[7px] px-2 text-label font-semibold",
+                    "h-8 gap-2 rounded-md px-2 text-label font-semibold",
                     filter === null && "bg-foreground/[0.08] text-foreground",
                   )}
                 >
@@ -1955,7 +1955,7 @@ export function SidebarInbox() {
               <button
                 type="button"
                 aria-label="Add repository"
-                className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-body leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
+                className="flex size-8 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-body leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
               >
                 +
               </button>

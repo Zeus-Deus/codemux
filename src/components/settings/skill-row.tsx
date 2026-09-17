@@ -88,7 +88,7 @@ export function SkillRow({
           {!enabled && (
             <span
               data-testid="skill-row-disabled-badge"
-              className="rounded bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
+              className="rounded-sm bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
             >
               Disabled
             </span>

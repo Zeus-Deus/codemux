@@ -480,7 +480,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                         >
                           <div
                             className={cn(
-                              "h-4 w-4 rounded border shrink-0 flex items-center justify-center transition-colors",
+                              "h-4 w-4 rounded-sm border shrink-0 flex items-center justify-center transition-colors",
                               action.checked
                                 ? "bg-primary border-primary"
                                 : "border-border",
@@ -559,10 +559,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                         />
                         <div className="flex flex-wrap items-center gap-1.5 border-t px-1 pt-2 text-label text-muted-foreground">
                           <span className="mr-1">Variables</span>
-                          <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                          <span className="rounded-sm bg-muted px-1.5 py-0.5 font-mono">
                             $CODEMUX_ROOT_PATH
                           </span>
-                          <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                          <span className="rounded-sm bg-muted px-1.5 py-0.5 font-mono">
                             $CODEMUX_WORKSPACE_PATH
                           </span>
                         </div>

@@ -915,7 +915,7 @@ function BranchControl({
                         {branch.name}
                       </span>
                       {hasWorktree && (
-                        <span className="shrink-0 rounded bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
+                        <span className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
                           WORKTREE
                         </span>
                       )}

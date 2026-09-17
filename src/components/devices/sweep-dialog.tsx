@@ -290,7 +290,7 @@ function SweepProgressSurface({
                 : "Sweep complete"}
           </DialogTitle>
           {!settled && outcome.skipped > 0 && (
-            <span className="ml-auto shrink-0 whitespace-nowrap rounded-[5px] bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-caption leading-[13px] text-status-working">
+            <span className="ml-auto shrink-0 whitespace-nowrap rounded-sm bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-caption leading-[13px] text-status-working">
               {outcome.skipped} skipped
             </span>
           )}

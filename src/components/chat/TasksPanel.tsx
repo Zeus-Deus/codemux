@@ -106,7 +106,7 @@ export function TasksPanel({
           <span
             data-testid="tasks-status-badge"
             className={cn(
-              "inline-flex items-center rounded-[5px] px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
+              "inline-flex items-center rounded-sm px-1.5 py-px font-mono text-caption font-semibold uppercase tracking-[0.09em]",
               BADGE_TONE[runState],
             )}
           >

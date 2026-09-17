@@ -286,7 +286,7 @@ function OrbPreviewRow({
   elapsed: string;
 }) {
   return (
-    <div className="flex items-center gap-2.5 rounded-[8px] px-2.5 py-2">
+    <div className="flex items-center gap-2.5 rounded-md px-2.5 py-2">
       <span className="flex size-5 shrink-0 items-center justify-center">
         <AgentOrb size={20} {...activity} aria-hidden />
       </span>
@@ -1651,7 +1651,7 @@ export function SettingsView() {
                 <p className="mb-1.5 font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
                   Preview
                 </p>
-                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-[11px] border border-border/60 bg-muted/30 p-1.5">
+                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-lg border border-border/60 bg-muted/30 p-1.5">
                   <OrbPreviewRow
                     activity={{ toolName: "Grep" }}
                     label="Fix scroll pinning on send"
@@ -1716,7 +1716,7 @@ export function SettingsView() {
                         <EditorIcon id={ed.id} className="h-4 w-4" />
                         {ed.name}
                       </span>
-                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded border border-border/40">
+                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded-sm border border-border/40">
                         {ed.command}
                       </code>
                     </div>
@@ -1817,7 +1817,7 @@ export function SettingsView() {
                     items={presetStore.presets.map((p) => p.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <div className="overflow-hidden rounded-xl border border-border/60">
+                    <div className="overflow-hidden rounded-lg border border-border/60">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -2138,7 +2138,7 @@ export function SettingsView() {
               <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
-                  A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemux/config.json</code> file was found.
+                  A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
                   File-based configuration takes precedence over these settings.
                 </p>
               </SettingsCard>
@@ -2150,9 +2150,9 @@ export function SettingsView() {
                 helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
                 caption={
                   <>
-                    Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file
+                    Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file
                     in your project root to share patterns with your team. When empty, defaults to{" "}
-                    <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
+                    <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.env .env.* .env.local</code>.{" "}
                     <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">Learn more</a>
                   </>
                 }
@@ -2160,7 +2160,7 @@ export function SettingsView() {
                 {hasIncludeFile && (
                   <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
                     <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
-                      This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file —
+                      This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
                     </p>
                   </SettingsCard>
@@ -2205,7 +2205,7 @@ export function SettingsView() {
                 helper={
                   <>
                     A command to start your dev server, triggered via{" "}
-                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded font-mono">Ctrl+Shift+G</kbd>.
+                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">Ctrl+Shift+G</kbd>.
                   </>
                 }
               >
@@ -2474,7 +2474,7 @@ function SortablePresetRow({
     >
       <button
         type="button"
-        className="p-1 rounded text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity"
+        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity"
         aria-label="Drag to reorder"
         title="Drag to reorder"
         onClick={(e) => e.stopPropagation()}

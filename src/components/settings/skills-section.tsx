@@ -370,7 +370,7 @@ function ConflictRow({
         <button
           type="button"
           onClick={onView}
-          className="rounded px-2 py-0.5 text-label hover:bg-foreground/10"
+          className="rounded-sm px-2 py-0.5 text-label hover:bg-foreground/10"
         >
           View
         </button>
@@ -378,7 +378,7 @@ function ConflictRow({
           type="button"
           onClick={onOpenFile}
           aria-label={`Open ${skill.name} in editor`}
-          className="rounded px-1 py-0.5 hover:bg-foreground/10"
+          className="rounded-sm px-1 py-0.5 hover:bg-foreground/10"
         >
           ↗
         </button>

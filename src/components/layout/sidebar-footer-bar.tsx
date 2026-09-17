@@ -108,7 +108,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
   );
 
   return (
-    <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-[12px] border-t border-border/70 bg-background/50 px-3.5">
+    <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-lg border-t border-border/70 bg-background/50 px-3.5">
       <span className="font-mono text-caption text-muted-foreground/70">
         Codemux {version ? `v${version}` : ""}
       </span>
@@ -125,7 +125,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-[5px] px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
+            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
@@ -167,7 +167,7 @@ function AppMenu({
               variant="ghost"
               size="icon-xs"
               aria-label="Menu"
-              className="h-7 w-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+              className="h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
             >
               <Settings className="size-[18px]" />
             </Button>
@@ -300,7 +300,7 @@ function FooterDestination({
       size={labeled ? "sm" : "icon-xs"}
       aria-label={action.label}
       className={cn(
-        "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+        "h-7 shrink-0 rounded-md text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
         labeled ? "gap-1.5 px-2 text-body-sm" : "w-7",
         fullWidth && "w-full justify-start",
       )}

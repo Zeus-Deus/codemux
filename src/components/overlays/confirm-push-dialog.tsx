@@ -116,7 +116,7 @@ export function ConfirmPushDialog({
               type="checkbox"
               checked={dontAskAgain}
               onChange={(e) => setDontAskAgain(e.target.checked)}
-              className="rounded border-border"
+              className="rounded-sm border-border"
             />
             <span className="text-body-sm text-muted-foreground">
               Don't ask again for {host.name}

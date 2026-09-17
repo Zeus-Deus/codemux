@@ -314,14 +314,14 @@ export function AttachmentChip({
           aria-label={`Expand ${metadata.label}`}
           title="Click to expand"
           data-testid="attachment-chip-preview-trigger"
-          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-[3px] outline-none focus-visible:ring-1 focus-visible:ring-current"
+          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-current"
         >
           <img
             src={previewUrl}
             alt=""
             aria-hidden
             data-testid="attachment-chip-thumbnail"
-            className="h-[22px] w-[30px] shrink-0 rounded-[3px] border border-foreground/10 object-cover"
+            className="h-[22px] w-[30px] shrink-0 rounded-sm border border-foreground/10 object-cover"
             onError={() => setPreviewFailed(true)}
           />
           <span className="truncate max-w-[200px]">{metadata.label}</span>
@@ -373,7 +373,7 @@ export function AttachmentChip({
             onToggleExpand?.(attachment.id);
           }}
           className={cn(
-            "ml-0.5 rounded p-0.5 hover:bg-foreground/10",
+            "ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10",
             expandActive && "bg-foreground/10",
           )}
           aria-label={expandTooltip}
@@ -390,7 +390,7 @@ export function AttachmentChip({
           e.stopPropagation();
           onRemove(attachment.id);
         }}
-        className="ml-0.5 rounded p-0.5 hover:bg-foreground/10"
+        className="ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10"
         aria-label={`Remove ${metadata.label}`}
       >
         <X className="h-2.5 w-2.5" />
@@ -433,7 +433,7 @@ export function AttachmentChip({
               alt=""
               aria-hidden
               data-testid="attachment-chip-tooltip-preview"
-              className="mb-1 max-h-[180px] max-w-[260px] rounded border border-foreground/10 object-contain"
+              className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-foreground/10 object-contain"
             />
           )}
           <div className="font-mono text-label truncate max-w-[260px]">

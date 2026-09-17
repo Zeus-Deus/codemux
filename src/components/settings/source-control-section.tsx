@@ -123,7 +123,7 @@ function AccountValue({ account }: { account: string }) {
       onClick={() => setRevealed((v) => !v)}
       title={revealed ? "Hide account" : "Click to reveal account"}
       aria-label={revealed ? "Hide account name" : "Reveal account name"}
-      className="font-mono text-body-sm text-foreground/90 rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
+      className="font-mono text-body-sm text-foreground/90 rounded-sm px-1 -mx-1 hover:bg-muted/60 transition-colors"
     >
       {revealed ? account : maskAccount(account)}
     </button>
@@ -180,7 +180,7 @@ function ProviderRow({
             onClick={() => setOpen((v) => !v)}
             aria-label={open ? "Hide details" : "Show details"}
             aria-expanded={open}
-            className="shrink-0 rounded p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors"
+            className="shrink-0 rounded-sm p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors"
           >
             <ChevronRight
               className={cn(

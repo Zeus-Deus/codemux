@@ -132,7 +132,7 @@ function PhaseCard({
   if (!hasAgents) {
     return (
       <div
-        className="overflow-hidden rounded-[11px] border border-border/60 bg-foreground/[0.015]"
+        className="overflow-hidden rounded-lg border border-border/60 bg-foreground/[0.015]"
         data-testid="workflow-phase-row"
       >
         <div className="flex items-center gap-2.5 px-3 py-2.5">{headerBody}</div>
@@ -144,7 +144,7 @@ function PhaseCard({
     <Collapsible
       open={open}
       onOpenChange={onToggle}
-      className="overflow-hidden rounded-[11px] border border-border/60 bg-foreground/[0.015]"
+      className="overflow-hidden rounded-lg border border-border/60 bg-foreground/[0.015]"
       data-testid="workflow-phase-row"
     >
       <CollapsibleTrigger asChild>
@@ -232,7 +232,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
           onSelect();
         }
       }}
-      className="flex cursor-pointer items-center gap-2 rounded-[8px] px-1.5 py-1.5 hover:bg-foreground/[0.05]"
+      className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-foreground/[0.05]"
       data-testid="workflow-agent-row"
     >
       <span className="flex h-4 w-4 shrink-0 items-center justify-center">
@@ -248,7 +248,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
       {badge && (
         <span
           className={cn(
-            "shrink-0 rounded-[4px] px-1.5 py-0.5 text-caption font-semibold",
+            "shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-semibold",
             findingTone(badge.tone).chipBg,
           )}
         >

@@ -316,7 +316,7 @@ export function QuestionForm({
     return (
       <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
         <div className={CHAT_COLUMN_INNER}>
-          <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 text-label text-muted-foreground">
+          <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3 text-label text-muted-foreground">
             AskUserQuestion with no questions.
           </div>
         </div>
@@ -330,7 +330,7 @@ export function QuestionForm({
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
       <div className={CHAT_COLUMN_INNER}>
-        <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3">
+        <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3">
           <Questionnaire
             ref={formRef}
             items={rootItems}
@@ -590,7 +590,7 @@ function OtherRow({
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
+    <kbd className="rounded-sm bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
       {children}
     </kbd>
   );
