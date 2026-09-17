@@ -15,6 +15,7 @@ import { type ChatMode } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
+import { randomUUID } from "@/lib/uuid";
 
 import {
   deriveTitleFromFirstMessage,
@@ -122,14 +123,6 @@ export type MaterializePhase =
   | "starting-session"
   | "sending";
 
-/** Mint a client nonce for optimistic-append rollback. Falls back to a
- *  timestamp+random token where `crypto.randomUUID` is unavailable. */
-function mintNonce(): string {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
 /**
  * Promote a draft into a real workspace and send the first turn.
  *
@@ -204,7 +197,7 @@ export async function materializeAndSend(
   // surface renders this bubble immediately (no more staring at a dead
   // composer for seconds). A client nonce lets us roll the bubble back
   // if any step below fails.
-  const clientNonce = mintNonce();
+  const clientNonce = randomUUID();
   actions.ensureThread(draft.threadId);
   seedSliceFromDraft(draft, actions);
   actions.appendUserMessage(
@@ -305,7 +298,17 @@ export async function materializeAndSend(
   // "Starting session…" until the user happens to click it.
   let paneId: string;
   try {
-    paneId = await launchAgentChatPane(workspaceId, draft.provider, effectiveCwd);
+    // Pass the draft's pre-minted thread id so the pane is published
+    // already bound to it. Otherwise the pane exists unbound until
+    // `start_session` below returns, and another client mounting it in
+    // that window starts a second session on the same pane.
+    paneId = await launchAgentChatPane(
+      workspaceId,
+      draft.provider,
+      effectiveCwd,
+      null,
+      draft.threadId,
+    );
   } catch (err) {
     const message = errorMessage(err);
     actions.removeUserMessageByNonce(draft.threadId, clientNonce);
@@ -318,7 +321,10 @@ export async function materializeAndSend(
   // AgentChatPane reads `materializedTo.workspaceId` to find this
   // draft when the user clicks the workspace in the sidebar, and
   // finishes the half-completed materialise rather than minting a
-  // brand-new orphan thread alongside it.
+  // brand-new orphan thread alongside it. The pane it finds is already
+  // bound to `draft.threadId` (see the launch above), so it recovers
+  // from its bound branch and re-starts under the same thread — which
+  // the backend's claim accepts as a no-op rebinding.
   actions.markMaterialized(draft.draftId, {
     workspaceId,
     paneId,
@@ -514,7 +520,13 @@ export async function materializeWithPreset(
     // Same intent-recording launch as `materializeAndSend`.
     let paneId: string;
     try {
-      paneId = await launchAgentChatPane(workspaceId, draft.provider, cwd);
+      paneId = await launchAgentChatPane(
+        workspaceId,
+        draft.provider,
+        cwd,
+        null,
+        draft.threadId,
+      );
     } catch (err) {
       const message = errorMessage(err);
       actions.markSendFailed(draft.draftId, message);
@@ -522,8 +534,10 @@ export async function materializeWithPreset(
     }
 
     // Record the partial materialisation so AgentChatPane can recover
-    // it if start_session or send_turn fails below. See the matching
-    // call in `materializeAndSend` for the full rationale.
+    // it if start_session or send_turn fails below — from the pane's
+    // already-bound branch, since the launch above binds it to
+    // `draft.threadId`. See the matching call in `materializeAndSend`
+    // for the full rationale.
     actions.markMaterialized(draft.draftId, {
       workspaceId,
       paneId,

@@ -2099,13 +2099,36 @@ impl AppStateStore {
     /// flag — callers (the Tauri command layer) are responsible for
     /// gating. Keeping the flag check at the command boundary keeps
     /// state-level operations reusable from tests that bypass the flag.
+    ///
+    /// `thread_id` binds the pane at creation time. Passing it is how a
+    /// caller that already minted a thread id keeps the pane from ever
+    /// being observable unbound, and makes the call idempotent: a pane in
+    /// this workspace already bound to that thread is returned unchanged.
     pub fn create_agent_chat_pane(
         &self,
         workspace_id: &str,
         provider: Option<crate::agent_provider::ProviderKind>,
         cwd: Option<String>,
         launch_mode: Option<crate::presets::LaunchMode>,
+        thread_id: Option<String>,
     ) -> Result<PaneId, String> {
+        self.create_or_reuse_agent_chat_pane(workspace_id, provider, cwd, launch_mode, thread_id)
+            .map(|(pane_id, _)| pane_id)
+    }
+
+    /// [`create_agent_chat_pane`](Self::create_agent_chat_pane) plus a flag
+    /// telling the caller whether a pane node was actually inserted. `false`
+    /// means an existing pane already owned `thread_id` and was returned
+    /// as-is. It does NOT mean the snapshot is unchanged: reuse still
+    /// activates the pane it returns, so callers must publish either way.
+    pub fn create_or_reuse_agent_chat_pane(
+        &self,
+        workspace_id: &str,
+        provider: Option<crate::agent_provider::ProviderKind>,
+        cwd: Option<String>,
+        launch_mode: Option<crate::presets::LaunchMode>,
+        thread_id: Option<String>,
+    ) -> Result<(PaneId, bool), String> {
         let mut snapshot = self.inner.lock().unwrap();
 
         let workspace_index = snapshot
@@ -2114,13 +2137,57 @@ impl AppStateStore {
             .position(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
+        // Bind-at-create is idempotent on the thread id. Two clients sharing
+        // one backend can promote the same draft concurrently; the second
+        // call must land on the SAME pane instead of cloning it. Every
+        // surface of the workspace is searched, not just the active one: the
+        // pane may already live in another tab.
+        if let Some(thread_id) = thread_id.as_deref() {
+            let workspace = snapshot
+                .workspaces
+                .get_mut(workspace_index)
+                .ok_or_else(|| "Workspace disappeared while creating chat pane".to_string())?;
+            let existing = workspace.surfaces.iter().find_map(|surface| {
+                find_agent_chat_pane_id(&surface.root, thread_id)
+                    .map(|pane_id| (surface.surface_id.clone(), pane_id))
+            });
+            if let Some((surface_id, existing_pane_id)) = existing {
+                // Reuse still has to put the pane on screen, exactly as the
+                // create path below does. Otherwise a `NewTab` launch that
+                // reuses an existing pane resolves to a pane sitting in some
+                // other tab and the user is left looking at an unrelated one.
+                if let Some(surface) = workspace
+                    .surfaces
+                    .iter_mut()
+                    .find(|surface| surface.surface_id == surface_id)
+                {
+                    surface.active_pane_id = existing_pane_id.clone();
+                }
+                if let Some(tab_id) = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.surface_id.as_ref() == Some(&surface_id))
+                    .map(|tab| tab.tab_id.clone())
+                {
+                    workspace.active_tab_id = tab_id;
+                }
+                workspace.active_surface_id = surface_id;
+                let active_workspace_id = workspace.workspace_id.clone();
+                snapshot.active_workspace_id = active_workspace_id;
+                return Ok((existing_pane_id, false));
+            }
+        }
+
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
         let title = "Agent Chat".to_string();
+        // Publish the binding in the SAME mutation that publishes the pane:
+        // a pane that is observable while still unbound is a pane another
+        // client can claim out from under the session that is starting.
         let new_node = PaneNodeSnapshot::AgentChat {
             pane_id: new_pane_id.clone(),
             title,
-            thread_id: None,
+            thread_id,
             provider,
             cwd,
         };
@@ -2170,7 +2237,7 @@ impl AppStateStore {
             });
             let active_workspace_id = workspace.workspace_id.clone();
             snapshot.active_workspace_id = active_workspace_id;
-            return Ok(new_pane_id);
+            return Ok((new_pane_id, true));
         }
 
         let active_surface_id = workspace.active_surface_id.clone();
@@ -2205,7 +2272,7 @@ impl AppStateStore {
         let active_workspace_id = workspace.workspace_id.clone();
         snapshot.active_workspace_id = active_workspace_id;
 
-        Ok(new_pane_id)
+        Ok((new_pane_id, true))
     }
 
     /// Return the [`ThreadId`] bound to the given chat pane, if any.
@@ -2239,31 +2306,96 @@ impl AppStateStore {
         false
     }
 
-    /// Atomically bind an agent-chat pane to the provider + thread that
-    /// actually owns its live session. Provider switches must update both
-    /// fields together: persisting only the new thread id leaves the pane
-    /// snapshot on its previous adapter, so an app restart routes the thread
-    /// through the wrong provider even though session startup succeeded.
-    pub fn set_agent_chat_binding(
+    /// Compare-and-set the pane's `(provider, thread_id)` binding.
+    ///
+    /// This is the ONLY way a live session may take ownership of a chat
+    /// pane. Desktop and remote clients share one backend and one snapshot,
+    /// so an unconditional overwrite lets a second client's auto-start
+    /// silently steal a pane whose session is still spawning, orphaning the
+    /// first client's CLI process. The compare-and-set runs under the single
+    /// state lock and accepts only when:
+    ///
+    /// * the pane is still unbound, or
+    /// * it is already bound to `thread_id` (idempotent restart), or
+    /// * `expected_thread` matches the current binding (an explicit rebind
+    ///   by a caller that knows which thread it is replacing).
+    ///
+    /// Anything else is a conflict and the pane is left untouched. The
+    /// returned claim carries the binding it replaced so a failed provider
+    /// spawn can roll back with
+    /// [`release_agent_chat_pane_claim`](Self::release_agent_chat_pane_claim)
+    /// and the caller can stop a rebound thread's stale session.
+    pub fn claim_agent_chat_pane(
         &self,
         pane_id: &str,
         provider: crate::agent_provider::ProviderKind,
-        thread_id: String,
-    ) -> bool {
+        thread_id: &str,
+        expected_thread: Option<&str>,
+    ) -> Result<AgentChatPaneClaim, PaneClaimConflict> {
         let mut snapshot = self.inner.lock().unwrap();
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
-                if assign_agent_chat_binding(
-                    &mut surface.root,
-                    pane_id,
-                    provider,
-                    &thread_id,
-                ) {
-                    return true;
-                }
+        let binding = snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.surfaces.iter_mut())
+            .find_map(|surface| agent_chat_binding_mut(&mut surface.root, pane_id));
+        let Some((current_provider, current_thread)) = binding else {
+            return Err(PaneClaimConflict::PaneNotFound {
+                pane_id: pane_id.to_string(),
+            });
+        };
+
+        if let Some(current) = current_thread.as_deref() {
+            let accepted = current == thread_id || expected_thread == Some(current);
+            if !accepted {
+                return Err(PaneClaimConflict::PaneAlreadyBound {
+                    pane_id: pane_id.to_string(),
+                    thread_id: current.to_string(),
+                    provider: *current_provider,
+                });
             }
         }
-        false
+
+        let previous = (*current_provider, current_thread.clone());
+        let changed = previous != (Some(provider), Some(thread_id.to_string()));
+        *current_provider = Some(provider);
+        *current_thread = Some(thread_id.to_string());
+        Ok(AgentChatPaneClaim { previous, changed })
+    }
+
+    /// Restore the binding a claim replaced. Used when the provider spawn
+    /// fails after the claim landed, so the pane does not stay bound to a
+    /// thread that has no session behind it.
+    ///
+    /// Compare-and-set, exactly like the claim it undoes: the rollback only
+    /// applies while the pane still carries `(provider, thread_id)` — the
+    /// binding this claim wrote. A spawn can take long enough for another
+    /// client to legitimately rebind the pane in the meantime, and writing
+    /// `previous` back over that would resurrect a dead thread on top of a
+    /// live one. Returns false when the pane is gone (closed while the
+    /// provider was starting) or has already moved on, in which case the
+    /// newer binding is left exactly as it is.
+    pub fn release_agent_chat_pane_claim(
+        &self,
+        pane_id: &str,
+        provider: crate::agent_provider::ProviderKind,
+        thread_id: &str,
+        previous: (Option<crate::agent_provider::ProviderKind>, Option<String>),
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let binding = snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.surfaces.iter_mut())
+            .find_map(|surface| agent_chat_binding_mut(&mut surface.root, pane_id));
+        let Some((current_provider, current_thread)) = binding else {
+            return false;
+        };
+        if *current_provider != Some(provider) || current_thread.as_deref() != Some(thread_id) {
+            return false;
+        }
+        *current_provider = previous.0;
+        *current_thread = previous.1;
+        true
     }
 
     pub fn rename_workspace(&self, workspace_id: &str, title: String) -> bool {
@@ -5275,28 +5407,55 @@ fn assign_agent_chat_thread(
     }
 }
 
-/// Assign the live provider and thread id as one pane-tree mutation.
-fn assign_agent_chat_binding(
-    root: &mut PaneNodeSnapshot,
+/// A successful [`AppStateStore::claim_agent_chat_pane`], carrying the
+/// binding the claim replaced so the caller can roll back or stop the
+/// session that used to own the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChatPaneClaim {
+    pub previous: (Option<crate::agent_provider::ProviderKind>, Option<String>),
+    /// Whether the claim actually rewrote the binding. `false` means the
+    /// pane was already on exactly this `(provider, thread_id)` — a restart
+    /// of the session that owns it — so there is no new binding to publish
+    /// and the caller can skip its `app-state` emit.
+    pub changed: bool,
+}
+
+/// Why a [`AppStateStore::claim_agent_chat_pane`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneClaimConflict {
+    /// No `AgentChat` pane with this id exists (closed, or never created).
+    PaneNotFound { pane_id: String },
+    /// Another thread already owns the pane. Carries the binding in force
+    /// so the caller can tell the losing client what won.
+    PaneAlreadyBound {
+        pane_id: String,
+        thread_id: String,
+        provider: Option<crate::agent_provider::ProviderKind>,
+    },
+}
+
+/// Mutable access to an `AgentChat` leaf's `(provider, thread_id)` pair, so
+/// both halves of the binding are always read and written under one borrow.
+/// Splitting them lets a provider handoff persist a new thread while leaving
+/// the pane on its previous adapter, which misroutes the resume on restart.
+fn agent_chat_binding_mut<'a>(
+    root: &'a mut PaneNodeSnapshot,
     target_pane_id: &str,
-    new_provider: crate::agent_provider::ProviderKind,
-    new_thread_id: &str,
-) -> bool {
+) -> Option<(
+    &'a mut Option<crate::agent_provider::ProviderKind>,
+    &'a mut Option<String>,
+)> {
     match root {
         PaneNodeSnapshot::AgentChat {
             pane_id,
             provider,
             thread_id,
             ..
-        } if pane_id.0 == target_pane_id => {
-            *provider = Some(new_provider);
-            *thread_id = Some(new_thread_id.to_string());
-            true
-        }
-        PaneNodeSnapshot::Split { children, .. } => children.iter_mut().any(|child| {
-            assign_agent_chat_binding(child, target_pane_id, new_provider, new_thread_id)
-        }),
-        _ => false,
+        } if pane_id.0 == target_pane_id => Some((provider, thread_id)),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| agent_chat_binding_mut(child, target_pane_id)),
+        _ => None,
     }
 }
 
@@ -8636,7 +8795,7 @@ mod tests {
         let workspace_id = snapshot.active_workspace_id.clone();
 
         let pane_id = store
-            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .create_agent_chat_pane(&workspace_id.0, None, None, None, None)
             .expect("create_agent_chat_pane should succeed");
 
         let after = store.snapshot();
@@ -8650,7 +8809,7 @@ mod tests {
     fn create_agent_chat_pane_on_missing_workspace_errors() {
         let store = AppStateStore::default();
         let err = store
-            .create_agent_chat_pane("does-not-exist", None, None, None)
+            .create_agent_chat_pane("does-not-exist", None, None, None, None)
             .unwrap_err();
         assert!(err.contains("does-not-exist"));
     }
@@ -8661,7 +8820,7 @@ mod tests {
         let snapshot = store.snapshot();
         let workspace_id = snapshot.active_workspace_id.clone();
         let pane_id = store
-            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .create_agent_chat_pane(&workspace_id.0, None, None, None, None)
             .unwrap();
 
         assert!(store.agent_chat_thread_id(&pane_id.0).is_none());
@@ -8673,8 +8832,10 @@ mod tests {
         );
     }
 
+    /// A pane created with a thread id is never observable unbound, which is
+    /// what stops a second client from auto-starting its own session on it.
     #[test]
-    fn set_agent_chat_binding_updates_provider_and_thread_together() {
+    fn create_agent_chat_pane_with_thread_publishes_it_bound() {
         use crate::agent_provider::ProviderKind;
 
         let store = AppStateStore::default();
@@ -8685,18 +8846,289 @@ mod tests {
                 Some(ProviderKind::Claude),
                 None,
                 None,
+                Some("thread-bound-at-create".into()),
+            )
+            .expect("create_agent_chat_pane should succeed");
+
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((
+                ProviderKind::Claude,
+                "thread-bound-at-create".to_string()
+            ))
+        );
+    }
+
+    /// Two clients promoting the same draft must land on ONE pane — and on
+    /// screen, not in whatever hidden tab the pane happens to live in.
+    #[test]
+    fn create_agent_chat_pane_with_existing_thread_reuses_pane() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let (first, created) = store
+            .create_or_reuse_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                None,
+                Some("thread-shared".into()),
             )
             .unwrap();
-        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-claude".into()));
+        assert!(created);
+        let nodes_after_first = count_agent_chat_panes(&store);
 
-        assert!(store.set_agent_chat_binding(
+        let (second, created_again) = store
+            .create_or_reuse_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Codex),
+                None,
+                None,
+                Some("thread-shared".into()),
+            )
+            .unwrap();
+
+        assert_eq!(second, first);
+        assert!(!created_again);
+        assert_eq!(count_agent_chat_panes(&store), nodes_after_first);
+    }
+
+    /// Reuse must activate the pane it returns. A `NewTab` launch whose
+    /// thread already has a pane in another tab would otherwise resolve to a
+    /// pane the user cannot see.
+    #[test]
+    fn create_agent_chat_pane_reuse_activates_the_existing_pane() {
+        use crate::agent_provider::ProviderKind;
+        use crate::presets::LaunchMode;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let bound = store
+            .create_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                Some(LaunchMode::NewTab),
+                Some("thread-hidden".into()),
+            )
+            .unwrap();
+        let bound_surface = active_surface_id(&store, &workspace_id.0);
+
+        // A second tab takes focus away from the bound pane's tab.
+        store
+            .create_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                Some(LaunchMode::NewTab),
+                None,
+            )
+            .unwrap();
+        assert_ne!(active_surface_id(&store, &workspace_id.0), bound_surface);
+
+        let (reused, created) = store
+            .create_or_reuse_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                Some(LaunchMode::NewTab),
+                Some("thread-hidden".into()),
+            )
+            .unwrap();
+        assert_eq!(reused, bound);
+        assert!(!created);
+
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id.0)
+            .unwrap();
+        assert_eq!(workspace.active_surface_id, bound_surface);
+        let surface = workspace
+            .surfaces
+            .iter()
+            .find(|s| s.surface_id == bound_surface)
+            .unwrap();
+        assert_eq!(surface.active_pane_id, bound);
+        let active_tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == workspace.active_tab_id)
+            .unwrap();
+        assert_eq!(active_tab.surface_id.as_ref(), Some(&bound_surface));
+        assert_eq!(snapshot.active_workspace_id.0, workspace_id.0);
+    }
+
+    fn active_surface_id(store: &AppStateStore, workspace_id: &str) -> SurfaceId {
+        store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .expect("workspace should exist")
+            .active_surface_id
+            .clone()
+    }
+
+    fn count_agent_chat_panes(store: &AppStateStore) -> usize {
+        fn walk(node: &PaneNodeSnapshot) -> usize {
+            match node {
+                PaneNodeSnapshot::AgentChat { .. } => 1,
+                PaneNodeSnapshot::Split { children, .. } => children.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+        store
+            .snapshot()
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.surfaces.iter())
+            .map(|surface| walk(&surface.root))
+            .sum()
+    }
+
+    /// The compare-and-set that keeps a second client from stealing a pane
+    /// whose session is still spawning, plus the rollback path.
+    #[test]
+    fn claim_agent_chat_pane_rejects_a_competing_thread() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&workspace_id.0, None, None, None, None)
+            .unwrap();
+
+        // Unbound pane: first claim wins and reports nothing replaced.
+        let claim = store
+            .claim_agent_chat_pane(&pane_id.0, ProviderKind::Claude, "thread-first", None)
+            .expect("claim on an unbound pane should succeed");
+        assert_eq!(claim.previous, (None, None));
+        assert!(claim.changed);
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Claude, "thread-first".to_string()))
+        );
+
+        // A different thread without an expectation is the bug this guards.
+        let conflict = store
+            .claim_agent_chat_pane(&pane_id.0, ProviderKind::Codex, "thread-second", None)
+            .expect_err("a competing thread must not steal the pane");
+        assert_eq!(
+            conflict,
+            PaneClaimConflict::PaneAlreadyBound {
+                pane_id: pane_id.0.clone(),
+                thread_id: "thread-first".to_string(),
+                provider: Some(ProviderKind::Claude),
+            }
+        );
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Claude, "thread-first".to_string()))
+        );
+
+        // Same thread: a restart of the session that already owns the pane.
+        // Nothing moves, so the caller has no new binding to publish.
+        let repeat = store
+            .claim_agent_chat_pane(&pane_id.0, ProviderKind::Claude, "thread-first", None)
+            .expect("re-claiming the same thread should be idempotent");
+        assert!(!repeat.changed);
+
+        // Explicit rebind: the caller names the thread it is replacing.
+        let rebind = store
+            .claim_agent_chat_pane(
+                &pane_id.0,
+                ProviderKind::Codex,
+                "thread-second",
+                Some("thread-first"),
+            )
+            .expect("an expected-thread rebind should succeed");
+        assert_eq!(
+            rebind.previous,
+            (Some(ProviderKind::Claude), Some("thread-first".to_string()))
+        );
+        assert!(rebind.changed);
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Codex, "thread-second".to_string()))
+        );
+
+        // Rollback after a failed provider spawn.
+        assert!(store.release_agent_chat_pane_claim(
             &pane_id.0,
             ProviderKind::Codex,
-            "thread-codex".into(),
+            "thread-second",
+            rebind.previous.clone(),
         ));
         assert_eq!(
             store.agent_chat_pane_thread(&pane_id.0),
-            Some((ProviderKind::Codex, "thread-codex".to_string()))
+            Some((ProviderKind::Claude, "thread-first".to_string()))
+        );
+    }
+
+    /// A provider spawn can take long enough for another client to rebind
+    /// the pane. Rolling the failed claim back unconditionally would put a
+    /// dead thread on top of that live one.
+    #[test]
+    fn release_agent_chat_pane_claim_does_not_clobber_a_newer_binding() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&workspace_id.0, None, None, None, None)
+            .unwrap();
+
+        let claim = store
+            .claim_agent_chat_pane(&pane_id.0, ProviderKind::Claude, "thread-spawning", None)
+            .expect("first claim should succeed");
+
+        // Another client rebinds while the first provider is still starting.
+        store
+            .claim_agent_chat_pane(
+                &pane_id.0,
+                ProviderKind::Codex,
+                "thread-newer",
+                Some("thread-spawning"),
+            )
+            .expect("an expected-thread rebind should succeed");
+
+        // The first client's spawn now fails and tries to roll back.
+        assert!(!store.release_agent_chat_pane_claim(
+            &pane_id.0,
+            ProviderKind::Claude,
+            "thread-spawning",
+            claim.previous.clone(),
+        ));
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Codex, "thread-newer".to_string()))
+        );
+
+        // A closed pane is simply not rollback-able either.
+        assert!(!store.release_agent_chat_pane_claim(
+            "pane-gone",
+            ProviderKind::Claude,
+            "thread-spawning",
+            claim.previous,
+        ));
+    }
+
+    #[test]
+    fn claim_agent_chat_pane_reports_a_missing_pane() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let conflict = store
+            .claim_agent_chat_pane("pane-gone", ProviderKind::Claude, "thread-x", None)
+            .expect_err("an unknown pane should not be claimable");
+        assert_eq!(
+            conflict,
+            PaneClaimConflict::PaneNotFound {
+                pane_id: "pane-gone".to_string()
+            }
         );
     }
 
@@ -8723,12 +9155,12 @@ mod tests {
         // Bind two chat panes: one with a live session, one still unbound.
         // Only the live one should be returned for cleanup.
         let pane_a = store
-            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None, None)
             .unwrap();
         store.set_agent_chat_thread_id(&pane_a.0, Some("thread-live".into()));
 
         let _pane_unbound = store
-            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Codex), None, None)
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Codex), None, None, None)
             .unwrap();
 
         let result = store
@@ -8752,7 +9184,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane_id = store
-            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None, None)
             .unwrap();
 
         // Unbound pane returns None — nothing to tear down.
@@ -8773,7 +9205,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane_id = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
 
         // Unbound pane cannot be resolved by thread id yet.
@@ -8819,17 +9251,17 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let reviewed = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         let working = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         let prompting = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
 
         let watching = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
 
         store.set_pane_status(&reviewed.0, PaneStatus::Review);
@@ -8861,7 +9293,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
 
         assert!(store.start_manual_monitor(&pane.0, Some("CI on #482".into())));
@@ -8888,7 +9320,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         store.start_manual_monitor(&pane.0, None);
 
@@ -8922,7 +9354,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         store.start_manual_monitor(&pane.0, Some("watching the deploy".into()));
 
@@ -8955,10 +9387,10 @@ mod tests {
         let keep = store.snapshot().active_workspace_id.0.clone();
         let doomed = store.create_workspace().0;
         let doomed_pane = store
-            .create_agent_chat_pane(&doomed, None, None, None)
+            .create_agent_chat_pane(&doomed, None, None, None, None)
             .unwrap();
         let kept_pane = store
-            .create_agent_chat_pane(&keep, None, None, None)
+            .create_agent_chat_pane(&keep, None, None, None, None)
             .unwrap();
         store.start_manual_monitor(&doomed_pane.0, Some("watching CI".into()));
         store.start_manual_monitor(&kept_pane.0, None);
@@ -8984,7 +9416,7 @@ mod tests {
         let store = AppStateStore::default();
         let only = store.snapshot().active_workspace_id.0.clone();
         let pane = store
-            .create_agent_chat_pane(&only, None, None, None)
+            .create_agent_chat_pane(&only, None, None, None, None)
             .unwrap();
         store.start_manual_monitor(&pane.0, None);
 
@@ -8998,7 +9430,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let chat = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
 
         // An explicit, existing pane id wins outright.
@@ -9024,7 +9456,7 @@ mod tests {
         let store = AppStateStore::default();
         let ws_id = store.snapshot().active_workspace_id.clone();
         let pane = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         store.set_pane_status(&pane.0, PaneStatus::Review);
         store.set_pane_status("pane-that-never-existed", PaneStatus::Review);
@@ -9044,7 +9476,7 @@ mod tests {
         let store = AppStateStore::default();
         let active_ws = store.snapshot().active_workspace_id.clone();
         let active_pane = store
-            .create_agent_chat_pane(&active_ws.0, None, None, None)
+            .create_agent_chat_pane(&active_ws.0, None, None, None, None)
             .unwrap();
         store.set_agent_chat_thread_id(&active_pane.0, Some("thread-active".into()));
 
@@ -9054,7 +9486,7 @@ mod tests {
             WorkspacePresetLayout::Single,
         );
         let other_pane = store
-            .create_agent_chat_pane(&other_ws.0, None, None, None)
+            .create_agent_chat_pane(&other_ws.0, None, None, None, None)
             .unwrap();
         store.set_agent_chat_thread_id(&other_pane.0, Some("thread-other".into()));
 
@@ -9077,10 +9509,10 @@ mod tests {
         let ws_id = store.snapshot().active_workspace_id.clone();
         // Two chat panes in the same surface (the second splits the first).
         let pane_a = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         let pane_b = store
-            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .create_agent_chat_pane(&ws_id.0, None, None, None, None)
             .unwrap();
         store.set_agent_chat_thread_id(&pane_a.0, Some("thread-a".into()));
         store.set_agent_chat_thread_id(&pane_b.0, Some("thread-b".into()));
@@ -9962,7 +10394,7 @@ mod workspace_activity_tests {
         let store = AppStateStore::default();
         let workspace_id = store.snapshot().active_workspace_id.clone();
         let pane_id = store
-            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .create_agent_chat_pane(&workspace_id.0, None, None, None, None)
             .unwrap();
         store.set_agent_chat_thread_id(&pane_id.0, Some("thread-activity".into()));
 

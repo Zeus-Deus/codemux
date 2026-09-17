@@ -2,6 +2,10 @@ import { useCallback } from "react";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
 import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
+import {
+  formatProviderError,
+  parsePaneAlreadyBound,
+} from "@/lib/agent-chat/provider-error";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -35,6 +39,27 @@ export interface AgentChatSessionActions {
   handleSelect: (record: AgentChatSessionRecord) => Promise<void>;
   /** Stop the current session and start a fresh one on the same pane. */
   handleNewChat: () => Promise<void>;
+}
+
+/**
+ * Follow the binding that beat us to the pane.
+ *
+ * Both actions here stop the pane's session and start a replacement under
+ * a fresh thread id, naming the old one as the thread they expect to
+ * replace. If another client rebound the pane in between, the backend
+ * refuses the claim and spawns nothing — so there is no failure to report,
+ * only a different owner. Seeding the winner's slice is all this side has
+ * to do: the pane snapshot already carries that thread id, so the pane
+ * re-renders onto it as soon as the next `app-state` lands.
+ *
+ * Returns true when the error was a lost claim and has been handled.
+ */
+function adoptPaneBindingFromError(error: unknown): boolean {
+  const claim = parsePaneAlreadyBound(error);
+  if (!claim) return false;
+  useAgentChatStore.getState().ensureThread(claim.threadId);
+  toast.info("Another client is already running a session on this chat pane.");
+  return true;
 }
 
 /**
@@ -159,6 +184,11 @@ export function useAgentChatSessionActions(
             additional_directories: [],
             env: null,
           },
+          // We just stopped this pane's session, so it is still bound to
+          // `threadId` while the resume starts under a fresh local id.
+          // Naming that binding lets the backend tell our own re-start
+          // apart from another client claiming the pane.
+          threadId,
         );
         // Seed the store slice for the freshly-started thread so the footer
         // pickers reflect the launched config. `permissionMode` and
@@ -178,7 +208,8 @@ export function useAgentChatSessionActions(
           `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
         );
       } catch (error) {
-        toast.error(`Failed to reopen chat: ${error}`);
+        if (adoptPaneBindingFromError(error)) return;
+        toast.error(`Failed to reopen chat: ${formatProviderError(error)}`);
       }
     },
     [cwd, paneId, threadId, provider],
@@ -204,16 +235,23 @@ export function useAgentChatSessionActions(
       // to close.
       const startMode = defaultPermissionModeForProvider(provider);
       const startModel = defaultModelForProvider(provider);
-      const newThreadId = await agentChatStartSession(paneId, provider, {
-        thread_id: newLocalThreadId,
-        cwd,
-        model: null,
-        resume_cursor: null,
-        permission_mode: startMode,
-        fast_mode: false,
-        additional_directories: [],
-        env: null,
-      });
+      const newThreadId = await agentChatStartSession(
+        paneId,
+        provider,
+        {
+          thread_id: newLocalThreadId,
+          cwd,
+          model: null,
+          resume_cursor: null,
+          permission_mode: startMode,
+          fast_mode: false,
+          additional_directories: [],
+          env: null,
+        },
+        // Same as resume: the pane still carries the thread we just
+        // stopped, and the new chat arrives under a different id.
+        threadId,
+      );
       // Seed the new slice the same way the pane's fresh-boot path does, so
       // the pickers render immediately and `permissionMode` /
       // `sessionLaunchMode` agree (a mismatch is read as a user mode change
@@ -227,7 +265,8 @@ export function useAgentChatSessionActions(
       store.setFastMode(newThreadId, false);
       store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
-      toast.error(`Failed to start new chat: ${error}`);
+      if (adoptPaneBindingFromError(error)) return;
+      toast.error(`Failed to start new chat: ${formatProviderError(error)}`);
     }
   }, [cwd, paneId, threadId, provider]);
 

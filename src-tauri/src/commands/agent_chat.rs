@@ -36,7 +36,7 @@ use crate::database::{
     AgentChatVisibleMessage, DatabaseStore,
 };
 use crate::observability::ObservabilityStore;
-use crate::state::{AppStateStore, PaneNodeSnapshot, PaneStatus};
+use crate::state::{AppStateStore, PaneClaimConflict, PaneNodeSnapshot, PaneStatus};
 use crate::utility_ai::{generate_utility_text, UtilityModelSelection};
 
 /// Event name used for the few provider events that are NOT scoped to
@@ -403,6 +403,42 @@ fn provider_err(err: ProviderError) -> String {
     serde_json::to_string(&ser).unwrap_or_else(|_| "provider_error".to_string())
 }
 
+/// Wire shape for a lost pane claim. The frontend parses this to tell the
+/// user another client owns the pane (and which thread won) instead of
+/// showing a generic start failure. `provider` uses `ProviderKind`'s
+/// lowercase serialization, the same value the pane node carries in
+/// `app-state`, so the frontend can match it against its own provider kind.
+#[derive(Debug, Serialize)]
+struct PaneAlreadyBoundError<'a> {
+    kind: &'static str,
+    pane_id: &'a str,
+    thread_id: &'a str,
+    provider: ProviderKind,
+}
+
+/// Render a refused pane claim as the error string the command returns.
+fn pane_claim_error(conflict: &PaneClaimConflict, requested: ProviderKind) -> String {
+    match conflict {
+        PaneClaimConflict::PaneNotFound { pane_id } => format!("pane_not_found: {pane_id}"),
+        PaneClaimConflict::PaneAlreadyBound {
+            pane_id,
+            thread_id,
+            provider,
+        } => {
+            let payload = PaneAlreadyBoundError {
+                kind: "pane_already_bound",
+                pane_id,
+                thread_id,
+                // A bound pane always carries a provider (both halves are
+                // written together); fall back to the requested kind rather
+                // than emit a null the frontend would have to special-case.
+                provider: provider.unwrap_or(requested),
+            };
+            serde_json::to_string(&payload).unwrap_or_else(|_| "pane_already_bound".to_string())
+        }
+    }
+}
+
 pub(super) async fn lookup_provider(
     registry: &ProviderRegistry,
     kind: ProviderKind,
@@ -426,6 +462,13 @@ pub(super) async fn lookup_provider(
 /// historical behaviour relied on by materialise / sidebar / prestart
 /// paths, where the chat IS the workspace and a fresh tab/surface is
 /// created automatically when surfaces are empty.
+///
+/// `thread_id` (optional) publishes the pane already bound to that thread.
+/// A caller that has pre-minted a thread id should always pass it: every
+/// client sees the pane bound from its first frame, so a second client
+/// mounting it cannot auto-start a competing session on it. Passing a
+/// thread that already has a pane in this workspace returns that pane
+/// instead of creating a duplicate.
 #[tauri::command]
 pub fn agent_chat_create_pane<R: Runtime>(
     app: AppHandle<R>,
@@ -435,9 +478,14 @@ pub fn agent_chat_create_pane<R: Runtime>(
     provider: Option<ProviderKind>,
     cwd: Option<String>,
     launch_mode: Option<crate::presets::LaunchMode>,
+    thread_id: Option<String>,
 ) -> Result<String, String> {
     feature_flag_on(&observability)?;
-    let pane_id = state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode)?;
+    let pane_id =
+        state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode, thread_id)?;
+    // Emit either way: reusing an existing pane still moves the active
+    // pane, tab, surface and workspace onto it, and those moves reach the
+    // clients only through this emit.
     crate::state::emit_app_state(&app);
     Ok(pane_id.0)
 }
@@ -516,7 +564,7 @@ pub fn dev_agent_chat_spawn_test_pane<R: Runtime>(
     if workspace_id.is_empty() {
         return Err("no_active_workspace".to_string());
     }
-    let pane_id = state.create_agent_chat_pane(&workspace_id, None, None, None)?;
+    let pane_id = state.create_agent_chat_pane(&workspace_id, None, None, None, None)?;
     eprintln!(
         "[codemux::agent_chat] dev_agent_chat_spawn_test_pane created pane {} in workspace {workspace_id}",
         pane_id.0
@@ -639,12 +687,21 @@ fn should_recover_persisted_resume_cursor(
 /// resolve it without re-consulting the provider, and upserts an
 /// `agent_chat_sessions` row so the history dropdown can surface
 /// the session after a restart.
+///
+/// The pane is CLAIMED (compare-and-set) before the provider spawns, so a
+/// second client that mounts the same pane cannot start a competing session
+/// on it. `expected_thread` is how a caller deliberately rebinds a pane that
+/// is already bound: pass the thread currently on the pane (a provider
+/// handoff or "New Chat" on a live pane). Omit it for a first start, and the
+/// claim only succeeds while the pane is unbound or already on this thread.
+/// A losing caller gets a `pane_already_bound` JSON error naming the winner.
 #[tauri::command]
 pub async fn agent_chat_start_session<R: Runtime>(
     app: AppHandle<R>,
     pane_id: String,
     provider: ProviderKind,
     mut input: StartSessionInput,
+    expected_thread: Option<String>,
 ) -> Result<ThreadId, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -765,6 +822,49 @@ pub async fn agent_chat_start_session<R: Runtime>(
             }
         }
     }
+    let requested_thread_id = input.thread_id.0.clone();
+    // Nothing to start when this pane already runs the requested thread.
+    // A materialised draft is only marked promoted once its FIRST TURN
+    // lands, so a draft whose turn failed keeps asking its (already bound,
+    // already running) pane to start the session again on every mount —
+    // which the adapters reject as a double start. Report the live session
+    // instead.
+    let pane_already_runs_thread = {
+        let state: State<'_, AppStateStore> = app.state();
+        state
+            .agent_chat_pane_thread(&pane_id)
+            .is_some_and(|(bound_provider, bound_thread)| {
+                bound_provider == provider && bound_thread == requested_thread_id
+            })
+    };
+    if pane_already_runs_thread && impl_.has_session(&input.thread_id).await {
+        return Ok(input.thread_id);
+    }
+    // Claim the pane BEFORE anything spawns. Desktop and remote clients
+    // share one backend, so between "create pane" and "start session" a
+    // second client can mount the pane and auto-start its own thread on it.
+    // An unconditional bind let the loser's write win and orphaned the real
+    // session's CLI child. The claim is a compare-and-set under the state
+    // lock, and the emit right after it publishes the binding to every
+    // client while the provider is still starting — so nobody else tries.
+    let claim = {
+        let state: State<'_, AppStateStore> = app.state();
+        state
+            .claim_agent_chat_pane(
+                &pane_id,
+                provider,
+                &requested_thread_id,
+                expected_thread.as_deref(),
+            )
+            .map_err(|conflict| pane_claim_error(&conflict, provider))?
+    };
+    // Only publish when the claim moved the binding. Re-starting the session
+    // that already owns the pane rewrites nothing, and an emit every client
+    // has to diff for no change is pure churn.
+    if claim.changed {
+        crate::state::emit_app_state(&app);
+    }
+
     // Lazy MCP spawn: first chat session triggers child-process startup
     // for every enabled (non-disabled) MCP server discovered for this
     // workspace. Stage 3 needs the spawn to COMPLETE before
@@ -811,13 +911,61 @@ pub async fn agent_chat_start_session<R: Runtime>(
         input.env = env;
         input.workspace_id = workspace_id;
     }
-    let session = impl_.start_session(input).await.map_err(provider_err)?;
+    let session = match impl_.start_session(input).await {
+        Ok(session) => session,
+        Err(error) => {
+            // The claim outlived its reason to exist: put the pane back the
+            // way we found it so it is not advertised as owned by a thread
+            // that has no session behind it.
+            // Compare-and-set: a no-op when another client has already
+            // rebound the pane, and then its emit is the current truth.
+            //
+            // Two cases the compare-and-set alone cannot see, because the
+            // claim accepts an idempotent re-claim of the SAME thread and so
+            // leaves the binding reading exactly what we would roll back:
+            // a claim that changed nothing has nothing to undo, and a thread
+            // that now has a live session behind it belongs to whichever
+            // client started it — restoring the old binding over that would
+            // strand a running CLI child.
+            let thread_taken_over = impl_
+                .has_session(&ThreadId(requested_thread_id.clone()))
+                .await;
+            let state: State<'_, AppStateStore> = app.state();
+            if claim.changed
+                && !thread_taken_over
+                && state.release_agent_chat_pane_claim(
+                    &pane_id,
+                    provider,
+                    &requested_thread_id,
+                    claim.previous.clone(),
+                )
+            {
+                crate::state::emit_app_state(&app);
+            }
+            return Err(provider_err(error));
+        }
+    };
     let state: State<'_, AppStateStore> = app.state();
-    // Session startup is authoritative for BOTH halves of the pane binding.
-    // This matters when the model picker hands an existing pane from Claude
-    // to Codex/OpenCode: persisting only `thread_id` would leave the pane's
-    // provider stale and route the next app-restart resume through Claude.
-    state.set_agent_chat_binding(&pane_id, provider, session.thread_id.0.clone());
+    // Providers are expected to honour the requested thread id; re-claim if
+    // one ever mints its own so the pane follows the session that exists.
+    // `expected_thread` is the id we just claimed, so this always succeeds.
+    if session.thread_id.0 != requested_thread_id {
+        let _ = state.claim_agent_chat_pane(
+            &pane_id,
+            provider,
+            &session.thread_id.0,
+            Some(&requested_thread_id),
+        );
+    }
+    // An explicit rebind (provider handoff / New Chat on a live pane) leaves
+    // the previous thread's CLI child running with no pane pointing at it.
+    // Callers already stop it themselves and `stop_session` is idempotent,
+    // so this is a best-effort backstop against an orphaned process.
+    if let (Some(previous_provider), Some(previous_thread)) = claim.previous.clone() {
+        if previous_thread != session.thread_id.0 {
+            shutdown_agent_chat_threads(&app, vec![(previous_provider, previous_thread)]);
+        }
+    }
     // Persist the session for the history dropdown. Scope is
     // (workspace_id, cwd): workspace lookup goes through the state
     // store because the command layer only knows the pane id.
@@ -4323,10 +4471,8 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
             Some(provider),
             record.cwd.clone(),
             Some(crate::presets::LaunchMode::NewTab),
+            Some(thread_id.clone()),
         )?;
-        if !state.set_agent_chat_binding(&pane_id.0, provider, thread_id.clone()) {
-            return Err("failed_to_bind_conversation_pane".to_string());
-        }
         pane_id.0
     };
 
@@ -6821,6 +6967,43 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The losing client parses this string to explain who owns the pane,
+    /// so the shape (and the lowercase provider kind) is a contract.
+    #[test]
+    fn pane_claim_error_serializes_the_conflict_contract() {
+        let conflict = PaneClaimConflict::PaneAlreadyBound {
+            pane_id: "pane-1".to_string(),
+            thread_id: "thread-winner".to_string(),
+            provider: Some(ProviderKind::Claude),
+        };
+        assert_eq!(
+            pane_claim_error(&conflict, ProviderKind::Codex),
+            r#"{"kind":"pane_already_bound","pane_id":"pane-1","thread_id":"thread-winner","provider":"claude"}"#
+        );
+
+        // A bound pane with no provider recorded falls back to the kind the
+        // losing caller asked for, so the field is never null.
+        let no_provider = PaneClaimConflict::PaneAlreadyBound {
+            pane_id: "pane-1".to_string(),
+            thread_id: "thread-winner".to_string(),
+            provider: None,
+        };
+        assert_eq!(
+            pane_claim_error(&no_provider, ProviderKind::Codex),
+            r#"{"kind":"pane_already_bound","pane_id":"pane-1","thread_id":"thread-winner","provider":"codex"}"#
+        );
+
+        assert_eq!(
+            pane_claim_error(
+                &PaneClaimConflict::PaneNotFound {
+                    pane_id: "pane-gone".to_string()
+                },
+                ProviderKind::Claude
+            ),
+            "pane_not_found: pane-gone"
+        );
+    }
 
     #[test]
     fn collapsed_session_cleanup_deletes_checkpoint_and_safety_refs() {

@@ -51,6 +51,7 @@ import {
   getPresets,
 } from "@/tauri/commands";
 import type { WorktreeInfo, DetectedSetup, BranchDetail } from "@/tauri/types";
+import { randomUUID } from "@/lib/uuid";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -225,7 +226,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       if (isCreating) return;
       setIsCreating(true);
 
-      const tempId = crypto.randomUUID();
+      const tempId = randomUUID();
       const displayName = task.slice(0, 40) || "New workspace";
 
       addPendingWorkspace({

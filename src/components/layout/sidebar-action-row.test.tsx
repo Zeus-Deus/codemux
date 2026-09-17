@@ -159,6 +159,39 @@ describe("SidebarActionRow — New agent button", () => {
       expect(setShowDialogMock).not.toHaveBeenCalled();
     });
 
+    // The remote web client is served over plain http — an insecure
+    // context, where `crypto.randomUUID` is simply absent. Minting the
+    // draft id used to throw inside this click handler, so the button
+    // did nothing at all.
+    it("opens a Home draft even when crypto.randomUUID is unavailable (insecure context)", () => {
+      enableAgentChatFlag = true;
+      enableLazyFlag = true;
+      const original = Object.getOwnPropertyDescriptor(
+        globalThis.crypto,
+        "randomUUID",
+      );
+      Object.defineProperty(globalThis.crypto, "randomUUID", {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      });
+      try {
+        const { newAgent } = renderRow();
+        fireEvent.click(newAgent);
+
+        const state = useChatDraftStore.getState();
+        expect(state.activeDraftId).not.toBeNull();
+        expect(state.activeDraftId).toBe(state.activeHomeDraftId);
+        expect(setShowDialogMock).not.toHaveBeenCalled();
+      } finally {
+        if (original) {
+          Object.defineProperty(globalThis.crypto, "randomUUID", original);
+        } else {
+          delete (globalThis.crypto as { randomUUID?: unknown }).randomUUID;
+        }
+      }
+    });
+
     it("lazy ON + plain click reuses the existing home draft on a second click", () => {
       enableAgentChatFlag = true;
       enableLazyFlag = true;

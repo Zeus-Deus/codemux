@@ -4,6 +4,11 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { hasAnyPane } from "@/lib/pane-tree";
 import { launchAgentChatPane } from "@/lib/agent-chat/launch-pane";
+import {
+  adoptLocalFallbackActivation,
+  noteLocalWorkspaceActivation,
+  wasActivatedLocally,
+} from "@/lib/local-activation";
 
 /**
  * Primitive-summary selector for the bits of `appState` this hook
@@ -54,6 +59,13 @@ function selectEmptyWorkspaceFingerprint(
  *    stops the effect from running again until the draft clears.
  *  - The pane-spawn branch guards with an in-flight ref so repeated
  *    effect fires while the Tauri call is pending don't double-spawn.
+ *  - The pane-spawn branch additionally requires that THIS client
+ *    activated the workspace (`wasActivatedLocally`). The in-flight ref
+ *    is client-local, but `active_workspace_id` is shared across every
+ *    connected client, so without that check a remote client injects a
+ *    duplicate pane into a workspace the desktop just created and is
+ *    still populating. The Home-draft branch needs no such check — a
+ *    draft is purely client-local state.
  */
 export function useEnsureDraftWhenEmpty() {
   // Subscribe to a primitive string fingerprint of the four fields
@@ -77,6 +89,20 @@ export function useEnsureDraftWhenEmpty() {
   // workspace. Cleared on failure so a retry can fire.
   const inFlightSpawnRef = useRef<string | null>(null);
 
+  // Boot restore has no activation to observe: the backend hands us a
+  // workspace that is already active, nobody clicked anything, and that
+  // workspace still needs its pane. Adopt whatever is active the first
+  // time this effect reaches a real snapshot, and require a local
+  // activation for every workspace after it.
+  //
+  // That leaves one narrow window: a client booting at the exact moment
+  // another client creates and activates a workspace adopts it as its
+  // own. It stays narrow because the `activeDraftId` early return above
+  // sits ahead of this adoption, and because it only spans the first
+  // snapshot this client ever sees — afterwards the local-activation
+  // record is the only way in.
+  const bootAdoptedRef = useRef(false);
+
   useEffect(() => {
     if (!flagsLoaded) return;
     if (!enableAgentChat || !enableLazyWorkspaceCreation) return;
@@ -88,6 +114,21 @@ export function useEnsureDraftWhenEmpty() {
     // surfaces / surface ids.
     const appState = useAppStore.getState().appState;
     if (!appState) return;
+
+    if (!bootAdoptedRef.current) {
+      bootAdoptedRef.current = true;
+      if (appState.active_workspace_id) {
+        noteLocalWorkspaceActivation(appState.active_workspace_id);
+      }
+    }
+
+    // Closing or archiving a workspace from THIS client hands the backend
+    // the job of picking the next active one, so there is no activation to
+    // observe — only the marker the close/archive command left behind. The
+    // workspace that fallback lands on is ours to fill like any other we
+    // navigated to. Consumed on this first snapshot after the command no
+    // matter where we landed, so it never outlives the fallback it marks.
+    adoptLocalFallbackActivation(appState.active_workspace_id);
 
     const activeWs = appState.workspaces.find(
       (w) => w.workspace_id === appState.active_workspace_id,
@@ -108,6 +149,12 @@ export function useEnsureDraftWhenEmpty() {
         homeDir !== null &&
         (activeWs.project_root ?? activeWs.cwd) !== homeDir;
       if (isProjectWorkspace) {
+        // Another client put this workspace on screen — it owns filling
+        // it. Injecting a pane from here would duplicate whatever that
+        // client is already launching. Return without the Home draft
+        // either: the workspace on screen is a project workspace, and
+        // the client that activated it is about to populate it.
+        if (!wasActivatedLocally(activeWs.workspace_id)) return;
         if (inFlightSpawnRef.current === activeWs.workspace_id) return;
         inFlightSpawnRef.current = activeWs.workspace_id;
         launchAgentChatPane(activeWs.workspace_id, "claude", null).catch(

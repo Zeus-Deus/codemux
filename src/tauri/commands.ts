@@ -2,6 +2,10 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import {
+  noteLocalActivationFallback,
+  noteLocalWorkspaceActivation,
+} from "@/lib/local-activation";
 
 export { Channel };
 import type {
@@ -383,8 +387,19 @@ export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
 export const createWorkspaceWithPreset = (cwd: string, presetId: string) =>
   invoke<string>("create_workspace_with_preset", { cwd, presetId });
 
-export const activateWorkspace = (workspaceId: string) =>
-  invoke("activate_workspace", { workspaceId });
+/** Switch the backend to `workspaceId`.
+ *
+ *  Recording the activation here, in the one wrapper every navigation path
+ *  bottoms out in, is what makes the record complete: an activation issued
+ *  through this client is by definition local, whichever surface asked for
+ *  it. Effects that auto-repair an empty active workspace consult that
+ *  record — every client shares one snapshot and one `active_workspace_id`,
+ *  so without it they would also fire on another client's activation and
+ *  race it injecting panes. */
+export const activateWorkspace = (workspaceId: string) => {
+  noteLocalWorkspaceActivation(workspaceId);
+  return invoke("activate_workspace", { workspaceId });
+};
 
 export const renameWorkspace = (workspaceId: string, title: string) =>
   invoke("rename_workspace", { workspaceId, title });
@@ -395,8 +410,18 @@ export const setWorkspaceMuted = (workspaceId: string, muted: boolean) =>
 export const setWorkspacePinned = (workspaceId: string, pinned: boolean) =>
   invoke<void>("set_workspace_pinned", { workspaceId, pinned });
 
-export const closeWorkspace = (workspaceId: string, forceDelete: boolean) =>
-  invoke<string>("close_workspace", { workspaceId, forceDelete });
+/** Close a workspace. Resolves with the workspace the backend fell back
+ *  to (empty when nothing is left).
+ *
+ *  Removing the active workspace makes the BACKEND pick the next one, so
+ *  no `activateWorkspace` records it. Marking the fallback here — before
+ *  the invoke, so the app-state event can't arrive first — keeps the
+ *  workspace we land on counted as ours to fill. Same for the archive and
+ *  worktree variants below, which route through the same close impl. */
+export const closeWorkspace = (workspaceId: string, forceDelete: boolean) => {
+  noteLocalActivationFallback();
+  return invoke<string>("close_workspace", { workspaceId, forceDelete });
+};
 
 export const cycleWorkspace = (step: number) =>
   invoke<string>("cycle_workspace", { step });
@@ -538,8 +563,10 @@ export const closeWorkspaceWithWorktree = (
   removeWorktree: boolean,
   deleteBranch: boolean,
   forceDelete: boolean,
-) =>
-  invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
+) => {
+  noteLocalActivationFallback();
+  return invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
+};
 
 // ── Workspace archive ──
 //
@@ -550,8 +577,10 @@ export const closeWorkspaceWithWorktree = (
 
 /** Archive a workspace. Resolves with the new archive entry's id, which
  *  `unarchiveWorkspace` accepts to restore it. */
-export const archiveWorkspace = (workspaceId: string) =>
-  invoke<string>("archive_workspace", { workspaceId });
+export const archiveWorkspace = (workspaceId: string) => {
+  noteLocalActivationFallback();
+  return invoke<string>("archive_workspace", { workspaceId });
+};
 
 /** Restore an archived workspace. Resolves with the restored workspace id;
  *  the backend also activates it. Rejects (entry kept) when nothing is
@@ -1543,25 +1572,55 @@ export interface TurnStartResult {
 
 export const getHomeDir = () => invoke<string>("get_home_dir");
 
+/** Create an agent-chat pane.
+ *
+ *  `threadId` publishes the pane already bound to that thread instead of
+ *  unbound. Several clients share one backend and one app-state snapshot,
+ *  so an unbound pane is a window in which another client can mount it,
+ *  see no `thread_id`, and start a session of its own on it. Passing the
+ *  caller's pre-minted thread id closes that window: the pane appears
+ *  bound in the first snapshot every client sees. The call is idempotent —
+ *  a pane in this workspace already bound to `threadId` is returned as-is
+ *  rather than duplicated. */
 export const agentChatCreatePane = (
   workspaceId: string,
   provider: AgentChatProviderKind | null = null,
   cwd: string | null = null,
   launchMode: LaunchMode | null = null,
+  threadId: string | null = null,
 ) =>
   invoke<string>("agent_chat_create_pane", {
     workspaceId,
     provider,
     cwd,
     launchMode,
+    threadId,
   });
 
+/** Start a provider session on a pane.
+ *
+ *  The backend claims the pane BEFORE spawning the provider: the claim is
+ *  accepted when the pane is unbound, already bound to `input.thread_id`,
+ *  or bound to `expectedThread`. Pass `expectedThread` whenever the caller
+ *  is re-starting a pane it believes it already owns (restart, provider
+ *  handoff, resume, New Chat) — the thread the pane is bound to right now,
+ *  which is NOT the thread the new session will carry. Leave it null when
+ *  the pane is known unbound or the start reuses the same thread id.
+ *
+ *  A rejected claim never spawns anything and reports a JSON
+ *  `pane_already_bound` error — see `parsePaneAlreadyBound`. */
 export const agentChatStartSession = (
   paneId: string,
   provider: AgentChatProviderKind,
   input: AgentChatStartSessionInput,
+  expectedThread: string | null = null,
 ) =>
-  invoke<string>("agent_chat_start_session", { paneId, provider, input });
+  invoke<string>("agent_chat_start_session", {
+    paneId,
+    provider,
+    input,
+    expectedThread,
+  });
 
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,

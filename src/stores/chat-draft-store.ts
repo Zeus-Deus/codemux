@@ -10,8 +10,9 @@ import {
   type ChatMode,
 } from "@/stores/agent-chat-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import { randomUUID } from "@/lib/uuid";
 
-/** Branded draft identifier. Assigned via `crypto.randomUUID()`. */
+/** Branded draft identifier. Assigned via `randomUUID()`. */
 export type DraftId = string & { readonly __brand: "DraftId" };
 
 /** Where a draft materialises on first send. */
@@ -192,11 +193,11 @@ const STORAGE_KEY = "codemux:chat-drafts:v1";
 const STORAGE_VERSION = 2;
 
 function newDraftId(): DraftId {
-  return crypto.randomUUID() as DraftId;
+  return randomUUID() as DraftId;
 }
 
 function newThreadId(): string {
-  return crypto.randomUUID();
+  return randomUUID();
 }
 
 /** A draft is reusable by `getOrCreate*Draft` only when it has never

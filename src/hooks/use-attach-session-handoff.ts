@@ -17,6 +17,7 @@ import {
   agentChatGetSessionContext,
   type AgentChatSessionMention,
 } from "@/tauri/commands";
+import { randomUUID } from "@/lib/uuid";
 
 /**
  * Stage a persisted GUI conversation as a provider-neutral handoff.
@@ -69,10 +70,7 @@ export function useAttachSessionHandoff(
         return;
       }
 
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? crypto.randomUUID()
-          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const id = randomUUID();
       const label = sessionMentionTitle(session);
       const mentionToken = sessionMentionToken(session);
       addStagedAttachment(threadId, {
