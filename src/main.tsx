@@ -1,9 +1,11 @@
+import { initializeBrowserApp } from "./remote/pwa";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import "./globals.css";
+import "./mobile.css";
 import { markStartup } from "@/lib/perf/interaction-trace";
 
 // Single QueryClient for the whole app. Defaults are tuned for the
@@ -109,6 +111,7 @@ async function installRuntimeShim(): Promise<void> {
   }
 }
 
+initializeBrowserApp();
 void installRuntimeShim().then(() => {
   markStartup("runtime-shim-ready");
   mountApp();

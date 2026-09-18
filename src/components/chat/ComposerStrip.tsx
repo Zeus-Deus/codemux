@@ -862,7 +862,6 @@ function StripMarkView({ mark }: { mark: StripMark }) {
       return (
         <Hourglass
           className="size-3.5 text-status-working"
-          strokeWidth={1.8}
           aria-hidden
         />
       );

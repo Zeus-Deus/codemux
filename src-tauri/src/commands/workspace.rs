@@ -988,8 +988,9 @@ pub async fn import_worktree_workspace<R: tauri::Runtime>(
     worktree_path: String,
     branch: String,
     layout: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    import_worktree_workspace_impl(app, &state, &db, worktree_path, branch, layout).await
+    import_worktree_workspace_impl(app, &state, &db, worktree_path, branch, layout, select.unwrap_or(true)).await
 }
 
 /// Adopt an already-on-disk git worktree into a fresh workspace WITHOUT
@@ -1009,6 +1010,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
     worktree_path: String,
     branch: String,
     layout: String,
+    select: bool,
 ) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
@@ -1021,7 +1023,7 @@ pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
     };
 
     let wt_path_buf = PathBuf::from(&worktree_path);
-    let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
+    let workspace_id = state.create_workspace_with_layout_with_selection(wt_path_buf.clone(), layout, select);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch);
 
@@ -1638,6 +1640,18 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
     presets: &crate::presets::PresetStoreState,
     archive_id: String,
 ) -> Result<String, String> {
+    unarchive_workspace_impl_with_selection(app, state, db, pty_state, presets, archive_id, true).await
+}
+
+pub(crate) async fn unarchive_workspace_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    pty_state: &crate::terminal::PtyState,
+    presets: &crate::presets::PresetStoreState,
+    archive_id: String,
+    select: bool,
+) -> Result<String, String> {
     let entry = state
         .find_archived_workspace(&archive_id)
         .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
@@ -1672,7 +1686,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
         if entry.pinned_at.is_some() {
             state.restore_workspace_pinned_at(&existing_id, entry.pinned_at)?;
         }
-        activate_workspace_impl(app.clone(), state, existing_id.clone())?;
+        if select { activate_workspace_impl(app.clone(), state, existing_id.clone())?; }
         let _ = state.remove_archived_workspace(&archive_id);
         crate::state::emit_app_state(&app);
         return Ok(existing_id);
@@ -1751,10 +1765,11 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
                 wt_path.clone(),
                 branch,
                 "single".to_string(),
+                select,
             )
             .await?
         } else {
-            create_worktree_workspace_impl(
+            create_worktree_workspace_impl_with_selection(
                 app.clone(),
                 state,
                 db,
@@ -1768,6 +1783,8 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
                 None,
                 None,
                 None,
+                None,
+                select,
                 None,
             )
             .await?
@@ -1788,7 +1805,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
                 entry.cwd
             ));
         }
-        let id = create_workspace_impl(app.clone(), state, db, Some(entry.cwd.clone())).await?;
+        let id = create_workspace_impl_with_selection(app.clone(), state, db, Some(entry.cwd.clone()), select).await?;
         state.rename_workspace(&id, entry.title.clone());
         id
     };
@@ -1800,7 +1817,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
     }
 
     let _ = state.remove_archived_workspace(&archive_id);
-    activate_workspace_impl(app.clone(), state, restored_id.clone())?;
+    if select { activate_workspace_impl(app.clone(), state, restored_id.clone())?; }
     crate::state::emit_app_state(&app);
     Ok(restored_id)
 }
@@ -1879,8 +1896,9 @@ pub async fn unarchive_workspace<R: tauri::Runtime>(
     pty_state: State<'_, crate::terminal::PtyState>,
     presets: State<'_, crate::presets::PresetStoreState>,
     archive_id: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    unarchive_workspace_impl(app, &state, &db, &pty_state, &presets, archive_id).await
+    unarchive_workspace_impl_with_selection(app, &state, &db, &pty_state, &presets, archive_id, select.unwrap_or(true)).await
 }
 
 // `async fn` because deleting a worktree is a recursive filesystem

@@ -6594,6 +6594,21 @@ fn publish_pane_status<R: Runtime>(
     if thread_id.0.is_empty() {
         return;
     }
+    if matches!(event, ProviderRuntimeEvent::QuestionsAsked { .. }) {
+        crate::web_remote::push::agent_status(app, &thread_id.0, PaneStatus::Permission);
+    }
+    if matches!(
+        event,
+        ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Error { .. }, .. }
+            | ProviderRuntimeEvent::TurnCompleted {
+                status: crate::agent_provider::TurnStatus::Error { .. }
+                    | crate::agent_provider::TurnStatus::MaxTurns
+                    | crate::agent_provider::TurnStatus::MaxBudget,
+                ..
+            }
+    ) {
+        crate::web_remote::push::agent_failure(app, &thread_id.0);
+    }
     // The status decision is per-thread and stateful (subagents can
     // outlive the parent turn), so resolve the thread first and route the
     // event through that thread's tracker.
@@ -6647,6 +6662,9 @@ fn apply_pane_status<R: Runtime>(
     mut status: PaneStatus,
     origin: SettleOrigin,
 ) {
+    if matches!(origin, SettleOrigin::ProviderEvent) {
+        crate::web_remote::push::agent_status(app, thread_id, status.clone());
+    }
     let state: State<'_, AppStateStore> = app.state();
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a

@@ -1,3 +1,4 @@
+import { currentSubscription } from "@/remote/push";
 import { useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
@@ -82,28 +83,10 @@ export function useWebNotifications(): void {
 
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    // Ask for permission lazily — only the first time an event actually
-    // arrives, never on mount, so a paired browser that never gets a
-    // notification is never nagged.
-    let permissionRequested = false;
-
+    // Permission belongs to the explicit install/notification button. Requesting
+    // it from an incoming event loses iOS user activation and surprises users.
     const handle = async (payload: WebNotificationPayload) => {
       const apiAvailable = webNotificationsAvailable();
-
-      if (
-        apiAvailable &&
-        Notification.permission === "default" &&
-        !permissionRequested
-      ) {
-        permissionRequested = true;
-        try {
-          await Notification.requestPermission();
-        } catch {
-          // requestPermission can reject on insecure origins — treat as
-          // "not granted" and fall through to the toast path.
-        }
-      }
-
       const permission = apiAvailable ? Notification.permission : null;
       const pageHidden =
         typeof document !== "undefined" && document.hidden === true;
@@ -114,6 +97,8 @@ export function useWebNotifications(): void {
         pageHidden,
       });
 
+      // A subscribed device receives the backend push; avoid a second alert.
+      if (delivery === "web" && await currentSubscription().catch(() => null)) return;
       if (delivery === "web") {
         showWebNotification(payload);
       } else {

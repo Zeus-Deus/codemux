@@ -166,7 +166,7 @@ function LauncherCommandList({
 }: {
   children: React.ReactNode;
   testId: string;
-  onManagePresets: () => void;
+  onManagePresets?: () => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [overflow, setOverflow] = useState({ top: false, bottom: false });
@@ -239,7 +239,7 @@ function LauncherCommandList({
               overflow.bottom ? "opacity-100" : "opacity-0",
             )}
           />
-          <LauncherFooter onSelect={onManagePresets} />
+          {onManagePresets && <LauncherFooter onSelect={onManagePresets} />}
         </div>
       </CommandList>
       <div
@@ -274,6 +274,7 @@ function LauncherFooter({ onSelect }: { onSelect: () => void }) {
 
 interface AgentLauncherProps {
   workspace: WorkspaceSnapshot;
+  mobile?: boolean;
 }
 
 /** Extract a human error string from a Tauri reject (string | Error). */
@@ -291,7 +292,7 @@ function errorMessage(err: unknown): string {
  * CLI agents), plus Terminal / Browser panes and a "Manage presets"
  * shortcut. Preset data comes from the live preset store snapshot.
  */
-export function AgentLauncher({ workspace }: AgentLauncherProps) {
+export function AgentLauncher({ workspace, mobile = false }: AgentLauncherProps) {
   const [open, setOpen] = useState(false);
   const presetStore = usePresetStore();
   // Track whether Shift was held when a CLI row was chosen so keyboard
@@ -399,10 +400,18 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
           />
           <LauncherCommandList
             testId="agent-launcher"
-            onManagePresets={managePresets}
+            onManagePresets={mobile ? undefined : managePresets}
           >
             <CommandEmpty>No matches.</CommandEmpty>
-            {chatPresets.length > 0 && (
+            {mobile && (
+              <CommandGroup heading="Agent" className={LAUNCHER_GROUP_CLASS}>
+                <CommandItem value="new chat" onSelect={launchChat} showCheckmark={false} className={LAUNCHER_ITEM_CLASS}>
+                  <Plus className="size-4" />
+                  <span className="flex-1">New chat</span>
+                </CommandItem>
+              </CommandGroup>
+            )}
+            {!mobile && chatPresets.length > 0 && (
               <CommandGroup heading="GUI" className={LAUNCHER_GROUP_CLASS}>
                 {chatPresets.map((preset) => (
                   <CommandItem
@@ -424,7 +433,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                 ))}
               </CommandGroup>
             )}
-            {cliPresets.length > 0 && (
+            {!mobile && cliPresets.length > 0 && (
               <CommandGroup
                 heading="CLI agents"
                 className={LAUNCHER_GROUP_CLASS}

@@ -34,6 +34,7 @@ import { StatusIndicator } from "@/components/ui/status-indicator";
 
 interface Props {
   workspace: WorkspaceSnapshot;
+  hideActions?: boolean;
 }
 
 const tabIcon: Record<TabKind, React.ReactNode> = {
@@ -48,7 +49,7 @@ function collectPaneIds(node: PaneNodeSnapshot): string[] {
   return [node.pane_id];
 }
 
-function TabBarImpl({ workspace }: Props) {
+function TabBarImpl({ workspace, hideActions = false }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const rightPanelTab = useUIStore(
@@ -344,7 +345,7 @@ function TabBarImpl({ workspace }: Props) {
               </ContextMenu>
             ))}
           </TabsList>
-          <DropdownMenu>
+          {!hideActions && <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 variant="ghost"
@@ -371,11 +372,11 @@ function TabBarImpl({ workspace }: Props) {
                 Browser
               </DropdownMenuItem>
             </DropdownMenuContent>
-          </DropdownMenu>
+          </DropdownMenu>}
         </div>
       </Tabs>
 
-      <Button
+      {!hideActions && <Button
         variant="ghost"
         size="icon-sm"
         className={`ml-1 shrink-0 ${rightPanelTab ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground"}`}
@@ -384,7 +385,7 @@ function TabBarImpl({ workspace }: Props) {
         aria-pressed={rightPanelTab != null}
       >
         <PanelRight className="size-3.5" />
-      </Button>
+      </Button>}
     </div>
   );
 }

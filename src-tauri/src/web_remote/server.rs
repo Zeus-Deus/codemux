@@ -115,6 +115,10 @@ impl ConnectionRegistry {
         self.conns.lock().unwrap().remove(&id);
     }
 
+    pub(super) fn session_for_connection(&self, id: u64) -> Option<String> {
+        self.conns.lock().unwrap().get(&id).map(|c| c.session_id.clone())
+    }
+
     /// Number of live sockets.
     pub fn active_count(&self) -> usize {
         self.conns.lock().unwrap().len()

@@ -1,3 +1,4 @@
+import { remoteViewHost } from "./client-view";
 import { setRemoteViewHost } from "./client-view";
 /**
  * Web-remote Tauri runtime shim.
@@ -300,6 +301,20 @@ export function installShim(options: InstallShimOptions): ShimHandle {
   }
 
   async function invoke(cmd: string, args: Args = {}): Promise<unknown> {
+    // View preferences belong to this browser, scoped to its host. The remote
+    // allowlist intentionally cannot write arbitrary desktop settings.
+    if ((cmd === "db_set_ui_state" || cmd === "db_get_ui_state") && typeof args.key === "string") {
+      const key = `codemux.remote.ui:${remoteViewHost()}:${args.key}`;
+      try {
+        if (cmd === "db_set_ui_state") { localStorage.setItem(key, String(args.value)); return undefined; }
+        const value = localStorage.getItem(key);
+        if (value !== null) return value;
+      } catch {
+        // Storage may be unavailable in private mode. Never forward a local
+        // preference write to the host as a fallback.
+        if (cmd === "db_set_ui_state") return undefined;
+      }
+    }
     const local = routePlugin(cmd, args);
     if (local !== MISS) return local;
     // First `get_app_state`: answer from the HTTP-prefetched snapshot when it

@@ -1,3 +1,5 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { useMobileHistory } from "@/components/mobile/mobile-history";
 import {
   ArrowDown,
   ChevronDown,
@@ -228,6 +230,7 @@ export const MessageList = memo(function MessageList({
   cwd,
   onReadingBackChange,
 }: Props) {
+  const mobile = useMobileLayout();
   const fileLinkContext = useMemo(
     () => ({ workspaceId, cwd }),
     [cwd, workspaceId],
@@ -579,6 +582,8 @@ export const MessageList = memo(function MessageList({
     },
     [glideInFlight, hideJumpToLatest, ownsScroll, scheduleJumpToLatest],
   );
+
+  useMobileHistory({ enabled: mobile, workspaceId, threadKey, slots, listRef, onNavigate: cancelFollowForUserNavigation });
 
   // The edge signal is `isNearEnd` (LegendList's `onEndReachedThreshold`,
   // default 0.5 — within half a viewport of the end), not the hairline
@@ -1306,7 +1311,7 @@ export const MessageList = memo(function MessageList({
         className="group/transcript-list relative size-full min-h-0 overflow-hidden"
         data-provider={provider ?? undefined}
       >
-      <MessageTrail slots={slots} listRef={listRef} />
+      {!mobile && <MessageTrail slots={slots} listRef={listRef} />}
       <LegendList<TranscriptSlot>
         ref={listRef}
         data={slots}
@@ -1550,18 +1555,17 @@ function AutoResumedTurnDivider({ text }: { text: string }) {
         aria-expanded={open}
         title={text}
         onClick={() => setOpen((cur) => !cur)}
-        className="group flex w-full items-center gap-3 rounded-[4px] text-muted-foreground/70 outline-none transition-colors hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+        className="group flex w-full items-center gap-3 rounded-sm text-muted-foreground/70 outline-none transition-colors duration-150 hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
       >
         <span className="h-px flex-1 bg-border/60" />
         <span className="inline-flex items-center gap-1.5 font-mono text-label font-medium tracking-wide">
-          <RotateCw className="size-3 shrink-0" strokeWidth={2} aria-hidden />
+          <RotateCw className="size-3 shrink-0" aria-hidden />
           Resumed automatically after usage limit reset
           <ChevronDown
             className={cn(
-              "size-3 shrink-0 opacity-60 transition-transform",
+              "size-3 shrink-0 opacity-60 transition-transform duration-150",
               open && "rotate-180",
             )}
-            strokeWidth={2}
             aria-hidden
           />
         </span>
@@ -1870,7 +1874,6 @@ function renderAssistantBody(
         >
           <Hourglass
             className="size-3.5 shrink-0 text-status-working"
-            strokeWidth={1.8}
             aria-hidden
           />
           <span className="min-w-0 select-text truncate tabular-nums">

@@ -151,6 +151,7 @@ fn handle_lifecycle_event<R: Runtime>(app: &AppHandle<R>, session_id: &str, stat
     } else {
         false
     };
+    crate::web_remote::push::agent_status(app, session_id, status.clone());
     let resolved_status = if status == PaneStatus::Review && is_active {
         PaneStatus::Idle
     } else {

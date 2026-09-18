@@ -24,3 +24,5 @@ let clientId: string | undefined;
 export function remoteClientId(): string {
   return clientId ??= randomUUID();
 }
+
+export function remoteViewHost(): string { return hostKey; }

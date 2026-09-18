@@ -141,7 +141,7 @@ export function NewProjectScreen() {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-background">
+    <div data-mobile-new-project className="fixed inset-0 z-50 flex flex-col bg-background">
       <WindowChrome />
       {/* Back button — pulled below the WindowChrome strip so the window
           controls keep their click target. */}

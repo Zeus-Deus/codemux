@@ -161,6 +161,8 @@ rpassword = "7"
 # Pinned to the 4.x line so it unifies with the copy tauri-plugin-updater
 # already pulls in on Windows/macOS instead of adding a second zip build.
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+web-push = { version = "0.11", default-features = false }
+openssl = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
@@ -186,6 +188,9 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+# Web Push's ECE encryption uses OpenSSL. Bundle it on Windows instead of
+# requiring users/builders to provide a system OpenSSL installation.
+openssl = { version = "0.10", features = ["vendored"] }
 tauri-plugin-dialog = { version = "2" }
 # Used only by os_input.rs Tier-3 input injection — EnumWindows,
 # QueryFullProcessImageNameW, SetCursorPos, SendInput. Already in the

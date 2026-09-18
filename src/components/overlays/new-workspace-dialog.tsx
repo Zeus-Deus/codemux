@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import {
@@ -165,6 +166,7 @@ interface Props {
 }
 
 export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
+  const mobile = useMobileLayout();
   const appState = useAppStore((s) => s.appState);
   const activeWorkspaceId = useAppStore(selectActiveWorkspaceId);
   const activeWs = appState?.workspaces.find(
@@ -1105,8 +1107,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
+        data-mobile-workspace-dialog
         showCloseButton={false}
-        className="sm:max-w-2xl max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-visible"
+        className={cn("sm:max-w-2xl bg-popover p-0 gap-0 overflow-visible", !mobile && "max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0")}
         onKeyDown={handleKeyDown}
       >
         <DialogHeader className="sr-only">
@@ -1116,6 +1119,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           </DialogDescription>
         </DialogHeader>
 
+        <div className="mobile-workspace-dialog-heading"><strong>New workspace</strong><button type="button" onClick={() => onOpenChange(false)}>Cancel</button></div>
         {/* Top row: workspace name + branch name — nearly invisible inline labels */}
         <div className="flex gap-3 px-4 pt-3 pb-0.5">
           <Input
@@ -1225,7 +1229,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             )}
 
             {/* Footer inside textarea border */}
-            <div className="flex items-center justify-between px-3 pb-3 pt-0">
+            <div className="flex items-center justify-between px-3 pb-3 pt-0" data-mobile-workspace-controls>
               <div className="flex items-center gap-2 min-w-0">
                 {/* Agent picker — pill with real icon. The DEVICE
                     picker used to live here too, but it belongs

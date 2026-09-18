@@ -1,3 +1,5 @@
+import { useNotificationLink } from "@/hooks/use-notification-link";
+import { useMobileLayout, useMobileViewport } from "@/hooks/use-mobile-layout";
 import { lazy, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -24,6 +26,8 @@ import { useWorktreeIncludeToast } from "@/hooks/use-worktree-include-toast";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
 import { markStartup } from "@/lib/perf/interaction-trace";
 import { scheduleSequentialIdlePrefetch } from "@/lib/idle-prefetch";
+
+const MobileShell = lazy(() => import("@/components/mobile/mobile-shell").then(m => ({ default: m.MobileShell })));
 
 const loadSettingsView = () => import("@/components/settings/settings-view");
 const loadCommandPalette = () => import("@/components/overlays/command-palette");
@@ -63,6 +67,9 @@ const BrowserPeekOverlay = lazy(() =>
 );
 
 export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
+  const mobile = useMobileLayout();
+  useMobileViewport();
+  useNotificationLink();
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const syncedLoading = useSyncedSettingsStore((s) => s.isLoading);
@@ -266,6 +273,12 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
       </LazyBoundary>
     );
   }
+
+  if (mobile) return <LazyBoundary label="mobile workspace" className="h-screen"><MobileShell overlays={<>
+    {commandPaletteOpen && <LazyBoundary label="commands" presentation="overlay"><CommandPalette open onOpenChange={setCommandPaletteOpen}/></LazyBoundary>}
+    {fileSearchOpen && <LazyBoundary label="file search" presentation="overlay"><FileSearchDialog/></LazyBoundary>}
+    {contentSearchOpen && <LazyBoundary label="search" presentation="overlay"><ContentSearchDialog/></LazyBoundary>}
+  </>} /></LazyBoundary>;
 
   // Full-screen empty state — no sidebar, no title bar. Bypassed when
   // a lazy-creation draft is active, so the draft surface can render

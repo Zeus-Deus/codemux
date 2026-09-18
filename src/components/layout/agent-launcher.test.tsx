@@ -180,6 +180,18 @@ afterEach(() => {
 });
 
 describe("AgentLauncher", () => {
+  it("offers chat and utility panes on mobile without CLI presets or titlebar controls", async () => {
+    render(<AgentLauncher workspace={makeWorkspace()} mobile />);
+    openLauncher();
+    expect(visibleItemValues()).toEqual(["new chat", "pane terminal", "pane browser"]);
+    expect(screen.queryByText("CLI agents")).not.toBeInTheDocument();
+    expect(screen.queryByText("Manage presets…")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Pin to title bar")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("New chat"));
+    expect(mocks.agentChatCreatePane).toHaveBeenCalledWith("ws-1", "claude", null, "new_tab");
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+  });
+
   it("lists GUI + CLI sections from the preset snapshot", () => {
     render(<AgentLauncher workspace={makeWorkspace()} />);
     openLauncher();

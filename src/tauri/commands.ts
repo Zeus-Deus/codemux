@@ -1,3 +1,4 @@
+import { containsPane, projectRemotePanes, rememberRemotePane } from "@/remote/pane-selection";
 import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { invoke, Channel } from "@tauri-apps/api/core";
 
@@ -447,8 +448,17 @@ export const cycleWorkspace = (step: number) =>
 export const splitPane = (paneId: string, direction: "horizontal" | "vertical") =>
   invoke<string>("split_pane", { paneId, direction });
 
-export const activatePane = (paneId: string) =>
-  invoke("activate_pane", { paneId });
+export const activatePane = async (paneId: string) => {
+  if (!isRemoteClient()) return invoke("activate_pane", { paneId });
+  const { useAppStore } = await import("@/stores/app-store");
+  const snapshot = useAppStore.getState().appState;
+  for (const workspace of snapshot?.workspaces ?? []) {
+    const surface = workspace.surfaces.find(s => containsPane(s.root, paneId));
+    const tab = workspace.tabs.find(t => t.surface_id === surface?.surface_id);
+    if (tab) { rememberRemotePane(workspace.workspace_id, tab.tab_id, paneId); break; }
+  }
+  useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
+};
 
 export const cyclePane = (step: number) =>
   invoke<string>("cycle_pane", { step });
@@ -490,14 +500,33 @@ export const undockBrowserFromRightPanel = (
   dismissed: boolean,
 ) => invoke("undock_browser_from_right_panel", { workspaceId, dismissed });
 
-export const createTab = (workspaceId: string, kind: TabKind) =>
-  invoke<string>("create_tab", { workspaceId, kind });
+export const createTab = async (workspaceId: string, kind: TabKind) => {
+  const id = await invoke<string>("create_tab", { workspaceId, kind });
+  if (isRemoteClient()) { await refreshRemoteWorkspaceView(workspaceId, id); }
+  return id;
+};
+
+async function refreshRemoteWorkspaceView(workspaceId: string, tabId?: string, paneId?: string) {
+  const snapshot = await getAppState();
+  const workspace = snapshot.workspaces.find(w => w.workspace_id === workspaceId);
+  if (!workspace) return;
+  const tab = paneId ? workspace.tabs.find(t => workspace.surfaces.some(s => s.surface_id === t.surface_id && containsPane(s.root, paneId))) : undefined;
+  rememberRemotePane(workspaceId, tabId ?? tab?.tab_id ?? workspace.active_tab_id, paneId);
+  const { useAppStore } = await import("@/stores/app-store");
+  useAppStore.getState().setAppState(snapshot);
+  // An event may already have applied this revision; still publish the view selection.
+  useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
+}
 
 export const closeTab = (workspaceId: string, tabId: string) =>
   invoke("close_tab", { workspaceId, tabId });
 
-export const activateTab = (workspaceId: string, tabId: string) =>
-  invoke("activate_tab", { workspaceId, tabId });
+export const activateTab = async (workspaceId: string, tabId: string) => {
+  if (!isRemoteClient()) return invoke("activate_tab", { workspaceId, tabId });
+  const { useAppStore } = await import("@/stores/app-store");
+  rememberRemotePane(workspaceId, tabId);
+  useAppStore.setState(s => s.appState ? { appState: projectRemotePanes(s.appState) } : {});
+};
 
 export const renameTab = (workspaceId: string, tabId: string, title: string) =>
   invoke("rename_tab", { workspaceId, tabId, title });
@@ -605,8 +634,11 @@ export const archiveWorkspace = (workspaceId: string) => {
 /** Restore an archived workspace. Resolves with the restored workspace id;
  *  the backend also activates it. Rejects (entry kept) when nothing is
  *  left on disk to restore. */
-export const unarchiveWorkspace = (archiveId: string) =>
-  invoke<string>("unarchive_workspace", { archiveId });
+export const unarchiveWorkspace = async (archiveId: string) => {
+  const id = await invoke<string>("unarchive_workspace", { archiveId });
+  if (isRemoteClient()) await activateWorkspace(id);
+  return id;
+};
 
 /** Permanently drop an archive entry, optionally deleting the worktree
  *  (and branch) from disk. Protected/root entries refuse
@@ -1258,20 +1290,22 @@ export const deletePreset = (id: string) =>
 export const setPresetPinned = (id: string, pinned: boolean) =>
   invoke("set_preset_pinned", { id, pinned });
 
-export const applyPreset = (
+export const applyPreset = async (
   workspaceId: string,
   presetId: string,
   overrideMode?: LaunchMode | "current_terminal" | "existing_panes",
   initialPrompt?: string | null,
   modelSelection?: ModelSelection | null,
-) =>
-  invoke("apply_preset", {
+) => {
+  await invoke("apply_preset", {
     workspaceId,
     presetId,
     overrideMode,
     initialPrompt,
     modelSelection: modelSelection ?? null,
   });
+  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId);
+};
 
 export const setPresetBarVisible = (visible: boolean) =>
   invoke("set_preset_bar_visible", { visible });
@@ -1604,20 +1638,23 @@ export const getHomeDir = () => invoke<string>("get_home_dir");
  *  bound in the first snapshot every client sees. The call is idempotent —
  *  a pane in this workspace already bound to `threadId` is returned as-is
  *  rather than duplicated. */
-export const agentChatCreatePane = (
+export const agentChatCreatePane = async (
   workspaceId: string,
   provider: AgentChatProviderKind | null = null,
   cwd: string | null = null,
   launchMode: LaunchMode | null = null,
   threadId: string | null = null,
-) =>
-  invoke<string>("agent_chat_create_pane", {
+) => {
+  const id = await invoke<string>("agent_chat_create_pane", {
     workspaceId,
     provider,
     cwd,
     launchMode,
     threadId,
   });
+  if (isRemoteClient()) await refreshRemoteWorkspaceView(workspaceId, undefined, id);
+  return id;
+};
 
 /** Start a provider session on a pane.
  *

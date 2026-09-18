@@ -35,6 +35,7 @@ pub mod endpoints;
 pub mod events;
 pub mod iroh;
 mod policy;
+pub(crate) mod push;
 pub mod proxy;
 pub mod registration;
 pub mod serve;

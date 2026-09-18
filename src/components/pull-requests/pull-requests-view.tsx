@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -38,6 +39,8 @@ const MAX_LIST_WIDTH = 720;
  * same surface, not a second implementation of it.
  */
 export function PullRequestsView() {
+  const mobile = useMobileLayout();
+  const [mobileDetail, setMobileDetail] = useState(false);
   const setShowPullRequests = useUIStore((s) => s.setShowPullRequests);
   const pendingSelection = useUIStore((s) => s.pendingPrSelection);
   const clearPendingPrSelection = useUIStore((s) => s.clearPendingPrSelection);
@@ -117,6 +120,7 @@ export function PullRequestsView() {
   const openRow = useCallback((row: PrRow) => {
     const key = rowKey(row);
     setSelectedKey(key);
+    setMobileDetail(true);
     setTabKeys((keys) => (keys.includes(key) ? keys : [...keys, key]));
   }, []);
 
@@ -194,8 +198,8 @@ export function PullRequestsView() {
         (login) => login.toLowerCase() === viewer.toLowerCase(),
       );
     });
-    if (first) openRow(first);
-  }, [rows, viewerByRoot, selectedKey, pendingSelection, openRow]);
+    if (first && !mobile) openRow(first);
+  }, [rows, viewerByRoot, selectedKey, pendingSelection, openRow, mobile]);
 
   // ── Rows that have left the list but are still open in a tab ──
   //
@@ -271,9 +275,9 @@ export function PullRequestsView() {
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="Close pull requests"
+          aria-label={mobile && mobileDetail ? "Back to pull requests" : "Close pull requests"}
           className="text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          onClick={() => setShowPullRequests(false)}
+          onClick={() => mobile && mobileDetail ? setMobileDetail(false) : setShowPullRequests(false)}
         >
           <ArrowLeft className="size-4" />
         </Button>
@@ -285,7 +289,7 @@ export function PullRequestsView() {
       <div className="flex min-h-0 flex-1">
         <div
           className="flex min-h-0 shrink-0 flex-col border-r border-border/40"
-          style={{ width: listWidth }}
+          style={{ width: mobile ? "100%" : listWidth, display: mobile && mobileDetail ? "none" : undefined }}
         >
           <PrList
             rows={rows}
@@ -310,6 +314,7 @@ export function PullRequestsView() {
         </div>
 
         <div
+          hidden={mobile}
           role="separator"
           aria-orientation="vertical"
           aria-label="Resize the list"
@@ -319,6 +324,7 @@ export function PullRequestsView() {
         />
 
         <div
+          style={{ display: mobile && !mobileDetail ? "none" : undefined }}
           ref={detailRef}
           tabIndex={-1}
           className="flex min-h-0 min-w-0 flex-1 flex-col outline-none"
