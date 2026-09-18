@@ -12,6 +12,11 @@
 import type { Attachment } from "@/stores/agent-chat-store";
 import type { Skill } from "@/tauri/commands";
 
+import {
+  parseLeadingCommand,
+  type CommandRegistryEntry,
+  type DraftCommandKind,
+} from "./command-tokens";
 import { parseSkillTokens } from "./skill-tokens";
 
 export interface AttachmentTokenMatch {
@@ -276,6 +281,17 @@ export type DraftHighlightSegment =
   | { kind: "plain"; text: string }
   | { kind: "skill"; text: string; name: string }
   | {
+      // A leading `/name` the runtime will actually execute. Painted
+      // like an attachment token rather than plain prose so "this line
+      // runs something" is legible before the user hits Enter.
+      // `commandKind` keeps the skill/provider distinction available to
+      // the renderer without a second lookup.
+      kind: "command";
+      text: string;
+      name: string;
+      commandKind: DraftCommandKind;
+    }
+  | {
       kind: "attachment";
       text: string;
       basename: string;
@@ -323,12 +339,32 @@ export function segmentDraftHighlight(
   text: string,
   skills: Skill[],
   attachments: Attachment[],
+  commands: ReadonlyMap<string, CommandRegistryEntry> = new Map(),
 ): DraftHighlightSegment[] {
   if (!text) return [];
 
   const annotations: RangeAnnotation[] = [];
 
+  // The leading token is the one the runtime executes, so it outranks
+  // the generic skill pass over the same characters. Claiming its range
+  // first also keeps every annotation non-overlapping, which the merge
+  // loop below depends on.
+  const leading = parseLeadingCommand(text, commands);
+  if (leading) {
+    annotations.push({
+      start: leading.start,
+      end: leading.end,
+      build: (slice) => ({
+        kind: "command",
+        text: slice,
+        name: leading.name,
+        commandKind: leading.kind,
+      }),
+    });
+  }
+
   for (const m of parseSkillTokens(text, skills)) {
+    if (leading && m.start === leading.start) continue;
     annotations.push({
       start: m.start,
       end: m.end,

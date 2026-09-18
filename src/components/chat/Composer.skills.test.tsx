@@ -322,7 +322,7 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     expect(listSkillsMock).not.toHaveBeenCalled();
   });
 
-  it("highlight mirror wraps matched /skill tokens in an amber span", async () => {
+  it("highlight mirror wraps matched /skill tokens in an accented span", async () => {
     // Seed the skills store directly so the parser has registry data
     // synchronously — bypasses the lazy-load flow which only fires when
     // the slash popup opens.
@@ -344,10 +344,12 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     const mirror = getByTestId("composer-highlight-mirror");
     expect(mirror).toHaveTextContent("hi test /omarchy");
 
-    // The matched skill must be wrapped in a status-working-colored span so
-    // the user sees it as a syntax-highlighted token. Plain prose around it
+    // The matched skill must be wrapped in a brand-accented span so the
+    // user sees it as an invocation, not prose. Plain text around it
     // stays in the default foreground color.
-    const highlightSpans = mirror.querySelectorAll("span.text-status-working");
+    const highlightSpans = mirror.querySelectorAll(
+      "[data-testid='composer-skill-token-omarchy']",
+    );
     expect(highlightSpans).toHaveLength(1);
     expect(highlightSpans[0].textContent).toBe("/omarchy");
   });
@@ -369,7 +371,12 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     });
 
     const mirror = getByTestId("composer-highlight-mirror");
-    expect(mirror.querySelectorAll("span.text-amber-500")).toHaveLength(0);
+    expect(
+      mirror.querySelectorAll("[data-testid^='composer-skill-token-']"),
+    ).toHaveLength(0);
+    expect(
+      mirror.querySelectorAll("[data-testid^='composer-command-token-']"),
+    ).toHaveLength(0);
     expect(mirror).toHaveTextContent("hi test /notreal");
   });
 

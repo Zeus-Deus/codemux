@@ -16,10 +16,11 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * keyed per `(provider, cwd)` because project-scoped custom commands
  * are cwd-sensitive and each provider reports its own vocabulary.
  *
- * Static provider catalogues stay cached for the app's lifetime. Grok's ACP
- * runtime can replace its backend snapshot, so the composer force-refreshes
- * this inexpensive IPC read whenever its popup reopens. A stale cache clears
- * on `invalidate()` (used by tests) or an app restart.
+ * Static provider catalogues stay cached for the app's lifetime. An ACP
+ * runtime can replace its backend snapshot at any point in a session, so the
+ * composer force-refreshes this inexpensive IPC read whenever its popup
+ * reopens. A stale cache clears on `invalidate()` (used by tests) or an app
+ * restart.
  */
 interface ProviderCommandsEntry {
   commands: ProviderSlashCommand[];
@@ -47,6 +48,21 @@ const EMPTY_ENTRY: ProviderCommandsEntry = {
   loading: false,
   error: null,
 };
+
+/**
+ * Whether this provider's catalogue is pushed by a live agent session.
+ *
+ * For these providers an empty answer only means "no session has published
+ * yet", not "there are no commands", so it must not be memoised as final —
+ * otherwise the first read, taken before the session starts, hides the real
+ * catalogue for the rest of the app's lifetime. Re-reading is cheap: the
+ * backend answers from its in-memory snapshot without spawning anything.
+ */
+export function catalogueFollowsSession(
+  provider: AgentChatProviderKind,
+): boolean {
+  return provider === "grok" || provider === "cursor";
+}
 
 export const commandsKey = (
   provider: AgentChatProviderKind,
