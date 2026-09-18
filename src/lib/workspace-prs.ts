@@ -111,7 +111,8 @@ export function prSetSummary(prs: readonly WorkspacePrRef[]): PrSetSummary {
  *  in the set:
  *
  *  - `worktree` PRs are this checkout's own work by construction — their
- *    branches are reachable from its HEAD — whichever branch is checked out.
+ *    branches were reachable from its HEAD at discovery. The recorded
+ *    checkout must still match, since a branch switch invalidates that proof.
  *    That is the stack case: the agent cut nine branches and left HEAD on none.
  *  - `branch` PRs still go through `isPrOnCurrentBranch`. The PR poll runs on
  *    its own minute-long cadence, so right after a branch switch the stored
@@ -130,7 +131,10 @@ export function prsDescribeThisCheckout(
   return prs.every((pr) => {
     switch (pr.source) {
       case "worktree":
-        return true;
+        return (
+          pr.checkout_branch != null &&
+          isPrOnCurrentBranch(pr.checkout_branch, gitBranch)
+        );
       case "side_branch":
         return false;
       default:

@@ -232,6 +232,7 @@ pub trait SourceControlProvider: Send + Sync {
             .map(|pr| SourcedPr {
                 pr,
                 source: PrSource::Branch,
+                checkout_branch: None,
             })
             .collect())
     }

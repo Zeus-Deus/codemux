@@ -857,6 +857,8 @@ export interface WorkspacePrRef {
    *  - `side_branch` — the recently-checked-out fallback, a badge only.
    *  Absent on state persisted before the field existed. */
   source?: WorkspacePrSource | null;
+  /** Checkout whose HEAD established worktree ownership. */
+  checkout_branch?: string | null;
 }
 
 export type WorkspacePrSource = "branch" | "worktree" | "side_branch";

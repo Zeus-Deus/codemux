@@ -1725,6 +1725,8 @@ pub enum PrSource {
 pub struct SourcedPr {
     pub pr: PullRequestInfo,
     pub source: PrSource,
+    /// Checkout whose HEAD established worktree ownership.
+    pub checkout_branch: Option<String>,
 }
 
 /// The branches this worktree owns, oldest commit first.
@@ -1873,13 +1875,20 @@ impl RemoteConfig {
 /// lookup could not answer and the stored set must be preserved, while an
 /// empty vector is the authoritative "this workspace has no PRs".
 pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
-    let lookup = resolve_branch_pr(repo_path)?;
+    get_workspace_prs_with(repo_path, resolve_branch_pr(repo_path)?, worktree_pr_list)
+}
 
+fn get_workspace_prs_with(
+    repo_path: &Path,
+    lookup: BranchPrLookup,
+    list: impl FnOnce(&Path) -> Result<Arc<Vec<serde_json::Value>>, String>,
+) -> Result<Vec<SourcedPr>, String> {
     let mut prs: Vec<SourcedPr> = Vec::new();
     if let Some(pr) = lookup.pr.clone() {
         prs.push(SourcedPr {
             pr,
             source: PrSource::Branch,
+            checkout_branch: Some(lookup.branch.clone()),
         });
     }
 
@@ -1894,35 +1903,35 @@ pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
     };
 
     if !owned.is_empty() {
-        // A failure here must not erase the current branch's own answer, so
-        // the extra branches are best-effort: no rows means no extras.
-        if let Ok(rows) = worktree_pr_list(repo_path) {
-            let all: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
-            let with_rows: Vec<(&String, Vec<PullRequestInfo>)> = owned
-                .iter()
-                .map(|branch| {
-                    let matching = all
-                        .iter()
-                        .filter(|pr| pr.head_branch.as_deref() == Some(branch.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    (branch, matching)
-                })
-                .filter(|(_, matching)| !matching.is_empty())
-                .collect();
-            // Read only once something needs disambiguating — the usual owned
-            // branch has no PR and should cost no config read at all.
-            if !with_rows.is_empty() {
-                let config = RemoteConfig::read(repo_path);
-                for (branch, matching) in with_rows {
-                    let owner = config.head_owner(branch);
-                    if let Some(pr) = select_branch_pr(matching, branch, owner.as_deref(), false) {
-                        if !prs.iter().any(|existing| existing.pr.number == pr.number) {
-                            prs.push(SourcedPr {
-                                pr,
-                                source: PrSource::Worktree,
-                            });
-                        }
+        // A partial set could hide an open stack layer and wrongly settle
+        // the workspace. Preserve the complete stored set on lookup errors.
+        let rows = list(repo_path)?;
+        let all: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
+        let with_rows: Vec<(&String, Vec<PullRequestInfo>)> = owned
+            .iter()
+            .map(|branch| {
+                let matching = all
+                    .iter()
+                    .filter(|pr| pr.head_branch.as_deref() == Some(branch.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (branch, matching)
+            })
+            .filter(|(_, matching)| !matching.is_empty())
+            .collect();
+        // Read only once something needs disambiguating — the usual owned
+        // branch has no PR and should cost no config read at all.
+        if !with_rows.is_empty() {
+            let config = RemoteConfig::read(repo_path);
+            for (branch, matching) in with_rows {
+                let owner = config.head_owner(branch);
+                if let Some(pr) = select_branch_pr(matching, branch, owner.as_deref(), false) {
+                    if !prs.iter().any(|existing| existing.pr.number == pr.number) {
+                        prs.push(SourcedPr {
+                            pr,
+                            source: PrSource::Worktree,
+                            checkout_branch: Some(lookup.branch.clone()),
+                        });
                     }
                 }
             }
@@ -1936,6 +1945,7 @@ pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
             prs.push(SourcedPr {
                 pr,
                 source: PrSource::SideBranch,
+                checkout_branch: Some(lookup.branch.clone()),
             });
         }
     }
@@ -5373,6 +5383,7 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         SourcedPr {
             pr: branch_pr(number, state, branch, "2026-01-01T00:00:00Z", None),
             source,
+            checkout_branch: Some(branch.to_string()),
         }
     }
 
@@ -5518,6 +5529,58 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
             );
             identity(&repo);
             repo
+        }
+
+        #[test]
+        fn workspace_prs_preserve_the_set_when_expanded_lookup_fails() {
+            use super::super::{
+                get_workspace_prs_with, workspace_prs_outcome, BranchPrLookup, WorkspacePrsOutcome,
+            };
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            git(&repo, &["checkout", "-qb", "workspace"], 3);
+            commit(&repo, "stack-layer", 4);
+            git(&repo, &["branch", "stack/01"], 5);
+            let lookup = BranchPrLookup {
+                branch: "workspace".into(),
+                default_branch: Some("main".into()),
+                pr: Some(super::branch_pr(
+                    10, "MERGED", "workspace", "2026-01-01T00:00:00Z", None,
+                )),
+            };
+            let result = get_workspace_prs_with(&repo, lookup, |_| {
+                Err("temporary list failure".into())
+            });
+            // The merged current-branch PR must not replace a stored set
+            // that may still contain open stack layers.
+            assert!(matches!(
+                workspace_prs_outcome(result),
+                WorkspacePrsOutcome::Preserve
+            ));
+        }
+
+        #[test]
+        fn workspace_prs_record_the_checkout_that_owns_the_stack() {
+            use super::super::{get_workspace_prs_with, BranchPrLookup, PrSource};
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            git(&repo, &["checkout", "-qb", "workspace"], 3);
+            commit(&repo, "stack-layer", 4);
+            git(&repo, &["branch", "stack/01"], 5);
+            let lookup = BranchPrLookup {
+                branch: "workspace".into(),
+                default_branch: Some("main".into()),
+                pr: None,
+            };
+            let rows = vec![serde_json::json!({
+                "number": 11, "state": "OPEN", "headRefName": "stack/01",
+                "baseRefName": "main", "url": "https://github.com/u/r/pull/11"
+            })];
+            let prs =
+                get_workspace_prs_with(&repo, lookup, |_| Ok(std::sync::Arc::new(rows))).unwrap();
+            assert_eq!(prs.len(), 1);
+            assert_eq!(prs[0].source, PrSource::Worktree);
+            assert_eq!(prs[0].checkout_branch.as_deref(), Some("workspace"));
         }
 
         #[test]

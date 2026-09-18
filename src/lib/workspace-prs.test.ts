@@ -27,6 +27,7 @@ function pr(
     head_branch: head ?? `branch-${number}`,
     base_branch: base ?? "main",
     ...(source ? { source } : {}),
+    ...(source === "worktree" ? { checkout_branch: "goal-passpage-space-task" } : {}),
   };
 }
 
@@ -165,6 +166,17 @@ describe("prsDescribeThisCheckout", () => {
     // them by reachability from HEAD, so they are this checkout's own work.
     const prs = stackOfNine(Array(9).fill("MERGED"));
     expect(prsDescribeThisCheckout(prs, "goal-passpage-space-task")).toBe(true);
+  });
+
+  it("does not trust stack ownership after switching checkout branches", () => {
+    const prs = stackOfNine(Array(9).fill("MERGED"));
+    expect(prsDescribeThisCheckout(prs, "new-work")).toBe(false);
+    expect(
+      prsDescribeThisCheckout(
+        prs.map(({ checkout_branch, ...pr }) => pr),
+        "new-work",
+      ),
+    ).toBe(false);
   });
 
   it("still guards the current branch's PR against a stale association", () => {

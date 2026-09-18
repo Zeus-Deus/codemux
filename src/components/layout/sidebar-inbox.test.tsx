@@ -194,6 +194,7 @@ function stackPrs(states: string[]): WorkspacePrRef[] {
     head_branch: `ui-pass/0${i + 1}`,
     base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
     source: "worktree" as const,
+    checkout_branch: "goal-passpage-space-task",
   }));
 }
 
@@ -1174,6 +1175,16 @@ describe("SidebarInbox — settle / un-settle", () => {
 
     expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+  });
+
+  it("does not settle a newly checked-out branch using the previous stack", async () => {
+    workspaces = [makeWorkspace({
+      title: "New work", worktree_path: "/wt/a", git_branch: "new-work",
+      last_active_at: Date.now(), prs: stackPrs(Array(9).fill("MERGED")),
+    })];
+    const { container } = await flushRender();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
   });
 
   it("settles a fully merged stack even though HEAD is on none of its branches", async () => {

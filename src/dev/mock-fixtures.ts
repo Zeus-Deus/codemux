@@ -617,6 +617,7 @@ const wsCodemuxStack = makeWorkspace({
     head_branch: `ui-pass/0${i + 1}`,
     base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
     source: "worktree" as const,
+    checkout_branch: "design-system-pass",
   })),
 });
 

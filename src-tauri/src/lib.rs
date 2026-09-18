@@ -245,6 +245,7 @@ pub(crate) fn workspace_pr_rows(
             head_branch: entry.pr.head_branch,
             base_branch: entry.pr.base_branch,
             source: Some(entry.source),
+            checkout_branch: entry.checkout_branch,
         })
         .collect()
 }

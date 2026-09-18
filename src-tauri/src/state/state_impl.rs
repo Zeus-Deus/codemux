@@ -472,6 +472,9 @@ pub struct WorkspacePr {
     /// the field existed, read by the frontend as the old single-PR rules.
     #[serde(default)]
     pub source: Option<crate::github::PrSource>,
+    /// Branch checked out when worktree ownership was resolved.
+    #[serde(default)]
+    pub checkout_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
