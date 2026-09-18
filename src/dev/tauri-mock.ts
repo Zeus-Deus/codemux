@@ -5760,13 +5760,10 @@ const handlers: Record<string, Handler> = {
       ws.surfaces[0].root.provider = chat.provider;
       ws.surfaces[0].root.thread_id = chat.thread_id;
     }
-    // ASYNC emit — the workspace lands in the store only AFTER this
-    // invoke's promise has already resolved (macrotask), mirroring the
-    // real runtime's event ordering that the bug depended on.
-    setTimeout(() => {
-      appState = { ...appState, workspaces: [...appState.workspaces, ws] };
-      emitAppState();
-    }, 0);
+    // The host has created it when invoke resolves; only delivery of the
+    // snapshot is asynchronous. Follow-up rename/activate must find it.
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    setTimeout(() => emitAppState(), 0);
     return ws.workspace_id;
   },
   /**

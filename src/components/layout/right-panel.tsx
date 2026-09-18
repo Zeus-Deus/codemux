@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 /**
  * The right panel — a **pane deck**.
  *
@@ -223,6 +224,7 @@ export const RightPanel = memo(function RightPanel({
   workspace,
   activeTab,
 }: Props) {
+  const mobile = useMobileLayout();
   const workspaceId = workspace.workspace_id;
   const cwd = workspace.worktree_path ?? workspace.cwd;
 
@@ -867,7 +869,16 @@ export const RightPanel = memo(function RightPanel({
   return (
     // No left border: the resize handle in `workspace-main.tsx` is the seam.
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
-      <PaneTabStrip
+      {mobile ? <div className="mobile-panel-header">
+        <div className="flex min-w-0 items-center gap-1">
+          <select aria-label="Open tool or file" className="mobile-pane-picker min-w-0 flex-1" value={activePane ?? "empty"} onChange={e => setRightPanelTab(workspaceId, e.target.value as RightPanelTab)}>
+            <option value="empty">All tools</option>{tabs.map(tab => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
+          </select>
+          <button aria-label="Find a file" onClick={handleOpenFile}>Find file</button>
+          <button aria-label="Back to conversation" onClick={handleCollapsePanel}>Back</button>
+        </div>
+        <div className="mobile-panel-actions">{actions}{activePane && <button onClick={() => handleClose(activePane)}>Close this view</button>}</div>
+      </div> : <PaneTabStrip
         inTitlebar={titlebarOverlay}
         tabs={tabs}
         activeTab={activePane}
@@ -881,7 +892,7 @@ export const RightPanel = memo(function RightPanel({
         onToggleExpand={handleToggleExpand}
         expanded={expanded}
         onCollapsePanel={handleCollapsePanel}
-      />
+      />}
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {activeDocPath ? (

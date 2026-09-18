@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#151716"><title>Codemux · Mobile concept</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="preview-heading"><span>CODEMUX <span class="muted">/ MOBILE</span></span><small>Interactive phone preview</small></div>
+<div class="app" id="app">
+<aside class="sidebar" id="sidebar"></aside>
+<div class="workspace">
+<header class="topbar"><button class="workspace-picker" data-action="workspaces" aria-label="Switch workspace"><span class="project-mark">C</span><span><strong id="workspace-title">Mobile remote control</strong><small>codemux <span class="chev">⌄</span></small></span></button><button class="icon-button connection" data-action="connection" aria-label="Connection details"><span class="live-dot"></span><span class="desktop-label">Desktop</span><i data-icon="wifi"></i></button></header>
+<div class="context"><span class="branch"><i data-icon="branch"></i><span id="branch-name">feat/mobile-remote</span></span><button class="demo-badge" data-action="about">Concept / 02</button></div>
+<main id="main" tabindex="-1"></main>
+<nav class="bottom-nav" aria-label="Workspace views" id="nav"></nav>
+</div>
+</div>
+<p class="preview-caption">Concept 02 · Sample data · Install & notification flow preview</p>
+<dialog id="sheet" aria-labelledby="sheet-title"><div class="sheet-grip"></div><header class="sheet-header"><h2 id="sheet-title"></h2><button class="icon-button" data-action="close" aria-label="Close dialog"><i data-icon="close"></i></button></header><div id="sheet-body"></div></dialog>
+<div class="toast" id="toast" role="status"></div>
+<script src="app.js"></script>
+<script src="experience.js"></script>
+</body></html>

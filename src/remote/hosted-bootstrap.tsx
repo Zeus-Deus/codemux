@@ -84,6 +84,7 @@ export async function bootstrapHosted(): Promise<void> {
   }
 
   const oauthStore = sessionOAuthStore();
+  const notificationKey = "codemux.hosted.notification-return";
 
   const deps: HostedFlowDeps = {
     async signIn(email, password) {
@@ -104,6 +105,12 @@ export async function bootstrapHosted(): Promise<void> {
     beginGithubSignIn() {
       // Mint + store the state, then hand the browser to the API's OAuth
       // interstitial. This unloads the page; the return leg is handled below.
+      const target = new URLSearchParams();
+      const params = new URLSearchParams(location.search);
+      for (const key of ["device", "workspace", "pane"]) {
+        const value = params.get(key); if (value && value.length <= 256) target.set(key, value);
+      }
+      oauthStore.set(notificationKey, target.toString());
       const { url } = prepareGithubOAuth({
         apiBase: base,
         returnTo: window.location.origin,
@@ -120,6 +127,7 @@ export async function bootstrapHosted(): Promise<void> {
   };
 
   const flow = new HostedFlow(deps);
+  let selectedNotificationDevice = false;
 
   // Handle a GitHub OAuth return before the first paint: verify the echoed
   // state, then trade the single-use code for a bearer. The code is stripped
@@ -129,10 +137,27 @@ export async function bootstrapHosted(): Promise<void> {
     clearOAuthParams(window.location, window.history);
   }
 
+  const savedTarget = oauthStore.get(notificationKey);
+  if (ret.kind !== "none") oauthStore.remove(notificationKey);
+  if (ret.kind === "code" && savedTarget) {
+    const target = new URLSearchParams(savedTarget);
+    const url = new URL(location.href);
+    for (const key of ["device", "workspace", "pane"]) {
+      const value = target.get(key); if (value && value.length <= 256) url.searchParams.set(key, value);
+    }
+    history.replaceState(history.state, "", url);
+  }
+  const notificationDevice = new URLSearchParams(location.search).get("device");
+
   const done = new Promise<void>((resolve) => {
     flow.subscribe((state) => {
       overlay.render(<HostedScreen state={state} flow={flow} apiHost={hostOf(base)} />);
       if (state.phase === "connected") resolve();
+      if (state.phase === "devices" && notificationDevice && !selectedNotificationDevice) {
+        selectedNotificationDevice = true;
+        const device = state.devices.find(d => d.id === notificationDevice);
+        if (device) void flow.select(device);
+      }
     });
   });
 

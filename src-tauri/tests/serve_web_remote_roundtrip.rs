@@ -260,6 +260,27 @@ fn serve_web_remote_pair_connect_and_invoke_roundtrip() {
             assert_eq!(response["t"], "ok", "remote bootstrap {cmd}: {response}");
         }
 
+        // Push uses the authenticated socket's session, never a client-supplied owner.
+        let config = remote_invoke(&mut socket, 200, "web_push_config", json!({})).await;
+        assert_eq!(config["t"], "ok", "{config}");
+        let public_key = config["data"]["public_key"].as_str().expect("VAPID public key");
+        assert_eq!(public_key.len(), 87);
+        let invalid = remote_invoke(&mut socket, 201, "web_push_subscribe", json!({
+            "subscription": {"endpoint":"https://127.0.0.1/private", "keys":{"p256dh":public_key,"auth":"AAAAAAAAAAAAAAAAAAAAAA"}},
+            "categories":{"attention":true,"complete":true,"failure":true}, "host":"test-desktop"
+        })).await;
+        assert_eq!(invalid["t"], "err", "private endpoints must be rejected");
+        let subscribed = remote_invoke(&mut socket, 202, "web_push_subscribe", json!({
+            "subscription": {"endpoint":"https://web.push.apple.com/test-not-sent", "keys":{"p256dh":public_key,"auth":"AAAAAAAAAAAAAAAAAAAAAA"}},
+            "categories":{"attention":true,"complete":false,"failure":true}, "host":"test-desktop"
+        })).await;
+        assert_eq!(subscribed["t"], "ok", "{subscribed}");
+        let status = remote_invoke(&mut socket, 203, "web_push_status", json!({})).await;
+        assert_eq!(status["data"]["categories"]["complete"], false);
+        assert!(status["data"].get("private_key").is_none());
+        assert_eq!(remote_invoke(&mut socket, 204, "web_push_unsubscribe", json!({})).await["t"], "ok");
+        assert_eq!(remote_invoke(&mut socket, 205, "web_push_status", json!({})).await["data"], json!({}));
+
         let (mut second, _) = tokio_tungstenite::connect_async(&second_url).await.unwrap();
         assert_eq!(
             remote_invoke(
@@ -364,6 +385,13 @@ fn serve_web_remote_pair_connect_and_invoke_roundtrip() {
                 .active_workspace_id(),
             desktop
         );
+
+        let archived = remote_invoke(&mut socket, 206, "archive_workspace", json!({"workspaceId":workspace_id})).await;
+        assert_eq!(archived["t"], "ok", "{archived}");
+        let restored = remote_invoke(&mut socket, 207, "unarchive_workspace", json!({"archiveId":archived["data"],"select":true})).await;
+        assert_eq!(restored["t"], "ok", "{restored}");
+        let workspace_id = restored["data"].as_str().unwrap();
+        assert_eq!(handle.state::<codemux_lib::state::AppStateStore>().active_workspace_id(), desktop, "restoring from phone must not navigate the desktop");
 
         let closed = remote_invoke(
             &mut socket,

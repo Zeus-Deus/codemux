@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
@@ -32,7 +33,8 @@ export function WindowControls() {
   // minimize/maximize/close would target the wrong (or no) window. Render
   // nothing there and skip the window-plugin IPC entirely. Desktop is
   // unchanged: `remote` is always false inside the real Tauri webview.
-  const remote = isRemoteClient();
+  const mobile = useMobileLayout();
+  const remote = isRemoteClient() || mobile;
   const [isMaximized, setIsMaximized] = useState(false);
   const appWindow = getCurrentWindow();
 
@@ -102,7 +104,8 @@ export function WindowChrome() {
   // reserve the top spacing (`pt-7`) themselves, so layout stays stable and
   // the strip's `data-tauri-drag-region` overlay never becomes a click dead
   // zone in the browser. Desktop behavior is unchanged.
-  if (isRemoteClient()) return null;
+  const mobile = useMobileLayout();
+  if (isRemoteClient() || mobile) return null;
 
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-50 flex h-7 items-center justify-end">

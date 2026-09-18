@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { resizePty } from "@/tauri/commands";
 import {
   flushAllTeardowns,
   setTeardownScheduler,
@@ -22,6 +23,11 @@ const h = vi.hoisted(() => ({
   webgls: [] as { index: number; disposed: number }[],
   serializeCalls: 0,
   serializeAddons: 0,
+  mobile: false,
+}));
+
+vi.mock("@/hooks/use-mobile-layout", () => ({
+  useMobileLayout: () => h.mobile,
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -52,6 +58,10 @@ vi.mock("@xterm/xterm", () => {
       return { dispose: () => {} };
     }
     write() {}
+    resize(cols: number, rows: number) {
+      this.cols = cols;
+      this.rows = rows;
+    }
     focus() {}
     getSelection() {
       return "";
@@ -210,7 +220,7 @@ vi.mock("@/stores/settings-store", () => ({
 }));
 
 vi.mock("@/stores/app-store", () => ({
-  useAppStore: {
+  useAppStore: Object.assign((selector: (state: { appState: null }) => unknown) => selector({ appState: null }), {
     getState: () => ({
       appState: {
         pane_statuses: {},
@@ -234,7 +244,7 @@ vi.mock("@/stores/app-store", () => ({
         ],
       },
     }),
-  },
+  }),
   getSessionWorkspaceId: () => "ws-1",
 }));
 
@@ -303,6 +313,8 @@ describe("TerminalPane deferred teardown", () => {
     h.webgls.length = 0;
     h.serializeCalls = 0;
     h.serializeAddons = 0;
+    h.mobile = false;
+    vi.mocked(resizePty).mockClear();
     cacheTerminalScrollback.mockClear();
     detachPtyOutput.mockClear();
     restoreEnabled = true;
@@ -312,6 +324,25 @@ describe("TerminalPane deferred teardown", () => {
     cleanup();
     flushAllTeardowns();
     setTeardownScheduler(null);
+  });
+
+  it("preserves the shared PTY size on mobile until the user chooses Fit to phone", async () => {
+    h.mobile = true;
+    schedulerHarness();
+    const view = renderPane("sess-a");
+    await act(async () => {});
+
+    expect(h.terminals).toHaveLength(1);
+    expect(resizePty).not.toHaveBeenCalled();
+
+    fireEvent.click(view.getByRole("button", { name: "Fit to phone" }));
+    await act(async () => {});
+    expect(resizePty).toHaveBeenCalledWith("sess-a", 80, 24);
+
+    vi.mocked(resizePty).mockClear();
+    fireEvent.click(view.getByRole("button", { name: "Follow desktop size" }));
+    await act(async () => {});
+    expect(resizePty).not.toHaveBeenCalled();
   });
 
   it("does not serialize, persist or dispose during unmount", async () => {

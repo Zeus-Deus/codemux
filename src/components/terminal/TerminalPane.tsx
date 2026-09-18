@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback, useMemo, memo } from "react";
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -93,6 +94,13 @@ function isAltScreen(t: Terminal): boolean {
 // so the exported pane skips re-render on backend ticks that don't change them.
 // Export-only wrapper: the component body below is unchanged.
 export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
+  const mobile = useMobileLayout();
+  const mobileRef = useRef(mobile);
+  mobileRef.current = mobile;
+  const [phoneControl, setPhoneControl] = useState(false);
+  const phoneControlRef = useRef(phoneControl);
+  phoneControlRef.current = phoneControl;
+  const mirrorSize = useAppStore(s => s.appState?.terminal_sessions.find(t => t.session_id === sessionId));
   const syntaxTheme = useSyntaxThemeColors();
   const typographyAppearance = useSyncedSettingsStore((s) => s.settings.appearance);
   const legacyTerminalFamily = useSettingsStore(selectLegacyTerminalFontFamily);
@@ -177,6 +185,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     const fitAddon = fitAddonRef.current;
     if (!term || !fitAddon || !visibleRef.current) return;
 
+    if (mobileRef.current && !phoneControlRef.current) {
+      const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sessionIdRef.current);
+      if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
+      return;
+    }
     fitAddon.fit();
     if (term.cols === 0 || term.rows === 0) return;
 
@@ -885,8 +898,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       // Stage 3: fit + resize. resizePty is fire-and-forget so doesn't
       // block the mount finishing.
-      fitAddon.fit();
-      if (term.cols > 0 && term.rows > 0) {
+      if (mobileRef.current && !phoneControlRef.current) {
+        const session = useAppStore.getState().appState?.terminal_sessions.find(s => s.session_id === sid);
+        if (session) term.resize(Math.max(2, session.cols), Math.max(1, session.rows));
+      } else fitAddon.fit();
+      if ((!mobileRef.current || phoneControlRef.current) && term.cols > 0 && term.rows > 0) {
         resizePty(sid, term.cols, term.rows).catch(console.error);
       }
 
@@ -1093,13 +1109,17 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // main mount effect is declared earlier, so it has already pointed
   // `termRef.current` at the new terminal by the time this runs.
   useEffect(() => {
-    if (focused && termRef.current) {
+    if (focused && termRef.current && !mobileRef.current) {
       termRef.current.focus();
     }
   }, [focused, sessionId]);
 
+  useEffect(() => { void syncTerminalSize(); }, [phoneControl, mirrorSize?.cols, mirrorSize?.rows, syncTerminalSize]);
   return (
-    <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background">
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {mobile && <div className="mobile-terminal-keys">{[["Esc", "\x1b"],["Tab", "\t"],["Ctrl C", "\x03"],["↑", "\x1b[A"],["↓", "\x1b[B"],["←", "\x1b[D"],["→", "\x1b[C"]].map(([label,key]) => <button key={label} onPointerDown={e => e.preventDefault()} onClick={() => { void writeToPty(sessionId, key).catch(console.error); }}>{label}</button>)}<button onClick={() => termRef.current?.focus()}>Keyboard</button><button aria-pressed={phoneControl} onClick={() => setPhoneControl(v => !v)}>{phoneControl ? "Follow desktop size" : "Fit to phone"}</button></div>}
+    <div className="min-h-0 min-w-0 flex-1 overflow-auto">
+    <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background" style={mobile && !phoneControl ? { minWidth: `${(mirrorSize?.cols ?? 80) * 9 + 16}px`, minHeight: `${(mirrorSize?.rows ?? 24) * 18 + 12}px` } : undefined}>
       <div
         ref={containerRef}
         className="block flex-1 w-full h-full min-w-0 min-h-0 overflow-hidden px-2 py-1.5 box-border [&_.xterm]:h-full [&_.xterm]:w-full [&_.xterm-viewport]:!bg-transparent"
@@ -1146,6 +1166,8 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
           </div>
         </div>
       </div>
+    </div>
+    </div>
     </div>
   );
 });

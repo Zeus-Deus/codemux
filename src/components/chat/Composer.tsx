@@ -1,3 +1,4 @@
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import {
   Bug,
   CircleCheck,
@@ -455,6 +456,8 @@ export function Composer({
   onModeActivate,
   onModeRemove,
 }: Props) {
+  const connectionStatus = useRemoteConnectionStore(s => s.status);
+  const remoteDisconnected = connectionStatus === "offline" || connectionStatus === "reconnecting";
   const configurationEnabled = sessionReady && configurationReady;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
@@ -488,15 +491,23 @@ export function Composer({
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    const desired = Math.min(el.scrollHeight, MAX_ROWS_APPROX_PX);
-    el.style.height = `${desired}px`;
-    // Keep the mirror's scroll offset in step with the textarea after
-    // any auto-grow recalculation. When the textarea shrinks (delete
-    // a line near the bottom) its `scrollTop` snaps; the mirror needs
-    // to follow so the painted text doesn't desync.
-    const mirror = mirrorRef.current;
-    if (mirror) mirror.scrollTop = el.scrollTop;
+    const resize = () => {
+      if (!el.getBoundingClientRect().width) return;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, MAX_ROWS_APPROX_PX)}px`;
+      const mirror = mirrorRef.current;
+      if (mirror) mirror.scrollTop = el.scrollTop;
+    };
+    resize();
+    // A phone keeps chat mounted behind the workspace list. Re-measure when
+    // it becomes visible or rotates, without reacting to our height writes.
+    let previousWidth = el.getBoundingClientRect().width;
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => {
+      const width = el.getBoundingClientRect().width;
+      if (width !== previousWidth) { previousWidth = width; resize(); }
+    });
+    observer?.observe(el);
+    return () => observer?.disconnect();
   }, [draft]);
 
   // Forward the textarea's scroll position to the mirror layer. We can't
@@ -2424,6 +2435,7 @@ export function Composer({
     [],
   );
   const submit = useCallback(() => {
+    if (remoteDisconnected) return;
     setSendHold(true);
     if (sendHoldTimerRef.current !== null) {
       window.clearTimeout(sendHoldTimerRef.current);
@@ -2433,7 +2445,7 @@ export function Composer({
       setSendHold(false);
     }, SEND_HOLD_MS);
     onSubmit();
-  }, [onSubmit]);
+  }, [onSubmit, remoteDisconnected]);
 
   // Follow-up queueing: submit is allowed WHILE a turn streams (the send
   // is queued, not rejected). It is still blocked while this composer's
@@ -2441,7 +2453,7 @@ export function Composer({
   // Stop button stays visible whenever a turn is active or a send is
   // mid-flight (`busy`).
   const busy = streaming || sending;
-  const canSubmit = sessionReady && !sending && draft.trim().length > 0;
+  const canSubmit = !remoteDisconnected && sessionReady && !sending && draft.trim().length > 0;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;

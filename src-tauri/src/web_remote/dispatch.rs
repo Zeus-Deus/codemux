@@ -239,6 +239,19 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    if cmd.starts_with("web_push_") {
+        let shared = app.state::<super::WebRemoteState>().shared();
+        let result = match shared.connections.session_for_connection(conn_id) {
+            Some(session) => super::push::invoke(app, &session, &cmd, &args).await,
+            None => Err("Remote connection is no longer active".into()),
+        };
+        let frame = match result {
+            Ok(value) => Message::Text(json!({"t":"ok", "id":id, "data":value}).to_string()),
+            Err(error) => err_text(id, &error),
+        };
+        let _ = out.send(frame);
+        return;
+    }
     if !super::policy::allowed(&cmd) {
         let _ = out.send(err_text(id, "web-remote: command is not allowed"));
         return;

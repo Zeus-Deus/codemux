@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, GitBranch, Home } from "lucide-react";
@@ -231,6 +232,7 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
 }
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
+  const mobile = useMobileLayout();
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
   const [provider, setProvider] =
     useState<AgentChatProviderKind>(initialProvider);
@@ -3429,7 +3431,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // an empty thread has nothing to choose either (see above), so the
     // strip never changes shape across the first send.
     <div className={SCOPE_STRIP_INSET}>
-      <div className={SCOPE_STRIP}>
+      <div className={SCOPE_STRIP} data-mobile-scope-strip>
         <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
           <span
             className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
@@ -3794,7 +3796,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         enteredSubagent ? "Steering goes to the orchestrator…" : undefined
       }
       zone1Override={zone1Override}
-      belowComposerSlot={belowComposerSlot}
+      belowComposerSlot={mobile ? null : belowComposerSlot}
       stripSlot={stripEl}
       hasQueuedMessage={queued.length > 0}
       paneDragActive={paneDragDepth > 0}

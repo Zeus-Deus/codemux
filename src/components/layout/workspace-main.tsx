@@ -166,7 +166,7 @@ function useContentRowWidth(ref: React.RefObject<HTMLDivElement | null>): number
   return width;
 }
 
-export function WorkspaceMain() {
+export function WorkspaceMain({ mobile = false }: { mobile?: boolean } = {}) {
   const contentRowRef = useRef<HTMLDivElement>(null);
   const contentRowWidth = useContentRowWidth(contentRowRef);
   const storedRightPanelWidth = useUIStore((s) => s.rightPanelWidth);
@@ -268,10 +268,10 @@ export function WorkspaceMain() {
     });
   }, [activeWorkspace?.workspace_id]);
 
-  if (lazyEnabled && activeDraftId && activeDraft) {
+  if ((lazyEnabled || mobile) && activeDraftId && activeDraft) {
     return (
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        {!enableAgentChat && (
+        {!enableAgentChat && !mobile && (
           <PresetBar
             workspaceId={null}
             draftId={activeDraft.draftId}
@@ -297,7 +297,7 @@ export function WorkspaceMain() {
 
   if (isOnboarding) {
     return (
-      <div className={cn("flex flex-1 min-h-0", enableAgentChat && "pt-10")}>
+      <div className={cn("flex flex-1 min-h-0", enableAgentChat && !mobile && "pt-10")}>
         <LazyBoundary label="project onboarding" className="h-full">
           <ProjectOnboarding
             projectDir={onboardingProjectDir}
@@ -314,7 +314,7 @@ export function WorkspaceMain() {
   // Full-expand only means anything while the panel is on screen. The store
   // clears the flag on collapse, but a stale `true` here would still be a
   // zero-width workspace column with nothing beside it.
-  const maximized = showRightPanel && rightPanelMaximized;
+  const maximized = showRightPanel && (mobile || rightPanelMaximized);
   // The stored width is what the user asked for; this is what fits right
   // now. Before the row has been measured (first paint, or a test with no
   // ResizeObserver) fall back to the stored value — the observer corrects
@@ -335,7 +335,7 @@ export function WorkspaceMain() {
   return (
     <div
       ref={contentRowRef}
-      className="flex flex-1 min-h-0 min-w-0 overflow-hidden"
+      className={cn("flex flex-1 min-h-0 min-w-0 overflow-hidden", mobile && "relative")}
     >
       {/* Left: tab bar + preset bar + pane content. In GUI chrome the
           title bar hosts the tabs + launcher, so both rows are dropped.
@@ -346,13 +346,15 @@ export function WorkspaceMain() {
       <div
         data-testid="workspace-content-column"
         data-maximized-away={maximized ? "true" : undefined}
+        inert={mobile && showRightPanel ? true : undefined}
+        aria-hidden={mobile && showRightPanel ? true : undefined}
         className={cn(
           "min-w-0 min-h-0 flex flex-col overflow-hidden",
-          maximized ? "w-0 flex-none" : "flex-1",
+          maximized && !mobile ? "w-0 flex-none" : "flex-1",
         )}
       >
-        {!enableAgentChat && <TabBar workspace={activeWorkspace} />}
-        {!enableAgentChat && (
+        {!enableAgentChat && !mobile && <TabBar workspace={activeWorkspace} />}
+        {!enableAgentChat && !mobile && (
           <PresetBar workspaceId={activeWorkspace.workspace_id} />
         )}
         <div
@@ -361,11 +363,11 @@ export function WorkspaceMain() {
           // fixed rows at the pane's top (the subagent breadcrumb) read
           // this to start below the band instead.
           data-under-titlebar={
-            enableAgentChat && isSoleRootChat ? "true" : undefined
+            enableAgentChat && !mobile && isSoleRootChat ? "true" : undefined
           }
           className={cn(
             "flex-1 min-h-0 overflow-hidden",
-            enableAgentChat && !isSoleRootChat && "pt-10",
+            enableAgentChat && !mobile && !isSoleRootChat && "pt-10",
           )}
         >
           <WorkspaceTranscriptCache workspace={activeWorkspace} enabled={enableAgentChat}>
@@ -397,6 +399,9 @@ export function WorkspaceMain() {
             data-testid="right-panel-column"
             className={cn(
               "h-full overflow-hidden",
+              // Overlay tools at phone width. Shrinking the hidden transcript
+              // to zero would remeasure its virtual rows and lose the reading position.
+              mobile && "absolute inset-0 z-10 bg-background",
               maximized ? "min-w-0 flex-1" : "shrink-0",
             )}
             // Maximizing drops the inline width instead of overwriting it,

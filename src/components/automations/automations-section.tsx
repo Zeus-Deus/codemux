@@ -1,3 +1,4 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
@@ -239,6 +240,7 @@ function draftToInput(draft: FormDraft): AutomationInput {
 }
 
 export function AutomationsSection() {
+  const mobile = useMobileLayout();
   const [automations, setAutomations] = useState<AutomationView[]>([]);
   const [hosts, setHosts] = useState<HostView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -429,9 +431,10 @@ export function AutomationsSection() {
   }
 
   return (
-    <div className="flex h-full min-h-[460px] gap-6">
+    <div data-mobile-automations className={cn("flex h-full min-h-[460px] gap-6", mobile && "flex-col")}>
+      {mobile && <div className="flex items-center gap-2"><select aria-label="Automation" className="mobile-pane-picker flex-1" value={draft ? "" : selectedId ?? ""} onChange={event => { setSelectedId(Number(event.target.value)); setDraft(null); }}><option value="" disabled>{draft ? "Editing automation" : "Select automation"}</option>{automations.map(automation => <option key={automation.id} value={automation.id}>{automation.name}</option>)}</select><Button onClick={startCreate}>New</Button></div>}
       {/* Sidebar */}
-      <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
+      <div style={{display: mobile ? "none" : undefined}} className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
         <div className="mb-3 flex items-end justify-between gap-2">
           <p className="text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
             Automations

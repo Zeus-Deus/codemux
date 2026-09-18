@@ -1,0 +1,585 @@
+/* Browser-only layout. Native desktop typography, pane sizes and chrome stay intact. */
+html[data-mobile] {
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+html[data-mobile] body,
+html[data-mobile] #root {
+  height: var(--mobile-height, 100dvh);
+  min-width: 0;
+  overflow: hidden;
+}
+html[data-mobile] .h-screen {
+  height: var(--mobile-height, 100dvh);
+}
+html[data-mobile] .max-h-screen {
+  max-height: var(--mobile-height, 100dvh);
+}
+html[data-mobile] :is(input, textarea, select, [contenteditable="true"]) {
+  font-size: max(16px, 1rem) !important;
+}
+html[data-mobile]
+  :is(
+    button,
+    [role="button"],
+    [role="tab"],
+    [role="menuitem"],
+    [role="option"]
+  ) {
+  min-height: 44px;
+  touch-action: manipulation;
+}
+html[data-mobile] button:has(> svg:only-child) {
+  min-width: 44px;
+}
+html[data-mobile]
+  :is([data-slot="dialog-content"], [data-slot="sheet-content"]) {
+  max-width: calc(100vw - 16px);
+  max-height: calc(var(--mobile-height, 100dvh) - 24px);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+html[data-mobile] [data-slot="dialog-content"] {
+  top: calc(var(--mobile-top, 0px) + var(--mobile-height, 100dvh) / 2);
+}
+html[data-mobile]
+  :is([data-slot="popover-content"], [data-slot="dropdown-menu-content"]) {
+  max-width: calc(100vw - 16px);
+  max-height: min(var(--radix-popper-available-height, 70dvh), 70dvh);
+  overflow: auto;
+}
+html[data-mobile] [data-terminal-pane-actions] {
+  opacity: 1;
+}
+.mobile-shell {
+  position: fixed;
+  inset-inline: 0;
+  top: var(--mobile-top, 0px);
+  height: var(--mobile-height, 100dvh);
+  padding-top: env(safe-area-inset-top);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+}
+.mobile-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+.mobile-header > button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  border-radius: var(--radius);
+}
+.mobile-home {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 22px 16px calc(24px + env(safe-area-inset-bottom));
+}
+.mobile-primary {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px;
+  border-radius: var(--radius);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-weight: 600;
+}
+.mobile-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  margin: 20px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted-foreground);
+}
+.mobile-search input {
+  min-width: 0;
+  width: 100%;
+  height: 46px;
+  background: transparent;
+  outline: none;
+  color: var(--foreground);
+}
+.mobile-search:focus-within {
+  outline: 2px solid var(--ring);
+}
+.mobile-filters {
+  display: flex;
+  overflow-x: auto;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+.mobile-filters button {
+  padding: 0 12px;
+  flex-shrink: 0;
+  border-radius: var(--radius);
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.mobile-filters button[aria-pressed="true"] {
+  background: var(--secondary);
+  color: var(--foreground);
+}
+.mobile-workspaces {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mobile-workspace {
+  display: flex;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.mobile-workspace-open {
+  display: flex;
+  text-align: left;
+  gap: 12px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  padding: 16px 8px 16px 12px;
+}
+.mobile-project-icon {
+  display: grid;
+  place-items: center;
+  height: 40px;
+  width: 40px;
+  flex-shrink: 0;
+  border-radius: var(--radius);
+  background: var(--secondary);
+  color: var(--muted-foreground);
+}
+.mobile-settle {
+  display: grid;
+  place-items: center;
+  align-self: center;
+  color: var(--muted-foreground);
+  margin-right: 4px;
+}
+.mobile-actions > button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  padding: 0 10px;
+  border-radius: var(--radius);
+}
+.mobile-actions > button:hover {
+  background: var(--accent);
+}
+.mobile-actions > button svg:last-child {
+  margin-left: auto;
+}
+.mobile-keyboard-dismiss {
+  display: none;
+}
+html[data-keyboard="true"] .mobile-nav {
+  display: none;
+}
+.mobile-pane-picker {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  background: var(--background);
+  color: var(--foreground);
+  border-bottom: 1px solid var(--border);
+  padding: 0 12px;
+}
+.mobile-install {
+  margin-top: 20px;
+  padding: 16px;
+  background: var(--secondary);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+.mobile-install p {
+  color: var(--muted-foreground);
+  line-height: 1.6;
+  margin: 8px 0;
+}
+.mobile-install button {
+  padding: 8px 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  html[data-mobile] *,
+  html[data-mobile] *::before,
+  html[data-mobile] *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+html[data-mobile] [data-mobile-scope-strip] {
+  flex-wrap: wrap;
+  height: auto;
+  min-height: 44px;
+  gap: 4px;
+  padding: 4px;
+}
+html[data-mobile] [data-mobile-scope-strip] > div {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+html[data-mobile] [data-testid="right-panel-tabs-header"] {
+  height: 48px;
+}
+html[data-mobile] [data-testid="right-panel-tabs-scroll"] {
+  flex: 1;
+}
+html[data-mobile]
+  [data-testid="workspace-content-column"][data-maximized-away="true"] {
+  visibility: hidden;
+}
+html[data-mobile] [data-transcript-viewport] {
+  overscroll-behavior: contain;
+}
+.mobile-home {
+  scrollbar-width: thin;
+}
+.mobile-terminal-keys {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+.mobile-terminal-keys button {
+  flex-shrink: 0;
+  padding: 0 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.mobile-settle:disabled {
+  opacity: 0.3;
+}
+/* Dense metadata is secondary on a phone, but remains available by scrolling. */
+html[data-mobile] [data-mobile-scope-strip] {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  justify-content: flex-start;
+}
+html[data-mobile] [data-mobile-scope-strip] > div {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+}
+html[data-mobile] [data-mobile-scope-strip] > div:first-child {
+  display: none;
+}
+html[data-mobile] .mobile-shell button {
+  -webkit-tap-highlight-color: transparent;
+}
+html[data-mobile] .mobile-shell button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+.mobile-panel-header {
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.mobile-panel-header button {
+  padding: 0 10px;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.mobile-panel-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  overflow-x: auto;
+  padding: 2px 8px;
+}
+.mobile-panel-actions > * {
+  flex-shrink: 0;
+}
+html[data-mobile] [data-testid="composer-controls-row"] {
+  height: auto;
+  min-height: 48px;
+  flex-wrap: wrap;
+}
+html[data-mobile] [data-testid="composer-gap"] {
+  min-width: 0;
+}
+html[data-mobile] .mobile-browser-dialog {
+  display: flex;
+  flex-direction: column;
+  height: calc(var(--mobile-height, 100dvh) - 24px);
+}
+html[data-mobile] [data-slot="dialog-content"] {
+  min-width: 0;
+  padding: 16px;
+}
+html[data-mobile] [data-slot="dialog-content"] :is(.grid-cols-2, .grid-cols-3) {
+  grid-template-columns: minmax(0, 1fr);
+}
+html[data-mobile] :is(input, textarea, select):focus {
+  scroll-margin-block: 12px;
+}
+html[data-mobile] [aria-label="Background browser preview"] {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+html[data-mobile] [aria-label="Background browser preview"] > div:first-child {
+  min-height: 48px;
+}
+html[data-mobile] [data-slot="dialog-content"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+html[data-mobile] [data-slot="dialog-content"] > * {
+  min-width: 0;
+}
+.mobile-workspace-dialog-heading {
+  display: none;
+}
+html[data-mobile] [data-mobile-workspace-dialog] {
+  padding: 0;
+  top: calc(var(--mobile-top, 0px) + 12px) !important;
+  translate: -50% 0 !important;
+  max-height: calc(var(--mobile-height, 100dvh) - 24px);
+  overflow-y: auto;
+}
+html[data-mobile] .mobile-workspace-dialog-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--border);
+}
+html[data-mobile] [data-mobile-workspace-dialog] input {
+  min-height: 44px;
+}
+html[data-mobile]
+  [data-mobile-workspace-dialog]
+  input[placeholder="branch name"] {
+  width: 105px;
+}
+html[data-mobile] [data-mobile-workspace-controls] {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+html[data-mobile] [data-mobile-workspace-controls] > div:first-child {
+  flex-wrap: wrap;
+  width: 100%;
+}
+html[data-mobile] [data-mobile-workspace-controls] > div:last-child {
+  margin-left: auto;
+}
+html[data-mobile] [data-mobile-workspace-dialog] [class*="w-[320px]"] {
+  position: relative;
+  width: 100%;
+}
+
+html[data-mobile] [data-mobile-automations] :is(.grid-cols-2, .grid-cols-3) {
+  grid-template-columns: minmax(0, 1fr);
+}
+html[data-mobile] [data-mobile-automations] form {
+  min-width: 0;
+}
+html[data-mobile] [data-mobile-new-project] {
+  height: var(--mobile-height, 100dvh);
+  top: var(--mobile-top, 0px);
+  padding-top: env(safe-area-inset-top);
+}
+html[data-mobile] [data-mobile-new-project] > div.absolute {
+  position: static;
+  padding: 8px 12px;
+}
+html[data-mobile] [data-mobile-new-project] > div:last-child {
+  min-height: 0;
+  overflow-y: auto;
+  align-items: flex-start;
+  padding-block: 16px;
+}
+html[data-mobile] [data-mobile-new-project] .grid-cols-2 {
+  grid-template-columns: minmax(0, 1fr);
+}
+html[data-mobile] #root > .h-screen {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.mobile-workspace-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-block: 1px solid var(--border);
+  padding-block: 12px;
+}
+.mobile-workspace-actions button {
+  text-align: left;
+  padding: 0 10px;
+}
+
+html[data-mobile] [data-testid="composer-body"] textarea {
+  min-height: 48px !important;
+}
+html[data-mobile] [data-testid="composer-highlight-mirror"] {
+  font-size: max(16px, 1rem) !important;
+}
+html[data-mobile] [data-mobile-scope-strip] {
+  scrollbar-width: none;
+}
+html[data-mobile] [data-mobile-scope-strip]::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-install-settings {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+html[data-mobile] [data-mobile-draft-scope],
+html[data-mobile] [data-mobile-draft-scope] > div {
+  flex-wrap: wrap;
+  height: auto;
+  min-width: 0;
+  max-width: 100%;
+}
+html[data-mobile] [data-mobile-draft-scope] > div > span {
+  display: none;
+}
+html[data-mobile] [data-mobile-draft-scope] button {
+  max-width: 100%;
+}
+
+/* Focused phone navigation: one header, content, composer. Tools stay in sheets. */
+.mobile-header {
+  padding: 4px 8px;
+  gap: 4px;
+  min-height: 53px;
+}
+.mobile-header .mobile-title {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 0 4px;
+  text-align: left;
+}
+.mobile-header .mobile-tools-trigger {
+  width: auto;
+  min-width: 44px;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.mobile-header .mobile-keyboard-dismiss {
+  display: none;
+}
+html[data-keyboard="true"] .mobile-header .mobile-keyboard-dismiss {
+  display: flex;
+}
+.mobile-content {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+html[data-keyboard="true"] .mobile-content {
+  padding-bottom: 0;
+}
+html[data-mobile] [data-slot="sheet-content"].mobile-bottom-sheet {
+  width: 100%;
+  max-width: 600px;
+  max-height: min(85dvh, calc(var(--mobile-height, 100dvh) - 16px));
+  bottom: max(
+    0px,
+    calc(100dvh - var(--mobile-height, 100dvh) - var(--mobile-top, 0px))
+  );
+  margin-inline: auto;
+  border-radius: 24px 24px 0 0;
+  padding: 8px 12px calc(16px + env(safe-area-inset-bottom));
+  gap: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--background);
+}
+.mobile-bottom-sheet::before {
+  content: "";
+  display: block;
+  width: 32px;
+  height: 4px;
+  min-height: 4px;
+  border-radius: 4px;
+  background: var(--border);
+  margin: 0 auto;
+}
+.mobile-bottom-sheet [data-slot="sheet-header"] {
+  padding: 16px 8px;
+  padding-right: 44px;
+}
+.mobile-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.mobile-tool-grid button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 72px !important;
+  min-width: 0;
+  border-radius: 14px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  background: var(--card);
+}
+.mobile-tool-grid button[aria-current="page"] {
+  color: var(--foreground);
+  background: var(--accent);
+}
+.mobile-workspace-context {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 8px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.mobile-workspace-context > div {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  min-width: 0;
+}
+.mobile-more-actions summary {
+  min-height: 48px;
+  padding: 14px 8px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.mobile-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mobile-actions > button {
+  width: 100%;
+}
+.mobile-bottom-sheet button:focus-visible,
+.mobile-more-actions summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+.mobile-bottom-sheet button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}

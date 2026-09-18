@@ -1,3 +1,6 @@
+import { MobileInstall } from "@/components/mobile/mobile-install";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
@@ -1216,6 +1219,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
 }
 
 export function SettingsView() {
+  const mobile = useMobileLayout();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
@@ -2241,6 +2245,14 @@ export function SettingsView() {
       }
 
       case "notifications":
+        if (mobile || isRemoteClient()) {
+          return (
+            <div>
+              <SectionHeader title="Notifications" description="Install Codemux and receive updates from your desktop." />
+              <MobileInstall />
+            </div>
+          );
+        }
         return (
           <div>
             <SectionHeader
@@ -2364,24 +2376,25 @@ export function SettingsView() {
         </Button>
         <div className="flex items-center gap-2 text-body-lg">
           <span className="font-semibold tracking-tight text-foreground">Settings</span>
-          {activeLabel && (
+          {activeLabel && !mobile && (
             <>
               <span className="text-muted-foreground/40">/</span>
               <span className="font-semibold text-muted-foreground">{activeLabel}</span>
             </>
           )}
         </div>
-        {sectionAvailable && <SettingsFooterPin section={activeSection} />}
+        {sectionAvailable && !mobile && <SettingsFooterPin section={activeSection} />}
       </div>
 
       {/* Body */}
-      <div className="flex flex-1 min-h-0">
+      <div className={cn("flex flex-1 min-h-0", mobile && "flex-col")}>
         {/* Left nav — refined-minimal pill rows matching the new
             sidebar aesthetic: inset margins, soft muted hover, calm
             type hierarchy. Group separation is whitespace alone (no
             dividers) so the nav reads as one continuous list. Mono
             group captions echo the design system's metadata voice. */}
-        <nav className="w-60 shrink-0 border-r border-border bg-background py-4">
+        {mobile && <select aria-label="Settings section" className="mobile-pane-picker" value={activeSection} onChange={e => setActiveSection(e.target.value as Section)}>{navGroups.map(group => <optgroup key={group.label} label={group.label}>{group.items.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</optgroup>)}</select>}
+        <nav className={cn("w-60 shrink-0 border-r border-border bg-background py-4", mobile && "hidden")}>
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
@@ -2408,7 +2421,7 @@ export function SettingsView() {
         <ScrollArea className="flex-1 bg-card">
           <div
             className={cn(
-              "mx-auto px-11 pt-8 pb-20",
+              mobile ? "mx-auto min-w-0 px-4 pt-5 pb-20" : "mx-auto px-11 pt-8 pb-20",
               WIDE_SECTIONS.has(activeSection as Section) ? "max-w-[1400px]" : "max-w-3xl",
             )}
           >

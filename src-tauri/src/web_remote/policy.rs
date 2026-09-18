@@ -6,7 +6,31 @@
 pub(super) fn allowed(cmd: &str) -> bool {
     matches!(
         cmd,
-        "close_workspace"
+        "reply_to_pr_thread"
+            | "set_pr_thread_resolved"
+            | "submit_pr_review"
+            | "add_pr_inline_comment"
+            | "submit_pr_review_with_comments"
+            | "create_preset"
+            | "update_preset"
+            | "delete_preset"
+            | "set_preset_pinned"
+            | "refresh_workspace_issue"
+            | "agent_chat_provider_health"
+            | "unarchive_workspace"
+            | "import_worktree_workspace"
+            | "link_workspace_issue"
+            | "unlink_workspace_issue"
+            | "set_workspace_host"
+            | "automations_create"
+            | "automations_update"
+            | "automations_set_enabled"
+            | "automations_delete"
+            | "automations_check_repo_access"
+            | "create_pull_request"
+            | "merge_pull_request"
+            | "update_synced_settings"
+            | "close_workspace"
             | "close_workspace_with_worktree"
             | "archive_workspace"
             | "activate_pane"
@@ -243,6 +267,9 @@ mod tests {
             "write_to_pty",
             "agent_chat_send_turn",
             "materialize_chat_workspace",
+            "submit_pr_review_with_comments",
+            "automations_create",
+            "unarchive_workspace",
         ] {
             assert!(allowed(cmd), "{cmd}");
         }

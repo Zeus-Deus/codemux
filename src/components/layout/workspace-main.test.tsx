@@ -308,6 +308,14 @@ describe("WorkspaceMain chrome rows", () => {
 });
 
 describe("WorkspaceMain draft branch chrome", () => {
+  it("uses the chat draft on mobile even with desktop lazy creation disabled", async () => {
+    state.enableLazy = false;
+    state.activeDraftId = "draft-1";
+    const view = render(<WorkspaceMain mobile />);
+    expect(await view.findByTestId("draft-surface")).toBeInTheDocument();
+    expect(view.queryByTestId("preset-bar")).not.toBeInTheDocument();
+  });
+
   it("renders the legacy PresetBar above the draft surface when the Beta is OFF", async () => {
     state.enableLazy = true;
     state.activeDraftId = "draft-1";
@@ -400,6 +408,22 @@ describe("WorkspaceMain right-panel stale-tab guard", () => {
 // scroll position — and the panel drops its inline width rather than
 // overwriting it, which is what makes the restore exact and free.
 describe("WorkspaceMain right-panel full expand", () => {
+  it("overlays mobile tools without shrinking the mounted conversation", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTabs = { "ws-1": "files" };
+    const view = render(<WorkspaceMain mobile />);
+    expect(view.getByTestId("right-panel-column")).toHaveClass("absolute", "inset-0");
+    const conversation = view.getByTestId("workspace-content-column");
+    expect(conversation).toHaveClass("flex-1");
+    expect(conversation).not.toHaveClass("w-0");
+    expect(conversation).toHaveAttribute("inert");
+    expect(conversation).toHaveAttribute("aria-hidden", "true");
+    state.rightPanelTabs = {};
+    view.rerender(<WorkspaceMain mobile />);
+    expect(view.getByTestId("workspace-content-column")).toBe(conversation);
+    expect(conversation).not.toHaveAttribute("inert");
+  });
+
   it("gives the panel a fixed width beside a flexible workspace column normally", () => {
     state.enableAgentChat = true;
     state.rightPanelTabs = { "ws-1": "files" };

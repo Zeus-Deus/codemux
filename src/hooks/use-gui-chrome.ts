@@ -1,3 +1,4 @@
+import { useMobileLayout } from "./use-mobile-layout";
 import { useActiveWorkspaceId } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -69,5 +70,6 @@ export function useDraftGuiChrome(): boolean {
 export function useTitlebarOverlay(): boolean {
   const guiChrome = useGuiChrome();
   const draftGuiChrome = useDraftGuiChrome();
-  return guiChrome || draftGuiChrome;
+  const mobile = useMobileLayout();
+  return !mobile && (guiChrome || draftGuiChrome);
 }

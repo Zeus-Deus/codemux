@@ -219,7 +219,7 @@ export function ThreadScopeRow({
   return (
     <div className="rise-in flex w-full flex-col items-center gap-3">
       <div className={SCOPE_STRIP_INSET}>
-        <div className={SCOPE_STRIP}>
+        <div className={SCOPE_STRIP} data-mobile-draft-scope>
           <div className="flex min-w-0 items-center gap-0.5">
             <LocationControl
               onChangeTarget={onChangeTarget}

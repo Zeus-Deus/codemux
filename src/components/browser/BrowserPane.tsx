@@ -325,6 +325,9 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
 
           // Pinned viewport: ignore container dimensions entirely — the
           // popover canvas letterboxes the larger frame down to fit.
+          // Remote viewers follow the existing desktop viewport. A phone must
+          // never reflow the agent’s browser when its keyboard opens.
+          if (isRemoteClient()) return;
           const fixed = fixedViewportRef.current;
           if (fixed && fixed.width > 10 && fixed.height > 10) {
             viewportRef.current = { width: fixed.width, height: fixed.height };
@@ -874,7 +877,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
       // Pinned viewport: the canvas tracks the container (above) but the
       // browser's viewport stays fixed — never re-send it or overwrite
       // viewportRef with container dims.
-      if (fixedViewportRef.current) return;
+      if (isRemoteClient() || fixedViewportRef.current) return;
       // Debounced: tell browser to resize viewport to match
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {

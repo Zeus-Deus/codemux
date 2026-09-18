@@ -1,3 +1,4 @@
+import { projectRemotePanes } from "@/remote/pane-selection";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { loadRemoteWorkspace, saveRemoteWorkspace } from "@/remote/client-view";
 import { useMemo } from "react";
@@ -543,7 +544,7 @@ export const useAppStore = create<AppStore>((set) => ({
 
       return {
         ...reconcileRemoteSelection(state, drained.appState),
-        appState: drained.appState,
+        appState: projectRemotePanes(drained.appState),
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
         // Adopt whatever instance stamped this snapshot. Only a stamped
@@ -609,7 +610,7 @@ export const useAppStore = create<AppStore>((set) => ({
       const confirmed = confirmsPending(state, drained.appState);
       return {
         ...reconcileRemoteSelection(state, drained.appState),
-        appState: drained.appState,
+        appState: projectRemotePanes(drained.appState),
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
         // The window only closes when nothing is left waiting on a revision.
@@ -659,7 +660,7 @@ export const useAppStore = create<AppStore>((set) => ({
       return {
         resyncInFlight: false,
         ...reconcileRemoteSelection(state, drained.appState),
-        appState: drained.appState,
+        appState: projectRemotePanes(drained.appState),
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
         gapWindowId:

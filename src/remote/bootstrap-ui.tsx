@@ -8,6 +8,7 @@
  * that read a binding from a partially evaluated module throw at load time.
  */
 import React from "react";
+import { useMobileViewport } from "@/hooks/use-mobile-layout";
 import ReactDOM from "react-dom/client";
 
 export function dismissSplash(): void {
@@ -55,9 +56,12 @@ export const overlayStyle: React.CSSProperties = {
   inset: 0,
   zIndex: 2147483645,
   display: "flex",
-  alignItems: "center",
+  alignItems: "safe center",
+  height: "var(--mobile-height, 100dvh)",
+  top: "var(--mobile-top, 0px)",
   justifyContent: "center",
   padding: 24,
+  overflowY: "auto",
   background: BOOT_BG,
   color: BOOT_FG,
   fontFamily: "var(--font-sans, system-ui, -apple-system, sans-serif)",
@@ -124,6 +128,11 @@ export const switchLinkStyle: React.CSSProperties = {
   textUnderlineOffset: 2,
 };
 
+function BootstrapViewport({ children }: { children: React.ReactNode }) {
+  useMobileViewport();
+  return <>{children}</>;
+}
+
 /** Owns a single React root in a dedicated overlay element so the pairing
  *  UI never fights the app's `#root` React tree. */
 export class BootstrapOverlay {
@@ -142,7 +151,7 @@ export class BootstrapOverlay {
   }
 
   render(node: React.ReactElement): void {
-    this.ensure().render(<React.StrictMode>{node}</React.StrictMode>);
+    this.ensure().render(<React.StrictMode><BootstrapViewport>{node}</BootstrapViewport></React.StrictMode>);
   }
 
   remove(): void {
