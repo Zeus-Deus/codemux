@@ -21,6 +21,7 @@ import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
 } from "@/stores/synced-settings-store";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 /** How long to wait for a keypress before showing the timeout hint */
 const RECORDING_TIMEOUT_MS = 4000;
@@ -158,14 +159,14 @@ export function KeybindEditor() {
             onClick={resetAll}
             className="shrink-0"
           >
-            <RotateCcw className="h-3.5 w-3.5" />
+            <RotateCcw className="size-3.5" />
             Reset all
           </Button>
         )}
       </div>
 
       <div className="relative mb-6">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/60 pointer-events-none" />
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
         <Input
           placeholder="Search shortcuts…"
           value={search}
@@ -222,8 +223,11 @@ function CategoryGroup({
 }) {
   return (
     <Collapsible defaultOpen className="border-b border-border/40 last:border-b-0 pb-1.5">
-      <CollapsibleTrigger className="group flex items-center gap-1.5 w-full pt-5 pb-2 text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60 hover:text-foreground transition-colors">
-        <ChevronDown className="h-3 w-3 transition-transform duration-150 group-data-[state=closed]:-rotate-90 opacity-60" />
+      <CollapsibleTrigger className={cn(
+          eyebrowVariants(),
+          "group flex items-center gap-1.5 w-full pt-5 pb-2 hover:text-foreground transition-colors",
+        )}>
+        <ChevronDown className="size-3 transition-transform duration-150 group-data-[state=closed]:-rotate-90 opacity-60" />
         {CATEGORY_LABELS[category]}
       </CollapsibleTrigger>
       <CollapsibleContent>
@@ -332,7 +336,7 @@ function KeybindRow({
             className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity p-1 rounded-sm hover:bg-muted/60"
             title="Reset to default"
           >
-            <RotateCcw className="h-3 w-3" />
+            <RotateCcw className="size-3" />
           </button>
         )}
 

@@ -17,6 +17,7 @@ import { findAgentContext } from "./workflow-phases";
 import { workflowRunTone } from "./workflow-tone";
 import { WorkflowPhaseList } from "./workflow-phase-list";
 import { WorkflowAgentDetail } from "./workflow-agent-detail";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 const STATUS_LABEL: Record<WorkflowRunItem["status"], string> = {
   pending_approval: "Pending approval",
@@ -97,9 +98,9 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
               type="button"
               onClick={() => setLevel("phases")}
               aria-label="Back to phases"
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground"
+              className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground"
             >
-              <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
+              <ChevronLeft className="size-3.5" aria-hidden />
             </button>
           )}
           <span className="min-w-0 flex-1 truncate text-body-lg font-bold text-foreground">
@@ -139,7 +140,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                     aria-label="Pause"
                     data-testid="workflow-pause"
                   >
-                    <Pause className="h-3 w-3" strokeWidth={1.8} fill="currentColor" aria-hidden />
+                    <Pause fill="currentColor" aria-hidden />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Pausing isn't supported yet.</TooltipContent>
@@ -153,7 +154,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
                 onClick={handleStop}
                 className="border-status-attention/35 bg-status-attention/10 text-status-attention hover:bg-status-attention/20"
               >
-                <Square className="h-2.5 w-2.5" strokeWidth={1.8} fill="currentColor" aria-hidden />
+                <Square fill="currentColor" aria-hidden />
               </Button>
             </div>
           </div>
@@ -195,7 +196,7 @@ function Stat({ label, value }: { label: string; value: ReactNode }) {
   return (
     <span className="flex flex-col">
       <span className="font-mono text-body font-semibold text-foreground">{value}</span>
-      <span className="text-caption uppercase tracking-wide text-muted-foreground">{label}</span>
+      <Eyebrow>{label}</Eyebrow>
     </span>
   );
 }

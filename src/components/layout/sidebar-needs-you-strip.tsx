@@ -244,7 +244,7 @@ export function SidebarNeedsYouStrip({
                 </span>
                 <span className="ml-auto flex items-center gap-1 shrink-0 font-mono text-caption text-muted-foreground tabular-nums">
                   {age}
-                  <ArrowDown className="size-2.5" aria-hidden />
+                  <ArrowDown className="size-3" aria-hidden />
                 </span>
               </button>
             );

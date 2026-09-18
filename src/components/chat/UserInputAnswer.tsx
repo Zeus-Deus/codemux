@@ -1,6 +1,7 @@
 import { memo } from "react";
 
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Right-aligned reply bubble that echoes the user's answer to an
@@ -46,9 +47,9 @@ export const UserInputAnswer = memo(function UserInputAnswer({
           {lines.map((line, i) => (
             <div key={i} className="flex flex-col gap-0.5">
               {showHeaders && line.header ? (
-                <div className="text-label font-medium uppercase tracking-wide text-muted-foreground">
+                <Eyebrow>
                   {line.header}
-                </div>
+                </Eyebrow>
               ) : null}
               <div className="select-text whitespace-pre-wrap break-words">
                 {line.value}

@@ -31,6 +31,7 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Settings → Hosts (Step 2 of cloud-push).
@@ -340,9 +341,9 @@ export function HostsSection() {
       {/* Sidebar */}
       <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
         <div className="mb-3 flex items-end justify-between gap-2">
-          <p className="text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+          <Eyebrow>
             Hosts
-          </p>
+          </Eyebrow>
           <span className="text-label text-muted-foreground/60 tabular-nums">
             {hosts.length}
           </span>
@@ -595,9 +596,9 @@ export function HostsSection() {
               <div className="mb-1 flex items-center gap-2">
                 <h3 className="text-body-lg font-semibold tracking-tight text-foreground">{selected.name}</h3>
                 {selected.dirty && (
-                  <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-caption font-medium uppercase tracking-wider text-warning">
+                  <Eyebrow className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-warning">
                     Pending sync
-                  </span>
+                  </Eyebrow>
                 )}
               </div>
               <p className="select-text font-mono text-body-sm text-muted-foreground/85">

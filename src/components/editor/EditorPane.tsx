@@ -335,7 +335,7 @@ export function EditorPane({
     return (
       <div className="flex h-full w-full items-center justify-center text-muted-foreground">
         <div className="flex flex-col items-center gap-2">
-          <FileCode className="h-8 w-8 opacity-40" />
+          <FileCode className="size-8 opacity-40" />
           <span className="text-label">Open a file from the file tree</span>
         </div>
       </div>
@@ -369,7 +369,7 @@ export function EditorPane({
           {filePath}
         </span>
         {isDirty && viewMode === "raw" && (
-          <span className="w-1.5 h-1.5 rounded-full bg-foreground/50 shrink-0 ml-1" title="Unsaved changes" />
+          <span className="size-1.5 rounded-full bg-foreground/50 shrink-0 ml-1" title="Unsaved changes" />
         )}
         <div className="flex-1" />
 

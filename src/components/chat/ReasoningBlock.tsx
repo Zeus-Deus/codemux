@@ -64,7 +64,6 @@ export const ReasoningBlock = memo(function ReasoningBlock({
           ) : (
             <Lightbulb
               className="size-3.5 text-accent-violet"
-              strokeWidth={1.5}
               aria-hidden
             />
           )}

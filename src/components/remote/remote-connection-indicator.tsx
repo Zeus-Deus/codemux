@@ -58,7 +58,7 @@ export function RemoteConnectionChip({ compact = false }: { compact?: boolean })
           )}
         >
           <span
-            className="h-1.5 w-1.5 shrink-0 rounded-full bg-status-remote"
+            className="size-1.5 shrink-0 rounded-full bg-status-remote"
             aria-hidden
           />
           <span className="shrink-0">Remote</span>
@@ -114,7 +114,7 @@ export function RemoteConnectionBanner() {
     >
       <span
         className={cn(
-          "cm-blink h-2 w-2 shrink-0 rounded-full",
+          "cm-blink size-2 shrink-0 rounded-full",
           offline ? "bg-status-attention" : "bg-status-working",
         )}
         aria-hidden

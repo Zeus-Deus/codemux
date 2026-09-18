@@ -10,6 +10,7 @@ import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Pull-request picker, mirroring `IssuePickerPanel`.
@@ -244,9 +245,9 @@ export function PrPickerPanel({
   return (
     <div onKeyDown={handleKeyDown} data-testid="pr-picker-panel">
       <div className="flex items-center justify-between px-3 pt-2.5 pb-1">
-        <span className="text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Open Pull Requests
-        </span>
+        </Eyebrow>
       </div>
 
       <div className="px-2 pb-1.5">
@@ -300,7 +301,7 @@ export function PrPickerPanel({
         )}
         {directSearching && displayPrs.length > 0 && (
           <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
-            <Loader2 className="h-3 w-3 animate-spin" />
+            <Loader2 className="size-3 animate-spin" />
             Searching…
           </div>
         )}

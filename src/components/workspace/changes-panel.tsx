@@ -79,6 +79,7 @@ import type {
   GitBranchInfo,
   MergeState,
 } from "@/tauri/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -242,10 +243,10 @@ function FileSection({
   if (files.length === 0) return null;
   return (
     <div className="mb-2">
-      <div className="flex items-center px-2.5 h-5 text-caption font-medium tracking-wider uppercase text-muted-foreground/60">
+      <Eyebrow className="flex items-center px-2.5 h-5">
         <span>{label}</span>
         <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
-      </div>
+      </Eyebrow>
       <div className="flex flex-col">
         {files.map((file) => (
           <FileRow
@@ -276,13 +277,13 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
         <span className="ml-auto flex items-center gap-1.5 tabular-nums text-caption">
           {behind > 0 && (
             <span className="flex items-center gap-0.5 text-warning">
-              <ArrowDown className="size-2.5" />
+              <ArrowDown className="size-3" />
               {behind}
             </span>
           )}
           {ahead > 0 && (
             <span className="flex items-center gap-0.5 text-info">
-              <ArrowUp className="size-2.5" />
+              <ArrowUp className="size-3" />
               {ahead}
             </span>
           )}

@@ -23,6 +23,8 @@ import {
 } from "@/lib/footer-actions";
 import { useFooterPinsStore, type FooterPin } from "@/stores/footer-pins-store";
 import { useFooterAvailability } from "./footer-availability";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { cn } from "@/lib/utils";
 
 function IconPicker({ pin }: { pin: FooterPin }) {
   const [open, setOpen] = useState(false);
@@ -102,7 +104,7 @@ export function CustomizeFooterDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="thin-scrollbar min-h-0 overflow-y-auto px-6 py-4">
-          <h3 className="mb-3 text-label font-semibold uppercase tracking-wider text-muted-foreground">
+          <h3 className={cn(eyebrowVariants(), "mb-3")}>
             Pinned destinations · {pins.length}
           </h3>
           {pins.length === 0 && (
@@ -166,7 +168,7 @@ export function CustomizeFooterDialog({
               );
             })}
           </ol>
-          <h3 className="mb-3 mt-6 text-label font-semibold uppercase tracking-wider text-muted-foreground">
+          <h3 className={cn(eyebrowVariants(), "mb-3 mt-6")}>
             Add a destination
           </h3>
           <Input

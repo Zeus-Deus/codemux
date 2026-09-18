@@ -588,6 +588,25 @@ body.pane-resizing iframe {
   html {
     @apply font-sans;
     }
+  /* One stroke weight for every icon.
+   *
+   * Icons set the optical weight of a row, so fifteen stroke weights made
+   * alignment unachievable even where the boxes agreed. Lucide writes
+   * `stroke-width` as a presentation attribute (default 2), and CSS outranks
+   * a presentation attribute — so this single rule is the whole vocabulary
+   * and the 73 per-call-site overrides are gone.
+   *
+   * 1.75 is where those call sites clustered: the explicit values ran
+   * 1.0–3.5, with two thirds of them between 1.5 and 1.8. Lucide's own 2 is
+   * a hair heavy at the 12–14px this app draws icons at.
+   *
+   * A glyph that genuinely needs a different weight asks for it with the
+   * `[stroke-width:N]` utility, which sits in the utilities layer and
+   * therefore wins over this base rule.
+   */
+  svg.lucide {
+    stroke-width: 1.75;
+    }
 }
 
 /* Typography settings use named surfaces rather than trying to globally

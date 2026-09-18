@@ -103,7 +103,7 @@ async function loadRepoTemplate(
 }
 
 const LABEL =
-  `font-mono ${tzEyebrow} font-semibold uppercase tracking-[0.07em] text-muted-foreground`;
+  `font-mono ${tzEyebrow} font-semibold uppercase tracking-eyebrow text-muted-foreground`;
 
 const FIELD =
   `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +
@@ -412,7 +412,7 @@ export function CreatePrForm({
                 className="text-muted-foreground transition-colors hover:text-foreground"
                 onClick={() => setReviewers(reviewers.filter((r) => r !== reviewer))}
               >
-                <X className="size-2.5" />
+                <X className="size-3" />
               </button>
             </span>
           ))}

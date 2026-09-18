@@ -34,6 +34,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   questions: Question[];
@@ -345,9 +346,9 @@ export function QuestionForm({
                 active question — every Item is mounted at all times, so
                 a per-item eyebrow would duplicate it. */}
             <div className="flex items-center gap-2">
-              <span className="text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
+              <Eyebrow>
                 {active.header || "Input requested"}
-              </span>
+              </Eyebrow>
               <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-caption text-muted-foreground/70">
                 {qi + 1} of {questions.length}
               </QuestionnaireProgress>
@@ -417,7 +418,7 @@ export function QuestionForm({
                   aria-label="Previous question"
                   size="sm"
                   variant="ghost"
-                  className="h-7 min-h-0 w-7 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
+                  className="size-7 min-h-0 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
                 >
                   <ChevronLeft className="size-3.5" />
                 </QuestionnairePrevious>
@@ -523,9 +524,9 @@ function OptionChoice({
         className="w-80"
         data-testid={`aq-option-preview-${questionIndex}-${optionIndex}`}
       >
-        <p className="mb-1 text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
+        <Eyebrow className="mb-1">
           Preview
-        </p>
+        </Eyebrow>
         <pre className="whitespace-pre-wrap break-words font-mono text-body-sm leading-5 text-foreground">
           {preview}
         </pre>

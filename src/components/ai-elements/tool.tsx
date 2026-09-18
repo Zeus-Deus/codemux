@@ -17,6 +17,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { isValidElement } from "react";
 
 import { CodeBlock } from "./code-block";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 // Local replacements for the Vercel AI SDK `ToolUIPart` / `DynamicToolUIPart`
 // types. This repo maps its own Tauri IPC tool lifecycle onto these plain
@@ -143,7 +144,7 @@ export type ToolInputProps = ComponentProps<"div"> & {
 
 export const ToolInput = ({ className, input, ...props }: ToolInputProps) => (
   <div className={cn("space-y-2 overflow-hidden", className)} {...props}>
-    <h4 className="font-medium text-muted-foreground text-label uppercase tracking-wide">
+    <h4 className={cn(eyebrowVariants())}>
       Parameters
     </h4>
     <div className="rounded-md bg-muted/50">
@@ -179,7 +180,7 @@ export const ToolOutput = ({
 
   return (
     <div className={cn("space-y-2", className)} {...props}>
-      <h4 className="font-medium text-muted-foreground text-label uppercase tracking-wide">
+      <h4 className={cn(eyebrowVariants())}>
         {errorText ? "Error" : "Result"}
       </h4>
       <div

@@ -64,7 +64,6 @@ export function PaneActionButton({
         >
           <Icon
             className={size === "titlebar" ? "size-3.5" : "size-[13px]"}
-            strokeWidth={size === "titlebar" ? 2 : 1.6}
           />
         </button>
       </TooltipTrigger>

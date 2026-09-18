@@ -163,7 +163,7 @@ export function ReviewSubmitSheet({
 
           <p
             className={cn(
-              "font-semibold uppercase tracking-wide text-muted-foreground",
+              "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
               tzMeta,
             )}
           >

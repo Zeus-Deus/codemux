@@ -132,9 +132,9 @@ function SyncReadyRow() {
           className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "export" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="size-3.5 animate-spin" />
           ) : (
-            <FileDown className="h-3.5 w-3.5" />
+            <FileDown className="size-3.5" />
           )}
           Export skills locally
         </button>
@@ -145,9 +145,9 @@ function SyncReadyRow() {
           className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "import" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="size-3.5 animate-spin" />
           ) : (
-            <FileUp className="h-3.5 w-3.5" />
+            <FileUp className="size-3.5" />
           )}
           Import skills from backup
         </button>

@@ -85,7 +85,7 @@ export function SessionSelector({
           data-testid="session-selector-trigger"
         >
           <span className="max-w-[200px] truncate">{triggerLabel}</span>
-          <ChevronDown className="h-3 w-3" />
+          <ChevronDown className="size-3" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent

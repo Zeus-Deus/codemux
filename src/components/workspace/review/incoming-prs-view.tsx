@@ -66,11 +66,11 @@ function ChecksIndicator({ status }: { status: string | null }) {
   if (!status) return null;
   switch (status) {
     case "success":
-      return <Check className="h-3 w-3 text-success" />;
+      return <Check className="size-3 text-success" />;
     case "failure":
-      return <X className="h-3 w-3 text-danger" />;
+      return <X className="size-3 text-danger" />;
     case "pending":
-      return <Circle className="h-2.5 w-2.5 fill-warning text-warning" />;
+      return <Circle className="size-3 fill-warning text-warning" />;
     default:
       return null;
   }
@@ -218,7 +218,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               onClick={handleView}
               title={`View on ${provider.name}`}
             >
-              <ExternalLink className="h-3 w-3 mr-0.5" />
+              <ExternalLink className="size-3 mr-0.5" />
               View
             </Button>
             {pr.head_branch && (
@@ -233,7 +233,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
                 onClick={handleCheckout}
                 title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
               >
-                <GitBranch className="h-3 w-3 mr-0.5" />
+                <GitBranch className="size-3 mr-0.5" />
                 {existingWs ? "Switch" : "Checkout"}
               </Button>
             )}
@@ -344,7 +344,7 @@ export function IncomingPrsView({
               tzBody,
             )}
           >
-            <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
+            <AlertCircle className="size-3 mt-0.5 shrink-0" />
             <span className="break-words">{error}</span>
           </div>
         )}
@@ -363,7 +363,7 @@ export function IncomingPrsView({
 
         {!loading && !error && prs.length === 0 && (
           <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-            <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
+            <GitPullRequest className="size-7 opacity-25 mb-2" />
             <p className={tzBody}>No open {provider.nounPlural}</p>
           </div>
         )}

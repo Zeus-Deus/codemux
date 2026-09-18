@@ -75,7 +75,7 @@ export function SubagentView({
           tone.border,
         )}
       >
-        <Lock className={cn("h-3.5 w-3.5 shrink-0", tone.text)} strokeWidth={1.5} aria-hidden />
+        <Lock className={cn("size-3.5 shrink-0", tone.text)} aria-hidden />
         <span>
           Read-only view of the <b className="text-foreground">{name}</b>{" "}
           subagent. To change direction, message the orchestrator.
@@ -110,7 +110,7 @@ export function SubagentView({
           <div
             className="mt-3 flex items-center gap-1.5 px-1 py-1 text-body-sm leading-5 text-muted-foreground"
           >
-            <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+            <span className="flex size-5 shrink-0 items-center justify-center">
               <AgentOrb
                 size={20}
                 {...subagentOrbActivity(subagent)}

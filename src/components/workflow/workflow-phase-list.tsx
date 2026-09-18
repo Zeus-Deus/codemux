@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 
 import { combinePhases, type CombinedPhase } from "./workflow-phases";
 import { findingTone, workflowAgentTone, workflowPhaseTone } from "./workflow-tone";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type AgentFilter = "all" | "running" | "issues";
 const AGENT_FILTERS: readonly AgentFilter[] = ["all", "running", "issues"];
@@ -108,7 +109,7 @@ function PhaseCard({
       ) : status === "pending" ? (
         <span className="h-[9px] w-[9px] rounded-full border-[1.6px] border-muted-foreground" aria-hidden />
       ) : (
-        <CheckCircle2 className={cn("h-[18px] w-[18px]", tone.text)} strokeWidth={1.8} aria-hidden />
+        <CheckCircle2 className={cn("h-[18px] w-[18px]", tone.text)} aria-hidden />
       )}
     </span>
   );
@@ -181,9 +182,9 @@ function PhaseAgents({
   return (
     <div className="border-t border-border/60 p-1.5">
       <div className="flex items-center gap-1.5 px-1.5 py-1">
-        <span className="font-mono text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Agents
-        </span>
+        </Eyebrow>
         <div className="ml-auto flex gap-1">
           {AGENT_FILTERS.map((f) => (
             <button
@@ -235,13 +236,13 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
       className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-surface-2"
       data-testid="workflow-agent-row"
     >
-      <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+      <span className="flex size-4 shrink-0 items-center justify-center">
         {agent.status === "running" ? (
-          <LoaderCircle className={cn("h-3.5 w-3.5 animate-spin", tone.text)} strokeWidth={2} aria-hidden />
+          <LoaderCircle className={cn("size-3.5 animate-spin", tone.text)} aria-hidden />
         ) : agent.status === "pending" ? (
           <span className="h-[7px] w-[7px] rounded-full border-[1.4px] border-muted-foreground" aria-hidden />
         ) : (
-          <CheckCircle2 className={cn("h-3.5 w-3.5", tone.text)} strokeWidth={2} aria-hidden />
+          <CheckCircle2 className={cn("size-3.5", tone.text)} aria-hidden />
         )}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">{label}</span>
@@ -255,7 +256,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
           {badge.label}
         </span>
       )}
-      <ChevronRight className="h-2.5 w-2.5 shrink-0 text-muted-foreground" strokeWidth={1.7} aria-hidden />
+      <ChevronRight className="size-3 shrink-0 text-muted-foreground" aria-hidden />
     </div>
   );
 }

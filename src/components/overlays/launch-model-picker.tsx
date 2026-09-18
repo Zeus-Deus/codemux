@@ -261,7 +261,7 @@ export function LaunchModelPicker({
           )}
         >
           <span className="max-w-[150px] truncate">{selectedModelLabel}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40 ml-auto" />
+          <ChevronDown className="size-3 opacity-40 ml-auto" />
         </button>
       </PopoverTrigger>
       <PopoverContent

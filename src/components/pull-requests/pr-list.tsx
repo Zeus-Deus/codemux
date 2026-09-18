@@ -377,7 +377,7 @@ export function PrList({
                   </span>
                   <span
                     className={cn(
-                      "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                      "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                       tzEyebrow,
                     )}
                   >
@@ -518,7 +518,7 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
       )}
       <span
         className={cn(
-          "font-mono font-semibold uppercase tracking-[0.07em] text-foreground/80",
+          "font-mono font-semibold uppercase tracking-eyebrow text-foreground/80",
           tzEyebrow,
         )}
       >

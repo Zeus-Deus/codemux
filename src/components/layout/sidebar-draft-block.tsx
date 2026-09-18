@@ -312,7 +312,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
                 aria-label={`${row.attachmentCount} attachment${row.attachmentCount === 1 ? "" : "s"}`}
                 className="flex shrink-0 items-center gap-0.5 text-caption tabular-nums text-muted-foreground/65"
               >
-                <Paperclip className="size-2.5" />
+                <Paperclip className="size-3" />
                 {row.attachmentCount}
               </span>
             )}
@@ -535,7 +535,7 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                   shape="square"
                 />
                 <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded-sm bg-sidebar text-accent-ember">
-                  <SquarePen className="size-2.5" />
+                  <SquarePen className="size-3" />
                 </span>
               </button>
             </TooltipTrigger>

@@ -50,6 +50,7 @@ import {
   partitionProjectScopes,
   visibleSettledProjects,
 } from "./project-scope-list";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 // Module-scoped stable empty array — returning a fresh `[]` literal
 // from a Zustand selector triggers React's "getSnapshot should be
@@ -480,7 +481,7 @@ function LocationControl({
             <Folder className="size-3.5 text-muted-foreground" />
           )}
           <span className="max-w-[140px] truncate">{label}</span>
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -498,9 +499,9 @@ function LocationControl({
             initials-style queries win and the Active/Settled split
             survives a search. cmdk still owns highlight + Enter. */}
         <Command shouldFilter={false} loop>
-          <div className="px-2.5 pb-1 pt-2 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
+          <Eyebrow className="px-2.5 pb-1 pt-2">
             Run in
-          </div>
+          </Eyebrow>
           <CommandInput
             placeholder="Search projects…"
             value={query}
@@ -618,7 +619,7 @@ function CheckoutControl({
             <Folder className="size-3 text-muted-foreground" />
           )}
           {isWorktree ? "New worktree" : "Current checkout"}
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -627,9 +628,9 @@ function CheckoutControl({
         side="top"
         onOpenAutoFocus={focusCmdkOnOpen}
       >
-        <div className="px-2 pb-1 pt-1 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
+        <Eyebrow className="px-2 pb-1 pt-1">
           Where should the agent work?
-        </div>
+        </Eyebrow>
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("current")}
@@ -844,7 +845,7 @@ function BranchControl({
           <span className="max-w-[160px] truncate font-mono text-foreground">
             {baseBranch || "…"}
           </span>
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -915,9 +916,9 @@ function BranchControl({
                         {branch.name}
                       </span>
                       {hasWorktree && (
-                        <span className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
+                        <Eyebrow className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-status-working">
                           WORKTREE
-                        </span>
+                        </Eyebrow>
                       )}
                       <span className="shrink-0 font-mono text-label text-muted-foreground/70">
                         {formatRelativeTime(branch.last_commit_unix)}

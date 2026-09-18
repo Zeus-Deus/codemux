@@ -26,6 +26,7 @@ import type { OrbActivity } from "@/lib/orb-state";
 import { cn } from "@/lib/utils";
 
 import { TickingText } from "./TickingText";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Which occupant leads the collapsed strip. Lower wins. */
 export const STRIP_PRIORITY = {
@@ -247,7 +248,7 @@ export function ComposerStrip({
         className={cn(STRIP_CHIP, "min-w-[26px] px-1.5 font-mono")}
       >
         {open ? (
-          <ChevronDown className="size-3" strokeWidth={2} aria-hidden />
+          <ChevronDown className="size-3" aria-hidden />
         ) : (
           `+${rest}`
         )}
@@ -556,7 +557,6 @@ function GoalRowView({
               Hide
               <ChevronDown
                 className="size-[9px] opacity-60"
-                strokeWidth={2.2}
                 aria-hidden
               />
             </button>
@@ -597,7 +597,6 @@ function GoalRowView({
                 <span className="font-mono">+{others}</span>
                 <ChevronUp
                   className="size-[9px] opacity-60"
-                  strokeWidth={2.2}
                   aria-hidden
                 />
               </button>
@@ -610,7 +609,7 @@ function GoalRowView({
                   onClick={onToggle}
                   className={GOAL_ICON_BUTTON}
                 >
-                  <ChevronUp className="size-2.5" strokeWidth={2} aria-hidden />
+                  <ChevronUp className="size-3" aria-hidden />
                 </button>
               )
             )}
@@ -631,9 +630,9 @@ function GoalRowView({
               data-testid="composer-strip-goal-sends"
               className="flex min-w-0 items-center gap-2 rounded-md border border-border/70 bg-surface-1 px-[9px] py-1.5"
             >
-              <span className="shrink-0 font-mono text-caption font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+              <Eyebrow className="shrink-0">
                 sends
-              </span>
+              </Eyebrow>
               <code
                 className="min-w-0 flex-1 truncate font-mono text-label text-accent-ember"
                 title={strip.resumePhrase}
@@ -659,7 +658,6 @@ function GoalRowView({
                   {jump.label}
                   <ChevronRight
                     className="size-[9px]"
-                    strokeWidth={2.2}
                     aria-hidden
                   />
                 </button>
@@ -714,7 +712,7 @@ function GoalOverflowMenu({ strip }: { strip: StripGoal }) {
           title="Goal actions"
           className={GOAL_ICON_BUTTON}
         >
-          <EllipsisVertical className="size-3" strokeWidth={2} aria-hidden />
+          <EllipsisVertical className="size-3" aria-hidden />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" side="top" className="w-[168px] p-1">
@@ -792,7 +790,6 @@ function StripMarkView({ mark }: { mark: StripMark }) {
       return (
         <Check
           className="size-4 text-status-open"
-          strokeWidth={1.8}
           aria-hidden
         />
       );
@@ -800,7 +797,6 @@ function StripMarkView({ mark }: { mark: StripMark }) {
       return (
         <Clock
           className="size-3.5 text-muted-foreground"
-          strokeWidth={1.8}
           aria-hidden
         />
       );
@@ -808,7 +804,6 @@ function StripMarkView({ mark }: { mark: StripMark }) {
       return (
         <CircleAlert
           className="size-4 text-danger"
-          strokeWidth={1.8}
           aria-hidden
         />
       );

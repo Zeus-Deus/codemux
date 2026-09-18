@@ -8,6 +8,7 @@
  */
 
 import { cn } from "@/lib/utils";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** In-section heading for grouped content (e.g. "AI Tools",
  *  "Detected editors"). Distinct from SectionHeader (which titles
@@ -27,9 +28,9 @@ export function SubsectionHeader({
   return (
     <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
-        <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+        <Eyebrow>
           {title}
-        </p>
+        </Eyebrow>
         {description && (
           <p className="text-body-sm text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
             {description}

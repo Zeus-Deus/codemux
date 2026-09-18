@@ -264,7 +264,7 @@ export function SidebarProjectGroup({
                 renders a Home glyph instead of a letter. */}
             {isHomeGroup ? (
               <div className="size-5 rounded-full border border-border bg-muted flex items-center justify-center shrink-0 mr-2.5">
-                <Home className="h-3 w-3 text-muted-foreground" />
+                <Home className="size-3 text-muted-foreground" />
               </div>
             ) : (
               <ProjectAvatar
@@ -298,7 +298,7 @@ export function SidebarProjectGroup({
                   aria-label="New workspace"
                   onClick={handlePlusClick}
                 >
-                  <Plus className="h-3.5 w-3.5 text-muted-foreground" />
+                  <Plus className="size-3.5 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" sideOffset={4} className="text-label">
@@ -310,7 +310,7 @@ export function SidebarProjectGroup({
             {/* Chevron stays visible as the only state cue */}
             <ChevronRight
               className={cn(
-                "h-3.5 w-3.5 text-muted-foreground/50 transition-transform duration-150 shrink-0",
+                "size-3.5 text-muted-foreground/50 transition-transform duration-150 shrink-0",
                 !collapsed && "rotate-90",
               )}
             />
@@ -318,15 +318,15 @@ export function SidebarProjectGroup({
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuItem onClick={handleRevealInFileManager}>
-            <FolderOpen className="mr-2 h-3.5 w-3.5" />
+            <FolderOpen className="mr-2 size-3.5" />
             Open in File Manager
           </ContextMenuItem>
           <ContextMenuItem onClick={handleCopyPath}>
-            <Clipboard className="mr-2 h-3.5 w-3.5" />
+            <Clipboard className="mr-2 size-3.5" />
             Copy Path
           </ContextMenuItem>
           <ContextMenuItem onClick={() => setShowImageDialog(true)}>
-            <ImageIcon className="mr-2 h-3.5 w-3.5" />
+            <ImageIcon className="mr-2 size-3.5" />
             {imageUrl ? "Change image…" : "Set image…"}
           </ContextMenuItem>
           <ContextMenuSub>
@@ -335,7 +335,7 @@ export function SidebarProjectGroup({
               <ContextMenuItem onClick={() => handleColorChange(null)}>
                 <span className="size-3.5 rounded-full border border-border bg-background shrink-0 mr-2" />
                 Default
-                {!customColor && <Check className="ml-auto h-3.5 w-3.5" />}
+                {!customColor && <Check className="ml-auto size-3.5" />}
               </ContextMenuItem>
               {PROJECT_COLORS.map((color) => (
                 <ContextMenuItem key={color.value} onClick={() => handleColorChange(color.value)}>
@@ -344,7 +344,7 @@ export function SidebarProjectGroup({
                     style={{ backgroundColor: color.value }}
                   />
                   {color.name}
-                  {customColor === color.value && <Check className="ml-auto h-3.5 w-3.5" />}
+                  {customColor === color.value && <Check className="ml-auto size-3.5" />}
                 </ContextMenuItem>
               ))}
             </ContextMenuSubContent>
@@ -426,9 +426,9 @@ export function SidebarProjectGroup({
           )}
         >
           {pw.status === "creating" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
+            <Loader2 className="size-3.5 animate-spin text-muted-foreground shrink-0" />
           ) : (
-            <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            <AlertCircle className="size-3.5 text-destructive shrink-0" />
           )}
           <span className="truncate text-muted-foreground text-label">
             {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}

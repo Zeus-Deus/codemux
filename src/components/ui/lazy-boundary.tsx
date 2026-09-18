@@ -95,7 +95,7 @@ export function LazyBoundary({
         {overlay && (
           <span
             aria-hidden
-            className="h-1.5 w-1.5 rounded-full bg-primary motion-safe:animate-pulse"
+            className="size-1.5 rounded-full bg-primary motion-safe:animate-pulse"
           />
         )}
         Loading {label}…
