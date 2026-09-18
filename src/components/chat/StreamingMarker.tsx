@@ -1,9 +1,12 @@
+import { ChevronRight } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
 
 import { AgentOrb } from "@/components/ui/agent-orb";
 import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { countRunningSubagents } from "@/lib/agent-chat/subagents";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
+import { cn } from "@/lib/utils";
+import { useUIStore } from "@/stores/ui-store";
 
 import { formatActivityDuration } from "./activity-steps";
 
@@ -18,9 +21,23 @@ import { formatActivityDuration } from "./activity-steps";
  * This is the thread's one live orb: it stands for the turn as a whole, so
  * individual tool-call rows above it stay still. There is one orb per live
  * thing.
+ *
+ * While the agent is waiting on background tasks, the label becomes a
+ * button that opens the Subagents panel, which lists those same tasks
+ * (subagents and background shell jobs). The line names the work, so it
+ * links to it.
  */
-export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
-  const label = deriveStreamingLabel(messages);
+export function StreamingMarker({
+  messages,
+  workspaceId,
+}: {
+  messages: ChatViewItem[];
+  workspaceId?: string | null;
+}) {
+  const { label, waiting } = useMemo(
+    () => deriveStreamingStatus(messages),
+    [messages],
+  );
   const activity = useMemo(() => turnOrbActivity(messages), [messages]);
   const startedAt = useMemo(() => deriveTurnStartedAt(messages), [messages]);
   const elapsedRef = useRef<HTMLSpanElement>(null);
@@ -53,7 +70,15 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
         <AgentOrb size={20} {...activity} aria-hidden />
       </span>
       <span className="flex min-w-0 items-baseline gap-1.5">
-        <span className="shimmer text-body font-semibold">{label}</span>
+        {waiting > 0 && workspaceId ? (
+          <WaitingLabel
+            label={label}
+            waiting={waiting}
+            workspaceId={workspaceId}
+          />
+        ) : (
+          <span className="shimmer text-body font-semibold">{label}</span>
+        )}
         {startedAt != null && (
           // Populated imperatively by the effect; render nothing when no
           // turn start is derivable (e.g. hydrated old transcripts) so the
@@ -69,32 +94,80 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
   );
 }
 
+/** The "Waiting on N background tasks…" label as a link to the Subagents
+ *  panel. The shimmer stays on the text so it still reads as live status.
+ *  A quiet `View ›` cue beside it matches the agents row in the transcript. */
+function WaitingLabel({
+  label,
+  waiting,
+  workspaceId,
+}: {
+  label: string;
+  waiting: number;
+  workspaceId: string;
+}) {
+  const selected = useUIStore(
+    (state) => state.rightPanelTabs[workspaceId] === "subagents",
+  );
+  const setRightPanelTab = useUIStore((state) => state.setRightPanelTab);
+  return (
+    <button
+      type="button"
+      onClick={() => setRightPanelTab(workspaceId, "subagents")}
+      aria-pressed={selected}
+      aria-label={`View ${waiting} background task${waiting === 1 ? "" : "s"}`}
+      className={cn(
+        "group/waiting -mx-1 flex min-w-0 items-baseline gap-1.5 rounded-md px-1 text-left transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+        selected && "bg-foreground/[0.055]",
+      )}
+    >
+      <span className="shimmer truncate text-body font-semibold">{label}</span>
+      <span className="flex shrink-0 items-center gap-0.5 self-center text-caption font-medium text-muted-foreground/70 transition-colors group-hover/waiting:text-foreground/80">
+        View
+        <ChevronRight
+          className="size-3 transition-transform group-hover/waiting:translate-x-0.5"
+          strokeWidth={1.7}
+          aria-hidden
+        />
+      </span>
+    </button>
+  );
+}
+
 /** Status line derived from the transcript tail. Running tool → "Running
  *  <tool>…", streaming prose → "Writing…", streaming reasoning →
  *  "Thinking…". A settled tail while background tasks (delegated
  *  subagents or background shell jobs) are still running is the agent
  *  waiting on them → "Waiting on N background tasks…"; otherwise the
- *  neutral "Working…". */
-export function deriveStreamingLabel(messages: ChatViewItem[]): string {
+ *  neutral "Working…". `waiting` is the number of background tasks being
+ *  waited on, and non-zero only for a "Waiting on…" label. */
+export function deriveStreamingStatus(messages: ChatViewItem[]): {
+  label: string;
+  waiting: number;
+} {
   const last = messages[messages.length - 1];
-  if (!last) return "Working…";
+  if (!last) return { label: "Working…", waiting: 0 };
   switch (last.kind) {
     case "tool_call":
-      if (last.status === "running") return `Running ${last.tool_name}…`;
+      if (last.status === "running") {
+        return { label: `Running ${last.tool_name}…`, waiting: 0 };
+      }
       break;
     case "assistant_message":
-      if (last.streaming) return "Writing…";
+      if (last.streaming) return { label: "Writing…", waiting: 0 };
       break;
     case "reasoning":
-      if (last.streaming) return "Thinking…";
+      if (last.streaming) return { label: "Thinking…", waiting: 0 };
       break;
     default:
       break;
   }
   const waiting = countRunningSubagents(messages, true);
-  if (waiting === 1) return "Waiting on a background task…";
-  if (waiting > 1) return `Waiting on ${waiting} background tasks…`;
-  return "Working…";
+  if (waiting === 1) return { label: "Waiting on a background task…", waiting };
+  if (waiting > 1) {
+    return { label: `Waiting on ${waiting} background tasks…`, waiting };
+  }
+  return { label: "Working…", waiting: 0 };
 }
 
 /**
