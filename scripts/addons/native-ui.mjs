@@ -50,7 +50,10 @@ function start(executable, args, options = {}) {
     output = (output + chunk).slice(-100000);
   });
   child.done = new Promise((done, fail) => {
-    child.once("error", fail);
+    child.once("error", (error) => {
+      owned.delete(child);
+      fail(error);
+    });
     child.once("exit", (code) => {
       owned.delete(child);
       done({ code, output });
@@ -240,10 +243,13 @@ async function openCommand(title) {
 }
 try {
   await run(application, ["login", "--token", token], { env });
-  driver = start("tauri-driver", ["--host", "127.0.0.1", "--port", "4444"], {
+  driver = start("tauri-driver", ["--port", "4444"], {
     env,
   });
-  await until("driver startup", () => request("GET", "/status"));
+  await until(
+    "driver startup",
+    async () => (await request("GET", "/status"))?.ready === true,
+  );
   const created = await request("POST", "/session", {
     capabilities: { alwaysMatch: { "tauri:options": { application } } },
   });
@@ -471,7 +477,7 @@ try {
   for (const child of owned) child.kill();
   if (driver) {
     const result = await Promise.race([
-      driver.done,
+      driver.done.catch((error) => ({ code: null, output: String(error) })),
       delay(3000).then(() => null),
     ]);
     if (result) await writeFile(join(evidenceDir, "driver.log"), result.output);
