@@ -201,16 +201,15 @@ export function ReasoningPicker({
               <Zap
                 aria-hidden
                 data-testid="fast-mode-indicator"
-                className="h-3.5 w-3.5 fill-current text-foreground/80"
-                strokeWidth={1.5}
+                className="size-3.5 fill-current text-foreground/80"
               />
             ) : reasoningLabel ? (
-              <Brain className="h-4 w-4" />
+              <Brain className="size-4" />
             ) : null}
             {!(iconOnly && (fastMode || reasoningLabel)) && (
               <span className="max-w-[200px] truncate">{triggerLabel}</span>
             )}
-            <ChevronDown className="h-3 w-3 opacity-50" />
+            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent
@@ -246,7 +245,7 @@ export function ReasoningPicker({
                       className="h-auto gap-2 py-2"
                     >
                       <div className="flex flex-1 flex-col min-w-0">
-                        <span className="text-xs text-foreground truncate">
+                        <span className="text-label text-foreground truncate">
                           {title}
                           {isDefault ? (
                             <span className="ml-1.5 text-muted-foreground/60">
@@ -262,7 +261,7 @@ export function ReasoningPicker({
                       </div>
                       <Check
                         className={cn(
-                          "h-3.5 w-3.5 text-muted-foreground",
+                          "size-3.5 text-muted-foreground",
                           currentEffort === level
                             ? "opacity-100"
                             : "opacity-0",
@@ -290,7 +289,7 @@ export function ReasoningPicker({
                       onSelect={() => onContextWindowChange(option.value)}
                       className="h-9 gap-2 py-2"
                     >
-                      <span className="flex-1 min-w-0 truncate text-xs text-foreground">
+                      <span className="flex-1 min-w-0 truncate text-label text-foreground">
                         {option.label}
                         {isDefault ? (
                           <span className="ml-1.5 text-muted-foreground/60">
@@ -300,7 +299,7 @@ export function ReasoningPicker({
                       </span>
                       <Check
                         className={cn(
-                          "h-3.5 w-3.5 text-muted-foreground",
+                          "size-3.5 text-muted-foreground",
                           currentContextWindow === option.value
                             ? "opacity-100"
                             : "opacity-0",
@@ -324,7 +323,7 @@ export function ReasoningPicker({
                   className="h-auto gap-2 py-2"
                 >
                   <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-xs text-foreground">
+                    <span className="text-label text-foreground">
                       Standard
                       <span className="ml-1.5 text-muted-foreground/60">
                         (default)
@@ -336,7 +335,7 @@ export function ReasoningPicker({
                   </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
+                      "size-3.5 text-muted-foreground",
                       fastMode ? "opacity-0" : "opacity-100",
                     )}
                   />
@@ -347,14 +346,14 @@ export function ReasoningPicker({
                   className="h-auto gap-2 py-2"
                 >
                   <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-xs text-foreground">Fast</span>
+                    <span className="text-label text-foreground">Fast</span>
                     <span className="text-label text-muted-foreground/80">
                       Faster output at a premium usage rate
                     </span>
                   </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
+                      "size-3.5 text-muted-foreground",
                       fastMode ? "opacity-100" : "opacity-0",
                     )}
                   />

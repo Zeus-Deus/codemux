@@ -50,6 +50,7 @@ import {
   partitionProjectScopes,
   visibleSettledProjects,
 } from "./project-scope-list";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 // Module-scoped stable empty array — returning a fresh `[]` literal
 // from a Zustand selector triggers React's "getSnapshot should be
@@ -57,12 +58,12 @@ import {
 const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
 
 const GHOST_BTN =
-  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground outline-none transition-colors hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
 
 /** Location-picker row geometry, shared by the Home row and the project
  *  rows so both sections line up on the same baseline. */
 const PICKER_ITEM =
-  "flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground";
+  "flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-label font-medium text-foreground";
 /** Tints `CommandItem`'s built-in trailing check (its last child) to the
  *  accent the location picker has always used for "this is the current
  *  target". Falls back to the neutral check if the selector ever stops
@@ -480,7 +481,7 @@ function LocationControl({
             <Folder className="size-3.5 text-muted-foreground" />
           )}
           <span className="max-w-[140px] truncate">{label}</span>
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -498,14 +499,14 @@ function LocationControl({
             initials-style queries win and the Active/Settled split
             survives a search. cmdk still owns highlight + Enter. */}
         <Command shouldFilter={false} loop>
-          <div className="px-2.5 pb-1 pt-2 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
+          <Eyebrow className="px-2.5 pb-1 pt-2">
             Run in
-          </div>
+          </Eyebrow>
           <CommandInput
             placeholder="Search projects…"
             value={query}
             onValueChange={setQuery}
-            className="text-xs"
+            className="text-label"
           />
           <CommandList
             className="max-h-[280px] min-h-0 flex-1 overflow-y-auto p-1.5 pb-0 [scrollbar-width:thin]"
@@ -577,7 +578,7 @@ function LocationControl({
                   handleSelectProject(result.path);
                 }
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
               <FolderPlus className="size-3.5" />
               Open another project…
@@ -618,7 +619,7 @@ function CheckoutControl({
             <Folder className="size-3 text-muted-foreground" />
           )}
           {isWorktree ? "New worktree" : "Current checkout"}
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -627,18 +628,18 @@ function CheckoutControl({
         side="top"
         onOpenAutoFocus={focusCmdkOnOpen}
       >
-        <div className="px-2 pb-1 pt-1 font-mono text-caption font-semibold uppercase tracking-wide text-muted-foreground">
+        <Eyebrow className="px-2 pb-1 pt-1">
           Where should the agent work?
-        </div>
+        </Eyebrow>
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("current")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <Folder className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
-              <span className="text-xs font-semibold text-foreground">
+              <span className="text-label font-semibold text-foreground">
                 Current checkout
               </span>
               {isCurrent && (
@@ -654,12 +655,12 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("worktree")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
-              <span className="text-xs font-semibold text-foreground">
+              <span className="text-label font-semibold text-foreground">
                 New worktree
               </span>
               {isWorktree && (
@@ -844,7 +845,7 @@ function BranchControl({
           <span className="max-w-[160px] truncate font-mono text-foreground">
             {baseBranch || "…"}
           </span>
-          <ChevronDown className="size-2.5 opacity-45" />
+          <ChevronDown className="size-3 opacity-45" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -859,7 +860,7 @@ function BranchControl({
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
                 filterMode === "all"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -871,7 +872,7 @@ function BranchControl({
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
                 filterMode === "worktrees"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -903,7 +904,7 @@ function BranchControl({
                       key={branch.name}
                       value={branch.name}
                       onSelect={() => handleSelect(branch.name)}
-                      className="h-8 gap-2 px-2 text-xs"
+                      className="h-8 gap-2 px-2 text-label"
                       data-checked={active ? "true" : undefined}
                     >
                       <BranchRowIcon
@@ -915,9 +916,9 @@ function BranchControl({
                         {branch.name}
                       </span>
                       {hasWorktree && (
-                        <span className="shrink-0 rounded bg-status-working/15 px-1.5 py-0.5 text-micro font-bold uppercase tracking-wide text-status-working">
+                        <Eyebrow className="shrink-0 rounded-sm bg-status-working/15 px-1.5 py-0.5 text-status-working">
                           WORKTREE
-                        </span>
+                        </Eyebrow>
                       )}
                       <span className="shrink-0 font-mono text-label text-muted-foreground/70">
                         {formatRelativeTime(branch.last_commit_unix)}

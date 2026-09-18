@@ -20,6 +20,7 @@ import {
 } from "@/stores/synced-settings-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dockBrowserInRightPanel } from "@/tauri/commands";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /** Fallback pinned viewport for the "Desktop-size background browser"
  *  setting when no `browser.default_viewport` is configured. Matches
@@ -134,11 +135,11 @@ export function BrowserPeekOverlay() {
       aria-label="Background browser preview"
       className={cn(
         "absolute right-3.5 top-3.5 z-30 flex h-[300px] w-[440px] flex-col overflow-hidden",
-        "rounded-xl border border-border bg-popover shadow-2xl",
+        "rounded-lg border border-border bg-popover shadow-2xl",
         "animate-in fade-in slide-in-from-top-1 duration-150 ease-out",
       )}
     >
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2.5">
+      <PanelHeader>
         <span
           className="h-[7px] w-[7px] shrink-0 rounded-full bg-status-open"
           aria-hidden
@@ -152,9 +153,9 @@ export function BrowserPeekOverlay() {
               type="button"
               onClick={handlePromote}
               aria-label="Open in side panel"
-              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.09] hover:text-foreground"
+              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
-              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+              <ExternalLink className="size-3.5" aria-hidden />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>
@@ -165,11 +166,11 @@ export function BrowserPeekOverlay() {
           type="button"
           onClick={() => close(activeWorkspaceId)}
           aria-label="Close preview"
-          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.09] hover:text-foreground"
+          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
         >
-          <X className="h-3.5 w-3.5" aria-hidden />
+          <X className="size-3.5" aria-hidden />
         </button>
-      </div>
+      </PanelHeader>
       <div className="min-h-0 flex-1">
         <BrowserPane
           browserId={session.cli_session_name}

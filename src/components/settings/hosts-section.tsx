@@ -31,6 +31,7 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Settings → Hosts (Step 2 of cloud-push).
@@ -328,7 +329,7 @@ export function HostsSection() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+      <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
         Loading hosts…
       </div>
@@ -340,9 +341,9 @@ export function HostsSection() {
       {/* Sidebar */}
       <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
         <div className="mb-3 flex items-end justify-between gap-2">
-          <p className="text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+          <Eyebrow>
             Hosts
-          </p>
+          </Eyebrow>
           <span className="text-label text-muted-foreground/60 tabular-nums">
             {hosts.length}
           </span>
@@ -481,7 +482,6 @@ export function HostsSection() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-7 px-3 text-body-sm"
                   onClick={() => {
                     setDraft(null);
                     setDraftKind(null);
@@ -494,7 +494,6 @@ export function HostsSection() {
                   type="button"
                   variant="secondary"
                   size="sm"
-                  className="h-7 px-3 text-body-sm"
                   onClick={handleAdd}
                 >
                   Add
@@ -506,7 +505,7 @@ export function HostsSection() {
               type="button"
               variant="ghost"
               size="sm"
-              className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
               onClick={() => {
                 setDraft({ name: "", ssh_target: "" });
                 setDraftKind(null);
@@ -575,7 +574,6 @@ export function HostsSection() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={handleCancelEdit}
               >
                 <X className="size-3.5" />
@@ -585,7 +583,6 @@ export function HostsSection() {
                 type="button"
                 variant="secondary"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={handleSaveEdit}
               >
                 <Check className="size-3.5" />
@@ -599,9 +596,9 @@ export function HostsSection() {
               <div className="mb-1 flex items-center gap-2">
                 <h3 className="text-body-lg font-semibold tracking-tight text-foreground">{selected.name}</h3>
                 {selected.dirty && (
-                  <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-caption font-medium uppercase tracking-wider text-warning">
+                  <Eyebrow className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-warning">
                     Pending sync
-                  </span>
+                  </Eyebrow>
                 )}
               </div>
               <p className="select-text font-mono text-body-sm text-muted-foreground/85">
@@ -621,7 +618,7 @@ export function HostsSection() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="h-8 text-body-sm gap-1.5 shrink-0"
+                  className="shrink-0"
                   disabled={testingId === selected.id}
                   onClick={() => void handleTestConnection(selected)}
                 >
@@ -661,7 +658,6 @@ export function HostsSection() {
                         type="button"
                         variant="secondary"
                         size="sm"
-                        className="h-8 text-body-sm"
                         disabled={installingId === selected.id}
                         onClick={() =>
                           void handleInstallRemote(
@@ -703,7 +699,7 @@ export function HostsSection() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="h-8 text-body-sm gap-1.5 shrink-0"
+                  className="shrink-0"
                   disabled={reinstallingId === selected.id}
                   onClick={() => void handleReinstallRemote(selected)}
                 >
@@ -727,7 +723,6 @@ export function HostsSection() {
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={() => handleStartEdit(selected)}
               >
                 <Pencil className="size-3.5" />
@@ -737,7 +732,7 @@ export function HostsSection() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                 onClick={() => void handleDelete(selected)}
               >
                 <Trash2 className="size-3.5" />

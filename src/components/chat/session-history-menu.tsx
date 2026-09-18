@@ -13,6 +13,7 @@ import {
   agentChatListSessions,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 const LIST_LIMIT = 50;
 
@@ -132,24 +133,24 @@ export function SessionHistoryList({
         }}
         data-testid="session-selector-new-chat"
       >
-        <Plus className="h-3.5 w-3.5" />
+        <Plus className="size-3.5" />
         New Chat
       </DropdownMenuItem>
       {footerItem}
       <DropdownMenuSeparator />
       {loading && sessions.length === 0 && (
-        <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+        <div className="px-2 py-4 text-center text-label text-muted-foreground">
           Loading…
         </div>
       )}
       {!loading && sessions.length === 0 && (
-        <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+        <div className="px-2 py-4 text-center text-label text-muted-foreground">
           No previous chats
         </div>
       )}
       {buckets.map((bucket) => (
         <div key={bucket.key}>
-          <DropdownMenuLabel className="text-caption uppercase tracking-wider text-muted-foreground/70">
+          <DropdownMenuLabel className={eyebrowVariants({ tone: "muted" })}>
             {bucket.label}
           </DropdownMenuLabel>
           {bucket.sessions.map((session) => (
@@ -200,7 +201,7 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
       )}
       data-testid={`session-row-${session.thread_id}`}
     >
-      <span className="flex-1 truncate text-xs">
+      <span className="flex-1 truncate text-label">
         {sessionDisplayTitle(session)}
       </span>
       <button
@@ -208,14 +209,14 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
         aria-label="Delete chat"
         data-session-delete
         data-testid={`session-delete-${session.thread_id}`}
-        className="rounded p-1 opacity-0 transition-opacity hover:bg-destructive/20 group-hover/row:opacity-100"
+        className="rounded-sm p-1 opacity-0 transition-opacity hover:bg-destructive/20 group-hover/row:opacity-100"
         onClick={(e) => {
           e.stopPropagation();
           e.preventDefault();
           onDelete();
         }}
       >
-        <Trash2 className="h-3 w-3" />
+        <Trash2 className="size-3" />
       </button>
     </DropdownMenuItem>
   );

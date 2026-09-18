@@ -362,9 +362,10 @@ impl AgentProvider for ClaudeAgentProvider {
 
     async fn turn_active(&self, thread_id: &ThreadId) -> bool {
         // Cheap in-memory check for the frontend hydrate path: a live
-        // (non-dead) session bound to the thread with `active_turn` set. Does
-        // not touch the sidecar. A dead session (watchdog fired) reports false
-        // even if a turn was mid-flight when the child exited.
+        // (non-dead) session bound to the thread that is mid-turn or parked
+        // on a pending request (see `turn_busy`). Does not touch the sidecar.
+        // A dead session (watchdog fired) reports false even if a turn was
+        // mid-flight when the child exited.
         let session = {
             let sessions = self.sessions.read().await;
             sessions.get(thread_id).cloned()
@@ -376,7 +377,7 @@ impl AgentProvider for ClaudeAgentProvider {
             return false;
         }
         let state = session.state.lock().await;
-        state.active_turn.is_some()
+        state.turn_busy()
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

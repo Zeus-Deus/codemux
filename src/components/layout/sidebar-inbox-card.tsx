@@ -380,7 +380,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           data-workspace-working-icon
           aria-hidden
           className="size-3.5"
-          strokeWidth={2}
         />
       )}
       {isNeeds && (
@@ -391,7 +390,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       {isMonitoring && (
         <span className="size-1.5 rounded-full bg-status-monitoring" />
       )}
-      {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
+      {isDone && <Check className="size-3" />}
       {isWorking ? (
         <>
           {/* Keep only the stable label in the live region. The elapsed value
@@ -501,7 +500,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 selectAndActivate();
               }}
               className={cn(
-                "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
+                "group/card relative mb-1.5 cursor-pointer rounded-lg border px-[11px] pt-[9px] pb-[10px]",
                 // select-none: a shift-click range gesture would otherwise
                 // drag a text highlight across every card it spans.
                 "select-none outline-none duration-150",
@@ -511,10 +510,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // the rise-in keyframe — with nothing here to fight it.
                 "transition-[color,background-color,border-color]",
                 isActive
-                  ? "border-border bg-foreground/[0.09]"
+                  ? "border-border bg-surface-3"
                   : isNeeds
-                    ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
-                    : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
+                    ? "border-status-attention/30 bg-transparent hover:bg-surface-2"
+                    : "border-transparent bg-transparent hover:bg-surface-2 focus-visible:border-border",
                 // Multi-select layers a ring over whatever the card already
                 // is, so "checked for a bulk action" never has to compete with
                 // "this is the workspace you're looking at" for the same
@@ -593,7 +592,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       "text-caption font-semibold leading-[15px] text-status-open",
                     )}
                   >
-                    <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    <AlarmClock className="size-3" />
                     Woke
                   </span>
                 )}
@@ -631,9 +630,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={eyebrowGlyphClass}
                   >
                     {pinned ? (
-                      <PinOff className="size-3" strokeWidth={1.5} />
+                      <PinOff className="size-3" />
                     ) : (
-                      <Pin className="size-3" strokeWidth={1.5} />
+                      <Pin className="size-3" />
                     )}
                   </button>
                 {canSnooze && (
@@ -649,7 +648,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         title="Snooze"
                         className={eyebrowGlyphClass}
                       >
-                        <AlarmClock className="size-3" strokeWidth={1.5} />
+                        <AlarmClock className="size-3" />
                       </button>
                     </DropdownMenuTrigger>
                     {/* Radix portals this into document.body, but React events
@@ -668,7 +667,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       {snoozePresets.map((preset) => (
                         <DropdownMenuItem
                           key={preset.id}
-                          className="gap-4 text-xs"
+                          className="gap-4 text-label"
                           onSelect={() =>
                             onSnooze(workspace.workspace_id, preset.at)
                           }
@@ -703,7 +702,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         "transition-colors duration-150 hover:text-foreground",
                       )}
                     >
-                      <Check className="size-[11px]" strokeWidth={2.1} />
+                      <Check className="size-[11px]" />
                       Settle
                     </button>
                   )}
@@ -717,7 +716,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   <kbd
                     aria-hidden="true"
                     className={cn(
-                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
+                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-sm px-1",
                       "border border-border/80 bg-background/80 font-mono text-caption font-semibold leading-none tabular-nums text-foreground/80",
                       "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
                       "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
@@ -853,7 +852,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         : `${scProvider.nounTitle} — ${prState}`
                     }
                     className={cn(
-                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded-sm px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(
@@ -862,7 +861,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           )
                         : prStatusTextClass(prState),
                       workspace.pr_url
-                        ? "hover:bg-foreground/[0.055]"
+                        ? "hover:bg-surface-2"
                         : // `cursor-default`, not `pointer-events-none`: the
                           // chip is already `disabled`, so it swallows the
                           // click. Letting pointer events pass through instead
@@ -916,7 +915,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           : "text-status-open",
                       )}
                     >
-                      <Terminal className="size-3" strokeWidth={1.7} />
+                      <Terminal className="size-3" />
                     </span>
                   )}
                   {providers.map((p) => (
@@ -924,7 +923,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       key={p}
                       provider={p}
                       className={cn(
-                        "h-3.5 w-3.5 transition-[opacity,filter]",
+                        "size-3.5 transition-[opacity,filter]",
                         visuallyReceded
                           ? "opacity-35 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
                           : "opacity-80",
@@ -945,7 +944,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-caption font-bold text-muted-foreground",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
                         "transition-opacity duration-150",
                         visuallyReceded &&
                           "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",

@@ -25,7 +25,7 @@ import {
 export const WORK_LOG_HISTORY_WINDOW = 10;
 
 const ROW_CLASS =
-  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
+  "flex w-full min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-body-sm leading-5 transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70";
 
 type OrbActivity = ReturnType<typeof turnOrbActivity>;
 
@@ -317,7 +317,7 @@ function SubagentRunRow({
       className={cn(
         ROW_CLASS,
         "group/subagents disabled:cursor-default",
-        selected && "bg-foreground/[0.055]",
+        selected && "bg-surface-3",
       )}
     >
       <span className="flex size-5 shrink-0 items-center justify-center">
@@ -336,7 +336,6 @@ function SubagentRunRow({
         View
         <ChevronRight
           className="size-3 transition-transform group-hover/subagents:translate-x-0.5"
-          strokeWidth={1.7}
           aria-hidden
         />
       </span>
@@ -349,13 +348,12 @@ function StepGlyph({ status }: { status: StepStatus }) {
     return (
       <LoaderCircle
         className="size-3 animate-spin text-muted-foreground/70"
-        strokeWidth={1.8}
         aria-hidden
       />
     );
   }
   if (status === "error") {
-    return <X className="size-3 text-status-attention" strokeWidth={2} aria-hidden />;
+    return <X className="size-3 text-status-attention" aria-hidden />;
   }
-  return <Check className="size-3 text-status-open" strokeWidth={2} aria-hidden />;
+  return <Check className="size-3 text-status-open" aria-hidden />;
 }

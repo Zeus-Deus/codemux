@@ -8,6 +8,7 @@ import type { SortOption } from "./types";
 import { formatCpu, formatMemory } from "./utils/formatters";
 import { getUsageSeverity } from "./utils/resource-severity";
 import { UsageSeverityBadge } from "./UsageSeverityBadge";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 const METRIC_COLS = "flex items-center shrink-0 tabular-nums tracking-tight";
 const CPU_COL = "w-12 text-right";
@@ -135,20 +136,20 @@ export function WorkspaceResourceSection({
         <button
           type="button"
           onClick={() => toggleProject(project.projectId)}
-          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-foreground/[0.04] transition-colors"
+          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-surface-2 transition-colors"
           aria-label={isProjectCollapsed ? "Expand project" : "Collapse project"}
         >
           <div className="flex items-center gap-1 min-w-0 mr-2">
-            <span className="flex items-center justify-center h-4 w-4 shrink-0 text-muted-foreground/70 group-hover:text-muted-foreground transition-colors">
+            <span className="flex items-center justify-center size-4 shrink-0 text-muted-foreground/70 group-hover:text-muted-foreground transition-colors">
               {isProjectCollapsed ? (
-                <ChevronRight className="h-3 w-3" />
+                <ChevronRight className="size-3" />
               ) : (
-                <ChevronDown className="h-3 w-3" />
+                <ChevronDown className="size-3" />
               )}
             </span>
-            <span className="text-label font-semibold uppercase tracking-[0.04em] truncate min-w-0 text-muted-foreground">
+            <Eyebrow className="truncate min-w-0">
               {project.projectName}
-            </span>
+            </Eyebrow>
             <UsageSeverityBadge severity={projectSeverity} />
           </div>
           <div className={cn(METRIC_COLS, "text-body-sm text-foreground/90")}>
@@ -165,7 +166,7 @@ export function WorkspaceResourceSection({
 
             return (
               <div key={workspace.workspace_id}>
-                <div className="group flex items-center hover:bg-foreground/[0.04] transition-colors">
+                <div className="group flex items-center hover:bg-surface-2 transition-colors">
                   {hasSessions ? (
                     <button
                       type="button"
@@ -176,9 +177,9 @@ export function WorkspaceResourceSection({
                       }
                     >
                       {isCollapsed ? (
-                        <ChevronRight className="h-3 w-3" />
+                        <ChevronRight className="size-3" />
                       ) : (
-                        <ChevronDown className="h-3 w-3" />
+                        <ChevronDown className="size-3" />
                       )}
                     </button>
                   ) : (
@@ -215,10 +216,10 @@ export function WorkspaceResourceSection({
                         type="button"
                         key={session.session_id}
                         onClick={() => navigateToSession(session.session_id)}
-                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-foreground/[0.04] transition-colors text-left"
+                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-surface-2 transition-colors text-left"
                       >
                         <div className="flex items-center gap-1.5 min-w-0 mr-2">
-                          <span className="h-1 w-1 shrink-0 rounded-full bg-muted-foreground/40" />
+                          <span className="size-1 shrink-0 rounded-full bg-muted-foreground/40" />
                           <span className="text-label text-muted-foreground truncate min-w-0">
                             {getSessionName(session)}
                           </span>

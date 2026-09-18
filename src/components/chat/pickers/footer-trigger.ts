@@ -12,7 +12,7 @@
  *  identical either way — the same 34px as the attach / send circles, so
  *  every control sits concentric inside the 44px composer pill. */
 export const FOOTER_TRIGGER =
-  "inline-flex h-[34px] shrink-0 items-center gap-2 rounded-lg px-2.5 text-sm font-medium leading-5 text-muted-foreground transition-colors outline-none hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-50";
+  "inline-flex h-[34px] shrink-0 items-center gap-2 rounded-lg px-2.5 text-body font-medium leading-5 text-muted-foreground transition-colors outline-none hover:bg-surface-2 hover:text-foreground disabled:opacity-50";
 
 /** A model label's leaf name — what the composer's narrow width ladder
  *  shows instead of the full label: the last `/` segment of routed ids

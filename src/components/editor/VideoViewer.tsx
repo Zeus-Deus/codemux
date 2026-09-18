@@ -31,10 +31,9 @@ export function VideoViewer({ filePath }: Props) {
           <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
             <VideoOff
               className="size-[18px] text-muted-foreground/60"
-              strokeWidth={1.5}
             />
           </div>
-          <p className="text-xs font-medium text-foreground">Can’t play this video</p>
+          <p className="text-label font-medium text-foreground">Can’t play this video</p>
           <p className="mt-1.5 break-all font-mono text-label leading-[1.55] text-muted-foreground">
             {filePath}
           </p>
@@ -66,7 +65,6 @@ export function VideoViewer({ filePath }: Props) {
         >
           <LoaderCircle
             className="size-[18px] animate-spin text-white/60"
-            strokeWidth={1.5}
             aria-label="Loading video"
           />
         </div>

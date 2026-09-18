@@ -924,13 +924,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (
               <>
-                <Globe className="h-8 w-8 text-muted-foreground/30 mb-2" />
-                <p className="text-xs text-destructive">{errorMsg || "Connection failed"}</p>
+                <Globe className="size-8 text-muted-foreground/30 mb-2" />
+                <p className="text-label text-destructive">{errorMsg || "Connection failed"}</p>
               </>
             ) : (
               <>
-                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground mb-2" />
-                <p className="text-xs text-muted-foreground">
+                <Loader2 className="size-6 animate-spin text-muted-foreground mb-2" />
+                <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
                   {status === "waiting" && "Waiting for first frame..."}
@@ -946,12 +946,12 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           >
             {status === "error" ? (
               <>
-                <Globe className="h-3 w-3 text-destructive" />
+                <Globe className="size-3 text-destructive" />
                 <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>
               </>
             ) : (
               <>
-                <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                <Loader2 className="size-3 animate-spin text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}

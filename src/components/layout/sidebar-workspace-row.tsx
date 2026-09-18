@@ -124,6 +124,7 @@ import { useDefaultBranch } from "./default-branch-cache";
 import { useDetectedEditors } from "@/stores/editor-discovery-store";
 import { computeSnoozePresets } from "./sidebar-snooze";
 import { useUIStore } from "@/stores/ui-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -204,7 +205,7 @@ export function DeleteWorktreeDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
-          <DialogTitle className="text-sm">
+          <DialogTitle className="text-body">
             Delete worktree &ldquo;{workspace.title}&rdquo;?
           </DialogTitle>
           <DialogDescription>
@@ -214,8 +215,8 @@ export function DeleteWorktreeDialog({
         </DialogHeader>
 
         {(forceMessage !== null || hasWarnings) && (
-          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
+            <AlertTriangle className="size-3.5 shrink-0" />
             {forceMessage ?? warningMessage}
           </div>
         )}
@@ -225,9 +226,9 @@ export function DeleteWorktreeDialog({
             type="checkbox"
             checked={deleteBranch}
             onChange={(e) => setDeleteBranch(e.target.checked)}
-            className="rounded border-border"
+            className="rounded-sm border-border"
           />
-          <span className="text-xs text-muted-foreground">
+          <span className="text-label text-muted-foreground">
             Also delete local branch
           </span>
         </label>
@@ -236,7 +237,6 @@ export function DeleteWorktreeDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -244,7 +244,6 @@ export function DeleteWorktreeDialog({
           <Button
             variant="destructive"
             size="sm"
-            className="h-7 px-3 text-xs"
             onClick={() => void confirm()}
           >
             {forceMessage !== null ? "Force delete" : "Delete"}
@@ -352,7 +351,7 @@ function MenuProjectAvatar({ project }: { project: MenuProject }) {
       imageUrl={appearance.imageUrl}
       cacheBust={appearance.imageVersion}
       shape="square"
-      className="size-[23px] rounded-[7px] text-label font-semibold"
+      className="size-[23px] rounded-md text-label font-semibold"
     />
   );
 }
@@ -386,7 +385,7 @@ function WorkspaceMenuHeader({
         <ProjectAvatar
           name={workspace.title}
           shape="square"
-          className="size-[23px] rounded-[7px] text-label font-semibold"
+          className="size-[23px] rounded-md text-label font-semibold"
         />
       )}
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -866,7 +865,7 @@ export function WorkspaceContextMenuItems({
             "ml-auto flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors",
             workspace.notifications_muted
               ? "justify-end bg-accent-ember/70"
-              : "bg-foreground/15",
+              : "bg-surface-3",
           )}
         >
           <span
@@ -1107,15 +1106,15 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   );
   const sidebarElapsedSec = useElapsedSeconds(inFlightStartedAt);
   const icon = isPushOrPullInFlight ? (
-    <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
+    <Loader2 className="size-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
-    <Cloud className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <Cloud className="size-3.5 shrink-0 text-muted-foreground" />
   ) : isPrimary ? (
-    <Laptop className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <Laptop className="size-3.5 shrink-0 text-muted-foreground" />
   ) : showWorkspaceIconAsPr ? (
     <PrStatusIcon state={workspace.pr_state} size={3.5} />
   ) : (
-    <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
   );
 
   const prHumanState = humanizePrState(workspace.pr_state);
@@ -1280,12 +1279,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
             onClick={handleActivate}
             onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleActivate(); }}
             className={cn(
-              "group/row mx-1.5 flex pl-[18px] pr-2 text-sm cursor-pointer relative transition-colors",
+              "group/row mx-1.5 flex pl-[18px] pr-2 text-body cursor-pointer relative transition-colors",
               // Cards (working / needs-you / done) gain a soft container and a
               // touch more vertical breathing room; idle rows keep today's
               // compact one-liner treatment.
               isCard
-                ? "py-1.5 rounded-[10px] border"
+                ? "py-1.5 rounded-lg border"
                 : "py-1 rounded-lg hover:bg-muted/40",
               isWorking && "border-border/60 bg-muted/30",
               isPermission && "border-status-attention/25 bg-status-attention/5",
@@ -1319,14 +1318,14 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                               : `Open ${provider.noun} on ${provider.name} — ${prHumanState ?? ""}`
                           }
                           className={cn(
-                            "inline-flex items-center justify-center rounded transition-opacity",
+                            "inline-flex items-center justify-center rounded-sm transition-opacity",
                             workspace.pr_url ? "hover:opacity-70" : "cursor-not-allowed opacity-60",
                           )}
                         >
                           {icon}
                         </button>
                       </TooltipTrigger>
-                      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                      <TooltipContent side="bottom" sideOffset={4} className="text-label">
                         {prHumanState
                           ? `${prHumanState} ${provider.shortNoun}`
                           : provider.nounTitle}
@@ -1409,11 +1408,11 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <BellOff
-                        className="h-3 w-3 shrink-0 text-muted-foreground/60"
+                        className="size-3 shrink-0 text-muted-foreground/60"
                         aria-label="Notifications muted"
                       />
                     </TooltipTrigger>
-                    <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                    <TooltipContent side="bottom" sideOffset={4} className="text-label">
                       Agent notifications muted
                     </TooltipContent>
                   </Tooltip>
@@ -1454,14 +1453,14 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           align="start"
                           className="w-64 p-2"
                         >
-                          <div className="mb-1.5 font-mono text-caption uppercase tracking-wide text-muted-foreground/70">
+                          <Eyebrow className="mb-1.5">
                             Shipped from this workspace
-                          </div>
+                          </Eyebrow>
                           <ul className="space-y-1">
                             {shipped?.map((r) => (
                               <li
                                 key={r.prNumber}
-                                className="flex items-baseline gap-1.5 text-xs"
+                                className="flex items-baseline gap-1.5 text-label"
                               >
                                 <span className="shrink-0 font-mono text-muted-foreground tabular-nums">
                                   #{r.issueNumber ?? r.prNumber}
@@ -1550,12 +1549,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       tunnel (reconnecting / circuit-open). A healthy or local
                       workspace shows nothing here. */}
                   {tunnelKind === "reconnecting" && (
-                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-warning bg-warning/15">
+                    <span className="shrink-0 rounded-sm px-1 text-caption leading-[14px] text-warning bg-warning/15">
                       Reconnecting…
                     </span>
                   )}
                   {tunnelKind === "lost" && (
-                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-danger bg-danger/15">
+                    <span className="shrink-0 rounded-sm px-1 text-caption leading-[14px] text-danger bg-danger/15">
                       Connection lost — re-push
                     </span>
                   )}
@@ -1626,11 +1625,11 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <BellOff
-                              className="h-3 w-3 text-muted-foreground/60"
+                              className="size-3 text-muted-foreground/60"
                               aria-label="Notifications muted"
                             />
                           </TooltipTrigger>
-                          <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                          <TooltipContent side="bottom" sideOffset={4} className="text-label">
                             Agent notifications muted
                           </TooltipContent>
                         </Tooltip>
@@ -1674,9 +1673,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               }
             >
               {isAttachOrRemote ? (
-                <X className="h-3.5 w-3.5" />
+                <X className="size-3.5" />
               ) : (
-                <Archive className="h-3.5 w-3.5" />
+                <Archive className="size-3.5" />
               )}
             </Button>
           </div>

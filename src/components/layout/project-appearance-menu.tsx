@@ -85,7 +85,7 @@ export function ProjectAppearanceMenu({
         <span
           aria-hidden
           className={cn(
-            "size-[9px] shrink-0 rounded-[3px]",
+            "size-[9px] shrink-0 rounded-sm",
             !selected && "bg-foreground/20",
           )}
           style={selected ? { backgroundColor: selected.value } : undefined}
@@ -127,7 +127,7 @@ export function ProjectAppearanceMenu({
           <span
             aria-hidden
             className={cn(
-              "size-2 shrink-0 rounded-[3px]",
+              "size-2 shrink-0 rounded-sm",
               !selected && "bg-foreground/20",
             )}
             style={selected ? { backgroundColor: selected.value } : undefined}
@@ -168,7 +168,7 @@ function ColorSwatch({
       data-selected={selected ? "true" : undefined}
       onClick={onSelect}
       className={cn(
-        "h-[26px] justify-center rounded-[7px] p-0",
+        "h-[26px] justify-center rounded-md p-0",
         // Selection is a ring held off the tile by a popover-coloured gap, so
         // it reads on a dark swatch and a light one alike — a check glyph
         // would have to fight whichever colour it lands on. The keyboard/hover

@@ -34,6 +34,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   questions: Question[];
@@ -316,7 +317,7 @@ export function QuestionForm({
     return (
       <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
         <div className={CHAT_COLUMN_INNER}>
-          <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 text-xs text-muted-foreground">
+          <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3 text-label text-muted-foreground">
             AskUserQuestion with no questions.
           </div>
         </div>
@@ -330,7 +331,7 @@ export function QuestionForm({
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
       <div className={CHAT_COLUMN_INNER}>
-        <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3">
+        <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3">
           <Questionnaire
             ref={formRef}
             items={rootItems}
@@ -345,9 +346,9 @@ export function QuestionForm({
                 active question — every Item is mounted at all times, so
                 a per-item eyebrow would duplicate it. */}
             <div className="flex items-center gap-2">
-              <span className="text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
+              <Eyebrow>
                 {active.header || "Input requested"}
-              </span>
+              </Eyebrow>
               <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-caption text-muted-foreground/70">
                 {qi + 1} of {questions.length}
               </QuestionnaireProgress>
@@ -361,7 +362,7 @@ export function QuestionForm({
                 required
                 className="gap-2"
               >
-                <QuestionnaireTitle className="text-sm [&:not(:has(~[data-slot=questionnaire-description]))]:mb-0">
+                <QuestionnaireTitle className="text-body [&:not(:has(~[data-slot=questionnaire-description]))]:mb-0">
                   {q.question}
                 </QuestionnaireTitle>
                 {q.multiSelect && (
@@ -417,7 +418,7 @@ export function QuestionForm({
                   aria-label="Previous question"
                   size="sm"
                   variant="ghost"
-                  className="h-7 min-h-0 w-7 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
+                  className="size-7 min-h-0 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
                 >
                   <ChevronLeft className="size-3.5" />
                 </QuestionnairePrevious>
@@ -437,14 +438,14 @@ export function QuestionForm({
               <QuestionnaireNext
                 size="sm"
                 disabled={nextDisabled}
-                className="h-7 min-h-0 px-3 text-xs sm:min-h-0"
+                className="h-7 min-h-0 px-3 text-label sm:min-h-0"
               >
                 Next
               </QuestionnaireNext>
               <QuestionnaireSubmit
                 size="sm"
                 disabled={submitted || nextDisabled}
-                className="h-7 min-h-0 px-3 text-xs sm:min-h-0"
+                className="h-7 min-h-0 px-3 text-label sm:min-h-0"
               >
                 Send
               </QuestionnaireSubmit>
@@ -496,13 +497,13 @@ function OptionChoice({
       data-testid={`aq-option-${questionIndex}-${optionIndex}`}
       className="min-h-0 gap-2 rounded-md px-2.5 py-1.5"
     >
-      <span className="text-sm leading-snug text-foreground">{label}</span>
+      <span className="text-body leading-snug text-foreground">{label}</span>
       {/* The registry's description slot: besides the muted styling it is
           what the indicator / shortcut chip alignment classes key off
           (`group-has-data-[slot=questionnaire-choice-description]`), so a
           raw span here would misalign both by a fraction of a spacing unit. */}
       {description && (
-        <QuestionnaireChoiceDescription className="text-xs leading-snug">
+        <QuestionnaireChoiceDescription className="text-label leading-snug">
           {description}
         </QuestionnaireChoiceDescription>
       )}
@@ -523,9 +524,9 @@ function OptionChoice({
         className="w-80"
         data-testid={`aq-option-preview-${questionIndex}-${optionIndex}`}
       >
-        <p className="mb-1 text-caption uppercase tracking-[0.08em] text-muted-foreground/70">
+        <Eyebrow className="mb-1">
           Preview
-        </p>
+        </Eyebrow>
         <pre className="whitespace-pre-wrap break-words font-mono text-body-sm leading-5 text-foreground">
           {preview}
         </pre>
@@ -578,7 +579,7 @@ function OtherRow({
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        className="h-8 min-h-0 rounded-md ps-8 text-sm sm:min-h-0 md:text-sm"
+        className="h-8 min-h-0 rounded-md ps-8 text-body sm:min-h-0 md:text-body"
       />
       <Pencil
         aria-hidden
@@ -590,7 +591,7 @@ function OtherRow({
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
+    <kbd className="rounded-sm bg-muted/60 px-1 py-[1px] font-mono text-caption text-muted-foreground/80">
       {children}
     </kbd>
   );

@@ -275,7 +275,7 @@ export function PullRequestsView() {
           className="text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           onClick={() => setShowPullRequests(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <span className={cn("font-semibold tracking-tight text-foreground", tzPageTitle)}>
           Pull requests

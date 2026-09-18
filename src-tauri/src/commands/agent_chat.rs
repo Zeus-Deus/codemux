@@ -8177,6 +8177,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

@@ -5,6 +5,7 @@ import { CircleDot, CircleCheck, Search, Loader2 } from "lucide-react";
 import { listGithubIssues, listGithubIssuesByPath } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 function IssueRow({
   issue,
@@ -33,15 +34,15 @@ function IssueRow({
       ) : (
         <CircleCheck className="size-3.5 shrink-0 text-muted-foreground" />
       )}
-      <span className="text-muted-foreground text-[0.75rem] shrink-0 font-mono tabular-nums">
+      <span className="text-muted-foreground text-label shrink-0 font-mono tabular-nums">
         #{issue.number}
       </span>
-      <span className="text-[0.8rem] text-foreground truncate min-w-0 flex-1">
+      <span className="text-body-sm text-foreground truncate min-w-0 flex-1">
         {issue.title}
       </span>
       <span
         className={cn(
-          "text-muted-foreground text-[0.7rem] shrink-0 select-none transition-opacity",
+          "text-muted-foreground text-caption shrink-0 select-none transition-opacity",
           isFocused ? "opacity-100" : "opacity-0 group-hover/row:opacity-100",
         )}
       >
@@ -55,8 +56,8 @@ function SkeletonRow() {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
       <div className="size-3.5 rounded-full bg-muted animate-pulse shrink-0" />
-      <div className="h-3 w-8 rounded bg-muted animate-pulse shrink-0" />
-      <div className="h-3 flex-1 rounded bg-muted animate-pulse" />
+      <div className="h-3 w-8 rounded-sm bg-muted animate-pulse shrink-0" />
+      <div className="h-3 flex-1 rounded-sm bg-muted animate-pulse" />
     </div>
   );
 }
@@ -222,9 +223,9 @@ export function IssuePickerPanel({
     <div onKeyDown={handleKeyDown} data-testid="issue-picker-panel">
       {/* Header */}
       <div className="flex items-center justify-between px-3 pt-2.5 pb-1">
-        <span className="text-[0.7rem] font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Open Issues
-        </span>
+        </Eyebrow>
       </div>
 
       {/* Search */}
@@ -236,7 +237,7 @@ export function IssuePickerPanel({
             value={search}
             onChange={(e) => handleSearchChange(e.target.value)}
             placeholder="Search issues..."
-            className="flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
+            className="flex-1 bg-transparent text-label text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
           />
         </div>
       </div>
@@ -252,7 +253,7 @@ export function IssuePickerPanel({
           </>
         ) : error ? (
           <div className="px-3 py-4 text-center">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-label text-muted-foreground">
               {error.includes("not authenticated") || error.includes("auth")
                 ? `Connect ${provider.name} to link issues`
                 : error.includes("not installed")
@@ -261,7 +262,7 @@ export function IssuePickerPanel({
             </p>
           </div>
         ) : displayIssues.length === 0 ? (
-          <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+          <div className="px-3 py-4 text-center text-label text-muted-foreground">
             {search.trim() ? "No issues found" : "No open issues"}
           </div>
         ) : (
@@ -276,8 +277,8 @@ export function IssuePickerPanel({
           ))
         )}
         {serverSearching && displayIssues.length > 0 && (
-          <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-[0.65rem]">
-            <Loader2 className="h-3 w-3 animate-spin" />
+          <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
+            <Loader2 className="size-3 animate-spin" />
             Searching...
           </div>
         )}

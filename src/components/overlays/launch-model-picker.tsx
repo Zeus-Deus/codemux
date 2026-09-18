@@ -161,7 +161,7 @@ export function LaunchModelPicker({
       data-checked={isSelected ? "true" : undefined}
       onSelect={onPick}
       className={cn(
-        "gap-2 text-xs",
+        "gap-2 text-label",
         isSelected && "bg-accent/70 data-[selected=true]:bg-accent/70",
       )}
     >
@@ -197,7 +197,7 @@ export function LaunchModelPicker({
           setOpen(false);
         }}
         className={cn(
-          "gap-2 text-xs",
+          "gap-2 text-label",
           isSelected && "bg-accent/70 data-[selected=true]:bg-accent/70",
         )}
       >
@@ -223,7 +223,7 @@ export function LaunchModelPicker({
           <button
             type="button"
             aria-label={isFav ? "Unfavorite model" : "Favorite model"}
-            className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-foreground/10"
+            className="flex size-5 shrink-0 items-center justify-center rounded-sm transition-colors hover:bg-surface-2"
             onClick={(e) => {
               e.stopPropagation();
               if (providerKind) toggleFavorite(providerKind, model.id);
@@ -261,7 +261,7 @@ export function LaunchModelPicker({
           )}
         >
           <span className="max-w-[150px] truncate">{selectedModelLabel}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40 ml-auto" />
+          <ChevronDown className="size-3 opacity-40 ml-auto" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -304,19 +304,19 @@ export function LaunchModelPicker({
             <CommandSeparator />
 
             {loading && models.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 Loading models…
               </div>
             ) : null}
 
             {!loading && models.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 No models available
               </div>
             ) : null}
 
             {models.length > 0 && filtered.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="px-3 py-6 text-center text-label text-muted-foreground">
                 No models match &quot;{query}&quot;
               </div>
             ) : null}

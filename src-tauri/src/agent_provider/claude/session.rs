@@ -95,6 +95,22 @@ pub(crate) struct ClaudeSessionState {
     pub dispatching: bool,
 }
 
+impl ClaudeSessionState {
+    /// Whether the SDK is mid-turn from Codemux's point of view.
+    ///
+    /// `active_turn` only covers turns Codemux dispatched. The SDK can also
+    /// start a turn on its own after a `result` — e.g. when background
+    /// subagents finish and their notifications wake the main agent — and
+    /// that turn can park on a `canUseTool` callback (AskUserQuestion, a
+    /// tool approval) with `active_turn` still `None`. A pending callback
+    /// means the SDK is blocked on the user, so it counts as busy: a new
+    /// message sent now would sit behind the unanswered callback forever,
+    /// and hydrate must keep the request answerable instead of expiring it.
+    pub(crate) fn turn_busy(&self) -> bool {
+        self.active_turn.is_some() || !self.pending_approvals.is_empty()
+    }
+}
+
 /// A user turn parked in the follow-up queue behind the active turn.
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedTurn {
@@ -427,12 +443,13 @@ impl ClaudeSession {
         self: &Arc<Self>,
         input: SendTurnInput,
     ) -> Result<SendOutcome, ProviderError> {
-        // Busy check under the lock. A pending approval keeps the turn
-        // active, so `active_turn.is_some()` covers the WaitingApproval
-        // window too.
+        // Busy check under the lock. `turn_busy` also covers a pending
+        // approval/question raised by an SDK-initiated turn, where
+        // `active_turn` is `None` but the SDK cannot read new input until
+        // the callback is answered.
         {
             let mut state = self.state.lock().await;
-            if state.active_turn.is_some() {
+            if state.turn_busy() {
                 let queued_id = mint_queued_id();
                 let text = input
                     .display_text
@@ -636,7 +653,11 @@ impl ClaudeSession {
         let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
             match promote_queued_to_front(&mut state.queued_turns, queued_id) {
-                Some(idx) => (state.active_turn.is_some(), idx),
+                // `turn_busy`, not `active_turn`: an SDK-initiated turn
+                // parked on a question has no `active_turn`, and draining
+                // would just leave the item stuck behind the callback.
+                // Interrupting aborts the callback sidecar-side.
+                Some(idx) => (state.turn_busy(), idx),
                 // Unknown / already-dispatched / cancelled — no-op.
                 None => return Ok(()),
             }

@@ -5758,6 +5758,7 @@ const handlers: Record<string, Handler> = {
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),
     );
+    ws.base_branch = a.newBranch ? String(a.base ?? "main") : null;
     // ASYNC emit — the workspace lands in the store only AFTER this
     // invoke's promise has already resolved (macrotask), mirroring the
     // real runtime's event ordering that the bug depended on.

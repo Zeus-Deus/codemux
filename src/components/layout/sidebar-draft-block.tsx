@@ -312,7 +312,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
                 aria-label={`${row.attachmentCount} attachment${row.attachmentCount === 1 ? "" : "s"}`}
                 className="flex shrink-0 items-center gap-0.5 text-caption tabular-nums text-muted-foreground/65"
               >
-                <Paperclip className="size-2.5" />
+                <Paperclip className="size-3" />
                 {row.attachmentCount}
               </span>
             )}
@@ -324,7 +324,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               className={cn(
                 "-mr-0.5 flex size-5 shrink-0 items-center justify-center rounded-md",
                 "text-muted-foreground opacity-0 transition-[opacity,color,background-color]",
-                "hover:bg-foreground/[0.07] hover:text-foreground",
+                "hover:bg-surface-2 hover:text-foreground",
                 "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
                 "group-hover/draft:opacity-100",
               )}
@@ -534,12 +534,12 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                   size="md"
                   shape="square"
                 />
-                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded bg-sidebar text-accent-ember">
-                  <SquarePen className="size-2.5" />
+                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded-sm bg-sidebar text-accent-ember">
+                  <SquarePen className="size-3" />
                 </span>
               </button>
             </TooltipTrigger>
-            <TooltipContent side="right" className="max-w-64 text-xs">
+            <TooltipContent side="right" className="max-w-64 text-label">
               <div className="font-semibold">Draft · {row.project.name}</div>
               <div className="mt-0.5 truncate text-muted-foreground">
                 {row.preview}

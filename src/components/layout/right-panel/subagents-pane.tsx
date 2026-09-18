@@ -63,6 +63,7 @@ import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How long a just-finished row keeps its place in the live list. */
 export const COMPLETION_LINGER_MS = 8000;
@@ -407,7 +408,6 @@ function RowGlyph({ view }: { view: SubagentView }) {
               ? "text-status-working/80"
               : "text-status-open",
         )}
-        strokeWidth={2.4}
         aria-hidden
       />
     </span>
@@ -454,7 +454,7 @@ function SubagentRow({
         disabled={!canOpen}
         onClick={onOpen}
         aria-label={`Open ${title} thread`}
-        className="flex w-full flex-col gap-0.5 rounded-[10px] bg-foreground/[0.03] px-2.5 py-2 text-left hover:bg-foreground/[0.05] disabled:cursor-default"
+        className="flex w-full flex-col gap-0.5 rounded-lg bg-surface-1 px-2.5 py-2 text-left hover:bg-surface-2 disabled:cursor-default"
       >
         <span className="flex w-full items-center gap-2">
           <RowGlyph view={view} />
@@ -503,7 +503,7 @@ function AttentionCard({
     <div
       data-testid="attention-card"
       data-subagent-id={view.id}
-      className="rounded-[10px] border border-status-attention/25 bg-status-attention/5 px-2.5 py-[7px]"
+      className="rounded-lg border border-status-attention/25 bg-status-attention/5 px-2.5 py-[7px]"
     >
       <div className="flex w-full items-center gap-2">
         <RowGlyph view={view} />
@@ -547,7 +547,7 @@ function CardAction({
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="rounded-[5px] px-1.5 py-px font-mono text-caption text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-default disabled:opacity-50"
+      className="rounded-sm px-1.5 py-px font-mono text-caption text-muted-foreground hover:bg-surface-2 hover:text-foreground disabled:cursor-default disabled:opacity-50"
     >
       {children}
     </button>
@@ -631,7 +631,7 @@ function HistoryView({
           type="button"
           onClick={onBack}
           aria-label="Back to Subagents"
-          className="rounded-[5px] px-1 py-px hover:bg-foreground/[0.06] hover:text-foreground"
+          className="rounded-sm px-1 py-px hover:bg-surface-2 hover:text-foreground"
         >
           ‹ Subagents
         </button>
@@ -649,10 +649,10 @@ function HistoryView({
             aria-pressed={filter === id}
             onClick={() => setFilter(id)}
             className={cn(
-              "rounded-[5px] px-1.5 py-px font-mono text-caption",
+              "rounded-sm px-1.5 py-px font-mono text-caption",
               filter === id
-                ? "bg-foreground/[0.08] text-foreground"
-                : "text-muted-foreground hover:bg-foreground/[0.04]",
+                ? "bg-surface-3 text-foreground"
+                : "text-muted-foreground hover:bg-surface-2",
             )}
           >
             {label}
@@ -679,7 +679,7 @@ function HistoryView({
                   key={wave.id}
                   aria-label={subagentWaveTitle(wave)}
                   data-wave-status={subagentWaveStatus(wave.subagents)}
-                  className="flex flex-col gap-1 rounded-[10px] bg-foreground/[0.03] px-1.5 py-1.5"
+                  className="flex flex-col gap-1 rounded-lg bg-surface-1 px-1.5 py-1.5"
                 >
                   <span className="truncate px-1 text-body-sm font-semibold text-foreground">
                     {subagentWaveTitle(wave)}
@@ -724,9 +724,9 @@ function PromptDivider({ text }: { text: string }) {
 
 function SectionHeader({ label }: { label: string }) {
   return (
-    <span className="shrink-0 font-mono text-caption tracking-[0.14em] text-muted-foreground/70 uppercase">
+    <Eyebrow className="shrink-0">
       {label}
-    </span>
+    </Eyebrow>
   );
 }
 
@@ -744,7 +744,7 @@ function SubagentModelBadge({ model }: { model?: string }) {
     <span
       data-subagent-model={value}
       title={`Model: ${value}`}
-      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-[5px] border border-foreground/[0.08] bg-background/55 px-1.5 font-mono text-[0.5625rem] text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
+      className="inline-flex h-[17px] max-w-[96px] min-w-0 shrink-0 items-center gap-1 overflow-hidden rounded-sm border border-hairline bg-background/55 px-1.5 font-mono text-micro text-muted-foreground shadow-[inset_0_1px_0_color-mix(in_oklch,var(--foreground)_2.5%,transparent)]"
     >
       <span
         className="size-1 shrink-0 rounded-full bg-accent-ember/75"

@@ -78,6 +78,16 @@
     --color-status-attention: var(--status-attention);
     --color-status-monitoring: var(--status-monitoring);
     --color-status-remote: var(--status-remote);
+    /* Surface alpha ladder → bg-surface-1/2/3, and the two hairlines →
+     * border-hairline / border-hairline-strong. Four steps of neutral ink
+     * over whatever the current surface is, so "resting fill", "hover" and
+     * "selected" mean the same thing in every panel. Values live in the
+     * "CodeMux custom tokens" block below. */
+    --color-surface-1: var(--surface-1);
+    --color-surface-2: var(--surface-2);
+    --color-surface-3: var(--surface-3);
+    --color-hairline: var(--hairline);
+    --color-hairline-strong: var(--hairline-strong);
     /* Radius scale — fully token-driven from the preset's --radius. Change
      * the preset (or --radius) and every rounded utility re-skins. */
     --radius-sm: calc(var(--radius) - 4px);
@@ -104,6 +114,12 @@
     --text-body-sm: 0.8125rem; /* 13px — dense rows, menus */
     --text-body: 0.875rem;    /* 14px — primary UI text */
     --text-body-lg: 0.9375rem; /* 15px — emphasized UI text */
+    /* Section-label (eyebrow) tracking. Uppercase mono at 11px needs the
+     * letters opened up or it reads as a smudge; 0.1em is the value the
+     * settings primitives already converged on, so it becomes the one
+     * name every eyebrow uses instead of the 19 tracking values the audit
+     * found. Consumed by the `Eyebrow` component via `tracking-eyebrow`. */
+    --tracking-eyebrow: 0.1em;
 }
 
 :root {
@@ -258,6 +274,31 @@
   --success: var(--status-open);
   --warning: var(--status-working);
   --danger:  var(--status-attention);
+  /*
+   * Surface alpha ladder. Three steps of neutral ink over the current
+   * surface, plus two hairlines — the whole interactive vocabulary of a
+   * quiet desktop UI. Before this existed, 124 call sites improvised 56
+   * distinct alphas, so hover in one panel was a different jump from hover
+   * in the next. The alpha is applied to --foreground, so a light theme
+   * gets dark ink and a dark theme gets light ink with no per-scheme rule.
+   *
+   *   surface-1  3%    resting fill (a card that needs to read as a card)
+   *   surface-2  6%    hover
+   *   surface-3  9.5%  active / selected
+   *
+   * Anything quieter than surface-1 is not a surface — it is a hairline:
+   *
+   *   hairline         7%    default rule between rows and sections
+   *   hairline-strong  11%   a rule that has to survive next to a fill
+   *
+   * Text alphas are deliberately NOT part of this ladder; they are a
+   * separate axis and a later pass.
+   */
+  --surface-1: color-mix(in oklch, var(--foreground) 3%, transparent);
+  --surface-2: color-mix(in oklch, var(--foreground) 6%, transparent);
+  --surface-3: color-mix(in oklch, var(--foreground) 9.5%, transparent);
+  --hairline: color-mix(in oklch, var(--foreground) 7%, transparent);
+  --hairline-strong: color-mix(in oklch, var(--foreground) 11%, transparent);
   /* The shadcn preset ships a saturated-blue --sidebar-primary (used for
    * the sidebar accent + the terminal cursor). CodeMux has no blue brand
    * colour, so route that accent to ember here — overrides the preset's
@@ -546,6 +587,25 @@ body.pane-resizing iframe {
     }
   html {
     @apply font-sans;
+    }
+  /* One stroke weight for every icon.
+   *
+   * Icons set the optical weight of a row, so fifteen stroke weights made
+   * alignment unachievable even where the boxes agreed. Lucide writes
+   * `stroke-width` as a presentation attribute (default 2), and CSS outranks
+   * a presentation attribute — so this single rule is the whole vocabulary
+   * and the 73 per-call-site overrides are gone.
+   *
+   * 1.75 is where those call sites clustered: the explicit values ran
+   * 1.0–3.5, with two thirds of them between 1.5 and 1.8. Lucide's own 2 is
+   * a hair heavy at the 12–14px this app draws icons at.
+   *
+   * A glyph that genuinely needs a different weight asks for it with the
+   * `[stroke-width:N]` utility, which sits in the utilities layer and
+   * therefore wins over this base rule.
+   */
+  svg.lucide {
+    stroke-width: 1.75;
     }
 }
 

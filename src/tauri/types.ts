@@ -1090,6 +1090,9 @@ export interface WorkspaceSnapshot {
    *  Optional because older persisted snapshots have no such field; `null` /
    *  absent is read as the pre-field case and settles as before. */
   pr_head_branch?: string | null;
+  /** Branch this worktree was created from. `null` / absent for checkouts
+   *  of an existing branch and for workspaces created before the field. */
+  base_branch?: string | null;
   /** Which hosting product this checkout's remotes point at — `"github"`,
    *  `"gitlab"`, `"bitbucket"`, `"azure_devops"`. `null` when there is no
    *  remote or the host isn't recognised.

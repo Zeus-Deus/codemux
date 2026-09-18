@@ -295,7 +295,7 @@ const TrailRail = memo(function TrailRail({
         <div
           aria-hidden
           style={{ top: clampCardTop(hovered!.centerY, railHeight) }}
-          className="pointer-events-none absolute left-full top-0 ml-1.5 w-[260px] -translate-y-1/2 animate-in fade-in-0 rounded-lg border border-border bg-popover p-2.5 text-xs shadow-md duration-150"
+          className="pointer-events-none absolute left-full top-0 ml-1.5 w-[260px] -translate-y-1/2 animate-in fade-in-0 rounded-lg border border-border bg-popover p-2.5 text-label shadow-md duration-150"
         >
           <p className="line-clamp-2 font-medium leading-snug text-foreground">
             {hoveredEntry.userText || "Empty turn"}

@@ -68,7 +68,7 @@ export function BackgroundBrowserIndicator({
         title="View background browser"
         className="inline-flex size-6 shrink-0 items-center justify-center rounded-md text-status-remote transition-colors hover:bg-status-remote/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-remote/50"
       >
-        <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
+        <Globe className="size-3.5" aria-hidden />
       </button>
     );
   }
@@ -80,7 +80,7 @@ export function BackgroundBrowserIndicator({
       aria-label="Browser running in background — view"
       className="inline-flex h-[26px] shrink-0 items-center gap-1.5 px-1.5 text-label font-semibold text-status-remote transition-opacity hover:opacity-80"
     >
-      <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
+      <Globe className="size-3.5" aria-hidden />
       Browser
     </button>
   );

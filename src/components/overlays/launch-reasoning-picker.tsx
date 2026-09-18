@@ -113,12 +113,12 @@ export function LaunchReasoningPicker({
       onSelect={() => onPick(opt.value)}
       className="h-9 gap-2 py-2"
     >
-      <span className="flex-1 min-w-0 truncate text-xs text-foreground">
+      <span className="flex-1 min-w-0 truncate text-label text-foreground">
         {opt.label}
       </span>
       <Check
         className={cn(
-          "h-3.5 w-3.5 text-muted-foreground",
+          "size-3.5 text-muted-foreground",
           current === opt.value ? "opacity-100" : "opacity-0",
         )}
       />
@@ -137,11 +137,11 @@ export function LaunchReasoningPicker({
             triggerClassName,
           )}
         >
-          <Brain className="h-3 w-3" />
+          <Brain className="size-3" />
           {pillLabel ? (
             <span className="max-w-[160px] truncate">{pillLabel}</span>
           ) : null}
-          <ChevronDown className="h-2.5 w-2.5 opacity-40 ml-auto" />
+          <ChevronDown className="size-3 opacity-40 ml-auto" />
         </button>
       </PopoverTrigger>
       <PopoverContent

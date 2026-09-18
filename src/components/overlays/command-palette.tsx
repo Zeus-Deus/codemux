@@ -99,6 +99,7 @@ import {
   workspaceRowSubtitle,
   workspaceSearchText,
 } from "./command-palette-model";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   open: boolean;
@@ -801,9 +802,9 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           value={rawQuery}
           onValueChange={setRawQuery}
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
-          className="h-8 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/70"
+          className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
+        <kbd className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc
         </kbd>
       </div>
@@ -974,9 +975,9 @@ function GroupHeader({
         !first && "mt-2",
       )}
     >
-      <span className="font-mono text-caption tracking-[0.15em] text-muted-foreground/70 uppercase">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       <span className="h-px flex-1 bg-border/60" />
       <span className="font-mono text-caption text-muted-foreground/50">{count}</span>
     </div>
@@ -1013,7 +1014,7 @@ function PaletteItem({
  *  row is selected — the palette's one moving part. */
 function EnterBadge() {
   return (
-    <span className="hidden flex-none rounded-[5px] border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
+    <span className="hidden flex-none rounded-sm border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
       ↵
     </span>
   );
@@ -1139,7 +1140,7 @@ function ConversationItem({
       onSelect={onSelect}
       className="h-[58px] py-1.5"
     >
-      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-foreground/[0.025] text-muted-foreground/80">
+      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground/80">
         <Icon className="size-3" />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -1234,7 +1235,7 @@ function ThemeStudioItemRow({
   const Icon = row.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
@@ -1249,14 +1250,14 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
   const Icon = row.command.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.command.label}
       </span>
       {row.keys && (
-        <span className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
+        <span className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
           {row.keys}
         </span>
       )}
@@ -1303,7 +1304,7 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
 function FooterHint({ keys, label }: { keys: string; label: string }) {
   return (
     <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
-      <kbd className="rounded border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
+      <kbd className="rounded-sm border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
         {keys}
       </kbd>
       {label}

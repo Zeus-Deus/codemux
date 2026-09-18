@@ -77,9 +77,9 @@ export function MessageCopyButton({
       )}
     >
       {copied ? (
-        <Check className="h-3 w-3" aria-hidden />
+        <Check className="size-3" aria-hidden />
       ) : (
-        <Copy className="h-3 w-3" aria-hidden />
+        <Copy className="size-3" aria-hidden />
       )}
       {copied ? "Copied" : "Copy"}
     </button>

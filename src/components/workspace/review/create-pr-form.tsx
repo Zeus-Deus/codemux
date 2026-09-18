@@ -103,7 +103,7 @@ async function loadRepoTemplate(
 }
 
 const LABEL =
-  `font-mono ${tzEyebrow} font-semibold uppercase tracking-[0.07em] text-muted-foreground`;
+  `font-mono ${tzEyebrow} font-semibold uppercase tracking-eyebrow text-muted-foreground`;
 
 const FIELD =
   `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +
@@ -112,7 +112,7 @@ const FIELD =
 
 /** A chip on the card background — the description's helpers. */
 const CHIP =
-  "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-[5px] border-0 bg-card px-2.5 " +
+  "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-sm border-0 bg-card px-2.5 " +
   `${tzMeta} text-foreground/90 transition-colors hover:bg-accent/50 ` +
   "disabled:opacity-50 outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 
@@ -284,7 +284,7 @@ export function CreatePrForm({
             type="button"
             aria-label="Back"
             onClick={onCancel}
-            className="-ml-1 flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            className="-ml-1 flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
           >
             <ChevronLeft className="size-3.5" />
           </button>
@@ -321,7 +321,7 @@ export function CreatePrForm({
             <SelectContent>
               {(branches.includes(baseBranch) ? branches : [baseBranch, ...branches]).map(
                 (branch) => (
-                  <SelectItem key={branch} value={branch} className="font-mono text-xs">
+                  <SelectItem key={branch} value={branch} className="font-mono text-label">
                     {branch}
                   </SelectItem>
                 ),
@@ -412,7 +412,7 @@ export function CreatePrForm({
                 className="text-muted-foreground transition-colors hover:text-foreground"
                 onClick={() => setReviewers(reviewers.filter((r) => r !== reviewer))}
               >
-                <X className="size-2.5" />
+                <X className="size-3" />
               </button>
             </span>
           ))}

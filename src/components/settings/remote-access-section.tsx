@@ -81,6 +81,7 @@ import {
   type DeviceKind,
   type EndpointGroupView,
 } from "./remote-access-utils";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 // ── Small presentational bits ────────────────────────────────────────
 
@@ -106,9 +107,9 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       }}
     >
       {copied ? (
-        <Check className="h-3.5 w-3.5 text-status-open" />
+        <Check className="size-3.5 text-status-open" />
       ) : (
-        <Copy className="h-3.5 w-3.5" />
+        <Copy className="size-3.5" />
       )}
     </Button>
   );
@@ -130,9 +131,9 @@ function DeviceIcon({ kind, className }: { kind: DeviceKind; className?: string 
 
 function SubHeading({ children }: { children: React.ReactNode }) {
   return (
-    <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+    <Eyebrow>
       {children}
-    </p>
+    </Eyebrow>
   );
 }
 
@@ -160,7 +161,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
               variant="outline"
               className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
             >
-              <ShieldCheck className="h-3 w-3" />
+              <ShieldCheck className="size-3" />
               {hint.badge}
             </Badge>
           ) : (
@@ -168,7 +169,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
               variant="outline"
               className="gap-1 border-status-working/30 bg-status-working/10 text-caption text-status-working"
             >
-              <ShieldAlert className="h-3 w-3" />
+              <ShieldAlert className="size-3" />
               {hint.badge}
             </Badge>
           )}
@@ -396,7 +397,7 @@ function PairingPanel({
 
           {fullUrl && (
             <div className="flex items-center gap-2 rounded-md border border-border/60 bg-background/60 px-2.5 py-1.5">
-              <Link2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
               <code className="min-w-0 flex-1 truncate font-mono text-body-sm text-foreground">
                 {fullUrl}
               </code>
@@ -409,12 +410,11 @@ function PairingPanel({
               type="button"
               variant="outline"
               size="sm"
-              className="gap-1.5"
               disabled={regenerating}
               onClick={onRegenerate}
             >
               <RefreshCw
-                className={cn("h-3.5 w-3.5", regenerating && "animate-spin")}
+                className={cn("size-3.5", regenerating && "animate-spin")}
               />
               {expired ? "Generate new link" : "Regenerate"}
             </Button>
@@ -441,7 +441,7 @@ function PendingRow({
   const d = describeDevice(session.name, session.user_agent);
   return (
     <div className="flex items-center gap-3 rounded-lg border border-status-working/30 bg-status-working/[0.07] px-3.5 py-3">
-      <DeviceIcon kind={d.kind} className="h-4 w-4 shrink-0 text-status-working" />
+      <DeviceIcon kind={d.kind} className="size-4 shrink-0 text-status-working" />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <p className="truncate text-body font-semibold text-foreground">
@@ -468,18 +468,18 @@ function PendingRow({
         <Button
           type="button"
           size="sm"
-          className="h-7 gap-1.5 bg-status-open/90 text-status-open-foreground hover:bg-status-open"
+          className="bg-status-open/90 text-status-open-foreground hover:bg-status-open"
           disabled={busy}
           onClick={onApprove}
         >
-          <Check className="h-3.5 w-3.5" />
+          <Check className="size-3.5" />
           Approve
         </Button>
         <Button
           type="button"
           size="sm"
           variant="ghost"
-          className="h-7 text-muted-foreground hover:text-status-attention"
+          className="text-muted-foreground hover:text-status-attention"
           disabled={busy}
           onClick={onReject}
         >
@@ -521,12 +521,12 @@ function DeviceRow({
           </Badge>
           {session.connected ? (
             <span className="flex items-center gap-1 text-label font-medium text-status-open">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-status-open" />
+              <span className="inline-block size-1.5 rounded-full bg-status-open" />
               Connected
             </span>
           ) : (
             <span className="flex items-center gap-1 text-label text-muted-foreground/70">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
+              <span className="inline-block size-1.5 rounded-full bg-muted-foreground/40" />
               Offline
             </span>
           )}
@@ -541,11 +541,11 @@ function DeviceRow({
         type="button"
         size="sm"
         variant="ghost"
-        className="h-7 shrink-0 gap-1.5 text-muted-foreground hover:text-status-attention"
+        className="shrink-0 text-muted-foreground hover:text-status-attention"
         disabled={busy}
         onClick={onRevoke}
       >
-        <Trash2 className="h-3.5 w-3.5" />
+        <Trash2 className="size-3.5" />
         Revoke
       </Button>
     </div>
@@ -1142,18 +1142,18 @@ export function RemoteAccessSection() {
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1 space-y-1.5">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-medium">Enable remote access</h3>
+              <h3 className="text-body font-medium">Enable remote access</h3>
               {running && (
                 <Badge
                   variant="outline"
                   className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
                 >
-                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-status-open" />
+                  <span className="inline-block size-1.5 rounded-full bg-status-open" />
                   Listening on {status?.port}
                 </Badge>
               )}
             </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
+            <p className="text-label leading-relaxed text-muted-foreground">
               Turning this on starts a server that listens on{" "}
               <span className="font-medium text-foreground">
                 every network interface
@@ -1189,7 +1189,7 @@ export function RemoteAccessSection() {
                   role="status"
                   className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
                 >
-                  <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
+                  <WifiOff className="mt-0.5 size-4 shrink-0" />
                   <span>{rebindPhase.message}</span>
                 </div>
               ) : (
@@ -1197,7 +1197,7 @@ export function RemoteAccessSection() {
                   role="status"
                   className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-body text-status-working"
                 >
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                  <Loader2 className="size-4 shrink-0 animate-spin" />
                   <span>Applying change — reconnecting to this device…</span>
                 </div>
               )
@@ -1227,7 +1227,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
+                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -1279,8 +1279,7 @@ export function RemoteAccessSection() {
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
-                  className="h-9"
+                  size="default"
                   disabled={
                     !portDirty || !portValidation.valid || portPending || rebindBusy
                   }
@@ -1342,7 +1341,7 @@ export function RemoteAccessSection() {
                 role="status"
                 className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
               >
-                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <ShieldAlert className="mt-0.5 size-4 shrink-0" />
                 <span>
                   This desktop isn't signed into a Codemux account, so account
                   sign-in can't verify anyone yet. Sign in from the account menu
@@ -1410,7 +1409,7 @@ export function RemoteAccessSection() {
                 role="status"
                 className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-body leading-relaxed text-status-attention"
               >
-                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <ShieldAlert className="mt-0.5 size-4 shrink-0" />
                 <span>
                   This desktop isn't signed into a Codemux account, so it can't
                   register for from-anywhere access. Sign in from the account
@@ -1430,7 +1429,7 @@ export function RemoteAccessSection() {
                       variant="outline"
                       className="gap-1 border-status-open/30 bg-status-open/10 text-caption text-status-open"
                     >
-                      <ShieldCheck className="h-3 w-3" />
+                      <ShieldCheck className="size-3" />
                       Registered
                     </Badge>
                   ) : (
@@ -1438,7 +1437,7 @@ export function RemoteAccessSection() {
                       variant="outline"
                       className="gap-1 border-status-working/30 bg-status-working/10 text-caption text-status-working"
                     >
-                      <ShieldAlert className="h-3 w-3" />
+                      <ShieldAlert className="size-3" />
                       Not registered yet
                     </Badge>
                   )}
@@ -1524,11 +1523,11 @@ export function RemoteAccessSection() {
                 <Button
                   type="button"
                   size="sm"
-                  className="shrink-0 gap-1.5"
+                  className="shrink-0"
                   disabled={pairingPending}
                   onClick={handleCreatePairing}
                 >
-                  <Link2 className="h-3.5 w-3.5" />
+                  <Link2 className="size-3.5" />
                   Create pairing link
                 </Button>
               </div>
@@ -1577,18 +1576,18 @@ export function RemoteAccessSection() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-7 gap-1.5 text-muted-foreground hover:text-status-attention"
+                  className="text-muted-foreground hover:text-status-attention"
                   disabled={revokingAll}
                   onClick={handleRevokeAll}
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <Trash2 className="size-3.5" />
                   Revoke all
                 </Button>
               )}
             </div>
             {approved.length === 0 ? (
               <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-body text-muted-foreground/70">
-                <Server className="h-4 w-4" />
+                <Server className="size-4" />
                 No devices paired yet. Create a pairing link above to connect
                 one.
               </div>

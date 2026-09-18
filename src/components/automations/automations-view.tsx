@@ -40,7 +40,7 @@ export function AutomationsView() {
           className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
           onClick={() => setShowAutomations(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <span className="text-body font-medium text-foreground">
           Automations

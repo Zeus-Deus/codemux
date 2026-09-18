@@ -100,7 +100,7 @@ export function ThemeMarketplacePanel({
         Search the Marketplace
       </span>
 
-      <label className="flex h-[34px] items-center gap-2 rounded-[9px] border border-border bg-muted/30 px-2.5">
+      <label className="flex h-[34px] items-center gap-2 rounded-md border border-border bg-muted/30 px-2.5">
         <Search className="size-3 flex-none text-muted-foreground" />
         <input
           value={query}

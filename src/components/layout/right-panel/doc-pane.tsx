@@ -81,14 +81,14 @@ export function DocPane({
       {treeOpen && (
         <div
           data-testid="doc-pane-tree"
-          className="flex w-[196px] shrink-0 flex-col border-l border-border/60 bg-foreground/[0.02]"
+          className="flex w-[196px] shrink-0 flex-col border-l border-border/60 bg-surface-1"
         >
           <button
             type="button"
             onClick={onSearchFiles}
-            className="flex h-[31px] shrink-0 items-center gap-[7px] border-b border-border/60 px-2.5 text-body-sm text-muted-foreground transition-colors hover:bg-foreground/6 hover:text-foreground/80"
+            className="flex h-[31px] shrink-0 items-center gap-[7px] border-b border-border/60 px-2.5 text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground/80"
           >
-            <Search className="size-3" strokeWidth={1.6} aria-hidden />
+            <Search className="size-3" aria-hidden />
             Search files
           </button>
           <div className="min-h-0 flex-1">

@@ -138,20 +138,15 @@ interface Props {
   state: string | null | undefined;
   /** Size in Tailwind spacing units (1 = 4px). 3.5 = 14px (default). */
   size?: number;
-  strokeWidth?: number;
   className?: string;
 }
 
-export function PrStatusIcon({ state, size = 3.5, strokeWidth = 1.75, className }: Props) {
+export function PrStatusIcon({ state, size = 3.5, className }: Props) {
   const normalized = normalizePrState(state);
   if (!normalized) return null;
   const { Icon, colorCls } = STATE_TO_ICON[normalized];
   return (
-    <Icon
-      size={size * 4}
-      strokeWidth={strokeWidth}
-      className={cn(colorCls, className)}
-    />
+    <Icon size={size * 4} className={cn(colorCls, className)} />
   );
 }
 

@@ -170,7 +170,7 @@ export function ResourceMonitor({
                   `size-4` and silently grow the glyph 14→16px — in the
                   legacy title bar too. 14px also matches the neighbouring
                   titlebar glyphs (PanelLeft/PanelRight, preset tiles). */}
-              <Cpu className="h-3.5 w-3.5" />
+              <Cpu className="size-3.5" />
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>
@@ -192,10 +192,10 @@ export function ResourceMonitor({
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex items-center gap-1 h-6 px-1.5 rounded text-label text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                    className="flex items-center gap-1 h-6 px-1.5 rounded-sm text-label text-muted-foreground hover:text-foreground hover:bg-surface-2 transition-colors"
                     aria-label="Sort workspaces"
                   >
-                    <ArrowDownNarrowWide className="h-3.5 w-3.5" />
+                    <ArrowDownNarrowWide className="size-3.5" />
                     <span>{SORT_LABELS[sortOption]}</span>
                   </button>
                 </DropdownMenuTrigger>
@@ -221,11 +221,11 @@ export function ResourceMonitor({
               <button
                 type="button"
                 onClick={() => refetch()}
-                className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06] transition-colors"
+                className="size-6 inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-surface-2 transition-colors"
                 aria-label="Refresh metrics"
               >
                 <RefreshCw
-                  className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
+                  className={cn("size-3.5", isFetching && "animate-spin")}
                 />
               </button>
             </div>

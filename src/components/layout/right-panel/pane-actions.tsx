@@ -56,15 +56,14 @@ export function PaneActionButton({
             "transition-colors duration-[120ms]",
             "disabled:pointer-events-none disabled:opacity-40",
             active
-              ? "bg-foreground/10 text-foreground"
+              ? "bg-surface-3 text-foreground"
               : size === "titlebar"
                 ? "text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
-                : "text-foreground/42 hover:bg-foreground/8 hover:text-foreground/80",
+                : "text-foreground/42 hover:bg-surface-2 hover:text-foreground/80",
           )}
         >
           <Icon
             className={size === "titlebar" ? "size-3.5" : "size-[13px]"}
-            strokeWidth={size === "titlebar" ? 2 : 1.6}
           />
         </button>
       </TooltipTrigger>

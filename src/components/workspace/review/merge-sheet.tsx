@@ -110,7 +110,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                 tzEyebrow,
               )}
             >
@@ -130,7 +130,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                 tzEyebrow,
               )}
             >
@@ -158,13 +158,13 @@ export function MergeSheet({
           >
             <span
               className={cn(
-                "flex size-3.5 shrink-0 items-center justify-center rounded-[3px]",
+                "flex size-3.5 shrink-0 items-center justify-center rounded-sm",
                 deleteBranch
                   ? "bg-status-open/20 text-status-open ring-1 ring-status-open"
                   : "bg-muted ring-1 ring-border",
               )}
             >
-              {deleteBranch && <Check className="size-2.5" strokeWidth={3.5} />}
+              {deleteBranch && <Check className="size-3" />}
             </span>
             <span className={cn("flex-1 text-foreground/80", tzBodyLg)}>
               Delete <span className={cn("font-mono", tzBody)}>{headBranch ?? "the branch"}</span>{" "}

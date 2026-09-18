@@ -29,7 +29,7 @@ function ToastShell({ children }: { children: React.ReactNode }) {
  */
 function RemoteConnectedHint() {
   return (
-    <p className="mb-2.5 flex items-start gap-1.5 text-xs text-muted-foreground">
+    <p className="mb-2.5 flex items-start gap-1.5 text-label text-muted-foreground">
       <Wifi className="mt-0.5 size-3 shrink-0" />
       <span>Remote devices are connected — restarting will briefly disconnect them.</span>
     </p>
@@ -75,13 +75,13 @@ export function UpdateToast() {
           <ToastShell>
             <div className="flex items-center gap-2 mb-1">
               <ArrowUpCircle className="size-4 text-primary shrink-0" />
-              <p className="text-sm font-semibold">Desktop update available</p>
+              <p className="text-body font-semibold">Desktop update available</p>
             </div>
-            <p className="text-xs text-muted-foreground mb-3.5">
+            <p className="text-label text-muted-foreground mb-3.5">
               Codemux v{updateVersion} is ready on the desktop
             </p>
             {updateRequested ? (
-              <p className="text-xs text-muted-foreground">
+              <p className="text-label text-muted-foreground">
                 Update requested — the desktop is restarting. This device will
                 reconnect automatically.
               </p>
@@ -106,14 +106,14 @@ export function UpdateToast() {
       if (state === "downloading") {
         return (
           <ToastShell>
-            <p className="text-sm font-semibold mb-2.5">Downloading update…</p>
+            <p className="text-body font-semibold mb-2.5">Downloading update…</p>
             <div className="bg-muted rounded-full h-2 overflow-hidden">
               <div
                 className="bg-primary h-full rounded-full transition-all duration-200"
                 style={{ width: `${downloadProgress}%` }}
               />
             </div>
-            <p className="text-xs text-muted-foreground mt-2">{downloadProgress}%</p>
+            <p className="text-label text-muted-foreground mt-2">{downloadProgress}%</p>
           </ToastShell>
         );
       }
@@ -121,8 +121,8 @@ export function UpdateToast() {
       if (state === "ready") {
         return (
           <ToastShell>
-            <p className="text-sm font-semibold mb-1">Update ready</p>
-            <p className="text-xs text-muted-foreground mb-3">
+            <p className="text-body font-semibold mb-1">Update ready</p>
+            <p className="text-label text-muted-foreground mb-3">
               Restart to apply v{updateVersion}
             </p>
             {remoteClientsConnected && <RemoteConnectedHint />}
@@ -142,9 +142,9 @@ export function UpdateToast() {
         <ToastShell>
           <div className="flex items-center gap-2 mb-1">
             <ArrowUpCircle className="size-4 text-primary shrink-0" />
-            <p className="text-sm font-semibold">Update available</p>
+            <p className="text-body font-semibold">Update available</p>
           </div>
-          <p className="text-xs text-muted-foreground mb-3.5">
+          <p className="text-label text-muted-foreground mb-3.5">
             Codemux v{updateVersion} is ready to install
           </p>
           {canAutoUpdate && remoteClientsConnected && <RemoteConnectedHint />}
