@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useAppStore, useHomeDir } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { useUIStore } from "@/stores/ui-store";
 import { useSidebar } from "@/components/ui/sidebar";
@@ -20,7 +20,7 @@ export function SidebarSetupBanner() {
   // itself moves on every commit — which meant re-running the project-root
   // derivation (and its effects' dependency checks) on every backend tick.
   const workspaces = useAppStore((s) => s.appState?.workspaces);
-  const activeWorkspaceId = useAppStore((s) => s.appState?.active_workspace_id);
+  const activeWorkspaceId = useAppStore((s) => selectActiveWorkspaceId(s));
   const homeDir = useHomeDir();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 

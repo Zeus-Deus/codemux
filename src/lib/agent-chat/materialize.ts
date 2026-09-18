@@ -1,3 +1,4 @@
+import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import {
   activateWorkspace,
   agentChatSendTurn,
@@ -10,6 +11,7 @@ import {
   getHomeDir,
   renameWorkspace,
   type WorkspaceCreateResult,
+  type InitialChatPane,
 } from "@/tauri/commands";
 import { type ChatMode } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
@@ -236,6 +238,7 @@ export async function materializeAndSend(
         draft.worktreeName ?? "",
         draft.baseBranch ?? "",
         text,
+        initialChatForDraft(draft),
       );
       workspaceId = created.workspaceId;
       // Prefer the cwd the create response carries (contract item 6);
@@ -253,7 +256,7 @@ export async function materializeAndSend(
     } else {
       switch (draft.target.kind) {
         case "home": {
-          const created = await createHomeRootedWorkspace(text);
+          const created = await createHomeRootedWorkspace(text, initialChatForDraft(draft));
           workspaceId = created;
           break;
         }
@@ -261,6 +264,7 @@ export async function materializeAndSend(
           workspaceId = await createProjectWorkspace(
             draft.target.projectPath,
             text,
+            initialChatForDraft(draft),
           );
           break;
         case "existing_workspace":
@@ -456,7 +460,10 @@ export async function materializeWithPreset(
   try {
     switch (draft.target.kind) {
       case "home": {
-        const created = await createHomeRootedWorkspace(initialPrompt);
+        const created = await createHomeRootedWorkspace(
+          initialPrompt,
+          preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
+        );
         workspaceId = created;
         break;
       }
@@ -464,6 +471,7 @@ export async function materializeWithPreset(
         workspaceId = await createProjectWorkspace(
           draft.target.projectPath,
           initialPrompt,
+          preset.kind === "chat_agent" ? initialChatForDraft(draft) : undefined,
         );
         break;
       case "existing_workspace":
@@ -699,6 +707,11 @@ export function effectivePermissionMode(draft: ChatDraft): string | null {
   );
 }
 
+function initialChatForDraft(draft: ChatDraft): InitialChatPane {
+  useProviderRuntimeIntent.getState().observe(draft.provider);
+  return { provider: draft.provider, thread_id: draft.threadId };
+}
+
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename
  *  it to a title derived from the first message.
  *
@@ -711,12 +724,18 @@ export function effectivePermissionMode(draft: ChatDraft): string | null {
  *  with its default path-basename title (i.e. the basename of `$HOME`)
  *  rather than aborting the whole send. Matches the locked "no
  *  rollback on post-create failure" policy. */
-async function createHomeRootedWorkspace(firstMessage: string): Promise<string> {
+async function createHomeRootedWorkspace(
+  firstMessage: string,
+  initialChat?: InitialChatPane,
+): Promise<string> {
   const homeDir = useAppStore.getState().homeDir;
   if (!homeDir) {
     throw new Error("Home directory not loaded yet");
   }
-  const workspaceId = await createEmptyWorkspace(homeDir, { skipSetup: true });
+  const workspaceId = await createEmptyWorkspace(homeDir, {
+    skipSetup: true,
+    ...(initialChat ? { initialChat } : {}),
+  });
   await applyFirstMessageTitle(workspaceId, firstMessage);
   return workspaceId;
 }
@@ -729,8 +748,9 @@ async function createHomeRootedWorkspace(firstMessage: string): Promise<string> 
 async function createProjectWorkspace(
   projectPath: string,
   firstMessage: string,
+  initialChat?: InitialChatPane,
 ): Promise<string> {
-  const workspaceId = await createEmptyWorkspace(projectPath);
+  const workspaceId = await createEmptyWorkspace(projectPath, initialChat ? { initialChat } : undefined);
   autoNameWorkspace(workspaceId, projectPath, firstMessage);
   return workspaceId;
 }
@@ -888,6 +908,7 @@ export async function createDeferredWorktree(
   worktreeName: string,
   baseBranch: string,
   firstMessage: string,
+  initialChat?: InitialChatPane,
 ): Promise<WorkspaceCreateResult> {
   let name = worktreeName.trim();
   if (!name) {
@@ -917,6 +938,9 @@ export async function createDeferredWorktree(
     baseBranch || null,
     null,
     null,
+    null,
+    null,
+    initialChat,
   );
 }
 

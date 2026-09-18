@@ -9,7 +9,7 @@ import {
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessagesAfter,
   agentChatStartSession,
@@ -82,7 +82,7 @@ export function useAgentChatSessionActions(
   // hasn't stamped its own (Home pane, pre-hydrate race).
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
-    const active = s.appState.active_workspace_id;
+    const active = selectActiveWorkspaceId(s);
     const ws = s.appState.workspaces.find((w) => w.workspace_id === active);
     return ws?.cwd ?? null;
   });

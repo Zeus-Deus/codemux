@@ -47,7 +47,7 @@ import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
@@ -192,17 +192,17 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // the workspace on submit.
   const activeSidebarWorkspaceId = useAppStore((s) => {
     const st = s.appState;
-    if (!st?.active_workspace_id) return null;
+    if (!st || !selectActiveWorkspaceId(s)) return null;
     const ws = st.workspaces.find(
-      (w) => w.workspace_id === st.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws ? ws.workspace_id : null;
   });
   const activeSidebarProjectPath = useAppStore((s) => {
     const st = s.appState;
-    if (!st?.active_workspace_id) return null;
+    if (!st || !selectActiveWorkspaceId(s)) return null;
     const ws = st.workspaces.find(
-      (w) => w.workspace_id === st.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws ? (ws.project_root ?? ws.cwd ?? null) : null;
   });

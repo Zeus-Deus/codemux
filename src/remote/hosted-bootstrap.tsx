@@ -199,6 +199,7 @@ async function connectOverIroh(args: ConnectArgs): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const { transport } = installShim({
       baseUrl: window.location.origin,
+      viewHost: args.device.id,
       appVersion: null,
       getToken: () => null,
       onStatusChange: args.onStatus,

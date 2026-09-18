@@ -34,7 +34,7 @@ import {
   CircleDot,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
@@ -166,8 +166,9 @@ interface Props {
 
 export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const appState = useAppStore((s) => s.appState);
+  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId);
   const activeWs = appState?.workspaces.find(
-    (w) => w.workspace_id === appState.active_workspace_id,
+    (w) => w.workspace_id === activeWorkspaceId,
   );
   const storeProjectDir = useUIStore((s) => s.newWorkspaceProjectDir);
   const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);

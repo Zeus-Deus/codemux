@@ -1,3 +1,4 @@
+import { setRemoteViewHost } from "./client-view";
 /**
  * Web-remote Tauri runtime shim.
  *
@@ -38,6 +39,7 @@ const APP_STATE_COMMAND = "get_app_state";
 const APP_STATE_EVENT = "app-state-changed";
 
 export interface InstallShimOptions {
+  viewHost?: string;
   /** Server origin the transport talks to (also the asset origin). */
   baseUrl: string;
   /** Current session bearer token (null → cookie fallback). */
@@ -73,6 +75,7 @@ export interface ShimHandle {
  * web client before React mounts.
  */
 export function installShim(options: InstallShimOptions): ShimHandle {
+  setRemoteViewHost(options.viewHost ?? options.baseUrl);
   // ── Callback registry (shared by Channels and event listeners) ──
   const callbacks = new Map<number, { fn: RawCallback; once: boolean }>();
   let nextCallbackId = 1;

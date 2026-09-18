@@ -19,7 +19,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import {
   createBrowserPane,
   killPort,
@@ -110,11 +110,11 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
     async (port: PortInfoSnapshot) => {
       const state = useAppStore.getState().appState;
       if (!state) return;
-      const wsId = port.workspace_id ?? state.active_workspace_id;
+      const wsId = port.workspace_id ?? selectActiveWorkspaceId(useAppStore.getState());
       if (!wsId) return;
 
       try {
-        if (wsId !== state.active_workspace_id) {
+        if (wsId !== selectActiveWorkspaceId(useAppStore.getState())) {
           await activateWorkspaceInteraction(wsId);
           await new Promise((r) => setTimeout(r, 100));
         }

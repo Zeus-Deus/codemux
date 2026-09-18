@@ -67,6 +67,7 @@ import {
   useProviderCommandsStore,
 } from "@/stores/provider-commands-store";
 import {
+  selectActiveWorkspaceId,
   findWorkspaceIdForPane,
   useAppStore,
   useHomeDir,
@@ -324,7 +325,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
-      (w) => w.workspace_id === s.appState!.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws?.cwd ?? null;
   });
@@ -490,7 +491,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.project_root ?? ws?.cwd ?? null;
   });
@@ -502,7 +503,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.provider_kind ?? null;
   });
@@ -514,7 +515,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // `autoNameWorkspace` re-reads it after its AI call resolves, which is
   // the only moment the guard is meaningful.
   const paneWorkspaceId = useAppStore(
-    (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
+    (s) => workspaceIdForPane ?? selectActiveWorkspaceId(s) ?? null,
   );
   useEffect(() => {
     // A brand-new conversation has no transcript to hydrate; its composer is
@@ -539,7 +540,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.git_branch ?? null;
   });
