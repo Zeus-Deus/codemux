@@ -154,5 +154,45 @@ describe("trusted add-on rendering", () => {
       />,
     );
     expect(screen.getAllByRole("listitem").length).toBeLessThanOrEqual(14);
+    expect(screen.getAllByRole("listitem")[0]).toHaveAttribute(
+      "aria-setsize",
+      "500",
+    );
+    expect(screen.getAllByRole("listitem")[0]).toHaveAttribute(
+      "aria-posinset",
+      "1",
+    );
+    fireEvent.scroll(screen.getByRole("list", { name: "Add-on list" }), {
+      target: { scrollTop: 3600 },
+    });
+    expect(screen.getAllByRole("listitem")[0]).toHaveAttribute(
+      "aria-posinset",
+      "99",
+    );
+    expect(screen.getAllByRole("listitem")[0]).toHaveTextContent("98");
+  });
+  it("exposes complete table dimensions and row positions across a virtual scroll", () => {
+    render(
+      <AddonRenderer
+        nodes={[
+          node("table", "cmx-table", {
+            headers: ["Path"],
+            rows: Array.from({ length: 500 }, (_, i) => [String(i)]),
+          }),
+        ]}
+        event={vi.fn()}
+        link={vi.fn()}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "Add-on table" });
+    expect(table).toHaveAttribute("aria-rowcount", "501");
+    expect(screen.getAllByRole("row")[0]).toHaveAttribute("aria-rowindex", "1");
+    expect(screen.getAllByRole("row")[1]).toHaveAttribute("aria-rowindex", "2");
+    fireEvent.scroll(table, { target: { scrollTop: 3600 } });
+    expect(screen.getAllByRole("row")[1]).toHaveAttribute(
+      "aria-rowindex",
+      "100",
+    );
+    expect(screen.getAllByRole("row")[1]).toHaveTextContent("98");
   });
 });

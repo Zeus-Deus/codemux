@@ -97,12 +97,16 @@ function VirtualRows({
       tabIndex={0}
       role={headers ? "table" : "list"}
       aria-label={headers ? "Add-on table" : "Add-on list"}
-      aria-rowcount={headers ? rows.length : undefined}
+      aria-rowcount={headers ? rows.length + 1 : undefined}
       className="max-h-72 overflow-auto rounded-md border"
       onScroll={(e) => setTop(e.currentTarget.scrollTop)}
     >
       {headers && (
-        <div role="row" className="sticky top-0 z-10 flex bg-muted font-medium">
+        <div
+          role="row"
+          aria-rowindex={1}
+          className="sticky top-0 z-10 flex bg-muted font-medium"
+        >
           {headers.map((h, i) => (
             <span
               role="columnheader"
@@ -119,7 +123,9 @@ function VirtualRows({
         <div
           key={start + index}
           role={headers ? "row" : "listitem"}
-          aria-rowindex={headers ? start + index + 1 : undefined}
+          aria-rowindex={headers ? start + index + 2 : undefined}
+          aria-setsize={headers ? undefined : rows.length}
+          aria-posinset={headers ? undefined : start + index + 1}
           className="flex h-9 items-center border-b text-label"
         >
           {row.map((cell, i) => (
