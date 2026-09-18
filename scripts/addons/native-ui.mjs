@@ -468,7 +468,7 @@ try {
   );
   await click('[aria-label="Close settings"]');
   const workspaceId = await native("create_workspace", { cwd: project });
-  await native("agent_chat_create_pane", {
+  const paneId = await native("agent_chat_create_pane", {
     workspaceId,
     cwd: project,
     provider: null,
@@ -482,9 +482,33 @@ try {
   await type('[role="combobox"]', "synthetic-project");
   await click(`[role="option"][data-value="ws:${workspaceId}"]`);
   await element(composer);
+  // Existing app behavior warms a provider when an unbound pane first gains
+  // focus, replacing its provisional composer. Finish that normal transition
+  // before typing or mounting a plugin; no provider CLI is installed in CI.
+  await click(composer);
+  const findPane = (value) => {
+    if (!value || typeof value !== "object") return null;
+    if (value.pane_id === paneId) return value;
+    return Object.values(value).map(findPane).find(Boolean) ?? null;
+  };
+  const threadId = await until("normal chat pane binding", async () =>
+    findPane(await native("get_app_state"))?.thread_id,
+  );
+  await hasText("Session error");
+  const messagesBefore = await native("agent_chat_list_messages", { threadId });
+  assert.ok(!messagesBefore.some((row) => JSON.parse(row).type === "user_message"));
   const sessionsBefore = await native("agent_chat_list_sessions", {
     workspaceId,
   });
+  async function assertNoSubmission() {
+    // Session lists omit rows without an SDK cursor. Check the actual bound
+    // thread's persisted messages too; an unchanged empty list alone is weak.
+    assert.deepEqual(await native("agent_chat_list_messages", { threadId }), messagesBefore,
+      "Plugin operations must not persist or submit a prompt");
+    assert.equal(findPane(await native("get_app_state"))?.thread_id, threadId);
+    assert.deepEqual(await native("agent_chat_list_sessions", { workspaceId }), sessionsBefore);
+  }
+  await capture("04-core-chat-ready");
   await step("04-project-brief-native-git", async () => {
     await openCommand("Open Project Brief");
     await hasText("Branch: main");
@@ -519,11 +543,7 @@ try {
     );
   });
   await step("07-no-auto-submit", async () => {
-    assert.deepEqual(
-      await native("agent_chat_list_sessions", { workspaceId }),
-      sessionsBefore,
-      "Plugin draft insertion must not start or submit a session",
-    );
+    await assertNoSubmission();
     await openSettings();
     await hasText("Pause all add-ons");
     await clickText("Pause all add-ons");
@@ -590,10 +610,7 @@ try {
       await openSettings();
       await hasText("Fault Isolation Fixture");
       await hasText("failed disabled");
-      assert.deepEqual(
-        await native("agent_chat_list_sessions", { workspaceId }),
-        sessionsBefore,
-      );
+      await assertNoSubmission();
     });
   }
   evidence.status = "passed";
