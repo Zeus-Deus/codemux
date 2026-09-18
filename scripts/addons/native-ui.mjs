@@ -859,11 +859,11 @@ try {
     });
   }
   await step("08-bounded-list-rendering-and-frame-budget", async () => {
-    const load = join(project, "ui-load");
-    await mkdir(load);
+    // Git's normal untracked mode collapses directories. Use root files so
+    // this workload actually exercises 500 separate model rows.
     for (let i = 0; i < 500; i++)
       await writeFile(
-        join(load, `${String(i).padStart(3, "0")}.txt`),
+        join(project, `ui-load-${String(i).padStart(3, "0")}.txt`),
         "Synthetic UI workload\n",
       );
     await click('[aria-label="Close settings"]');
