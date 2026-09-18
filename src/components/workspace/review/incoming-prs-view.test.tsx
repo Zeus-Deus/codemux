@@ -170,7 +170,7 @@ describe("IncomingPrsView", () => {
     render(<IncomingPrsView {...defaultProps} />);
 
     // Should show skeleton pulse elements
-    const skeletons = document.querySelectorAll(".animate-pulse");
+    const skeletons = document.querySelectorAll('[class*="animate-pulse"]');
     expect(skeletons.length).toBeGreaterThan(0);
   });
 

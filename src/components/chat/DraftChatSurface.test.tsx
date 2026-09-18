@@ -376,8 +376,11 @@ describe("DraftChatSurface", () => {
       const header = getByTestId("draft-surface-header");
       expect(header).toBeInTheDocument();
       expect(header.textContent).toContain("Agent Chat");
-      expect(header.className).toContain("h-7");
-      expect(header.className).toContain("border-b");
+      // The band is the shared primitive's in-flow variant — same height
+      // and same rule as the materialized pane's header, which is the
+      // whole point of borrowing the silhouette.
+      expect(header).toHaveAttribute("data-slot", "panel-header");
+      expect(header).toHaveAttribute("data-variant", "inline");
     });
 
     it("suppresses the header band in GUI chrome (Agent Chat Beta ON) — the titlebar draft pill covers it", async () => {
@@ -449,7 +452,7 @@ describe("DraftChatSurface", () => {
       const chip = getByTestId("composer-attachment-token-Composer.tsx");
       expect(chip).toBeInTheDocument();
       expect(chip.textContent).toBe("@Composer.tsx");
-      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip).toHaveAttribute("data-tint", "neutral");
     });
 
     it("the inline mirror chip vanishes when the file token is removed from the draft text", () => {

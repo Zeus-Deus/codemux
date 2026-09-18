@@ -47,7 +47,7 @@ import { utilitySelectionFromStores } from "@/lib/utility-agent";
 import { toast } from "@/lib/toast";
 import { markPaneReady } from "@/lib/perf/interaction-trace";
 import { useAgentChatStore, type Attachment } from "@/stores/agent-chat-store";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
@@ -90,6 +90,7 @@ import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -192,17 +193,17 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // the workspace on submit.
   const activeSidebarWorkspaceId = useAppStore((s) => {
     const st = s.appState;
-    if (!st?.active_workspace_id) return null;
+    if (!st || !selectActiveWorkspaceId(s)) return null;
     const ws = st.workspaces.find(
-      (w) => w.workspace_id === st.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws ? ws.workspace_id : null;
   });
   const activeSidebarProjectPath = useAppStore((s) => {
     const st = s.appState;
-    if (!st?.active_workspace_id) return null;
+    if (!st || !selectActiveWorkspaceId(s)) return null;
     const ws = st.workspaces.find(
-      (w) => w.workspace_id === st.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws ? (ws.project_root ?? ws.cwd ?? null) : null;
   });
@@ -1244,7 +1245,6 @@ function DraftPendingConversation({
             <span className="flex w-[29px] shrink-0 justify-center">
               <LoaderCircle
                 className="h-[15px] w-[15px] animate-spin text-accent-ember"
-                strokeWidth={1.6}
                 aria-hidden
               />
             </span>
@@ -1263,18 +1263,19 @@ function DraftPendingConversation({
 
 /**
  * Placeholder chrome that matches AgentChatPaneHeader's visual band
- * (h-7 border-b) so the draft surface doesn't look "naked" next to a
+ * (the shared inline PanelHeader) so the draft surface doesn't look
+ * "naked" next to a
  * materialized pane. Drafts have no session yet, so the session
  * selector / split / close controls from the real pane header don't
  * apply — we only borrow the silhouette.
  */
 function DraftSurfaceHeader() {
   return (
-    <header
-      className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-background px-1.5"
+    <PanelHeader
+      className="gap-1 bg-background px-1.5"
       data-testid="draft-surface-header"
     >
-      <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
-    </header>
+      <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>
+    </PanelHeader>
   );
 }

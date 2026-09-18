@@ -55,8 +55,12 @@ export const overlayStyle: React.CSSProperties = {
   inset: 0,
   zIndex: 2147483645,
   display: "flex",
-  alignItems: "center",
+  // `safe center` so a viewport shorter than the card — a phone in landscape,
+  // a short window — spills off the bottom and scrolls, instead of centring
+  // and clipping the top out of reach, which plain `center` does.
+  alignItems: "safe center",
   justifyContent: "center",
+  overflowY: "auto",
   padding: 24,
   background: BOOT_BG,
   color: BOOT_FG,
@@ -70,7 +74,11 @@ export const cardStyle: React.CSSProperties = {
   border: `1px solid ${BOOT_HAIRLINE}`,
   borderRadius: 14,
   padding: 28,
-  boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+  // Depth, not a smudge. The stored palette may be light, where a 45%-black
+  // drop shadow reads as a grey haze around a white card on a white canvas;
+  // this is soft enough to disappear there and still lift the card off a dark
+  // one, which the hairline border alone does not.
+  boxShadow: "0 10px 30px rgba(0,0,0,0.18)",
 };
 
 export const inputStyle: React.CSSProperties = {

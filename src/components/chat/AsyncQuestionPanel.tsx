@@ -10,6 +10,7 @@ import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { agentChatAnswerQuestion, type QuestionAction } from "@/tauri/commands";
 import { QuestionForm, type Question } from "./QuestionForm";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { cn } from "@/lib/utils";
 import { randomUUID } from "@/lib/uuid";
 
@@ -78,9 +79,9 @@ export function AsyncQuestionPanel({
   return (
     <section aria-label="Agent questions" className="pb-2">
       <div className={CHAT_COLUMN_OUTER}>
-        <div className={CHAT_COLUMN_INNER}>
+        <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
           {selected && (
-            <div className="flex items-center justify-between gap-3 px-3 pb-2 text-xs">
+            <div className="flex items-center justify-between gap-3 px-3 pb-2 text-label">
               <div className="flex min-w-0 items-center gap-2">
                 <MessageCircleQuestion className="size-3.5 shrink-0 text-primary" />
                 <span className="font-medium">
@@ -99,7 +100,7 @@ export function AsyncQuestionPanel({
                       type="button"
                       aria-label="Previous question set"
                       disabled={index === 0}
-                      className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                      className="rounded-sm p-1 hover:bg-muted disabled:opacity-30"
                       onClick={() =>
                         setSelectedId(pending[index - 1].question.id)
                       }
@@ -113,7 +114,7 @@ export function AsyncQuestionPanel({
                       type="button"
                       aria-label="Next question set"
                       disabled={index === pending.length - 1}
-                      className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                      className="rounded-sm p-1 hover:bg-muted disabled:opacity-30"
                       onClick={() =>
                         setSelectedId(pending[index + 1].question.id)
                       }
@@ -127,7 +128,7 @@ export function AsyncQuestionPanel({
                   <button
                     type="button"
                     aria-label="Dismiss question"
-                    className="rounded p-1 text-muted-foreground hover:bg-muted"
+                    className="rounded-sm p-1 text-muted-foreground hover:bg-muted"
                     onClick={() =>
                       void act(selected.question.id, {
                         action: "dismiss",
@@ -141,7 +142,7 @@ export function AsyncQuestionPanel({
             </div>
           )}
           {error && (
-            <p role="alert" className="px-3 pb-2 text-xs text-destructive">
+            <p role="alert" className="px-3 pb-2 text-label text-destructive">
               {error}
             </p>
           )}
@@ -158,7 +159,11 @@ export function AsyncQuestionPanel({
       {dismissed.length > 0 && (
         <div className={CHAT_COLUMN_OUTER}>
           <details
-            className={cn(CHAT_COLUMN_INNER, "text-xs text-muted-foreground")}
+            className={cn(
+              CHAT_COLUMN_INNER,
+              COMPOSER_OVERLAY_CARD,
+              "text-label text-muted-foreground",
+            )}
           >
             <summary className="cursor-pointer px-3 py-1">
               Dismissed questions ({dismissed.length})
@@ -226,8 +231,8 @@ function QuestionCard({
   if (resolution.status === "submitting" || resolution.status === "unknown") {
     return (
       <div className={CHAT_COLUMN_OUTER}>
-        <div className={CHAT_COLUMN_INNER}>
-          <div className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-xs">
+        <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
+          <div className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-label">
             <p role="status">
               {resolution.status === "submitting"
                 ? "Submitting answer…"

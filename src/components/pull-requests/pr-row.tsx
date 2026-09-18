@@ -99,7 +99,7 @@ function HostMark({ kind }: { kind: string }) {
       aria-hidden
       data-testid={`host-mark-${kind}`}
       className={cn(
-        "size-[12px] shrink-0 rounded-[3px]",
+        "size-[12px] shrink-0 rounded-sm",
         kind === "gitlab" ? "bg-accent-ember/80" : "bg-foreground/40",
       )}
     />
@@ -231,7 +231,7 @@ function PrRowImpl({
         {row.is_draft && (
           <span
             className={cn(
-              "shrink-0 rounded border border-border px-1.5 py-px text-muted-foreground",
+              "shrink-0 rounded-sm border border-border px-1.5 py-px text-muted-foreground",
               tzEyebrow,
             )}
           >
@@ -266,9 +266,9 @@ function PrRowImpl({
               tabIndex={-1}
               onClick={checkOut}
               className={cn(
-                "invisible max-w-full shrink-0 truncate rounded-[5px] bg-card px-2 py-0.5 text-foreground/90",
+                "invisible max-w-full shrink-0 truncate rounded-sm bg-card px-2 py-0.5 text-foreground/90",
                 tzMeta,
-                "transition-colors hover:bg-accent/60 disabled:opacity-60",
+                "transition-colors duration-150 hover:bg-accent/60 disabled:opacity-60",
                 "group-hover:visible group-data-[focused=true]:visible",
               )}
             >

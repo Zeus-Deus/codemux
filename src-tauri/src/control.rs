@@ -682,6 +682,7 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 override_mode,
                 initial_prompt,
                 model_selection,
+                None,
             )
             .map(|()| serde_json::json!({ "ok": true }))
         }
@@ -2066,6 +2067,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

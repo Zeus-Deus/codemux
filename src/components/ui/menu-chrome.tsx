@@ -19,16 +19,16 @@ import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 /** One 32px menu row: 8px radius, 9px side padding, 10px gap, 13px label, and
  *  a 14px muted icon in the leading slot. */
 export const MENU_ROW =
-  "h-8 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-8 gap-2.5 whitespace-nowrap rounded-md px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A row whose label wraps to a second, quieter description line. Taller than
  *  `MENU_ROW`, so the icon is top-aligned rather than centred. */
 export const MENU_ROW_TWO_LINE =
-  "items-start gap-2.5 rounded-[8px] px-[9px] py-2 text-body [&>svg]:mt-0.5 [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "items-start gap-2.5 rounded-md px-[9px] py-2 text-body [&>svg]:mt-0.5 [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /** A 36px row carrying a title plus a mono state line (the device list). */
 export const MENU_ROW_TWO_LINE_COMPACT =
-  "h-9 gap-2.5 whitespace-nowrap rounded-[8px] px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
+  "h-9 gap-2.5 whitespace-nowrap rounded-md px-[9px] text-body [&>svg:first-child]:size-3.5 [&>svg:first-child]:shrink-0 [&>svg:first-child]:text-muted-foreground/70";
 
 /**
  * The destructive tail row. Radix's highlight convention is a surface change,

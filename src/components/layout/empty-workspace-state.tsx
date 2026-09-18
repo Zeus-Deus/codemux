@@ -6,7 +6,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
   createTab,
@@ -41,9 +41,9 @@ function ActionRow({ icon, label, keys, onClick }: ActionRowProps) {
     <button
       type="button"
       onClick={onClick}
-      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-muted-foreground/80 transition-colors hover:bg-muted/60 hover:text-foreground"
+      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-body text-muted-foreground/80 transition-colors duration-150 hover:bg-muted/60 hover:text-foreground"
     >
-      <span className="rounded p-1 text-muted-foreground/70 transition-colors group-hover:text-foreground">
+      <span className="rounded-sm p-1 text-muted-foreground/70 transition-colors duration-150 group-hover:text-foreground">
         {icon}
       </span>
       <span className="flex-1 text-left">{label}</span>
@@ -63,7 +63,7 @@ export function EmptyWorkspaceState() {
   // `appState` re-rendered on every snapshot / delta commit.
   const ws = useAppStore((s) =>
     s.appState?.workspaces.find(
-      (w) => w.workspace_id === s.appState?.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     ) ?? null,
   );
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
@@ -159,25 +159,25 @@ export function EmptyWorkspaceState() {
         {/* Action rows */}
         <div className="mx-auto grid w-full gap-0.5">
           <ActionRow
-            icon={<Terminal className="h-4 w-4" />}
+            icon={<Terminal className="size-4" />}
             label="Open Terminal"
             keys={["Ctrl", "T"]}
             onClick={handleOpenTerminal}
           />
           <ActionRow
-            icon={<Globe className="h-4 w-4" />}
+            icon={<Globe className="size-4" />}
             label="Open Browser"
             keys={["Ctrl", "Alt", "B"]}
             onClick={handleOpenBrowser}
           />
           <ActionRow
-            icon={<ExternalLink className="h-4 w-4" />}
+            icon={<ExternalLink className="size-4" />}
             label="Open in Editor"
             keys={["Ctrl", "Shift", "E"]}
             onClick={handleOpenInEditor}
           />
           <ActionRow
-            icon={<Search className="h-4 w-4" />}
+            icon={<Search className="size-4" />}
             label="Search Files"
             keys={["Ctrl", "Shift", "P"]}
             onClick={handleSearchFiles}
@@ -191,9 +191,9 @@ export function EmptyWorkspaceState() {
           <button
             type="button"
             onClick={handleDeleteWorkspace}
-            className="flex items-center gap-1.5 text-xs text-muted-foreground/40 transition-colors hover:text-muted-foreground"
+            className="flex items-center gap-1.5 text-label text-muted-foreground/40 transition-colors duration-150 hover:text-muted-foreground"
           >
-            <Trash2 className="h-3 w-3" />
+            <Trash2 className="size-3" />
             {canRemoveWorktree ? "Delete workspace" : "Close workspace"}
           </button>
         </div>

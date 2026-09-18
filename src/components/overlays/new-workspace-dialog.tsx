@@ -34,7 +34,7 @@ import {
   CircleDot,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
@@ -166,8 +166,9 @@ interface Props {
 
 export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const appState = useAppStore((s) => s.appState);
+  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId);
   const activeWs = appState?.workspaces.find(
-    (w) => w.workspace_id === appState.active_workspace_id,
+    (w) => w.workspace_id === activeWorkspaceId,
   );
   const storeProjectDir = useUIStore((s) => s.newWorkspaceProjectDir);
   const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);
@@ -1121,17 +1122,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             value={workspaceName}
             onChange={(e) => setWorkspaceName(e.target.value)}
             placeholder="Workspace name (optional)"
-            className="h-6 text-xs flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
+            className="h-6 text-label flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
           />
           {branchMode === "create_new" ? (
             <Input
               value={branchName}
               onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
               placeholder="branch name"
-              className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
+              className="h-6 text-label w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
             />
           ) : (
-            <span className="h-6 text-xs text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
+            <span className="h-6 text-label text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
               on {openExistingBranch}
             </span>
           )}
@@ -1139,14 +1140,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         {/* Center: prompt textarea with embedded controls */}
         <div className="relative px-3 pt-2 pb-3">
-          <div className="rounded-2xl border border-border bg-muted overflow-hidden">
+          <div className="rounded-lg border border-border bg-muted overflow-hidden">
             <Textarea
               ref={textareaRef}
               value={prompt}
               onChange={handleTextareaChange}
               onPaste={handlePasteImage}
               placeholder="What do you want to do?"
-              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
+              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-body px-4 pt-3 pb-1"
               rows={1}
             />
 
@@ -1161,13 +1162,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   >
                     <span
                       className={cn(
-                        "flex size-5 shrink-0 items-center justify-center rounded",
+                        "flex size-5 shrink-0 items-center justify-center rounded-sm",
                         linkedIssue.state === "Open"
                           ? "bg-success/15 text-success"
-                          : "bg-foreground/10 text-muted-foreground",
+                          : "bg-surface-3 text-muted-foreground",
                       )}
                     >
-                      <CircleDot className="h-3 w-3" />
+                      <CircleDot className="size-3" />
                     </span>
                     <span className="font-mono tabular-nums text-muted-foreground">
                       #{linkedIssue.number}
@@ -1176,7 +1177,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label={`Remove issue #${linkedIssue.number}`}
-                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-foreground/10 hover:text-foreground"
+                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                       onClick={() => {
                         setLinkedIssue(null);
                         if (branchAutoFilled) {
@@ -1185,7 +1186,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         }
                       }}
                     >
-                      <X className="h-2.5 w-2.5" />
+                      <X className="size-3" />
                     </button>
                   </span>
                 )}
@@ -1216,7 +1217,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   onClick={() =>
                     handleOpenExistingWorkspace(existingWorkspaceForBranch)
                   }
-                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:bg-muted"
+                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors duration-150 hover:bg-muted"
                 >
                   Open it
                 </button>
@@ -1235,20 +1236,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-foreground transition-colors outline-none hover:bg-muted"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-label text-foreground transition-colors duration-150 hover:bg-muted"
                   >
                     {selectedAgent ? (
                       <>
-                        <PresetIcon icon={selectedAgent.icon} className="h-3.5 w-3.5" />
+                        <PresetIcon icon={selectedAgent.icon} className="size-3.5" />
                         {selectedAgent.name}
                       </>
                     ) : (
                       <>
-                        <PresetIcon icon="claude" className="h-3.5 w-3.5" />
+                        <PresetIcon icon="claude" className="size-3.5" />
                         Claude Code
                       </>
                     )}
-                    <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+                    <ChevronDown className="size-3 opacity-40" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="w-[200px]">
@@ -1259,12 +1260,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         setSelectedAgentId(p.id);
                         setLastSelectedAgentId(p.id);
                       }}
-                      className="text-xs gap-2"
+                      className="text-label gap-2"
                     >
-                      <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
+                      <PresetIcon icon={p.icon} className="size-3.5" />
                       <span className="flex-1">{p.name}</span>
                       {selectedAgentId === p.id && (
-                        <Check className="h-3.5 w-3.5 text-primary" />
+                        <Check className="size-3.5 text-primary" />
                       )}
                     </DropdownMenuItem>
                   ))}
@@ -1323,7 +1324,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Attach files"
-                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                       onClick={async () => {
                         const files = await pickFiles("Attach files");
                         if (files.length > 0) {
@@ -1334,7 +1335,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         }
                       }}
                     >
-                      <Paperclip className="h-4 w-4" />
+                      <Paperclip className="size-4" />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top">Attach files</TooltipContent>
@@ -1347,13 +1348,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link pull request"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                         onClick={() => {
                           setIssuePickerOpen(false);
                           setPrPickerOpen(true);
                         }}
                       >
-                        <GitPullRequest className="h-4 w-4" />
+                        <GitPullRequest className="size-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="top">Link pull request</TooltipContent>
@@ -1367,13 +1368,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       <button
                         type="button"
                         aria-label="Link issue"
-                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
                         onClick={() => {
                           setPrPickerOpen(false);
                           setIssuePickerOpen(true);
                         }}
                       >
-                        <CircleDot className="h-4 w-4" />
+                        <CircleDot className="size-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="top">Link issue</TooltipContent>
@@ -1386,11 +1387,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       aria-label="Create"
-                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 outline-none"
+                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
                       onClick={handleSubmit}
                       disabled={!projectDir}
                     >
-                      <ArrowUp className="h-4 w-4" />
+                      <ArrowUp className="size-4" />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top">Create workspace</TooltipContent>

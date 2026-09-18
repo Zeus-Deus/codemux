@@ -281,8 +281,14 @@ export const getAppState = () =>
 export const createTerminalSession = () =>
   invoke<string>("create_terminal_session");
 
-export const activateTerminalSession = (sessionId: string) =>
-  invoke("activate_terminal_session", { sessionId });
+export const activateTerminalSession = async (sessionId: string) => {
+  await invoke("activate_terminal_session", { sessionId });
+  if (isRemoteClient()) {
+    const { getSessionWorkspaceId } = await import("@/stores/app-store");
+    const workspaceId = getSessionWorkspaceId(sessionId);
+    if (workspaceId) await activateWorkspace(workspaceId);
+  }
+};
 
 export const closeTerminalSession = (sessionId: string) =>
   invoke<string>("close_terminal_session", { sessionId });
@@ -331,20 +337,26 @@ function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
   };
 }
 
+export interface InitialChatPane {
+  provider: AgentChatProviderKind;
+  thread_id: string;
+}
+
 /** Create an empty workspace, returning both its id and (when the
  *  backend supplies it) its resolved cwd. */
 export const createEmptyWorkspaceResult = (
   cwd: string,
-  opts?: { skipSetup?: boolean },
+  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane },
 ): Promise<WorkspaceCreateResult> =>
-  invoke<unknown>("create_empty_workspace", {
+  invoke<unknown>(opts?.initialChat ? "materialize_chat_workspace" : "create_empty_workspace", {
     cwd,
+    ...(opts?.initialChat ? { initialChat: opts.initialChat } : {}),
     skipSetup: opts?.skipSetup ?? null,
   }).then(normalizeWorkspaceCreate);
 
 export const createEmptyWorkspace = (
   cwd: string,
-  opts?: { skipSetup?: boolean },
+  opts?: { skipSetup?: boolean; initialChat?: InitialChatPane },
 ): Promise<string> =>
   createEmptyWorkspaceResult(cwd, opts).then((r) => r.workspaceId);
 
@@ -387,18 +399,23 @@ export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
 export const createWorkspaceWithPreset = (cwd: string, presetId: string) =>
   invoke<string>("create_workspace_with_preset", { cwd, presetId });
 
-/** Switch the backend to `workspaceId`.
- *
- *  Recording the activation here, in the one wrapper every navigation path
- *  bottoms out in, is what makes the record complete: an activation issued
- *  through this client is by definition local, whichever surface asked for
- *  it. Effects that auto-repair an empty active workspace consult that
- *  record — every client shares one snapshot and one `active_workspace_id`,
- *  so without it they would also fire on another client's activation and
- *  race it injecting panes. */
-export const activateWorkspace = (workspaceId: string) => {
+/** Navigate this client. Desktop activation owns the shared selection; remote
+ * clients commit their local selection after hydration succeeds. */
+let remoteActivationSequence = 0;
+
+export const activateWorkspace = async (workspaceId: string) => {
   noteLocalWorkspaceActivation(workspaceId);
-  return invoke("activate_workspace", { workspaceId });
+  if (!isRemoteClient()) return invoke("activate_workspace", { workspaceId });
+  const sequence = ++remoteActivationSequence;
+  await invoke("touch_workspace", { workspaceId });
+  const { useAppStore } = await import("@/stores/app-store");
+  if (!useAppStore.getState().appState?.workspaces.some((w) => w.workspace_id === workspaceId)) {
+    useAppStore.getState().setAppState(await getAppState());
+  }
+  if (sequence === remoteActivationSequence) {
+    useAppStore.getState().setRemoteActiveWorkspace(workspaceId);
+    useAppStore.getState().clearPendingActivation(workspaceId);
+  }
 };
 
 export const renameWorkspace = (workspaceId: string, title: string) =>
@@ -509,8 +526,10 @@ export const createWorktreeWorkspaceResult = (
   agentPresetId?: string | null,
   prNumber?: number | null,
   modelSelection?: ModelSelection | null,
+  initialChat?: InitialChatPane,
 ): Promise<WorkspaceCreateResult> =>
   invoke<unknown>("create_worktree_workspace", {
+    ...(initialChat ? { initialChat } : {}),
     repoPath,
     branch,
     newBranch,

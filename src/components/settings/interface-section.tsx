@@ -105,9 +105,9 @@ export function InterfaceSection() {
           <div className="flex-1 space-y-1.5">
             <div className="flex items-center gap-2">
               <MessageSquareText className="size-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">Agent Chat GUI</h3>
+              <h3 className="text-body font-medium">Agent Chat GUI</h3>
             </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
+            <p className="text-label text-muted-foreground leading-relaxed">
               The chat-based agent interface with multi-provider model
               selection, MCP server management, and skills sync. On by
               default — turn it off to go back to the classic terminal-first
@@ -127,14 +127,14 @@ export function InterfaceSection() {
         <button
           type="button"
           onClick={() => setShowDetails((v) => !v)}
-          className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+          className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
           aria-expanded={showDetails}
         >
           {showDetails ? "Hide details" : "What's included →"}
         </button>
 
         {showDetails && (
-          <ul className="text-xs text-muted-foreground space-y-1 pt-2 border-t border-border">
+          <ul className="text-label text-muted-foreground space-y-1 pt-2 border-t border-border">
             <li>
               • Chat-based agent interface (Claude, Codex, Cursor, Grok,
               OpenCode)
@@ -157,9 +157,9 @@ export function InterfaceSection() {
           <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2">
               <Gauge className="size-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">Performance diagnostics</h3>
+              <h3 className="text-body font-medium">Performance diagnostics</h3>
             </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
+            <p className="text-label text-muted-foreground leading-relaxed">
               Copy bounded startup, workspace-switch, renderer, payload-size,
               and native timing summaries. Paths, titles, messages, and IDs are excluded.
             </p>
@@ -168,7 +168,7 @@ export function InterfaceSection() {
             type="button"
             onClick={() => void copyDiagnostics()}
             disabled={copyingDiagnostics}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium hover:bg-muted disabled:opacity-50"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-label font-medium hover:bg-muted disabled:opacity-50"
           >
             {diagnosticsCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {diagnosticsCopied ? "Copied" : copyingDiagnostics ? "Collecting…" : "Copy performance diagnostics"}

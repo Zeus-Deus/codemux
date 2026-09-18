@@ -1745,20 +1745,16 @@ fn translate_system(
             }]
         }
         "status" => {
+            if parent_tool_use_id(msg).is_some() {
+                return vec![];
+            }
             let state = msg
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let status = if state == "compacting" {
-                SessionStatus::Running {
-                    active_turn: TurnId("compacting".into()),
-                }
-            } else {
-                SessionStatus::Ready
-            };
-            vec![ProviderRuntimeEvent::SessionStateChanged {
+            vec![ProviderRuntimeEvent::ContextCompactionChanged {
                 thread_id: thread_id.clone(),
-                status,
+                active: state == "compacting",
             }]
         }
         "session_state_changed" => {
@@ -1784,11 +1780,18 @@ fn translate_system(
         "task_progress" => translate_task_progress(thread_id, msg, demux),
         "task_updated" => translate_task_updated(thread_id, msg, demux),
         "task_notification" => translate_task_notification(thread_id, msg, demux),
-        // A compaction just rewrote the window. Emit the token facts
-        // first, then keep surfacing the raw system event so anything
+        // A compaction just rewrote the window. Clear the activity and
+        // emit token facts, then keep surfacing the raw event so anything
         // already keyed off the warning still sees it.
         "compact_boundary" => {
-            let mut out = translate_compact_boundary(thread_id, msg, &mut demux.context);
+            if parent_tool_use_id(msg).is_some() {
+                return vec![];
+            }
+            let mut out = vec![ProviderRuntimeEvent::ContextCompactionChanged {
+                thread_id: thread_id.clone(),
+                active: false,
+            }];
+            out.extend(translate_compact_boundary(thread_id, msg, &mut demux.context));
             out.extend(warning(thread_id, "sdk system.compact_boundary", msg));
             out
         }
@@ -2438,16 +2441,40 @@ mod tests {
     }
 
     #[test]
-    fn system_status_emits_state_change() {
+    fn context_compaction_start_is_not_a_new_turn() {
         let msg = json!({"type": "system", "subtype": "status", "status": "compacting"});
         let events = translate_sdk_message(&tid(), &msg);
         assert!(matches!(
             &events[0],
-            ProviderRuntimeEvent::SessionStateChanged {
-                status: SessionStatus::Running { .. },
+            ProviderRuntimeEvent::ContextCompactionChanged {
+                active: true,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn context_compaction_in_child_does_not_change_parent() {
+        for msg in [
+            json!({"type": "system", "subtype": "status", "status": "compacting",
+                "parent_tool_use_id": "child"}),
+            json!({"type": "system", "subtype": "status", "status": null,
+                "parent_tool_use_id": "child"}),
+            json!({"type": "system", "subtype": "compact_boundary",
+                "parent_tool_use_id": "child",
+                "compact_metadata": {"pre_tokens": 100_000, "post_tokens": 10_000}}),
+        ] {
+            assert!(translate_sdk_message(&tid(), &msg).is_empty());
+        }
+    }
+
+    #[test]
+    fn context_compaction_end_is_not_session_ready() {
+        let events = translate_sdk_message(&tid(), &json!({
+            "type": "system", "subtype": "status", "status": null
+        }));
+        assert!(matches!(events.as_slice(),
+            [ProviderRuntimeEvent::ContextCompactionChanged { active: false, .. }]));
     }
 
     #[test]

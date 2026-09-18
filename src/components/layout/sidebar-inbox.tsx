@@ -88,12 +88,13 @@ import {
   useFrozenActiveDraftRow,
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
- *  the divider. Matches the card wrapper's `duration-200`. */
+ *  the divider. Matches the card wrapper's `duration-250`. */
 const SETTLE_ANIM_MS = 200;
 /** How long the rise-in ease on a just-settled / just-un-settled row is kept
  *  before the marker clears. */
@@ -372,8 +373,8 @@ function ProjectFilterItem({
       onClick={onSelect}
       aria-label={name}
       className={cn(
-        "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
-        active && "bg-foreground/[0.08] text-foreground",
+        "h-8 gap-2 rounded-md px-2 text-label font-semibold",
+        active && "bg-surface-3 text-foreground",
       )}
     >
       <ProjectMiniAvatar name={name} path={path} />
@@ -385,7 +386,7 @@ function ProjectFilterItem({
   );
 }
 
-/** Header for the Snoozed / Settled shelves. Collapsing is a plain disclosure
+/** Header for the Wrapping up / Snoozed / Settled sections. Collapsing is a plain disclosure
  *  button rather than a hover affordance so the section state is discoverable
  *  and keyboard-reachable. */
 function ShelfHeader({
@@ -394,6 +395,7 @@ function ShelfHeader({
   showCount,
   collapsed,
   onToggle,
+  marker,
 }: {
   label: string;
   count: number;
@@ -402,25 +404,29 @@ function ShelfHeader({
   showCount: boolean;
   collapsed: boolean;
   onToggle: () => void;
+  /** Optional `data-*` attribute name stamped on the button, so tests and
+   *  styling can find a specific section header. */
+  marker?: `data-${string}`;
 }) {
   return (
     <button
       type="button"
+      {...(marker ? { [marker]: "" } : {})}
       onClick={onToggle}
       aria-expanded={!collapsed}
       aria-label={`${label} (${count})`}
-      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3 outline-none"
+      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
       <ChevronRight
         aria-hidden="true"
         className={cn(
-          "size-2.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150",
           !collapsed && "rotate-90",
         )}
       />
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       {showCount && (
         <span className="font-mono text-caption tabular-nums text-muted-foreground/70">
           ({count})
@@ -428,30 +434,6 @@ function ShelfHeader({
       )}
       <span className="h-px flex-1 bg-border/60" />
     </button>
-  );
-}
-
-/** The label above the "Wrapping up" tier.
- *
- *  Deliberately *not* `ShelfHeader`. That component is a disclosure button, and
- *  everything about it — the chevron, `aria-expanded`, the tab stop — promises
- *  that the rows below can be folded away. These rows can't and mustn't: they
- *  are ordinary active cards that happen to be winding down, and a control that
- *  offers to hide live-but-nearly-done work is the bug this tier exists to
- *  avoid. Sharing the typography and the hairline rule keeps it in the same
- *  visual family as the Snoozed / Settled headers (the user reads it as "a
- *  section starts here") while the missing chevron says the rest. */
-function WrappingUpDivider() {
-  return (
-    <div
-      data-wrapping-up-divider
-      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
-    >
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
-        Wrapping up
-      </span>
-      <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
-    </div>
   );
 }
 
@@ -559,6 +541,7 @@ const SettledRow = memo(function SettledRow({
       tabIndex={0}
       data-settled-row={workspace.workspace_id}
       data-selected={selected ? "true" : undefined}
+      data-active={isActive ? "true" : undefined}
       onClick={handleClick}
       onKeyDown={(e) => {
         if (!isRowActivationKey(e)) return;
@@ -589,9 +572,9 @@ const SettledRow = memo(function SettledRow({
         // height is the literal `h-[30px]` above and it carries no margin — so
         // scroll position can't drift as rows are realised.
         "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
-        "outline-none transition-colors duration-150 hover:bg-foreground/[0.045] focus-visible:bg-foreground/[0.045]",
-        isActive && "bg-foreground/[0.06]",
-        selected && "bg-foreground/[0.09] ring-1 ring-inset ring-border",
+        "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
+        isActive && "bg-surface-3",
+        selected && "bg-surface-3 ring-1 ring-inset ring-border",
         justSettled && "rise-in",
       )}
     >
@@ -610,7 +593,7 @@ const SettledRow = memo(function SettledRow({
       />
       <span
         className={cn(
-          "min-w-0 truncate text-xs font-medium transition-colors duration-150",
+          "min-w-0 truncate text-label font-medium transition-colors duration-150",
           dimmed
             ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
             : "text-foreground",
@@ -641,7 +624,7 @@ const SettledRow = memo(function SettledRow({
                 : `${provider.nounTitle} — ${prState}`
             }
             className={cn(
-              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded px-1 font-mono text-caption font-medium",
+              "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded-sm px-1 font-mono text-caption font-medium",
               "transition-colors duration-150",
               // Held one step brighter than the avatar's /40: `#87` is this
               // control's only label, so the badge has to stay legible at rest
@@ -655,7 +638,7 @@ const SettledRow = memo(function SettledRow({
                   )
                 : prStatusTextClass(prState),
               workspace.pr_url
-                ? "hover:bg-foreground/[0.055]"
+                ? "hover:bg-surface-2"
                 : "cursor-default opacity-65",
             )}
           >
@@ -796,6 +779,7 @@ const SnoozeRow = memo(function SnoozeRow({
         tabIndex={0}
         data-snoozed-row={workspace.workspace_id}
         data-selected={selected ? "true" : undefined}
+        data-active={isActive ? "true" : undefined}
         onClick={handleClick}
         onKeyDown={(e) => {
           if (!isRowActivationKey(e)) return;
@@ -809,9 +793,9 @@ const SnoozeRow = memo(function SnoozeRow({
           // Identical silhouette to a settled row, so identical containment
           // hint — 30px exactly, no margin.
           "[content-visibility:auto] [contain-intrinsic-size:auto_30px]",
-          "outline-none transition-colors duration-150 hover:bg-foreground/[0.045] focus-visible:bg-foreground/[0.045]",
-          isActive && "bg-foreground/[0.06]",
-          selected && "bg-foreground/[0.09] ring-1 ring-inset ring-border",
+          "outline-none transition-colors duration-150 hover:bg-surface-2 focus-visible:bg-surface-2",
+          isActive && "bg-surface-3",
+          selected && "bg-surface-3 ring-1 ring-inset ring-border",
         )}
       >
         <ProjectAvatar
@@ -825,9 +809,9 @@ const SnoozeRow = memo(function SnoozeRow({
         />
         <AlarmClock
           aria-hidden="true"
-          className="h-3 w-3 shrink-0 text-muted-foreground/60"
+          className="size-3 shrink-0 text-muted-foreground/60"
         />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
         </span>
         {/* Same face as a settled row's age (`font-mono tabular-nums`): the two
@@ -854,7 +838,7 @@ const SnoozeRow = memo(function SnoozeRow({
             "group-hover/snoozed:inline-flex group-focus-within/snoozed:inline-flex",
           )}
         >
-          <AlarmClock className="h-2.5 w-2.5" />
+          <AlarmClock className="size-3" />
           Wake now
         </button>
       </div>
@@ -966,6 +950,9 @@ export function SidebarInbox() {
   // work the user said they did not want to see right now, so re-showing them
   // every launch would undo the gesture.
   const [settledCollapsed, setSettledCollapsed] = useState(false);
+  // Wrapping up starts open: its rows are still active work, so hiding them
+  // is only ever the user's explicit choice.
+  const [wrappingUpCollapsed, setWrappingUpCollapsed] = useState(false);
   const [snoozeCollapsed, setSnoozeCollapsed] = useState(true);
 
   // Workspaces woken by the timer or by their own agent, so the card can badge
@@ -1200,6 +1187,11 @@ export function SidebarInbox() {
       : topTier;
     tier.push(ws);
   }
+  // A collapsed Wrapping up section still shows the open workspace — its
+  // highlight is the user's "you are here", same rule as the shelves below.
+  const visibleWrappingUp = wrappingUpCollapsed
+    ? wrappingUpTier.filter((ws) => ws.workspace_id === activeWorkspaceId)
+    : wrappingUpTier;
   // Everything downstream that means "the active cards, top to bottom" reads
   // this and not `activeCards`: the Alt+1..9 jump targets, range selection, and
   // the post-park forward navigation all describe positions on screen, so a
@@ -1208,7 +1200,7 @@ export function SidebarInbox() {
   const orderedActiveCards = [
     ...pinnedCards,
     ...topTier,
-    ...wrappingUpTier,
+    ...visibleWrappingUp,
   ];
 
   // One reservation for the whole render, so every card's PR chip right-aligns
@@ -1883,9 +1875,9 @@ export function SidebarInbox() {
                 aria-label="Filter by project"
                 data-project-filter
                 className={cn(
-                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
-                  "border border-transparent bg-transparent text-xs font-semibold text-foreground/80",
-                  "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
+                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2.5",
+                  "border border-transparent bg-transparent text-label font-semibold text-foreground/80",
+                  "transition-colors duration-150 hover:border-border/60 hover:bg-surface-2",
                 )}
               >
                 {filter === null ? (
@@ -1923,8 +1915,8 @@ export function SidebarInbox() {
                   onClick={() => setFilter(null)}
                   aria-label="All projects"
                   className={cn(
-                    "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
-                    filter === null && "bg-foreground/[0.08] text-foreground",
+                    "h-8 gap-2 rounded-md px-2 text-label font-semibold",
+                    filter === null && "bg-surface-3 text-foreground",
                   )}
                 >
                   <Folder className="size-3.5 shrink-0 text-muted-foreground" />
@@ -1934,7 +1926,7 @@ export function SidebarInbox() {
                   </span>
                 </DropdownMenuItem>
               </div>
-              <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+              <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
                 {projectGroups.map((group) => (
                   <ProjectFilterItem
                     key={group.projectPath}
@@ -1953,7 +1945,7 @@ export function SidebarInbox() {
               <button
                 type="button"
                 aria-label="Add repository"
-                className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-sm leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
+                className="flex size-8 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-body leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
               >
                 +
               </button>
@@ -2018,7 +2010,7 @@ export function SidebarInbox() {
         {visibleDraftCount === 0 &&
           orderedActiveCards.length === 0 &&
           filteredPending.length === 0 && (
-          <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+          <div className="px-2 py-6 text-center text-label text-muted-foreground">
             Nothing active
             {filterName && (
               <>
@@ -2050,16 +2042,16 @@ export function SidebarInbox() {
           <div
             key={pw.id}
             className={cn(
-              "flex items-center gap-2 px-2 py-2 text-sm",
-              pw.status === "failed" ? "opacity-60" : "animate-pulse opacity-70",
+              "flex items-center gap-2 px-2 py-2 text-body",
+              pw.status === "failed" ? "opacity-60" : "motion-safe:animate-pulse opacity-70",
             )}
           >
             {pw.status === "creating" ? (
-              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
             ) : (
-              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+              <AlertCircle className="size-3.5 shrink-0 text-destructive" />
             )}
-            <span className="truncate text-xs text-muted-foreground">
+            <span className="truncate text-label text-muted-foreground">
               {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
             </span>
           </div>
@@ -2067,12 +2059,19 @@ export function SidebarInbox() {
 
         {/* The wind-down tier. Same full card, same actions — only its place
             in the list changed, and only while the rule above holds. No
-            divider at all when nothing qualifies: an empty section header
+            header at all when nothing qualifies: an empty section header
             would imply a category the list isn't currently using. */}
         {wrappingUpTier.length > 0 && (
           <>
-            <WrappingUpDivider />
-            {wrappingUpTier.map((ws, index) =>
+            <ShelfHeader
+              label="Wrapping up"
+              count={wrappingUpTier.length}
+              showCount={wrappingUpCollapsed}
+              collapsed={wrappingUpCollapsed}
+              onToggle={() => setWrappingUpCollapsed((c) => !c)}
+              marker="data-wrapping-up-divider"
+            />
+            {visibleWrappingUp.map((ws, index) =>
               renderCard(ws, pinnedCards.length + topTier.length + index),
             )}
           </>
@@ -2184,14 +2183,14 @@ export function SidebarInbox() {
                 guardrail, hiding them empties the menu; the disabled line
                 says why instead of leaving a blank popover. */}
             {!canBulkSettle && (
-              <DropdownMenuItem disabled className="text-xs">
+              <DropdownMenuItem disabled className="text-label">
                 {parkableSelection.length === 0
                   ? "Pinned workspaces must be unpinned first"
                   : "Selection includes working or blocked workspaces"}
               </DropdownMenuItem>
             )}
             {canBulkSettle && (
-              <DropdownMenuItem onClick={handleBulkSettle} className="text-xs">
+              <DropdownMenuItem onClick={handleBulkSettle} className="text-label">
                 {`Settle (${parkableSelection.length})`}
               </DropdownMenuItem>
             )}
@@ -2201,7 +2200,7 @@ export function SidebarInbox() {
                   if (open) setBulkSnoozePresets(computeSnoozePresets(Date.now()));
                 }}
               >
-                <DropdownMenuSubTrigger className="text-xs">
+                <DropdownMenuSubTrigger className="text-label">
                   {`Snooze (${parkableSelection.length})`}
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent>
@@ -2209,7 +2208,7 @@ export function SidebarInbox() {
                     <DropdownMenuItem
                       key={preset.id}
                       onClick={() => handleBulkSnooze(preset.at)}
-                      className="gap-4 text-xs"
+                      className="gap-4 text-label"
                     >
                       <span className="flex-1">{preset.label}</span>
                       <span className="shrink-0 font-mono text-caption tabular-nums text-muted-foreground">

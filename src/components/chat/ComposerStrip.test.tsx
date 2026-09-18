@@ -18,7 +18,11 @@ import type {
 } from "@/lib/agent-chat/types";
 import { toast } from "@/lib/toast";
 
-import { ComposerStrip, type StripGoal } from "./ComposerStrip";
+import {
+  ComposerStrip,
+  STRIP_ROW_HEIGHT,
+  type StripGoal,
+} from "./ComposerStrip";
 import {
   queuedMessages,
   queuedOccupant,
@@ -134,7 +138,7 @@ describe("ComposerStrip — shell", () => {
     expect(shell.className).toContain("bg-muted/20");
     expect(shell.className).not.toContain("rounded-t-[19px]");
     const row = rows()[0];
-    expect(row.className).toContain("h-[34px]");
+    expect(row.className).toContain(STRIP_ROW_HEIGHT);
   });
 
   it("colours only the mark: an amber, still monitoring dot", () => {
@@ -489,7 +493,7 @@ describe("ComposerStrip — goal", () => {
     expect(screen.queryByTestId("composer-strip-goal-resume")).toBeNull();
     expect(screen.queryByTestId("composer-strip-goal-edge")).toBeNull();
     // Resting height is one strip row.
-    expect(row.firstElementChild?.className).toContain("h-[34px]");
+    expect(row.firstElementChild?.className).toContain(STRIP_ROW_HEIGHT);
   });
 
   it("contention: the goal keeps the row, the rest count into +n, and the drill-in lists them", () => {

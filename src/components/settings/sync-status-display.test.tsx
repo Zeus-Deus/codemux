@@ -54,7 +54,7 @@ describe("SyncStatusDisplay", () => {
   it("renders a skeleton while initial fetch is pending", () => {
     vi.mocked(skillsSyncStatus).mockReturnValue(new Promise(() => {})); // never resolves
     const { container } = render(<SyncStatusDisplay />);
-    expect(container.querySelector(".animate-pulse")).not.toBeNull();
+    expect(container.querySelector('[class*="animate-pulse"]')).not.toBeNull();
   });
 
   it("idle with no last sync hides the relative-time line but shows the label", async () => {

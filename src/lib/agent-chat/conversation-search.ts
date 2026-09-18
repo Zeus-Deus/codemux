@@ -1,3 +1,5 @@
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { toast } from "@/lib/toast";
 import { useConversationSearchStore } from "@/stores/conversation-search-store";
 import {
@@ -17,7 +19,8 @@ export async function openConversationSearchResult(
     turnId: result.turn_id,
   });
   try {
-    await agentChatOpenSearchResult(result.thread_id);
+    const opened = await agentChatOpenSearchResult(result.thread_id);
+    if (isRemoteClient()) await activateWorkspaceInteraction(opened.workspace_id);
   } catch (error) {
     useConversationSearchStore.getState().clearHandled(target.nonce);
     toast.error(`Failed to open conversation: ${error}`);

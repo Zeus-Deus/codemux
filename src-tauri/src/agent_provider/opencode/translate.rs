@@ -833,8 +833,8 @@ fn translate_message_updated(
     subagent_id: Option<&str>,
     usage: &mut OpenCodeUsageState,
 ) -> Vec<ProviderRuntimeEvent> {
-    // Only assistant errors matter at this layer; all other content is
-    // already covered by the per-part events.
+    // Assistant envelopes carry errors, usage, and compaction lifecycle.
+    // Transcript content is already covered by the per-part events.
     if env.info.role != "assistant" {
         return vec![];
     }
@@ -857,7 +857,14 @@ fn translate_message_updated(
         }
         return translate_assistant_error(err, ctx);
     }
-    translate_message_tokens(&env.info, ctx, subagent_id, usage)
+    let mut events = translate_message_tokens(&env.info, ctx, subagent_id, usage);
+    if subagent_id.is_none() && env.info.summary.as_bool() == Some(true) {
+        events.push(ProviderRuntimeEvent::ContextCompactionChanged {
+            thread_id: ctx.thread_id.clone(),
+            active: env.info.time.as_ref().and_then(|time| time.completed).is_none(),
+        });
+    }
+    events
 }
 
 /// Context-meter update from an assistant message's `tokens` block.
@@ -1067,6 +1074,29 @@ mod tests {
             context_window_tokens: Some(window),
             ..ctx()
         }
+    }
+
+    #[test]
+    fn context_compaction_uses_assistant_summary_lifecycle() {
+        for (completed, active) in [(None, true), (Some(42u64), false)] {
+            let event: OpenCodeEvent = serde_json::from_value(json!({
+                "type": "message.updated", "properties": {"info": {
+                    "id": "summary", "sessionID": "s1", "role": "assistant",
+                    "summary": true, "time": {"created": 1, "completed": completed}
+                }}
+            })).unwrap();
+            let out = opencode_event_to_runtime(event.clone(), &ctx(), None);
+            assert!(matches!(out.as_slice(),
+                [ProviderRuntimeEvent::ContextCompactionChanged { active: actual, .. }] if *actual == active));
+            assert!(opencode_event_to_runtime(event, &ctx(), Some("child")).is_empty());
+        }
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "type": "message.updated", "properties": {"info": {
+                "id": "user", "sessionID": "s1", "role": "user",
+                "summary": {"title": "A normal user summary"}
+            }}
+        })).unwrap();
+        assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 
     #[test]

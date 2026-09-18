@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useAppStore, useHomeDir } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { useUIStore } from "@/stores/ui-store";
 import { useSidebar } from "@/components/ui/sidebar";
@@ -20,7 +20,7 @@ export function SidebarSetupBanner() {
   // itself moves on every commit — which meant re-running the project-root
   // derivation (and its effects' dependency checks) on every backend tick.
   const workspaces = useAppStore((s) => s.appState?.workspaces);
-  const activeWorkspaceId = useAppStore((s) => s.appState?.active_workspace_id);
+  const activeWorkspaceId = useAppStore((s) => selectActiveWorkspaceId(s));
   const homeDir = useHomeDir();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
@@ -113,21 +113,21 @@ export function SidebarSetupBanner() {
             <Button
               variant="ghost"
               size="icon-xs"
-              className="shrink-0 h-5 w-5 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
+              className="shrink-0 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
               onClick={handleDismiss}
             >
-              <X className="h-3 w-3" />
+              <X className="size-3" />
             </Button>
           </div>
-          <p className="text-xs font-semibold text-foreground">Setup scripts</p>
+          <p className="text-label font-semibold text-foreground">Setup scripts</p>
           <p className="text-label text-muted-foreground mt-0.5">
             Automate workspace setup for {projectName} with setup scripts
-            and <code className="font-mono text-caption bg-muted/50 px-0.5 rounded">.codemuxinclude</code>
+            and <code className="font-mono text-caption bg-muted/50 px-0.5 rounded-sm">.codemuxinclude</code>
           </p>
           <Button
             variant="outline"
             size="sm"
-            className="w-full mt-2.5 h-7 text-xs"
+            className="w-full mt-2.5"
             onClick={handleConfigure}
           >
             Configure

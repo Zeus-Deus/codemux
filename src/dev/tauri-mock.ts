@@ -1,3 +1,4 @@
+import type { AgentChatProviderKind } from "@/tauri/types";
 /**
  * Dev-only Tauri runtime shim.
  *
@@ -3589,10 +3590,10 @@ const handlers: Record<string, Handler> = {
           : a.provider === "grok"
             ? GROK_CAPABILITIES
             : EMPTY_CAPABILITIES,
-  // Provider slash commands — in production these are harvested live
-  // from the deployed Claude Code CLI (SDK `supportedCommands()`),
-  // including custom `.claude/commands` entries. The mock serves a
-  // representative subset so the composer's COMMANDS group renders.
+  // Provider slash commands. Each adapter discovers these differently in
+  // production — an SDK probe, an ACP catalogue pushed by a live session,
+  // and the mock mirrors what each adapter can execute and
+  // actually answer, including the shapes that carry no argument hint.
   list_chat_slash_commands: (a) =>
     a.provider === "claude"
       ? [
@@ -3644,8 +3645,39 @@ const handlers: Record<string, Handler> = {
             description: "List current todo items",
             argumentHint: "",
           },
+          {
+            name: "goal",
+            description: "Set a standing goal for this thread",
+            argumentHint: "<goal text>",
+          },
         ]
-      : [],
+      : a.provider === "cursor"
+          ? [
+              // This adapter's catalogue carries a name and description
+              // only, and it labels each entry's scope inside the
+              // description rather than in a separate field.
+              {
+                name: "plan-feature",
+                description: "Draft an implementation plan (project)",
+                argumentHint: "",
+              },
+              {
+                name: "copy-request-id",
+                description: "Copy the last request ID to clipboard",
+                argumentHint: "",
+              },
+            ]
+          : a.provider === "grok"
+            ? [
+                {
+                  name: "research",
+                  description: "Research a topic before editing",
+                  argumentHint: "<query>",
+                },
+              ]
+            : // Codex built-ins and OpenCode native commands are not
+              // executed by the prompt endpoints our adapters use.
+              [],
   list_skills: (a) => {
     const cwd = String(a.projectRoot ?? "");
     const inCodemux = cwd === `${MOCK_HOME_DIR}/projects/codemux`
@@ -5769,11 +5801,34 @@ const handlers: Record<string, Handler> = {
   },
   generate_random_branch_name: () =>
     `mock-worktree-${Math.random().toString(36).slice(2, 8)}`,
+  materialize_chat_workspace: (a) => {
+    const cwd = String(a.cwd);
+    const ws = buildWorktreeWorkspace(cwd, cwd.split("/").pop() ?? "Chat");
+    ws.cwd = cwd;
+    ws.project_root = cwd;
+    ws.worktree_path = null;
+    const root = ws.surfaces[0].root;
+    if (root.kind === "agent_chat") {
+      const chat = a.initialChat as { provider: AgentChatProviderKind; thread_id: string };
+      root.cwd = cwd;
+      root.provider = chat.provider;
+      root.thread_id = chat.thread_id;
+    }
+    appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+    emitAppState();
+    return { workspace_id: ws.workspace_id, cwd, adopted: false };
+  },
   create_worktree_workspace: (a) => {
     const ws = buildWorktreeWorkspace(
       String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
       String(a.branch ?? "mock-branch"),
     );
+    if (a.initialChat && ws.surfaces[0].root.kind === "agent_chat") {
+      const chat = a.initialChat as { provider: AgentChatProviderKind; thread_id: string };
+      ws.surfaces[0].root.provider = chat.provider;
+      ws.surfaces[0].root.thread_id = chat.thread_id;
+    }
+    ws.base_branch = a.newBranch ? String(a.base ?? "main") : null;
     // ASYNC emit — the workspace lands in the store only AFTER this
     // invoke's promise has already resolved (macrotask), mirroring the
     // real runtime's event ordering that the bug depended on.
@@ -5887,6 +5942,9 @@ const handlers: Record<string, Handler> = {
   // (`applyDeltaToSnapshot` + pending confirmation). The mock's own copy is
   // mutated identically so any later full emit (rename, close, …) agrees
   // with what the renderer already derived from the delta.
+  touch_workspace: (a) => {
+    if (!findWorkspace(a.workspaceId)) throw new Error(`No workspace found for ${a.workspaceId}`);
+  },
   activate_workspace: (a) => {
     const target = findWorkspace(a.workspaceId);
     if (!target) return undefined;

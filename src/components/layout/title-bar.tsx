@@ -52,6 +52,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
+  selectActiveWorkspaceId,
   useActiveWorkspace,
   useActiveWorkspaceId,
   useAppStore,
@@ -81,6 +82,7 @@ import { PresetIcon } from "@/components/icons/preset-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
 import type { TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
 import { useDetectedEditors } from "@/stores/editor-discovery-store";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 // ── IDE Launcher ──
 
@@ -99,7 +101,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
   const activeWorkspace = useAppStore(
     (s) =>
       s.appState?.workspaces.find(
-        (w) => w.workspace_id === s.appState?.active_workspace_id,
+        (w) => w.workspace_id === selectActiveWorkspaceId(s),
       ),
   );
 
@@ -160,9 +162,9 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
               // treatment, same as the panel toggle. Non-compact (legacy
               // bar) keeps its bordered chip and stays byte-identical.
               !compact && "border border-r-0 bg-secondary/50",
-              "text-xs font-medium",
+              "text-label font-medium",
               compact
-                ? cn("h-7 w-7 justify-center px-0", BAND_CONTROL_RADIUS)
+                ? cn("size-7 justify-center px-0", BAND_CONTROL_RADIUS)
                 : "h-6 rounded-l-md border-border/60 px-2",
               compact ? BAND_CONTROL_HOVER : "transition-colors duration-150",
               !compact && "hover:bg-secondary hover:border-border",
@@ -170,9 +172,9 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             )}
           >
             {defaultEditor ? (
-              <EditorIcon id={defaultEditor.id} className="h-3.5 w-3.5" />
+              <EditorIcon id={defaultEditor.id} className="size-3.5" />
             ) : (
-              <ExternalLink className="h-3 w-3 shrink-0" />
+              <ExternalLink className="size-3 shrink-0" />
             )}
             {!compact && (
               <span className="hidden sm:inline">
@@ -202,7 +204,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
-            <ChevronDown className="h-3 w-3" />
+            <ChevronDown className="size-3" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-48">
@@ -215,7 +217,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             <DropdownMenuGroup key={group.id}>
               {groupIdx > 0 && <DropdownMenuSeparator />}
               {showGroupLabels && (
-                <DropdownMenuLabel className="text-caption font-medium uppercase tracking-wide text-muted-foreground/70">
+                <DropdownMenuLabel className={eyebrowVariants({ tone: "muted" })}>
                   {group.label}
                 </DropdownMenuLabel>
               )}
@@ -224,7 +226,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
                   key={editor.id}
                   onClick={() => handleOpen(editor.id)}
                 >
-                  <EditorIcon id={editor.id} className="h-4 w-4" />
+                  <EditorIcon id={editor.id} className="size-4" />
                   <span>{editor.name}</span>
                   {editor.id === defaultEditorId && (
                     <span className="ml-auto text-caption text-muted-foreground">
@@ -261,7 +263,7 @@ function SidebarToggleButton({
           onClick={onToggle}
           className="text-muted-foreground"
         >
-          <PanelLeft className="h-3.5 w-3.5" />
+          <PanelLeft className="size-3.5" />
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>
@@ -376,14 +378,14 @@ function PinnedPresetTile({
             // The tinted treatments stay: these tiles are shortcuts to
             // *launch* something, so unlike Run and the editor launcher
             // they keep a fill that says which agent family they belong to.
-            "flex h-7 w-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
             BAND_CONTROL_RADIUS,
             variant === "ember"
               ? "border border-accent-ember/40 bg-accent-ember/14 text-accent-ember hover:bg-accent-ember/20"
               : "border border-border bg-secondary/50 text-muted-foreground hover:bg-secondary hover:text-foreground",
           )}
         >
-          <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+          <PresetIcon icon={preset.icon} className="size-3.5" />
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>
@@ -501,12 +503,12 @@ function TitleBarDraftSlots() {
         // The draft's stand-in for the active tab, so it wears exactly the
         // active pill: same radius token, same 6% selected fill.
         className={cn(
-          "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-xs font-semibold text-foreground",
+          "flex h-7 shrink-0 items-center gap-1.5 pl-2.5 pr-2.5 text-label font-semibold text-foreground",
           BAND_CONTROL_RADIUS,
           BAND_ACTIVE_FILL,
         )}
       >
-        <MessageSquare className="h-3 w-3" />
+        <MessageSquare className="size-3" />
         <span>Agent Chat</span>
       </div>
       <DraftAgentLauncher draft={draft} />

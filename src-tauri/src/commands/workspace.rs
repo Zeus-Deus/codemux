@@ -161,12 +161,30 @@ pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
     db: &crate::database::DatabaseStore,
     cwd: Option<String>,
 ) -> Result<String, String> {
+    create_workspace_impl_with_selection(app, state, db, cwd, true).await
+}
+
+pub(crate) async fn create_workspace_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    cwd: Option<String>,
+    select: bool,
+) -> Result<String, String> {
     // A workspace cwd must be absolute so its terminals can `chdir` into it;
     // a hand-typed `~` path would otherwise be stored verbatim.
     let cwd = cwd.map(|path| crate::project::expand_tilde(&path));
     let workspace_id = match &cwd {
-        Some(path) => state.create_workspace_at_path(PathBuf::from(path)),
-        None => state.create_workspace(),
+        Some(path) => state.create_workspace_with_layout_with_selection(
+            PathBuf::from(path),
+            WorkspacePresetLayout::Single,
+            select,
+        ),
+        None => state.create_workspace_with_layout_with_selection(
+            crate::project::current_project_root(),
+            WorkspacePresetLayout::Single,
+            select,
+        ),
     };
 
     // Set project root (resolve through git root for worktree grouping)
@@ -178,9 +196,7 @@ pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
     populate_git_info_async(state, &workspace_id.0, repo_path.clone()).await;
 
-    if let Some(session_id) = state.active_terminal_session_id() {
-        terminal::spawn_pty_for_session(app.clone(), session_id.0);
-    }
+    terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
 
     // Run setup scripts in background thread
     spawn_setup_scripts(&app, state, db, &workspace_id.0, &repo_path);
@@ -200,13 +216,23 @@ pub(crate) fn split_pane_impl<R: tauri::Runtime>(
     pane_id: String,
     direction: String,
 ) -> Result<String, String> {
+    split_pane_impl_with_selection(app, state, pane_id, direction, true)
+}
+
+pub(crate) fn split_pane_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    pane_id: String,
+    direction: String,
+    select: bool,
+) -> Result<String, String> {
     let direction = match direction.as_str() {
         "horizontal" => SplitDirection::Horizontal,
         "vertical" => SplitDirection::Vertical,
         _ => return Err(format!("Unsupported split direction: {direction}")),
     };
 
-    let session_id = state.split_pane(&pane_id, direction)?;
+    let session_id = state.split_pane_with_selection(&pane_id, direction, select)?;
     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
     crate::state::emit_app_state(&app);
     Ok(session_id.0)
@@ -260,8 +286,9 @@ pub async fn create_workspace<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    create_workspace_impl(app, &state, &db, cwd).await
+    create_workspace_impl_with_selection(app, &state, &db, cwd, select.unwrap_or(true)).await
 }
 
 /// Additive return payload for the workspace-creation commands
@@ -296,13 +323,65 @@ pub async fn create_empty_workspace<R: tauri::Runtime>(
     db: State<'_, crate::database::DatabaseStore>,
     cwd: String,
     skip_setup: Option<bool>,
+    select: Option<bool>,
+) -> Result<WorkspaceCreated, String> {
+    create_empty_workspace_impl(
+        app,
+        &state,
+        &db,
+        cwd,
+        skip_setup,
+        select.unwrap_or(true),
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn materialize_chat_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    observability: State<'_, crate::observability::ObservabilityStore>,
+    cwd: String,
+    skip_setup: Option<bool>,
+    initial_chat: crate::state::InitialChatPane,
+    select: Option<bool>,
+) -> Result<WorkspaceCreated, String> {
+    crate::commands::agent_chat::feature_flag_on(&observability)?;
+    if initial_chat.thread_id.trim().is_empty() {
+        return Err("thread id is required".into());
+    }
+    create_empty_workspace_impl(
+        app,
+        &state,
+        &db,
+        cwd,
+        skip_setup,
+        select.unwrap_or(true),
+        Some(initial_chat),
+    )
+    .await
+}
+
+async fn create_empty_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    cwd: String,
+    skip_setup: Option<bool>,
+    select: bool,
+    initial_chat: Option<crate::state::InitialChatPane>,
 ) -> Result<WorkspaceCreated, String> {
     // Defense-in-depth: a workspace cwd must always be an absolute path so
     // every terminal it spawns can `chdir` into it. A literal `~` here would
     // be stored verbatim and leave terminals stranded in `$HOME`.
     let cwd = crate::project::expand_tilde(&cwd);
     let repo_path = PathBuf::from(&cwd);
-    let workspace_id = state.create_empty_workspace_at_path(repo_path.clone());
+    let workspace_id = match initial_chat {
+        Some(chat) => state.materialize_chat_workspace(repo_path.clone(), chat, select),
+        None => state.create_empty_workspace_at_path_with_selection(repo_path.clone(), select),
+    };
 
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
@@ -346,16 +425,17 @@ pub async fn create_empty_workspace<R: tauri::Runtime>(
 pub async fn get_or_create_home_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
+    select: Option<bool>,
 ) -> Result<String, String> {
     if let Some(existing) = state.find_home_workspace_id() {
         return Ok(existing);
     }
 
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| "home_dir_unavailable".to_string())?;
+    let home_dir = dirs::home_dir().ok_or_else(|| "home_dir_unavailable".to_string())?;
     let repo_path = home_dir.clone();
 
-    let workspace_id = state.create_empty_workspace_at_path(repo_path.clone());
+    let workspace_id = state
+        .create_empty_workspace_at_path_with_selection(repo_path.clone(), select.unwrap_or(true));
 
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
@@ -377,6 +457,7 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
     db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
     layout: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
@@ -393,8 +474,16 @@ pub async fn create_workspace_with_preset<R: tauri::Runtime>(
         .map(|p| PathBuf::from(p))
         .unwrap_or_else(crate::project::current_project_root);
     let workspace_id = match cwd {
-        Some(path) => state.create_workspace_with_layout(PathBuf::from(path), layout),
-        None => state.create_workspace_with_layout(crate::project::current_project_root(), layout),
+        Some(path) => state.create_workspace_with_layout_with_selection(
+            PathBuf::from(path),
+            layout,
+            select.unwrap_or(true),
+        ),
+        None => state.create_workspace_with_layout_with_selection(
+            crate::project::current_project_root(),
+            layout,
+            select.unwrap_or(true),
+        ),
     };
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
@@ -440,11 +529,26 @@ pub async fn create_worktree_workspace<R: tauri::Runtime>(
     agent_preset_id: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
+    select: Option<bool>,
+    initial_chat: Option<crate::state::InitialChatPane>,
 ) -> Result<WorkspaceCreated, String> {
-    let created = create_worktree_workspace_impl(
-        app, &state, &db, &pty_state, &presets,
-        repo_path, branch, new_branch, base, layout,
-        initial_prompt, agent_preset_id, model_selection, pr_number,
+    let created = create_worktree_workspace_impl_with_selection(
+        app,
+        &state,
+        &db,
+        &pty_state,
+        &presets,
+        repo_path,
+        branch,
+        new_branch,
+        base,
+        layout,
+        initial_prompt,
+        agent_preset_id,
+        model_selection,
+        pr_number,
+        select.unwrap_or(true),
+        initial_chat,
     )
     .await?;
     // Resolve the workspace's cwd (the worktree checkout path) from the
@@ -563,6 +667,53 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
 ) -> Result<CreatedWorktreeWorkspace, String> {
+    create_worktree_workspace_impl_with_selection(
+        app,
+        state,
+        db,
+        pty_state,
+        presets,
+        repo_path,
+        branch,
+        new_branch,
+        base,
+        layout,
+        initial_prompt,
+        agent_preset_id,
+        model_selection,
+        pr_number,
+        true,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn create_worktree_workspace_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    pty_state: &crate::terminal::PtyState,
+    presets: &crate::presets::PresetStoreState,
+    repo_path: String,
+    branch: String,
+    new_branch: bool,
+    base: Option<String>,
+    layout: String,
+    initial_prompt: Option<String>,
+    agent_preset_id: Option<String>,
+    model_selection: Option<crate::agent_capability::ModelSelection>,
+    pr_number: Option<u32>,
+    select: bool,
+    initial_chat: Option<crate::state::InitialChatPane>,
+) -> Result<CreatedWorktreeWorkspace, String> {
+    if let Some(chat) = &initial_chat {
+        crate::commands::agent_chat::feature_flag_on(
+            &app.state::<crate::observability::ObservabilityStore>(),
+        )?;
+        if chat.thread_id.trim().is_empty() {
+            return Err("thread id is required".into());
+        }
+    }
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -585,18 +736,28 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
 
     // The slow git op (recursive checkout, may fetch). Off-load to the
     // blocking pool so it doesn't stall a Tokio worker.
-    let worktree_path = {
+    //
+    // Also resolves the branch the new worktree forks from, for display.
+    // Only a freshly created branch has one: without an explicit `base`,
+    // `git worktree add -b` forks the repo's checked-out branch, so that is
+    // read BEFORE the add. A reused on-disk worktree keeps whatever it was
+    // forked from originally, which we can't know, so it records nothing.
+    let (worktree_path, base_branch) = {
         let repo_path = repo_path.clone();
         let branch = branch.clone();
         let base = base.clone();
         tokio::task::spawn_blocking(move || {
-            crate::git::git_create_worktree(
-                Path::new(&repo_path),
-                &branch,
-                new_branch,
-                base.as_deref(),
-                pr_number,
-            )
+            let repo = Path::new(&repo_path);
+            let base_branch = if new_branch
+                && !crate::git::conventional_worktree_path(repo, &branch)
+                    .is_some_and(|p| p.exists())
+            {
+                base.clone().or_else(|| crate::git::current_branch(repo))
+            } else {
+                None
+            };
+            crate::git::git_create_worktree(repo, &branch, new_branch, base.as_deref(), pr_number)
+                .map(|path| (path, base_branch))
         })
         .await
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
@@ -639,7 +800,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     // Archived workspaces do not participate — see
     // `find_live_workspace_for_worktree_path` for why they are neither a
     // blocker nor auto-unarchived here.
-    let claim = state.adopt_or_create_worktree_workspace(
+    let claim = state.adopt_or_create_worktree_workspace_with_selection(
         wt_path_buf.clone(),
         layout,
         worktree_path.clone(),
@@ -647,6 +808,8 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
         // as the previous separate `set_workspace_worktree` call did.
         branch.clone(),
         |snapshot| find_live_workspace_for_worktree_path(snapshot, &wt_path_buf, &branch),
+        select,
+        initial_chat,
     );
     let workspace_id = match claim {
         WorktreeWorkspaceClaim::Adopted(existing_id) => {
@@ -659,7 +822,11 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
             // `cwd` from the snapshot afterwards, and the adopted workspace
             // is in that snapshot, so the wrapper's cwd lookup keeps working
             // unchanged.
-            activate_workspace_impl(app.clone(), state, existing_id.clone())?;
+            if select {
+                activate_workspace_impl(app.clone(), state, existing_id.clone())?;
+            } else {
+                hydrate_workspace(&app, state, &existing_id);
+            }
             return Ok(CreatedWorktreeWorkspace {
                 workspace_id: existing_id,
                 adopted: true,
@@ -669,6 +836,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     };
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
+    state.set_workspace_base_branch(&workspace_id.0, base_branch);
 
     populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 
@@ -770,12 +938,11 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
                 let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
 
                 if !session_id.is_empty() && !command.is_empty() {
-                    let (cmd, needs_pty_injection) =
-                        crate::branch_name::prepare_agent_command(
-                            &preset.id,
-                            command,
-                            initial_prompt.as_deref(),
-                        );
+                    let (cmd, needs_pty_injection) = crate::branch_name::prepare_agent_command(
+                        &preset.id,
+                        command,
+                        initial_prompt.as_deref(),
+                    );
 
                     state.update_terminal_session_command(&session_id, command.clone());
 
@@ -1747,6 +1914,21 @@ pub fn activate_workspace<R: tauri::Runtime>(
     activate_workspace_impl(app, &state, workspace_id)
 }
 
+/// Hydrate a client's view without changing the desktop/MCP selection.
+#[tauri::command]
+pub fn touch_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<(), String> {
+    if !state.touch_workspace(&workspace_id) {
+        return Err(format!("No workspace found for {workspace_id}"));
+    }
+    hydrate_workspace(&app, &state, &workspace_id);
+    crate::state::schedule_emit_app_state(&app);
+    Ok(())
+}
+
 /// Shared workspace-switch implementation used by both the Tauri command
 /// (sidebar / palette click) and the `activate_workspace` control-socket
 /// command exposed via the `workspace_open` MCP tool.
@@ -1808,6 +1990,18 @@ fn run_activation_side_effects<R: tauri::Runtime>(
     workspace_id: &str,
     delta: crate::state::RevisionedDelta,
 ) -> f64 {
+    hydrate_workspace(app, state, workspace_id);
+
+    let emit_started = std::time::Instant::now();
+    crate::state::emit_activation_delta(app, delta);
+    emit_started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn hydrate_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    workspace_id: &str,
+) {
     // Kick off git refresh in a background thread — don't block the
     // activate click. `populate_git_info` runs 5-8 git subprocesses
     // (branch + upstream + ahead/behind + two diff-stat calls + status
@@ -1859,10 +2053,6 @@ fn run_activation_side_effects<R: tauri::Runtime>(
     std::thread::spawn(move || {
         terminal::spawn_missing_ptys_for_workspace(spawn_app, &spawn_ws);
     });
-
-    let emit_started = std::time::Instant::now();
-    crate::state::emit_activation_delta(app, delta);
-    emit_started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[tauri::command]
@@ -2085,8 +2275,9 @@ pub fn split_pane<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     pane_id: String,
     direction: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    split_pane_impl(app, &state, pane_id, direction)
+    split_pane_impl_with_selection(app, &state, pane_id, direction, select.unwrap_or(true))
 }
 
 #[tauri::command]
@@ -2094,8 +2285,9 @@ pub fn activate_pane<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
+    select: Option<bool>,
 ) -> Result<(), String> {
-    if state.activate_pane(&pane_id) {
+    if state.activate_pane_with_selection(&pane_id, select.unwrap_or(true)) {
         crate::state::emit_app_state(&app);
         Ok(())
     } else {
@@ -2126,8 +2318,9 @@ pub fn close_pane<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
+    select: Option<bool>,
 ) -> Result<Option<String>, String> {
-    close_pane_impl(app, &state, pane_id)
+    close_pane_impl_with_selection(app, &state, pane_id, select.unwrap_or(true))
 }
 
 /// Shared close-pane implementation backing both the Tauri command
@@ -2146,8 +2339,17 @@ pub(crate) fn close_pane_impl<R: tauri::Runtime>(
     state: &AppStateStore,
     pane_id: String,
 ) -> Result<Option<String>, String> {
+    close_pane_impl_with_selection(app, state, pane_id, true)
+}
+
+pub(crate) fn close_pane_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    pane_id: String,
+    select: bool,
+) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
-    let removed = state.close_pane(&pane_id)?;
+    let removed = state.close_pane_with_selection(&pane_id, select)?;
     // A `codemux monitor start` flag belongs to the process that was running
     // in this pane. The pane is gone, so the claim is too — and a flag with no
     // pane behind it has no UI left that could ever turn it off.
@@ -2178,8 +2380,9 @@ pub fn swap_panes<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     source_pane_id: String,
     target_pane_id: String,
+    select: Option<bool>,
 ) -> Result<(), String> {
-    state.swap_panes(&source_pane_id, &target_pane_id)?;
+    state.swap_panes_with_selection(&source_pane_id, &target_pane_id, select.unwrap_or(true))?;
     crate::state::emit_app_state(&app);
     Ok(())
 }

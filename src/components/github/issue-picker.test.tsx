@@ -40,8 +40,8 @@ describe("IssuePickerPanel", () => {
   it("shows skeleton loading state initially", () => {
     mockListGithubIssues.mockReturnValue(new Promise(() => {}));
     const { container } = renderPanel();
-    // Skeleton rows have animate-pulse class
-    const skeletons = container.querySelectorAll(".animate-pulse");
+    // Skeleton rows pulse (gated on motion-safe)
+    const skeletons = container.querySelectorAll('[class*="animate-pulse"]');
     expect(skeletons.length).toBeGreaterThan(0);
   });
 

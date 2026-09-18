@@ -64,7 +64,7 @@ function ToolResultThumbnail({
         className="flex h-20 w-28 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
         aria-label="Image failed to load"
       >
-        <ImageOff className="h-5 w-5 opacity-40" aria-hidden />
+        <ImageOff className="size-5 opacity-40" aria-hidden />
       </div>
     );
   }
@@ -74,7 +74,7 @@ function ToolResultThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
     >
       <img
         src={image.src}
@@ -95,8 +95,8 @@ function LightboxImage({ image }: { image: ToolResultImage }) {
   if (failed) {
     return (
       <div className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
-        <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
-        <span className="text-xs">Failed to load image</span>
+        <ImageOff className="size-8 opacity-40" aria-hidden />
+        <span className="text-label">Failed to load image</span>
       </div>
     );
   }

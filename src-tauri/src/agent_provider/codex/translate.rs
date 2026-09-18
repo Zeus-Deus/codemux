@@ -405,6 +405,10 @@ pub fn translate_notification_with(
         if demux.is_subagent(wire_tid) {
             let child = wire_tid.to_string();
             let mut events = translate_parent(thread_id, msg);
+            // Compaction is scoped to the child context, not the parent activity.
+            events.retain(|event| {
+                !matches!(event, ProviderRuntimeEvent::ContextCompactionChanged { .. })
+            });
             tag_subagent_id(&mut events, &child);
             return events;
         }
@@ -1335,6 +1339,10 @@ fn translate_item_started(
         .to_string();
 
     match item_type.as_str() {
+        "contextCompaction" => vec![ProviderRuntimeEvent::ContextCompactionChanged {
+            thread_id: thread_id.clone(),
+            active: true,
+        }],
         "commandExecution" => vec![ProviderRuntimeEvent::ItemCompleted {
             subagent_id: None,
             thread_id: thread_id.clone(),
@@ -1412,6 +1420,10 @@ fn translate_item_completed(
         .to_string();
 
     match item_type.as_str() {
+        "contextCompaction" => vec![ProviderRuntimeEvent::ContextCompactionChanged {
+            thread_id: thread_id.clone(),
+            active: false,
+        }],
         "agentMessage" => {
             let text = env
                 .item
@@ -1554,6 +1566,33 @@ pub fn translate_server_request(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn context_compaction_lifecycle() {
+        for (method, active) in [("item/started", true), ("item/completed", false)] {
+            let events = translate_notification(&ThreadId("parent".into()),
+                NotificationMessage::from_raw(method, json!({
+                    "threadId": "native", "turnId": "turn",
+                    "item": {"type": "contextCompaction", "id": "compact"}
+                })));
+            assert!(matches!(events.as_slice(),
+                [ProviderRuntimeEvent::ContextCompactionChanged { active: actual, .. }] if *actual == active));
+        }
+    }
+
+    #[test]
+    fn context_compaction_in_child_does_not_change_parent() {
+        let mut demux = CodexSubagentDemux::default();
+        demux.register("child", "parent");
+        for method in ["item/started", "item/completed"] {
+            let events = translate_notification_with(&mut demux, &ThreadId("parent".into()),
+                NotificationMessage::from_raw(method, json!({
+                    "threadId": "child", "turnId": "turn",
+                    "item": {"type": "contextCompaction", "id": "compact"}
+                })));
+            assert!(events.is_empty());
+        }
+    }
 
     #[test]
     fn async_question_native_shape_suppresses_only_its_own_text() {

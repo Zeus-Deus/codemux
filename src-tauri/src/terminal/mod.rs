@@ -2143,8 +2143,9 @@ pub fn activate_terminal_session<R: Runtime>(
     app: AppHandle<R>,
     app_state: State<'_, AppStateStore>,
     session_id: String,
+    select: Option<bool>,
 ) -> Result<(), String> {
-    if app_state.activate_terminal_session(&session_id) {
+    if app_state.activate_terminal_session_with_selection(&session_id, select.unwrap_or(true)) {
         state::emit_app_state(&app);
         Ok(())
     } else {
@@ -2303,8 +2304,10 @@ pub fn close_terminal_session<R: Runtime>(
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     session_id: String,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    let fallback_session = app_state.close_terminal_session(&session_id)?;
+    let fallback_session =
+        app_state.close_terminal_session_with_selection(&session_id, select.unwrap_or(true))?;
     terminate_pty_session(&terminal_state.sessions, &session_id);
     state::emit_app_state(&app);
     Ok(fallback_session.0)
@@ -4782,6 +4785,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

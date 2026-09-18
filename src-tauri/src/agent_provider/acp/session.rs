@@ -28,6 +28,7 @@ use super::protocol::{
     resolve_effort_value, resolve_select_value, session_id, set_config_params, set_model_params,
     ConfigKind, GrokModelEffortCatalog,
 };
+use super::slash_commands::{is_available_commands_update, AcpSlashCommandCache};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -41,7 +42,7 @@ const XAI_TERMINAL_RESPONSE_GRACE: Duration = RPC_TIMEOUT;
 const DISPATCHING_TURN_SUFFIX: &str = "dispatching-turn";
 
 /// Provider-specific ACP behavior layered over the shared session engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AcpDialect {
     Cursor,
     Grok,
@@ -99,10 +100,9 @@ impl AcpDialect {
 pub struct AcpSpawnConfig {
     pub binary: PathBuf,
     pub dialect: AcpDialect,
-    /// Shared only by the Grok adapter. Cursor leaves this unset and retains
-    /// its existing command behavior.
-    pub grok_slash_command_cache:
-        Option<Arc<crate::agent_provider::grok::slash_commands::GrokSlashCommandCache>>,
+    /// Shared with the command IPC so the composer reads the same catalogue
+    /// the live session last observed.
+    pub slash_command_cache: Arc<AcpSlashCommandCache>,
 }
 
 #[derive(Debug)]
@@ -276,8 +276,7 @@ pub(crate) struct AcpSession {
     cwd: PathBuf,
     child: Arc<JsonRpcChild>,
     dialect: AcpDialect,
-    grok_slash_command_cache:
-        Option<Arc<crate::agent_provider::grok::slash_commands::GrokSlashCommandCache>>,
+    slash_command_cache: Arc<AcpSlashCommandCache>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Ordering barriers into the two tasks that consume child messages.
@@ -308,7 +307,7 @@ impl AcpSession {
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
         let dialect = spawn.dialect;
-        let grok_slash_command_cache = spawn.grok_slash_command_cache.clone();
+        let slash_command_cache = Arc::clone(&spawn.slash_command_cache);
         let child_env = env.unwrap_or_default();
         let child = JsonRpcChild::spawn(SpawnConfig {
             program: spawn.binary,
@@ -335,11 +334,9 @@ impl AcpSession {
                 .request("initialize", initialize_params("codemux"))
                 .await
                 .map_err(|error| map_rpc_error(error, dialect))?;
-            if dialect.is_grok() {
-                if let Some(cache) = grok_slash_command_cache.as_ref() {
-                    cache.replace_from_value(&cwd, &initialized).await;
-                }
-            }
+            slash_command_cache
+                .replace_from_value(dialect, &cwd, &initialized)
+                .await;
             let auth_method = match dialect {
                 AcpDialect::Cursor => "cursor_login".to_string(),
                 AcpDialect::Grok => grok_auth_method(&initialized, &child_env).ok_or_else(|| {
@@ -513,7 +510,7 @@ impl AcpSession {
             cwd,
             child,
             dialect,
-            grok_slash_command_cache,
+            slash_command_cache,
             event_tx,
             tasks: Mutex::new(Vec::new()),
             notification_barrier_tx,
@@ -1101,10 +1098,10 @@ impl AcpSession {
     /// from their per-prompt billing aggregate. Keep that level reading fresh
     /// for every extension update, then process the durable terminal marker.
     async fn handle_xai_session_update(&self, params: Value) {
-        if crate::agent_provider::grok::slash_commands::is_available_commands_update(&params) {
-            if let Some(cache) = self.grok_slash_command_cache.as_ref() {
-                cache.replace_from_value(&self.cwd, &params).await;
-            }
+        if is_available_commands_update(&params) {
+            self.slash_command_cache
+                .replace_from_value(self.dialect, &self.cwd, &params)
+                .await;
         }
         if let Some((model, effort)) = xai_model_changed(&params) {
             let mut state = self.state.lock().await;
@@ -1906,6 +1903,19 @@ impl AcpSession {
             | "_x.ai/session_notification"
                 if self.dialect.is_grok() =>
             {
+                // session/update also carries historical replay. Only live
+                // compaction notifications may change the activity indicator.
+                if notification.method.ends_with("/session_notification") {
+                    if let Some(active) = xai_compaction_activity(
+                        &notification.params,
+                        &self.provider_session_id.0,
+                    ) {
+                        let _ = self.event_tx.send(ProviderRuntimeEvent::ContextCompactionChanged {
+                            thread_id: self.thread_id.clone(),
+                            active,
+                        });
+                    }
+                }
                 self.handle_xai_session_update(notification.params).await;
             }
             "x.ai/models/update" | "_x.ai/models/update" if self.dialect.is_grok() => {
@@ -1966,12 +1976,13 @@ impl AcpSession {
                 }
             })
             .unwrap_or_default();
-        if self.dialect.is_grok()
-            && crate::agent_provider::grok::slash_commands::is_available_commands_update(&params)
-        {
-            if let Some(cache) = self.grok_slash_command_cache.as_ref() {
-                cache.replace_from_value(&self.cwd, &params).await;
-            }
+        // Every ACP dialect announces its command catalogue this way, and the
+        // snapshot is session-scoped rather than turn-scoped — so it has to be
+        // taken before the active-turn check below drops replay frames.
+        if is_available_commands_update(&params) {
+            self.slash_command_cache
+                .replace_from_value(self.dialect, &self.cwd, &params)
+                .await;
             return;
         }
         let Some(turn_id) = self.state.lock().await.active_turn.clone() else {
@@ -2059,7 +2070,7 @@ impl AcpSession {
                 }
             }
             "usage_update" => self.handle_usage_update(update).await,
-            "config_option_update" | "current_mode_update" | "available_commands_update" => {}
+            "config_option_update" | "current_mode_update" => {}
             "current_model_update" => {
                 if let Some(model) = current_model_id(update).or_else(|| {
                     update
@@ -2595,6 +2606,29 @@ fn xai_completion_value(value: &Value, session_id: &str, prompt_id: &str) -> Opt
         "stopReason": normalize_xai_stop_reason(Some(&stop_reason)),
         "_meta": meta
     }))
+}
+
+/// Grok's live xAI compaction lifecycle is session-scoped, including idle
+/// model switches; these events do not carry prompt IDs. Never infer a start
+/// from token counts or replayed history.
+fn xai_compaction_activity(params: &Value, expected_session_id: &str) -> Option<bool> {
+    if params.pointer("/_meta/isReplay").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    // Older ACP transports wrap extension params in an ExtNotification.
+    let params = params.get("params").unwrap_or(params);
+    if params.pointer("/_meta/isReplay").and_then(Value::as_bool) == Some(true)
+        || xai_string_field(params, "sessionId", "session_id").as_deref()
+            != Some(expected_session_id)
+    {
+        return None;
+    }
+    let update = params.get("update")?;
+    match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "auto_compact_started" => Some(true),
+        "auto_compact_completed" | "auto_compact_failed" | "auto_compact_cancelled" => Some(false),
+        _ => None,
+    }
 }
 
 /// Validate and translate Grok's durable live/replay turn terminal. Both
@@ -3557,6 +3591,37 @@ mod tests {
             ),
             TurnStatus::Error { ref subtype, .. } if subtype == "rate_limit"
         ));
+    }
+
+    #[test]
+    fn context_compaction_xai_lifecycle_is_session_scoped_and_live_only() {
+        for (kind, active) in [
+            ("auto_compact_started", true),
+            ("auto_compact_completed", false),
+            ("auto_compact_failed", false),
+            ("auto_compact_cancelled", false),
+        ] {
+            let mut params = json!({
+                "sessionId": "parent",
+                "update": {"sessionUpdate": kind},
+                "_meta": {"eventId": "event-1", "agentTimestampMs": 123}
+            });
+            assert_eq!(xai_compaction_activity(&params, "parent"), Some(active));
+            assert_eq!(xai_compaction_activity(&params, "child"), None);
+            let wrapped = json!({"method": "x.ai/session_notification", "params": params});
+            assert_eq!(xai_compaction_activity(&wrapped, "parent"), Some(active));
+            params["_meta"]["isReplay"] = json!(true);
+            assert_eq!(xai_compaction_activity(&params, "parent"), None);
+            let replay = json!({"method": "x.ai/session_notification", "params": params});
+            assert_eq!(xai_compaction_activity(&replay, "parent"), None);
+        }
+        for params in [
+            json!({"update": {"sessionUpdate": "auto_compact_started"}}),
+            json!({"sessionId": "parent", "update": {"sessionUpdate": "memory_flush_started"}}),
+            json!({"sessionId": "parent", "update": {"percentage": 100}}),
+        ] {
+            assert_eq!(xai_compaction_activity(&params, "parent"), None);
+        }
     }
 
     #[test]

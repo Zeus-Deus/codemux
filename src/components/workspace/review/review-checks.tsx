@@ -231,7 +231,7 @@ function CheckRow({
         )}
         <ChevronDown
           className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
+            "size-3.5 shrink-0 text-muted-foreground transition-transform duration-150",
             expanded && "rotate-180",
           )}
         />
@@ -242,7 +242,7 @@ function CheckRow({
           {excerpt && (
             <pre
               className={cn(
-                "overflow-hidden whitespace-pre-wrap break-all rounded bg-background/60 px-2.5 py-2 font-mono leading-[1.7] text-destructive",
+                "overflow-hidden whitespace-pre-wrap break-all rounded-sm bg-background/60 px-2.5 py-2 font-mono leading-[1.7] text-destructive",
                 tzLog,
               )}
             >

@@ -3088,3 +3088,33 @@ describe("usage limit", () => {
     expect(answered.usageLimit).toBeNull();
   });
 });
+
+describe("context compaction activity", () => {
+  const compaction: ProviderRuntimeEvent = {
+    type: "context_compaction_changed", thread_id: "t", active: true,
+  };
+  it("ends summarization without ending the turn", () => {
+    const running = { ...createEmptyThreadState(), streaming: true };
+    const active = applyEvent(running, compaction);
+    expect(active.compacting).toBe(true);
+    const done = applyEvent(active, { ...compaction, active: false });
+    expect(done.compacting).toBe(false);
+    expect(done.streaming).toBe(true);
+    expect(done.messages).toEqual([]);
+  });
+  it.each(["ready", "closed", "error"] as const)("clears on session %s", (status) => {
+    const active = applyEvent(createEmptyThreadState(), compaction);
+    const done = applyEvent(active, {
+      type: "session_state_changed", thread_id: "t",
+      status: status === "error" ? { status, message: "disconnected" } : { status },
+    });
+    expect(done.compacting).toBe(false);
+  });
+  it("clears on turn completion even without a compaction end", () => {
+    const active = applyEvent(createEmptyThreadState(), compaction);
+    expect(applyEvent(active, {
+      type: "turn_completed", thread_id: "t", turn_id: "turn",
+      status: { kind: "success" }, usage: null,
+    }).compacting).toBe(false);
+  });
+});

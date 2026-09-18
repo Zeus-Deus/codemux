@@ -298,7 +298,7 @@ export function AppShell({ onFirstPaint }: { onFirstPaint?: () => void } = {}) {
           {browserPeekOpen && (
             <LazyBoundary
               label="browser peek"
-              className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-xl border border-border"
+              className="absolute right-3.5 top-3.5 z-30 h-[300px] w-[440px] rounded-lg border border-border"
             >
               <BrowserPeekOverlay />
             </LazyBoundary>

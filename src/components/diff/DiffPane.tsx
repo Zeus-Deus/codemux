@@ -159,8 +159,8 @@ export function DiffPane({ tabId, workspace, embedded = false }: Props) {
           />
         )}
         <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-          <GitCompare className="h-8 w-8 opacity-30" />
-          <p className="text-xs">Select a file to view changes</p>
+          <GitCompare className="size-8 opacity-30" />
+          <p className="text-label">Select a file to view changes</p>
           {filteredFiles.length > 0 && (
             <p className="text-caption text-muted-foreground/60">
               {filteredFiles.length} file{filteredFiles.length !== 1 ? "s" : ""}{" "}
@@ -190,12 +190,12 @@ export function DiffPane({ tabId, workspace, embedded = false }: Props) {
       )}
       {loading ? (
         <div className="flex flex-1 items-center justify-center text-muted-foreground">
-          <p className="text-xs">Loading diff...</p>
+          <p className="text-label">Loading diff...</p>
         </div>
       ) : lines.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-          <GitCompare className="h-6 w-6 opacity-30" />
-          <p className="text-xs">No changes in this file</p>
+          <GitCompare className="size-6 opacity-30" />
+          <p className="text-label">No changes in this file</p>
         </div>
       ) : tab.layout === "split" ? (
         <DiffSplitView ref={viewRef} lines={lines} />

@@ -72,12 +72,14 @@ import { useAiCommitStore } from "@/stores/ai-commit-store";
 import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
 import { utilitySelectionFromStores } from "@/lib/utility-agent";
+import { PanelHeader } from "@/components/ui/panel-header";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
   GitBranchInfo,
   MergeState,
 } from "@/tauri/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -175,19 +177,19 @@ function FileRow({
               onOpenDiff(file.path, staged);
             }
           }}
-          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors"
+          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors duration-150"
         >
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
           </span>
-          <span className="truncate text-xs text-foreground min-w-0 flex-1">
+          <span className="truncate text-label text-foreground min-w-0 flex-1">
             {name}
             {dir && (
               <span className="ml-1 text-caption text-muted-foreground/40">{dir}</span>
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
@@ -214,7 +216,7 @@ function FileRow({
           </span>
         </div>
       </TooltipTrigger>
-      <TooltipContent side="left" className="text-xs">
+      <TooltipContent side="left" className="text-label">
         {file.path}
       </TooltipContent>
     </Tooltip>
@@ -241,10 +243,10 @@ function FileSection({
   if (files.length === 0) return null;
   return (
     <div className="mb-2">
-      <div className="flex items-center px-2.5 h-5 text-caption font-medium tracking-wider uppercase text-muted-foreground/60">
+      <Eyebrow className="flex items-center px-2.5 h-5">
         <span>{label}</span>
         <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
-      </div>
+      </Eyebrow>
       <div className="flex flex-col">
         {files.map((file) => (
           <FileRow
@@ -268,20 +270,20 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
   const ahead = info.ahead ?? 0;
   const behind = info.behind ?? 0;
   return (
-    <div className="flex items-center gap-1.5 px-2.5 h-7 text-label text-muted-foreground/80 border-b border-border/40">
+    <PanelHeader className="gap-1.5 text-label text-muted-foreground/80">
       <GitBranch className="size-3 shrink-0" />
       <span className="truncate font-mono text-foreground/90">{info.branch}</span>
       {(ahead > 0 || behind > 0) && (
         <span className="ml-auto flex items-center gap-1.5 tabular-nums text-caption">
           {behind > 0 && (
             <span className="flex items-center gap-0.5 text-warning">
-              <ArrowDown className="size-2.5" />
+              <ArrowDown className="size-3" />
               {behind}
             </span>
           )}
           {ahead > 0 && (
             <span className="flex items-center gap-0.5 text-info">
-              <ArrowUp className="size-2.5" />
+              <ArrowUp className="size-3" />
               {ahead}
             </span>
           )}
@@ -290,7 +292,7 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
       {!info.has_upstream && (
         <span className="ml-auto text-caption italic text-muted-foreground/60">no remote</span>
       )}
-    </div>
+    </PanelHeader>
   );
 }
 
@@ -664,7 +666,7 @@ export function ChangesPanel({
           <Button
             variant="ghost"
             size="xs"
-            className="h-6 text-caption text-muted-foreground hover:text-foreground"
+            className="text-caption text-muted-foreground hover:text-foreground"
             onClick={handleAbortMerge}
             disabled={busy !== null}
           >
@@ -674,7 +676,7 @@ export function ChangesPanel({
             <Button
               size="xs"
               variant="ghost"
-              className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+              className="text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
               onClick={handleContinueMerge}
               disabled={busy !== null}
             >
@@ -696,7 +698,7 @@ export function ChangesPanel({
                 <Button
                   size="xs"
                   variant="ghost"
-                  className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                  className="text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                   onClick={async () => {
                     await initialize();
                     refresh();
@@ -770,7 +772,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
@@ -779,7 +781,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption text-muted-foreground hover:text-foreground"
+                className="text-caption text-muted-foreground hover:text-foreground"
                 onClick={() => {
                   const msg = consumeMessage(workspace.workspace_id) ?? generatedMsg;
                   setEditedMsg(msg);
@@ -822,7 +824,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
@@ -948,7 +950,7 @@ function SmartCommitButton({
   // when the action button blends with the card surface rather than
   // competing with it.
   const fillCls =
-    "bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60";
+    "bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60";
 
   return (
     <div className="flex items-stretch gap-px rounded-md overflow-hidden">
@@ -956,7 +958,7 @@ function SmartCommitButton({
         size="sm"
         variant="ghost"
         className={cn(
-          "flex-1 h-8 text-xs gap-1.5 rounded-r-none border-r-0",
+          "flex-1 rounded-r-none border-r-0",
           fillCls,
         )}
         onClick={primary.action}
@@ -968,13 +970,16 @@ function SmartCommitButton({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
-            size="sm"
+            // `icon` is the 32px square rung: same height as the `sm`
+            // primary half beside it, and no padding to override — a
+            // segmented pair has to share a baseline.
+            size="icon"
             variant="ghost"
-            className={cn("h-8 w-7 px-0 rounded-l-none border-l-0", fillCls)}
+            className={cn("rounded-l-none border-l-0", fillCls)}
             aria-label="More actions"
             disabled={busy !== null}
           >
-            <ChevronDown className="size-3" />
+            <ChevronDown className="size-3.5" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-[200px]">

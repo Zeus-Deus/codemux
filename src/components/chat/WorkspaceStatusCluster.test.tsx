@@ -185,7 +185,6 @@ describe("WorkspaceStatusCluster", () => {
     const icon = chip.querySelector("svg");
     expect(icon).toHaveClass("text-status-open");
     expect(icon).toHaveAttribute("width", "14");
-    expect(icon).toHaveAttribute("stroke-width", "1.75");
     await userEvent.click(chip);
     expect(mocks.openUrl).toHaveBeenCalledWith(
       "https://github.com/org/repo/pull/172",
@@ -245,6 +244,32 @@ describe("WorkspaceStatusCluster", () => {
       "/home/dev/.codemux/worktrees/repo/feature-19",
       172,
     );
+  });
+
+  it("shows the branch the worktree was created from without a PR", async () => {
+    mocks.workspace = makeWorkspace({ base_branch: "develop" });
+    const user = userEvent.setup();
+    render(<WorkspaceStatusCluster />);
+    await user.click(screen.getByRole("button", { name: "Workspace details" }));
+    expect(screen.getByText("Base")).toBeInTheDocument();
+    expect(screen.getByText("develop")).toBeInTheDocument();
+    expect(mocks.getGithubPrByPath).not.toHaveBeenCalled();
+  });
+
+  it("prefers the PR target over the recorded base once resolved", async () => {
+    mocks.workspace = makeWorkspace({
+      base_branch: "develop",
+      pr_number: 172,
+      pr_state: "open",
+    });
+    mocks.getGithubPrByPath.mockResolvedValue({
+      base_branch: "main",
+    } as PullRequestInfo);
+    const user = userEvent.setup();
+    render(<WorkspaceStatusCluster />);
+    await user.click(screen.getByRole("button", { name: "Workspace details" }));
+    await waitFor(() => expect(screen.getByText("main")).toBeInTheDocument());
+    expect(screen.queryByText("develop")).not.toBeInTheDocument();
   });
 
   it("omits the Base row when the PR detail fetch fails", async () => {
@@ -325,7 +350,6 @@ describe("WorkspaceStatusCluster", () => {
     expect(indicator.querySelector(".cm-blink")).not.toBeInTheDocument();
     const icon = indicator.querySelector("svg");
     expect(icon).toHaveClass("size-3.5");
-    expect(icon).toHaveAttribute("stroke-width", "1.75");
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
     await userEvent.click(indicator);
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);

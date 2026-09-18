@@ -137,7 +137,7 @@ describe("ResourceMonitor", () => {
       const icon = screen
         .getByRole("button", { name: "Resource monitor" })
         .querySelector("svg");
-      expect(icon).toHaveClass("h-3.5", "w-3.5");
+      expect(icon).toHaveClass("size-3.5");
     },
   );
 

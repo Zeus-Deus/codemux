@@ -50,7 +50,7 @@ export function ReviewTabStrip({ tabs, activeId, onSelect, trailing }: Props) {
             data-testid={`review-tab-${tab.id}`}
             onClick={() => onSelect(tab.id)}
             className={cn(
-              "-mb-px border-b-[1.5px] py-2.5 transition-colors",
+              "-mb-px border-b-[1.5px] py-2.5 transition-colors duration-150",
               tzBodyLg,
               active
                 ? "border-accent-ember font-semibold text-foreground"

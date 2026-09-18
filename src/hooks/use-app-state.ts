@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useEffect, useRef, useCallback } from "react";
 import { getAppState } from "@/tauri/commands";
 import { onAppStateChanged, onAppStateDelta, onAppStateRevision } from "@/tauri/events";
@@ -37,6 +39,13 @@ function tracedPayloadMeta(payload: AppStateSnapshot): Record<string, number> | 
 }
 
 export function useAppStateInit(skip = false) {
+  const remoteWorkspaceId = useAppStore((s) => s.remoteActiveWorkspaceId);
+  const remoteBackend = useAppStore((s) => s.backendInstance);
+  useEffect(() => {
+    if (skip || !isRemoteClient() || !remoteWorkspaceId) return;
+    void invoke("touch_workspace", { workspaceId: remoteWorkspaceId }).catch(console.error);
+  }, [skip, remoteWorkspaceId, remoteBackend]);
+
   const setAppState = useAppStore((s) => s.setAppState);
   const applyAppStateDelta = useAppStore((s) => s.applyAppStateDelta);
   const resyncRequestId = useAppStore((s) => s.resyncRequestId);

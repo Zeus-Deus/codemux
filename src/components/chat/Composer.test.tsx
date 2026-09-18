@@ -398,7 +398,7 @@ describe("Composer", () => {
       });
       const chip = getByTestId("composer-attachment-token-Composer.tsx");
       expect(chip).toBeInTheDocument();
-      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip).toHaveAttribute("data-tint", "neutral");
       expect(chip.textContent).toBe("@Composer.tsx");
     });
 

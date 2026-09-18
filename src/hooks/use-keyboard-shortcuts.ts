@@ -232,7 +232,7 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
 
   if (!appState) return false;
   const ws = appState.workspaces.find(
-    (w) => w.workspace_id === appState.active_workspace_id,
+    (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
   );
   if (!ws) return false;
 

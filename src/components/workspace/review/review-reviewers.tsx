@@ -119,7 +119,7 @@ export function ReviewReviewers({ pr, cwd, canRequestReview, onRequested }: Prop
               if (e.key === "Escape") setShowInput(false);
             }}
             className={cn(
-              "h-[30px] min-w-0 flex-1 rounded-md border-0 bg-background px-2.5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              "h-[30px] min-w-0 flex-1 rounded-md border-0 bg-background px-2.5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring/60",
               tzBody,
             )}
             data-testid="request-review-input"

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
 import { Loader2, Globe } from "lucide-react";
@@ -220,7 +220,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const handleTellAgent = useCallback(async (selector: string) => {
     const appState = useAppStore.getState().appState;
     if (!appState) return;
-    const ws = appState.workspaces.find((w) => w.workspace_id === appState.active_workspace_id);
+    const ws = appState.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()));
     if (!ws) return;
     const surface = ws.surfaces.find((s) => s.surface_id === ws.active_surface_id);
     if (!surface) return;
@@ -360,7 +360,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                   target:
                     traceWorkspaceId ??
                     workspaceId ??
-                    useAppStore.getState().appState?.active_workspace_id ??
+                    selectActiveWorkspaceId(useAppStore.getState()) ??
                     undefined,
                 });
               }
@@ -924,13 +924,13 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (
               <>
-                <Globe className="h-8 w-8 text-muted-foreground/30 mb-2" />
-                <p className="text-xs text-destructive">{errorMsg || "Connection failed"}</p>
+                <Globe className="size-8 text-muted-foreground/30 mb-2" />
+                <p className="text-label text-destructive">{errorMsg || "Connection failed"}</p>
               </>
             ) : (
               <>
-                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground mb-2" />
-                <p className="text-xs text-muted-foreground">
+                <Loader2 className="size-6 animate-spin text-muted-foreground mb-2" />
+                <p className="text-label text-muted-foreground">
                   {status === "starting" && "Starting browser..."}
                   {status === "connecting" && "Connecting to stream..."}
                   {status === "waiting" && "Waiting for first frame..."}
@@ -941,17 +941,17 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         )}
         {status !== "live" && hasFrame && (
           <div
-            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-200"
+            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"
             style={{ animationDelay: "400ms", animationFillMode: "backwards" }}
           >
             {status === "error" ? (
               <>
-                <Globe className="h-3 w-3 text-destructive" />
+                <Globe className="size-3 text-destructive" />
                 <span className="text-label text-destructive">{errorMsg || "Stream disconnected"}</span>
               </>
             ) : (
               <>
-                <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                <Loader2 className="size-3 animate-spin text-muted-foreground" />
                 <span className="text-label text-muted-foreground">Reconnecting…</span>
               </>
             )}

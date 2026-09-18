@@ -1,3 +1,4 @@
+import { remoteClientId } from "./client-view";
 /**
  * Web-remote WebSocket transport.
  *
@@ -322,7 +323,7 @@ export class RemoteTransport {
         // JSON.stringify converts `Channel` args to "__CHANNEL__:<id>"
         // strings via their `toJSON`; the shim's transformCallback minted
         // those ids and holds the callbacks.
-        this.ws!.send(JSON.stringify({ t: "invoke", id, cmd, args }));
+        this.ws!.send(JSON.stringify({ t: "invoke", id, cmd, args: { ...args, __remoteClientId: remoteClientId() } }));
       } catch (err) {
         this.pending.delete(id);
         reject(err);

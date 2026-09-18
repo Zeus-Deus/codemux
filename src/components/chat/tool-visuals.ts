@@ -95,6 +95,6 @@ export function categoryTint(category: ToolCategory): string {
     case "file":
     case "terminal":
     case "other":
-      return "bg-foreground/10 text-muted-foreground";
+      return "bg-surface-3 text-muted-foreground";
   }
 }

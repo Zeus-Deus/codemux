@@ -81,7 +81,7 @@ describe("AttachmentChip", () => {
         <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
       );
       const chip = getByRole("status");
-      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip).toHaveAttribute("data-tint", "neutral");
       expect(chip.className).toContain("text-foreground");
     });
 
@@ -180,7 +180,7 @@ describe("AttachmentChip", () => {
           onRemove={vi.fn()}
         />,
       );
-      expect(getByRole("status").className).toContain("bg-foreground/10");
+      expect(getByRole("status")).toHaveAttribute("data-tint", "neutral");
       expect(getByLabelText(/folder attachment/)).toBeInTheDocument();
     });
 

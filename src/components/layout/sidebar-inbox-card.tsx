@@ -292,6 +292,12 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     status !== null && workspace.linked_issue
       ? workspace.linked_issue.title
       : workspace.title;
+  /** A workspace named after its project prints the same word twice — once
+   *  in the eyebrow, once as the title. The avatar already carries project
+   *  identity, so the eyebrow's label stands down and the card reads as one
+   *  name on one line. */
+  const titleRepeatsProject =
+    displayTitle.trim().toLowerCase() === repo.name.trim().toLowerCase();
 
   const prState = normalizePrState(workspace.pr_state);
   // `scProvider` — the *hosting* product. Distinct from `providers`
@@ -368,7 +374,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         // rather than outshining that card's own title.
         !status &&
           (visuallyReceded
-            ? "font-medium text-muted-foreground/50 transition-colors group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
+            ? "font-medium text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-muted-foreground/70 group-focus-within/card:text-muted-foreground/70"
             : "font-medium text-muted-foreground/70"),
       )}
     >
@@ -380,18 +386,17 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           data-workspace-working-icon
           aria-hidden
           className="size-3.5"
-          strokeWidth={2}
         />
       )}
       {isNeeds && (
-        <span className="size-1.5 animate-pulse rounded-full bg-status-attention" />
+        <span className="size-1.5 motion-safe:animate-pulse rounded-full bg-status-attention" />
       )}
       {/* Steady dot, deliberately not the configurable WorkingIndicator and
           deliberately not animated: monitoring is calm background presence. */}
       {isMonitoring && (
         <span className="size-1.5 rounded-full bg-status-monitoring" />
       )}
-      {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
+      {isDone && <Check className="size-3" />}
       {isWorking ? (
         <>
           {/* Keep only the stable label in the live region. The elapsed value
@@ -451,7 +456,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
     >
       <div
         className={cn(
-          "overflow-hidden transition-[max-height,opacity] duration-200 ease-out",
+          "overflow-hidden transition-[max-height,opacity] duration-250 ease-out",
           // Off-screen cards stop costing layout and paint. At 50+ workspaces
           // the inbox is several viewports tall and every card was laying out
           // and painting on each coarse tick even when nowhere near the
@@ -501,20 +506,22 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 selectAndActivate();
               }}
               className={cn(
-                "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
+                "group/card relative mb-1.5 cursor-pointer rounded-lg border px-2.5 py-2",
                 // select-none: a shift-click range gesture would otherwise
                 // drag a text highlight across every card it spans.
-                "select-none outline-none duration-150",
+                "select-none duration-150",
                 // No opacity on this node: the recede is per element (see the
                 // `receded` note above), which leaves the wrapper above the
                 // sole owner of the card's opacity — the leaving collapse and
                 // the rise-in keyframe — with nothing here to fight it.
-                "transition-[color,background-color,border-color]",
+                "transition-[color,background-color,border-color] duration-150",
                 isActive
-                  ? "border-border bg-foreground/[0.09]"
-                  : isNeeds
-                    ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
-                    : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
+                  ? "border-border bg-surface-3"
+                  // No red border for a needs-you card: the status dot, the
+                  // red "Needs you" readout and the red blocker line already
+                  // say it three times, and a fourth signal wrapped around the
+                  // whole card turned the rail into a warning panel.
+                  : "border-transparent bg-transparent hover:bg-surface-2 focus-visible:border-border",
                 // Multi-select layers a ring over whatever the card already
                 // is, so "checked for a bulk action" never has to compete with
                 // "this is the workspace you're looking at" for the same
@@ -539,16 +546,18 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       "opacity-40 grayscale group-hover/card:opacity-100 group-hover/card:grayscale-0 group-focus-within/card:opacity-100 group-focus-within/card:grayscale-0",
                   )}
                 />
-                <span
-                  className={cn(
-                    "min-w-0 truncate text-label font-semibold tracking-[0.01em] transition-colors duration-150",
-                    visuallyReceded
-                      ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/80 group-focus-within/card:text-muted-foreground/80"
-                      : "text-muted-foreground/80",
-                  )}
-                >
-                  {repo.name}
-                </span>
+                {!titleRepeatsProject && (
+                  <span
+                    className={cn(
+                      "min-w-0 truncate text-label font-medium tracking-[0.01em] transition-colors duration-150",
+                      visuallyReceded
+                        ? "text-muted-foreground/55 group-hover/card:text-muted-foreground/80 group-focus-within/card:text-muted-foreground/80"
+                        : "text-muted-foreground/80",
+                    )}
+                  >
+                    {repo.name}
+                  </span>
+                )}
                 {/* Resting pin marker. It sits beside the repo name rather
                     than at the row's right edge because that edge belongs to
                     the state readout, and it hides under the pointer: the
@@ -593,7 +602,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       "text-caption font-semibold leading-[15px] text-status-open",
                     )}
                   >
-                    <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    <AlarmClock className="size-3" />
                     Woke
                   </span>
                 )}
@@ -631,9 +640,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={eyebrowGlyphClass}
                   >
                     {pinned ? (
-                      <PinOff className="size-3" strokeWidth={1.5} />
+                      <PinOff className="size-3" />
                     ) : (
-                      <Pin className="size-3" strokeWidth={1.5} />
+                      <Pin className="size-3" />
                     )}
                   </button>
                 {canSnooze && (
@@ -649,7 +658,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         title="Snooze"
                         className={eyebrowGlyphClass}
                       >
-                        <AlarmClock className="size-3" strokeWidth={1.5} />
+                        <AlarmClock className="size-3" />
                       </button>
                     </DropdownMenuTrigger>
                     {/* Radix portals this into document.body, but React events
@@ -668,7 +677,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       {snoozePresets.map((preset) => (
                         <DropdownMenuItem
                           key={preset.id}
-                          className="gap-4 text-xs"
+                          className="gap-4 text-label"
                           onSelect={() =>
                             onSnooze(workspace.workspace_id, preset.at)
                           }
@@ -703,7 +712,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         "transition-colors duration-150 hover:text-foreground",
                       )}
                     >
-                      <Check className="size-[11px]" strokeWidth={2.1} />
+                      <Check className="size-[11px]" />
                       Settle
                     </button>
                   )}
@@ -717,7 +726,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   <kbd
                     aria-hidden="true"
                     className={cn(
-                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
+                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-sm px-1",
                       "border border-border/80 bg-background/80 font-mono text-caption font-semibold leading-none tabular-nums text-foreground/80",
                       "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
                       "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
@@ -729,7 +738,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               </div>
 
               {/* Title line: work title + linked-issue chip */}
-              <div className="mt-1 flex min-w-0 items-center gap-1.5">
+              <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
                 {/* No visible unread dot: the eyebrow status and full-brightness
                     card already say "look here", so unread is carried by the
                     bolder title alone. Screen readers still get it spelled out. */}
@@ -741,8 +750,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       ? "text-muted-foreground/55 group-hover/card:text-foreground group-focus-within/card:text-foreground"
                       : "text-foreground",
                     // The extra weight is what makes an unread card readable
-                    // as unread at a glance down a scrolling list.
-                    unread ? "font-bold" : "font-semibold",
+                    // as unread at a glance down a scrolling list. Read cards
+                    // sit at 500 with the project label, so neither line wins
+                    // a weight contest with the other.
+                    unread ? "font-semibold" : "font-medium",
                   )}
                 >
                   {displayTitle}
@@ -796,7 +807,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               <div
                 data-meta-line
                 className={cn(
-                  "mt-[5px] flex min-w-0 items-center gap-2 font-mono text-label leading-tight transition-colors duration-150",
+                  "mt-1 flex min-w-0 items-center gap-2 font-mono text-label leading-tight tabular-nums transition-colors duration-150",
                   // Branch and ↑ahead inherit this, so one mute here covers
                   // the whole git-local run.
                   visuallyReceded
@@ -818,7 +829,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-muted-foreground/50 transition-colors group-hover/card:text-status-open/80 group-focus-within/card:text-status-open/80"
+                            ? "text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-status-open/80 group-focus-within/card:text-status-open/80"
                             : "text-status-open/80",
                         )}
                       >
@@ -829,7 +840,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       <span
                         className={cn(
                           visuallyReceded
-                            ? "text-muted-foreground/50 transition-colors group-hover/card:text-status-attention/80 group-focus-within/card:text-status-attention/80"
+                            ? "text-muted-foreground/50 transition-colors duration-150 group-hover/card:text-status-attention/80 group-focus-within/card:text-status-attention/80"
                             : "text-status-attention/80",
                         )}
                       >
@@ -853,7 +864,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         : `${scProvider.nounTitle} — ${prState}`
                     }
                     className={cn(
-                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded-sm px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(
@@ -862,7 +873,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           )
                         : prStatusTextClass(prState),
                       workspace.pr_url
-                        ? "hover:bg-foreground/[0.055]"
+                        ? "hover:bg-surface-2"
                         : // `cursor-default`, not `pointer-events-none`: the
                           // chip is already `disabled`, so it swallows the
                           // click. Letting pointer events pass through instead
@@ -910,13 +921,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       aria-label={`Long-running process on :${runningPort}`}
                       title={`Long-running process on :${runningPort}`}
                       className={cn(
-                        "flex shrink-0 animate-pulse items-center transition-colors",
+                        "flex shrink-0 motion-safe:animate-pulse items-center transition-colors duration-150",
                         visuallyReceded
                           ? "text-muted-foreground/40 group-hover/card:text-status-open group-focus-within/card:text-status-open"
                           : "text-status-open",
                       )}
                     >
-                      <Terminal className="size-3" strokeWidth={1.7} />
+                      <Terminal className="size-3" />
                     </span>
                   )}
                   {providers.map((p) => (
@@ -924,7 +935,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       key={p}
                       provider={p}
                       className={cn(
-                        "h-3.5 w-3.5 transition-[opacity,filter]",
+                        "size-3.5 transition-[opacity,filter] duration-150",
                         visuallyReceded
                           ? "opacity-35 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
                           : "opacity-80",
@@ -935,7 +946,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     <Cloud
                       aria-label="Runs on a remote host"
                       className={cn(
-                        "h-[13px] w-[13px] shrink-0 transition-colors",
+                        "h-[13px] w-[13px] shrink-0 transition-colors duration-150",
                         visuallyReceded
                           ? "text-muted-foreground/40 group-hover/card:text-status-remote group-focus-within/card:text-status-remote"
                           : "text-status-remote",
@@ -945,7 +956,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-caption font-bold text-muted-foreground",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
                         "transition-opacity duration-150",
                         visuallyReceded &&
                           "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",
