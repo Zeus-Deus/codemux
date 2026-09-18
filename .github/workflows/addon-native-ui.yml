@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - scripts/addons/native-ui.mjs
+      - scripts/addons/context-fixture.mjs
+      - scripts/addons/reversion-fixture.mjs
       - scripts/addons/install-webdriver.ps1
       - scripts/addons/windows-*.ps1
       - .github/workflows/addon-native-ui.yml
