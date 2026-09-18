@@ -434,11 +434,12 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(std::sync::Arc::new(
             crate::agent_provider::grok::capabilities::GrokCapabilityCache::new(),
         ))
-        // Grok's ACP command catalogue starts in initialize metadata and can
-        // be replaced by a live session update. The command IPC and running
-        // provider share this cache so the composer sees the latest snapshot.
+        // ACP command catalogues arrive from a live session update, and from
+        // initialize metadata on agents that publish it there. The command IPC
+        // and every running ACP session share this cache so the composer sees
+        // the latest snapshot; entries are keyed per provider.
         .manage(std::sync::Arc::new(
-            crate::agent_provider::grok::slash_commands::GrokSlashCommandCache::new(),
+            crate::agent_provider::acp::slash_commands::AcpSlashCommandCache::new(),
         ))
         // Claude capability cache — populated lazily on the first
         // `list_chat_provider_capabilities` call for Claude when
@@ -1126,25 +1127,27 @@ fn build_core_app<R: tauri::Runtime>(
                         // Cursor Agent speaks the official Agent Client
                         // Protocol over stdio. Like Codex, its subprocess is
                         // spawned lazily per chat session.
-                        let cursor = agent_provider::cursor::CursorAgentProvider::new(
-                            agent_provider::cursor::CursorProviderConfig::default(),
-                        );
+                        let acp_slash_commands: tauri::State<
+                            '_,
+                            std::sync::Arc<
+                                agent_provider::acp::slash_commands::AcpSlashCommandCache,
+                            >,
+                        > = registry_handle.state();
+                        let cursor =
+                            agent_provider::cursor::CursorAgentProvider::new_with_slash_command_cache(
+                                agent_provider::cursor::CursorProviderConfig::default(),
+                                acp_slash_commands.inner().clone(),
+                            );
                         registry
                             .set_cursor(std::sync::Arc::new(cursor) as _)
                             .await;
 
                         // Grok Build also speaks ACP over stdio and is
                         // spawned lazily per chat session.
-                        let grok_slash_commands: tauri::State<
-                            '_,
-                            std::sync::Arc<
-                                agent_provider::grok::slash_commands::GrokSlashCommandCache,
-                            >,
-                        > = registry_handle.state();
                         let grok =
                             agent_provider::grok::GrokAgentProvider::new_with_slash_command_cache(
                                 agent_provider::grok::GrokProviderConfig::default(),
-                                grok_slash_commands.inner().clone(),
+                                acp_slash_commands.inner().clone(),
                             );
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)

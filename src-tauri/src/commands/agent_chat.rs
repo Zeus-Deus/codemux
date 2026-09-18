@@ -3793,10 +3793,12 @@ pub async fn agent_chat_provider_health(
 }
 
 /// List the provider-native slash commands available to a chat thread
-/// anchored at `cwd`. Claude discovers them through the Agent SDK, while
-/// Grok reads the official ACP initialize catalogue and any newer full
-/// snapshot observed by a running session. Providers without a discovery
-/// surface resolve to an empty list.
+/// anchored at `cwd`. Claude discovers them through the Agent SDK. ACP
+/// providers publish a full catalogue over `available_commands_update`,
+/// which running sessions record in the shared cache; Grok additionally
+/// answers with one at initialize, so it can be probed before any session
+/// exists. OpenCode serves its catalogue over the local HTTP server
+/// Codemux already runs for its sessions.
 ///
 /// Selecting one of these in the UI inserts the literal `/name ` text
 /// into the draft; the text is forwarded verbatim to the provider,
@@ -3810,9 +3812,13 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
     >,
-    grok_slash_cache: tauri::State<
+    acp_slash_cache: tauri::State<
         '_,
-        std::sync::Arc<crate::agent_provider::grok::slash_commands::GrokSlashCommandCache>,
+        std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
+    >,
+    opencode_manager: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
     >,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     match provider {
@@ -3824,13 +3830,54 @@ pub async fn list_chat_slash_commands(
                 }
                 .to_command_string()
             })?;
-            grok_slash_cache
-                .get_or_harvest(&binary_path, std::path::Path::new(&cwd))
+            acp_slash_cache
+                .get_or_harvest(
+                    crate::agent_provider::acp::session::AcpDialect::Grok,
+                    &binary_path,
+                    std::path::Path::new(&cwd),
+                )
                 .await
         }
-        // No discovery surface on these providers (yet) — empty list,
-        // not an error, so the popup renders without a failure footer.
-        ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::OpenCode => Ok(Vec::new()),
+        // Cursor announces its catalogue only after `session/new`, so serve
+        // what a running session already published for this cwd. Do not add
+        // a probe here: it would have to open a real Cursor session just to
+        // read a menu, spawning a child process and writing Cursor's own
+        // session storage as a side effect.
+        ProviderKind::Cursor => Ok(acp_slash_cache
+            .cached(
+                crate::agent_provider::acp::session::AcpDialect::Cursor,
+                std::path::Path::new(&cwd),
+            )
+            .await),
+        ProviderKind::OpenCode => {
+            let handle = match opencode_manager.ensure_running().await {
+                Ok(handle) => handle,
+                // Someone who never installed OpenCode still opens this
+                // popup for the provider they do use, so a missing binary
+                // is an empty menu rather than a failure footer — the same
+                // reading the skill inventory gives that message. Every
+                // other failure (spawn refused, server wedged) means a
+                // server Codemux does depend on is broken, and hiding that
+                // behind an empty list would make the menu silently lie.
+                Err(error) if error == "opencode_not_installed" => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+            let mut config =
+                crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
+            config.server_password = Some(handle.server_password);
+            // One localhost round-trip against an already-running server,
+            // and the frontend memoises per provider and cwd, so a second
+            // cache here would only add a staleness window.
+            crate::agent_provider::opencode::OpenCodeClient::new(config)?
+                .list_commands(std::path::Path::new(&cwd))
+                .await
+        }
+        // Codex has nothing to enumerate: upstream deleted custom prompts
+        // outright and skills took their place, and the slash commands its
+        // TUI still offers are interpreted by that TUI and never reach the
+        // model, so they mean nothing sent over the app-server protocol
+        // Codemux drives.
+        ProviderKind::Codex => Ok(Vec::new()),
     }
 }
 

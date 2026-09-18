@@ -8,3 +8,4 @@
 
 pub mod protocol;
 pub mod session;
+pub mod slash_commands;

@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::protocol::{SessionInfo, SessionMessage};
+use crate::agent_provider::claude::slash_commands::ProviderSlashCommand;
 
 /// Configuration knobs for [`OpenCodeClient`]. Plain struct so callers
 /// can override fields one at a time; `Default` populates the values
@@ -160,6 +161,50 @@ impl OpenCodeClient {
             .map_err(|error| format!("parse_error: {error}"))
     }
 
+    /// Return the slash commands OpenCode resolves for one working
+    /// directory, shaped for the composer popup.
+    ///
+    /// `GET /command` (operation `command.list`) answers
+    /// `[{ name, description?, agent?, model?, source, template, subtask?,
+    /// hints }]`. Only the fields a menu renders are decoded; everything
+    /// else is ignored so the server can extend the schema without
+    /// breaking the catalogue here.
+    pub async fn list_commands(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<Vec<ProviderSlashCommand>, String> {
+        let url = format!(
+            "{}/command?directory={}",
+            self.config.base_url,
+            urlencoding::encode(&directory.to_string_lossy())
+        );
+        let response = self
+            .attach_auth(self.http.get(&url))
+            .send()
+            .await
+            .map_err(format_request_error)?;
+        if !response.status().is_success() {
+            return Err(format!("http_status_{}", response.status().as_u16()));
+        }
+        let entries: Vec<OpenCodeCommand> = response
+            .json()
+            .await
+            .map_err(|error| format!("parse_error: {error}"))?;
+        Ok(entries
+            .into_iter()
+            // Skills reach the composer through Codemux's own inventory,
+            // which groups them separately and honours per-skill
+            // enablement. Letting them through here would list every skill
+            // a second time, under a group that ignores those preferences.
+            .filter(|entry| entry.source.as_deref() != Some("skill"))
+            .map(|entry| ProviderSlashCommand {
+                name: entry.name,
+                description: entry.description.unwrap_or_default(),
+                argument_hint: format_argument_hint(&entry.hints),
+            })
+            .collect())
+    }
+
     /// Cold-backfill a (sub)session's transcript.
     ///
     /// `GET /session/{id}/message?limit=N` returns the most recent
@@ -229,6 +274,43 @@ impl OpenCodeClient {
             None => request,
         }
     }
+}
+
+/// One entry of `GET /command`. `template`, `agent`, `model` and
+/// `subtask` steer execution inside OpenCode and mean nothing to a menu,
+/// so they stay undecoded.
+#[derive(Debug, Clone, Deserialize)]
+struct OpenCodeCommand {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    /// `"command" | "mcp" | "skill"` today, kept as a string so an origin
+    /// added upstream still decodes instead of failing the whole batch.
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    hints: Vec<String>,
+}
+
+/// Render OpenCode's template placeholders as the `<name>` hints the rest
+/// of the popup already speaks, so one list does not mix two placeholder
+/// vocabularies and the user reads arity at a glance: `$ARGUMENTS` takes
+/// the whole remaining line, each positional `$1`, `$2`, … takes one slot.
+fn format_argument_hint(hints: &[String]) -> String {
+    hints
+        .iter()
+        .map(|hint| {
+            let token = hint.trim_start_matches('$');
+            if token == "ARGUMENTS" {
+                "<arguments>".to_string()
+            } else if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+                format!("<arg{token}>")
+            } else {
+                format!("<{token}>")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +809,44 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
         assert_eq!(skills[0].content, "Follow the checklist.");
+    }
+
+    #[tokio::test]
+    async fn list_commands_passes_directory_and_maps_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/command?directory=%2Frepo%2Fwith%20space")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"name":"review","description":"Review the diff","source":"command","template":"Review $ARGUMENTS","subtask":true,"hints":["$ARGUMENTS"]},
+                    {"name":"compare","source":"command","template":"Compare $1 and $2","hints":["$1","$2"],"future_field":"ignored"},
+                    {"name":"init","description":"Write AGENTS.md","source":"command","template":"init","hints":[]},
+                    {"name":"brainstorm","description":"A skill","source":"skill","template":"...","hints":["$ARGUMENTS"]}
+                ]"#,
+            )
+            .create_async()
+            .await;
+        let client =
+            OpenCodeClient::new(OpenCodeClientConfig::new(server.url())).expect("client builds");
+
+        let commands = client
+            .list_commands(std::path::Path::new("/repo/with space"))
+            .await
+            .expect("catalog decodes");
+
+        mock.assert_async().await;
+        let names = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["review", "compare", "init"]);
+        assert_eq!(commands[0].description, "Review the diff");
+        assert_eq!(commands[0].argument_hint, "<arguments>");
+        assert_eq!(commands[1].description, "", "missing description is empty");
+        assert_eq!(commands[1].argument_hint, "<arg1> <arg2>");
+        assert_eq!(commands[2].argument_hint, "", "no hints, no hint text");
     }
 
     #[tokio::test]
