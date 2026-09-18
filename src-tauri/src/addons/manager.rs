@@ -133,7 +133,7 @@ pub struct Running {
     activated: AtomicBool,
     cancel: CancellationToken,
     stopped: CancellationToken,
-    storage: StdMutex<Storage>,
+    storage: StdMutex<Option<Storage>>,
     settings: StdMutex<Value>,
     views: Mutex<HashMap<String, View>>,
     disposed_views: Mutex<HashSet<String>>,
@@ -444,7 +444,7 @@ impl Manager {
             activated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             stopped: CancellationToken::new(),
-            storage: StdMutex::new(storage),
+            storage: StdMutex::new(Some(storage)),
             settings: StdMutex::new(settings),
             views: Mutex::new(HashMap::new()),
             disposed_views: Mutex::new(HashSet::new()),
@@ -643,6 +643,11 @@ impl Manager {
         };
         let probe = running.as_ref().is_some_and(|r| r.probe);
         if let Some(running) = &running {
+            // Cancelled broker tasks and activation callers may still hold an
+            // Arc<Running>. Release SQLite explicitly instead of retaining its
+            // Windows file locks until those references happen to disappear.
+            // The same mutex serializes any already-entered storage operation.
+            running.storage.lock().unwrap().take();
             self.contexts
                 .lock()
                 .await
@@ -939,6 +944,9 @@ impl Manager {
                     .as_str()
                     .ok_or_else(|| ProtocolError::invalid("Missing storage key"))?;
                 let mut storage = running.storage.lock().unwrap();
+                let storage = storage.as_mut().ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::PluginStopped, "Plugin storage is closed")
+                })?;
                 match operation {
                     "storage.get" => storage.get(&scope, key),
                     "storage.set" => {
@@ -1582,8 +1590,12 @@ mod tests {
             .await
             .expect("activation and removal serialize");
             activated.unwrap();
-            assert!(removed.unwrap().is_empty());
+            let warnings = removed.unwrap();
+            assert!(warnings.is_empty(), "Removal cleanup: {warnings:?}");
             assert!(running.stopped.is_cancelled());
+            // Keep this stale reference alive while checking cleanup. Windows
+            // must not depend on Arc drop to release private database handles.
+            assert!(running.storage.lock().unwrap().is_none());
             assert!(manager.running.lock().await.is_empty());
             assert!(manager.list().unwrap().is_empty());
             assert!(!manager
