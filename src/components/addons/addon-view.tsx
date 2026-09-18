@@ -116,7 +116,7 @@ export function AddonView({
       className="h-full min-h-0 overflow-auto p-3"
     >
       {error || failed || installation?.status === "failed-disabled" ? (
-        <div role="alert" className="rounded-md border p-3 text-sm">
+        <div role="alert" className="rounded-md border p-3 text-body">
           <p className="font-medium">Add-on unavailable</p>
           <p className="mt-1 text-muted-foreground">
             {error ||
@@ -140,7 +140,7 @@ export function AddonView({
           }}
         />
       ) : (
-        <p role="status" className="text-sm text-muted-foreground">
+        <p role="status" className="text-body text-muted-foreground">
           Loading add-on…
         </p>
       )}

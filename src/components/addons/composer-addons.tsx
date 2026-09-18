@@ -55,7 +55,7 @@ export function ComposerAddonAccessory({ composerId }: { composerId: string }) {
       aria-label={`${declaration.title} — ${plugin.manifest.name}`}
       className="mx-3 my-2 max-h-72 overflow-auto rounded-lg border bg-background"
     >
-      <div className="flex items-center justify-between border-b px-3 py-2 text-xs">
+      <div className="flex items-center justify-between border-b px-3 py-2 text-label">
         <span>
           {declaration.title}{" "}
           <span className="text-muted-foreground">

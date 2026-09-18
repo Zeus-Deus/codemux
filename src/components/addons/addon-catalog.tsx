@@ -91,24 +91,24 @@ export function AddonCatalog({
         </Button>
       </div>
       {catalog?.snapshot && (
-        <p className="text-xs text-muted-foreground">
+        <p className="text-label text-muted-foreground">
           {catalog.stale ? "Cached catalog" : "Catalog"} · revision{" "}
           {catalog.snapshot.catalog.revision} · checked{" "}
           {new Date(catalog.snapshot.fetchedAt * 1000).toLocaleString()}
         </p>
       )}
       {(failure || catalog?.error) && (
-        <p role="status" className="rounded-lg border p-3 text-sm">
+        <p role="status" className="rounded-lg border p-3 text-body">
           {failure || catalog?.error} Installed packages remain available
           offline. New installations require a successful refresh.
         </p>
       )}
       {loading ? (
-        <p role="status" className="text-sm text-muted-foreground">
+        <p role="status" className="text-body text-muted-foreground">
           Checking the reviewed catalog…
         </p>
       ) : !plugins.length ? (
-        <p className="py-8 text-center text-sm text-muted-foreground">
+        <p className="py-8 text-center text-body text-muted-foreground">
           {query
             ? "No add-ons match your search."
             : "No reviewed releases are available yet."}
@@ -120,7 +120,7 @@ export function AddonCatalog({
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h3 className="font-medium">{plugin.name}</h3>
-                  <p className="text-xs text-muted-foreground">
+                  <p className="text-label text-muted-foreground">
                     {plugin.publisher} · {plugin.tier}
                   </p>
                 </div>
@@ -128,13 +128,13 @@ export function AddonCatalog({
                   <ShieldCheck className="size-4" aria-label="Official" />
                 )}
               </div>
-              <p className="text-sm text-muted-foreground">
+              <p className="text-body text-muted-foreground">
                 {plugin.description}
               </p>
               <div className="flex flex-wrap items-center gap-2">
                 <select
                   aria-label={`Release of ${plugin.name}`}
-                  className="rounded border bg-background px-2 py-1 text-sm"
+                  className="rounded-sm border bg-background px-2 py-1 text-body"
                   value={versions[plugin.id] ?? ""}
                   onChange={(e) =>
                     setVersions({ ...versions, [plugin.id]: e.target.value })
@@ -172,7 +172,7 @@ export function AddonCatalog({
           ))}
         </div>
       )}
-      <p className="text-xs text-muted-foreground">
+      <p className="text-label text-muted-foreground">
         Listings are reviewed contributions, not a guarantee against defects.
         Offline devices learn new revocations when they reconnect.
       </p>

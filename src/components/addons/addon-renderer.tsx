@@ -46,9 +46,9 @@ const colors: Record<string, string> = {
   accent: "text-primary",
 };
 const sizes: Record<string, string> = {
-  xs: "text-xs",
-  sm: "text-sm",
-  md: "text-base",
+  xs: "text-label",
+  sm: "text-body",
+  md: "text-body-lg",
   lg: "text-lg",
 };
 const alignment: Record<string, string> = {
@@ -106,7 +106,7 @@ function VirtualRows({
           {headers.map((h, i) => (
             <span
               role="columnheader"
-              className="min-w-0 flex-1 truncate px-2 py-2 text-xs"
+              className="min-w-0 flex-1 truncate px-2 py-2 text-label"
               key={i}
             >
               {h}
@@ -120,7 +120,7 @@ function VirtualRows({
           key={start + index}
           role={headers ? "row" : "listitem"}
           aria-rowindex={headers ? start + index + 1 : undefined}
-          className="flex h-9 items-center border-b text-xs"
+          className="flex h-9 items-center border-b text-label"
         >
           {row.map((cell, i) => (
             <span
@@ -254,7 +254,7 @@ export function AddonRenderer({ nodes, event, link }: Props) {
       case "cmx-text-area": {
         const field = {
           className:
-            "w-full rounded-md border bg-background px-2 py-1.5 text-sm focus-visible:outline-2 focus-visible:outline-ring",
+            "w-full rounded-md border bg-background px-2 py-1.5 text-body focus-visible:outline-2 focus-visible:outline-ring",
           value: text("value"),
           placeholder: text("placeholder"),
           disabled,
@@ -389,7 +389,7 @@ export function AddonRenderer({ nodes, event, link }: Props) {
           <span
             className={cn(
               className,
-              "inline-flex rounded-md bg-muted px-2 py-0.5 text-xs",
+              "inline-flex rounded-md bg-muted px-2 py-0.5 text-label",
             )}
           >
             {children}
