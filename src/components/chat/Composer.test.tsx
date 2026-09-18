@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Provider slash-command discovery runs on every popup open. Mock the
@@ -874,6 +874,232 @@ describe("Composer", () => {
       fireEvent.keyDown(textarea, { key: "Enter" });
       expect(onModeActivate).not.toHaveBeenCalled();
       expect(onSubmit).toHaveBeenCalled();
+    });
+
+    describe("subcommands", () => {
+      const GOAL_COMMAND = {
+        name: "goal",
+        description: "Set a goal — keep working until the condition is met",
+        argumentHint: "<condition>",
+      };
+
+      /** Keeps the draft in state so accepted rows feed back into the
+       *  textarea the way the real parent does. */
+      function renderWithDraft(props: Partial<ComposerProps> = {}) {
+        const onDraftChange = vi.fn();
+        function Harness() {
+          const [draft, setDraft] = useState("");
+          return (
+            <TooltipProvider>
+              <Composer
+                {...baseProps()}
+                {...props}
+                draft={draft}
+                onDraftChange={(next) => {
+                  onDraftChange(next);
+                  setDraft(next);
+                }}
+              />
+            </TooltipProvider>
+          );
+        }
+        return { ...render(<Harness />), onDraftChange };
+      }
+
+      async function openGoal(container: HTMLElement) {
+        const textarea = getTextarea(container);
+        type(textarea, "/goa");
+        await waitFor(() =>
+          expect(
+            container.ownerDocument.querySelector(
+              '[data-testid="slash-item-provider-command:goal"]',
+            ),
+          ).not.toBeNull(),
+        );
+        return textarea;
+      }
+
+      it("lists the goal subcommands in the argument slot and filters them", async () => {
+        listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+        const { container, queryByTestId, getByTestId, getByText } =
+          renderWithDraft({ hasActiveGoal: true });
+        const textarea = await openGoal(container);
+
+        type(textarea, "/goal ");
+        expect(queryByTestId("slash-command-popup")).not.toBeNull();
+        expect(
+          getByTestId("slash-command-popup").querySelector("[cmdk-group-heading]"),
+        ).toHaveTextContent("/goal");
+        for (const name of ["resume", "clear", "status", "pause"]) {
+          expect(queryByTestId(`slash-item-subcommand:goal:${name}`)).not.toBeNull();
+        }
+        expect(getByText("/goal resume")).toBeInTheDocument();
+
+        type(textarea, "/goal RE");
+        expect(queryByTestId("slash-item-subcommand:goal:resume")).not.toBeNull();
+        expect(queryByTestId("slash-item-subcommand:goal:clear")).toBeNull();
+
+        type(textarea, "/goal resume ");
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+      });
+
+      it("stays out of the way when the argument is goal text", async () => {
+        listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+        const onSubmit = vi.fn();
+        const { container, queryByTestId } = renderWithDraft({ onSubmit });
+        const textarea = await openGoal(container);
+
+        type(textarea, "/goal ship");
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+        type(textarea, "/goal https://example.com/issue");
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        expect(onSubmit).toHaveBeenCalled();
+      });
+
+      it("offers no subcommands when the provider didn't advertise the command", () => {
+        const { container, queryByTestId } = renderWithDraft();
+        type(getTextarea(container), "/goal ");
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+      });
+
+      it("accepting /goal opens its subcommands; Enter accepts one without sending", async () => {
+        listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+        const onSubmit = vi.fn();
+        const { container, queryByTestId, onDraftChange } = renderWithDraft({
+          onSubmit,
+          hasActiveGoal: true,
+        });
+        const textarea = await openGoal(container);
+
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        expect(onDraftChange).toHaveBeenLastCalledWith("/goal ");
+        expect(queryByTestId("slash-command-popup")).not.toBeNull();
+        expect(queryByTestId("slash-item-subcommand:goal:resume")).toHaveAttribute(
+          "data-selected",
+          "true",
+        );
+
+        fireEvent.keyDown(textarea, { key: "ArrowDown" });
+        expect(queryByTestId("slash-item-subcommand:goal:clear")).toHaveAttribute(
+          "data-selected",
+          "true",
+        );
+        fireEvent.keyDown(textarea, { key: "ArrowUp" });
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        expect(onDraftChange).toHaveBeenLastCalledWith("/goal resume ");
+        expect(onSubmit).not.toHaveBeenCalled();
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+      });
+
+      it("Esc closes the subcommand list", async () => {
+        listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+        const { container, queryByTestId } = renderWithDraft({
+          hasActiveGoal: true,
+        });
+        const textarea = await openGoal(container);
+
+        type(textarea, "/goal ");
+        expect(queryByTestId("slash-command-popup")).not.toBeNull();
+        fireEvent.keyDown(textarea, { key: "Escape" });
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+      });
+
+      it("offers no list without a standing goal; Enter sends", async () => {
+        listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+        const onSubmit = vi.fn();
+        const { container, queryByTestId, onDraftChange } = renderWithDraft({
+          onSubmit,
+        });
+        const textarea = await openGoal(container);
+
+        // Accepting /goal inserts the command but opens nothing.
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        expect(onDraftChange).toHaveBeenLastCalledWith("/goal ");
+        expect(onSubmit).not.toHaveBeenCalled();
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+        expect(queryByTestId("slash-item-subcommand:goal:resume")).toBeNull();
+
+        type(textarea, "/goal re");
+        expect(queryByTestId("slash-command-popup")).toBeNull();
+
+        type(textarea, "/goal ");
+        fireEvent.keyDown(textarea, { key: "Enter" });
+        expect(onSubmit).toHaveBeenCalled();
+      });
+
+      describe("argument ghost", () => {
+        const COMPACT_COMMAND = {
+          name: "compact",
+          description: "Compact the conversation",
+          argumentHint: "<optional summary instructions>",
+        };
+
+        it("hints the goal text after `/goal ` and vanishes on typing", async () => {
+          listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+          const { container, queryByTestId } = renderWithDraft();
+          const textarea = await openGoal(container);
+
+          type(textarea, "/goal ");
+          const ghost = queryByTestId("composer-argument-ghost");
+          expect(ghost).toHaveTextContent("describe the goal to work toward");
+          expect(ghost).toHaveAttribute("aria-hidden");
+          expect(ghost?.closest("[data-testid='composer-highlight-mirror']"))
+            .not.toBeNull();
+          expect(textarea.value).toBe("/goal ");
+
+          type(textarea, "/goal x");
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+          type(textarea, "/goal");
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+          type(textarea, "hi /goal ");
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+          type(textarea, "/goal \nmore");
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+        });
+
+        it("points at the list while a goal stands", async () => {
+          listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+          const { container, queryByTestId } = renderWithDraft({
+            hasActiveGoal: true,
+          });
+          const textarea = await openGoal(container);
+
+          type(textarea, "/goal ");
+          expect(queryByTestId("composer-argument-ghost")).toHaveTextContent(
+            "describe a new goal, or pick an option above",
+          );
+          expect(queryByTestId("slash-command-popup")).not.toBeNull();
+        });
+
+        it("shows a provider's cleaned hint, and nothing for unknown commands", async () => {
+          listChatSlashCommandsMock.mockResolvedValue([
+            GOAL_COMMAND,
+            COMPACT_COMMAND,
+          ]);
+          const { container, queryByTestId } = renderWithDraft();
+          const textarea = await openGoal(container);
+
+          type(textarea, "/compact ");
+          expect(queryByTestId("composer-argument-ghost")).toHaveTextContent(
+            "optional summary instructions",
+          );
+          type(textarea, "/nope ");
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+        });
+
+        it("hides when the caret leaves the end", async () => {
+          listChatSlashCommandsMock.mockResolvedValue([GOAL_COMMAND]);
+          const { container, queryByTestId } = renderWithDraft();
+          const textarea = await openGoal(container);
+
+          type(textarea, "/goal ");
+          expect(queryByTestId("composer-argument-ghost")).not.toBeNull();
+          textarea.setSelectionRange(2, 2);
+          fireEvent.select(textarea);
+          expect(queryByTestId("composer-argument-ghost")).toBeNull();
+        });
+      });
     });
   });
 

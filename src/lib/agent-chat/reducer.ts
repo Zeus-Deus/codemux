@@ -34,6 +34,7 @@ import {
   type ToolCallItem,
   type TurnEndedItem,
   type UserMessageImage,
+  type UsageLimitItem,
   type UserMessageItem,
   type WorkflowPhaseView,
   type WorkflowRunItem,
@@ -1169,6 +1170,10 @@ function appendUserMessageLocal(
   const appended: ChatThreadState = {
     ...next,
     interrupted: false,
+    // Any new user turn is the answer to a usage-limit stop (a manual
+    // resume, the automatic one, or simply moving on), so the standing
+    // limit and its composer row go with it.
+    usageLimit: null,
     // A user turn with no completion after it is the definition of an
     // unsettled tail. Set optimistically for the same reason the bubble is:
     // a remount before the turn's first output must not read the thread as
@@ -1284,6 +1289,8 @@ function promoteQueuedUserMessage(
     // A dispatched follow-up means a live turn is starting — clear any
     // interrupted flag so the Continue chip / divider drop.
     interrupted: false,
+    // A dispatched turn answers a usage-limit stop like a direct send.
+    usageLimit: null,
     // ...and it is an unsettled tail until that turn completes, exactly
     // like a directly-sent one. `appendUserMessageLocal` sets this for the
     // ordinary path but a queued turn never goes through it: its persisted
@@ -1822,6 +1829,9 @@ function applyEventInner(
         // "child_exited", so it never nags with the Continue affordance.
         const interrupted =
           event.status.subtype === "child_exited" ? true : state.interrupted;
+        // The error closing a run stopped by a usage limit is already on
+        // record as the `usage_limit` row; keep the boundary silent.
+        const usageLimited = state.usageLimit !== null;
         const { seq, next: seqBumped } = takeSeq({ ...state, messages });
         return {
           ...seqBumped,
@@ -1838,6 +1848,7 @@ function applyEventInner(
             turn_id: event.turn_id,
             status: event.status,
             completed_at: now(),
+            ...(usageLimited ? { usageLimited: true } : {}),
           }),
         };
       }
@@ -2080,6 +2091,41 @@ function applyEventInner(
         message: notice,
       };
       return { ...next, messages: appendItem(next.messages, item) };
+    }
+
+    case "usage_limit_reached": {
+      const resetsAtMs = event.resets_at_ms ?? null;
+      const window = event.window ?? null;
+      const sealed = sealTrailingReasoning(state, now);
+      const { seq, next } = takeSeq(sealed);
+      const item: UsageLimitItem = {
+        kind: "usage_limit",
+        id: nextId("usage-limit"),
+        seq,
+        resetsAtMs,
+        window,
+      };
+      return {
+        ...next,
+        usageLimit: {
+          provider: event.provider,
+          resetsAtMs,
+          autoResumeAtMs: event.auto_resume_at_ms ?? null,
+          window,
+          at: now(),
+        },
+        messages: appendItem(next.messages, item),
+      };
+    }
+
+    case "usage_resume_cancelled": {
+      if (!state.usageLimit || state.usageLimit.autoResumeAtMs === null) {
+        return state;
+      }
+      return {
+        ...state,
+        usageLimit: { ...state.usageLimit, autoResumeAtMs: null },
+      };
     }
 
     case "resume_cursor_updated": {

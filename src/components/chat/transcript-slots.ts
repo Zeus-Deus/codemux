@@ -124,6 +124,12 @@ function lastTurnEnd(segment: TurnSegment): TurnEndedItem | null {
   return null;
 }
 
+/** Success boundaries render nothing, and neither does the error that
+ *  closed a usage-limited run: its `usage_limit` row is the record. */
+function silentTurnEnd(item: TurnEndedItem): boolean {
+  return item.status.kind !== "error" || item.usageLimited === true;
+}
+
 function terminalAssistantId(segment: TurnSegment): string | null {
   for (let i = segment.items.length - 1; i >= 0; i--) {
     const item = segment.items[i];
@@ -267,7 +273,7 @@ function buildPresentationEntries(
 
     if (!ended || !segment.user) {
       for (const item of segment.items) {
-        if (item.kind === "turn_ended" && item.status.kind !== "error") continue;
+        if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
         entries.push({ kind: "item", item });
       }
       continue;
@@ -291,7 +297,7 @@ function buildPresentationEntries(
     let foldInserted = false;
 
     for (const item of segment.items) {
-      if (item.kind === "turn_ended" && item.status.kind !== "error") continue;
+      if (item.kind === "turn_ended" && silentTurnEnd(item)) continue;
       if (hiddenIds.has(item.id) && !foldInserted) {
         entries.push({ kind: "turn_fold", body });
         foldInserted = true;

@@ -1,4 +1,5 @@
 import type { UserQuestionSet, QuestionResolution } from "@/tauri/events";
+import type { AgentChatProviderKind } from "@/tauri/types";
 import type { GoalSnapshot } from "./goal";
 import type {
   ApprovalDecision,
@@ -211,6 +212,10 @@ export interface TurnEndedItem {
    *  the transcript keeps the turn live across it and folds only at the
    *  final, non-interim marker. */
   interim?: boolean;
+  /** The error that closed a run the provider stopped for a usage limit.
+   *  The `usage_limit` row already records it, so this marker stays a
+   *  silent lifecycle boundary (it still settles and folds the turn). */
+  usageLimited?: boolean;
 }
 
 /**
@@ -378,6 +383,36 @@ export interface RuntimeNoticeItem {
   severity?: "warning" | "error";
 }
 
+/**
+ * The provider stopped the run because the user's subscription usage limit
+ * is exhausted. A historical record: the live countdown and resume actions
+ * live in the composer strip, driven by `ChatThreadState.usageLimit`.
+ */
+export interface UsageLimitItem {
+  kind: "usage_limit";
+  id: ChatItemId;
+  seq: number;
+  /** When the provider said the limit lifts (unix ms), if it said. */
+  resetsAtMs: number | null;
+  /** Exhausted window label (`five_hour`, `seven_day`, …), if reported. */
+  window: string | null;
+}
+
+/**
+ * The thread's standing usage-limit stop, from the last
+ * `usage_limit_reached` until the next user turn. Replayed by hydrate, so a
+ * limit that stopped the run before a restart is still actionable after it.
+ */
+export interface UsageLimitState {
+  provider: AgentChatProviderKind;
+  resetsAtMs: number | null;
+  /** When Codemux resumes on its own; `null` when nothing is armed. */
+  autoResumeAtMs: number | null;
+  window: string | null;
+  /** Clock time the limit was observed. */
+  at: number;
+}
+
 export interface AsyncQuestionItem {
   source_event_id?: number;
   kind: "async_question";
@@ -397,7 +432,8 @@ export type ChatViewItem =
   | TurnEndedItem
   | SubagentRunItem
   | WorkflowRunItem
-  | RuntimeNoticeItem;
+  | RuntimeNoticeItem
+  | UsageLimitItem;
 
 /**
  * A live provider event plus the durable row id it was persisted as
@@ -474,6 +510,10 @@ export interface ChatThreadState {
   /** Goals this thread replaced or cleared, oldest first. Stored for a
    *  future details view; nothing renders it yet. */
   goalHistory: GoalSnapshot[];
+  /** Set by `usage_limit_reached`, cleared by the next user turn (sent,
+   *  fanned out, queued-and-dispatched or replayed). A finished turn does
+   *  NOT clear it: the limit outlives the run it stopped. */
+  usageLimit: UsageLimitState | null;
 }
 
 export function emptyThreadState(): ChatThreadState {
@@ -491,6 +531,7 @@ export function emptyThreadState(): ChatThreadState {
     contextUsage: null,
     goal: null,
     goalHistory: [],
+    usageLimit: null,
   };
 }
 

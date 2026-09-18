@@ -546,6 +546,28 @@ fn translate_parent(
     }
 }
 
+/// Whether a failed Codex turn stopped because the account's usage limit
+/// was hit. Prefers the server's structured `codexErrorInfo`
+/// (`usageLimitExceeded`, or any classification carrying HTTP 429 after the
+/// server gave up retrying); falls back to the message text for builds that
+/// do not classify.
+fn is_usage_limit_failure(error_info: Option<&serde_json::Value>, message: &str) -> bool {
+    let info_says_so = match error_info {
+        Some(serde_json::Value::String(kind)) => kind == "usageLimitExceeded",
+        Some(serde_json::Value::Object(map)) => {
+            map.contains_key("usageLimitExceeded")
+                || map.values().any(|detail| {
+                    detail
+                        .get("httpStatusCode")
+                        .and_then(|v| v.as_u64())
+                        == Some(429)
+                })
+        }
+        _ => false,
+    };
+    info_says_so || message.to_ascii_lowercase().contains("usage limit")
+}
+
 /// Translate a `turn/completed` notification. May emit both a
 /// [`ProviderRuntimeEvent::TurnCompleted`] AND a
 /// [`ProviderRuntimeEvent::SessionStateChanged`] depending on outcome.
@@ -562,9 +584,17 @@ pub fn translate_turn_completed(
         }
         "failed" | "error" => {
             let msg = params.error.clone().unwrap_or_else(|| "turn failed".into());
+            // A usage-limit failure gets the shared `rate_limit` subtype so
+            // the command layer can offer (and schedule) a resume the same
+            // way it does for every other provider.
+            let subtype = if is_usage_limit_failure(params.error_info.as_ref(), &msg) {
+                crate::agent_provider::events::RATE_LIMIT_SUBTYPE.to_string()
+            } else {
+                params.status.clone()
+            };
             (
                 TurnStatus::Error {
-                    subtype: params.status.clone(),
+                    subtype,
                     message: msg.clone(),
                 },
                 Some(SessionStatus::Error { message: msg }),
@@ -2008,6 +2038,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn turn_completed_usage_limit_maps_to_rate_limit_subtype() {
+        use crate::agent_provider::events::RATE_LIMIT_SUBTYPE;
+        let cases = [
+            json!({"threadId":"c1","turn":{"id":"t1","status":"failed",
+                "error":{"message":"limit","codexErrorInfo":"usageLimitExceeded"}}}),
+            json!({"threadId":"c1","turn":{"id":"t1","status":"failed",
+                "error":{"message":"x","codexErrorInfo":
+                    {"responseTooManyFailedAttempts":{"httpStatusCode":429}}}}}),
+            json!({"threadId":"c1","turnId":"t1","status":"failed",
+                "error":"You've hit your usage limit. Try again later."}),
+        ];
+        for raw in cases {
+            let params: TurnCompletedParams = serde_json::from_value(raw.clone()).unwrap();
+            match &translate_turn_completed(&ThreadId("t".into()), params)[0] {
+                ProviderRuntimeEvent::TurnCompleted {
+                    status: TurnStatus::Error { subtype, .. },
+                    ..
+                } => assert_eq!(subtype, RATE_LIMIT_SUBTYPE, "for {raw}"),
+                other => panic!("expected error TurnCompleted, got {other:?}"),
+            }
+        }
+        // An unrelated failure keeps its own subtype.
+        let params: TurnCompletedParams = serde_json::from_value(json!({
+            "threadId":"c1","turn":{"id":"t1","status":"failed",
+                "error":{"message":"boom","codexErrorInfo":"internalServerError"}}
+        }))
+        .unwrap();
+        match &translate_turn_completed(&ThreadId("t".into()), params)[0] {
+            ProviderRuntimeEvent::TurnCompleted {
+                status: TurnStatus::Error { subtype, .. },
+                ..
+            } => assert_eq!(subtype, "failed"),
+            other => panic!("expected error TurnCompleted, got {other:?}"),
+        }
     }
 
     #[test]

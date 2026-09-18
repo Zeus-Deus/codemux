@@ -58,5 +58,9 @@ export function shouldShowThinkingIndicator(
       // Settled inline rows — back to dead time waiting on the agent, so
       // the tail pulse fills the gap (still gated by `streaming` above).
       return true;
+    case "usage_limit":
+      // The provider stopped the run; its closing turn_completed is all
+      // that is left to arrive, so there is nothing to wait on.
+      return false;
   }
 }

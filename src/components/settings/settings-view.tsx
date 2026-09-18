@@ -51,6 +51,7 @@ import {
   selectChatCodeWrap,
   SETTINGS_DEFAULTS,
   selectSidebarShowGitStats,
+  selectAutoResumeUsageLimit,
   selectOrbMatchActivity,
   type AppearanceDensity,
   type AutoSettleDays,
@@ -1237,6 +1238,7 @@ export function SettingsView() {
         SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!) as AutoSettleDays,
   );
   const orbMatchActivity = useSettingsStore(selectOrbMatchActivity);
+  const autoResumeUsageLimit = useSettingsStore(selectAutoResumeUsageLimit);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -2023,6 +2025,21 @@ export function SettingsView() {
                       onCheckedChange={(checked) => {
                         updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
                       }}
+                    />
+                  </SettingRow>
+                  <Separator />
+                  <SettingRow
+                    label="Resume automatically after usage limits reset"
+                    description="When a provider reports when your usage limit resets, continue the interrupted run then. At most two automatic attempts before it waits for you."
+                  >
+                    <Switch
+                      checked={autoResumeUsageLimit}
+                      onCheckedChange={(checked) =>
+                        storeSet(
+                          "agents.auto_resume_usage_limit",
+                          checked ? "true" : "false",
+                        )
+                      }
                     />
                   </SettingRow>
                   <Separator />

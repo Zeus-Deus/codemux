@@ -2,6 +2,8 @@ import {
   ArrowDown,
   ChevronDown,
   ChevronRight,
+  Hourglass,
+  RotateCw,
   TriangleAlert,
 } from "lucide-react";
 import {
@@ -25,6 +27,10 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import {
+  isAutoResumeText,
+  usageLimitRecordText,
+} from "@/lib/agent-chat/usage-limit";
 import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
@@ -1533,6 +1539,46 @@ function RunInterruptedDivider() {
   );
 }
 
+/** A turn the backend sent on its own once a usage limit reset. Same
+ *  hairline as the session-start marker; the label discloses the full text. */
+function AutoResumedTurnDivider({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div data-testid="auto-resume-divider">
+      <button
+        type="button"
+        aria-expanded={open}
+        title={text}
+        onClick={() => setOpen((cur) => !cur)}
+        className="group flex w-full items-center gap-3 rounded-[4px] text-muted-foreground/70 outline-none transition-colors hover:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <span className="h-px flex-1 bg-border/60" />
+        <span className="inline-flex items-center gap-1.5 font-mono text-label font-medium tracking-wide">
+          <RotateCw className="size-3 shrink-0" strokeWidth={2} aria-hidden />
+          Resumed automatically after usage limit reset
+          <ChevronDown
+            className={cn(
+              "size-3 shrink-0 opacity-60 transition-transform",
+              open && "rotate-180",
+            )}
+            strokeWidth={2}
+            aria-hidden
+          />
+        </span>
+        <span className="h-px flex-1 bg-border/60" />
+      </button>
+      {open && (
+        <p
+          data-testid="auto-resume-divider-text"
+          className="mx-auto mt-2 max-w-[560px] select-text whitespace-pre-wrap break-words text-center text-body-sm text-muted-foreground"
+        >
+          {text}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
     <div className="flex items-center gap-3 text-muted-foreground/70">
@@ -1649,6 +1695,12 @@ function ItemRow({
   const handleRejectPlan = useCallback(() => {
     if (item.kind === "permission_request") return onRejectPlan(item.request_id);
   }, [item, onRejectPlan]);
+
+  // The backend's automatic resume after a usage limit is not something
+  // the user typed: a quiet divider marks it, the text stays one click away.
+  if (item.kind === "user_message" && !item.queued && isAutoResumeText(item.text)) {
+    return <AutoResumedTurnDivider text={item.text} />;
+  }
 
   if (item.kind === "user_message") {
     const checkpoint = item.clientNonce
@@ -1809,8 +1861,25 @@ function renderAssistantBody(
             </div>
           );
       }
+    case "usage_limit":
+      // The record only; the countdown and Resume live in the composer strip.
+      return (
+        <div
+          data-testid="usage-limit-record"
+          className="flex items-center gap-2 py-0.5 text-body-sm text-muted-foreground"
+        >
+          <Hourglass
+            className="size-3.5 shrink-0 text-status-working"
+            strokeWidth={1.8}
+            aria-hidden
+          />
+          <span className="min-w-0 select-text truncate tabular-nums">
+            {usageLimitRecordText(item.resetsAtMs, item.window)}
+          </span>
+        </div>
+      );
     case "turn_ended":
-      if (item.status.kind !== "error") return null;
+      if (item.status.kind !== "error" || item.usageLimited) return null;
       return (
         <div className="select-text py-0.5 text-label text-muted-foreground">
           Turn ended: {item.status.subtype}

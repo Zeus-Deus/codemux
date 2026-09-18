@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runtimeNoticeFromWarning } from "./runtime-notice";
 
 describe("runtimeNoticeFromWarning", () => {
-  it("promotes a rejected rate-limit event to a usage-limit notice", () => {
+  it("still promotes a legacy rejected rate-limit event row", () => {
     // The payload below is the whole SDK message the Claude adapter
     // forwards verbatim — see `rejected_rate_limit_event_also_emits_the_
     // transcript_notice_warning` in
@@ -39,11 +39,16 @@ describe("runtimeNoticeFromWarning", () => {
 
   it("maps an enumerated assistant error to a provider-error notice", () => {
     expect(
-      runtimeNoticeFromWarning("assistant error: rate_limit", null),
-    ).toBe("Provider error: rate_limit");
-    expect(
       runtimeNoticeFromWarning("assistant error: overloaded_error", {}),
     ).toBe("Provider error: overloaded_error");
+  });
+
+  it("leaves a rate_limit assistant error to the usage-limit record", () => {
+    // `usage_limit_reached` writes the transcript row and drives the resume
+    // affordance; a second "Provider error: rate_limit" line would be noise.
+    expect(
+      runtimeNoticeFromWarning("assistant error: rate_limit", null),
+    ).toBeNull();
   });
 
   it("promotes a resume-fallback warning to its inline notice text", () => {

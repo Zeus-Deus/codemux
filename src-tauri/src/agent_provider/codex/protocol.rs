@@ -775,10 +775,16 @@ struct TurnObj {
     duration_ms: Option<u64>,
 }
 
-/// The v2 `TurnError` object; we only surface its `message`.
+/// The v2 `TurnError` object. `codexErrorInfo` is kept raw: it is either a
+/// bare variant string (`"usageLimitExceeded"`) or a single-key object
+/// carrying details (`{"responseTooManyFailedAttempts": {"httpStatusCode":
+/// 429}}`), and only the usage-limit classification reads it.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TurnErrorObj {
     message: String,
+    #[serde(default)]
+    codex_error_info: Option<serde_json::Value>,
 }
 
 /// Params for `thread/tokenUsage/updated`.
@@ -935,6 +941,10 @@ pub struct TurnCompletedParams {
     /// Elapsed wall-clock time in milliseconds, when the v2 shape
     /// reports it. Feeds a sub-agent's `duration_ms` for child turns.
     pub duration_ms: Option<u64>,
+    /// The v2 `TurnError.codexErrorInfo` classification, verbatim. `None`
+    /// for the legacy flat shape and for errors the server did not
+    /// classify.
+    pub error_info: Option<serde_json::Value>,
 }
 
 /// Untagged decode helper for [`TurnCompletedParams`].
@@ -963,13 +973,20 @@ impl<'de> Deserialize<'de> for TurnCompletedParams {
         D: serde::Deserializer<'de>,
     {
         Ok(match TurnCompletedWire::deserialize(deserializer)? {
-            TurnCompletedWire::Nested { thread_id, turn } => Self {
-                thread_id,
-                turn_id: turn.id,
-                status: turn.status.unwrap_or_default(),
-                error: turn.error.map(|e| e.message),
-                duration_ms: turn.duration_ms,
-            },
+            TurnCompletedWire::Nested { thread_id, turn } => {
+                let (error, error_info) = match turn.error {
+                    Some(e) => (Some(e.message), e.codex_error_info),
+                    None => (None, None),
+                };
+                Self {
+                    thread_id,
+                    turn_id: turn.id,
+                    status: turn.status.unwrap_or_default(),
+                    error,
+                    duration_ms: turn.duration_ms,
+                    error_info,
+                }
+            }
             TurnCompletedWire::Flat {
                 thread_id,
                 turn_id,
@@ -981,6 +998,7 @@ impl<'de> Deserialize<'de> for TurnCompletedParams {
                 status,
                 error,
                 duration_ms: None,
+                error_info: None,
             },
         })
     }

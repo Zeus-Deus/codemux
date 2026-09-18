@@ -14,7 +14,9 @@ import type {
   ChatViewItem,
   SubagentRunItem,
   SubagentView,
+  UsageLimitState,
 } from "@/lib/agent-chat/types";
+import { toast } from "@/lib/toast";
 
 import {
   ComposerStrip,
@@ -27,7 +29,10 @@ import {
   sessionErrorOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
+  useUsageLimitOccupant,
 } from "./use-composer-strip-occupants";
+
+vi.mock("@/lib/toast", () => ({ toast: { error: vi.fn() } }));
 
 afterEach(() => {
   cleanup();
@@ -606,5 +611,169 @@ describe("ComposerStrip — goal", () => {
       expect(text).not.toMatch(/\d+\s*\/\s*\d+|%|turn \d|pass|fail|complete/i);
       unmount();
     }
+  });
+});
+
+describe("ComposerStrip — usage limit", () => {
+  const MIN = 60_000;
+
+  function limit(overrides: Partial<UsageLimitState> = {}): UsageLimitState {
+    return {
+      provider: "claude",
+      resetsAtMs: null,
+      autoResumeAtMs: null,
+      window: "five_hour",
+      at: Date.now(),
+      ...overrides,
+    };
+  }
+
+  function UsageHarness({
+    usageLimit,
+    streaming = false,
+    onResume = () => Promise.resolve(),
+    onCancel = () => Promise.resolve(),
+    goal = null,
+  }: {
+    usageLimit: UsageLimitState | null;
+    streaming?: boolean;
+    onResume?: () => Promise<void>;
+    onCancel?: () => Promise<void>;
+    goal?: StripGoal | null;
+  }) {
+    const usage = useUsageLimitOccupant({
+      usageLimit,
+      threadId: "t1",
+      streaming,
+      onResume,
+      onCancel,
+    });
+    return <ComposerStrip goal={goal} occupants={[usage]} />;
+  }
+
+  const usageRow = () =>
+    document.querySelector<HTMLElement>('[data-kind="usage"]')!;
+
+  it("armed: counts down to the automatic resume with Cancel and Try now", () => {
+    const at = Date.now() + 72 * MIN;
+    render(<UsageHarness usageLimit={limit({ resetsAtMs: at - MIN, autoResumeAtMs: at })} />);
+    expect(screen.getByTestId("composer-strip")).toHaveAttribute("data-lead", "usage");
+    const row = usageRow();
+    expect(within(row).getByText("Usage limit")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-countdown")).toHaveTextContent(
+      "resuming automatically in 1h 12m",
+    );
+    expect(within(row).getByText(/^at \d\d:\d\d$/)).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-cancel")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-strip-usage-resume")).toBeNull();
+  });
+
+  it("armed and due: Resuming… with no buttons, then Resume after the grace", () => {
+    vi.useFakeTimers();
+    const at = Date.now() - 10_000;
+    render(<UsageHarness usageLimit={limit({ autoResumeAtMs: at })} />);
+    expect(within(usageRow()).getByText("Resuming…")).toBeInTheDocument();
+    expect(within(usageRow()).queryAllByRole("button")).toHaveLength(0);
+    act(() => {
+      vi.advanceTimersByTime(2 * MIN);
+    });
+    expect(within(usageRow()).getByText("Usage limit has reset")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeInTheDocument();
+  });
+
+  it("not armed with a future reset: counts down to it with Try now only", () => {
+    render(<UsageHarness usageLimit={limit({ resetsAtMs: Date.now() + 30 * MIN })} />);
+    expect(screen.getByTestId("composer-strip-usage-countdown")).toHaveTextContent(
+      "resets in 30m",
+    );
+    expect(screen.queryByTestId("composer-strip-usage-cancel")).toBeNull();
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toBeInTheDocument();
+  });
+
+  it("reset passed or unknown: a solid Resume", () => {
+    const { unmount } = render(
+      <UsageHarness usageLimit={limit({ resetsAtMs: Date.now() - MIN })} />,
+    );
+    expect(within(usageRow()).getByText("Usage limit has reset")).toBeInTheDocument();
+    expect(within(usageRow()).getByText("5-hour limit")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-resume").className).toContain(
+      "bg-status-working",
+    );
+    unmount();
+    render(<UsageHarness usageLimit={limit({ window: null })} />);
+    expect(within(usageRow()).getByText("Usage limit reached")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-usage-resume")).toBeInTheDocument();
+  });
+
+  it("stands down while a turn is running and when there is no limit", () => {
+    const { rerender } = render(
+      <UsageHarness usageLimit={limit()} streaming />,
+    );
+    expect(screen.queryByTestId("composer-strip")).toBeNull();
+    rerender(<UsageHarness usageLimit={null} />);
+    expect(screen.queryByTestId("composer-strip")).toBeNull();
+  });
+
+  it("buttons call their command and disable while it is in flight", async () => {
+    let finish: () => void = () => {};
+    const onCancel = vi.fn(
+      () => new Promise<void>((resolve) => (finish = resolve)),
+    );
+    const onResume = vi.fn(() => Promise.resolve());
+    render(
+      <UsageHarness
+        usageLimit={limit({ autoResumeAtMs: Date.now() + 20 * MIN })}
+        onCancel={onCancel}
+        onResume={onResume}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("composer-strip-usage-cancel"));
+    await waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("composer-strip-usage-cancel")).toBeDisabled();
+    expect(screen.getByTestId("composer-strip-usage-try-now")).toBeDisabled();
+    await act(async () => finish());
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-strip-usage-try-now")).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByTestId("composer-strip-usage-try-now"));
+    await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+  });
+
+  it("a failed command toasts and re-enables the button", async () => {
+    const onResume = vi.fn(() => Promise.reject(new Error("no session")));
+    render(<UsageHarness usageLimit={limit()} onResume={onResume} />);
+    fireEvent.click(screen.getByTestId("composer-strip-usage-resume"));
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-strip-usage-resume")).not.toBeDisabled(),
+    );
+  });
+
+  it("takes its own row above a goal instead of folding into +n", () => {
+    const goal: StripGoal = {
+      goal: {
+        text: "Port the importer",
+        setAt: Date.now() - MIN,
+        sourceMessageId: "user-1",
+        status: "standing",
+      },
+      resumePhrase: "/goal resume",
+      onResume: vi.fn(),
+      onEditResume: vi.fn(),
+      onClear: vi.fn(),
+      onCopy: vi.fn(),
+      onJump: null,
+      stopped: null,
+    };
+    render(<UsageHarness usageLimit={limit()} goal={goal} />);
+    expect(screen.getByTestId("composer-strip")).toHaveAttribute("data-lead", "goal");
+    expect(usageRow()).toBeInTheDocument();
+    expect(screen.getByTestId("composer-strip-goal")).toHaveAttribute(
+      "data-status",
+      "standing",
+    );
+    expect(screen.queryByTestId("composer-strip-goal-more")).toBeNull();
+    expect(screen.queryByTestId("composer-strip-goal-resume")).toBeNull();
   });
 });
