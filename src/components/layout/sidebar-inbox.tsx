@@ -385,7 +385,7 @@ function ProjectFilterItem({
   );
 }
 
-/** Header for the Snoozed / Settled shelves. Collapsing is a plain disclosure
+/** Header for the Wrapping up / Snoozed / Settled sections. Collapsing is a plain disclosure
  *  button rather than a hover affordance so the section state is discoverable
  *  and keyboard-reachable. */
 function ShelfHeader({
@@ -394,6 +394,7 @@ function ShelfHeader({
   showCount,
   collapsed,
   onToggle,
+  marker,
 }: {
   label: string;
   count: number;
@@ -402,10 +403,14 @@ function ShelfHeader({
   showCount: boolean;
   collapsed: boolean;
   onToggle: () => void;
+  /** Optional `data-*` attribute name stamped on the button, so tests and
+   *  styling can find a specific section header. */
+  marker?: `data-${string}`;
 }) {
   return (
     <button
       type="button"
+      {...(marker ? { [marker]: "" } : {})}
       onClick={onToggle}
       aria-expanded={!collapsed}
       aria-label={`${label} (${count})`}
@@ -428,30 +433,6 @@ function ShelfHeader({
       )}
       <span className="h-px flex-1 bg-border/60" />
     </button>
-  );
-}
-
-/** The label above the "Wrapping up" tier.
- *
- *  Deliberately *not* `ShelfHeader`. That component is a disclosure button, and
- *  everything about it — the chevron, `aria-expanded`, the tab stop — promises
- *  that the rows below can be folded away. These rows can't and mustn't: they
- *  are ordinary active cards that happen to be winding down, and a control that
- *  offers to hide live-but-nearly-done work is the bug this tier exists to
- *  avoid. Sharing the typography and the hairline rule keeps it in the same
- *  visual family as the Snoozed / Settled headers (the user reads it as "a
- *  section starts here") while the missing chevron says the rest. */
-function WrappingUpDivider() {
-  return (
-    <div
-      data-wrapping-up-divider
-      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
-    >
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
-        Wrapping up
-      </span>
-      <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
-    </div>
   );
 }
 
@@ -966,6 +947,9 @@ export function SidebarInbox() {
   // work the user said they did not want to see right now, so re-showing them
   // every launch would undo the gesture.
   const [settledCollapsed, setSettledCollapsed] = useState(false);
+  // Wrapping up starts open: its rows are still active work, so hiding them
+  // is only ever the user's explicit choice.
+  const [wrappingUpCollapsed, setWrappingUpCollapsed] = useState(false);
   const [snoozeCollapsed, setSnoozeCollapsed] = useState(true);
 
   // Workspaces woken by the timer or by their own agent, so the card can badge
@@ -1200,6 +1184,11 @@ export function SidebarInbox() {
       : topTier;
     tier.push(ws);
   }
+  // A collapsed Wrapping up section still shows the open workspace — its
+  // highlight is the user's "you are here", same rule as the shelves below.
+  const visibleWrappingUp = wrappingUpCollapsed
+    ? wrappingUpTier.filter((ws) => ws.workspace_id === activeWorkspaceId)
+    : wrappingUpTier;
   // Everything downstream that means "the active cards, top to bottom" reads
   // this and not `activeCards`: the Alt+1..9 jump targets, range selection, and
   // the post-park forward navigation all describe positions on screen, so a
@@ -1208,7 +1197,7 @@ export function SidebarInbox() {
   const orderedActiveCards = [
     ...pinnedCards,
     ...topTier,
-    ...wrappingUpTier,
+    ...visibleWrappingUp,
   ];
 
   // One reservation for the whole render, so every card's PR chip right-aligns
@@ -2067,12 +2056,19 @@ export function SidebarInbox() {
 
         {/* The wind-down tier. Same full card, same actions — only its place
             in the list changed, and only while the rule above holds. No
-            divider at all when nothing qualifies: an empty section header
+            header at all when nothing qualifies: an empty section header
             would imply a category the list isn't currently using. */}
         {wrappingUpTier.length > 0 && (
           <>
-            <WrappingUpDivider />
-            {wrappingUpTier.map((ws, index) =>
+            <ShelfHeader
+              label="Wrapping up"
+              count={wrappingUpTier.length}
+              showCount={wrappingUpCollapsed}
+              collapsed={wrappingUpCollapsed}
+              onToggle={() => setWrappingUpCollapsed((c) => !c)}
+              marker="data-wrapping-up-divider"
+            />
+            {visibleWrappingUp.map((ws, index) =>
               renderCard(ws, pinnedCards.length + topTier.length + index),
             )}
           </>
