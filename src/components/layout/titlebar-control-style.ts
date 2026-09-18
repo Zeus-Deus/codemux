@@ -25,7 +25,7 @@ export const BAND_CONTROL_RADIUS = "rounded-[min(var(--radius-md),12px)]";
  * only. Identical to the panel toggle's treatment.
  */
 export const BAND_CONTROL_HOVER =
-  "transition-colors duration-[120ms] hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
+  "transition-colors duration-100 hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
 
 /**
  * The "this one is selected" fill, used by the active tab pill and its
@@ -33,4 +33,4 @@ export const BAND_CONTROL_HOVER =
  * 6% it separates the active tab from its neighbours without drawing a
  * box on top of the transcript showing through behind it.
  */
-export const BAND_ACTIVE_FILL = "bg-foreground/6";
+export const BAND_ACTIVE_FILL = "bg-surface-2";

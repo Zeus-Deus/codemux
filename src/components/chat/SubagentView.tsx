@@ -70,12 +70,12 @@ export function SubagentView({
       {/* Read-only banner */}
       <div
         className={cn(
-          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-body-sm text-muted-foreground",
+          "mb-4 flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-body-sm text-muted-foreground",
           tone.softBg,
           tone.border,
         )}
       >
-        <Lock className={cn("h-3.5 w-3.5 shrink-0", tone.text)} strokeWidth={1.5} aria-hidden />
+        <Lock className={cn("size-3.5 shrink-0", tone.text)} aria-hidden />
         <span>
           Read-only view of the <b className="text-foreground">{name}</b>{" "}
           subagent. To change direction, message the orchestrator.
@@ -96,7 +96,7 @@ export function SubagentView({
                 workspaceId={workspaceId}
               />
             ) : slot.body.kind === "turn_fold" ? (
-              <div className="border-b border-border/60 pb-2 text-xs text-muted-foreground">
+              <div className="border-b border-border/60 pb-2 text-label text-muted-foreground">
                 {slot.body.label}
               </div>
             ) : (
@@ -110,7 +110,7 @@ export function SubagentView({
           <div
             className="mt-3 flex items-center gap-1.5 px-1 py-1 text-body-sm leading-5 text-muted-foreground"
           >
-            <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+            <span className="flex size-5 shrink-0 items-center justify-center">
               <AgentOrb
                 size={20}
                 {...subagentOrbActivity(subagent)}
@@ -156,7 +156,7 @@ function SubItem({
       );
     case "permission_request":
       return (
-        <div className="rounded-[9px] border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-label text-muted-foreground">
           {item.resolution.state === "failed"
             ? item.resolution.message
             : item.resolution.state === "pending"

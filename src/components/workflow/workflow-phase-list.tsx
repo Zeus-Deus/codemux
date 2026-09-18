@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 
 import { combinePhases, type CombinedPhase } from "./workflow-phases";
 import { findingTone, workflowAgentTone, workflowPhaseTone } from "./workflow-tone";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type AgentFilter = "all" | "running" | "issues";
 const AGENT_FILTERS: readonly AgentFilter[] = ["all", "running", "issues"];
@@ -108,7 +109,7 @@ function PhaseCard({
       ) : status === "pending" ? (
         <span className="h-[9px] w-[9px] rounded-full border-[1.6px] border-muted-foreground" aria-hidden />
       ) : (
-        <CheckCircle2 className={cn("h-[18px] w-[18px]", tone.text)} strokeWidth={1.8} aria-hidden />
+        <CheckCircle2 className={cn("h-[18px] w-[18px]", tone.text)} aria-hidden />
       )}
     </span>
   );
@@ -132,7 +133,7 @@ function PhaseCard({
   if (!hasAgents) {
     return (
       <div
-        className="overflow-hidden rounded-[11px] border border-border/60 bg-foreground/[0.015]"
+        className="overflow-hidden rounded-lg border border-border/60 bg-surface-1"
         data-testid="workflow-phase-row"
       >
         <div className="flex items-center gap-2.5 px-3 py-2.5">{headerBody}</div>
@@ -144,14 +145,14 @@ function PhaseCard({
     <Collapsible
       open={open}
       onOpenChange={onToggle}
-      className="overflow-hidden rounded-[11px] border border-border/60 bg-foreground/[0.015]"
+      className="overflow-hidden rounded-lg border border-border/60 bg-surface-1"
       data-testid="workflow-phase-row"
     >
       <CollapsibleTrigger asChild>
         <div
           role="button"
           tabIndex={0}
-          className="flex cursor-pointer items-center gap-2.5 px-3 py-2.5 hover:bg-foreground/[0.03]"
+          className="flex cursor-pointer items-center gap-2.5 px-3 py-2.5 hover:bg-surface-2"
         >
           {headerBody}
         </div>
@@ -181,9 +182,9 @@ function PhaseAgents({
   return (
     <div className="border-t border-border/60 p-1.5">
       <div className="flex items-center gap-1.5 px-1.5 py-1">
-        <span className="font-mono text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Agents
-        </span>
+        </Eyebrow>
         <div className="ml-auto flex gap-1">
           {AGENT_FILTERS.map((f) => (
             <button
@@ -196,7 +197,7 @@ function PhaseAgents({
               className={cn(
                 "rounded-full px-2 py-0.5 text-caption font-semibold",
                 filter === f
-                  ? "bg-foreground/[0.12] text-foreground"
+                  ? "bg-surface-3 text-foreground"
                   : "text-muted-foreground hover:text-foreground/80",
               )}
             >
@@ -232,30 +233,30 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
           onSelect();
         }
       }}
-      className="flex cursor-pointer items-center gap-2 rounded-[8px] px-1.5 py-1.5 hover:bg-foreground/[0.05]"
+      className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-surface-2"
       data-testid="workflow-agent-row"
     >
-      <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+      <span className="flex size-4 shrink-0 items-center justify-center">
         {agent.status === "running" ? (
-          <LoaderCircle className={cn("h-3.5 w-3.5 animate-spin", tone.text)} strokeWidth={2} aria-hidden />
+          <LoaderCircle className={cn("size-3.5 animate-spin", tone.text)} aria-hidden />
         ) : agent.status === "pending" ? (
           <span className="h-[7px] w-[7px] rounded-full border-[1.4px] border-muted-foreground" aria-hidden />
         ) : (
-          <CheckCircle2 className={cn("h-3.5 w-3.5", tone.text)} strokeWidth={2} aria-hidden />
+          <CheckCircle2 className={cn("size-3.5", tone.text)} aria-hidden />
         )}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">{label}</span>
       {badge && (
         <span
           className={cn(
-            "shrink-0 rounded-[4px] px-1.5 py-0.5 text-caption font-semibold",
+            "shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-semibold",
             findingTone(badge.tone).chipBg,
           )}
         >
           {badge.label}
         </span>
       )}
-      <ChevronRight className="h-2.5 w-2.5 shrink-0 text-muted-foreground" strokeWidth={1.7} aria-hidden />
+      <ChevronRight className="size-3 shrink-0 text-muted-foreground" aria-hidden />
     </div>
   );
 }

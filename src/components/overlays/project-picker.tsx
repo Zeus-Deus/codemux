@@ -158,7 +158,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
+          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
         >
           {selectedName ? (
             // `size="sm"` keeps the trigger pill the same height
@@ -174,12 +174,12 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
               shape="circle"
             />
           ) : (
-            <FolderOpen className="h-3.5 w-3.5" />
+            <FolderOpen className="size-3.5" />
           )}
           <span className="max-w-[120px] truncate">
             {selectedName || "Select project"}
           </span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown className="size-3 opacity-40" />
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-60 p-0" align="start">
@@ -197,7 +197,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                       onChange(g.projectPath, g.projectName);
                       setOpen(false);
                     }}
-                    className="text-xs gap-2"
+                    className="text-label gap-2"
                   >
                     <ProjectAvatar
                       name={g.projectName}
@@ -209,7 +209,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                     />
                     <span className="flex-1 truncate">{g.projectName}</span>
                     {value === g.projectPath && (
-                      <Check className="ml-auto h-3.5 w-3.5 text-primary" />
+                      <Check className="ml-auto size-3.5 text-primary" />
                     )}
                   </CommandItem>
                 ))}
@@ -225,7 +225,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                       onChange(p.path, p.name);
                       setOpen(false);
                     }}
-                    className="text-xs gap-2"
+                    className="text-label gap-2"
                   >
                     <ProjectAvatar
                       name={p.name}
@@ -237,7 +237,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                     />
                     <span className="flex-1 truncate">{p.name}</span>
                     {value === p.path && (
-                      <Check className="ml-auto h-3.5 w-3.5 text-primary" />
+                      <Check className="ml-auto size-3.5 text-primary" />
                     )}
                   </CommandItem>
                 ))}
@@ -249,9 +249,9 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
             <button
               type="button"
               onClick={handleOpenProject}
-              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-label text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors duration-150"
             >
-              <FolderOpen className="h-3.5 w-3.5" />
+              <FolderOpen className="size-3.5" />
               Open project
             </button>
             <button
@@ -260,9 +260,9 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                 setOpen(false);
                 setShowNewProjectScreen(true);
               }}
-              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-label text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors duration-150"
             >
-              <FolderPlus className="h-3.5 w-3.5" />
+              <FolderPlus className="size-3.5" />
               New project
             </button>
           </div>

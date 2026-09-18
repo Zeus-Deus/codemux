@@ -202,7 +202,7 @@ export function SweepDialog({ open, onOpenChange, candidates, knownBytes }: Prop
               <DialogTitle className="text-body-lg">
                 Sweep {count} settled {count === 1 ? "workspace" : "workspaces"}
                 {knownBytes !== null && knownBytes > 0 && (
-                  <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground">
+                  <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground tabular-nums">
                     ~{formatBytes(knownBytes)}
                   </span>
                 )}
@@ -290,7 +290,7 @@ function SweepProgressSurface({
                 : "Sweep complete"}
           </DialogTitle>
           {!settled && outcome.skipped > 0 && (
-            <span className="ml-auto shrink-0 whitespace-nowrap rounded-[5px] bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-caption leading-[13px] text-status-working">
+            <span className="ml-auto shrink-0 whitespace-nowrap rounded-sm bg-status-working/[0.14] px-1.5 py-0.5 font-mono text-caption leading-[13px] text-status-working">
               {outcome.skipped} skipped
             </span>
           )}
@@ -326,7 +326,7 @@ function SweepProgressSurface({
         aria-valuemin={0}
         aria-valuemax={total}
         aria-valuenow={index}
-        className="relative flex h-0.5 bg-foreground/[0.07]"
+        className="relative flex h-0.5 bg-surface-2"
       >
         {!settled ? (
           <div

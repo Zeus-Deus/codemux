@@ -272,14 +272,14 @@ export function PrList({
             applyPendingOrder();
             onRefresh();
           }}
-          className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
         >
           <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
         </button>
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5 border-b border-border/40 px-3 py-2">
-        <span className="flex flex-1 items-center gap-1.5 rounded-[7px] bg-muted/40 px-2 py-1">
+        <span className="flex flex-1 items-center gap-1.5 rounded-md bg-muted/40 px-2 py-1">
           <Search className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             value={query}
@@ -298,7 +298,7 @@ export function PrList({
               type="button"
               data-testid="pr-state-filter"
               className={cn(
-                "flex shrink-0 items-center gap-1 rounded-[7px] bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors hover:bg-accent/50",
+                "flex shrink-0 items-center gap-1 rounded-md bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors duration-150 hover:bg-accent/50",
                 tzBody,
               )}
             >
@@ -377,7 +377,7 @@ export function PrList({
                   </span>
                   <span
                     className={cn(
-                      "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                      "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                       tzEyebrow,
                     )}
                   >
@@ -518,7 +518,7 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
       )}
       <span
         className={cn(
-          "font-mono font-semibold uppercase tracking-[0.07em] text-foreground/80",
+          "font-mono font-semibold uppercase tracking-eyebrow text-foreground/80",
           tzEyebrow,
         )}
       >
@@ -557,7 +557,7 @@ function EmptyList({
   if (query.trim() && hasRows) {
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8">
-        <p className="text-xs text-foreground">Nothing matches that search.</p>
+        <p className="text-label text-foreground">Nothing matches that search.</p>
         <p className={cn("text-muted-foreground", tzBody)}>
           Tokens are <span className="font-mono">is:draft</span>,{" "}
           <span className="font-mono">ci:failing</span> and{" "}
@@ -580,7 +580,7 @@ function EmptyList({
   if (!hasHosts) {
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8">
-        <p className="text-xs text-foreground">No projects open.</p>
+        <p className="text-label text-foreground">No projects open.</p>
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           This page lists pull requests across the projects you have open. Open one and
           its repository shows up here.
@@ -595,7 +595,7 @@ function EmptyList({
   if (unanswered) {
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-unanswered">
-        <p className="text-xs text-foreground">Nothing to show yet.</p>
+        <p className="text-label text-foreground">Nothing to show yet.</p>
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           The host is refusing requests until the account&apos;s API budget refills, so this
           page has not been able to ask what is open. It tries again on its own.
@@ -611,7 +611,7 @@ function EmptyList({
   if (isLoading) {
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-8" data-testid="pr-list-first-load">
-        <p className="text-xs text-foreground">Looking for pull requests…</p>
+        <p className="text-label text-foreground">Looking for pull requests…</p>
         <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
           Asking each repository you have open. Rows appear as they answer.
         </p>
@@ -621,7 +621,7 @@ function EmptyList({
 
   return (
     <div className="flex flex-col items-start gap-2 px-3 py-8">
-      <p className="text-xs text-foreground">No open pull requests.</p>
+      <p className="text-label text-foreground">No open pull requests.</p>
       <p className={cn("leading-relaxed text-muted-foreground", tzBody)}>
         Nothing is open on the projects you have here. If you expected some, check that
         the host CLI is signed in under Settings ▸ Source Control.

@@ -23,21 +23,21 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
 
   return (
     <div className={cn("space-y-1.5", className)}>
-      <div className="flex items-center justify-between gap-2 text-xs">
+      <div className="flex items-center justify-between gap-2 text-label">
         <span className="font-medium text-foreground">{phase}…</span>
         {determinate && (
-          <span className="font-mono text-muted-foreground">{percent}%</span>
+          <span className="font-mono text-muted-foreground tabular-nums">{percent}%</span>
         )}
       </div>
 
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-3">
         {determinate ? (
           <div
             className="h-full rounded-full bg-foreground transition-[width] duration-300 ease-out"
             style={{ width: `${percent}%` }}
           />
         ) : (
-          <div className="h-full w-full animate-pulse rounded-full bg-foreground/40" />
+          <div className="h-full w-full motion-safe:animate-pulse rounded-full bg-foreground/40" />
         )}
       </div>
 

@@ -265,7 +265,7 @@ export function WorkspaceHoverCardBody({
             <ProviderLogo
               key={p}
               provider={p}
-              className="h-3.5 w-3.5 shrink-0 opacity-80"
+              className="size-3.5 shrink-0 opacity-80"
             />
           ))}
           <span
@@ -408,8 +408,7 @@ export function WorkspaceHoverCardBody({
               >
                 <Terminal
                   aria-hidden="true"
-                  className="size-3 shrink-0 animate-pulse"
-                  strokeWidth={1.7}
+                  className="size-3 shrink-0 motion-safe:animate-pulse"
                 />
                 <span>{runningProcessCount} running</span>
               </span>

@@ -66,8 +66,8 @@ export function IssueDetailPopover({
           type="button"
           className={cn(
             variant === "chip"
-              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors hover:bg-muted"
-              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors",
+              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors duration-150 hover:bg-muted"
+              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors duration-150",
           )}
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); }}
@@ -107,11 +107,10 @@ export function IssueDetailPopover({
             </div>
           ) : error ? (
             <div className="text-center space-y-2 py-2">
-              <p className="text-xs text-muted-foreground">Failed to load issue details</p>
+              <p className="text-label text-muted-foreground">Failed to load issue details</p>
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 text-xs"
                 onClick={fetchIssue}
               >
                 Retry
@@ -126,14 +125,14 @@ export function IssueDetailPopover({
                 ) : (
                   <CircleCheck className="size-4 shrink-0 text-muted-foreground mt-0.5" />
                 )}
-                <p className="text-sm font-medium text-foreground leading-snug line-clamp-2">
+                <p className="text-body font-medium text-foreground leading-snug line-clamp-2">
                   {fullIssue.title}
                 </p>
               </div>
 
               {/* Meta: number + labels + assignees */}
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-xs text-muted-foreground font-mono">
+                <span className="text-label text-muted-foreground font-mono">
                   #{fullIssue.number}
                 </span>
                 {fullIssue.labels.map((label) => (
@@ -157,12 +156,12 @@ export function IssueDetailPopover({
               {/* Body */}
               {fullIssue.body ? (
                 <div className="max-h-[300px] overflow-y-auto">
-                  <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
+                  <p className="select-text text-label text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
                     {fullIssue.body}
                   </p>
                 </div>
               ) : (
-                <p className="text-xs text-muted-foreground italic">
+                <p className="text-label text-muted-foreground italic">
                   No description provided.
                 </p>
               )}
@@ -172,10 +171,10 @@ export function IssueDetailPopover({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="w-full justify-center gap-1.5 text-xs"
+                  className="w-full justify-center"
                   onClick={() => openUrl(fullIssue.url)}
                 >
-                  <ExternalLink className="h-3 w-3" />
+                  <ExternalLink className="size-3" />
                   Open on {provider.name}
                 </Button>
               )}

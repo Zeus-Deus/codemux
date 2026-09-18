@@ -93,7 +93,7 @@ export function MergeSheet({
                 onClick={() => pickMethod(strategy.id)}
                 data-testid={`merge-strategy-${strategy.id}`}
                 className={cn(
-                  "rounded-md px-2.5 py-1.5 transition-colors",
+                  "rounded-md px-2.5 py-1.5 transition-colors duration-150",
                   tzMetaNum,
                   method === strategy.id
                     ? "bg-card font-semibold text-foreground"
@@ -110,7 +110,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                 tzEyebrow,
               )}
             >
@@ -121,7 +121,7 @@ export function MergeSheet({
               onChange={(e) => setTitle(e.target.value)}
               data-testid="merge-commit-title"
               className={cn(
-                "h-[34px] rounded-md border-0 bg-muted/50 px-2.5 text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                "h-[34px] rounded-md border-0 bg-muted/50 px-2.5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 tzBodyLg,
               )}
             />
@@ -130,7 +130,7 @@ export function MergeSheet({
           <label className="flex flex-col gap-1.5">
             <span
               className={cn(
-                "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                 tzEyebrow,
               )}
             >
@@ -142,7 +142,7 @@ export function MergeSheet({
               rows={4}
               data-testid="merge-commit-body"
               className={cn(
-                "resize-y rounded-md border-0 bg-muted/50 px-2.5 py-2 leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                "resize-y rounded-md border-0 bg-muted/50 px-2.5 py-2 leading-relaxed text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 tzBody,
               )}
             />
@@ -158,13 +158,13 @@ export function MergeSheet({
           >
             <span
               className={cn(
-                "flex size-3.5 shrink-0 items-center justify-center rounded-[3px]",
+                "flex size-3.5 shrink-0 items-center justify-center rounded-sm",
                 deleteBranch
                   ? "bg-status-open/20 text-status-open ring-1 ring-status-open"
                   : "bg-muted ring-1 ring-border",
               )}
             >
-              {deleteBranch && <Check className="size-2.5" strokeWidth={3.5} />}
+              {deleteBranch && <Check className="size-3" />}
             </span>
             <span className={cn("flex-1 text-foreground/80", tzBodyLg)}>
               Delete <span className={cn("font-mono", tzBody)}>{headBranch ?? "the branch"}</span>{" "}

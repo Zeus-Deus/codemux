@@ -29,7 +29,7 @@ export function LoginScreen() {
     return (
       <div className="relative flex h-screen w-screen items-center justify-center bg-background">
         <WindowChrome />
-        <div className="text-xl font-semibold text-foreground animate-pulse opacity-80">
+        <div className="text-xl font-semibold text-foreground motion-safe:animate-pulse opacity-80">
           codemux
         </div>
       </div>
@@ -82,11 +82,11 @@ export function LoginScreen() {
                 codemux
               </span>
             </div>
-            <Mail className="h-10 w-10 text-muted-foreground mb-4" />
-            <h2 className="text-sm font-medium text-foreground mb-2">
+            <Mail className="size-10 text-muted-foreground mb-4" />
+            <h2 className="text-body font-medium text-foreground mb-2">
               Check your email
             </h2>
-            <p className="text-xs text-muted-foreground text-center mb-6">
+            <p className="text-label text-muted-foreground text-center mb-6">
               We sent a verification link to{" "}
               <span className="text-foreground">{email}</span>. Click the link
               to verify your account.
@@ -100,7 +100,7 @@ export function LoginScreen() {
             </Button>
             <button
               type="button"
-              className="mt-4 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
               onClick={() => switchView("signin")}
             >
               Back to sign in
@@ -125,13 +125,13 @@ export function LoginScreen() {
               </span>
             </div>
             <div className="text-center mb-6">
-              <p className="text-sm text-muted-foreground">
+              <p className="text-body text-muted-foreground">
                 Reset your password
               </p>
             </div>
             {resetSent ? (
               <>
-                <p className="text-sm text-muted-foreground text-center mb-6">
+                <p className="text-body text-muted-foreground text-center mb-6">
                   If that email exists, we sent a reset link.
                 </p>
                 <Button
@@ -160,7 +160,7 @@ export function LoginScreen() {
                   disabled={resetLoading}
                 >
                   {resetLoading && (
-                    <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                    <Loader2 className="size-4 animate-spin mr-1.5" />
                   )}
                   Send reset link
                 </Button>
@@ -169,7 +169,7 @@ export function LoginScreen() {
             {!resetSent && (
               <button
                 type="button"
-                className="mt-4 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
                 onClick={() => switchView("signin")}
               >
                 Back to sign in
@@ -200,7 +200,7 @@ export function LoginScreen() {
 
           {/* Subtitle */}
           <div className="text-center mb-6">
-            <p className="text-sm text-muted-foreground">
+            <p className="text-body text-muted-foreground">
               {view === "signin"
                 ? "Sign in to get started"
                 : "Create your account"}
@@ -216,9 +216,9 @@ export function LoginScreen() {
             disabled={isSigningIn}
           >
             {isSigningIn ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Loader2 className="size-4 animate-spin" />
             ) : (
-              <Github className="h-4 w-4" />
+              <Github className="size-4" />
             )}
             Continue with GitHub
           </Button>
@@ -229,7 +229,7 @@ export function LoginScreen() {
               <span className="w-full border-t border-border" />
             </div>
             <div className="relative flex justify-center">
-              <span className="bg-background px-2 text-xs text-muted-foreground">
+              <span className="bg-background px-2 text-label text-muted-foreground">
                 or
               </span>
             </div>
@@ -273,7 +273,7 @@ export function LoginScreen() {
               <div className="flex justify-end">
                 <button
                   type="button"
-                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
                   onClick={() => switchView("forgot-password")}
                 >
                   Forgot password?
@@ -285,15 +285,15 @@ export function LoginScreen() {
             {error &&
               (isEmailNotVerified ? (
                 <div className="text-center space-y-1">
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-body text-muted-foreground">
                     Your email hasn't been verified yet.
                   </p>
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-body text-muted-foreground">
                     Check your inbox for the verification link.
                   </p>
                 </div>
               ) : (
-                <p className="text-destructive text-sm text-center">{error}</p>
+                <p className="text-destructive text-body text-center">{error}</p>
               ))}
 
             <Button
@@ -303,7 +303,7 @@ export function LoginScreen() {
               disabled={isSigningIn}
             >
               {isSigningIn && (
-                <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                <Loader2 className="size-4 animate-spin mr-1.5" />
               )}
               {view === "signin" ? "Sign in" : "Create account"}
             </Button>
@@ -312,7 +312,7 @@ export function LoginScreen() {
           {/* Toggle sign-in / sign-up */}
           <button
             type="button"
-            className="mt-4 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
             onClick={() =>
               switchView(view === "signin" ? "signup" : "signin")
             }

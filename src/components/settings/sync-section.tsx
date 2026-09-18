@@ -33,7 +33,7 @@ export function SyncSection() {
         {sessionStatus === "offline" && (
           <p
             role="status"
-            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-xs text-muted-foreground"
+            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-label text-muted-foreground"
           >
             Offline — using your cached settings. Changes will sync when the
             connection returns.
@@ -42,7 +42,7 @@ export function SyncSection() {
         {sessionStatus === "degraded" && (
           <p
             role="status"
-            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-xs text-muted-foreground"
+            className="rounded-md border border-warning/35 bg-warning/5 p-3 text-label text-muted-foreground"
           >
             Signed in, but settings refresh failed. Your cached settings are
             still active.
@@ -54,7 +54,7 @@ export function SyncSection() {
   }
 
   return (
-    <p className="rounded-md border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+    <p className="rounded-md border border-border bg-muted/30 p-3 text-label text-muted-foreground">
       Sign in to sync your skills across devices.
     </p>
   );
@@ -117,7 +117,7 @@ function SyncReadyRow() {
     <div className="space-y-3">
       <div className="rounded-md border border-border bg-muted/30 p-3">
         <SyncStatusDisplay />
-        <p className="mt-3 text-xs text-muted-foreground">
+        <p className="mt-3 text-label text-muted-foreground">
           Your skills sync to your Codemux account so they follow you
           across devices. They're stored on Codemux servers, encrypted
           at rest.
@@ -129,12 +129,12 @@ function SyncReadyRow() {
           type="button"
           onClick={handleExport}
           disabled={busy !== null}
-          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "export" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="size-3.5 animate-spin" />
           ) : (
-            <FileDown className="h-3.5 w-3.5" />
+            <FileDown className="size-3.5" />
           )}
           Export skills locally
         </button>
@@ -142,19 +142,19 @@ function SyncReadyRow() {
           type="button"
           onClick={handleImport}
           disabled={busy !== null}
-          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {busy === "import" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="size-3.5 animate-spin" />
           ) : (
-            <FileUp className="h-3.5 w-3.5" />
+            <FileUp className="size-3.5" />
           )}
           Import skills from backup
         </button>
       </div>
 
       {feedback && (
-        <p className="text-xs text-muted-foreground" role="status">
+        <p className="text-label text-muted-foreground" role="status">
           {feedback}
         </p>
       )}

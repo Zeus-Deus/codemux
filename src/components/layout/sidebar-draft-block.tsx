@@ -284,9 +284,9 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
         onClick={handleActivate}
         onKeyDown={handleKeyDown}
         className={cn(
-          "group/draft relative cursor-pointer overflow-hidden rounded-lg text-left outline-none",
+          "group/draft relative cursor-pointer overflow-hidden rounded-lg text-left",
           "transition-[background-color,box-shadow] duration-150",
-          "focus-visible:ring-2 focus-visible:ring-ring/50",
+          "focus-visible:ring-2 focus-visible:ring-ring/60",
           props.active
             ? "bg-accent-ember/[0.09]"
             : "bg-transparent hover:bg-accent-ember/[0.055]",
@@ -312,7 +312,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
                 aria-label={`${row.attachmentCount} attachment${row.attachmentCount === 1 ? "" : "s"}`}
                 className="flex shrink-0 items-center gap-0.5 text-caption tabular-nums text-muted-foreground/65"
               >
-                <Paperclip className="size-2.5" />
+                <Paperclip className="size-3" />
                 {row.attachmentCount}
               </span>
             )}
@@ -323,9 +323,9 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               onClick={handleDiscard}
               className={cn(
                 "-mr-0.5 flex size-5 shrink-0 items-center justify-center rounded-md",
-                "text-muted-foreground opacity-0 transition-[opacity,color,background-color]",
-                "hover:bg-foreground/[0.07] hover:text-foreground",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+                "text-muted-foreground opacity-0 transition-[opacity,color,background-color] duration-150",
+                "hover:bg-surface-2 hover:text-foreground",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 "group-hover/draft:opacity-100",
               )}
             >
@@ -523,7 +523,7 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                 aria-label={`Open draft: ${row.preview}`}
                 onClick={() => setActiveDraft(row.draftId)}
                 className={cn(
-                  "relative flex size-7 items-center justify-center rounded-lg transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+                  "relative flex size-7 items-center justify-center rounded-lg transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                   row.draftId === activeDraftId
                     ? "bg-accent-ember/[0.10]"
                     : "bg-transparent hover:bg-accent-ember/[0.07]",
@@ -534,12 +534,12 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                   size="md"
                   shape="square"
                 />
-                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded bg-sidebar text-accent-ember">
-                  <SquarePen className="size-2.5" />
+                <span className="absolute -bottom-0.5 -right-0.5 flex size-3 items-center justify-center rounded-sm bg-sidebar text-accent-ember">
+                  <SquarePen className="size-3" />
                 </span>
               </button>
             </TooltipTrigger>
-            <TooltipContent side="right" className="max-w-64 text-xs">
+            <TooltipContent side="right" className="max-w-64 text-label">
               <div className="font-semibold">Draft · {row.project.name}</div>
               <div className="mt-0.5 truncate text-muted-foreground">
                 {row.preview}

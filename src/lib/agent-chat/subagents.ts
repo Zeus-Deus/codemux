@@ -442,8 +442,8 @@ export function statusTone(status: SubagentViewStatus): SubagentToneClasses {
     case "stopped":
       return {
         text: "text-muted-foreground",
-        chipBg: "bg-foreground/10 text-muted-foreground",
-        softBg: "bg-foreground/[0.04]",
+        chipBg: "bg-surface-3 text-muted-foreground",
+        softBg: "bg-surface-1",
         border: "border-border",
       };
   }

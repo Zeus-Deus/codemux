@@ -253,7 +253,7 @@ export function SidebarProjectGroup({
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
-            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-sm font-medium hover:bg-muted/40 transition-colors cursor-pointer rounded-lg"
+            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-body font-medium hover:bg-muted/40 transition-colors duration-150 cursor-pointer rounded-lg"
             draggable={!!onProjectDragStart}
             onDragStart={onProjectDragStart}
             data-project-header-path={projectPath}
@@ -264,7 +264,7 @@ export function SidebarProjectGroup({
                 renders a Home glyph instead of a letter. */}
             {isHomeGroup ? (
               <div className="size-5 rounded-full border border-border bg-muted flex items-center justify-center shrink-0 mr-2.5">
-                <Home className="h-3 w-3 text-muted-foreground" />
+                <Home className="size-3 text-muted-foreground" />
               </div>
             ) : (
               <ProjectAvatar
@@ -284,7 +284,7 @@ export function SidebarProjectGroup({
 
             {/* Count — visible at rest, fades on hover so the + can
                 take its slot without ever colliding. */}
-            <span className="text-label text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
+            <span className="text-label text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity duration-150 group-hover/proj:opacity-0">
               {visibleCount}
             </span>
 
@@ -294,14 +294,14 @@ export function SidebarProjectGroup({
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  className="absolute right-7 opacity-0 group-hover/proj:opacity-100 transition-opacity"
+                  className="absolute right-7 opacity-0 group-hover/proj:opacity-100 transition-opacity duration-150"
                   aria-label="New workspace"
                   onClick={handlePlusClick}
                 >
-                  <Plus className="h-3.5 w-3.5 text-muted-foreground" />
+                  <Plus className="size-3.5 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+              <TooltipContent side="bottom" sideOffset={4} className="text-label">
                 {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
                 {newWsKeys ? ` · ${newWsKeys}` : ""}
               </TooltipContent>
@@ -310,7 +310,7 @@ export function SidebarProjectGroup({
             {/* Chevron stays visible as the only state cue */}
             <ChevronRight
               className={cn(
-                "h-3.5 w-3.5 text-muted-foreground/50 transition-transform duration-150 shrink-0",
+                "size-3.5 text-muted-foreground/50 transition-transform duration-150 shrink-0",
                 !collapsed && "rotate-90",
               )}
             />
@@ -318,15 +318,15 @@ export function SidebarProjectGroup({
         </ContextMenuTrigger>
         <ContextMenuContent>
           <ContextMenuItem onClick={handleRevealInFileManager}>
-            <FolderOpen className="mr-2 h-3.5 w-3.5" />
+            <FolderOpen className="mr-2 size-3.5" />
             Open in File Manager
           </ContextMenuItem>
           <ContextMenuItem onClick={handleCopyPath}>
-            <Clipboard className="mr-2 h-3.5 w-3.5" />
+            <Clipboard className="mr-2 size-3.5" />
             Copy Path
           </ContextMenuItem>
           <ContextMenuItem onClick={() => setShowImageDialog(true)}>
-            <ImageIcon className="mr-2 h-3.5 w-3.5" />
+            <ImageIcon className="mr-2 size-3.5" />
             {imageUrl ? "Change image…" : "Set image…"}
           </ContextMenuItem>
           <ContextMenuSub>
@@ -335,7 +335,7 @@ export function SidebarProjectGroup({
               <ContextMenuItem onClick={() => handleColorChange(null)}>
                 <span className="size-3.5 rounded-full border border-border bg-background shrink-0 mr-2" />
                 Default
-                {!customColor && <Check className="ml-auto h-3.5 w-3.5" />}
+                {!customColor && <Check className="ml-auto size-3.5" />}
               </ContextMenuItem>
               {PROJECT_COLORS.map((color) => (
                 <ContextMenuItem key={color.value} onClick={() => handleColorChange(color.value)}>
@@ -344,7 +344,7 @@ export function SidebarProjectGroup({
                     style={{ backgroundColor: color.value }}
                   />
                   {color.name}
-                  {customColor === color.value && <Check className="ml-auto h-3.5 w-3.5" />}
+                  {customColor === color.value && <Check className="ml-auto size-3.5" />}
                 </ContextMenuItem>
               ))}
             </ContextMenuSubContent>
@@ -367,7 +367,7 @@ export function SidebarProjectGroup({
       <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
         <DialogContent showCloseButton={false} className="max-w-[340px]">
           <DialogHeader>
-            <DialogTitle className="text-sm">
+            <DialogTitle className="text-body">
               Archive project &ldquo;{projectName}&rdquo;?
             </DialogTitle>
             <DialogDescription>
@@ -381,7 +381,6 @@ export function SidebarProjectGroup({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-xs"
               onClick={() => setShowCloseDialog(false)}
             >
               Cancel
@@ -389,7 +388,6 @@ export function SidebarProjectGroup({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-xs"
               onClick={() => void handleArchiveProject()}
             >
               Archive Project
@@ -423,16 +421,16 @@ export function SidebarProjectGroup({
         <div
           key={pw.id}
           className={cn(
-            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-sm",
-            pw.status === "failed" ? "opacity-60" : "opacity-70 animate-pulse",
+            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-body",
+            pw.status === "failed" ? "opacity-60" : "opacity-70 motion-safe:animate-pulse",
           )}
         >
           {pw.status === "creating" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
+            <Loader2 className="size-3.5 animate-spin text-muted-foreground shrink-0" />
           ) : (
-            <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            <AlertCircle className="size-3.5 text-destructive shrink-0" />
           )}
-          <span className="truncate text-muted-foreground text-xs">
+          <span className="truncate text-muted-foreground text-label">
             {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
           </span>
         </div>

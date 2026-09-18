@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import type { AppearanceSettings } from "@/tauri/types";
 import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type TypographyField =
   | "interface_font_family"
@@ -315,7 +316,7 @@ export function TypographySettings() {
           <button
             type="button"
             onClick={restoreDefaults}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
           >
             <RotateCcw className="size-3" aria-hidden />
             Restore defaults
@@ -358,11 +359,11 @@ function TypographySurfaceCard({
   linkedLabel?: string;
 }) {
   return (
-    <div className="overflow-hidden rounded-xl border border-border/65 bg-card/35 shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_3%,transparent)]">
+    <div className="overflow-hidden rounded-lg border border-border/65 bg-card/35 shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_3%,transparent)]">
       <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3.5">
         <div className="flex min-w-[220px] flex-1 items-start gap-3">
           <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-background/80 text-muted-foreground">
-            <Icon className="size-3.5" strokeWidth={1.7} aria-hidden />
+            <Icon className="size-3.5" aria-hidden />
           </div>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -461,7 +462,7 @@ function FontFamilyPicker({
         <button
           type="button"
           aria-label={`Font family: ${display}`}
-          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[190px] sm:flex-none"
+          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:w-[190px] sm:flex-none"
         >
           <span className="min-w-0 truncate" style={{ fontFamily: fontStack(value, defaultStack) }}>
             {display}
@@ -483,9 +484,9 @@ function FontFamilyPicker({
                 <span className="min-w-0 flex-1 truncate" style={{ fontFamily: defaultStack }}>
                   {defaultFamily}
                 </span>
-                <span className="text-micro uppercase tracking-[0.08em] text-muted-foreground/55">
+                <Eyebrow>
                   default
-                </span>
+                </Eyebrow>
                 {value === null ? <Check className="size-3.5" aria-hidden /> : null}
               </CommandItem>
             ) : null}
@@ -569,7 +570,7 @@ function InterfacePreview({ family, size }: { family: string; size: number }) {
     <PreviewFrame>
       <div style={{ fontFamily: family, fontSize: size }}>
         <div className="flex items-center gap-2 border-b border-border/45 px-3 py-2">
-          <span className="size-2 rounded-[3px] bg-accent-ember" />
+          <span className="size-2 rounded-sm bg-accent-ember" />
           <span className="font-semibold tracking-[-0.01em]">Codemux</span>
           <span className="ml-auto text-[0.72em] text-muted-foreground">main</span>
         </div>

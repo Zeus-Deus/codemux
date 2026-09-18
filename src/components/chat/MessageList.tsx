@@ -75,6 +75,7 @@ import type {
   SlotBody,
   TranscriptSlot,
 } from "./transcript-slots";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   messages: ChatViewItem[];
@@ -1224,7 +1225,7 @@ export const MessageList = memo(function MessageList({
         )}
         {showLiveMarker && !(stalled && streaming) && (
           <div className="mt-[13px]">
-            <StreamingMarker messages={ordered} />
+            <StreamingMarker messages={ordered} workspaceId={workspaceId} />
           </div>
         )}
         {interrupted && !streaming && (
@@ -1234,7 +1235,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [interrupted, ordered, showLiveMarker, stalled, streaming],
+    [interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
   );
 
   return (
@@ -1300,10 +1301,10 @@ export const MessageList = memo(function MessageList({
           onClick={handleJumpToLatest}
           variant="secondary"
           size="sm"
-          className="absolute bottom-4 left-1/2 z-10 h-8 w-auto -translate-x-1/2 gap-1.5 rounded-full border border-border bg-card px-3.5 text-body-sm font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className="absolute bottom-4 left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
-          <ArrowDown className="h-3.5 w-3.5" aria-hidden />
+          <ArrowDown className="size-3.5" aria-hidden />
         </Button>
       )}
       </div>
@@ -1443,7 +1444,7 @@ function RunStalledNotice({ silentForSecs }: { silentForSecs: number }) {
       data-testid="run-stalled-notice"
       className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-body-sm text-warning"
     >
-      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
       <span>
         No activity for {minutes}m — the agent may have stopped.
       </span>
@@ -1651,7 +1652,7 @@ function renderAssistantBody(
   switch (item.kind) {
     case "async_question":
       return (
-        <div className="space-y-1 py-1 text-sm">
+        <div className="space-y-1 py-1 text-body">
           {item.question.text && (
             <p className="text-muted-foreground">{item.question.text}</p>
           )}
@@ -1660,7 +1661,7 @@ function renderAssistantBody(
             .map((question, index) => (
               <p key={index}>{question.title}</p>
             ))}
-          <p className="text-xs text-muted-foreground">
+          <p className="text-label text-muted-foreground">
             {item.resolution.status === "answered"
               ? "Answered"
               : item.resolution.status === "dismissed"
@@ -1707,21 +1708,21 @@ function renderAssistantBody(
           // one-line pointer while it's still open.
           if (item.resolution.state === "pending") {
             return (
-              <div className="py-0.5 text-xs text-muted-foreground">
+              <div className="py-0.5 text-label text-muted-foreground">
                 Input requested — answer above the composer.
               </div>
             );
           }
           if (item.resolution.state === "responding") {
             return (
-              <div className="py-0.5 text-xs text-muted-foreground">
+              <div className="py-0.5 text-label text-muted-foreground">
                 Submitting answers…
               </div>
             );
           }
           if (item.resolution.state === "failed") {
             return (
-              <div className="select-text py-0.5 text-xs text-muted-foreground">
+              <div className="select-text py-0.5 text-label text-muted-foreground">
                 {item.resolution.message}
               </div>
             );
@@ -1734,9 +1735,9 @@ function renderAssistantBody(
           return (
             <div className="space-y-1">
               {handlers.subagentName && (
-                <div className="font-mono text-label font-semibold uppercase tracking-wide text-muted-foreground">
+                <Eyebrow>
                   From subagent {handlers.subagentName}
-                </div>
+                </Eyebrow>
               )}
               <PermissionRequestBlock item={item} onDecide={handlers.handleDecide} />
             </div>
@@ -1745,7 +1746,7 @@ function renderAssistantBody(
     case "turn_ended":
       if (item.status.kind !== "error") return null;
       return (
-        <div className="select-text py-0.5 text-xs text-muted-foreground">
+        <div className="select-text py-0.5 text-label text-muted-foreground">
           Turn ended: {item.status.subtype}
           {item.status.message ? ` — ${item.status.message}` : ""}
         </div>
@@ -1807,11 +1808,11 @@ function TurnFoldRow({
         type="button"
         aria-expanded={expanded}
         onClick={() => onToggleTurnFold(turnId)}
-        className="flex items-center gap-1 rounded-md px-1 text-xs tabular-nums text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        className="flex items-center gap-1 rounded-md px-1 text-label tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
         <span>{label}</span>
         {failedCount > 0 ? (
-          <span className="text-status-attention">
+          <span className="text-status-attention tabular-nums">
             · {failedCount} failed
           </span>
         ) : null}

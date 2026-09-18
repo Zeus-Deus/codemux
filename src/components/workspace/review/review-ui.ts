@@ -55,8 +55,8 @@ export const tzLog = "text-body-sm";
 
 const BASE =
   "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md border-0 " +
-  "px-3.5 text-body font-medium transition-colors outline-none " +
-  "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+  "px-3.5 text-body font-medium transition-colors duration-150 outline-none " +
+  "focus-visible:ring-2 focus-visible:ring-ring/60";
 
 /** Neutral secondary — sits on the bar's card background. */
 export const btnCard = `${BASE} bg-card text-foreground/90 hover:bg-accent/50`;
@@ -111,9 +111,9 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
  * its box never changes between states.
  */
 const BASE_XS =
-  "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded border-0 " +
-  "px-2 text-body-sm font-medium transition-colors outline-none " +
-  "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+  "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded-sm border-0 " +
+  "px-2 text-body-sm font-medium transition-colors duration-150 outline-none " +
+  "focus-visible:ring-2 focus-visible:ring-ring/60";
 
 export const btnEmberXs = `${BASE_XS} bg-accent-ember/15 font-semibold text-accent-ember hover:bg-accent-ember/25`;
 

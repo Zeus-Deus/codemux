@@ -37,10 +37,10 @@ interface Props {
 }
 
 const tabIcon: Record<TabKind, React.ReactNode> = {
-  terminal: <Terminal className="h-3 w-3" />,
-  browser: <Globe className="h-3 w-3" />,
-  diff: <GitCompare className="h-3 w-3" />,
-  editor: <FileCode className="h-3 w-3" />,
+  terminal: <Terminal className="size-3" />,
+  browser: <Globe className="size-3" />,
+  diff: <GitCompare className="size-3" />,
+  editor: <FileCode className="size-3" />,
 };
 
 function collectPaneIds(node: PaneNodeSnapshot): string[] {
@@ -272,7 +272,7 @@ function TabBarImpl({ workspace }: Props) {
               className="absolute top-1 bottom-1 z-30 pointer-events-none flex flex-col items-center"
               style={{ left: dropIndicatorLeft - 1, width: 2 }}
             >
-              <div className="h-1.5 w-1.5 rounded-full bg-foreground/70 shrink-0 -mt-0.5" />
+              <div className="size-1.5 rounded-full bg-foreground/70 shrink-0 -mt-0.5" />
               <div className="w-px flex-1 bg-foreground/40 rounded-full" />
             </div>
           )}
@@ -289,9 +289,9 @@ function TabBarImpl({ workspace }: Props) {
                   >
                     <TabsTrigger
                       value={tab.tab_id}
-                      className="group relative gap-1 px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
+                      className="group relative gap-1 px-3 !h-full !py-0 !m-0 text-label !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
                     >
-                      {tab.icon ? <PresetIcon icon={tab.icon} className="h-3 w-3" /> : tabIcon[tab.kind]}
+                      {tab.icon ? <PresetIcon icon={tab.icon} className="size-3" /> : tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
                       {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
                       {tabStatusMap.has(tab.tab_id) && (
@@ -300,13 +300,13 @@ function TabBarImpl({ workspace }: Props) {
                       <span
                         role="button"
                         tabIndex={0}
-                        className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer"
+                        className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 cursor-pointer"
                         onClick={(e) => handleCloseTab(e, tab.tab_id)}
                         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleCloseTab(e as unknown as React.MouseEvent, tab.tab_id); }}
                         aria-label="Close tab"
                         title="Close tab"
                       >
-                        <X className="h-2.5 w-2.5" />
+                        <X className="size-3" />
                       </span>
                     </TabsTrigger>
                   </div>
@@ -353,12 +353,12 @@ function TabBarImpl({ workspace }: Props) {
                 title="New tab"
                 aria-label="New tab"
               >
-                <Plus className="h-3.5 w-3.5" />
+                <Plus className="size-3.5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start">
               <DropdownMenuItem onClick={handleCreateTab}>
-                <Terminal className="h-3.5 w-3.5 mr-2" />
+                <Terminal className="size-3.5 mr-2" />
                 Terminal
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -367,7 +367,7 @@ function TabBarImpl({ workspace }: Props) {
                   if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
                 }}
               >
-                <Globe className="h-3.5 w-3.5 mr-2" />
+                <Globe className="size-3.5 mr-2" />
                 Browser
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -383,7 +383,7 @@ function TabBarImpl({ workspace }: Props) {
         title={rightPanelTab ? "Close panel" : "Open panel"}
         aria-pressed={rightPanelTab != null}
       >
-        <PanelRight className="h-3.5 w-3.5" />
+        <PanelRight className="size-3.5" />
       </Button>
     </div>
   );
@@ -392,7 +392,7 @@ function TabBarImpl({ workspace }: Props) {
 function EditorDirtyDot({ tabId }: { tabId: string }) {
   const isDirty = useEditorStore((s) => s.getTab(tabId)?.isDirty ?? false);
   if (!isDirty) return null;
-  return <span className="w-1.5 h-1.5 rounded-full bg-foreground/50 shrink-0" title="Unsaved changes" />;
+  return <span className="size-1.5 rounded-full bg-foreground/50 shrink-0" title="Unsaved changes" />;
 }
 
 // #127: memo is effective because setAppState performs structural sharing, so

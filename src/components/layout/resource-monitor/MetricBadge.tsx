@@ -3,6 +3,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface MetricBadgeProps {
   label: string;
@@ -14,9 +15,9 @@ interface MetricBadgeProps {
 export function MetricBadge({ label, value, tooltip }: MetricBadgeProps) {
   const content = (
     <div className="min-w-0 px-3 first:pl-0 last:pr-0">
-      <div className="text-caption font-medium uppercase tracking-[0.06em] text-muted-foreground/80">
+      <Eyebrow>
         {label}
-      </div>
+      </Eyebrow>
       <div className="mt-1.5 text-body-lg leading-none font-medium tabular-nums tracking-tight text-foreground whitespace-nowrap">
         {value}
       </div>

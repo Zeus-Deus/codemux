@@ -100,7 +100,7 @@ export function ReviewCodeFile({
           <span
             data-testid="file-pending-count"
             className={cn(
-              "flex shrink-0 items-center gap-1 rounded bg-accent-ember/15 px-1.5 py-0.5 font-semibold text-accent-ember",
+              "flex shrink-0 items-center gap-1 rounded-sm bg-accent-ember/15 px-1.5 py-0.5 font-semibold text-accent-ember",
               tzMeta,
             )}
           >
@@ -120,7 +120,7 @@ export function ReviewCodeFile({
           aria-pressed={viewed}
           onClick={onToggleViewed}
           className={cn(
-            "shrink-0 rounded border-0 px-2 py-0.5 transition-colors",
+            "shrink-0 rounded-sm border-0 px-2 py-0.5 transition-colors duration-150",
             tzMetaNum,
             viewed
               ? "bg-status-open/15 font-semibold text-status-open"
@@ -157,7 +157,7 @@ export function ReviewCodeFile({
               data-testid="load-anyway"
               onClick={() => setLoadedAnyway(true)}
               className={cn(
-                "shrink-0 rounded bg-card px-2.5 py-1 font-medium text-foreground hover:bg-accent/50",
+                "shrink-0 rounded-sm bg-card px-2.5 py-1 font-medium text-foreground hover:bg-accent/50",
                 tzMetaNum,
               )}
             >

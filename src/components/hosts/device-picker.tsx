@@ -102,14 +102,14 @@ export function DevicePicker({
           // rendered taller than its neighbors. Match-by-string is
           // the most reliable diff guard.
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none",
+            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground",
             className,
           )}
         >
           {isLocal ? (
-            <Monitor className="h-3.5 w-3.5" />
+            <Monitor className="size-3.5" />
           ) : (
-            <Server className="h-3.5 w-3.5" />
+            <Server className="size-3.5" />
           )}
           {!iconOnly && (
             // Match the project picker's label shape exactly —
@@ -125,7 +125,7 @@ export function DevicePicker({
             />
           )}
           {!iconOnly && (
-            <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+            <ChevronDown className="size-3 opacity-40" />
           )}
         </button>
       </DropdownMenuTrigger>

@@ -129,7 +129,7 @@ export function ReviewDescription({
       <div className="flex items-center gap-1.5">
         <span
           className={cn(
-            "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+            "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
             tzEyebrow,
           )}
         >
@@ -141,10 +141,10 @@ export function ReviewDescription({
             onClick={toggleFold}
             aria-expanded={!isFolded}
             aria-label={isFolded ? "Unfold description" : "Fold description"}
-            className="text-muted-foreground transition-colors hover:text-foreground"
+            className="text-muted-foreground transition-colors duration-150 hover:text-foreground"
           >
             <ChevronDown
-              className={cn("size-3 transition-transform", isFolded && "-rotate-90")}
+              className={cn("size-3 transition-transform duration-150", isFolded && "-rotate-90")}
             />
           </button>
         )}
@@ -154,7 +154,7 @@ export function ReviewDescription({
             type="button"
             onClick={startEdit}
             className={cn(
-              "text-muted-foreground transition-colors hover:text-foreground",
+              "text-muted-foreground transition-colors duration-150 hover:text-foreground",
               tzMeta,
             )}
             data-testid="edit-description"
@@ -173,7 +173,7 @@ export function ReviewDescription({
             onChange={(e) => onChange(e.target.value)}
             rows={10}
             className={cn(
-              "w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-2 font-mono leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              "w-full resize-y rounded-md border-0 bg-muted/40 px-2 py-2 font-mono leading-relaxed text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
               tzBody,
             )}
             data-testid="description-editor"
@@ -217,7 +217,7 @@ export function ReviewDescription({
               data-testid="description-fold"
             >
               <ChevronDown
-                className={cn("size-3 transition-transform", !isFolded && "rotate-180")}
+                className={cn("size-3 transition-transform duration-150", !isFolded && "rotate-180")}
               />
               {isFolded ? `Show all ${lineCount} lines` : "Show less"}
             </button>

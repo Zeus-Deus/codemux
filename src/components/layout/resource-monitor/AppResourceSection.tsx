@@ -23,7 +23,7 @@ interface SubRowProps {
 
 function SubRow({ label, cpu, memory, severity }: SubRowProps) {
   return (
-    <div className="group flex items-center justify-between px-3.5 pl-7 py-1 hover:bg-foreground/[0.04] transition-colors">
+    <div className="group flex items-center justify-between px-3.5 pl-7 py-1 hover:bg-surface-2 transition-colors duration-150">
       <div className="flex items-center gap-1.5 min-w-0 mr-2">
         <span className="text-label text-muted-foreground/90 truncate min-w-0">
           {label}
