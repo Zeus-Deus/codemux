@@ -630,6 +630,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       return {
         messages: t?.messages ?? EMPTY_MESSAGES,
         streaming: t?.streaming ?? false,
+        compacting: t?.compacting ?? false,
         // Dead-run detection (issue #154): the stall notice + interrupted /
         // Continue affordances read straight off the thread slice.
         stalled: t?.stalled ?? null,
@@ -638,7 +639,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       };
     }),
   );
-  const { messages, streaming, stalled, interrupted, activeTurnId } = timeline;
+  const { messages, streaming, compacting, stalled, interrupted, activeTurnId } = timeline;
   const settings = useAgentChatStore(
     useShallow((s) => {
       const t = threadId ? s.threads[threadId] : undefined;
@@ -3924,6 +3925,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             <ChatTranscript
               messages={messages}
               streaming={transcriptStreaming}
+              compacting={compacting}
               stalled={stalled}
               interrupted={interrupted}
               sendAnchor={sendAnchor}

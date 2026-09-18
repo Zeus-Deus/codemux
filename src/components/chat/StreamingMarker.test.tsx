@@ -139,6 +139,15 @@ describe("deriveStreamingLabel — waiting on background work", () => {
   });
 });
 
+
+it("announces summarization ahead of transcript-derived activity", () => {
+  const { rerender } = render(<StreamingMarker messages={[toolCall(1)]} compacting />);
+  expect(screen.getByRole("status", { name: "Agent is summarizing context" })).toHaveTextContent("Summarizing context…");
+  expect(screen.queryByText("Running Read…")).toBeNull();
+  rerender(<StreamingMarker messages={[toolCall(1)]} />);
+  expect(screen.getByText("Running Read…")).toBeInTheDocument();
+});
+
 describe("StreamingMarker — waiting label opens the Subagents panel", () => {
   const waitingMessages = (): ChatViewItem[] => [
     userMsg(0),

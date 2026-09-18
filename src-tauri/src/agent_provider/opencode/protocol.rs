@@ -321,6 +321,9 @@ pub struct MessageInfo {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub role: String,
+    /// Assistant compaction messages carry true; user summaries can be objects.
+    #[serde(default)]
+    pub summary: serde_json::Value,
     #[serde(default)]
     pub error: Option<OpenCodeApiError>,
     #[serde(default)]

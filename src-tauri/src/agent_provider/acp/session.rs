@@ -1906,6 +1906,19 @@ impl AcpSession {
             | "_x.ai/session_notification"
                 if self.dialect.is_grok() =>
             {
+                // session/update also carries historical replay. Only live
+                // compaction notifications may change the activity indicator.
+                if notification.method.ends_with("/session_notification") {
+                    if let Some(active) = xai_compaction_activity(
+                        &notification.params,
+                        &self.provider_session_id.0,
+                    ) {
+                        let _ = self.event_tx.send(ProviderRuntimeEvent::ContextCompactionChanged {
+                            thread_id: self.thread_id.clone(),
+                            active,
+                        });
+                    }
+                }
                 self.handle_xai_session_update(notification.params).await;
             }
             "x.ai/models/update" | "_x.ai/models/update" if self.dialect.is_grok() => {
@@ -2594,6 +2607,29 @@ fn xai_completion_value(value: &Value, session_id: &str, prompt_id: &str) -> Opt
         "stopReason": normalize_xai_stop_reason(Some(&stop_reason)),
         "_meta": meta
     }))
+}
+
+/// Grok's live xAI compaction lifecycle is session-scoped, including idle
+/// model switches; these events do not carry prompt IDs. Never infer a start
+/// from token counts or replayed history.
+fn xai_compaction_activity(params: &Value, expected_session_id: &str) -> Option<bool> {
+    if params.pointer("/_meta/isReplay").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    // Older ACP transports wrap extension params in an ExtNotification.
+    let params = params.get("params").unwrap_or(params);
+    if params.pointer("/_meta/isReplay").and_then(Value::as_bool) == Some(true)
+        || xai_string_field(params, "sessionId", "session_id").as_deref()
+            != Some(expected_session_id)
+    {
+        return None;
+    }
+    let update = params.get("update")?;
+    match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "auto_compact_started" => Some(true),
+        "auto_compact_completed" | "auto_compact_failed" | "auto_compact_cancelled" => Some(false),
+        _ => None,
+    }
 }
 
 /// Validate and translate Grok's durable live/replay turn terminal. Both
@@ -3556,6 +3592,37 @@ mod tests {
             ),
             TurnStatus::Error { ref subtype, .. } if subtype == "rate_limit"
         ));
+    }
+
+    #[test]
+    fn context_compaction_xai_lifecycle_is_session_scoped_and_live_only() {
+        for (kind, active) in [
+            ("auto_compact_started", true),
+            ("auto_compact_completed", false),
+            ("auto_compact_failed", false),
+            ("auto_compact_cancelled", false),
+        ] {
+            let mut params = json!({
+                "sessionId": "parent",
+                "update": {"sessionUpdate": kind},
+                "_meta": {"eventId": "event-1", "agentTimestampMs": 123}
+            });
+            assert_eq!(xai_compaction_activity(&params, "parent"), Some(active));
+            assert_eq!(xai_compaction_activity(&params, "child"), None);
+            let wrapped = json!({"method": "x.ai/session_notification", "params": params});
+            assert_eq!(xai_compaction_activity(&wrapped, "parent"), Some(active));
+            params["_meta"]["isReplay"] = json!(true);
+            assert_eq!(xai_compaction_activity(&params, "parent"), None);
+            let replay = json!({"method": "x.ai/session_notification", "params": params});
+            assert_eq!(xai_compaction_activity(&replay, "parent"), None);
+        }
+        for params in [
+            json!({"update": {"sessionUpdate": "auto_compact_started"}}),
+            json!({"sessionId": "parent", "update": {"sessionUpdate": "memory_flush_started"}}),
+            json!({"sessionId": "parent", "update": {"percentage": 100}}),
+        ] {
+            assert_eq!(xai_compaction_activity(&params, "parent"), None);
+        }
     }
 
     #[test]
