@@ -47,3 +47,9 @@ none of that loader's dynamic-import execution path is reused.
 Initialization transfers the permitted 5 MiB bundle as bounded `initialize`
 source chunks. This resolves the 5 MiB source / 1 MiB frame requirements without
 relaxing either limit or granting filesystem access to JS.
+
+PR 1: https://github.com/Zeus-Deus/codemux/pull/390 (draft).
+Initial CI: Linux host + SDK passed; Windows GNU host compiled and all native
+process tests passed. Windows schema comparison failed solely on checkout CRLF
+versus generated LF. Compare with CRLF normalization; SDK native callback test
+on Windows remains pending the corrected run.

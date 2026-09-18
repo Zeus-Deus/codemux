@@ -58,8 +58,8 @@ jobs:
           npm ci --ignore-scripts --prefix packages/plugin-cli
           npm run build --prefix packages/plugin-sdk
           cargo run -j 2 --locked --manifest-path src-tauri/addon-protocol/Cargo.toml --example schema > /tmp/manifest-schema.json
-          diff -u packages/plugin-sdk/schema/manifest.json /tmp/manifest-schema.json
-          diff -u packages/plugin-sdk/schema/manifest.json packages/plugin-cli/schema/manifest.json
+          diff --strip-trailing-cr -u packages/plugin-sdk/schema/manifest.json /tmp/manifest-schema.json
+          diff --strip-trailing-cr -u packages/plugin-sdk/schema/manifest.json packages/plugin-cli/schema/manifest.json
       - name: Native SDK Remote DOM integration
         shell: bash
         run: |
