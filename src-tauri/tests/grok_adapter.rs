@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codemux_lib::agent_provider::grok::slash_commands::GrokSlashCommandCache;
+use codemux_lib::agent_provider::acp::session::AcpDialect;
+use codemux_lib::agent_provider::acp::slash_commands::AcpSlashCommandCache;
 use codemux_lib::agent_provider::grok::{GrokAgentProvider, GrokProviderConfig};
 use codemux_lib::agent_provider::{
     AgentProvider, CompletedItem, CostSource, ProviderError, ProviderKind, ProviderRuntimeEvent,
@@ -13,8 +14,8 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tokio::time::{timeout, Duration};
 
-fn fixture_provider() -> (GrokAgentProvider, Arc<GrokSlashCommandCache>) {
-    let commands = Arc::new(GrokSlashCommandCache::new());
+fn fixture_provider() -> (GrokAgentProvider, Arc<AcpSlashCommandCache>) {
+    let commands = Arc::new(AcpSlashCommandCache::new());
     let provider = GrokAgentProvider::new_with_slash_command_cache(
         GrokProviderConfig {
             binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_grok_acp")),
@@ -178,7 +179,11 @@ async fn grok_process_boundary_preserves_lifecycle_and_usage_contracts() {
     assert_eq!(usage.num_turns, 2);
 
     let commands = command_cache
-        .get_or_harvest(&PathBuf::from(env!("CARGO_BIN_EXE_fake_grok_acp")), &cwd)
+        .get_or_harvest(
+            AcpDialect::Grok,
+            &PathBuf::from(env!("CARGO_BIN_EXE_fake_grok_acp")),
+            &cwd,
+        )
         .await
         .expect("running session populated the shared command cache");
     assert_eq!(
