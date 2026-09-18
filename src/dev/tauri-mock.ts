@@ -3580,7 +3580,7 @@ const handlers: Record<string, Handler> = {
             : EMPTY_CAPABILITIES,
   // Provider slash commands. Each adapter discovers these differently in
   // production — an SDK probe, an ACP catalogue pushed by a live session,
-  // or a local HTTP catalogue — and the mock mirrors what each one can
+  // and the mock mirrors what each adapter can execute and
   // actually answer, including the shapes that carry no argument hint.
   list_chat_slash_commands: (a) =>
     a.provider === "claude"
@@ -3633,26 +3633,7 @@ const handlers: Record<string, Handler> = {
             argumentHint: "<goal text>",
           },
         ]
-      : a.provider === "opencode"
-        ? [
-            {
-              name: "init",
-              description: "guided AGENTS.md setup",
-              argumentHint: "<arguments>",
-            },
-            {
-              name: "review",
-              description:
-                "review changes [commit|branch|pr], defaults to uncommitted",
-              argumentHint: "<arguments>",
-            },
-            {
-              name: "seed",
-              description: "Reseed the local database from the staging dump",
-              argumentHint: "",
-            },
-          ]
-        : a.provider === "cursor"
+      : a.provider === "cursor"
           ? [
               // This adapter's catalogue carries a name and description
               // only, and it labels each entry's scope inside the
@@ -3676,8 +3657,8 @@ const handlers: Record<string, Handler> = {
                   argumentHint: "<query>",
                 },
               ]
-            : // Codex has no enumerable command surface: its built-ins are
-              // handled inside its own UI and never reach the model.
+            : // Codex built-ins and OpenCode native commands are not
+              // executed by the prompt endpoints our adapters use.
               [],
   list_skills: (a) => {
     const cwd = String(a.projectRoot ?? "");

@@ -3674,10 +3674,6 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
 pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    opencode_manager: tauri::State<
-        '_,
-        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
-    >,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -3797,8 +3793,7 @@ pub async fn agent_chat_provider_health(
 /// providers publish a full catalogue over `available_commands_update`,
 /// which running sessions record in the shared cache; Grok additionally
 /// answers with one at initialize, so it can be probed before any session
-/// exists. OpenCode serves its catalogue over the local HTTP server
-/// Codemux already runs for its sessions.
+/// exists. Only expose commands the current adapter can execute.
 ///
 /// Selecting one of these in the UI inserts the literal `/name ` text
 /// into the draft; the text is forwarded verbatim to the provider,
@@ -3815,10 +3810,6 @@ pub async fn list_chat_slash_commands(
     acp_slash_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
-    >,
-    opencode_manager: tauri::State<
-        '_,
-        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
     >,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     match provider {
@@ -3849,29 +3840,11 @@ pub async fn list_chat_slash_commands(
                 std::path::Path::new(&cwd),
             )
             .await),
-        ProviderKind::OpenCode => {
-            let handle = match opencode_manager.ensure_running().await {
-                Ok(handle) => handle,
-                // Someone who never installed OpenCode still opens this
-                // popup for the provider they do use, so a missing binary
-                // is an empty menu rather than a failure footer — the same
-                // reading the skill inventory gives that message. Every
-                // other failure (spawn refused, server wedged) means a
-                // server Codemux does depend on is broken, and hiding that
-                // behind an empty list would make the menu silently lie.
-                Err(error) if error == "opencode_not_installed" => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-            };
-            let mut config =
-                crate::agent_provider::opencode::OpenCodeClientConfig::new(handle.base_url);
-            config.server_password = Some(handle.server_password);
-            // One localhost round-trip against an already-running server,
-            // and the frontend memoises per provider and cwd, so a second
-            // cache here would only add a staleness window.
-            crate::agent_provider::opencode::OpenCodeClient::new(config)?
-                .list_commands(std::path::Path::new(&cwd))
-                .await
-        }
+        // OpenCode lists commands through GET /command, but its prompt_async
+        // endpoint treats slash text literally. Native execution needs the
+        // separate command endpoint and project-scoped session lifecycle.
+        // Keep skills available through Codemux's existing skill inventory.
+        ProviderKind::OpenCode => Ok(Vec::new()),
         // Codex has nothing to enumerate: upstream deleted custom prompts
         // outright and skills took their place, and the slash commands its
         // TUI still offers are interpreted by that TUI and never reach the
