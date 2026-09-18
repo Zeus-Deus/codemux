@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/dialog";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { AddonCatalog } from "@/components/addons/addon-catalog";
-import { useAddonsStore } from "@/stores/addons-store";
+import { beginAddonRevocation, useAddonsStore } from "@/stores/addons-store";
 import { addonInvoke } from "@/lib/addons/bridge";
 import { refreshAddons } from "@/lib/addons/platform";
 import {
@@ -300,7 +300,6 @@ export function AddonsSettings() {
   const showReview = (value: AddonReview) => {
     setRestoreData(false);
     setReplace(false);
-    setRestoreData(false);
     setEnable(true);
     setReview(value);
   };
@@ -313,7 +312,8 @@ export function AddonsSettings() {
       useAddonsStore.setState({ developmentReview: null });
     }
   }, [state.developmentReview]);
-  const perform = async (action: () => Promise<unknown>) => {
+  const perform = async (action: () => Promise<unknown>, revoke?: string) => {
+    const release = revoke ? beginAddonRevocation(revoke) : undefined;
     setBusy(true);
     setError("");
     try {
@@ -322,6 +322,7 @@ export function AddonsSettings() {
       setError(addonMessage(cause));
     } finally {
       await refreshAddons();
+      release?.();
       setBusy(false);
     }
   };
@@ -349,8 +350,10 @@ export function AddonsSettings() {
           variant="outline"
           disabled={busy}
           onClick={() => {
-            void perform(() =>
-              addonInvoke(state.paused ? "addon_resume" : "addon_pause_all"),
+            void perform(
+              () =>
+                addonInvoke(state.paused ? "addon_resume" : "addon_pause_all"),
+              state.paused ? undefined : "*",
             );
           }}
         >
@@ -541,14 +544,16 @@ export function AddonsSettings() {
                       variant="outline"
                       disabled={busy}
                       onClick={() =>
-                        void perform(() =>
-                          addonInvoke(
-                            item.desiredEnabled &&
-                              item.status !== "failed-disabled"
-                              ? "addon_disable"
-                              : "addon_enable",
-                            { id: item.manifest.id },
-                          ),
+                        void perform(
+                          () =>
+                            addonInvoke(
+                              item.desiredEnabled &&
+                                item.status !== "failed-disabled"
+                                ? "addon_disable"
+                                : "addon_enable",
+                              { id: item.manifest.id },
+                            ),
+                          item.desiredEnabled ? item.manifest.id : undefined,
                         )
                       }
                     >
@@ -820,7 +825,7 @@ export function AddonsSettings() {
                   });
                   setRemove(null);
                   if (warnings.length) setError(warnings.join(" "));
-                })
+                }, remove!.manifest.id)
               }
             >
               Remove add-on

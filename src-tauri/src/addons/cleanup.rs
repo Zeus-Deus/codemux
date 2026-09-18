@@ -24,10 +24,21 @@ pub(super) fn queue(
     installation: &Installation,
     keep_data: bool,
 ) -> Result<()> {
-    for credential in &installation.manifest.credentials {
+    // Include credentials from every accepted release, even declarations that
+    // were removed in later versions. The index contains no secret values.
+    tx.execute("INSERT OR IGNORE INTO cleanup(installation,credential) SELECT installation,id FROM credential_entries WHERE installation=?1",[&installation.installation_id]).map_err(|_|unavailable())?;
+    for credential in installation.manifest.credentials.iter().chain(
+        installation
+            .previous
+            .iter()
+            .flat_map(|p| p.manifest.credentials.iter()),
+    ) {
         tx.execute(
             "INSERT OR IGNORE INTO cleanup(installation,credential) VALUES(?1,?2)",
-            rusqlite::params![installation.installation_id, credential.id],
+            rusqlite::params![
+                installation.installation_id,
+                super::credentials::Credentials::key(&credential.id, &credential.origin)
+            ],
         )
         .map_err(|_| unavailable())?;
     }
@@ -202,7 +213,7 @@ impl Manager {
         };
         for (installation, credential) in credentials {
             if uuid::Uuid::parse_str(&installation).is_err()
-                || !codemux_addon_protocol::manifest::local_id(&credential)
+                || !codemux_addon_protocol::catalog::hex(&credential, 64)
             {
                 return Err(unavailable());
             }

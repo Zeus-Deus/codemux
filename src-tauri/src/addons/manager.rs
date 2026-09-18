@@ -164,7 +164,7 @@ pub struct Manager {
     pub credentials: Credentials,
     pub contexts: Mutex<Contexts>,
     pub(super) catalog_serial: Mutex<()>,
-    running: Mutex<HashMap<String, Arc<Running>>>,
+    running: Arc<Mutex<HashMap<String, Arc<Running>>>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     effects: Mutex<HashMap<String, PendingEffect>>,
     pub events: broadcast::Sender<UiEvent>,
@@ -209,7 +209,7 @@ impl Manager {
                 .map_err(storage_error)?;
             if entries.iter().any(|(installation, id)| {
                 uuid::Uuid::parse_str(installation).is_err()
-                    || !codemux_addon_protocol::manifest::local_id(id)
+                    || !codemux_addon_protocol::catalog::hex(id, 64)
             }) {
                 return Err(ProtocolError::invalid("Invalid credential index"));
             }
@@ -229,7 +229,7 @@ impl Manager {
             credentials: Credentials::with_configured(configured_credentials),
             contexts: Mutex::new(Contexts::default()),
             catalog_serial: Mutex::new(()),
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
             operations: Mutex::new(HashMap::new()),
             effects: Mutex::new(HashMap::new()),
             events,
@@ -635,7 +635,7 @@ impl Manager {
                 Some(running) => {
                     let stopped = running.stopped.clone();
                     drop(hosts);
-                    stopped.cancelled().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), stopped.cancelled()).await;
                     return;
                 }
                 None => None,
@@ -656,7 +656,32 @@ impl Manager {
                 generation: running.generation().into(),
                 message: failure.clone().unwrap_or_else(|| "Plugin stopped".into()),
             });
-            running.host.stop().await;
+            if !running.host.stop().await {
+                // A kernel-level termination delay must never make room for a
+                // second generation. Keep the cancelled instance registered
+                // until the supervisor confirms actual reaping.
+                if let Ok(mut installation) = self.installation(id) {
+                    installation.status = Status::FailedDisabled;
+                    installation.failure =
+                        Some("The plugin process has not exited; it remains quarantined".into());
+                    let _ = self.save(&installation);
+                }
+                let hosts = self.running.clone();
+                let instance = running.clone();
+                let id = id.to_owned();
+                tokio::spawn(async move {
+                    instance.host.reaped().await;
+                    let mut hosts = hosts.lock().await;
+                    if hosts
+                        .get(&id)
+                        .is_some_and(|r| r.generation() == instance.generation())
+                    {
+                        hosts.remove(&id);
+                    }
+                    instance.stopped.cancel();
+                });
+                return;
+            }
         }
         let _ = self.registry.lock().unwrap().execute(
             "DELETE FROM metadata WHERE key=?1",
@@ -954,7 +979,12 @@ impl Manager {
                         )
                     })?;
                 let credential = if let Some(id) = &grant.credential {
-                    self.credentials.get(&running.installation_id, id).await?
+                    self.credentials
+                        .get(
+                            &running.installation_id,
+                            &Credentials::key(id, &grant.origin),
+                        )
+                        .await?
                 } else {
                     None
                 };

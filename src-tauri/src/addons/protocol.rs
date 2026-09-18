@@ -25,8 +25,17 @@ pub enum Event {
 struct Outbound {
     bytes: Vec<u8>,
 }
+struct HostLease(CancellationToken);
+impl Drop for HostLease {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 #[derive(Clone)]
 pub struct Host {
+    // The supervising task owns the child, not this lease. Losing the last
+    // caller (including a cancelled/failed initialization) must reap the child.
+    _lease: Arc<HostLease>,
     pub generation: String,
     writer: mpsc::Sender<Outbound>,
     cancel: CancellationToken,
@@ -76,6 +85,7 @@ impl Host {
         let generation = uuid::Uuid::new_v4().to_string();
         let progress = Arc::new(Mutex::new(HashMap::new()));
         let host = Self {
+            _lease: Arc::new(HostLease(cancel.clone())),
             generation: generation.clone(),
             writer,
             cancel: cancel.clone(),
@@ -98,7 +108,7 @@ impl Host {
             let mut system = sysinfo::System::new();
             let pid = child.id().map(sysinfo::Pid::from_u32);
             let result:Result<()>=async{loop{
-    let next_deadline = progress.lock().await.values().min().map(|time| *time + Duration::from_secs(2));
+    let next_deadline = progress.lock().await.values().min().map(|time| *time + Duration::from_millis(1500));
     let watchdog = async { match next_deadline { Some(deadline) => tokio::time::sleep_until(deadline.into()).await, None => std::future::pending::<()>().await } };
     tokio::select!{
      biased;
@@ -117,17 +127,21 @@ impl Host {
        if let Some(id)=message.params.as_ref().and_then(|p|p["requestId"].as_u64()){progress.lock().await.remove(&id);}
       }
       // Bounded backpressure; never discard a patch and continue a corrupt tree.
-      tokio::select!{_ = cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(2),events.send(Event::Message(message)))=>{result.map_err(|_|ProtocolError::new(ErrorCode::ResourceLimit,"Plugin event queue overflow"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin receiver closed"))?;}}
+      tokio::select!{_ = cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_millis(1500),events.send(Event::Message(message)))=>{result.map_err(|_|ProtocolError::new(ErrorCode::ResourceLimit,"Plugin event queue overflow"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin receiver closed"))?;}}
      }
     }
    }}.await;
             cancel.cancel();
             write_task.abort();
             let _ = write_task.await;
-            reap(&mut child).await;
+            // Revoke broker authority even if the kernel delays termination.
+            // Closing a full event queue also makes the manager stop after it
+            // drains the already-bounded messages; it cannot wait on reaping.
             if let Err(error) = result {
                 let _ = events.try_send(Event::Stopped(error));
             }
+            drop(events);
+            reap(&mut child).await;
             done.cancel();
         });
         if source.len() > limits::BUNDLE {
@@ -192,19 +206,24 @@ impl Host {
             ));
         }
         bytes.push(b'\n');
-        tokio::select! {_ = self.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin is stopped")),result=tokio::time::timeout(Duration::from_secs(2),self.writer.send(Outbound{bytes}))=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"Plugin input queue timed out"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin input closed"))}
+        tokio::select! {_ = self.cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin is stopped")),result=tokio::time::timeout(Duration::from_millis(1500),self.writer.send(Outbound{bytes}))=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"Plugin input queue timed out"))?.map_err(|_|ProtocolError::new(ErrorCode::PluginStopped,"Plugin input closed"))}
     }
-    pub async fn stop(&self) {
+    pub async fn stop(&self) -> bool {
         let finished = tokio::time::timeout(Duration::from_millis(500), async {
             let _ = self.send("deactivate", json!({})).await;
             self.done.cancelled().await;
         })
         .await;
         if finished.is_ok() {
-            return;
+            return true;
         }
         self.cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_millis(1500), self.done.cancelled()).await;
+        tokio::time::timeout(Duration::from_millis(1500), self.done.cancelled())
+            .await
+            .is_ok()
+    }
+    pub async fn reaped(&self) {
+        self.done.cancelled().await;
     }
     pub fn revoke(&self) {
         self.cancel.cancel();
@@ -242,5 +261,57 @@ async fn read_frame(
         if end.is_some() {
             return Ok(());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn unresponsive(root: &Path) -> std::path::PathBuf {
+        let path = root.join("unresponsive-host");
+        // exec replaces the shell: the supervisor owns the only process.
+        std::fs::write(&path, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+    #[tokio::test]
+    async fn unresponsive_child_is_reaped_inside_the_fault_and_shutdown_deadlines() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = unresponsive(root.path());
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let (host, mut events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let start = Instant::now();
+        host.send("activate", json!({})).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("fault must be contained within 2 s");
+        assert!(matches!(event, Some(Event::Stopped(_))));
+        host.reaped().await;
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (host, _events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let start = Instant::now();
+        assert!(host.stop().await);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[tokio::test]
+    async fn dropped_initialization_cancels_supervision_and_reaps_the_owned_child() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = unresponsive(root.path());
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let (host, _events) = Host::spawn(&executable, &manifest, "").await.unwrap();
+        let reaped = host.done.clone();
+        drop(host);
+        tokio::time::timeout(Duration::from_secs(2), reaped.cancelled())
+            .await
+            .expect("last host handle must not leak a process");
     }
 }

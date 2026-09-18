@@ -1,0 +1,181 @@
+name: Packaged add-on runtime
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['scripts/addons/packaged-smoke.mjs', 'scripts/addons/host-limits.mjs', 'scripts/addons/sdk-native.mjs', 'src-tauri/addon-host/**', 'src-tauri/tauri.conf.json', 'scripts/build-addon-host.sh', '.github/workflows/addon-packaged.yml']
+permissions:
+  contents: read
+concurrency:
+  group: addon-packaged-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2 \
+            file
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install standalone add-on host Windows GNU target
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Install add-on host C compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Select add-on host compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: addon-packaged-${{ matrix.os }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and verify independent add-on packages and release host
+        shell: bash
+        run: |
+          bash scripts/addons/build-examples.sh
+          bash scripts/build-addon-host.sh --profile release
+          if [ "$RUNNER_OS" = Windows ]; then
+            addon_host=src-tauri/binaries/codemux-addon-host-windows-x64.exe
+          else
+            addon_host=src-tauri/binaries/codemux-addon-host-linux-x64
+          fi
+          node scripts/addons/sdk-native.mjs "$addon_host"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.21"
+
+      - name: Stage claude-agent sidecar binary
+        shell: bash
+        run: |
+          bash scripts/build-claude-sidecar.sh --strict
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET" ;;
+          esac
+          if [ ! -s "$DEST" ]; then
+            echo "::error::build-claude-sidecar.sh did not produce a non-empty binary at $DEST"
+            echo "::error::Target: $TARGET"
+            ls -la src-tauri/binaries/ || true
+            exit 1
+          fi
+
+      - name: Stage agent-browser sidecar binary
+        shell: bash
+        run: |
+          bash scripts/copy-agent-browser.sh
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/agent-browser-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/agent-browser-$TARGET" ;;
+          esac
+          if [ ! -s "$DEST" ]; then
+            echo "::error::copy-agent-browser.sh did not produce a non-empty binary at $DEST"
+            echo "::error::Target: $TARGET"
+            ls -la src-tauri/binaries/ || true
+            ls -la node_modules/agent-browser/bin/ || true
+            exit 1
+          fi
+
+      - name: Build codemux-remote binary (release profile)
+        shell: bash
+        run: |
+          bash scripts/build-codemux-remote.sh --profile release
+
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-remote-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-remote-$TARGET" ;;
+          esac
+          STAMP="src-tauri/binaries/.codemux-remote-$TARGET.profile"
+
+          if [ ! -s "$DEST" ]; then
+            echo "::error::codemux-remote build did not produce a non-empty binary at $DEST"
+            exit 1
+          fi
+
+          if [ ! -f "$STAMP" ]; then
+            echo "::error::missing provenance stamp $STAMP — build-codemux-remote.sh did not complete"
+            exit 1
+          fi
+          cat "$STAMP"
+          if ! grep -qx 'profile=release' "$STAMP"; then
+            echo "::error::codemux-remote was staged from a non-release profile — refusing to publish"
+            exit 1
+          fi
+          ls -la src-tauri/binaries/codemux-remote-*
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          git config --global user.email "release@codemux.dev"
+          git config --global user.name "Codemux Release"
+
+
+      - name: Pre-cache stable linuxdeploy + plugin-appimage
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          mkdir -p ~/.cache/tauri
+          curl -fsSL -o ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
+          ls -la ~/.cache/tauri/
+
+      - name: Build installers without publishing
+        shell: bash
+        env:
+          NO_STRIP: 'true'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then formats=nsis; else formats=deb,appimage; fi
+          npm run tauri -- build --verbose --bundles "$formats" --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Verify bundled host and runtime deadlines
+        run: node scripts/addons/packaged-smoke.mjs src-tauri/target/release/bundle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: addon-packaged-evidence-${{ matrix.os }}
+          path: addon-packaged-evidence.json
+          if-no-files-found: warn

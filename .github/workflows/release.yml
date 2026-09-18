@@ -311,6 +311,17 @@ jobs:
           chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
           ls -la ~/.cache/tauri/
 
+      - name: Build installer payloads for the add-on runtime gate
+        shell: bash
+        env:
+          NO_STRIP: 'true'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then formats=nsis; else formats=deb,appimage; fi
+          npm run tauri -- build --verbose --bundles "$formats" --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify packaged add-on host before publication
+        run: node scripts/addons/packaged-smoke.mjs src-tauri/target/release/bundle
+
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2

@@ -51,6 +51,7 @@ export interface AddonInstallation {
   manifest: AddonManifest;
   source: AddonSource;
   digest: string;
+  dataGeneration: string;
   desiredEnabled: boolean;
   status:
     | "installed-disabled"
