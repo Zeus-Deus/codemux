@@ -51,6 +51,23 @@ jobs:
         # on — MSVC on windows-latest, GNU on ubuntu-22.04. No toolchain
         # override needed.
 
+      - name: Install standalone add-on host Windows GNU target
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Install add-on host C compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Select add-on host compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -72,6 +89,18 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Build and verify independent add-on packages and release host
+        shell: bash
+        run: |
+          bash scripts/addons/build-examples.sh
+          bash scripts/build-addon-host.sh --profile release
+          if [ "$RUNNER_OS" = Windows ]; then
+            addon_host=src-tauri/binaries/codemux-addon-host-windows-x64.exe
+          else
+            addon_host=src-tauri/binaries/codemux-addon-host-linux-x64
+          fi
+          node scripts/addons/sdk-native.mjs "$addon_host"
 
       - name: Setup Bun
         # The claude-agent sidecar (sidecar/claude-agent/) is a small

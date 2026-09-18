@@ -72,3 +72,8 @@ src-tauri/addon-protocol/target/
 docs/addons/research-probe/target/
 docs/addons/research-probe/probe-ui.bundle.js
 *.cmxaddon
+
+# Independent add-on build products
+examples/addons/*/plugin.js
+
+src-tauri/addon-catalog/target/

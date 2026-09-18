@@ -1,0 +1,20 @@
+{
+  "name": "codemux.project-brief",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "codemux-plugin build",
+    "check": "tsc --noEmit && codemux-plugin check",
+    "pack": "codemux-plugin pack",
+    "dev": "codemux-plugin dev"
+  },
+  "dependencies": {
+    "@codemux/plugin-sdk": "1.0.0",
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@codemux/plugin-cli": "1.0.0",
+    "typescript": "5.6.2"
+  }
+}
