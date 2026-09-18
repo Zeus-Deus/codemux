@@ -183,7 +183,7 @@ const elementId = (el) => el["element-6066-11e4-a52e-4f735466cecf"];
 async function clickText(value, scope = "document") {
   const el = await until(`click ${value}`, () =>
     script(
-      `return [...${scope}.querySelectorAll('button,[role="menuitem"],[role="option"]')].find(e => e.getClientRects().length && (e.innerText.trim() === arguments[0] || e.getAttribute('aria-label') === arguments[0])) ?? null`,
+      `return [...${scope}.querySelectorAll('button,[role="menuitem"],[role="option"]')].find(e => e.getClientRects().length && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && (e.innerText.trim() === arguments[0] || e.getAttribute('aria-label') === arguments[0])) ?? null`,
       value,
     ),
   );
@@ -195,6 +195,9 @@ async function click(css) {
 }
 async function type(css, value) {
   const el = await element(css);
+  await until(`enabled ${css}`, () =>
+    wd("GET", `/element/${elementId(el)}/enabled`),
+  );
   await wd("POST", `/element/${elementId(el)}/value`, { text: value });
 }
 async function shortcut(key) {
@@ -346,6 +349,9 @@ try {
           label,
         ),
       );
+      await until(`loaded ${label}`, () =>
+        wd("GET", `/element/${elementId(input)}/enabled`),
+      );
       await wd("POST", `/element/${elementId(input)}/value`, { text: value });
     }
     await clickText("Save settings");
@@ -363,10 +369,10 @@ try {
     join(project, "README.md"),
     "# Native add-on acceptance fixture\n",
   );
-  // Workspace creation normally writes its own MCP discovery file. Keep that
-  // normal behavior while making the deliberately untracked path unambiguous.
-  await writeFile(join(project, ".git", "info", "exclude"), ".mcp.json\n");
-  await run("git", ["-C", project, "add", "README.md"]);
+  // Keep the fixture independent of app-generated discovery files. Repository
+  // info/exclude preservation has a separate native Git regression test.
+  await writeFile(join(project, ".gitignore"), ".mcp.json\n");
+  await run("git", ["-C", project, "add", "README.md", ".gitignore"]);
   await run("git", [
     "-C",
     project,
@@ -488,7 +494,10 @@ try {
 } catch (error) {
   evidence.status = "failed";
   evidence.error = String(error);
-  if (session) await capture("failure").catch((error) => { evidence.captureError = String(error); });
+  if (session)
+    await capture("failure").catch((error) => {
+      evidence.captureError = String(error);
+    });
   throw error;
 } finally {
   if (session) await wd("DELETE", "").catch(() => {});

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -18,6 +19,20 @@ vi.mock("@/components/remote/is-remote-client", () => ({
 }));
 import { AddonsSettings } from "./addons-settings";
 import { useAddonsStore } from "@/stores/addons-store";
+import { addonInvoke } from "@/lib/addons/bridge";
+import type { AddonInstallation, AddonManifest } from "@/lib/addons/types";
+import manifest from "../../../examples/addons/issue-companion/manifest.json";
+const installation: AddonInstallation = {
+  installationId: "configuration-fixture",
+  manifest: manifest as AddonManifest,
+  source: { kind: "local", identity: "fixture" },
+  digest: "fixture-digest",
+  dataGeneration: "fixture-data",
+  desiredEnabled: true,
+  status: "enabled-idle",
+  failure: null,
+  previous: null,
+};
 beforeEach(() =>
   useAddonsStore.setState({
     installed: [],
@@ -29,6 +44,79 @@ beforeEach(() =>
   }),
 );
 afterEach(cleanup);
+it("waits for stored configuration before accepting an edit or save", async () => {
+  let finish!: (settings: Record<string, unknown>) => void;
+  const pending = new Promise<Record<string, unknown>>((resolve) => {
+    finish = resolve;
+  });
+  vi.mocked(addonInvoke)
+    .mockReset()
+    .mockImplementation((command) =>
+      command === "addon_settings_get" ? pending : Promise.resolve(null),
+    );
+  useAddonsStore.setState({ installed: [installation] });
+  render(<AddonsSettings />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Configure / Permissions" }),
+  );
+  const owner = screen.getByRole("textbox", { name: "Repository owner" });
+  const save = screen.getByRole("button", { name: "Save settings" });
+  expect(owner).toBeDisabled();
+  expect(save).toBeDisabled();
+  fireEvent.submit(save.closest("form")!);
+  expect(addonInvoke).not.toHaveBeenCalledWith(
+    "addon_settings_set",
+    expect.anything(),
+  );
+  await act(async () =>
+    finish({ owner: "stored-owner", repository: "stored-repository" }),
+  );
+  await waitFor(() => expect(owner).toBeEnabled());
+  expect(owner).toHaveValue("stored-owner");
+  fireEvent.change(owner, { target: { value: "edited-owner" } });
+  fireEvent.click(save);
+  await waitFor(() =>
+    expect(addonInvoke).toHaveBeenCalledWith("addon_settings_set", {
+      id: "codemux.issue-companion",
+      settings: { owner: "edited-owner", repository: "stored-repository" },
+    }),
+  );
+});
+it("loads the accepted release's configuration and ignores the disposed load's error", async () => {
+  let rejectOld!: (error: Error) => void;
+  const pending = new Promise<Record<string, unknown>>((_, reject) => {
+    rejectOld = reject;
+  });
+  vi.mocked(addonInvoke)
+    .mockReset()
+    .mockReturnValueOnce(pending)
+    .mockResolvedValue({
+      owner: "current-owner",
+      repository: "current-repository",
+    });
+  useAddonsStore.setState({ installed: [installation] });
+  render(<AddonsSettings />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Configure / Permissions" }),
+  );
+  await act(async () => {
+    useAddonsStore.setState({
+      installed: [
+        { ...installation, digest: "new-digest", dataGeneration: "new-data" },
+      ],
+    });
+  });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("textbox", { name: "Repository owner" }),
+    ).toHaveValue("current-owner"),
+  );
+  const owner = screen.getByRole("textbox", { name: "Repository owner" });
+  fireEvent.change(owner, { target: { value: "my-current-edit" } });
+  await act(async () => rejectOld(new Error("Obsolete configuration request")));
+  expect(owner).toHaveValue("my-current-edit");
+  expect(screen.queryByText("Obsolete configuration request")).toBeNull();
+});
 it("Escape dismisses only the install dialog and restores its opener", async () => {
   const outerEscape = vi.fn();
   window.addEventListener("keydown", outerEscape);
