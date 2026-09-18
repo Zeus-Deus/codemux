@@ -1528,6 +1528,133 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_delayed_effects_cannot_outlive_their_target_or_installation() {
+        for action in [
+            "workspace",
+            "close",
+            "replace",
+            "disable",
+            "remove",
+            "pause",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+            let mut manifest = Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap();
+            manifest.permissions.push(Permission::ComposerAppend);
+            let installation = installed(manifest);
+            manager.save(&installation).unwrap();
+            let source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+            let running = manager
+                .activate(installation, source.into(), false)
+                .await
+                .unwrap();
+            let composer = uuid::Uuid::new_v4().to_string();
+            manager
+                .contexts
+                .lock()
+                .await
+                .register_composer(composer.clone(), "original".into())
+                .unwrap();
+            let workspace = Workspace {
+                id: "original".into(),
+                name: "Original project".into(),
+                root_name: "project".into(),
+                location: "local",
+                root: root.path().into(),
+            };
+            let base = manager
+                .context_handle(&running, Some(workspace), Some(composer.clone()))
+                .await
+                .unwrap();
+            let interaction = manager
+                .contexts
+                .lock()
+                .await
+                .interact(&base, running.generation(), Instant::now())
+                .unwrap();
+            let mut events = manager.events.subscribe();
+            let broker = manager.clone();
+            let instance = running.clone();
+            let request = tokio::spawn(async move {
+                broker.request(&instance, "composer.appendText", json!({"context":interaction,"text":"Must never reach a replacement draft"})).await
+            });
+            let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let UiEvent::Effect {
+                        request_id, params, ..
+                    } = events.recv().await.unwrap()
+                    {
+                        assert_eq!(params["workspaceId"], "original");
+                        assert_eq!(params["composerId"], composer);
+                        break request_id;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            // Hold the frontend completion at the real native broker boundary.
+            // Neither the claim nor a late result may survive a target change.
+            assert!(manager
+                .claim_effect(&request_id, "forged-generation")
+                .await
+                .is_err());
+            match action {
+                "workspace" => manager.change_workspace(None).await,
+                "close" => manager.contexts.lock().await.revoke_composer(&composer),
+                "replace" => manager
+                    .contexts
+                    .lock()
+                    .await
+                    .register_composer(composer.clone(), "replacement".into())
+                    .unwrap(),
+                "disable" => {
+                    let mut installed = manager.installation(&running.manifest.id).unwrap();
+                    installed.desired_enabled = false;
+                    manager.save(&installed).unwrap();
+                    manager.stop(&running.manifest.id, None).await;
+                }
+                "remove" => {
+                    manager.remove(&running.manifest.id, false).await.unwrap();
+                }
+                "pause" => manager.pause_all().await,
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .claim_effect(&request_id, running.generation())
+                    .await
+                    .is_err(),
+                "late claim after {action}"
+            );
+            assert!(
+                manager
+                    .effect_result(&request_id, running.generation(), Ok(json!(1)))
+                    .await
+                    .is_err(),
+                "late completion after {action}"
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_err(), "delayed request after {action}");
+            assert!(manager.effects.lock().await.is_empty());
+            assert!(manager
+                .contexts
+                .lock()
+                .await
+                .get(&base, running.generation())
+                .is_err());
+            manager.shutdown().await;
+            assert!(manager.running.lock().await.is_empty());
+        }
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
     async fn native_runtime_faults_quarantine_one_plugin_and_preserve_another() {
         let root = tempfile::tempdir().unwrap();
         let manager = Manager::open(root.path().into(), test_host_path()).unwrap();

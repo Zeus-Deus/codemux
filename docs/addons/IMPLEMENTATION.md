@@ -33,6 +33,32 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- The [Windows installed-app run](https://github.com/Zeus-Deus/codemux/actions/runs/35391050285)
+  passes all five hostile SDK callback workloads on installer `da835efb`, plus
+  restart with identical installation/grant/source/data-generation/settings,
+  removal of all packages, and core startup with a deliberately corrupted plugin
+  registry. The terminal and controlled draft remain usable with zero plugin
+  hosts. No provider CLI is installed in this synthetic VM, so typing/persistence
+  checks do not claim successful provider inference. GUI observations were
+  707–794 ms including driver/input overhead on the recorded 4-vCPU EPYC runner.
+  [Exact provenance and checks](evidence/native-ui-windows-da835efb.json) and
+  [corrupt-registry core screenshot](evidence/native-corrupt-registry-windows.png)
+  are retained. This saved installer predates SDK acknowledgement backpressure;
+  the equivalent Linux five-workload run exposed the queue overflow that fix addresses.
+- A real-host broker regression passes all six delayed-effect transitions:
+  workspace change, composer close/replacement, disable, removal and pause.
+  Forged-generation claims and late claims/results cannot complete the old draft
+  operation; contexts and pending effects are disposed. This complements the
+  frontend's delayed-claim/latest-draft tests, without claiming a GUI race run.
+  A standalone native-process test also passes hostile shutdown cleanup
+  (synchronous loop, endless promise jobs and throw), with termination within 2 s.
+- After rebasing onto main, Windows packaging selected Git Bash's Perl, whose
+  missing OpenSSL modules stopped the MSVC dependency build. Packaging and the
+  ordinary desktop release workflow now explicitly select the runner's native
+  Strawberry Perl through `OPENSSL_SRC_PERL`; the separate GNU plugin-host
+  compiler is unchanged. The native Windows preflight passes in the run above;
+  an actual rebuilt installer remains the verification gate.
+
 - Stock installed-app GUI flows pass on [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35388617257)
   and [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35387729205),
   using saved installer `603a7352`. Both independently import the example archives,
@@ -239,8 +265,8 @@ publication and Settings remain separate deliverables.
 - Eleven lifecycle tests and `cargo check` pass with a new ignored real-ENOSPC
   test. CI mounts a dedicated 16 MiB tmpfs and fills it at six transaction
   boundaries. Both script and test refuse local/persistent runners, and the
-  test rejects a non-tmpfs or volume larger than 32 MiB. The native full-volume
-  run is pending; compiling an ignored test is not disk-full evidence.
+  test rejects a non-tmpfs or volume larger than 32 MiB. The actual hosted six-checkpoint run passed at `278df894`, as recorded above;
+  the strengthened data-generation assertion is tracked separately.
 
 ## Unresolved release gates
 

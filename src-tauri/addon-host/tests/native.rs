@@ -101,6 +101,25 @@ fn hostile_callbacks_and_promise_jobs_are_bounded_in_real_processes() {
     }
 }
 #[test]
+fn ignored_shutdown_cannot_keep_the_native_runtime_alive() {
+    for cleanup in [
+        "while(true){}",
+        "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+        "throw Error('private cleanup failure')",
+    ] {
+        let mut host = Host::new(&format!(
+            "__codemuxRegister({{}}, () => m => {{if(m.method==='deactivate'){{{cleanup}}}}});"
+        ));
+        host.receive();
+        host.send("activate", json!({}));
+        while host.receive()["method"] != "ready" {}
+        let started = Instant::now();
+        host.send("deactivate", json!({}));
+        host.stopped();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+#[test]
 fn stale_generation_and_oversized_input_stop_only_the_child() {
     let mut host = Host::new("__codemuxRegister({},()=>()=>{});");
     host.receive();
