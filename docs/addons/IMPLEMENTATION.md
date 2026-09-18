@@ -33,6 +33,21 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- The [Linux installer run](https://github.com/Zeus-Deus/codemux/actions/runs/35389012944)
+  at merge `91bd6a2b` passes both example flows and all five hostile SDK callbacks
+  after the acknowledgement/backpressure correction. The healthy Project Brief,
+  controlled draft and real terminal remain usable after each fault. Measured
+  GUI observations are 819–1029 ms on the recorded 4-vCPU Xeon runner.
+  [Provenance](evidence/native-ui-linux-91bd6a2b.json) identifies the exact installer;
+  this run predates the restart/corruption extensions and final design-token changes.
+- The [Windows classic-interface run](https://github.com/Zeus-Deus/codemux/actions/runs/35391899586)
+  additionally verifies that Settings and Project Brief's native Git panel work
+  after restarting with chat GUI disabled, no composer/accessory is present,
+  Add to draft reports `No chat composer is available`, the core terminal works,
+  and enabling chat GUI and restarting restores the composer. It also repeats
+  restart, removal and corrupted-plugin-registry startup checks;
+  [exact evidence](evidence/native-ui-windows-classic-da835efb.json) is retained.
+
 - The [Windows installed-app run](https://github.com/Zeus-Deus/codemux/actions/runs/35391050285)
   passes all five hostile SDK callback workloads on installer `da835efb`, plus
   restart with identical installation/grant/source/data-generation/settings,
@@ -77,10 +92,11 @@ publication and Settings remain separate deliverables.
   passes actual ENOSPC injection in a disposable 16 MiB tmpfs at package-write,
   package-staged, journal-saved, data-snapshotted, registry-switched and activated.
   Each failed transaction recovers the previous release/grant/private-state tuple.
-  The test now additionally checks the exact recovered data-generation identity;
-  that stronger assertion awaits CI. The same run passes Linux Rust and both
-  frontend suites, but Windows Rust exposes a same-size Git edit missed by the
-  freshly timestamped index snapshot; the timestamp-preserving fix awaits Windows CI.
+  The strengthened exact data-generation assertion passes in
+  [CI at `9dfda479`](https://github.com/Zeus-Deus/codemux/actions/runs/35390059608),
+  which also passes both full frontend and Rust platform suites. The Windows
+  same-size Git edit regression now passes with the original index timestamp
+  preserved; all five jobs in that full CI run are green.
 - The rebase preserves current mobile Settings, responsive panel, remote command
   policy and composer delivery logic. TypeScript and 166 focused integration/UI
   tests pass. Native cargo check and 40 focused tests pass (7 explicit ignored
