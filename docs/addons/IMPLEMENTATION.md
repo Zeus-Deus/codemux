@@ -33,6 +33,29 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- Rebuilt Windows `312321e3` passes the [entire expanded native GUI flow](https://github.com/Zeus-Deus/codemux/actions/runs/35397531415),
+  including active-host update, expanded-access review/cancellation and rollback
+  with matching private data. This repeats the formerly failing old-installer
+  case using the backpressure-fixed SDK packages. [Native evidence](evidence/native-ui-windows-updates-312321e3.json)
+  records installer SHA-256 `e6342ccb5010295443ff4a2d262b202013000ffa2cb2f8423059d50d22cad3b9`.
+  [Windows bundle evidence](evidence/packaged-windows-312321e3.json) records exact
+  host payload identity and all five hostile deadlines. The native Strawberry
+  Perl selection is now verified by an actual successful MSVC installer build,
+  not merely its preflight. The original run's Linux UI step used the earlier
+  removal-dialog harness and failed; its saved installer subsequently passes the
+  expanded harness as recorded above.
+
+- [Full desktop CI at `1e628eec`](https://github.com/Zeus-Deus/codemux/actions/runs/35396377918)
+  passes all five jobs, including the corrected Windows real-child
+  activation/removal test and explicit SQLite disposal. The subsequent
+  credential-recovery UI regression fails before and passes after clearing its
+  stale error on successful save. All four Settings tests and TypeScript pass;
+  the actual Settings component was checked at localhost with synthetic IPC,
+  including visible failure, opt-in session recovery, empty password field and
+  removed alert. The temporary fixture, tab and server were removed. Final
+  installer assertions additionally require correct virtual-row ARIA positions
+  and keyboard access to row 500; those assertions remain pending on final source.
+
 - [Linux native active-update acceptance](https://github.com/Zeus-Deus/codemux/actions/runs/35397049892)
   passes same-access watched-package update while its real panel is active,
   expanded-permission review/cancellation, and Settings rollback restoring the
@@ -381,56 +404,22 @@ publication and Settings remain separate deliverables.
 
 ## Unresolved release gates
 
-Native desktop UI acceptance now has a CI-only external `tauri-driver` harness
-(`scripts/addons/native-ui.mjs`). It refuses local and self-hosted execution,
-installs the ordinary deb/NSIS artifact, uses a synthetic loopback account API,
-and supplies only the OS file chooser's selected package path. Package review,
-installation, host execution, permissions, Remote DOM rendering, Git, HTTPS,
-and controlled draft insertion use the production app. Windows downloads the
-driver matching WebView2 and verifies Microsoft's executable signature.
-Installer and harness revisions are recorded separately so a harness-only retry
-cannot imply a newer app build was tested. This harness has passed syntax,
-workflow-parse and local-refusal checks. A [stock Linux run](https://github.com/Zeus-Deus/codemux/actions/runs/35382610101)
-passed Settings startup, actual review/import of both independent examples and
-the hostile fixture, disable/enable and native configuration persistence.
-[Partial evidence](evidence/native-ui-linux-partial.json) records exact installer
-and harness revisions. Project Brief rendered real Git data, but the count
-assertion exposed missing repository-local exclude rules in the private Git
-snapshot. That early run failed there and did not verify draft, HTTPS or hostile-GUI steps. [Native review](evidence/native-package-review.png) and
-[configuration](evidence/native-settings-configuration.png) screenshots use only
-synthetic runner data. A later [Linux retry](https://github.com/Zeus-Deus/codemux/actions/runs/35383319034)
-passes the Git assertion with a versioned ignore fixture, then stops because
-WebKit screenshot capture times out after the terminal canvas appears; text
-queries still work. [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35383388810)
-stops at driver session creation. The harness now captures Linux's actual X
-display and uses Microsoft's [documented WebView2 attach mode](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webdriver#step-4b-attaching-microsoft-edge-webdriver-to-a-running-webview2-app)
-with a debug port enabled only by an executable-specific policy on the
-disposable Windows runner. The runner starts elevated, and [Microsoft documents](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security)
-that elevated hosts ignore environment overrides. The harness refuses to
-replace existing policy and removes its value after use. No
-production test hook or app configuration change is introduced. Windows subsequently passes the saved-installer flow at `cc1327df`, as
-recorded above; Linux subsequently passes with harness `a9cbe22b`. Both
-platforms still need the final-source/five-workload installer run.
-It currently targets import/review, enable/disable, both example views and draft
-insertion, read-only public GitHub HTTPS, no auto-submit, pause/resume, and an
-independently packaged five-workload fixture while typing in the core draft
-and reopening Project Brief. Only the completed steps above are evidence; the remaining targets have not
-passed and the harness does not cover the full race matrix. The OS file chooser and account
-service are explicit fixture seams.
+- Repeat the expanded installed-app acceptance on both platforms after the final
+  storage cleanup, virtual-row accessibility and credential-error changes.
+  Saved-installer evidence above records its exact earlier source and cannot
+  establish the final binary. Full CI and the independent distribution workflow
+  must also pass for the final review head.
+- The context/authority matrix uses both real-child native broker cancellation
+  and focused controlled-composer tests with injected timing and transport seams
+  allowed by chapter 12. Integrated example flows use real stock desktop IPC.
+  Delayed effects across every project/thread/surface transition have not all
+  been driven through WebDriver; this distinction remains explicit in the
+  acceptance map rather than treating mocked effect completion as native UI.
+- Publish reviewed independent package assets and the first immutable catalog
+  artifact through normal authorized workflows, then pin that artifact in the
+  website and verify website-to-desktop digest identity. The prepared release
+  distributions and instructions are reviewable; nothing has been published,
+  merged or listed using fabricated assets.
 
-- Stock built-app E2E for both examples, including real frontend/native IPC,
-  actual controlled draft insertion and core UI operation during hostile plugins.
-- Complete failure-injection matrix: disk-full boundaries, every journal/crash
-  point, unexpected child exit/ignored shutdown, concurrent update/uninstall,
-  and delayed workspace/thread/composer races through the actual desktop. Native
-  update/uninstall serialization and dropped Git requests are covered, but those
-  do not establish all installed-app race cases.
-- Complete keyboard/screen-reader, light/dark, small-window, chat-GUI-off and
-  core pane restoration evidence; measured runtime fault and UI budgets with
-  hardware/workload details.
-- Publish reviewed independent package releases and the first immutable catalog
-  artifact through the normal release workflow; then pin that published artifact
-  in the website and verify website-to-desktop digest identity. The current seed
-  deliberately contains no fabricated release URLs or installable listings.
-
+See [the acceptance evidence map](ACCEPTANCE.md) and [release procedure](RELEASING.md).
 No milestone with an unresolved exit gate is represented as complete.
