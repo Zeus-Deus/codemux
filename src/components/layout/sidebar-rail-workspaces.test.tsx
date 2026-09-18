@@ -338,8 +338,9 @@ describe("SidebarRailWorkspaces", () => {
 
     const active = container.querySelector('[data-rail-ws="ws-2"]')!;
     const inactive = container.querySelector('[data-rail-ws="ws-1"]')!;
-    expect(active).toHaveClass("border-border", "bg-foreground/[0.09]");
-    expect(inactive).not.toHaveClass("bg-foreground/[0.09]");
+    expect(active).toHaveAttribute("data-active", "true");
+    expect(active).toHaveClass("border-border");
+    expect(inactive).not.toHaveAttribute("data-active");
     // Selection is neutral now — no ember on any rail button.
     for (const btn of container.querySelectorAll("[data-rail-ws]")) {
       expect(btn.className).not.toMatch(/accent-ember/);
@@ -357,12 +358,13 @@ describe("SidebarRailWorkspaces", () => {
     pendingActiveWorkspaceId = "ws-2";
     const { container } = await renderRail();
 
-    expect(container.querySelector('[data-rail-ws="ws-2"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-2"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
     expect(
       container.querySelector('[data-rail-ws="ws-1"]'),
-    ).not.toHaveClass("bg-foreground/[0.09]");
+    ).not.toHaveAttribute("data-active");
   });
 
   it("keeps the snapshot's selection when the pending workspace is unknown", async () => {

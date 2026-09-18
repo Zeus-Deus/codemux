@@ -28,8 +28,22 @@ import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { utilitySummaryFallbackLabel } from "@/lib/agent-chat/session-handoff";
 import type { Attachment, AttachmentKind } from "@/stores/agent-chat-store";
 
+/** The named tint a chip wears. The name is the contract — the classes
+ *  are the current expression of it — so a chip's identity survives a
+ *  token migration and is assertable without reading a class string. */
+type ChipTint =
+  | "neutral"
+  | "muted"
+  | "warning"
+  | "primary"
+  | "accent"
+  | "merged"
+  | "destructive";
+
 interface KindConfig {
   icon: LucideIcon;
+  /** Named tint, surfaced on the chip as `data-tint`. */
+  tint: ChipTint;
   /** Tailwind classes — bg + text. 15% opacity fill matches ModePill
    *  per the chat-ui chip token. Note: chat-ui skill technically
    *  reserves accent for the app shell only, but ModePill set the
@@ -43,26 +57,32 @@ interface KindConfig {
 const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
   file: {
     icon: FileIcon,
+    tint: "neutral",
     className: "bg-foreground/10 text-foreground border-border/60",
   },
   folder: {
     icon: FolderOpen,
+    tint: "neutral",
     className: "bg-foreground/10 text-foreground border-border/60",
   },
   issue: {
     icon: CircleDot,
+    tint: "warning",
     className: "bg-warning/15 text-warning border-warning/25",
   },
   pr: {
     icon: GitPullRequest,
+    tint: "primary",
     className: "bg-primary/15 text-primary border-primary/25",
   },
   image: {
     icon: ImageIcon,
+    tint: "accent",
     className: "bg-accent/15 text-accent-foreground border-accent/30",
   },
   session: {
     icon: MessagesSquare,
+    tint: "primary",
     className: "bg-primary/10 text-primary border-primary/20",
   },
 };
@@ -73,28 +93,47 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
  *  billboard. Merged PRs get a one-off purple fallback so a merged
  *  ref is still visually distinct from a closed/draft one — matches
  *  the picker's GitMerge tint. */
-function classNameForAttachment(attachment: Attachment): string {
+function tintForAttachment(attachment: Attachment): {
+  tint: ChipTint;
+  className: string;
+} {
   const state = attachment.metadata.state;
   if (
     attachment.kind === "session" &&
     attachment.metadata.handoffKind === "direct"
   ) {
     return attachment.metadata.summaryError === "utility_model_required"
-      ? "bg-warning/10 text-warning border-warning/25"
-      : "bg-muted/70 text-muted-foreground border-border/70";
+      ? {
+          tint: "warning",
+          className: "bg-warning/10 text-warning border-warning/25",
+        }
+      : {
+          tint: "muted",
+          className: "bg-muted/70 text-muted-foreground border-border/70",
+        };
   }
   if (attachment.kind === "issue" && state === "closed") {
-    return "bg-foreground/10 text-muted-foreground border-border/60";
+    return {
+      tint: "neutral",
+      className: "bg-foreground/10 text-muted-foreground border-border/60",
+    };
   }
   if (attachment.kind === "pr") {
     if (state === "merged") {
-      return "bg-chart-4/15 text-chart-4 border-chart-4/25";
+      return {
+        tint: "merged",
+        className: "bg-chart-4/15 text-chart-4 border-chart-4/25",
+      };
     }
     if (state === "closed" || state === "draft") {
-      return "bg-foreground/10 text-muted-foreground border-border/60";
+      return {
+        tint: "neutral",
+        className: "bg-foreground/10 text-muted-foreground border-border/60",
+      };
     }
   }
-  return KIND_CONFIG[attachment.kind].className;
+  const config = KIND_CONFIG[attachment.kind];
+  return { tint: config.tint, className: config.className };
 }
 
 /** Step 8 Stage 7 — rough token estimate for the tooltip preview.
@@ -228,6 +267,8 @@ export function AttachmentChip({
   const showPreview =
     previewUrl !== null && !previewFailed && !metadata.isLoading;
 
+  const { tint, className: tintClassName } = tintForAttachment(attachment);
+
   const chip = (
     <div
       className={cn(
@@ -243,11 +284,12 @@ export function AttachmentChip({
         showPreview
           ? "gap-2 rounded-md py-[3px] pl-[3px] pr-2"
           : "gap-1.5 rounded-full px-2.5 py-1",
-        classNameForAttachment(attachment),
+        tintClassName,
       )}
       role="status"
       aria-label={`${attachment.kind} attachment: ${metadata.label}`}
       data-attachment-kind={attachment.kind}
+      data-tint={tint}
       data-truncated={isTruncatedFile || undefined}
       data-expanded={expandActive || undefined}
       data-preview={showPreview || undefined}

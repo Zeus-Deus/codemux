@@ -3046,6 +3046,7 @@ export function Composer({
                         data-testid={`composer-attachment-token-${seg.basename}`}
                         data-loading={seg.isLoading || undefined}
                         data-error={seg.hasError || undefined}
+                        data-tint={seg.hasError ? "destructive" : "neutral"}
                         className={cn(
                           "rounded-sm bg-foreground/10 text-foreground",
                           seg.isLoading && "opacity-60",

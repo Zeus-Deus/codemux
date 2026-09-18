@@ -82,6 +82,7 @@ function RailWorkspaceItem({
         <button
           type="button"
           data-rail-ws={workspace.workspace_id}
+          data-active={isActive ? "true" : undefined}
           onClick={handleClick}
           aria-label={workspace.title}
           className={cn(

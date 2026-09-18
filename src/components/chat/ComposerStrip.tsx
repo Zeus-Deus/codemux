@@ -102,6 +102,11 @@ export interface StripGoal {
   } | null;
 }
 
+/** One strip row's resting height. Exported so the occupant row, the goal
+ *  row and the tests all read the same value from one place instead of
+ *  three copies of a pixel literal. */
+export const STRIP_ROW_HEIGHT = "h-[34px]";
+
 /** Rows are 34px; four fit before the list scrolls (4 × 34 + 3 × 3). */
 const OPEN_MAX_HEIGHT = "max-h-[145px]";
 
@@ -377,7 +382,10 @@ function StripRowView({
       data-testid="composer-strip-row"
       data-kind={kind}
       data-row-id={row.id}
-      className="flex h-[34px] shrink-0 items-center gap-2.5 px-2"
+      className={cn(
+        "flex shrink-0 items-center gap-2.5 px-2",
+        STRIP_ROW_HEIGHT,
+      )}
     >
       <span className="flex size-5 shrink-0 items-center justify-center">
         <StripMarkView mark={row.mark} />
@@ -466,7 +474,7 @@ function GoalRowView({
       data-open={open || undefined}
       className="flex shrink-0 flex-col"
     >
-      <div className="flex h-[34px] items-center gap-2 px-2">
+      <div className={cn("flex items-center gap-2 px-2", STRIP_ROW_HEIGHT)}>
         <span className="flex size-5 shrink-0 items-center justify-center">
           {interrupted ? (
             <GoalPauseGlyph className="text-status-working" />
