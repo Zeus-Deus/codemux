@@ -62,7 +62,6 @@ import {
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { isRowActivationKey } from "./sidebar-row-activation";
 import {
-  isPrOnCurrentBranch,
   normalizePrState,
   PrStatusIcon,
   prStatusSettledHoverClass,
@@ -82,6 +81,12 @@ import {
   providerRef,
   providerRefLabel,
 } from "@/lib/source-control";
+import {
+  prSetLabel,
+  prSetSummary,
+  prsDescribeThisCheckout,
+  workspacePrs,
+} from "@/lib/workspace-prs";
 import {
   buildSidebarDraftCatalog,
   SidebarDraftBlock,
@@ -475,7 +480,14 @@ const SettledRow = memo(function SettledRow({
   onMarkUnread,
 }: SettledRowProps) {
   const appearance = useProjectAppearance(repo.path);
-  const prState = normalizePrState(workspace.pr_state);
+  const prs = workspacePrs(workspace);
+  const prSummary = prSetSummary(prs);
+  // `?? normalizePrState(...)`: a stored state with no number is a real, if
+  // odd, association — the badge has always rendered as an icon alone there,
+  // and the set cannot represent it because a PR without a number is not a PR
+  // you can open. The scalar keeps answering for that one case.
+  const prState = prSummary.state ?? normalizePrState(workspace.pr_state);
+  const primaryPr = prs[0] ?? null;
   const provider = providerForWorkspace(workspace);
 
   // Settled work is history, so the shelf reads as one grey block at rest:
@@ -511,7 +523,7 @@ const SettledRow = memo(function SettledRow({
 
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (workspace.pr_url) void openExternalUrl(workspace.pr_url, { event: e });
+    if (primaryPr?.url) void openExternalUrl(primaryPr.url, { event: e });
   };
 
   return (
@@ -615,13 +627,20 @@ const SettledRow = memo(function SettledRow({
             onAuxClick={(e) => {
               if (e.button === 1) handlePrClick(e);
             }}
-            disabled={!workspace.pr_url}
+            disabled={!primaryPr?.url}
+            // The badge's 56px track has room for one reference and nothing
+            // else, so a set that settled with more than one PR reports its
+            // composition here rather than growing the column: settled rows
+            // are history, and the count matters less than it does on a live
+            // card where work is still outstanding.
             aria-label={
-              workspace.pr_number
-                ? workspace.pr_url
-                  ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prState}`
-                  : `${providerRefLabel(provider, workspace.pr_number)} — ${prState}`
-                : `${provider.nounTitle} — ${prState}`
+              prSummary.total > 1
+                ? prSetLabel(provider, prs, prSummary)
+                : primaryPr
+                  ? primaryPr.url
+                    ? `Open ${providerRefLabel(provider, primaryPr.number)} on ${provider.name} — ${prState}`
+                    : `${providerRefLabel(provider, primaryPr.number)} — ${prState}`
+                  : `${provider.nounTitle} — ${prState}`
             }
             className={cn(
               "inline-flex h-5 min-w-0 items-center gap-1 whitespace-nowrap rounded-sm px-1 font-mono text-caption font-medium",
@@ -637,7 +656,7 @@ const SettledRow = memo(function SettledRow({
                     prStatusSettledHoverClass(prState),
                   )
                 : prStatusTextClass(prState),
-              workspace.pr_url
+              primaryPr?.url
                 ? "hover:bg-surface-2"
                 : "cursor-default opacity-65",
             )}
@@ -656,9 +675,9 @@ const SettledRow = memo(function SettledRow({
               size={3}
               className="shrink-0 text-current"
             />
-            {workspace.pr_number != null && (
+            {primaryPr && (
               <span className="truncate">
-                {providerRef(provider, workspace.pr_number)}
+                {providerRef(provider, primaryPr.number)}
               </span>
             )}
           </button>
@@ -1177,11 +1196,16 @@ export function SidebarInbox() {
   const topTier: WorkspaceSnapshot[] = [];
   const wrappingUpTier: WorkspaceSnapshot[] = [];
   for (const ws of activeCards) {
+    // Both inputs come from the whole PR set, not the scalar head: a stack
+    // with four PRs merged and five open is still open work, and judging it
+    // by whichever PR happens to be primary would demote or settle it on the
+    // strength of one ninth of the evidence.
+    const prs = workspacePrs(ws);
     const tier = isWrappingUp(
-      normalizePrState(ws.pr_state),
+      prSetSummary(prs).state,
       statusOf(ws),
       isUnread(ws),
-      isPrOnCurrentBranch(ws.pr_head_branch, ws.git_branch),
+      prsDescribeThisCheckout(prs, ws.git_branch),
     )
       ? wrappingUpTier
       : topTier;
@@ -1698,7 +1722,12 @@ export function SidebarInbox() {
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
       if (keepActive[id]) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      const prState = normalizePrState(ws.pr_state);
+      // Aggregate state: the workspace settles when the *set* is finished,
+      // not when its primary happens to merge. Settling a nine-PR stack
+      // because its bottom landed would file the card away with eight
+      // reviews still open.
+      const prs = workspacePrs(ws);
+      const prState = prSetSummary(prs).state;
       const stamp = effectiveActivityAt(ws.last_active_at, activity[id]);
       if (
         shouldAutoSettle(
@@ -1707,7 +1736,7 @@ export function SidebarInbox() {
           stamp,
           now,
           autoSettleDays,
-          isPrOnCurrentBranch(ws.pr_head_branch, ws.git_branch),
+          prsDescribeThisCheckout(prs, ws.git_branch),
         )
       ) {
         store.settle(id, ws.last_active_at ?? undefined);

@@ -539,6 +539,7 @@ export type ProviderRuntimeEvent =
   // `client_nonce`.
   | {
       type: "user_message";
+      steered_turn_id?: string;
       thread_id: string;
       text: string;
       /** On-disk image records; absent for a text-only turn and for rows
@@ -564,6 +565,7 @@ export type ProviderRuntimeEvent =
     }
   | {
       type: "queued_turn_dispatched";
+      steered?: boolean;
       thread_id: string;
       queued_id: string;
       turn_id: string;

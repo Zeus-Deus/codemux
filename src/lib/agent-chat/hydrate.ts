@@ -468,7 +468,7 @@ export function lastTurnUnsettled(
       !completed.has(row.resolution.delivery.turn_id)
     )
       unsettled = true;
-    if (row.type === "user_message") unsettled = true;
+    if (row.type === "user_message" && !row.steered_turn_id) unsettled = true;
     else if (row.type === "turn_completed") unsettled = false;
   }
   return unsettled;
@@ -545,12 +545,14 @@ function parsePayload(raw: string): ReplayPayload | null {
         })
       : undefined;
     const nonce = (value as { client_nonce?: unknown }).client_nonce;
+    const steeredTurnId = (value as { steered_turn_id?: unknown }).steered_turn_id;
     return {
       type: "user_message",
       thread_id: (value as { thread_id?: string }).thread_id ?? "",
       text,
       images,
       client_nonce: typeof nonce === "string" && nonce ? nonce : undefined,
+      steered_turn_id: typeof steeredTurnId === "string" && steeredTurnId ? steeredTurnId : undefined,
     };
   }
   // Provider events — trust the discriminated union shape. Unknown

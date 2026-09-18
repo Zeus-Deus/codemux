@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use super::detect::ProviderKind;
 use crate::github::{
     CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
-    PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    PrOverviewStats, PrReviewThread, PrSource, PrTimelineEvent, PrsOverview, PullRequestInfo,
+    ReviewComment, SourcedPr,
 };
 
 /// What a provider can actually do, declared statically so the UI can
@@ -210,6 +211,31 @@ pub trait SourceControlProvider: Send + Sync {
     /// Like [`branch_pull_request`](Self::branch_pull_request) but with
     /// the side-branch fallback the sidebar badge uses.
     fn workspace_pull_request(&self, repo_path: &Path) -> Result<Option<PullRequestInfo>, String>;
+
+    /// Every PR this workspace owns, primary first, each tagged with how it
+    /// was attributed — the set behind the sidebar badge, not just its
+    /// representative.
+    ///
+    /// Same error contract as
+    /// [`workspace_pull_request`](Self::workspace_pull_request): `Err` means
+    /// preserve what is stored, an empty vector is an authoritative "none".
+    ///
+    /// The default delegates to the single-PR lookup and tags the result as the
+    /// current branch's own. That is accurate for every provider that relies on
+    /// it: only GitHub has a side-branch fallback, and GitHub overrides this.
+    /// It reports the one PR it can find rather than claiming the workspace has
+    /// only ever opened one.
+    fn workspace_pull_requests(&self, repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
+        Ok(self
+            .workspace_pull_request(repo_path)?
+            .into_iter()
+            .map(|pr| SourcedPr {
+                pr,
+                source: PrSource::Branch,
+                checkout_branch: None,
+            })
+            .collect())
+    }
 
     fn list_pull_requests(
         &self,

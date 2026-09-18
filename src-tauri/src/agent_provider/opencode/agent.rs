@@ -265,38 +265,45 @@ impl AgentProvider for OpenCodeAgentProvider {
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
         let session = self.lookup(&input.thread_id).await?;
-        let checkpoint = input.turn_checkpoint.clone();
-        if let Some(checkpoint) = checkpoint.as_ref() {
-            checkpoint.prepare().await;
-        }
-        let sent = session
-            .send_turn(
-                input.text,
-                input.images,
-                input.model_override,
-                input.effort_override,
-            )
-            .await;
-        let turn_id = match sent {
-            Ok(turn_id) => {
-                if let Some(checkpoint) = checkpoint.as_ref() {
-                    checkpoint.commit().await;
-                }
-                turn_id
-            }
-            Err(error) => {
-                if let Some(checkpoint) = checkpoint.as_ref() {
-                    checkpoint.abort().await;
-                }
-                return Err(error);
-            }
-        };
-        // OpenCode has no busy guard and no follow-up queue yet — every
-        // send starts immediately, so `queued_id` is always `None`.
-        Ok(TurnStartResult {
-            turn_id,
-            queued_id: None,
-        })
+        session.enqueue_or_send(input).await
+    }
+
+    async fn steer_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        self.lookup(&input.thread_id).await?.steer_turn(input).await
+    }
+
+    async fn cancel_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<bool, ProviderError> {
+        Ok(self
+            .lookup(&thread_id)
+            .await?
+            .cancel_queued(&queued_id)
+            .await)
+    }
+
+    async fn send_queued_turn_now(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        self.lookup(&thread_id)
+            .await?
+            .send_queued_now(&queued_id, false)
+            .await
+    }
+
+    async fn steer_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        self.lookup(&thread_id)
+            .await?
+            .send_queued_now(&queued_id, true)
+            .await
     }
 
     async fn interrupt_turn(

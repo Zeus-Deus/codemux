@@ -645,6 +645,8 @@ pub enum ProviderRuntimeEvent {
     /// permanently. The sending client already has the bubble and drops
     /// this copy by `client_nonce`.
     UserMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steered_turn_id: Option<TurnId>,
         thread_id: ThreadId,
         text: String,
         /// On-disk image records attached to the turn. Omitted (not
@@ -681,6 +683,8 @@ pub enum ProviderRuntimeEvent {
     /// at real turn order (queued turns are NOT persisted at enqueue
     /// time). The UI promotes the greyed bubble to a normal user message.
     QueuedTurnDispatched {
+        #[serde(default)]
+        steered: bool,
         thread_id: ThreadId,
         queued_id: String,
         turn_id: TurnId,

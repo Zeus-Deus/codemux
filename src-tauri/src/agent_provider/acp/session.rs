@@ -853,6 +853,7 @@ impl AcpSession {
             let _ = self
                 .event_tx
                 .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                    steered: false,
                     thread_id: self.thread_id.clone(),
                     queued_id: id,
                     turn_id: turn_id.clone(),

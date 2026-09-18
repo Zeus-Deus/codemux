@@ -236,6 +236,7 @@ pub fn build_capabilities(entries: Vec<ModelEntry>) -> ProviderChatCapabilities 
         .map(model_entry_to_chat_info)
         .collect();
     ProviderChatCapabilities {
+        supports_steering: false,
         models,
         effort_granularity: EffortGranularity::PerTurn,
         effort_label_map: codex_effort_label_map(),

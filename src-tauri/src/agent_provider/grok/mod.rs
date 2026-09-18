@@ -184,10 +184,12 @@ impl AgentProvider for GrokAgentProvider {
         let session = self.session(&input.thread_id).await?;
         Ok(match session.enqueue_or_send(input).await? {
             SendOutcome::Started(turn_id) => TurnStartResult {
+                steered: false,
                 turn_id,
                 queued_id: None,
             },
             SendOutcome::Queued(queued_id) => TurnStartResult {
+                steered: false,
                 turn_id: TurnId(String::new()),
                 queued_id: Some(queued_id),
             },

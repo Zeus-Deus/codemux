@@ -1,3 +1,4 @@
+import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
   BookOpen,
   Bug,
@@ -168,6 +169,7 @@ interface Props {
   permissionModes: PermissionModeOption[] | null;
   ultrathinkInBodyText: boolean;
   streaming: boolean;
+  supportsSteering?: boolean;
   /** True while THIS composer's send RPC is in flight (before the
    *  backend acks). Blocks submit to avoid a double-send, but — unlike
    *  `streaming` — does not block queueing a follow-up. Defaults false. */
@@ -414,6 +416,7 @@ export function Composer({
   permissionModes,
   ultrathinkInBodyText,
   streaming,
+  supportsSteering = false,
   sending = false,
   interrupted = false,
   onContinueRun,
@@ -710,7 +713,7 @@ export function Composer({
   // textarea mutation happens inside `handleSlashSelect` based on the
   // item's id prefix. Modes still need their `onSelect` activator.
   const skillItems = useMemo(
-    () => buildSkillCommands({ skills, onInvoke: () => {} }),
+    () => buildSkillCommands({ skills: skills.filter((skill) => !["queue", "steer", "interrupt"].includes(skill.name.toLowerCase())), onInvoke: () => {} }),
     [skills],
   );
 
@@ -743,6 +746,7 @@ export function Composer({
       "default",
       "model",
       "workflow",
+      "queue", "steer", "interrupt",
     ]);
     for (const skill of skills) {
       names.add(skillTokenFor(skill, skills).slice(1).toLowerCase());
@@ -813,6 +817,12 @@ export function Composer({
       workflowCommand,
       modelCommand,
       ...skillItems,
+      ...(slashLeadsMessage ? MESSAGE_DELIVERY_OPTIONS.map((option): SlashCommandItem => ({
+        id: `delivery:${option.value}`, label: option.label, command: `/${option.value}`,
+        description: option.value === "steer" && streaming && !supportsSteering ? STEERING_UNAVAILABLE : option.description,
+        disabled: option.value === "steer" && streaming && !supportsSteering,
+        group: "MESSAGE DELIVERY", onSelect: () => {},
+      })) : []),
       ...(slashLeadsMessage ? providerCommandItems : []),
     ],
     [
@@ -822,6 +832,8 @@ export function Composer({
       skillItems,
       providerCommandItems,
       slashLeadsMessage,
+      streaming,
+      supportsSteering,
     ],
   );
 
@@ -2320,6 +2332,7 @@ export function Composer({
         item.id.startsWith("skill:") ||
         item.id.startsWith("provider-command:") ||
         item.id.startsWith("subcommand:") ||
+        item.id.startsWith("delivery:") ||
         item.id === "workflow"
       ) {
         // Inline token expansion. Replace the typed `/<query>` with
@@ -2568,7 +2581,9 @@ export function Composer({
   // Stop button stays visible whenever a turn is active or a send is
   // mid-flight (`busy`).
   const busy = streaming || sending;
-  const canSubmit = sessionReady && !sending && draft.trim().length > 0;
+  const delivery = parseMessageDelivery(draft);
+  const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
+  const canSubmit = sessionReady && !sending && delivery.text.length > 0 && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -3432,6 +3447,12 @@ export function Composer({
             permissionModes={permissionModes}
             ultrathinkInBodyText={ultrathinkInBodyText}
             streaming={busy}
+            delivery={delivery.delivery}
+            supportsSteering={supportsSteering}
+            onDeliveryChange={streaming ? (value) => {
+              onDraftChange(withMessageDelivery(draft, value));
+              requestAnimationFrame(() => textareaRef.current?.focus());
+            } : undefined}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
@@ -3465,7 +3486,7 @@ export function Composer({
                 </span>
               ) : showQueueHint ? (
                 <span className="truncate text-label leading-none text-muted-foreground/70">
-                  Enter to queue
+                  {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
                 </span>
               ) : null
             }

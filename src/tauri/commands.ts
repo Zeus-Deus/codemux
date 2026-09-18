@@ -1,3 +1,4 @@
+import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
@@ -1552,6 +1553,7 @@ export interface AgentChatStartSessionInput {
 }
 
 export interface AgentChatSendTurnInput {
+  delivery?: MessageDelivery;
   thread_id: string;
   text: string;
   /** Unexpanded composer text used for the durable transcript. */
@@ -1585,6 +1587,7 @@ export interface AgentChatSendTurnInput {
  *  was queued behind an active turn (rendered greyed-out) instead of
  *  starting immediately; `turn_id` is an empty placeholder in that case. */
 export interface TurnStartResult {
+  steered?: boolean;
   turn_id: string;
   queued_id: string | null;
 }
@@ -1831,11 +1834,13 @@ export const agentChatSendQueuedTurnNow = (
   provider: AgentChatProviderKind,
   threadId: string,
   queuedId: string,
+  delivery: "steer" | "interrupt" = "interrupt",
 ) =>
   invoke<void>("agent_chat_send_queued_turn_now", {
     provider,
     threadId,
     queuedId,
+    delivery,
   });
 
 export const agentChatRespondToRequest = (

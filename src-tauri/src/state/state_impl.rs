@@ -444,6 +444,39 @@ pub struct SurfaceSnapshot {
     pub active_pane_id: PaneId,
 }
 
+/// One pull request a workspace owns.
+///
+/// A workspace produces a *set* of PRs, not one: an agent given a multi-part
+/// plan routinely splits it into a branch and a PR per concern, and every one
+/// of those PRs is the workspace's own work. The flat `pr_*` scalars below
+/// name only the primary of that set and cannot represent the rest, so the
+/// set lives here and the scalars are derived from its head.
+///
+/// Snapshot-local and re-derived on every poll, like the other git fields;
+/// never synced across devices. Additive — old persisted state reads as an
+/// empty vector, which the frontend treats as "fall back to the scalars".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspacePr {
+    pub number: u32,
+    /// Display state, already collapsed by `PullRequestInfo::display_state`
+    /// so `DRAFT` is a state here rather than a separate flag.
+    pub state: String,
+    pub url: String,
+    pub head_branch: Option<String>,
+    /// The branch this PR merges into. Stored — unlike on the scalars, where
+    /// it is fetched and dropped — because it is what makes a stack legible:
+    /// a PR whose base is another PR's head is stacked on it.
+    pub base_branch: Option<String>,
+    /// How this PR was attributed to the workspace, which decides whether
+    /// lifecycle rules may act on it. `None` only on state persisted before
+    /// the field existed, read by the frontend as the old single-PR rules.
+    #[serde(default)]
+    pub source: Option<crate::github::PrSource>,
+    /// Branch checked out when worktree ownership was resolved.
+    #[serde(default)]
+    pub checkout_branch: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
@@ -531,6 +564,15 @@ pub struct WorkspaceSnapshot {
     /// which the frontend treats as the pre-field (matching) case.
     #[serde(default)]
     pub pr_head_branch: Option<String>,
+    /// Every PR this workspace owns, primary first.
+    ///
+    /// The `pr_*` scalars above are this list's head, kept as separate fields
+    /// because every existing workspace-scoped surface reads them. An empty
+    /// list means "no PRs found", not "not looked up yet" — the pollers clear
+    /// and rewrite it wholesale, on the same Write/Clear/Preserve contract as
+    /// the scalars.
+    #[serde(default)]
+    pub prs: Vec<WorkspacePr>,
     /// Branch this worktree was created from (the explicit base, or the
     /// repo's checked-out branch when none was given). Recorded once at
     /// create time; `None` for checkouts of an existing branch and for
@@ -1629,6 +1671,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,
@@ -1714,6 +1757,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,
@@ -1790,6 +1834,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,
@@ -1897,6 +1942,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,
@@ -2057,6 +2103,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,
@@ -2836,6 +2883,48 @@ impl AppStateStore {
         {
             return false;
         }
+        workspace.pr_number = pr_number;
+        workspace.pr_state = pr_state;
+        workspace.pr_url = pr_url;
+        workspace.pr_head_branch = pr_head_branch;
+        true
+    }
+
+    /// Replace the whole set of PRs a workspace owns, deriving the flat
+    /// `pr_*` scalars from its head.
+    ///
+    /// This is the writer the pollers use. It exists alongside
+    /// `update_workspace_pr_info` rather than replacing it because the
+    /// worktree-creation seed knows a PR *number* and nothing else, which is
+    /// not enough to build a `WorkspacePr`; that path stays scalar-only and is
+    /// overwritten by the first poll. Keeping one writer per shape means the
+    /// list and the scalars can never disagree about the primary.
+    ///
+    /// Same emit-gating contract as the other updaters — returns true only
+    /// when something actually moved.
+    pub fn update_workspace_prs(&self, workspace_id: &str, prs: Vec<WorkspacePr>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        let primary = prs.first();
+        let pr_number = primary.map(|pr| pr.number);
+        let pr_state = primary.map(|pr| pr.state.clone());
+        let pr_url = primary.map(|pr| pr.url.clone());
+        let pr_head_branch = primary.and_then(|pr| pr.head_branch.clone());
+        if workspace.prs == prs
+            && workspace.pr_number == pr_number
+            && workspace.pr_state == pr_state
+            && workspace.pr_url == pr_url
+            && workspace.pr_head_branch == pr_head_branch
+        {
+            return false;
+        }
+        workspace.prs = prs;
         workspace.pr_number = pr_number;
         workspace.pr_state = pr_state;
         workspace.pr_url = pr_url;
@@ -5886,6 +5975,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,

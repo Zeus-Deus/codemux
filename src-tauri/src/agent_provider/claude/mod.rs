@@ -237,10 +237,12 @@ impl AgentProvider for ClaudeAgentProvider {
         })?;
         Ok(match session.enqueue_or_send(input).await? {
             crate::agent_provider::SendOutcome::Started(turn_id) => TurnStartResult {
+                steered: false,
                 turn_id,
                 queued_id: None,
             },
             crate::agent_provider::SendOutcome::Queued(queued_id) => TurnStartResult {
+                steered: false,
                 // No live turn yet — the real id arrives on
                 // QueuedTurnDispatched. Empty placeholder keeps the shape.
                 turn_id: TurnId(String::new()),

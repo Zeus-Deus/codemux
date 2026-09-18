@@ -355,6 +355,7 @@ async fn dispatch_resume<R: Runtime>(
         effort_override: None,
         permission_mode_override: None,
         client_nonce: None,
+        delivery: crate::agent_provider::types::MessageDelivery::Queue,
     };
     send_turn_with_origin(app.clone(), provider, input, TurnOrigin::UsageResume)
         .await

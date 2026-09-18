@@ -199,6 +199,7 @@ fn build_capabilities(entries: Vec<AvailableModel>) -> ProviderChatCapabilities 
         .collect();
 
     ProviderChatCapabilities {
+        supports_steering: false,
         models,
         effort_granularity: EffortGranularity::PerTurn,
         effort_label_map,

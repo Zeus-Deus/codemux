@@ -179,6 +179,25 @@ import {
 import { getJumpTarget } from "./sidebar-inbox-jump";
 
 let wsCounter = 0;
+import type { WorkspacePrRef } from "@/lib/workspace-prs";
+
+/** The stack that motivated multi-PR support: nine PRs opened from one
+ *  workspace, `#372` based on `main` and the rest each based on the previous
+ *  one. The worktree is left on its own branch, which has no PR of its own —
+ *  the agent cut every stack branch with `git branch` and never checked one
+ *  out. */
+function stackPrs(states: string[]): WorkspacePrRef[] {
+  return states.map((state, i) => ({
+    number: 372 + i,
+    state,
+    url: `https://github.com/u/r/pull/${372 + i}`,
+    head_branch: `ui-pass/0${i + 1}`,
+    base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+    source: "worktree" as const,
+    checkout_branch: "goal-passpage-space-task",
+  }));
+}
+
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
 ): WorkspaceSnapshot {
@@ -406,6 +425,40 @@ describe("SidebarInbox — cards", () => {
     expect(merged.className).not.toMatch(/\bborder\b/);
     expect(screen.queryByText("PR #87")).not.toBeInTheDocument();
     expect(screen.queryByText("merged")).not.toBeInTheDocument();
+  });
+
+  it("shows the rest of the set on a card that opened more than one PR", async () => {
+    // Before the set existed this card showed a single number — or, when the
+    // stack branches were never checked out, nothing at all — which read as
+    // "this workspace opened one PR". The count is the difference between
+    // naming a PR and describing the work.
+    workspaces = [
+      makeWorkspace({
+        worktree_path: "/wt/a",
+        git_branch: "goal-passpage-space-task",
+        prs: stackPrs([
+          "MERGED",
+          "MERGED",
+          "MERGED",
+          "MERGED",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+        ]),
+      }),
+    ];
+    await renderInbox();
+
+    const chip = screen.getByRole("button", {
+      name: "9 pull requests — 5 open, 4 merged. Opens #372",
+    });
+    // The primary is still a specific PR the click opens, so the count reads
+    // as "+8 more" rather than replacing the reference with a total.
+    expect(chip).toHaveTextContent("#372");
+    expect(chip).toHaveTextContent("+8");
+    expect(chip).not.toHaveTextContent("#380");
   });
 
   it("renders the PR chip icon alone when the number is unknown", async () => {
@@ -1093,6 +1146,64 @@ describe("SidebarInbox — settle / un-settle", () => {
       screen.getByRole("button", { name: "Pull request #250 — merged" }),
     ).toBeInTheDocument();
     expect(screen.getByText("#250")).toBeInTheDocument();
+  });
+
+  it("does NOT settle a stack while any of its PRs is still open", async () => {
+    // The regression this pins: judging the workspace by one PR settled the
+    // card as soon as *that* one merged. Four of these nine have landed and
+    // five have not — the work is plainly unfinished.
+    workspaces = [
+      makeWorkspace({
+        title: "Half-landed stack",
+        worktree_path: "/wt/a",
+        git_branch: "goal-passpage-space-task",
+        last_active_at: Date.now(),
+        prs: stackPrs([
+          "MERGED",
+          "MERGED",
+          "MERGED",
+          "MERGED",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+          "OPEN",
+        ]),
+      }),
+    ];
+    const { container } = await flushRender();
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+  });
+
+  it("does not settle a newly checked-out branch using the previous stack", async () => {
+    workspaces = [makeWorkspace({
+      title: "New work", worktree_path: "/wt/a", git_branch: "new-work",
+      last_active_at: Date.now(), prs: stackPrs(Array(9).fill("MERGED")),
+    })];
+    const { container } = await flushRender();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
+
+  it("settles a fully merged stack even though HEAD is on none of its branches", async () => {
+    // The mirror image, and why a set of more than one bypasses the
+    // side-branch guard: every one of these branches is reachable from this
+    // checkout's own HEAD, so the work really is this workspace's and really
+    // is done. Judged by `pr_head_branch` alone it would never settle.
+    workspaces = [
+      makeWorkspace({
+        title: "Landed stack",
+        worktree_path: "/wt/a",
+        git_branch: "goal-passpage-space-task",
+        last_active_at: Date.now(),
+        prs: stackPrs(Array(9).fill("MERGED")),
+      }),
+    ];
+    const { container } = await flushRender();
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
   it("still settles on a PR whose head branch IS the checked-out branch", async () => {
