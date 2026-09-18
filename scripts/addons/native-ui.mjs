@@ -939,7 +939,16 @@ try {
     "normal chat pane binding",
     async () => findPane(await native("get_app_state"))?.thread_id,
   );
-  await hasText("Session error");
+  // The existing composer may show either the notice label or the provider's
+  // direct availability detail. Both represent the same settled, unbound-CLI
+  // state; neither starts inference or submits the synthetic draft.
+  await until("provider unavailable in the disposable runner", async () => {
+    const content = await text();
+    return (
+      content.includes("Session error") ||
+      content.includes("Claude Code CLI (`claude`) is not installed or not on PATH.")
+    );
+  });
   const messagesBefore = await native("agent_chat_list_messages", { threadId });
   assert.ok(
     !messagesBefore.some((row) => JSON.parse(row).type === "user_message"),
