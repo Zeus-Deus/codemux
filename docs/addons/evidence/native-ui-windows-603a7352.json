@@ -1,0 +1,38 @@
+{
+  "commit": "cc1327dff26070b8030110df82d50b85dc15917d",
+  "platform": "win32",
+  "checks": [
+    "01-settings",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity"
+  ],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "603a73527c98883937296904e66b20c4744a1abe",
+    "run": "35379118363",
+    "platform": "win32"
+  },
+  "installerSha256": "d589dd5dd4bab1fae45fd2c5706fd6dc3bb9383ab503b5f5533b25beee979fca",
+  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 703.9978999999985
+    }
+  ],
+  "status": "passed",
+  "workflowRun": "35386068123",
+  "artifactId": "10564421235",
+  "note": "Passes against the saved e95b13cf PR-merge installer (603a7352), not the current source head. Saved hostile fixture contains only the blocking command. Does not establish other hostile workloads, later app fixes, or the remaining acceptance matrix."
+}
