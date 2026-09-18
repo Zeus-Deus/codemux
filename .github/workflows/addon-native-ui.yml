@@ -88,6 +88,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install external WebDriver
         run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Verify native Windows dependency toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/windows-native-perl.ps1
       - name: Install matching Microsoft WebView2 driver
         if: runner.os == 'Windows'
         shell: pwsh

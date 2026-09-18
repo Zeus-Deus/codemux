@@ -76,6 +76,11 @@ jobs:
         shell: pwsh
         run: '"C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
 
+      - name: Select native Perl for MSVC dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/windows-native-perl.ps1
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
