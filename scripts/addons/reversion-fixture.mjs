@@ -3,6 +3,16 @@
 import assert from "node:assert/strict";
 import { gunzipSync, gzipSync } from "node:zlib";
 export function reversionFixture(bytes, version, extraPermission) {
+  return transformFixture(bytes, (name, data) => {
+    if (name !== "manifest.json") return data;
+    const manifest = JSON.parse(data);
+    assert.equal(manifest.id, "codemux.project-brief");
+    manifest.version = version;
+    if (extraPermission) manifest.permissions.push(extraPermission);
+    return Buffer.from(JSON.stringify(manifest, null, 2));
+  });
+}
+export function transformFixture(bytes, transform) {
   const tar = gunzipSync(bytes);
   const files = [];
   for (let offset = 0; offset < tar.length && tar[offset]; ) {
@@ -20,12 +30,9 @@ export function reversionFixture(bytes, version, extraPermission) {
     );
     let data = tar.subarray(offset + 512, offset + 512 + size);
     offset += 512 + Math.ceil(size / 512) * 512;
-    if (name === "manifest.json") {
-      const manifest = JSON.parse(data);
-      assert.equal(manifest.id, "codemux.project-brief");
-      manifest.version = version;
-      if (extraPermission) manifest.permissions.push(extraPermission);
-      data = Buffer.from(JSON.stringify(manifest, null, 2));
+    const replacement = transform(name, data);
+    if (replacement !== data) {
+      data = replacement;
       header.write(data.length.toString(8).padStart(11, "0") + "\0", 124);
       header.fill(32, 148, 156);
       header.write(

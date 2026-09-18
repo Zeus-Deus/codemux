@@ -2,6 +2,7 @@
 // Never run on a developer profile. No embedded driver or production test hooks.
 import assert from "node:assert/strict";
 import { reversionFixture } from "./reversion-fixture.mjs";
+import { contextFixture } from "./context-fixture.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpus, totalmem, release, homedir } from "node:os";
@@ -542,9 +543,15 @@ async function checkCredentialSettings() {
       field,
     ),
   );
-  assert.ok(
-    !(await text()).includes("Credential store unavailable or locked"),
-    "A successful explicit fallback must clear its stale failure",
+  await step(
+    "07-credential-success-clears-error",
+    async () => {
+      assert.ok(
+        !(await text()).includes("Credential store unavailable or locked"),
+        "A successful explicit fallback must clear its stale failure",
+      );
+    },
+    true,
   );
   const inventory = await native("addon_inventory");
   const installationId = inventory.installed.find(
@@ -686,6 +693,192 @@ async function openSettings() {
   await shortcut(",");
   await clickText("Add-ons");
   await hasText("Import package");
+}
+async function checkContextRaces(originalWorkspace, assertNoSubmission) {
+  const bytes = contextFixture(
+    await readFile(
+      resolve(
+        "examples/addons/project-brief/codemux.project-brief-1.0.0.cmxaddon",
+      ),
+    ),
+  );
+  const path = join(root, "context-races.cmxaddon");
+  await writeFile(path, bytes);
+  evidence.seams.push(
+    "Synthetic delayed author definition using the input example's unchanged public SDK; normal native package import and SDK broker",
+  );
+  evidence.contextRaces = {
+    fixtureSha256: createHash("sha256").update(bytes).digest("hex"),
+    delayMs: 4000,
+    completed: [],
+  };
+  await openSettings();
+  await choosePackage(path);
+  await clickText("Import package");
+  await hasText("Review Context Race Fixture");
+  await clickText("Accept and install");
+  await until("context fixture installed", async () =>
+    (await native("addon_inventory")).installed.some(
+      (i) => i.manifest.id === "example.context-races" && i.desiredEnabled,
+    ),
+  );
+  await until("context review closed", () =>
+    script(`return !document.querySelector('[role="dialog"]')`),
+  );
+  await click('[aria-label="Close settings"]');
+  const cwd = join(root, "context-race-project");
+  await mkdir(cwd);
+  const workspaceId = await native("create_workspace", { cwd });
+  const createPane = () =>
+    native("agent_chat_create_pane", {
+      workspaceId,
+      cwd,
+      provider: null,
+      launchMode: null,
+      threadId: null,
+    });
+  const selectWorkspace = async (id, name) => {
+    await shortcut("k");
+    await type('[role="combobox"]', name);
+    await click(`[role="option"][data-value="ws:${id}"]`);
+  };
+  const findPane = (value, id) => {
+    if (!value || typeof value !== "object") return null;
+    if (value.pane_id === id) return value;
+    return (
+      Object.values(value)
+        .map((v) => findPane(v, id))
+        .find(Boolean) ?? null
+    );
+  };
+  const fixtureThreads = new Map();
+  const warmPane = async (id) => {
+    await element(composer);
+    await click(composer);
+    const threadId = await until(
+      "race pane bound",
+      async () => findPane(await native("get_app_state"), id)?.thread_id,
+    );
+    await until("race pane provider settled", async () => {
+      const content = await text();
+      return (
+        content.includes("Session error") ||
+        content.includes(
+          "Claude Code CLI (`claude`) is not installed or not on PATH.",
+        )
+      );
+    });
+    fixtureThreads.set(
+      threadId,
+      await native("agent_chat_list_messages", { threadId }),
+    );
+  };
+  const drafts = () =>
+    script(
+      `return [...document.querySelectorAll(arguments[0])].map(e => e.value)`,
+      composer,
+    );
+  const pending = async (id) => {
+    await openCommand(`CI delayed ${id}`);
+    await hasText(`CI pending ${id}`);
+  };
+  const cancelled = async (id) => {
+    await hasText(`CI cancelled ${id}`);
+    assert.ok(
+      (await drafts()).every((value) => !value.includes(`CI delayed ${id}.`)),
+    );
+    evidence.contextRaces.completed.push(id);
+  };
+  let pane = await createPane();
+  await selectWorkspace(workspaceId, "context-race-project");
+  await warmPane(pane);
+  await selectWorkspace(originalWorkspace, "synthetic-project");
+  await step("10-context-typing-preserved", async () => {
+    await pending("typing");
+    await typeComposer(" User race input.");
+    await hasText("CI appended typing");
+    assert.ok(
+      (await drafts()).some(
+        (value) =>
+          value.includes("User race input.") &&
+          value.includes("CI delayed typing."),
+      ),
+    );
+    await assertNoSubmission();
+    evidence.contextRaces.completed.push("typing");
+  });
+  await step("10-context-project-switch-cancels", async () => {
+    await pending("workspace");
+    await selectWorkspace(workspaceId, "context-race-project");
+    await cancelled("workspace");
+    await selectWorkspace(originalWorkspace, "synthetic-project");
+    assert.ok(
+      (await drafts()).every(
+        (value) => !value.includes("CI delayed workspace."),
+      ),
+    );
+    await selectWorkspace(workspaceId, "context-race-project");
+  });
+  await step("10-context-thread-close-cancels", async () => {
+    await pending("thread");
+    await native("agent_chat_close_pane", { paneId: pane, select: true });
+    await cancelled("thread");
+  });
+  pane = await createPane();
+  await selectWorkspace(workspaceId, "context-race-project");
+  await warmPane(pane);
+  await step("10-context-composer-replacement-cancels", async () => {
+    await pending("replacement");
+    await native("agent_chat_close_pane", { paneId: pane, select: true });
+    pane = await createPane();
+    await selectWorkspace(workspaceId, "context-race-project");
+    await cancelled("replacement");
+    await warmPane(pane);
+  });
+  await step("10-context-disable-cancels", async () => {
+    await pending("disable");
+    await openSettings();
+    const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Context Race Fixture')))`;
+    await clickText("Disable", article);
+    await until(
+      "context fixture disabled",
+      async () =>
+        !(await native("addon_inventory")).installed.find(
+          (i) => i.manifest.id === "example.context-races",
+        ).desiredEnabled,
+    );
+    await delay(4500);
+    assert.equal(await pluginHostCount(), 0);
+    await click('[aria-label="Close settings"]');
+    assert.ok(
+      (await drafts()).every((value) => !value.includes("CI delayed disable.")),
+    );
+    evidence.contextRaces.completed.push("disable");
+    await openSettings();
+    await clickText("Remove", article);
+    await hasText("Remove Context Race Fixture?");
+    await clickText(
+      "Remove add-on",
+      `document.querySelector('[role="dialog"]')`,
+    );
+    await until(
+      "context fixture removed",
+      async () => (await native("addon_inventory")).installed.length === 0,
+    );
+    await until("context removal dialog closed", () =>
+      script(`return !document.querySelector('[role="dialog"]')`),
+    );
+    await click('[aria-label="Close settings"]');
+  });
+  for (const [threadId, messages] of fixtureThreads)
+    assert.deepEqual(
+      await native("agent_chat_list_messages", { threadId }),
+      messages,
+      "Race tests must never submit prompts",
+    );
+  await selectWorkspace(originalWorkspace, "synthetic-project");
+  await assertNoSubmission();
+  await checkCoreTerminal();
 }
 async function openCommand(title) {
   await shortcut("k");
@@ -1418,46 +1611,54 @@ try {
       p95FrameGapMs <= 100,
       "Shared-runner UI frame p95 exceeds the recorded 100 ms budget",
     );
-    const list = 'section[aria-label="Add-on view"] [role="list"]';
-    const positions = () =>
-      script(
-        `return [...document.querySelector(arguments[0]).querySelectorAll('[role="listitem"]')].map(e => ({size:Number(e.getAttribute('aria-setsize')),position:Number(e.getAttribute('aria-posinset'))}))`,
-        list,
-      );
-    assert.ok(
-      (await positions()).every((row) => row.size === 500 && row.position >= 1),
-    );
-    assert.equal(
-      await script(
-        `return document.querySelector(arguments[0]).getAttribute('aria-label')`,
-        list,
-      ),
-      "Add-on list",
-    );
-    await click(list);
-    await wd("DELETE", "/actions");
-    await wd("POST", "/actions", {
-      actions: [
-        {
-          type: "key",
-          id: "list-keyboard",
+    await step(
+      "08-virtual-list-native-accessibility",
+      async () => {
+        const list = 'section[aria-label="Add-on view"] [role="list"]';
+        const positions = () =>
+          script(
+            `return [...document.querySelector(arguments[0]).querySelectorAll('[role="listitem"]')].map(e => ({size:Number(e.getAttribute('aria-setsize')),position:Number(e.getAttribute('aria-posinset'))}))`,
+            list,
+          );
+        assert.ok(
+          (await positions()).every(
+            (row) => row.size === 500 && row.position >= 1,
+          ),
+        );
+        assert.equal(
+          await script(
+            `return document.querySelector(arguments[0]).getAttribute('aria-label')`,
+            list,
+          ),
+          "Add-on list",
+        );
+        await click(list);
+        await wd("DELETE", "/actions");
+        await wd("POST", "/actions", {
           actions: [
-            { type: "keyDown", value: "\ue010" },
-            { type: "keyUp", value: "\ue010" },
+            {
+              type: "key",
+              id: "list-keyboard",
+              actions: [
+                { type: "keyDown", value: "\ue010" },
+                { type: "keyUp", value: "\ue010" },
+              ],
+            },
           ],
-        },
-      ],
-    });
-    await until("keyboard reaches the final virtual row", async () =>
-      (await positions()).some((row) => row.position === 500),
+        });
+        await until("keyboard reaches the final virtual row", async () =>
+          (await positions()).some((row) => row.position === 500),
+        );
+        assert.ok((await positions()).length <= 14);
+        evidence.virtualListAccessibility = {
+          label: "Add-on list",
+          setSize: 500,
+          keyboardEndPosition: 500,
+          boundedRows: true,
+        };
+      },
+      true,
     );
-    assert.ok((await positions()).length <= 14);
-    evidence.virtualListAccessibility = {
-      label: "Add-on list",
-      setSize: 500,
-      keyboardEndPosition: 500,
-      boundedRows: true,
-    };
     await assertNoSubmission();
     await capture("08-virtualized-native-plugin-list");
     await openSettings();
@@ -1600,6 +1801,9 @@ try {
       noEmptyAccessorySpace: true,
     };
   });
+  await step("10-delayed-public-sdk-context-races", () =>
+    checkContextRaces(workspaceId, assertNoSubmission),
+  );
   await step(
     "11-corrupt-plugin-registry-does-not-block-core-startup",
     async () => {
