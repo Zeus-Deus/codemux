@@ -783,7 +783,7 @@ async function checkContextRaces(originalWorkspace, assertNoSubmission) {
     await hasText(`CI pending ${id}`);
   };
   const cancelled = async (id) => {
-    await hasText(`CI cancelled ${id}`);
+    await hasText(`CI cancelled ${id}: CONTEXT_STALE`);
     assert.ok(
       (await drafts()).every((value) => !value.includes(`CI delayed ${id}.`)),
     );
