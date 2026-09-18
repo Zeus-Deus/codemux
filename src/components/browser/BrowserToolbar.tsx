@@ -92,7 +92,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         onKeyDown={handleKeyDown}
         onFocus={(e) => e.target.select()}
         placeholder="Enter URL..."
-        className="h-6 flex-1 text-xs bg-background border-none px-2"
+        className="h-6 flex-1 text-label bg-background border-none px-2"
       />
     </div>
   );

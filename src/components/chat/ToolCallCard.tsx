@@ -187,20 +187,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* In-flight decision marker */}
       {isResponding && (
-        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground/70">
+        <div className="border-t border-border/60 px-3 py-2 text-label text-muted-foreground/70">
           Submitting decision…
         </div>
       )}
 
       {isRequestFailed && resolution?.state === "failed" && (
-        <div className="select-text border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
+        <div className="select-text border-t border-border/60 px-3 py-2 text-label text-muted-foreground">
           {resolution.message}
         </div>
       )}
 
       {/* Denied terminal state */}
       {isDenied && resolution?.state === "resolved" && (
-        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
+        <div className="border-t border-border/60 px-3 py-2 text-label text-muted-foreground">
           {denialLabel(resolution.decision)}
         </div>
       )}
@@ -300,7 +300,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
           <Button
             type="button"
             size="sm"
-            className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
+            className="h-7 px-3 text-label bg-foreground text-background hover:bg-foreground/90"
             onClick={() => handleAllow("once")}
           >
             Allow
@@ -311,16 +311,16 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-7 px-3 text-xs"
+                className="h-7 px-3 text-label"
               >
                 Allow always
                 <ChevronDown className="ml-1 h-3 w-3" aria-hidden />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="text-xs">
+            <DropdownMenuContent align="start" className="text-label">
               <DropdownMenuItem
                 onSelect={() => handleAllow("project")}
-                className="text-xs gap-3"
+                className="text-label gap-3"
               >
                 <span>For this project</span>
                 <span className="ml-auto text-caption text-muted-foreground">
@@ -329,7 +329,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               </DropdownMenuItem>
               <DropdownMenuItem
                 onSelect={() => handleAllow("user")}
-                className="text-xs gap-3"
+                className="text-label gap-3"
               >
                 <span>For all projects</span>
                 <span className="ml-auto text-caption text-muted-foreground">
@@ -342,7 +342,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+            className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
             onClick={() => setDenying(true)}
           >
             Deny
@@ -354,7 +354,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             placeholder="Reason (optional)"
-            className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-xs text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
+            className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-label text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
             rows={2}
           />
           {/* Destructive intent — the sole sanctioned use of --danger
@@ -365,7 +365,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               type="button"
               variant="destructive"
               size="sm"
-              className="h-7 px-3 text-xs"
+              className="h-7 px-3 text-label"
               onClick={confirmDeny}
             >
               Confirm deny
@@ -374,7 +374,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+              className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");

@@ -2914,7 +2914,7 @@ export function Composer({
                     type="button"
                     data-testid="composer-continue-run-chip"
                     onClick={onContinueRun}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-label text-warning hover:bg-warning/25"
                   >
                     <RotateCw className="h-3 w-3" aria-hidden />
                     <span>Continue run</span>

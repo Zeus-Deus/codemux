@@ -102,7 +102,7 @@ export function DevicesSection() {
 
   if (!loaded) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+      <div className="flex h-full items-center justify-center text-body text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
         Loading devices…
       </div>

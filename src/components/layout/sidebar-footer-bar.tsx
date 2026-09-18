@@ -193,7 +193,7 @@ function AppMenu({
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+        <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
           Menu
         </TooltipContent>
       </Tooltip>
@@ -339,7 +339,7 @@ function FooterDestination({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
         {action.label}
       </TooltipContent>
     </Tooltip>
@@ -493,7 +493,7 @@ export function SidebarFooterBar() {
               align="start"
               className="w-64 p-2"
             >
-              <p className="px-2 py-1 text-xs font-medium text-muted-foreground">
+              <p className="px-2 py-1 text-label font-medium text-muted-foreground">
                 Footer destinations
               </p>
               <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">

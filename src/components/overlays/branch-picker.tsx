@@ -212,7 +212,7 @@ export function BranchPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
+          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
         >
           {isOpenMode ? <CornerDownRight className="h-3 w-3" /> : <GitBranch className="h-3 w-3" />}
           <span className="max-w-[120px] truncate">{baseBranch}</span>
@@ -246,7 +246,7 @@ export function BranchPicker({
             <button
               type="button"
               className={cn(
-                "flex-1 px-2 py-1 text-xs rounded-md transition-colors",
+                "flex-1 px-2 py-1 text-label rounded-md transition-colors",
                 filterMode === "all"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -259,7 +259,7 @@ export function BranchPicker({
             <button
               type="button"
               className={cn(
-                "flex-1 px-2 py-1 text-xs rounded-md transition-colors",
+                "flex-1 px-2 py-1 text-label rounded-md transition-colors",
                 filterMode === "worktrees"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -276,7 +276,7 @@ export function BranchPicker({
             onWheel={(e) => e.stopPropagation()}
           >
             {loading ? (
-              <div className="flex items-center justify-center py-8 text-xs text-muted-foreground">
+              <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
                 <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
                 Loading branches...
               </div>
@@ -332,7 +332,7 @@ export function BranchPicker({
                           key={branch.name}
                           value={branch.name}
                           onSelect={() => handlePrimaryAction(branch)}
-                          className="h-9 text-xs gap-2 px-2 group/row"
+                          className="h-9 text-label gap-2 px-2 group/row"
                         >
                           {/* Icon */}
                           <BranchIcon

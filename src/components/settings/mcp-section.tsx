@@ -117,10 +117,10 @@ export function McpSection({ projectRoot }: Props) {
     <div>
       <div className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-base font-semibold tracking-tight">
+          <h2 className="text-body-lg font-semibold tracking-tight">
             MCP Servers
           </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-body text-muted-foreground">
             Model Context Protocol servers expose tools to your agent.
             Servers spawn lazily on first chat session start; toggle a
             row off to stop it. Codemux's own MCP is always on.
@@ -144,7 +144,7 @@ export function McpSection({ projectRoot }: Props) {
       {error && (
         <p
           data-testid="mcp-error"
-          className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive"
         >
           Failed to load MCP servers: {error}
         </p>
@@ -153,7 +153,7 @@ export function McpSection({ projectRoot }: Props) {
       {loading && !loaded ? (
         <div
           data-testid="mcp-loading"
-          className="flex items-center gap-2 py-6 text-sm text-muted-foreground"
+          className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
           Loading MCP servers…
@@ -161,7 +161,7 @@ export function McpSection({ projectRoot }: Props) {
       ) : servers.length === 0 && !error ? (
         <p
           data-testid="mcp-empty"
-          className="py-6 text-center text-sm text-muted-foreground"
+          className="py-6 text-center text-body text-muted-foreground"
         >
           No MCP servers discovered.
         </p>
@@ -205,7 +205,7 @@ function ToolLoadNote({ total }: { total: number }) {
   return (
     <div
       data-testid="mcp-tool-load-note"
-      className="mb-4 flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+      className="mb-4 flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-label text-muted-foreground"
     >
       <Info className="size-3.5 shrink-0 mt-0.5" aria-hidden />
       <p className="flex-1">
@@ -239,7 +239,7 @@ function ServerGroup({
   return (
     <section data-testid={`mcp-group-${source}`}>
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
           {sourceHeading(source)}
         </h3>
         <span className="text-caption text-muted-foreground/70">
@@ -317,7 +317,7 @@ function ServerRow({
         <div className="flex items-center gap-2 flex-wrap">
           <span
             className={cn(
-              "truncate text-sm font-medium",
+              "truncate text-body font-medium",
               disabled && "opacity-60",
             )}
           >
@@ -333,7 +333,7 @@ function ServerRow({
                   · {sourceHeading(server.sources[0])}
                 </span>
               </TooltipTrigger>
-              <TooltipContent className="max-w-xs text-xs">
+              <TooltipContent className="max-w-xs text-label">
                 Same name as another server with a different config —
                 they are treated as separate.
               </TooltipContent>
@@ -359,7 +359,7 @@ function ServerRow({
             </span>
           )}
         </div>
-        <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
+        <p className="mt-0.5 truncate font-mono text-label text-muted-foreground">
           {commandPreview(server)}
         </p>
       </div>
@@ -367,7 +367,7 @@ function ServerRow({
       <Button
         variant="ghost"
         size="sm"
-        className="h-7 px-2 text-xs opacity-0 transition-opacity group-hover:opacity-100"
+        className="h-7 px-2 text-label opacity-0 transition-opacity group-hover:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
@@ -378,7 +378,7 @@ function ServerRow({
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-2 text-xs"
+          className="h-7 px-2 text-label"
           onClick={() =>
             void restartMcpServerCmd(server.id).catch((err) =>
               console.warn(`[mcp] restart ${server.id} failed:`, err),

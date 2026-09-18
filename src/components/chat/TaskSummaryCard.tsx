@@ -52,7 +52,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
         strokeWidth={1.6}
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate text-xs text-foreground/80">
+      <span className="min-w-0 flex-1 truncate text-label text-foreground/80">
         {done > 0 ? "Task list updated" : "Task list created"} ·{" "}
         <span className="font-semibold text-foreground">
           {done > 0

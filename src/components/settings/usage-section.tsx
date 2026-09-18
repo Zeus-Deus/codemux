@@ -311,7 +311,7 @@ export function UsageSection() {
     <div>
       <div className="mb-6 flex items-end justify-between gap-4">
         <div className="min-w-0">
-          <h2 className="text-base font-semibold tracking-tight">Usage</h2>
+          <h2 className="text-body-lg font-semibold tracking-tight">Usage</h2>
           <p className="mt-1 text-body-sm text-muted-foreground">
             {summary ? rangeLabel(summary) : "Loading…"} ·{" "}
             {refreshing ? "refreshing…" : "live"}
@@ -351,14 +351,14 @@ export function UsageSection() {
       </div>
 
       {error && (
-        <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive">
           Failed to load usage: {error}
         </p>
       )}
 
       {summary === null ? (
         !error && (
-          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
             Loading usage…
           </div>

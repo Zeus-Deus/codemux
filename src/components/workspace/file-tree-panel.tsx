@@ -74,7 +74,7 @@ const TreeNode = memo(function TreeNode({
   const children = dirContents.get(entry.path);
 
   const row =
-    "flex h-[22px] w-full items-center gap-1.5 rounded-[5px] pr-1.5 text-left text-xs transition-colors duration-[120ms]";
+    "flex h-[22px] w-full items-center gap-1.5 rounded-[5px] pr-1.5 text-left text-label transition-colors duration-[120ms]";
 
   if (entry.is_dir) {
     return (
@@ -242,7 +242,7 @@ export function FileTreePanel({
             />
           ))}
           {rootEntries.length === 0 && (
-            <p className="py-8 text-center text-xs text-foreground/40">No files</p>
+            <p className="py-8 text-center text-label text-foreground/40">No files</p>
           )}
         </div>
       </ScrollArea>

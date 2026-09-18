@@ -539,7 +539,7 @@ export const SidebarRailDrafts = memo(function SidebarRailDrafts(props: {
                 </span>
               </button>
             </TooltipTrigger>
-            <TooltipContent side="right" className="max-w-64 text-xs">
+            <TooltipContent side="right" className="max-w-64 text-label">
               <div className="font-semibold">Draft · {row.project.name}</div>
               <div className="mt-0.5 truncate text-muted-foreground">
                 {row.preview}

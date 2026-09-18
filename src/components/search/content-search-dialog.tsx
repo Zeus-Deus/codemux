@@ -153,7 +153,7 @@ export function ContentSearchDialog() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search in files..."
-            className="h-9 text-sm"
+            className="h-9 text-body"
           />
           <div className="flex items-center gap-1">
             <Button
@@ -184,7 +184,7 @@ export function ContentSearchDialog() {
 
         <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto px-1.5 pb-1.5">
           {!query.trim() && (
-            <p className="text-xs text-muted-foreground text-center py-8">
+            <p className="text-label text-muted-foreground text-center py-8">
               Type to search across files
             </p>
           )}
@@ -194,7 +194,7 @@ export function ContentSearchDialog() {
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (
-            <p className="text-xs text-muted-foreground text-center py-8">
+            <p className="text-label text-muted-foreground text-center py-8">
               No results found
             </p>
           )}
@@ -229,7 +229,7 @@ export function ContentSearchDialog() {
               <div key={group.filePath} className="mb-1">
                 <div className="flex items-center gap-1.5 px-2 py-1 sticky top-0 bg-card z-10">
                   <FileCode className="h-3 w-3 shrink-0 text-muted-foreground" />
-                  <span className="text-xs text-muted-foreground truncate">{group.filePath}</span>
+                  <span className="text-label text-muted-foreground truncate">{group.filePath}</span>
                   <span className="text-caption text-muted-foreground/50 shrink-0">
                     ({group.matches.length})
                   </span>

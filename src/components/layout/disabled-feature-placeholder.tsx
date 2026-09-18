@@ -44,8 +44,8 @@ export function DisabledFeaturePlaceholder({
           <Sparkles className="size-5 text-warning" />
         </div>
         <div className="space-y-1.5">
-          <h3 className="text-sm font-medium">{feature} is disabled</h3>
-          <p className="text-xs text-muted-foreground leading-relaxed">
+          <h3 className="text-body font-medium">{feature} is disabled</h3>
+          <p className="text-label text-muted-foreground leading-relaxed">
             {description}
           </p>
         </div>

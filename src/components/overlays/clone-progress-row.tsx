@@ -23,7 +23,7 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
 
   return (
     <div className={cn("space-y-1.5", className)}>
-      <div className="flex items-center justify-between gap-2 text-xs">
+      <div className="flex items-center justify-between gap-2 text-label">
         <span className="font-medium text-foreground">{phase}…</span>
         {determinate && (
           <span className="font-mono text-muted-foreground">{percent}%</span>

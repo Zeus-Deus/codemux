@@ -138,12 +138,12 @@ export function SessionHistoryList({
       {footerItem}
       <DropdownMenuSeparator />
       {loading && sessions.length === 0 && (
-        <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+        <div className="px-2 py-4 text-center text-label text-muted-foreground">
           Loading…
         </div>
       )}
       {!loading && sessions.length === 0 && (
-        <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+        <div className="px-2 py-4 text-center text-label text-muted-foreground">
           No previous chats
         </div>
       )}
@@ -200,7 +200,7 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
       )}
       data-testid={`session-row-${session.thread_id}`}
     >
-      <span className="flex-1 truncate text-xs">
+      <span className="flex-1 truncate text-label">
         {sessionDisplayTitle(session)}
       </span>
       <button

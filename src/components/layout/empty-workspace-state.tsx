@@ -41,7 +41,7 @@ function ActionRow({ icon, label, keys, onClick }: ActionRowProps) {
     <button
       type="button"
       onClick={onClick}
-      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-muted-foreground/80 transition-colors hover:bg-muted/60 hover:text-foreground"
+      className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-body text-muted-foreground/80 transition-colors hover:bg-muted/60 hover:text-foreground"
     >
       <span className="rounded p-1 text-muted-foreground/70 transition-colors group-hover:text-foreground">
         {icon}
@@ -191,7 +191,7 @@ export function EmptyWorkspaceState() {
           <button
             type="button"
             onClick={handleDeleteWorkspace}
-            className="flex items-center gap-1.5 text-xs text-muted-foreground/40 transition-colors hover:text-muted-foreground"
+            className="flex items-center gap-1.5 text-label text-muted-foreground/40 transition-colors hover:text-muted-foreground"
           >
             <Trash2 className="h-3 w-3" />
             {canRemoveWorktree ? "Delete workspace" : "Close workspace"}

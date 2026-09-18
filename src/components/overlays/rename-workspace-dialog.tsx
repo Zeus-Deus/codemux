@@ -251,7 +251,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
                 autoComplete="off"
                 spellCheck={false}
                 placeholder="add-gpt5-benchmark-runs"
-                className="h-6 min-w-0 flex-1 border-0 bg-transparent p-0 text-sm tracking-[-0.005em] text-foreground outline-none placeholder:text-muted-foreground/60 selection:bg-accent-ember/40"
+                className="h-6 min-w-0 flex-1 border-0 bg-transparent p-0 text-body tracking-[-0.005em] text-foreground outline-none placeholder:text-muted-foreground/60 selection:bg-accent-ember/40"
               />
               {name.length > 0 && (
                 <button

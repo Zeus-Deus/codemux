@@ -329,7 +329,7 @@ function PaneNodeImpl({
           {showTerminalContext && (
             <span
               className={cn(
-                "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-xs shadow-sm ring-1 ring-border/30 backdrop-blur-md",
+                "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-label shadow-sm ring-1 ring-border/30 backdrop-blur-md",
                 isActive
                   ? "bg-card/70 text-muted-foreground"
                   : "bg-background/65 text-muted-foreground/70",
@@ -472,7 +472,7 @@ function PaneNodeImpl({
           className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
-          <span className="flex-1 truncate text-xs text-muted-foreground">
+          <span className="flex-1 truncate text-label text-muted-foreground">
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">

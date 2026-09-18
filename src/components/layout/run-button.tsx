@@ -110,7 +110,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               type="button"
               onClick={isConfigured ? handleRun : handleConfigure}
               className={cn(
-                "flex h-7 items-center gap-1.5 px-2 text-xs font-semibold text-foreground",
+                "flex h-7 items-center gap-1.5 px-2 text-label font-semibold text-foreground",
                 BAND_CONTROL_RADIUS,
                 BAND_CONTROL_HOVER,
                 !isConfigured && "text-muted-foreground",

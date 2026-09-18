@@ -321,7 +321,7 @@ export function CreatePrForm({
             <SelectContent>
               {(branches.includes(baseBranch) ? branches : [baseBranch, ...branches]).map(
                 (branch) => (
-                  <SelectItem key={branch} value={branch} className="font-mono text-xs">
+                  <SelectItem key={branch} value={branch} className="font-mono text-label">
                     {branch}
                   </SelectItem>
                 ),

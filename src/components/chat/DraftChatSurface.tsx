@@ -1274,7 +1274,7 @@ function DraftSurfaceHeader() {
       className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-background px-1.5"
       data-testid="draft-surface-header"
     >
-      <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
+      <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>
     </header>
   );
 }

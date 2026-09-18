@@ -163,7 +163,7 @@ export function ComposerCommandMenu({
         )}
         <CommandPrimitive.List className="max-h-[340px] overflow-x-hidden overflow-y-auto p-1.5 outline-none">
           {items.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+            <div className="px-3 py-6 text-center text-label text-muted-foreground">
               No matches
             </div>
           ) : (

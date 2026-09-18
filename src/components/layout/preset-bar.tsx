@@ -533,7 +533,7 @@ function PresetButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+      <TooltipContent side="bottom" sideOffset={4} className="text-label">
         {tooltip}
       </TooltipContent>
     </Tooltip>
