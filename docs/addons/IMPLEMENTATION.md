@@ -30,6 +30,15 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- Full desktop [CI at `3045f47f`](https://github.com/Zeus-Deus/codemux/actions/runs/35376157828)
+  passes on Linux and Windows, including 5,610 frontend tests on Linux. The same
+  revision passes [all installer payload checks](https://github.com/Zeus-Deus/codemux/actions/runs/35376157749):
+  Linux deb/AppImage and Windows NSIS. Maximum observed fault latencies are
+  1007.0 ms and 1014.7 ms respectively. Recorded [Linux](evidence/packaged-linux-3045.json)
+  and [Windows](evidence/packaged-windows-3045.json) results include source-run
+  provenance. Subsequent CI harness changes do not change production app code;
+  native desktop UI acceptance remains separate and pending.
+
 - PR 1 hosted CI: Linux and Windows GNU host, manifest contracts, SDK callback
   integration all passed. Schema comparison normalizes Windows CRLF only.
 - Protocol: 14 focused tests pass, including atomic malformed UI rejection,
@@ -191,18 +200,11 @@ service are explicit fixture seams.
 
 - Stock built-app E2E for both examples, including real frontend/native IPC,
   actual controlled draft insertion and core UI operation during hostile plugins.
-- Latest-commit packaged rerun after the final integration follow-ups. Linux
-  AppImage/deb and Windows NSIS payload behavior passed on recorded revisions;
-  stock desktop GUI launch and integration still require separate evidence.
 - Complete failure-injection matrix: disk-full boundaries, every journal/crash
   point, unexpected child exit/ignored shutdown, concurrent update/uninstall,
   and delayed workspace/thread/composer races through the actual desktop. Native
   update/uninstall serialization and dropped Git requests are covered, but those
   do not establish all installed-app race cases.
-- Latest-commit hosted native checks after the cancellation and concurrency
-  follow-ups. Native TLS, recovery and OS credential checks have passed on both
-  platforms; installed-app cancellation races and external network behavior
-  remain part of desktop E2E.
 - Complete keyboard/screen-reader, light/dark, small-window, chat-GUI-off and
   core pane restoration evidence; measured runtime fault and UI budgets with
   hardware/workload details.

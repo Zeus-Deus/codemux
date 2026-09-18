@@ -11,6 +11,12 @@ on:
         description: Packaged add-on workflow run containing the installer input artifacts
         required: true
         type: string
+      platform:
+        description: Run either ready installer artifact, or both platforms
+        required: true
+        type: choice
+        default: both
+        options: [both, Linux, Windows]
 permissions:
   contents: read
   actions: read
@@ -40,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]
+        os: ${{ inputs.platform == 'Linux' && fromJSON('["ubuntu-22.04"]') || inputs.platform == 'Windows' && fromJSON('["windows-latest"]') || fromJSON('["ubuntu-22.04", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:

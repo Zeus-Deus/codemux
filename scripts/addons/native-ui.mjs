@@ -384,7 +384,9 @@ try {
     await hasText("draft-context.txt");
   });
   await step("05-project-brief-real-draft", async () => {
-    await type("textarea", "Existing draft <literal>\n");
+    // WebDriver translates a newline to Enter; never send a submit key. The
+    // plugin itself appends its multiline text through the real draft adapter.
+    await type("textarea", "Existing draft <literal> ");
     await clickText("Add to draft");
     await until("literal draft appended", () =>
       script(
