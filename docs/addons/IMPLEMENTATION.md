@@ -33,6 +33,25 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- Native pane restoration, no empty accessory/footer spacing, credential
+  removal/redaction and paired remote denial now all pass on
+  [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35396542696) and
+  [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35396547958).
+  Both preserve the same core pane order and activate a core pane after pause
+  and removal. The Windows run verifies actual OS credential save and deletion;
+  Linux verifies missing-service failure followed by explicit session-only
+  fallback. Warning-only driver logging passes the same secret scan.
+  [Linux provenance](evidence/native-ui-linux-panes-312321e3.json) and
+  [Windows provenance](evidence/native-ui-windows-panes-da835efb.json) retain the
+  exact saved installer and harness revisions. Final-source repeat remains.
+
+- `prepare-release.mjs` builds the SDK/CLI tarballs and both example packages
+  from a committed export in a fresh directory outside the app checkout.
+  The local four-asset preparation at `1e628eec` passes type/build/package checks,
+  repeat-pack byte identity and every SHA256SUMS entry. No distribution is
+  published. [Release instructions](RELEASING.md) explain the review/provenance,
+  normal authorized publication and website catalog pinning sequence.
+
 - The expanded [Linux installed-app run](https://github.com/Zeus-Deus/codemux/actions/runs/35395837249)
   passes on the newer `312321e3` installer, including masked credential entry,
   missing Secret Service with explicit session-only fallback, removal/redaction,
@@ -43,7 +62,7 @@ publication and Settings remain separate deliverables.
   restart, GUI-off and corrupt-registry checks. This is a saved installer, not
   the final source. Windows passed OS credential save/delete and remote checks,
   but verbose WebDriver logging captured its synthetic SendKeys value; the
-  harness now uses warning-only diagnostics and its redaction rerun is pending.
+  harness now uses warning-only diagnostics; its later successful rerun is recorded above.
 
 - Final-source Windows CI at `ff086c77` exposed a private SQLite file handle
   surviving runtime stop while an activation caller retained `Arc<Running>`.
