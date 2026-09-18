@@ -90,6 +90,7 @@ import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN } from "./chat-column";
 import { randomUUID } from "@/lib/uuid";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -1263,18 +1264,19 @@ function DraftPendingConversation({
 
 /**
  * Placeholder chrome that matches AgentChatPaneHeader's visual band
- * (h-7 border-b) so the draft surface doesn't look "naked" next to a
+ * (the shared inline PanelHeader) so the draft surface doesn't look
+ * "naked" next to a
  * materialized pane. Drafts have no session yet, so the session
  * selector / split / close controls from the real pane header don't
  * apply — we only borrow the silhouette.
  */
 function DraftSurfaceHeader() {
   return (
-    <header
-      className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-background px-1.5"
+    <PanelHeader
+      className="gap-1 bg-background px-1.5"
       data-testid="draft-surface-header"
     >
       <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>
-    </header>
+    </PanelHeader>
   );
 }

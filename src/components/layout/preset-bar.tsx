@@ -57,6 +57,7 @@ import type {
   TerminalPreset,
 } from "@/tauri/types";
 import { toast } from "@/lib/toast";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /** Translate a "drop position N in the pinned-only bar" into the
  *  splice index inside the GLOBAL preset Vec the backend stores.
@@ -387,9 +388,9 @@ function PresetBarImpl({
   const requestNewPreset = useUIStore.getState().requestNewPreset;
 
   return (
-    <div
+    <PanelHeader
       ref={scrollerRef}
-      className="flex items-center h-8 border-b border-border bg-background px-2 gap-0.5 shrink-0 overflow-x-auto"
+      className="bg-background px-2 gap-0.5 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
     >
       {/* Settings gear */}
@@ -486,7 +487,7 @@ function PresetBarImpl({
           <RunButton workspaceId={workspaceId} />
         </>
       )}
-    </div>
+    </PanelHeader>
   );
 }
 

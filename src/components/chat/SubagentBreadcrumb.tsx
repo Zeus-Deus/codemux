@@ -7,6 +7,7 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type { SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /**
  * Breadcrumb sub-header shown while a subagent drill-in is open (design
@@ -30,10 +31,10 @@ export function SubagentBreadcrumb({
   const label = subagentStatusLabel(subagent);
 
   return (
-    <div
+    <PanelHeader
       data-testid="subagent-breadcrumb"
       className={cn(
-        "flex h-9 shrink-0 items-center gap-2.5 border-b border-border/60 bg-card px-3",
+        "gap-2.5 bg-card px-3",
         // Under the floating titlebar (a lone chat tab), start below its
         // 40px band. Otherwise the band's tabs and actions cover this row.
         "[[data-under-titlebar=true]_&]:mt-10",
@@ -87,6 +88,6 @@ export function SubagentBreadcrumb({
         )}
         {label}
       </span>
-    </div>
+    </PanelHeader>
   );
 }

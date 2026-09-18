@@ -25,6 +25,7 @@ import {
 } from "@/lib/source-control";
 import { cn } from "@/lib/utils";
 import { tzBody, tzEyebrow, tzMeta, tzRowTitle } from "./review-ui";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 // ── Module-level cache ──
 //
@@ -324,7 +325,7 @@ export function IncomingPrsView({
 
   return (
     <div className="flex flex-col">
-      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+      <PanelHeader className="gap-0 pl-2.5 pr-1">
         <span className={cn("font-medium text-muted-foreground tracking-wide truncate", tzBody)}>
           {provider.nounTitleCase}s
         </span>
@@ -333,7 +334,7 @@ export function IncomingPrsView({
             {prs.length}
           </span>
         )}
-      </div>
+      </PanelHeader>
 
       <div className="px-1.5 pt-1.5 pb-3">
         {error && (
