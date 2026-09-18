@@ -786,14 +786,18 @@ describe("Composer", () => {
         "true",
       );
       fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      for (const command of ["queue", "steer", "interrupt"]) {
+        expect(getByTestId(`slash-item-delivery:${command}`)).toHaveAttribute("data-selected", "true");
+        fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      }
       // Wraps around to the top.
       expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
         "data-selected",
         "true",
       );
       fireEvent.keyDown(textarea, { key: "ArrowUp" });
-      // Wraps from top to bottom, landing on the last item (/model).
-      expect(getByTestId("slash-item-composer:model")).toHaveAttribute(
+      // Wraps from top to bottom, landing on the last delivery command.
+      expect(getByTestId("slash-item-delivery:interrupt")).toHaveAttribute(
         "data-selected",
         "true",
       );

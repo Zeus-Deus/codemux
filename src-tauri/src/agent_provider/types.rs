@@ -34,6 +34,23 @@ pub enum ProviderKind {
     OpenCode,
 }
 
+impl ProviderKind {
+    /// Only adapters with verified non-interrupting native input opt in.
+    pub fn supports_steering(self) -> bool {
+        matches!(self, Self::Codex | Self::OpenCode)
+    }
+}
+
+/// Codemux-owned delivery semantics, independent of provider slash commands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    #[default]
+    Queue,
+    Steer,
+    Interrupt,
+}
+
 /// Capabilities a provider declares statically so the UI can enable or hide
 /// controls without probing.
 ///
@@ -398,6 +415,9 @@ pub struct ChatModelInfo {
 /// client-side in a Zustand store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderChatCapabilities {
+    /// Native guidance during a turn without cancelling its tools.
+    #[serde(default)]
+    pub supports_steering: bool,
     /// Models the provider exposes, in the order they should be displayed.
     pub models: Vec<ChatModelInfo>,
     /// How the provider applies effort changes.
@@ -425,6 +445,9 @@ pub struct ProviderChatCapabilities {
 /// Result of a successful [`AgentProvider::send_turn`](super::AgentProvider::send_turn).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStartResult {
+    /// Accepted into an existing turn, rather than starting a new one.
+    #[serde(default)]
+    pub steered: bool,
     /// Provider-assigned turn identifier. Subsequent events for this turn
     /// reference it. For a **queued** send (see `queued_id`) this is an
     /// empty placeholder — no live turn exists yet; the real turn id

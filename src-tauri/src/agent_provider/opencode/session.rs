@@ -21,6 +21,7 @@
 //! 5. [`shutdown`](OpenCodeSession::shutdown) — abort the SSE task,
 //!    `DELETE /session/{id}`, emit `Closed` state.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -83,6 +84,9 @@ pub struct OpenCodeSession {
     /// `has_session` treats the corpse as absent and the next send rebuilds
     /// a fresh session via `ensure_live_session`.
     dead: Arc<AtomicBool>,
+    outbound: Mutex<()>,
+    queued: Mutex<VecDeque<(String, crate::agent_provider::SendTurnInput)>>,
+    queue_worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl OpenCodeSession {
@@ -223,6 +227,7 @@ impl OpenCodeSession {
             Some(carried) if did_resume => carried,
             _ => Arc::new(Mutex::new(OpenCodeUsageState::default())),
         };
+        let queue_events = event_tx.subscribe();
         let peer = SsePeer {
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
@@ -263,7 +268,7 @@ impl OpenCodeSession {
             status: SessionStatus::Ready,
         });
 
-        Ok(Arc::new(Self {
+        let session = Arc::new(Self {
             thread_id,
             provider_session_id,
             current_model: Mutex::new(initial_model),
@@ -276,7 +281,245 @@ impl OpenCodeSession {
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
             dead,
-        }))
+            outbound: Mutex::new(()),
+            queued: Mutex::new(VecDeque::new()),
+            queue_worker: Mutex::new(None),
+        });
+        session.start_queue_worker(queue_events).await;
+        Ok(session)
+    }
+
+    async fn start_queue_worker(
+        self: &Arc<Self>,
+        mut events: broadcast::Receiver<ProviderRuntimeEvent>,
+    ) {
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(session) = weak.upgrade() {
+                            session.drain_queue().await;
+                        }
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let Some(session) = weak.upgrade() else { break };
+                match event {
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id,
+                        status: SessionStatus::Ready,
+                    } if thread_id == session.thread_id => session.drain_queue().await,
+                    ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id,
+                        status: SessionStatus::Closed | SessionStatus::Error { .. },
+                    } if thread_id == session.thread_id => session.cancel_all_queued().await,
+                    _ => {}
+                }
+            }
+        });
+        *self.queue_worker.lock().await = Some(handle);
+    }
+
+    pub async fn enqueue_or_send(
+        &self,
+        input: crate::agent_provider::SendTurnInput,
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        if self.is_dead() {
+            return Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            });
+        }
+        if self.turn_active().await || !self.queued.lock().await.is_empty() {
+            let id = format!("opencode-queued-{}", Uuid::new_v4());
+            let text = input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| input.text.clone());
+            let client_nonce = input.client_nonce.clone();
+            self.queued.lock().await.push_back((id.clone(), input));
+            let _ = self.event_tx.send(ProviderRuntimeEvent::TurnQueued {
+                thread_id: self.thread_id.clone(),
+                queued_id: id.clone(),
+                client_nonce,
+                text,
+            });
+            return Ok(crate::agent_provider::TurnStartResult {
+                turn_id: TurnId(String::new()),
+                queued_id: Some(id),
+                steered: false,
+            });
+        }
+        self.dispatch_input(input, false).await
+    }
+
+    pub async fn steer_turn(
+        &self,
+        input: crate::agent_provider::SendTurnInput,
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        let _outbound = self.outbound.lock().await;
+        self.dispatch_input(input, true).await
+    }
+
+    async fn dispatch_input(
+        &self,
+        input: crate::agent_provider::SendTurnInput,
+        steer: bool,
+    ) -> Result<crate::agent_provider::TurnStartResult, ProviderError> {
+        if self.is_dead() {
+            return Err(ProviderError::SessionClosed {
+                thread_id: self.thread_id.clone(),
+            });
+        }
+        let steered = steer && self.turn_active().await;
+        let checkpoint = input.turn_checkpoint.as_ref().filter(|_| !steered);
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.prepare().await;
+        }
+        let result = self
+            .post_turn(
+                input.text,
+                input.images,
+                input.model_override,
+                input.effort_override,
+                steered,
+            )
+            .await;
+        match result {
+            Ok(turn_id) => {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.commit().await;
+                }
+                Ok(crate::agent_provider::TurnStartResult {
+                    turn_id,
+                    queued_id: None,
+                    steered,
+                })
+            }
+            Err(error) => {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.abort().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn drain_queue(&self) {
+        let _outbound = self.outbound.lock().await;
+        if self.is_dead() {
+            self.cancel_all_queued().await;
+            return;
+        }
+        while !self.turn_active().await {
+            let Some((id, input)) = self.queued.lock().await.pop_front() else {
+                return;
+            };
+            let text = input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| input.text.clone());
+            match self.dispatch_input(input, false).await {
+                Ok(result) => {
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                            steered: false,
+                            thread_id: self.thread_id.clone(),
+                            queued_id: id,
+                            turn_id: result.turn_id,
+                            text,
+                        });
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(self.thread_id.clone()),
+                        message: format!("Queued message failed: {error}"),
+                        original_payload: None,
+                    });
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                            thread_id: self.thread_id.clone(),
+                            queued_id: id,
+                        });
+                }
+            }
+        }
+    }
+
+    pub async fn cancel_queued(&self, id: &str) -> bool {
+        let _outbound = self.outbound.lock().await;
+        let mut queue = self.queued.lock().await;
+        let Some(index) = queue.iter().position(|(key, _)| key == id) else {
+            return false;
+        };
+        queue.remove(index);
+        let _ = self
+            .event_tx
+            .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(),
+                queued_id: id.into(),
+            });
+        true
+    }
+
+    async fn cancel_all_queued(&self) {
+        for (id, _) in self.queued.lock().await.drain(..) {
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: id,
+                });
+        }
+    }
+
+    pub async fn send_queued_now(&self, id: &str, steer: bool) -> Result<(), ProviderError> {
+        let outbound = self.outbound.lock().await;
+        let input = self
+            .queued
+            .lock()
+            .await
+            .iter()
+            .find(|(key, _)| key == id)
+            .map(|(_, input)| input.clone());
+        let Some(input) = input else { return Ok(()) };
+        if steer {
+            let text = input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| input.text.clone());
+            let result = self.dispatch_input(input, true).await?;
+            self.queued.lock().await.retain(|(key, _)| key != id);
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                    steered: result.steered,
+                    thread_id: self.thread_id.clone(),
+                    queued_id: id.into(),
+                    turn_id: result.turn_id,
+                    text,
+                });
+        } else {
+            // Keep the queue unchanged if the abort fails. The outbound lock
+            // prevents the completion worker from draining before promotion.
+            if self.turn_active().await {
+                self.interrupt().await?;
+            }
+            let mut queue = self.queued.lock().await;
+            if let Some(index) = queue.iter().position(|(key, _)| key == id) {
+                let item = queue.remove(index).unwrap();
+                queue.push_front(item);
+            }
+        }
+        drop(outbound);
+        self.drain_queue().await;
+        Ok(())
     }
 
     /// Whether the SSE listener has declared this session's server
@@ -311,17 +554,18 @@ impl OpenCodeSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
-        let turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
-        // Swap the turn id into the routing context up front so SSE events for
-        // this turn tag correctly — but DO NOT arm `turn_active` yet. Arming is
-        // deferred until the POST succeeds: a failed `prompt_async` means no
-        // turn ever started, so a later SSE give-up must not synthesize a
-        // `child_exited` completion for a phantom turn.
-        {
-            let mut ctx = self.event_ctx.lock().await;
-            ctx.turn_id = turn_id.clone();
-        }
+        self.post_turn(text, images, model_override, effort_override, false)
+            .await
+    }
 
+    async fn post_turn(
+        &self,
+        text: String,
+        images: Vec<ImageInput>,
+        model_override: Option<String>,
+        effort_override: Option<String>,
+        steer: bool,
+    ) -> Result<TurnId, ProviderError> {
         let model = match model_override {
             Some(m) => Some(m),
             None => self.current_model.lock().await.clone(),
@@ -333,9 +577,26 @@ impl OpenCodeSession {
             Some(v) => Some(v),
             None => self.current_variant.lock().await.clone(),
         };
-        let body =
-            build_prompt_async_request(text, model.as_deref(), variant.as_deref(), &images)
-                .map_err(|err| ProviderError::ValidationError { message: err })?;
+        let body = build_prompt_async_request(text, model.as_deref(), variant.as_deref(), &images)
+            .map_err(|err| ProviderError::ValidationError { message: err })?;
+        let turn_id = {
+            let mut ctx = self.event_ctx.lock().await;
+            if !steer {
+                ctx.turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
+            }
+            ctx.turn_active = true;
+            ctx.turn_id.clone()
+        };
+        if !steer {
+            let _ = self
+                .event_tx
+                .send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Running {
+                        active_turn: turn_id.clone(),
+                    },
+                });
+        }
         let url = format!(
             "{}/session/{}/prompt_async",
             self.server_handle.base_url.trim_end_matches('/'),
@@ -353,7 +614,15 @@ impl OpenCodeSession {
             Err(err) => {
                 // POST never landed — make sure the give-up path stays disarmed
                 // (defensive against a stale prior arm) and surface the error.
-                self.event_ctx.lock().await.turn_active = false;
+                if !steer {
+                    self.event_ctx.lock().await.turn_active = false;
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::SessionStateChanged {
+                            thread_id: self.thread_id.clone(),
+                            status: SessionStatus::Ready,
+                        });
+                }
                 return Err(ProviderError::RpcError {
                     message: format!("prompt_async_send_failed: {err}"),
                 });
@@ -361,7 +630,15 @@ impl OpenCodeSession {
         };
         let status = response.status();
         if !status.is_success() {
-            self.event_ctx.lock().await.turn_active = false;
+            if !steer {
+                self.event_ctx.lock().await.turn_active = false;
+                let _ = self
+                    .event_tx
+                    .send(ProviderRuntimeEvent::SessionStateChanged {
+                        thread_id: self.thread_id.clone(),
+                        status: SessionStatus::Ready,
+                    });
+            }
             let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::RpcError {
                 message: format!(
@@ -370,16 +647,8 @@ impl OpenCodeSession {
                 ),
             });
         }
-        // POST accepted — NOW arm the give-up path: a turn is genuinely in
-        // flight, so if the SSE listener exhausts its reconnect budget before
-        // this turn settles it must synthesize a `child_exited` `TurnCompleted`.
-        self.event_ctx.lock().await.turn_active = true;
-        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: self.thread_id.clone(),
-            status: SessionStatus::Running {
-                active_turn: turn_id.clone(),
-            },
-        });
+        // SSE may already have completed the turn before this HTTP response.
+        // Never re-arm it here. A steer retains the active turn's identity.
         Ok(turn_id)
     }
 
@@ -505,6 +774,11 @@ impl OpenCodeSession {
     /// Tear down the session. Aborts the SSE task, deletes the
     /// OpenCode-side session, and emits the closed state.
     pub async fn shutdown(&self) {
+        self.dead.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.queue_worker.lock().await.take() {
+            worker.abort();
+        }
+        self.cancel_all_queued().await;
         if let Some(handle) = self.sse_handle.lock().await.take() {
             handle.abort();
         }
@@ -699,6 +973,135 @@ mod tests {
     use crate::agent_provider::types::{ImageInput, ThreadId};
     use mockito::Server;
 
+    fn delivery_input(text: &str) -> crate::agent_provider::SendTurnInput {
+        crate::agent_provider::SendTurnInput {
+            thread_id: ThreadId("thread-1".into()),
+            text: text.into(),
+            display_text: None,
+            images: vec![],
+            skill_invocations: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: Some(text.into()),
+            turn_checkpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_queue_waits_and_steer_keeps_running_turn() {
+        let mut server = Server::new_async().await;
+        let post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(204)
+            .expect(2)
+            .create_async()
+            .await;
+        let abort = server
+            .mock("POST", "/session/sess_1/abort")
+            .expect(0)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        let original = session
+            .enqueue_or_send(delivery_input("Build"))
+            .await
+            .unwrap();
+        let queued = session
+            .enqueue_or_send(delivery_input("Later"))
+            .await
+            .unwrap();
+        assert!(queued.queued_id.is_some());
+        let guidance = session
+            .steer_turn(delivery_input("Correction"))
+            .await
+            .unwrap();
+        assert!(guidance.steered);
+        assert_eq!(guidance.turn_id, original.turn_id);
+        assert!(session.turn_active().await);
+        assert_eq!(session.queued.lock().await.len(), 1);
+        assert!(
+            session
+                .cancel_queued(queued.queued_id.as_ref().unwrap())
+                .await
+        );
+        assert!(
+            !session
+                .cancel_queued(queued.queued_id.as_ref().unwrap())
+                .await
+        );
+        post.assert_async().await;
+        abort.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_failed_queued_steer_preserves_message_and_active_turn() {
+        let mut server = Server::new_async().await;
+        let post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .with_status(500)
+            .create_async()
+            .await;
+        let (session, _, _) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        let queued = session
+            .enqueue_or_send(delivery_input("Keep me"))
+            .await
+            .unwrap();
+        assert!(session
+            .send_queued_now(queued.queued_id.as_ref().unwrap(), true)
+            .await
+            .is_err());
+        assert_eq!(session.queued.lock().await.len(), 1);
+        assert!(session.turn_active().await);
+        post.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_completion_drains_fifo() {
+        let mut server = Server::new_async().await;
+        let post = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"parts":[{"type":"text","text":"First"}]}),
+            ))
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let (session, tx, mut rx) = mock_session(server.url(), "pw".into(), "sess_1").await;
+        session.event_ctx.lock().await.turn_active = true;
+        let first = session
+            .enqueue_or_send(delivery_input("First"))
+            .await
+            .unwrap();
+        session
+            .enqueue_or_send(delivery_input("Second"))
+            .await
+            .unwrap();
+        session.event_ctx.lock().await.turn_active = false;
+        let _ = tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: session.thread_id.clone(),
+            status: SessionStatus::Ready,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let ProviderRuntimeEvent::QueuedTurnDispatched {
+                    queued_id, steered, ..
+                } = rx.recv().await.unwrap()
+                {
+                    assert_eq!(Some(queued_id), first.queued_id);
+                    assert!(!steered);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.queued.lock().await.len(), 1);
+        post.assert_async().await;
+    }
+
     #[tokio::test]
     async fn attaches_shared_gateway_through_opencode_runtime_api() {
         let mut server = Server::new_async().await;
@@ -879,7 +1282,11 @@ mod tests {
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
             dead: Arc::new(AtomicBool::new(false)),
+            outbound: Mutex::new(()),
+            queued: Mutex::new(VecDeque::new()),
+            queue_worker: Mutex::new(None),
         });
+        session.start_queue_worker(tx.subscribe()).await;
         (session, tx, rx)
     }
 

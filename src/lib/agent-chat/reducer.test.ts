@@ -2948,6 +2948,32 @@ describe("agent-chat reducer — interim turn ends (provider yields on backgroun
   });
 });
 
+describe("steering transcript semantics", () => {
+  it("marks guidance inside the running turn and deduplicates live/replayed envelopes", () => {
+    const running = applyEvent(createEmptyThreadState(), { type: "session_state_changed", thread_id: "t1", status: { status: "running", active_turn: "turn1" } });
+    const event: ProviderRuntimeEvent = { type: "user_message", thread_id: "t1", text: "Use SQLite", client_nonce: "guidance1", steered_turn_id: "turn1" };
+    const next = applyEvent(running, event);
+    const replayed = applyEvent(next, event);
+    expect(replayed.messages).toHaveLength(1);
+    expect(replayed.messages[0]).toMatchObject({ kind: "user_message", inflight: true, turn_id: "turn1", text: "Use SQLite" });
+    expect(replayed.streaming).toBe(true);
+    expect(replayed.nextSeq).toBe(next.nextSeq);
+  });
+});
+
+it("moves queued guidance to its delivery position even when the persisted envelope arrives first", () => {
+  const queued = applyEvent(createEmptyThreadState(), { type: "turn_queued", thread_id: "t1", queued_id: "q1", client_nonce: "n1", text: "Correction" });
+  const later = applyEvent(queued, { type: "content_delta", thread_id: "t1", turn_id: "turn1", delta: { kind: "text", text: "Still working" } });
+  const envelope: ProviderRuntimeEvent = { type: "user_message", thread_id: "t1", text: "Correction", client_nonce: "n1", steered_turn_id: "turn1" };
+  const guided = applyEvent(later, envelope);
+  const message = guided.messages.find((item) => item.kind === "user_message") as UserMessageItem;
+  expect(message.queued).toBeUndefined();
+  expect(message.seq).toBe(later.nextSeq);
+  expect(message.inflight).toBe(true);
+  const dispatched = applyEvent(guided, { type: "queued_turn_dispatched", thread_id: "t1", queued_id: "q1", text: "Correction", turn_id: "turn1", steered: true });
+  expect(dispatched.messages).toEqual(guided.messages);
+  expect(dispatched.nextSeq).toBe(guided.nextSeq);
+});
 
 describe("context compaction activity", () => {
   const compaction: ProviderRuntimeEvent = {

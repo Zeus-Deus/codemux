@@ -1092,6 +1092,7 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       expect.anything(),
       "thread-x",
       "q-1",
+      "interrupt",
     );
   });
 
@@ -1250,11 +1251,16 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
   it("keeps the parent-bound composer mounted while entered", () => {
     const { container } = render(<AgentChatPane pane={pane} />);
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    const region = () => container.querySelector('[data-testid="composer"]')!.parentElement!;
+    expect(region()).toHaveClass("absolute");
     fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
     // Drill-in swaps the transcript body but the composer stays parent-bound
     // (design: "steering goes to the orchestrator").
     expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    expect(region()).not.toHaveClass("absolute");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(region()).toHaveClass("absolute");
   });
 
   it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", () => {
@@ -3828,5 +3834,30 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     await Promise.resolve();
     expect(setHasDebugActivityMock).not.toHaveBeenCalled();
     expect(setDebugActivityResolvedMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("GUI delivery commands", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    setInputDraftMock.mockClear();
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
+  });
+  it.each(["queue", "steer", "interrupt"])("sends /%s as delivery metadata, not provider prompt text", async (delivery) => {
+    currentSliceOverrides = { "thread-x": { inputDraft: `/${delivery} Use SQLite` } };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(agentChatSendTurn).toHaveBeenCalledOnce());
+    expect(vi.mocked(agentChatSendTurn).mock.calls[0][1]).toMatchObject({ delivery, text: "Use SQLite", display_text: "Use SQLite" });
+  });
+  it("restores the complete delivery command on provider rejection", async () => {
+    currentSliceOverrides = { "thread-x": { inputDraft: "/steer Use SQLite" } };
+    vi.mocked(agentChatSendTurn).mockRejectedValueOnce(new Error("Delivery rejected"));
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(setInputDraftMock).toHaveBeenCalledWith("thread-x", "/steer Use SQLite"));
   });
 });

@@ -4785,6 +4785,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            prs: Vec::new(),
             base_branch: None,
             provider_kind: None,
             linked_issue: None,

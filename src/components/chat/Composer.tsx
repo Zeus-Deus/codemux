@@ -1,5 +1,7 @@
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
+import { MESSAGE_DELIVERY_OPTIONS, parseMessageDelivery, STEERING_UNAVAILABLE, withMessageDelivery } from "@/lib/agent-chat/message-delivery";
 import {
+  BookOpen,
   Bug,
   CircleCheck,
   CircleDot,
@@ -16,6 +18,7 @@ import {
   RotateCw,
   Server,
   Settings,
+  SquareSlash,
 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -24,6 +27,10 @@ import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 import { resolveProvider } from "@/lib/source-control";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
+import {
+  buildCommandRegistry,
+  parseLeadingCommand,
+} from "@/lib/agent-chat/command-tokens";
 import {
   ATTACHMENT_HARD_LIMIT,
   SESSION_ATTACHMENT_LIMIT,
@@ -38,7 +45,7 @@ import {
 import { parseSqliteTimestamp } from "@/lib/agent-chat/session-history";
 import { isChatModeSupported } from "@/lib/agent-chat/mode-compatibility";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
-import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
+import { skillsForProvider, skillTokenFor } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   buildModelCommand,
@@ -56,6 +63,7 @@ import {
 } from "@/lib/agent-chat/slash-commands";
 import type { Attachment, ChatMode } from "@/stores/agent-chat-store";
 import {
+  catalogueFollowsSession,
   selectProviderCommands,
   useProviderCommandsStore,
 } from "@/stores/provider-commands-store";
@@ -102,6 +110,7 @@ import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -158,6 +167,7 @@ interface Props {
   permissionModes: PermissionModeOption[] | null;
   ultrathinkInBodyText: boolean;
   streaming: boolean;
+  supportsSteering?: boolean;
   /** True while THIS composer's send RPC is in flight (before the
    *  backend acks). Blocks submit to avoid a double-send, but — unlike
    *  `streaming` — does not block queueing a follow-up. Defaults false. */
@@ -400,6 +410,7 @@ export function Composer({
   permissionModes,
   ultrathinkInBodyText,
   streaming,
+  supportsSteering = false,
   sending = false,
   interrupted = false,
   onContinueRun,
@@ -690,18 +701,8 @@ export function Composer({
   // textarea mutation happens inside `handleSlashSelect` based on the
   // item's id prefix. Modes still need their `onSelect` activator.
   const skillItems = useMemo(
-    () => buildSkillCommands({ skills, onInvoke: () => {} }),
+    () => buildSkillCommands({ skills: skills.filter((skill) => !["queue", "steer", "interrupt"].includes(skill.name.toLowerCase())), onInvoke: () => {} }),
     [skills],
-  );
-
-  // Highlight segments for the mirror overlay. Recomputed on every
-  // keystroke; cheap (one regex pass + map) for realistic draft sizes.
-  // Step 8 Stage 2.1 — folds attachment tokens into the same segment
-  // stream so `@filename` mentions render as inline chips alongside
-  // `/skill-name` highlights.
-  const highlightSegments = useMemo(
-    () => segmentDraftHighlight(draft, skills, stagedAttachments),
-    [draft, skills, stagedAttachments],
   );
 
   // ─── Provider slash commands (Claude Code built-ins + custom) ────
@@ -720,6 +721,11 @@ export function Composer({
   // Names already claimed by Codemux-local rows. A provider command
   // with a colliding name is dropped — the local behaviour (mode
   // pill, workflow, skill expansion) wins.
+  //
+  // What a skill reserves is the token the popup inserts for it, not
+  // its bare name. Two same-named skills are addressed by a qualified
+  // token, so the bare name goes unclaimed; reserving it anyway would
+  // hide a provider's own command behind a spelling nothing offers.
   const reservedCommandNames = useMemo(() => {
     const names = new Set<string>([
       "plan",
@@ -728,8 +734,11 @@ export function Composer({
       "default",
       "model",
       "workflow",
+      "queue", "steer", "interrupt",
     ]);
-    for (const skill of skills) names.add(skill.name.toLowerCase());
+    for (const skill of skills) {
+      names.add(skillTokenFor(skill, skills).slice(1).toLowerCase());
+    }
     return names;
   }, [skills]);
 
@@ -740,6 +749,40 @@ export function Composer({
         reservedNames: reservedCommandNames,
       }),
     [providerCommandsEntry.commands, reservedCommandNames],
+  );
+
+  // ─── Executable-command recognition ──────────────────────────────
+  // One registry shared by the inline highlight and the "runs on send"
+  // chip, so both agree on what counts as a real invocation. Provider
+  // commands Codemux intercepts locally (`/plan`, `/model`, …) are
+  // excluded the same way the popup excludes them — the text the user
+  // is left holding for those is prose, not a command.
+  const commandRegistry = useMemo(
+    () =>
+      buildCommandRegistry(
+        skills,
+        providerCommandsEntry.commands.filter(
+          (command) => !reservedCommandNames.has(command.name.toLowerCase()),
+        ),
+      ),
+    [skills, providerCommandsEntry.commands, reservedCommandNames],
+  );
+
+  // The command this draft will run on send, or null for a plain
+  // prompt. Drives the chip above the textarea.
+  const pendingCommand = useMemo(
+    () => parseLeadingCommand(draft, commandRegistry),
+    [draft, commandRegistry],
+  );
+
+  // Highlight segments for the mirror overlay. Recomputed on every
+  // keystroke; cheap (one regex pass + map) for realistic draft sizes.
+  // Step 8 Stage 2.1 — folds attachment tokens into the same segment
+  // stream so `@filename` mentions render as inline chips alongside
+  // `/skill-name` highlights.
+  const highlightSegments = useMemo(
+    () => segmentDraftHighlight(draft, skills, stagedAttachments, commandRegistry),
+    [draft, skills, stagedAttachments, commandRegistry],
   );
 
   // Provider-native commands are forwarded to the provider verbatim,
@@ -762,6 +805,12 @@ export function Composer({
       workflowCommand,
       modelCommand,
       ...skillItems,
+      ...(slashLeadsMessage ? MESSAGE_DELIVERY_OPTIONS.map((option): SlashCommandItem => ({
+        id: `delivery:${option.value}`, label: option.label, command: `/${option.value}`,
+        description: option.value === "steer" && streaming && !supportsSteering ? STEERING_UNAVAILABLE : option.description,
+        disabled: option.value === "steer" && streaming && !supportsSteering,
+        group: "MESSAGE DELIVERY", onSelect: () => {},
+      })) : []),
       ...(slashLeadsMessage ? providerCommandItems : []),
     ],
     [
@@ -771,6 +820,8 @@ export function Composer({
       skillItems,
       providerCommandItems,
       slashLeadsMessage,
+      streaming,
+      supportsSteering,
     ],
   );
 
@@ -835,13 +886,20 @@ export function Composer({
   // context) or explicit Esc.
   const slashOpen = slashAnchor !== null;
 
+  // A draft can open with a command without the popup ever having been
+  // opened — a paste, a restored draft, or a cursor moved past the
+  // token all land there. Discovery has to run in those paths too, or
+  // the command silently reads as prose right up until send.
+  const draftLeadsWithSlash = useMemo(() => /^\s*\//.test(draft), [draft]);
+  const commandsWanted = slashOpen || draftLeadsWithSlash;
+
   // First-open lazy load. The store guards against double-fetch via its
   // loaded + in-flight loading flags, so re-firing this effect on every
   // open is harmless and keeps the popup snappy after the initial scan.
   useEffect(() => {
-    if (!slashOpen) return;
+    if (!commandsWanted) return;
     void loadSkills(cwd ?? null);
-  }, [slashOpen, cwd, loadSkills, skillsGeneration]);
+  }, [commandsWanted, cwd, loadSkills, skillsGeneration]);
 
   // Do not restart the watcher when its events invalidate discovery. The
   // load effect above retries even while the popup stays open.
@@ -853,13 +911,18 @@ export function Composer({
   }, [slashOpen, cwd, includePluginSkills]);
 
   useEffect(() => {
-    if (!slashOpen) return;
-    // Provider command discovery rides the same first-open trigger. Grok can
-    // replace its ACP command snapshot while a session is running, so each
-    // popup reopen asks the backend cache for the latest value. Other
-    // providers retain the app-lifetime frontend cache.
-    void loadProviderCommands(provider, cwd ?? null, provider === "grok");
-  }, [slashOpen, cwd, loadProviderCommands, provider]);
+    if (!commandsWanted) return;
+    // Provider command discovery rides the same trigger. A session-fed
+    // catalogue is re-read every time the user enters command context,
+    // because the first read can predate the session that publishes it.
+    // The deps are booleans, so this runs on entering or leaving command
+    // context rather than on every keystroke.
+    void loadProviderCommands(
+      provider,
+      cwd ?? null,
+      catalogueFollowsSession(provider),
+    );
+  }, [commandsWanted, slashOpen, cwd, loadProviderCommands, provider]);
 
   // ─── Mention popup: debounced file fetch ─────────────────────────
   // Fires on every query change while the popup is open. The 100ms
@@ -2212,6 +2275,7 @@ export function Composer({
       if (
         item.id.startsWith("skill:") ||
         item.id.startsWith("provider-command:") ||
+        item.id.startsWith("delivery:") ||
         item.id === "workflow"
       ) {
         // Inline token expansion. Replace the typed `/<query>` with
@@ -2449,7 +2513,9 @@ export function Composer({
   // Stop button stays visible whenever a turn is active or a send is
   // mid-flight (`busy`).
   const busy = streaming || sending;
-  const canSubmit = !remoteDisconnected && sessionReady && !sending && draft.trim().length > 0;
+  const delivery = parseMessageDelivery(draft);
+  const steeringUnavailable = streaming && delivery.delivery === "steer" && !supportsSteering;
+  const canSubmit = !remoteDisconnected && sessionReady && !sending && delivery.text.length > 0 && !steeringUnavailable;
   // Subtle affordance so the user knows Enter will queue rather than
   // interrupt, shown only while a turn streams and there's text to send.
   const showQueueHint = streaming && draft.trim().length > 0;
@@ -2679,7 +2745,7 @@ export function Composer({
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
-      <div className={CHAT_COLUMN_INNER}>
+      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
@@ -2907,6 +2973,7 @@ export function Composer({
                 the `+ Mode` dropdown was retired in favour of the
                 unified `+` popup. */}
             {(mode !== "default" ||
+              pendingCommand !== null ||
               stagedAttachments.some(
                 (a) =>
                   a.kind === "image" ||
@@ -2918,6 +2985,45 @@ export function Composer({
                 data-testid="composer-attachment-strip"
                 className="flex flex-wrap gap-1.5 px-3 pt-2"
               >
+                {/* A leading `/name` the runtime will execute. The
+                    inline token in the mirror below can only carry
+                    colour — it shares character metrics with the
+                    textarea, so no icon or padding can go in there.
+                    This chip is where the invocation gets said out
+                    loud: icon, the literal command, and the registry's
+                    own one-liner. */}
+                {pendingCommand && (
+                  <span
+                    data-testid="composer-command-chip"
+                    data-command-kind={pendingCommand.kind}
+                    role="status"
+                    className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-accent-ember/15 px-2.5 py-1 text-label text-accent-ember"
+                  >
+                    {/* Same icon the popup row carried, so the chip is
+                        recognisably the thing the user just picked. */}
+                    {pendingCommand.kind === "skill" ? (
+                      <BookOpen className="size-3 shrink-0" aria-hidden />
+                    ) : (
+                      <SquareSlash className="size-3 shrink-0" aria-hidden />
+                    )}
+                    <span className="shrink-0 font-medium">
+                      Runs {pendingCommand.token}
+                    </span>
+                    {/* The argument placeholder only shows while the
+                        command is still bare, so a filled-in command
+                        doesn't keep nagging with a hint it satisfied. */}
+                    {!pendingCommand.args && pendingCommand.argumentHint && (
+                      <span className="shrink-0 opacity-60">
+                        {pendingCommand.argumentHint}
+                      </span>
+                    )}
+                    {pendingCommand.description && (
+                      <span className="truncate opacity-70">
+                        · {pendingCommand.description}
+                      </span>
+                    )}
+                  </span>
+                )}
                 {/* Dead-run recovery (issue #154): a one-click chip that
                     resumes the interrupted run. Amber-tinted, mirroring
                     ModePill's shape. */}
@@ -3035,11 +3141,33 @@ export function Composer({
                 )}
               >
                 {highlightSegments.map((seg, i) => {
-                  if (seg.kind === "skill") {
+                  if (seg.kind === "command") {
+                    // Fill and colour only. The mirror's glyph advances
+                    // have to match the textarea's exactly, so padding,
+                    // icons and even a heavier font-weight are off
+                    // limits — any of them drifts the caret off the
+                    // painted text.
                     return (
                       <span
                         key={i}
-                        className="text-status-working dark:text-status-working"
+                        data-testid={`composer-command-token-${seg.name}`}
+                        data-command-kind={seg.commandKind}
+                        className="rounded-sm bg-accent-ember/15 text-accent-ember"
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  }
+                  if (seg.kind === "skill") {
+                    // A skill named mid-prompt is still an invocation,
+                    // just not the leading one — same fill as the
+                    // command token so both read as "this runs", with
+                    // the chip above naming only the leading one.
+                    return (
+                      <span
+                        key={i}
+                        data-testid={`composer-skill-token-${seg.name}`}
+                        className="rounded-sm bg-accent-ember/15 text-accent-ember"
                       >
                         {seg.text}
                       </span>
@@ -3238,6 +3366,12 @@ export function Composer({
             permissionModes={permissionModes}
             ultrathinkInBodyText={ultrathinkInBodyText}
             streaming={busy}
+            delivery={delivery.delivery}
+            supportsSteering={supportsSteering}
+            onDeliveryChange={streaming ? (value) => {
+              onDraftChange(withMessageDelivery(draft, value));
+              requestAnimationFrame(() => textareaRef.current?.focus());
+            } : undefined}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
@@ -3271,7 +3405,7 @@ export function Composer({
                 </span>
               ) : showQueueHint ? (
                 <span className="truncate text-label leading-none text-muted-foreground/70">
-                  Enter to queue
+                  {steeringUnavailable ? "Steer unavailable" : `Enter to ${delivery.delivery}`}
                 </span>
               ) : null
             }

@@ -18,6 +18,7 @@ use crate::agent_provider::{
 };
 
 use crate::agent_provider::acp::session::{AcpDialect, AcpSession, AcpSpawnConfig};
+use crate::agent_provider::acp::slash_commands::AcpSlashCommandCache;
 
 #[derive(Debug, Clone)]
 pub struct CursorProviderConfig {
@@ -36,15 +37,24 @@ impl Default for CursorProviderConfig {
 
 pub struct CursorAgentProvider {
     config: CursorProviderConfig,
+    slash_command_cache: Arc<AcpSlashCommandCache>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<AcpSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
 
 impl CursorAgentProvider {
     pub fn new(config: CursorProviderConfig) -> Self {
+        Self::new_with_slash_command_cache(config, Arc::new(AcpSlashCommandCache::new()))
+    }
+
+    pub fn new_with_slash_command_cache(
+        config: CursorProviderConfig,
+        slash_command_cache: Arc<AcpSlashCommandCache>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity.max(16));
         Self {
             config,
+            slash_command_cache,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
         }
@@ -134,7 +144,7 @@ impl AgentProvider for CursorAgentProvider {
             AcpSpawnConfig {
                 binary: self.config.binary.clone(),
                 dialect: AcpDialect::Cursor,
-                grok_slash_command_cache: None,
+                slash_command_cache: Arc::clone(&self.slash_command_cache),
             },
             self.event_tx.clone(),
         )
@@ -173,10 +183,12 @@ impl AgentProvider for CursorAgentProvider {
         let session = self.session(&input.thread_id).await?;
         Ok(match session.enqueue_or_send(input).await? {
             SendOutcome::Started(turn_id) => TurnStartResult {
+                steered: false,
                 turn_id,
                 queued_id: None,
             },
             SendOutcome::Queued(queued_id) => TurnStartResult {
+                steered: false,
                 turn_id: TurnId(String::new()),
                 queued_id: Some(queued_id),
             },

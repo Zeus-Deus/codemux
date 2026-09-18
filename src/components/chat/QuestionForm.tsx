@@ -34,6 +34,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
@@ -316,7 +317,7 @@ export function QuestionForm({
   if (questions.length === 0) {
     return (
       <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
-        <div className={CHAT_COLUMN_INNER}>
+        <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
           <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3 text-label text-muted-foreground">
             AskUserQuestion with no questions.
           </div>
@@ -330,7 +331,7 @@ export function QuestionForm({
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
-      <div className={CHAT_COLUMN_INNER}>
+      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
         <div className="rounded-lg border border-border bg-muted/40 shadow-sm px-4 py-3">
           <Questionnaire
             ref={formRef}

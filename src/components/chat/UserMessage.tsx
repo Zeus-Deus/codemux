@@ -94,11 +94,9 @@ function useImageWithFallback(rawSrc: string): {
  *
  * Follow-up queueing: while `item.queued` is set the bubble renders
  * visually muted with a quiet "Queued" footer anchored to the bubble's
- * right edge. On hover or keyboard focus, two compact actions appear to the
- * footer's left without moving the status: "Send now" soft-interrupts the
- * active turn and dispatches this message immediately (keeping all progress),
- * while X cancels and restores the text into the composer. Both are handled
- * by the parent. All colors are theme tokens.
+ * right edge. Visible actions let the user steer where supported, explicitly
+ * interrupt and send, or cancel and restore the text into the composer.
+ * Delivery is handled by the parent. All colors are theme tokens.
  *
  * Settled turns get a footer strip under the bubble that fades in on hover or
  * keyboard focus, holding Copy (the original prompt back on the clipboard
@@ -111,12 +109,14 @@ export const UserMessage = memo(function UserMessage({
   item,
   onCancelQueued,
   onSendQueuedNow,
+  onSteerQueued,
   onRevert,
   reverting = false,
 }: {
   item: UserMessageItem;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onSendQueuedNow?: (queuedId: string) => void;
+  onSteerQueued?: (queuedId: string) => void;
   onRevert?: () => void;
   reverting?: boolean;
 }) {
@@ -161,16 +161,18 @@ export const UserMessage = memo(function UserMessage({
         </div>
         {queued ? (
           <div className="relative flex h-4 items-center justify-end pr-0.5">
-            <div className="pointer-events-none absolute right-full mr-1 flex h-4 translate-x-0.5 items-center gap-px opacity-0 transition-[opacity,transform] duration-100 group-focus-within:pointer-events-auto group-focus-within:translate-x-0 group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:translate-x-0 group-hover:opacity-100">
+            <div className="mr-2 flex items-center gap-2">
+              {onSteerQueued && <button type="button" aria-label="Steer with queued message" title="Guide the current task without stopping tools" onClick={() => onSteerQueued(queued.queuedId)} className="rounded-sm px-1 text-caption text-muted-foreground hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring">Steer</button>}
               {onSendQueuedNow ? (
                 <button
                   type="button"
-                  aria-label="Send now"
-                  title="Interrupt current work and send this message now — progress so far is kept"
+                  aria-label="Interrupt and send queued message"
+                  title="Stop current work and send this message"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors duration-150 hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                  className="inline-flex items-center gap-1 rounded-sm px-1 text-caption text-muted-foreground transition-colors duration-150 hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 >
                   <CornerDownLeft className="size-3" aria-hidden />
+                  Interrupt
                 </button>
               ) : null}
               {onCancelQueued ? (
@@ -190,6 +192,8 @@ export const UserMessage = memo(function UserMessage({
               Queued
             </span>
           </div>
+        ) : item.inflight && !item.in_reply_to ? (
+          <span className="text-caption text-muted-foreground" title="Guidance accepted within the current turn">Steered</span>
         ) : item.text || onRevert ? (
           // Shared footer strip. Revert stays anchored to the bubble's right
           // edge where it has always been, and Copy takes the slot to its

@@ -2228,3 +2228,144 @@ async fn async_question_lost_ack_is_uncertain_and_reconciles_after_reconnect() {
         .await
         .unwrap();
 }
+
+fn guidance_input(thread: &str, text: &str) -> SendTurnInput {
+    SendTurnInput {
+        thread_id: ThreadId(thread.into()),
+        text: text.into(),
+        display_text: None,
+        images: vec![],
+        skill_invocations: vec![],
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: Some(format!("nonce-{text}")),
+        turn_checkpoint: None,
+    }
+}
+
+#[tokio::test]
+async fn gui_steer_retains_turn_without_interrupt_or_second_start() {
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "running"),
+        ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("gui-steer"))
+        .await
+        .unwrap();
+    let original = provider
+        .send_turn(guidance_input("gui-steer", "Build"))
+        .await
+        .unwrap();
+    let steered = provider
+        .steer_turn(guidance_input("gui-steer", "Use SQLite"))
+        .await
+        .unwrap();
+    assert!(steered.steered);
+    assert_eq!(steered.turn_id, original.turn_id);
+    assert!(steered.queued_id.is_none());
+    let calls: Vec<serde_json::Value> = std::fs::read_to_string(trace.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "turn/start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["method"] == "turn/interrupt")
+            .count(),
+        0
+    );
+    let steer = calls
+        .iter()
+        .find(|call| call["method"] == "turn/steer")
+        .unwrap();
+    assert_eq!(steer["params"]["expectedTurnId"], original.turn_id.0);
+    assert_eq!(steer["params"]["input"][0]["text"], "Use SQLite");
+    assert_eq!(steer["params"]["clientUserMessageId"], "nonce-Use SQLite");
+}
+
+#[tokio::test]
+async fn gui_steer_completion_race_starts_one_followup_without_interrupt() {
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "race"),
+        ("FAKE_CODEX_TRACE", trace.path().to_str().unwrap()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("gui-race"))
+        .await
+        .unwrap();
+    provider
+        .send_turn(guidance_input("gui-race", "Build"))
+        .await
+        .unwrap();
+    let result = provider
+        .steer_turn(guidance_input("gui-race", "Correction"))
+        .await
+        .unwrap();
+    assert!(!result.steered);
+    assert!(result.queued_id.is_none());
+    let calls = std::fs::read_to_string(trace.path()).unwrap();
+    assert!(!calls.contains("turn/interrupt"));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.contains("turn/start"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn gui_failed_steer_surfaces_rejection() {
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_ASYNC_MODE", "reject")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("gui-reject"))
+        .await
+        .unwrap();
+    provider
+        .send_turn(guidance_input("gui-reject", "Build"))
+        .await
+        .unwrap();
+    // The fixture does not emit turn/started by default. A native steer
+    // checks native state, while queueing needs its normal notification.
+    let result = provider
+        .steer_turn(guidance_input("gui-reject", "Correction"))
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn gui_queued_steer_failure_keeps_message_cancellable() {
+    let script = write_script(json!([
+        {"after":"turn/start","emit":"notification","method":"turn/started","params":{"threadId":"c-1","turnId":"t-1"}}
+    ]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_ASYNC_MODE", "reject"),
+        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let mut events = provider.event_stream();
+    let thread = ThreadId("gui-queued-reject".into());
+    start_session_resilient(&provider, start_input(&thread.0)).await.unwrap();
+    provider.send_turn(guidance_input(&thread.0, "Build")).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.next().await {
+            if matches!(event, ProviderRuntimeEvent::SessionStateChanged { status: SessionStatus::Running { .. }, .. }) { break; }
+        }
+    }).await.unwrap();
+    let queued = provider.send_turn(guidance_input(&thread.0, "Later")).await.unwrap();
+    let id = queued.queued_id.expect("busy send must queue");
+    assert!(provider.steer_queued_turn(thread.clone(), id.clone()).await.is_err());
+    assert!(provider.cancel_queued_turn(thread, id).await.unwrap());
+}

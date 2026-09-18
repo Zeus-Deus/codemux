@@ -124,3 +124,20 @@ describe("UserMessage turn revert", () => {
     ).toBeNull();
   });
 });
+
+describe("queued message delivery actions", () => {
+  const queued: UserMessageItem = { kind: "user_message", id: "queued", seq: 1, text: "Use SQLite", queued: { queuedId: "q1" } };
+  it("keeps steering separate from interruption", () => {
+    const steer = vi.fn();
+    const interrupt = vi.fn();
+    const { getByRole } = render(<UserMessage item={queued} onSteerQueued={steer} onSendQueuedNow={interrupt} />);
+    fireEvent.click(getByRole("button", { name: "Steer with queued message" }));
+    expect(steer).toHaveBeenCalledWith("q1");
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+  it("does not offer unsupported steering", () => {
+    const { queryByRole, getByRole } = render(<UserMessage item={queued} onSendQueuedNow={vi.fn()} />);
+    expect(queryByRole("button", { name: "Steer with queued message" })).toBeNull();
+    expect(getByRole("button", { name: "Interrupt and send queued message" })).toBeTruthy();
+  });
+});

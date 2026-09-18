@@ -233,6 +233,23 @@ mod window_background_tests {
     }
 }
 
+/// Convert host PR rows into the snapshot's stored shape.
+pub(crate) fn workspace_pr_rows(
+    prs: Vec<crate::github::SourcedPr>,
+) -> Vec<crate::state::WorkspacePr> {
+    prs.into_iter()
+        .map(|entry| crate::state::WorkspacePr {
+            number: entry.pr.number,
+            state: entry.pr.display_state(),
+            url: entry.pr.url,
+            head_branch: entry.pr.head_branch,
+            base_branch: entry.pr.base_branch,
+            source: Some(entry.source),
+            checkout_branch: entry.checkout_branch,
+        })
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
@@ -436,11 +453,12 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(std::sync::Arc::new(
             crate::agent_provider::grok::capabilities::GrokCapabilityCache::new(),
         ))
-        // Grok's ACP command catalogue starts in initialize metadata and can
-        // be replaced by a live session update. The command IPC and running
-        // provider share this cache so the composer sees the latest snapshot.
+        // ACP command catalogues arrive from a live session update, and from
+        // initialize metadata on agents that publish it there. The command IPC
+        // and every running ACP session share this cache so the composer sees
+        // the latest snapshot; entries are keyed per provider.
         .manage(std::sync::Arc::new(
-            crate::agent_provider::grok::slash_commands::GrokSlashCommandCache::new(),
+            crate::agent_provider::acp::slash_commands::AcpSlashCommandCache::new(),
         ))
         // Claude capability cache — populated lazily on the first
         // `list_chat_provider_capabilities` call for Claude when
@@ -1128,25 +1146,27 @@ fn build_core_app<R: tauri::Runtime>(
                         // Cursor Agent speaks the official Agent Client
                         // Protocol over stdio. Like Codex, its subprocess is
                         // spawned lazily per chat session.
-                        let cursor = agent_provider::cursor::CursorAgentProvider::new(
-                            agent_provider::cursor::CursorProviderConfig::default(),
-                        );
+                        let acp_slash_commands: tauri::State<
+                            '_,
+                            std::sync::Arc<
+                                agent_provider::acp::slash_commands::AcpSlashCommandCache,
+                            >,
+                        > = registry_handle.state();
+                        let cursor =
+                            agent_provider::cursor::CursorAgentProvider::new_with_slash_command_cache(
+                                agent_provider::cursor::CursorProviderConfig::default(),
+                                acp_slash_commands.inner().clone(),
+                            );
                         registry
                             .set_cursor(std::sync::Arc::new(cursor) as _)
                             .await;
 
                         // Grok Build also speaks ACP over stdio and is
                         // spawned lazily per chat session.
-                        let grok_slash_commands: tauri::State<
-                            '_,
-                            std::sync::Arc<
-                                agent_provider::grok::slash_commands::GrokSlashCommandCache,
-                            >,
-                        > = registry_handle.state();
                         let grok =
                             agent_provider::grok::GrokAgentProvider::new_with_slash_command_cache(
                                 agent_provider::grok::GrokProviderConfig::default(),
-                                grok_slash_commands.inner().clone(),
+                                acp_slash_commands.inner().clone(),
                             );
                         registry
                             .set_grok(std::sync::Arc::new(grok) as _)
@@ -1915,7 +1935,7 @@ fn build_core_app<R: tauri::Runtime>(
                                 "background.pr-poll.queue-delay",
                                 queued_at.elapsed(),
                             );
-                            provider_for_pr.workspace_pull_request(&path_for_pr)
+                            provider_for_pr.workspace_pull_requests(&path_for_pr)
                         })
                         .await;
 
@@ -1938,28 +1958,20 @@ fn build_core_app<R: tauri::Runtime>(
                                 // emits at most one snapshot per pass, so an
                                 // update that does not set the flag is an
                                 // update the renderer never hears about.
-                                match github::branch_pr_outcome(lookup) {
-                                    github::BranchPrOutcome::Write(pr) => {
-                                        changed |= state.update_workspace_pr_info(
+                                match github::workspace_prs_outcome(lookup) {
+                                    github::WorkspacePrsOutcome::Write(prs) => {
+                                        changed |= state.update_workspace_prs(
                                             &workspace_id,
-                                            Some(pr.number),
-                                            Some(pr.display_state()),
-                                            Some(pr.url),
-                                            pr.head_branch,
+                                            workspace_pr_rows(prs),
                                         );
                                         refreshed += 1;
                                     }
-                                    github::BranchPrOutcome::Clear => {
-                                        changed |= state.update_workspace_pr_info(
-                                            &workspace_id,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                        );
+                                    github::WorkspacePrsOutcome::Clear => {
+                                        changed |=
+                                            state.update_workspace_prs(&workspace_id, Vec::new());
                                         refreshed += 1;
                                     }
-                                    github::BranchPrOutcome::Preserve => {}
+                                    github::WorkspacePrsOutcome::Preserve => {}
                                 }
                             }
                             Err(e) => {

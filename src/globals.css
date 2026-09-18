@@ -1244,3 +1244,35 @@ body.pane-resizing iframe {
     animation: none;
   }
 }
+
+/* ── Composer overlay: dim while reading back ──
+   The composer region floats over the bottom of the transcript, so while the
+   reader is scrolled off the live edge the whole docked cluster — pending
+   question card, debug banner, composer pill — drops to a low opacity and
+   lets the thread read straight through it. Hovering or focusing anywhere in
+   a card brings that card back immediately; pointer events are never
+   disabled, so a dimmed composer is still fully clickable and typable.
+
+   Hand-written rather than composed from `group-data-*` utilities: Tailwind
+   wraps group selectors in `:where()`, which contributes no specificity, so
+   the stacked `:hover` / `:focus-within` restores tied with the dim rule and
+   lost or won purely on emitted source order — hover silently never applied.
+   Spelling the three rules out here keeps that ordering explicit. */
+.composer-overlay-card {
+  transition: opacity 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+[data-reading-back] .composer-overlay-card {
+  opacity: 0.3;
+}
+
+[data-reading-back] .composer-overlay-card:hover,
+[data-reading-back] .composer-overlay-card:focus-within {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-overlay-card {
+    transition-duration: 0ms;
+  }
+}

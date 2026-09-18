@@ -244,6 +244,42 @@ describe("WorkspaceHoverCardBody — git rows", () => {
 });
 
 describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
+  it("lists every PR of a set, bottom of the stack first, each with its state", () => {
+    // The backend sends the primary (first open PR, #376) first. A list in
+    // that order would put the middle of the stack above the merged PRs it
+    // sits on, so the card rebuilds stack order from base/head links.
+    const states = ["MERGED", "MERGED", "MERGED", "MERGED", "OPEN", "OPEN", "OPEN", "OPEN", "OPEN"];
+    const stack = states.map((state, i) => ({
+      number: 372 + i,
+      state,
+      url: `https://github.com/u/r/pull/${372 + i}`,
+      head_branch: `ui-pass/0${i + 1}`,
+      base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+      source: "worktree" as const,
+    }));
+    const primaryFirst = [stack[4], ...stack.slice(0, 4), ...stack.slice(5)];
+    const { container } = renderBody(
+      makeWorkspace({
+        git_branch: "goal-passpage-space-task",
+        pr_number: 376,
+        pr_state: "OPEN",
+        prs: primaryFirst,
+      }),
+    );
+
+    expect(valueFor("9 pull requests")).toBe("5 open, 4 merged");
+    const rows = [...container.querySelectorAll("[data-pr-set-row]")];
+    expect(rows.map((r) => r.getAttribute("data-pr-set-row"))).toEqual(
+      ["372", "373", "374", "375", "376", "377", "378", "379", "380"],
+    );
+    expect(screen.getByRole("button", { name: "#372 · merged · ui-pass/01" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "#380 · open · ui-pass/09" })).toBeInTheDocument();
+    expect(screen.getByText("#372")).toHaveClass("text-accent-violet");
+    expect(screen.getByText("#380")).toHaveClass("text-status-open");
+    // The single-PR row would only name the primary — it must not also appear.
+    expect(screen.queryByText("Pull request")).not.toBeInTheDocument();
+  });
+
   it("shows PR number and state with the shared PR tone", () => {
     renderBody(makeWorkspace({ pr_number: 140, pr_state: "merged" }));
     expect(valueFor("Pull request")).toBe("#140 · merged");

@@ -37,6 +37,7 @@ use crate::agent_provider::types::{
 /// "restart on change" hint, and `PerTurn` is the friendlier default.
 pub fn opencode_stage1_placeholder() -> ProviderChatCapabilities {
     ProviderChatCapabilities {
+        supports_steering: false,
         models: Vec::new(),
         effort_granularity: EffortGranularity::PerTurn,
         effort_label_map: Default::default(),
@@ -73,10 +74,9 @@ pub async fn harvest_opencode_capabilities(
 /// Pure constructor exposed for tests — wraps
 /// [`flatten_into_chat_models`] in the surrounding bundle so the
 /// effort/permission scaffolding stays in one place.
-pub fn build_capabilities(
-    providers: Vec<OpenCodeProviderEntry>,
-) -> ProviderChatCapabilities {
+pub fn build_capabilities(providers: Vec<OpenCodeProviderEntry>) -> ProviderChatCapabilities {
     ProviderChatCapabilities {
+        supports_steering: false,
         models: flatten_into_chat_models(&providers),
         effort_granularity: EffortGranularity::PerTurn,
         // No canonical effort vocabulary — variant slugs come straight

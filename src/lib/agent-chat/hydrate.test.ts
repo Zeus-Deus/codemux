@@ -1185,3 +1185,14 @@ describe("applyReplayTail — a live run's streaming reasoning", () => {
     expect(block.kind === "reasoning" && block.streaming).toBe(false);
   });
 });
+
+describe("persisted steering", () => {
+  it("keeps guidance inside its original turn after reopening", () => {
+    const rows = [user("Build"), JSON.stringify({ type: "user_message", thread_id: "t", text: "Use SQLite", client_nonce: "n1", steered_turn_id: "turn1" })];
+    const state = replayPayloads(rows);
+    expect(state.messages[1]).toMatchObject({ kind: "user_message", inflight: true, turn_id: "turn1" });
+  });
+  it("does not invent an unfinished turn when delayed guidance is persisted after completion", () => {
+    expect(lastTurnUnsettled(parseReplayPayloads([user("Build"), event({ type: "turn_completed", thread_id: "t", turn_id: "turn1", status: { kind: "success" }, usage: null }), JSON.stringify({ type: "user_message", thread_id: "t", text: "Use SQLite", steered_turn_id: "turn1" })]))).toBe(false);
+  });
+});

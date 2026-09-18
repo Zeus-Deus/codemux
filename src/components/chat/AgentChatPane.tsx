@@ -1,4 +1,5 @@
 import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { parseMessageDelivery, STEERING_UNAVAILABLE } from "@/lib/agent-chat/message-delivery";
 import { AsyncQuestionPanel } from "./AsyncQuestionPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Folder, GitBranch, Home } from "lucide-react";
@@ -307,6 +308,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // refs mutate synchronously, so the second call within the same
   // tick sees the flag the first one just set. We do the same.
   const [isSending, setIsSending] = useState(false);
+  const localSendFocusRef = useRef(false);
   const sendInFlightRef = useRef(false);
 
   // Stage 6 Debug-mode cleanup affordances. The exit dialog opens when
@@ -1540,10 +1542,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // attachments; resuming a dead run should leave that draft + its chips
     // untouched and send a plain "Continue" with no images.
     const isContinue = options?.continueRun === true;
-      const rawText = (
-        typeof textOverride === "string" ? textOverride : draft
-      ).trim();
-    if (!rawText) return;
+      const originalDraft = (typeof textOverride === "string" ? textOverride : draft).trim();
+      const delivery = parseMessageDelivery(originalDraft);
+      const rawText = delivery.text;
+      if (!rawText) return;
+      if (delivery.delivery === "steer" && useAgentChatStore.getState().threads[threadId]?.streaming && !capabilities?.supports_steering) {
+        toast.error(STEERING_UNAVAILABLE);
+        return;
+      }
     // Snapshot the pre-append interrupted state + composer draft so a failed
     // send can restore both (the optimistic append clears `interrupted` and
     // the store's `appendUserMessage` resets `inputDraft`).
@@ -1552,6 +1558,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const composerDraft = draft;
     const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
+    localSendFocusRef.current = true;
     setIsSending(true);
     void (async () => {
       // Stage 7 — re-fetch any GitHub-kind chip whose detail is older
@@ -1764,7 +1771,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // The anchored row is gone, so its reserved response space must go
         // with it — otherwise a failed image send leaves phantom end space.
         clearSendAnchor(clientNonce);
-        setInputDraft(threadId, rawText);
+        setInputDraft(threadId, originalDraft);
         toast.error(
           "An attached image failed to upload — remove it and try again.",
         );
@@ -1773,13 +1780,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         return;
       }
       const imageRefs = buildImageRefs(freshAttachments);
-      if (!isContinue) {
-        // Clear chips per-turn (matches the inputDraft = "" reset that
-        // appendUserMessage already does for the textarea).
-        clearStagedAttachments(threadId);
-      }
       const input = {
         thread_id: threadId,
+        delivery: delivery.delivery,
         text: sdkText,
         display_text: rawText,
         skill_ids: skillSelection.skillIds,
@@ -1796,7 +1799,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // that case the `turn_queued` event greys the optimistic bubble;
         // we do nothing extra here. An immediate start keeps the bubble
         // as a normal user message.
-        await agentChatSendTurn(provider, input);
+        const result = await agentChatSendTurn(provider, input);
+        if (!isContinue) {
+          // Remove only the submitted snapshot. Attachments added while the
+          // provider acknowledges this message belong to the next draft.
+          for (const attachment of freshAttachments) {
+            useAgentChatStore.getState().removeStagedAttachment(threadId, attachment.id);
+          }
+        }
+        if (result.steered) toast.success("Guidance accepted", { description: "The agent will use it at its next safe opportunity." });
         // The turn was accepted, so the provider runtime is alive and
         // authenticated — retire a stale failure banner instead of
         // leaving it up until the next failed send.
@@ -1816,12 +1827,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // send never owned the draft (it preserved the user's own in-progress
         // text above), so leave that intact rather than stamping "Continue".
         if (!isContinue) {
-          setInputDraft(threadId, rawText);
+          setInputDraft(threadId, originalDraft);
         }
         toast.error(`Failed to send turn: ${formatProviderError(err)}`);
         // A failed send may mean the provider runtime itself is broken —
         // re-probe (bypassing the TTL) so the status banner explains it.
         void useProviderHealth.getState().refresh(provider, { force: true });
+        sendInFlightRef.current = false;
+        setIsSending(false);
+      } finally {
         sendInFlightRef.current = false;
         setIsSending(false);
       }
@@ -1835,6 +1849,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     mode,
     cwd,
     skillsRegistry,
+    capabilities,
     appendUserMessage,
     removeUserMessageByNonce,
     setInputDraft,
@@ -2260,22 +2275,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, addStagedAttachment, updateStagedAttachment],
   );
 
-  // Clear the optimistic send flag the moment the backend
-  // acknowledges the turn via Running (streaming=true in the store).
-  // For the degenerate case where Running and turn_completed batch
-  // into the same render — so `streaming` appears to stay false from
-  // the Composer's perspective — we also clear when `activeTurnId`
-  // transitions non-null (another backend-ack signal) or when the
-  // next render cycle completes without streaming flipping; the
-  // sync-ref flip already prevented duplicate submits so the `ref`
-  // stays correct either way.
   useEffect(() => {
-    if (!isSending) return;
-    if (streaming || activeTurnId != null) {
-      sendInFlightRef.current = false;
-      setIsSending(false);
-    }
-  }, [isSending, streaming, activeTurnId]);
+    if (streaming || messages.length > 0) localSendFocusRef.current = false;
+  }, [streaming, messages.length]);
 
   // Stop is turn-scoped, not conversation-scoped. Every provider recovers
   // its query/stream after an interrupt, and a dead provider process is
@@ -2376,14 +2378,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, provider, setInputDraft],
   );
 
-  // Follow-up queueing: send a queued turn NOW (steer). The backend
-  // promotes it to the front of the queue and soft-interrupts the active
-  // turn — the session, transcript, and on-disk work are all preserved —
-  // then dispatches it as a normal follow-up. No optimistic state change:
-  // the `queued_turn_dispatched` event promotes the greyed bubble and the
-  // interrupt's `ready`/`running` state events settle the composer.
+  // Promote a queued message using the chosen delivery mode. Provider
+  // acknowledgement drives the bubble update; failures leave it queued.
   const handleSendQueuedNow = useCallback(
-    (queuedId: string) => {
+    (queuedId: string, delivery: "interrupt" | "steer" = "interrupt") => {
       if (!threadId) return;
       // Dispatching a queued turn is a send, so it gets the same navigation
       // intent as a composer submission — anchored on the bubble that is
@@ -2401,7 +2399,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? queuedItem.clientNonce
           : undefined;
       if (anchoredNonce) requestSendAnchor(anchoredNonce);
-      agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
+      agentChatSendQueuedTurnNow(provider, threadId, queuedId, delivery).catch((err) => {
         // Unlike a composer send there is no bubble to roll back — the
         // queued turn stays queued — so without this the list would sit
         // anchored on a turn that is never going to stream, holding blank
@@ -2412,6 +2410,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     },
     [threadId, provider, requestSendAnchor, clearSendAnchor],
   );
+
+  const handleSteerQueued = useCallback((id: string) => handleSendQueuedNow(id, "steer"), [handleSendQueuedNow]);
 
   const handleRespond = useCallback(
     (
@@ -3724,9 +3724,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
   }, [paneDragDepth, resetPaneDrag]);
 
-  // Pin the transcript across composer height changes (the pill expanding,
-  // the strip opening): the content just above the composer stays put
-  // instead of sliding under it, and a reader at the live edge stays there.
+  // The composer region floats over the transcript so the thread reads
+  // through it while dimmed. Two jobs here, both driven off its measured
+  // height: publish it as `--composer-overlay-height` (the transcript's
+  // footer reserves exactly that much, so the tail can still be scrolled
+  // clear of the overlay), and re-pin a reader who was at the live edge when
+  // the region changed height (the pill expanding, a question card opening).
+  // Content above no longer slides as the region grows — it is out of flow —
+  // so the old scrollTop-by-delta correction would now double-count.
   const paneRootRef = useRef<HTMLDivElement | null>(null);
   const composerRegionRef = useRef<HTMLDivElement | null>(null);
   const hasTranscript = messages.length > 0 && !enteredSubagent;
@@ -3737,14 +3742,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!region || !root || typeof ResizeObserver === "undefined") return;
 
     let viewport: HTMLElement | null = null;
-    // Geometry as of the last scroll: by the time the observer fires, the
-    // viewport has already resized and the browser may have clamped it.
+    // Geometry as of the last scroll: by the time the observer fires the
+    // reserve has already changed, so "was at the end" has to be judged
+    // against the scrollHeight that was live when the reader last moved.
     let prevTop = 0;
     let prevClient = 0;
+    let prevScrollHeight = 0;
     const snapshot = () => {
       if (!viewport) return;
       prevTop = viewport.scrollTop;
       prevClient = viewport.clientHeight;
+      prevScrollHeight = viewport.scrollHeight;
     };
     const bind = () => {
       const next = root.querySelector<HTMLElement>(
@@ -3757,26 +3765,43 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       snapshot();
     };
 
-    let lastHeight = region.getBoundingClientRect().height;
+    let lastHeight = -1;
+    const publish = () => {
+      const height = region.getBoundingClientRect().height;
+      if (height === lastHeight) return false;
+      lastHeight = height;
+      root.style.setProperty("--composer-overlay-height", `${height}px`);
+      return true;
+    };
+    publish();
     bind();
     const observer = new ResizeObserver(() => {
-      const height = region.getBoundingClientRect().height;
-      const delta = height - lastHeight;
-      lastHeight = height;
+      const wasAtEnd = prevTop >= prevScrollHeight - prevClient - 2;
+      const changed = publish();
       bind();
-      if (!viewport || delta === 0) return;
-      const wasAtEnd = prevTop >= viewport.scrollHeight - prevClient - 2;
-      viewport.scrollTop = wasAtEnd
-        ? viewport.scrollHeight
-        : Math.max(0, prevTop + delta);
+      if (!viewport || !changed) return;
+      if (wasAtEnd) viewport.scrollTop = viewport.scrollHeight;
       snapshot();
     });
     observer.observe(region);
     return () => {
       observer.disconnect();
       viewport?.removeEventListener("scroll", snapshot);
+      root.style.removeProperty("--composer-overlay-height");
     };
   }, [hasTranscript]);
+
+  // Reading-back state is stamped straight onto the pane root instead of
+  // held in React state: it flips on scroll, and the composer subtree is
+  // expensive to re-render. The fade is then pure CSS descending from this
+  // attribute (see `.composer-overlay-card` in `globals.css`), so scrolling
+  // costs zero renders in a subtree that re-renders on every keystroke.
+  const handleReadingBackChange = useCallback((readingBack: boolean) => {
+    const root = paneRootRef.current;
+    if (!root) return;
+    if (readingBack) root.setAttribute("data-reading-back", "");
+    else root.removeAttribute("data-reading-back");
+  }, []);
 
   const composerEl = (
     <Composer
@@ -3790,7 +3815,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // Both swaps create a new textarea, so explicitly carry keyboard
       // focus across them. Existing-thread mounts have neither signal and
       // therefore do not steal focus.
-      focusOnMount={isSending || focusComposerAfterPromotion}
+      focusOnMount={isSending || localSendFocusRef.current || focusComposerAfterPromotion}
       // In a subagent drill-in the composer stays parent-bound; only the
       // placeholder changes to make that explicit (design copy).
       placeholderOverride={
@@ -3819,6 +3844,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // QUEUED, not blocked. `sending` blocks re-submit during the send
       // RPC ack-lag without blocking queueing.
       streaming={streaming}
+      supportsSteering={capabilities?.supports_steering ?? false}
       sending={isSending}
       // Dead-run recovery (issue #154): a Continue chip in the composer
       // strip when the last run died and nothing is in flight.
@@ -3944,19 +3970,38 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onRejectPlan={handleRejectPlan}
               onCancelQueued={handleCancelQueued}
               onSendQueuedNow={handleSendQueuedNow}
+              onSteerQueued={capabilities?.supports_steering ? handleSteerQueued : undefined}
               turnCheckpointByNonce={turnCheckpointByNonce}
               onRevertTurn={handleRequestTurnRevert}
               revertingTurnIndex={revertingTurnIndex}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
               cwd={cwd}
+              onReadingBackChange={handleReadingBackChange}
             />
           )}
           {/* Composer region (design D10): groups the whole composer
               column — AskUserQuestion panel, debug banner, the strip and
-              the composer pill — below the scrolling transcript. Observed
-              to pin the transcript while it changes height. */}
-          <div ref={composerRegionRef} className="pt-3.5">
+              the composer pill. Floats over the bottom of the scrolling
+              transcript rather than sitting below it, so scrolling back
+              draws the thread through the dimmed composer instead of
+              through flat pane background. The transcript reserves the
+              region's measured height in its footer, so nothing is
+              permanently hidden underneath. Observed to publish that
+              height and to pin the live edge while it changes.
+              `pointer-events-none` keeps the empty column gutters
+              transparent to selection and clicks on the rows behind; the
+              cards inside opt themselves back in. */}
+          <div
+            ref={composerRegionRef}
+            className={
+              // Only the parent transcript reserves space for an overlay.
+              // Keep drill-in in normal flow so its final rows remain visible.
+              enteredSubagent
+                ? "pt-3.5"
+                : "pointer-events-none absolute inset-x-0 bottom-0 z-10 pt-3.5"
+            }
+          >
             {pendingInputPanelEl}
             {threadId && (
               <AsyncQuestionPanel
@@ -3970,7 +4015,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 )}
               />
             )}
-            {debugBannerEl}
+            {debugBannerEl && (
+              // Docked in a `pointer-events-none` region, so the banner's
+              // own buttons have to opt back in.
+              <div className="pointer-events-auto">{debugBannerEl}</div>
+            )}
             {composerEl}
           </div>
         </>

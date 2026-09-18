@@ -2268,6 +2268,92 @@ describe("MessageList — live marker when the live tail row is not on screen", 
   });
 });
 
+describe("MessageList reading-back signal", () => {
+  const readerTurn: ChatViewItem = {
+    kind: "user_message",
+    id: "rb-1",
+    seq: 0,
+    text: "scroll me",
+  };
+
+  /** Point the double's scroll node at a given distance from the tail. */
+  function setDistanceFromTail(distance: number) {
+    const node = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    );
+    if (!node) throw new Error("scroll node missing");
+    const clientHeight = 800;
+    const scrollHeight = 10_000;
+    Object.defineProperty(node, "clientHeight", {
+      configurable: true,
+      get: () => clientHeight,
+    });
+    Object.defineProperty(node, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+    Object.defineProperty(node, "scrollTop", {
+      configurable: true,
+      get: () => scrollHeight - clientHeight - distance,
+    });
+    return node;
+  }
+
+  it("reports leaving and returning to the live edge, and only on transitions", async () => {
+    const onReadingBackChange = vi.fn();
+    render(
+      <MessageList
+        messages={[readerTurn]}
+        onReadingBackChange={onReadingBackChange}
+        {...noopHandlers}
+      />,
+    );
+
+    // Mount publishes the initial state once.
+    expect(onReadingBackChange).toHaveBeenCalledTimes(1);
+    expect(onReadingBackChange).toHaveBeenLastCalledWith(false);
+
+    const node = setDistanceFromTail(600);
+    await act(async () => {
+      node.dispatchEvent(new Event("scroll"));
+    });
+    expect(onReadingBackChange).toHaveBeenLastCalledWith(true);
+    const afterLeaving = onReadingBackChange.mock.calls.length;
+
+    // Scrolling further back is the same state — no repeat notifications, so
+    // the pane never re-stamps the attribute on every frame.
+    setDistanceFromTail(4_000);
+    await act(async () => {
+      node.dispatchEvent(new Event("scroll"));
+    });
+    expect(onReadingBackChange).toHaveBeenCalledTimes(afterLeaving);
+
+    setDistanceFromTail(0);
+    await act(async () => {
+      node.dispatchEvent(new Event("scroll"));
+    });
+    expect(onReadingBackChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("clears the state on unmount so a retained pane cannot stay dimmed", async () => {
+    const onReadingBackChange = vi.fn();
+    const view = render(
+      <MessageList
+        messages={[readerTurn]}
+        onReadingBackChange={onReadingBackChange}
+        {...noopHandlers}
+      />,
+    );
+    const node = setDistanceFromTail(600);
+    await act(async () => {
+      node.dispatchEvent(new Event("scroll"));
+    });
+    expect(onReadingBackChange).toHaveBeenLastCalledWith(true);
+
+    view.unmount();
+    expect(onReadingBackChange).toHaveBeenLastCalledWith(false);
+  });
+});
 
 it("shows summarization instead of the live activity line", () => {
   renderList([

@@ -549,12 +549,15 @@ impl ClaudeSession {
                         let mut state = self.state.lock().await;
                         state.dispatching = false;
                     }
-                    let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
-                        thread_id: self.thread_id.clone(),
-                        queued_id: queued.queued_id,
-                        turn_id,
-                        text,
-                    });
+                    let _ = self
+                        .event_tx
+                        .send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                            steered: false,
+                            thread_id: self.thread_id.clone(),
+                            queued_id: queued.queued_id,
+                            turn_id,
+                            text,
+                        });
                     return;
                 }
                 Err(err) => {

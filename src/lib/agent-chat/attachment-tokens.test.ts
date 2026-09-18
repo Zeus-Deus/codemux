@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { buildCommandRegistry } from "./command-tokens";
 import {
   activeAttachments,
   parseFileTokens,
@@ -243,6 +244,38 @@ describe("segmentDraftHighlight", () => {
     expect(out).toEqual([
       { kind: "skill", text: "/plan", name: "plan" },
       { kind: "plain", text: " now" },
+    ]);
+  });
+
+  it("promotes a leading registered token to a command segment", () => {
+    const registry = buildCommandRegistry([], [{ name: "goal" }]);
+    const out = segmentDraftHighlight("/goal ship it", [], [], registry);
+    expect(out).toEqual([
+      { kind: "command", text: "/goal", name: "goal", commandKind: "provider" },
+      { kind: "plain", text: " ship it" },
+    ]);
+  });
+
+  it("claims a leading skill once, as a command rather than a skill segment", () => {
+    const skill = makeSkill("plan");
+    const registry = buildCommandRegistry([skill], []);
+    const out = segmentDraftHighlight("/plan now", [skill], [], registry);
+    // The character range must be emitted exactly once, or the mirror's
+    // glyph advances drift out of step with the textarea's caret.
+    expect(out).toEqual([
+      { kind: "command", text: "/plan", name: "plan", commandKind: "skill" },
+      { kind: "plain", text: " now" },
+    ]);
+  });
+
+  it("leaves a non-leading skill as a plain skill segment", () => {
+    const skill = makeSkill("plan");
+    const registry = buildCommandRegistry([skill], []);
+    const out = segmentDraftHighlight("do /plan now", [skill], [], registry);
+    expect(out.map((segment) => segment.kind)).toEqual([
+      "plain",
+      "skill",
+      "plain",
     ]);
   });
 
