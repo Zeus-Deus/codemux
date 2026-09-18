@@ -394,6 +394,14 @@ pub async fn addon_credential_set<R: Runtime>(
             "Credential was not declared",
         ));
     }
+    let origin = &installation
+        .manifest
+        .credentials
+        .iter()
+        .find(|c| c.id == credential_id)
+        .unwrap()
+        .origin;
+    let credential_id = super::super::addons::credentials::Credentials::key(&credential_id, origin);
     // Persist the host-owned index before the non-cancellable OS write. If
     // this IPC task is dropped, uninstall/restart can still find the credential.
     if !session_only {

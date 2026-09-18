@@ -31,32 +31,47 @@ export function activeAddonWorkspace(): string | null {
     ? id
     : null;
 }
-export async function refreshAddons() {
-  try {
-    const inventory = await addonInventory();
-    useAddonsStore.setState({ ...inventory, loaded: true });
-    const enabled = new Set(
-      inventory.paused
-        ? []
-        : inventory.installed
-            .filter((i) => addonEnabled(i) || i.status === "failed-disabled")
-            .map((i) => i.manifest.id),
-    );
-    const ui = useUIStore.getState();
-    for (const [workspace, panes] of Object.entries(ui.rightPanelPanes))
-      for (const pane of panes) {
-        if (pane.startsWith("addon:") && !enabled.has(pane.split(":")[1]))
-          ui.closeRightPanelPane(workspace, pane);
-      }
-  } catch (error) {
-    useAddonsStore.setState({
-      loaded: true,
-      error: addonMessage(error),
-      paused: true,
-    });
-  }
+let inventoryRevision = 0;
+let latestInventory: Promise<void> = Promise.resolve();
+export function refreshAddons(): Promise<void> {
+  const revision = ++inventoryRevision;
+  const request = (async () => {
+    try {
+      const inventory = await addonInventory();
+      if (revision !== inventoryRevision) return;
+      useAddonsStore.setState({ ...inventory, loaded: true });
+      const enabled = new Set(
+        inventory.paused
+          ? []
+          : inventory.installed
+              .filter((i) => addonEnabled(i) || i.status === "failed-disabled")
+              .map((i) => i.manifest.id),
+      );
+      const ui = useUIStore.getState();
+      for (const [workspace, panes] of Object.entries(ui.rightPanelPanes))
+        for (const pane of panes) {
+          if (pane.startsWith("addon:") && !enabled.has(pane.split(":")[1]))
+            ui.closeRightPanelPane(workspace, pane);
+        }
+    } catch (error) {
+      if (revision !== inventoryRevision) return;
+      useAddonsStore.setState({
+        loaded: true,
+        error: addonMessage(error),
+        paused: true,
+      });
+    }
+  })();
+  const complete: Promise<void> = request.then(() =>
+    latestInventory === complete ? undefined : latestInventory,
+  );
+  latestInventory = complete;
+  return complete;
 }
-async function effect(event: Extract<AddonEvent, { type: "effect" }>) {
+
+export async function applyAddonEffect(
+  event: Extract<AddonEvent, { type: "effect" }>,
+) {
   let value: unknown = null;
   let error = null;
   try {
@@ -71,6 +86,8 @@ async function effect(event: Extract<AddonEvent, { type: "effect" }>) {
     );
     if (
       state.paused ||
+      state.revoking["*"] ||
+      state.revoking[event.pluginId] ||
       !installation ||
       !addonEnabled(installation) ||
       state.failures[event.generation]
@@ -151,7 +168,7 @@ function receive(event: AddonEvent) {
   if (event.type === "development-error")
     toast.error("Development reload failed", { description: event.message });
   if (event.type === "inventory") void refreshAddons();
-  if (event.type === "effect") void effect(event);
+  if (event.type === "effect") void applyAddonEffect(event);
   if (event.type === "tree")
     useAddonsStore.setState((state) =>
       state.failures[event.generation] || !state.ready
@@ -165,6 +182,10 @@ function receive(event: AddonEvent) {
     );
   if (event.type === "stopped")
     useAddonsStore.setState((state) => ({
+      hostEpochs: {
+        ...state.hostEpochs,
+        [event.pluginId]: (state.hostEpochs[event.pluginId] ?? 0) + 1,
+      },
       failures: Object.fromEntries([
         ...Object.entries(state.failures).slice(-63),
         [event.generation, event.message],

@@ -780,6 +780,96 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn sqlite_full_during_update_preserves_the_previous_release_and_state() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let reviews = Reviews::default();
+        let package = Package::parse(super::super::package::fixture_archive(), None).unwrap();
+        let first = reviews
+            .prepare(
+                &manager,
+                package,
+                Source::Local {
+                    identity: Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap();
+        let old = reviews
+            .accept(&manager, &first.token, false, false)
+            .await
+            .unwrap();
+        let state = manager
+            .root
+            .join("state")
+            .join(&old.installation_id)
+            .join(&old.data_generation)
+            .join("state.sqlite");
+        Storage::open(&state)
+            .unwrap()
+            .set("global", "value", &serde_json::json!("original"))
+            .unwrap();
+        let package = Package::parse(super::super::package::fixture_archive(), None).unwrap();
+        let mut files = package.files;
+        let mut manifest = package.manifest;
+        manifest.version = "2.0.0".into();
+        manifest
+            .settings
+            .push(codemux_addon_protocol::manifest::Setting::String {
+                id: "large-default".into(),
+                label: "Fixture".into(),
+                default: "x".repeat(4096),
+            });
+        files.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, bytes.as_slice())
+                .unwrap();
+        }
+        let candidate = Package::parse(tar.into_inner().unwrap().finish().unwrap(), None).unwrap();
+        let review = reviews
+            .prepare(&manager, candidate, old.source.clone())
+            .unwrap();
+        {
+            let db = manager.registry.lock().unwrap();
+            let pages: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            // SQLite now returns the real SQLITE_FULL error when this larger
+            // record requires another page. No production fault bypass exists.
+            db.pragma_update(None, "max_page_count", pages).unwrap();
+        }
+        let error = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .err()
+            .expect("update should hit SQLITE_FULL");
+        assert_eq!(error.data.code, ErrorCode::StorageUnavailable);
+        let restored = manager.installation(&old.manifest.id).unwrap();
+        assert_eq!(restored.digest, old.digest);
+        assert_eq!(restored.data_generation, old.data_generation);
+        assert_eq!(
+            Storage::open(&state)
+                .unwrap()
+                .get("global", "value")
+                .unwrap(),
+            serde_json::json!("original")
+        );
+        drop(manager);
+        let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        assert_eq!(
+            reopened.installation(&old.manifest.id).unwrap().digest,
+            old.digest
+        );
+    }
+    #[tokio::test]
     async fn rollback_copies_matching_data_and_preserves_snapshot_on_activation_failure() {
         let root = tempfile::tempdir().unwrap();
         let manager =

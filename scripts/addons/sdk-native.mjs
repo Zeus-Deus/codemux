@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 const dir=await mkdtemp(join(tmpdir(),'codemux-sdk-native-'));
 const entry=resolve('packages/plugin-sdk');
 await build({stdin:{contents:"import plugin from './tests/fixture.tsx'; import {register} from './src/runtime.ts'; register(plugin);",resolveDir:entry},bundle:true,format:'iife',platform:'neutral',target:'es2020',jsx:'automatic',jsxImportSource:'preact',outfile:join(dir,'plugin.js')});
-const binary=process.argv[2]??resolve('src-tauri/addon-host/target/debug/codemux-addon-host'+(process.platform==='win32'?'.exe':''));
+const binary=resolve(process.argv[2]??('src-tauri/addon-host/target/debug/codemux-addon-host'+(process.platform==='win32'?'.exe':'')));
 const child=spawn(binary,[],{cwd:dir,env:process.platform==='win32'?{SystemRoot:process.env.SystemRoot}:{},stdio:['pipe','pipe','pipe']});
 let diagnostics='';child.stderr.on('data',data=>diagnostics+=data);
 const frames=[];let resolveWait;const lines=createInterface({input:child.stdout});lines.on('line',line=>{frames.push(JSON.parse(line));resolveWait?.();});
