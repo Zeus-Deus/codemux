@@ -226,6 +226,25 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install standalone Windows host toolchain
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Select standalone Windows host compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Stage real add-on host
+        shell: bash
+        run: bash scripts/build-addon-host.sh --profile debug
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -413,3 +432,15 @@ jobs:
         if: matrix.os == 'windows-latest'
         timeout-minutes: 15
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build independent add-on examples
+        shell: bash
+        run: bash scripts/addons/build-examples.sh
+
+      - name: Native installed add-on behavior
+        shell: bash
+        run: |
+          suffix=linux-x64
+          if [ "$RUNNER_OS" = Windows ]; then suffix=windows-x64.exe; fi
+          export CODEMUX_TEST_ADDON_HOST="$PWD/src-tauri/binaries/codemux-addon-host-$suffix"
+          cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::manager::tests::native_ -- --ignored --test-threads=2
