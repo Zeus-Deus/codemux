@@ -1,0 +1,301 @@
+//! Validate the entire Remote DOM batch before committing a normalized tree.
+use crate::{limits, ProtocolError};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
+type Result<T> = std::result::Result<T, ProtocolError>;
+fn invalid() -> ProtocolError {
+    ProtocolError::invalid("Invalid plugin UI")
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Node {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub event_listeners: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub children: Vec<Node>,
+}
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Tree {
+    pub children: Vec<Node>,
+}
+pub const TAGS: &[&str] = &[
+    "cmx-stack",
+    "cmx-grid",
+    "cmx-card",
+    "cmx-text",
+    "cmx-heading",
+    "cmx-markdown",
+    "cmx-button",
+    "cmx-text-field",
+    "cmx-text-area",
+    "cmx-select",
+    "cmx-checkbox",
+    "cmx-switch",
+    "cmx-tabs",
+    "cmx-list",
+    "cmx-table",
+    "cmx-badge",
+    "cmx-progress",
+    "cmx-icon",
+    "cmx-divider",
+    "cmx-empty-state",
+];
+fn identifier(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+fn token(v: &Value, tokens: &[&str]) -> bool {
+    v.as_str().is_some_and(|s| tokens.contains(&s))
+}
+fn string(v: &Value, max: usize) -> bool {
+    v.as_str().is_some_and(|s| s.len() <= max)
+}
+fn property(key: &str, v: &Value) -> bool {
+    if v.is_null() {
+        return true;
+    }
+    match key {
+        "spacing" => token(v, &["none", "xs", "sm", "md", "lg"]),
+        "direction" => token(v, &["horizontal", "vertical"]),
+        "columns" => v.as_u64().is_some_and(|n| (1..=12).contains(&n)),
+        "align" => token(v, &["start", "center", "end", "stretch"]),
+        "width" | "height" => token(v, &["auto", "full"]),
+        "size" => token(v, &["xs", "sm", "md", "lg"]),
+        "color" => token(
+            v,
+            &["default", "muted", "success", "warning", "danger", "accent"],
+        ),
+        "label" | "title" | "placeholder" => string(v, 4096),
+        "name" => v
+            .as_str()
+            .is_some_and(|s| crate::manifest::ICONS.contains(&s)),
+        "value" => {
+            string(v, 32768)
+                || v.is_boolean()
+                || v.as_f64()
+                    .is_some_and(|n| n.is_finite() && n.abs() <= 1_000_000_000.0)
+        }
+        "disabled" | "checked" => v.is_boolean(),
+        "level" => v.as_u64().is_some_and(|n| (1..=6).contains(&n)),
+        "max" => v.as_f64().is_some_and(|n| n > 0.0 && n <= 1_000_000_000.0),
+        "headers" | "items" => v
+            .as_array()
+            .is_some_and(|a| a.len() <= 500 && a.iter().all(|x| string(x, 4096))),
+        "rows" => v.as_array().is_some_and(|a| {
+            a.len() <= 500
+                && a.iter().all(|r| {
+                    r.as_array()
+                        .is_some_and(|r| r.len() <= 20 && r.iter().all(|x| string(x, 4096)))
+                })
+        }),
+        "options" => v.as_array().is_some_and(|a| {
+            a.len() <= 500
+                && a.iter().all(|x| {
+                    x.as_object().is_some_and(|o| {
+                        o.len() == 2 && string(&x["label"], 4096) && string(&x["value"], 4096)
+                    })
+                })
+        }),
+        _ => false,
+    }
+}
+impl Tree {
+    pub fn apply(&mut self, records: &[Value]) -> Result<()> {
+        if records.len() > limits::MUTATIONS {
+            return Err(invalid());
+        }
+        let mut candidate = self.clone();
+        for record in records {
+            let r = record.as_array().ok_or_else(invalid)?;
+            let kind = r.first().and_then(Value::as_u64).ok_or_else(invalid)?;
+            let id = r.get(1).and_then(Value::as_str).ok_or_else(invalid)?;
+            match kind {
+                0 if r.len() == 4 => {
+                    let node: Node = serde_json::from_value(r[2].clone()).map_err(|_| invalid())?;
+                    // Moving an existing node is supported, but never under itself/descendants.
+                    if contains(&node, id) || id == node.id {
+                        return Err(invalid());
+                    }
+                    remove_id(&mut candidate.children, &node.id);
+                    let children = children_mut(&mut candidate.children, id).ok_or_else(invalid)?;
+                    let index = r[3].as_u64().ok_or_else(invalid)? as usize;
+                    if index > children.len() {
+                        return Err(invalid());
+                    }
+                    children.insert(index, node);
+                }
+                1 if r.len() == 3 => {
+                    let children = children_mut(&mut candidate.children, id).ok_or_else(invalid)?;
+                    let index = r[2].as_u64().ok_or_else(invalid)? as usize;
+                    if index >= children.len() {
+                        return Err(invalid());
+                    }
+                    children.remove(index);
+                }
+                2 if r.len() == 3 => {
+                    let node = find_mut(&mut candidate.children, id).ok_or_else(invalid)?;
+                    if ![3, 8].contains(&node.kind) {
+                        return Err(invalid());
+                    }
+                    node.data = Some(r[2].as_str().ok_or_else(invalid)?.into());
+                }
+                3 if r.len() == 4 || r.len() == 5 => {
+                    let node = find_mut(&mut candidate.children, id).ok_or_else(invalid)?;
+                    if node.kind != 1 {
+                        return Err(invalid());
+                    }
+                    let key = r[2].as_str().ok_or_else(invalid)?.to_string();
+                    let target = match r.get(4).and_then(Value::as_u64).unwrap_or(1) {
+                        1 => &mut node.properties,
+                        3 => &mut node.event_listeners,
+                        _ => return Err(invalid()),
+                    };
+                    if r[3].is_null() {
+                        target.remove(&key);
+                    } else {
+                        target.insert(key, r[3].clone());
+                    }
+                }
+                _ => return Err(invalid()),
+            }
+            // Bound growth during the batch, as well as the final committed state.
+            candidate.validate()?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+    pub fn validate(&self) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut callbacks = HashSet::new();
+        for node in &self.children {
+            validate_node(node, 1, &mut ids, &mut callbacks)?
+        }
+        if serde_json::to_vec(self).map_err(|_| invalid())?.len() > limits::TREE {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub fn callback(&self, node_id: &str, event: &str, callback_id: &str) -> bool {
+        find(&self.children, node_id)
+            .and_then(|n| n.event_listeners.get(event))
+            .is_some_and(|v| v["callbackId"].as_str() == Some(callback_id))
+    }
+}
+fn validate_node<'a>(
+    node: &'a Node,
+    depth: usize,
+    ids: &mut HashSet<&'a str>,
+    callbacks: &mut HashSet<&'a str>,
+) -> Result<()> {
+    if !identifier(&node.id)
+        || !ids.insert(&node.id)
+        || ids.len() > limits::NODES
+        || depth > limits::DEPTH
+        || !node.attributes.is_empty()
+    {
+        return Err(invalid());
+    }
+    match node.kind {
+        1 => {
+            let tag = node.element.as_deref().ok_or_else(invalid)?;
+            if !TAGS.contains(&tag)
+                || node.data.is_some()
+                || node.properties.iter().any(|(k, v)| !property(k, v))
+            {
+                return Err(invalid());
+            }
+            for (event, value) in &node.event_listeners {
+                let permitted = match event.as_str() {
+                    "press" => tag == "cmx-button" || tag == "cmx-markdown",
+                    "change" => [
+                        "cmx-text-field",
+                        "cmx-text-area",
+                        "cmx-select",
+                        "cmx-checkbox",
+                        "cmx-switch",
+                        "cmx-tabs",
+                    ]
+                    .contains(&tag),
+                    _ => false,
+                };
+                let id = value["callbackId"].as_str().ok_or_else(invalid)?;
+                if !permitted
+                    || !value.as_object().is_some_and(|o| o.len() == 1)
+                    || !identifier(id)
+                    || !callbacks.insert(id)
+                    || callbacks.len() > limits::CALLBACKS
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        3 | 8 => {
+            if node.element.is_some()
+                || node.data.as_ref().is_none_or(|s| s.len() > 32768)
+                || !node.children.is_empty()
+                || !node.properties.is_empty()
+                || !node.event_listeners.is_empty()
+            {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    for child in &node.children {
+        validate_node(child, depth + 1, ids, callbacks)?
+    }
+    Ok(())
+}
+fn contains(node: &Node, id: &str) -> bool {
+    node.id == id || node.children.iter().any(|n| contains(n, id))
+}
+fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+    for node in nodes {
+        if node.id == id {
+            return Some(node);
+        }
+        if let Some(v) = find(&node.children, id) {
+            return Some(v);
+        }
+    }
+    None
+}
+fn find_mut<'a>(nodes: &'a mut [Node], id: &str) -> Option<&'a mut Node> {
+    for node in nodes {
+        if node.id == id {
+            return Some(node);
+        }
+        if let Some(v) = find_mut(&mut node.children, id) {
+            return Some(v);
+        }
+    }
+    None
+}
+fn children_mut<'a>(nodes: &'a mut Vec<Node>, id: &str) -> Option<&'a mut Vec<Node>> {
+    if id == "~" {
+        Some(nodes)
+    } else {
+        find_mut(nodes, id)
+            .filter(|n| n.kind == 1)
+            .map(|n| &mut n.children)
+    }
+}
+fn remove_id(nodes: &mut Vec<Node>, id: &str) -> bool {
+    if let Some(i) = nodes.iter().position(|n| n.id == id) {
+        nodes.remove(i);
+        true
+    } else {
+        nodes.iter_mut().any(|n| remove_id(&mut n.children, id))
+    }
+}

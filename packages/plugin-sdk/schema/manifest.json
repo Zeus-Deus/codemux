@@ -1,0 +1,400 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Manifest",
+  "type": "object",
+  "required": [
+    "api",
+    "author",
+    "contributes",
+    "credentials",
+    "description",
+    "entry",
+    "format",
+    "http",
+    "id",
+    "license",
+    "manifestVersion",
+    "name",
+    "permissions",
+    "platforms",
+    "repository",
+    "settings",
+    "version"
+  ],
+  "properties": {
+    "api": {
+      "type": "string"
+    },
+    "author": {
+      "$ref": "#/definitions/Author"
+    },
+    "contributes": {
+      "$ref": "#/definitions/Contributions"
+    },
+    "credentials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Credential"
+      }
+    },
+    "description": {
+      "type": "string"
+    },
+    "entry": {
+      "type": "string"
+    },
+    "format": {
+      "type": "string"
+    },
+    "http": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/HttpGrant"
+      }
+    },
+    "id": {
+      "type": "string"
+    },
+    "license": {
+      "type": "string"
+    },
+    "manifestVersion": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "name": {
+      "type": "string"
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Permission"
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Platform"
+      }
+    },
+    "repository": {
+      "type": "string"
+    },
+    "settings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Setting"
+      }
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Author": {
+      "type": "object",
+      "required": [
+        "name",
+        "url"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Command": {
+      "type": "object",
+      "required": [
+        "id",
+        "requiresWorkspace",
+        "title"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "requiresWorkspace": {
+          "type": "boolean"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Contributions": {
+      "type": "object",
+      "required": [
+        "commands",
+        "composerActions",
+        "composerViews",
+        "panels"
+      ],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Command"
+          }
+        },
+        "composerActions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          }
+        },
+        "composerViews": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          }
+        },
+        "panels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/View"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Credential": {
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "origin",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/CredentialType"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CredentialType": {
+      "type": "string",
+      "enum": [
+        "bearer"
+      ]
+    },
+    "HttpGrant": {
+      "type": "object",
+      "required": [
+        "methods",
+        "origin"
+      ],
+      "properties": {
+        "credential": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HttpMethod"
+          }
+        },
+        "origin": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE"
+      ]
+    },
+    "Permission": {
+      "type": "string",
+      "enum": [
+        "workspace.read",
+        "git.read",
+        "composer.append",
+        "external.open"
+      ]
+    },
+    "Platform": {
+      "type": "string",
+      "enum": [
+        "linux-x64",
+        "windows-x64"
+      ]
+    },
+    "Setting": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "boolean"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "label",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "default": "",
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "string"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "max",
+            "min",
+            "type"
+          ],
+          "properties": {
+            "default": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "max": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "min": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "integer"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "default",
+            "id",
+            "label",
+            "type",
+            "values"
+          ],
+          "properties": {
+            "default": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "enum"
+              ]
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "View": {
+      "type": "object",
+      "required": [
+        "icon",
+        "id",
+        "title"
+      ],
+      "properties": {
+        "icon": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
