@@ -36,6 +36,10 @@ fn rejects_unknown_capabilities_and_invalid_declarations() {
         );
     }
     let mut bad = good;
+    bad["http"] = json!([{"origin":"https://api.github.com","methods":["GET"]}]);
+    assert!(Manifest::parse(&serde_json::to_vec(&bad).unwrap(), None).is_err());
+    bad["http"][0]["credential"] = serde_json::Value::Null;
+    assert!(Manifest::parse(&serde_json::to_vec(&bad).unwrap(), None).is_ok());
     bad["contributes"]["commands"] = json!([{"id":"hello","title":"First","requiresWorkspace":false},{"id":"hello","title":"Second","requiresWorkspace":false}]);
     assert!(Manifest::parse(&serde_json::to_vec(&bad).unwrap(), None).is_err());
 }

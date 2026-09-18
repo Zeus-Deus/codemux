@@ -111,14 +111,18 @@ fn run() -> Result<(), String> {
     })));
     let rejected = Arc::new(Mutex::new(HashSet::new()));
     let tracker = rejected.clone();
+    let rejection_overflow = Arc::new(AtomicBool::new(false));
+    let tracker_overflow = rejection_overflow.clone();
     rt.set_host_promise_rejection_tracker(Some(Box::new(move |_, promise, _, handled| {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         promise.hash(&mut hash);
         let mut rejected = tracker.lock().unwrap();
         if handled {
             rejected.remove(&hash.finish());
-        } else {
+        } else if rejected.len() < 4096 {
             rejected.insert(hash.finish());
+        } else {
+            tracker_overflow.store(true, Ordering::Release);
         }
     })));
     let context = Context::full(&rt).map_err(|_| "Context initialization failed")?;
@@ -261,7 +265,7 @@ fn run() -> Result<(), String> {
             })
             .map_err(|_| "Plugin callback failed")?;
         drain(&rt, &deadline)?;
-        if !rejected.lock().unwrap().is_empty() {
+        if rejection_overflow.load(Ordering::Acquire) || !rejected.lock().unwrap().is_empty() {
             return Err("Unhandled plugin promise rejection".into());
         }
         cpu.push_back((started, started.elapsed()));
@@ -272,7 +276,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         emit(
-            &json!({"jsonrpc":"2.0","generation":generation,"method":"ready","params":{"phase":"yielded"}}),
+            &json!({"jsonrpc":"2.0","generation":generation,"method":"ready","params":{"phase":"yielded","requestId":parsed.as_ref().filter(|m|m.method.is_some()).and_then(|m|m.id)}}),
         )?;
     }
 }

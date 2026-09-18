@@ -7,6 +7,9 @@ pub mod ports;
 #[derive(Parser)]
 #[command(name = "codemux", about = "Codemux desktop and control CLI")]
 pub struct Cli {
+    /// Launch the desktop with feature plugins paused.
+    #[arg(long, global = true)]
+    pub disable_addons: bool,
     #[command(subcommand)]
     pub command: Option<CommandSet>,
 }
@@ -366,6 +369,9 @@ pub enum CliOutcome {
 
 pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
     let cli = Cli::parse();
+    if cli.disable_addons {
+        std::env::set_var("CODEMUX_DISABLE_ADDONS", "1");
+    }
     // `serve` never touches the control socket — hand it back to `main` so it
     // can run the long-lived server on the main thread outside `block_on`.
     if let Some(CommandSet::Serve { scope, port, relay }) = &cli.command {

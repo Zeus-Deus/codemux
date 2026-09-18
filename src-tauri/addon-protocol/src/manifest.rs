@@ -61,7 +61,15 @@ pub enum HttpMethod {
 pub struct HttpGrant {
     pub origin: String,
     pub methods: Vec<HttpMethod>,
+    #[serde(deserialize_with = "required_nullable_string")]
+    #[schemars(required, schema_with = "nullable_string_schema")]
     pub credential: Option<String>,
+}
+fn required_nullable_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+fn nullable_string_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    generator.subschema_for::<Option<String>>()
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

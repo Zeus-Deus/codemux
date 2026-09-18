@@ -239,6 +239,11 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    // Deny before channel rewriting or native invocation.
+    if cmd.starts_with("addon_") {
+        let _ = out.send(err_text(id, "REMOTE_UNSUPPORTED: add-ons require the desktop app"));
+        return;
+    }
     // Route any channels this command opens back to *this* browser, tagging
     // them with whether this command's channel carries raw bytes.
     rewrite_channel_markers(&mut args, router, conn_id, out, is_raw_byte_stream(&cmd));
@@ -499,5 +504,22 @@ mod tests {
         let routes = router.routes.lock().unwrap();
         assert_eq!(routes.len(), 1);
         assert!(routes.values().all(|r| r.conn_id == 200));
+    }
+}
+
+#[cfg(test)]
+mod addons_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn addon_commands_are_denied_before_any_channel_is_allocated() {
+        let app = tauri::test::mock_app();
+        let router = Arc::new(ChannelRouter::default());
+        let (out, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        for command in ["addon_inventory", "addon_subscribe", "addon_execute", "addon_future_command"] {
+            dispatch_invoke(app.handle(), &router, 7, &out, 1, command.into(), json!({"channel":"__CHANNEL__:12"})).await;
+            let Message::Text(frame) = frames.recv().await.unwrap() else { panic!("Expected rejection") };
+            assert!(frame.contains("REMOTE_UNSUPPORTED"));
+            assert!(router.routes.lock().unwrap().is_empty());
+        }
     }
 }

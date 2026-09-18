@@ -20,6 +20,8 @@ fn invalid_batch_never_partially_commits() {
         json!([0,"a",{"id":"a","type":1,"element":"cmx-card"},0]),
         json!([0,"~",{"id":"c","type":1,"element":"script"},0]),
         json!([3, "a", "href", "https://attacker", 2]),
+        json!([3, "a", "dangerouslySetInnerHTML", null, 1]),
+        json!([0,"~",{"id":"z","type":1,"element":"cmx-text","properties":{"style":null}},0]),
     ] {
         assert!(tree.apply(&[record]).is_err());
     }
