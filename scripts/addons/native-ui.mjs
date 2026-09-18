@@ -3,9 +3,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpus, totalmem, release } from "node:os";
+import { cpus, totalmem, release, homedir } from "node:os";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile,
+  rename,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -377,7 +384,7 @@ async function createNativeSession() {
   );
   await element('button[aria-label="Menu"]');
 }
-async function restartNativeSession() {
+async function stopNativeSession() {
   // The driver owns the Linux app child. On Windows attach mode we retain the
   // exact process handle ourselves. Never stop a process by name or pattern.
   await wd("DELETE", "");
@@ -400,6 +407,10 @@ async function restartNativeSession() {
         return true;
       }
     });
+  }
+}
+async function startNativeSession() {
+  if (process.platform === "win32") {
     desktop = start(application, [], { env });
     await until(
       "restarted WebView2 ready",
@@ -412,6 +423,10 @@ async function restartNativeSession() {
     );
   }
   await createNativeSession();
+}
+async function restartNativeSession() {
+  await stopNativeSession();
+  await startNativeSession();
 }
 
 try {
@@ -855,6 +870,51 @@ try {
     await click('[aria-label="Close settings"]');
     await checkCoreTerminal();
   });
+  await step(
+    "11-corrupt-plugin-registry-does-not-block-core-startup",
+    async () => {
+      assert.deepEqual((await native("addon_inventory")).installed, []);
+      await stopNativeSession();
+      // This exact registry was created by the imports above in a fresh disposable
+      // runner. Preserve it and its SQLite companions; never touch core databases.
+      const dataHome =
+        process.platform === "win32"
+          ? env.APPDATA
+          : env.XDG_DATA_HOME || join(homedir(), ".local/share");
+      assert.ok(dataHome);
+      const registry = join(
+        dataHome,
+        "codemux",
+        "addons-v1",
+        "registry.sqlite",
+      );
+      assert.equal(
+        (await readFile(registry)).subarray(0, 16).toString(),
+        "SQLite format 3\0",
+      );
+      for (const suffix of ["", "-wal", "-shm"]) {
+        try {
+          await rename(registry + suffix, registry + suffix + ".ci-backup");
+        } catch (error) {
+          if (suffix === "" || error.code !== "ENOENT") throw error;
+        }
+      }
+      await writeFile(registry, "Synthetic invalid plugin registry", {
+        flag: "wx",
+      });
+      await startNativeSession();
+      await openSettings();
+      const unavailable = await native("addon_inventory");
+      assert.equal(unavailable.paused, true);
+      assert.ok(unavailable.error);
+      assert.equal(await pluginHostCount(), 0);
+      await clickText("Appearance");
+      await hasText("Theme");
+      await click('[aria-label="Close settings"]');
+      await checkCoreTerminal();
+      await typeComposer(" Core input while plugin storage is unavailable.");
+    },
+  );
   if (evidence.failedChecks.length)
     throw Error("One or more native acceptance gates failed; see failedChecks");
   evidence.status = "passed";
