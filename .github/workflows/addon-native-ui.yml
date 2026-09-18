@@ -1,0 +1,73 @@
+name: Retry native add-on UI acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Packaged add-on workflow run containing the installer input artifacts
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native-ui:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Validate installer source run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          const id = process.env.BUILD_RUN_ID;
+          assert.match(id, /^\d+$/);
+          const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/actions/runs/${id}`, {
+            headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
+          });
+          assert.equal(response.status, 200);
+          const run = await response.json();
+          assert.equal(run.repository.full_name, process.env.GITHUB_REPOSITORY);
+          assert.equal(run.head_repository.full_name, process.env.GITHUB_REPOSITORY);
+          assert.equal(run.path, '.github/workflows/addon-packaged.yml');
+          console.log(`Testing installers from ${run.head_sha}; harness ${process.env.GITHUB_SHA}`);
+          JS
+      - uses: actions/download-artifact@v4
+        with:
+          name: addon-native-ui-inputs-${{ runner.os }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Native Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-0 libayatana-appindicator3-1 webkit2gtk-driver xvfb dbus-x11
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install external WebDriver
+        run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Install matching Microsoft WebView2 driver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/install-webdriver.ps1
+      - name: Native desktop UI acceptance (Linux)
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a node scripts/addons/native-ui.mjs
+      - name: Native desktop UI acceptance (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/addons/native-ui.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: addon-native-ui-evidence-${{ runner.os }}
+          path: addon-native-ui-evidence/
+          if-no-files-found: warn
