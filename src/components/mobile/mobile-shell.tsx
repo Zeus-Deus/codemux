@@ -13,6 +13,7 @@ import {
   MessageSquare,
   Globe,
   ListTodo,
+  History,
   Users,
   Code2,
   Folder,
@@ -40,6 +41,7 @@ import {
 } from "@/components/ui/dialog";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { toast } from "@/lib/toast";
+import { MobileHistorySheet } from "./mobile-history-sheet";
 import { MobileInstall } from "./mobile-install";
 import { MobileSessionSheet } from "./mobile-session-sheet";
 import { WorkspaceStatusCluster } from "@/components/chat/WorkspaceStatusCluster";
@@ -69,6 +71,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
   const [more, setMore] = useState(false);
   const [install, setInstall] = useState(false);
   const [sessions, setSessions] = useState(false);
+  const [history, setHistory] = useState(false);
   const toolsButton = useRef<HTMLButtonElement>(null);
   const sessionButton = useRef<HTMLButtonElement>(null);
   const settled = useSidebarInboxStore((s) => s.settled);
@@ -342,13 +345,21 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           returnFocusRef={sessionButton}
         />
       )}
+      {history && workspace && !draft && (
+        <MobileHistorySheet
+          key={workspace.workspace_id}
+          workspaceId={workspace.workspace_id}
+          onClose={() => setHistory(false)}
+          returnFocusRef={toolsButton}
+        />
+      )}
       <Sheet open={more} onOpenChange={setMore}>
         <SheetContent
           side="bottom"
           className="mobile-bottom-sheet mobile-tools-sheet"
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            if (!sessions) toolsButton.current?.focus();
+            if (!sessions && !history) toolsButton.current?.focus();
           }}
         >
           <SheetHeader>
@@ -364,8 +375,17 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
           {workspace && !draft && !home && (
             <>
               <div className="mobile-tool-grid">
+                <button
+                  onClick={() => {
+                    selectPanel(null);
+                    setMore(false);
+                    setHistory(true);
+                  }}
+                >
+                  <History size={20} />
+                  <span>History</span>
+                </button>
                 {[
-                  { tab: null, label: "Conversation", icon: MessageSquare },
                   { tab: "files" as const, label: "Files", icon: Folder },
                   {
                     tab: "changes" as const,

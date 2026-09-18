@@ -88,3 +88,14 @@ Latest captures supersede the earlier persistent-footer screenshots:
 | Conversation | [390px](assets/mobile-remote/focused-chat-390.png) |
 | Workspace tools | [390px](assets/mobile-remote/focused-tools-390.png) |
 | Sessions | [390px](assets/mobile-remote/focused-sessions-390.png) |
+
+### Touch-friendly conversation history
+
+Mobile now replaces the desktop message-trail stripes with **Tools → History**. The bottom sheet lists prompts newest first, searches the whole conversation and shows 50 results at a time, with an option to show older prompts. Tapping a prompt closes History and jumps to that turn; Jump to latest remains available. Opening History focuses its heading instead of summoning the keyboard. Desktop keeps its existing message trail.
+
+TypeScript and 101 targeted history, shell, message-list and desktop-trail tests passed. Browser verification searched a 522-turn conversation and jumped to turn 2 at 390px; the sheet also fits at 320px without document overflow, with 16px search text. Physical-device keyboard behavior remains part of the release checks above.
+
+| History refinement | Capture |
+| --- | --- |
+| Searchable prompt history | [390px](assets/mobile-remote/history-390.png) |
+| Conversation after jumping, without the rail | [390px](assets/mobile-remote/history-chat-390.png) |

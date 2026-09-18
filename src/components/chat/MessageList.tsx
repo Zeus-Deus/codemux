@@ -1,3 +1,5 @@
+import { useMobileLayout } from "@/hooks/use-mobile-layout";
+import { useMobileHistory } from "@/components/mobile/mobile-history";
 import {
   ArrowDown,
   ChevronDown,
@@ -210,6 +212,7 @@ export const MessageList = memo(function MessageList({
   workspaceId,
   cwd,
 }: Props) {
+  const mobile = useMobileLayout();
   const fileLinkContext = useMemo(
     () => ({ workspaceId, cwd }),
     [cwd, workspaceId],
@@ -560,6 +563,8 @@ export const MessageList = memo(function MessageList({
     },
     [glideInFlight, hideJumpToLatest, ownsScroll, scheduleJumpToLatest],
   );
+
+  useMobileHistory({ enabled: mobile, workspaceId, threadKey, slots, listRef, onNavigate: cancelFollowForUserNavigation });
 
   // The edge signal is `isNearEnd` (LegendList's `onEndReachedThreshold`,
   // default 0.5 — within half a viewport of the end), not the hairline
@@ -1243,7 +1248,7 @@ export const MessageList = memo(function MessageList({
         className="group/transcript-list relative size-full min-h-0 overflow-hidden"
         data-provider={provider ?? undefined}
       >
-      <MessageTrail slots={slots} listRef={listRef} />
+      {!mobile && <MessageTrail slots={slots} listRef={listRef} />}
       <LegendList<TranscriptSlot>
         ref={listRef}
         data={slots}
