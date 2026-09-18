@@ -43,7 +43,7 @@ export type ThemeStudioRequest =
  *  opened per file, so the id carries its own payload — that keeps the
  *  open-pane list a plain, persistable string array. */
 export type RightPanelTab =
-  RightPanelCorePane | `doc:${string}` | typeof RIGHT_PANEL_EMPTY;
+  RightPanelCorePane | `doc:${string}` | `addon:${string}:${string}` | typeof RIGHT_PANEL_EMPTY;
 
 /** The deck a workspace starts with. Matches the three panes that were
  *  always-present tabs before the deck existed, so an upgrade is a no-op

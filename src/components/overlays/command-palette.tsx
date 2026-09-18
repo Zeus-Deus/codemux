@@ -1,3 +1,7 @@
+import { useAddonsStore } from "@/stores/addons-store";
+import { addonEnabled } from "@/lib/addons/types";
+import { executeAddon } from "@/lib/addons/platform";
+import { Puzzle } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Command as CommandPrimitive } from "cmdk";
 import {
@@ -138,6 +142,7 @@ interface PaletteCommand {
   run?: (ctx: CommandContext) => void;
   /** Hidden when there is no active workspace to act on. */
   requiresWorkspace?: boolean;
+  addon?: boolean;
 }
 
 interface CommandContext {
@@ -437,15 +442,18 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   );
 
   // ── Command rows ───────────────────────────────────────────────────────
+  const addonInstalled = useAddonsStore(s => s.installed);
+  const addonsPaused = useAddonsStore(s => s.paused);
+  const addonCommands = useMemo<PaletteCommand[]>(()=>addonsPaused || activeWorkspace?.host_id || activeWorkspace?.remote_cwd || activeWorkspace?.attach_only ? [] : addonInstalled.filter(addonEnabled).flatMap(({manifest})=>manifest.contributes.commands.map(command=>({id:`addon:${manifest.id}:${command.id}`,label:`${command.title} · ${manifest.name}`,icon:Puzzle,requiresWorkspace:command.requiresWorkspace,addon:true,run:()=>{void executeAddon(manifest.id,command.id,'commands');}}))),[addonInstalled,addonsPaused,activeWorkspace?.host_id,activeWorkspace?.remote_cwd,activeWorkspace?.attach_only]);
   const commandRows = useMemo<CommandRow[]>(
     () =>
-      COMMANDS.filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
+      [...COMMANDS,...addonCommands].filter((c) => !c.requiresWorkspace || activeWorkspace !== null).map((command) => ({
         kind: "command" as const,
         key: `cmd:${command.id}`,
         command,
         keys: command.actionId ? getKeysForAction(command.actionId) : "",
       })),
-    [activeWorkspace, getKeysForAction],
+    [activeWorkspace, getKeysForAction, addonCommands],
   );
 
   // ── Theme rows ─────────────────────────────────────────────────────────
@@ -917,9 +925,11 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
               }
             />
           )}
-          {matchedCommands.map((row) => (
+          {matchedCommands.filter(row=>!row.command.addon).map((row) => (
             <CommandItemRow key={row.key} row={row} onSelect={() => runCommand(row.command)} />
           ))}
+          {matchedCommands.some(row=>row.command.addon) && <GroupHeader label="Add-ons" count={`${matchedCommands.filter(row=>row.command.addon).length}`} first={false} />}
+          {matchedCommands.filter(row=>row.command.addon).map(row=><CommandItemRow key={row.key} row={row} onSelect={()=>runCommand(row.command)} />)}
         </CommandPrimitive.List>
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-5 bg-gradient-to-b from-transparent to-popover" />
       </div>

@@ -1,3 +1,8 @@
+import { useAddonsStore } from "@/stores/addons-store";
+import { addonEnabled } from "@/lib/addons/types";
+import { AddonView } from "@/components/addons/addon-view";
+import { addonIcon } from "@/components/addons/addon-renderer";
+import { isAddonPane } from "./right-panel/pane-registry";
 /**
  * The right panel — a **pane deck**.
  *
@@ -300,9 +305,13 @@ export const RightPanel = memo(function RightPanel({
   const openPanes = storedPanes ?? DEFAULT_RIGHT_PANEL_PANES;
   const dismissed = storedDismissed;
 
+  const addonInstalled = useAddonsStore(s => s.installed);
+  const addonsPaused = useAddonsStore(s => s.paused);
+  const addonPanels = useMemo(() => addonsPaused || workspace.host_id || workspace.remote_cwd || workspace.attach_only ? [] : addonInstalled.filter(i => addonEnabled(i) || i.status === "failed-disabled").flatMap(({manifest}) => manifest.contributes.panels.map(panel => ({...panel, failed: addonInstalled.find(i=>i.manifest.id===manifest.id)?.status === "failed-disabled", pane: `addon:${manifest.id}:${panel.id}` as const, pluginId: manifest.id, pluginName: manifest.name}))), [addonInstalled, addonsPaused, workspace.host_id, workspace.remote_cwd, workspace.attach_only]);
   const isAvailable = useCallback(
     (id: RightPanelTab): boolean => {
-      if (!isCorePane(id)) return true;
+      if (isAddonPane(id)) return addonPanels.some(panel => panel.pane === id);
+      if (!isCorePane(id)) return id.startsWith("doc:");
       switch (id) {
         case "tasks":
           return tasksSnapshot != null;
@@ -314,7 +323,7 @@ export const RightPanel = memo(function RightPanel({
           return true;
       }
     },
-    [tasksSnapshot, workflowRun, subagentSummary.groups],
+    [tasksSnapshot, workflowRun, subagentSummary.groups, addonPanels],
   );
 
   // Availability-gated panes join the strip on their own when their data
@@ -597,6 +606,10 @@ export const RightPanel = memo(function RightPanel({
           : FileText;
       return { id, label: baseName(path), icon, testId: "doc-tab" };
     }
+    if (isAddonPane(id)) {
+      const panel = addonPanels.find(panel => panel.pane === id)!;
+      return {id, label: panel.title, icon: addonIcon(panel.icon), testId: "addon-tab"};
+    }
     const meta = paneMeta(id as RightPanelCorePane)!;
     const tab: DeckTab = { id, label: meta.label, icon: meta.icon };
     switch (id) {
@@ -664,6 +677,7 @@ export const RightPanel = memo(function RightPanel({
       icon: meta.icon,
       onOpen: () => setRightPanelTab(workspaceId, meta.id),
     })),
+    ...addonPanels.filter(panel => !panel.failed && !visiblePanes.includes(panel.pane)).map(panel => ({id:panel.pane, label:panel.title, description:panel.pluginName, icon:addonIcon(panel.icon), onOpen:()=>setRightPanelTab(workspaceId,panel.pane)})),
   ];
 
   // ── Pane action model ──
@@ -896,6 +910,8 @@ export const RightPanel = memo(function RightPanel({
             onRequestRawView={showActiveDocSource}
             treeRefreshKey={treeRefreshKey}
           />
+        ) : activePane && isAddonPane(activePane) ? (
+          <AddonView key={`${workspaceId}/${activePane}`} id={activePane.split(":")[1]} view={activePane.split(":")[2]} workspaceId={workspaceId} />
         ) : activePane === "files" ? (
           <FileTreePanel
             workspace={workspace}

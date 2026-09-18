@@ -1,3 +1,5 @@
+import { useAddonComposerAdapter } from "@/lib/addons/use-addon-composer-adapter";
+import { ComposerAddonAccessory, useAddonComposerActions } from "@/components/addons/composer-addons";
 import {
   Bug,
   CircleCheck,
@@ -455,6 +457,8 @@ export function Composer({
   onModeActivate,
   onModeRemove,
 }: Props) {
+  const addonComposer = useAddonComposerAdapter(workspaceId, threadId, draft, onDraftChange);
+  const addonActions = useAddonComposerActions(addonComposer.id, addonComposer.registered);
   const configurationEnabled = sessionReady && configurationReady;
   // Named apart from the `provider` prop above, which is the AI agent
   // backend (claude/codex/…) — a different axis entirely.
@@ -1721,6 +1725,7 @@ export function Composer({
           group: "INTEGRATIONS",
           onSelect: () => {},
         },
+        ...addonActions,
       ];
     }
     if (attachSubmode === "mcp") {
@@ -1801,6 +1806,7 @@ export function Composer({
     }));
   }, [
     attachSubmode,
+    addonActions,
     attachFileMatches,
     attachFolderMatches,
     attachSessionMatches,
@@ -1900,6 +1906,7 @@ export function Composer({
   const handleAttachPopupSelect = useCallback(
     (item: SlashCommandItem) => {
       if (item.disabled) return;
+      if (item.id.startsWith("addon:")) { item.onSelect(); closeAttachPopup(); return; }
       // Submode pivots
       if (item.id === "attach:file") {
         setAttachSubmode("file");
@@ -3219,6 +3226,7 @@ export function Composer({
               Drop images to attach
             </div>
           ) : null}
+          <ComposerAddonAccessory composerId={addonComposer.id} />
           <ComposerFooter
             provider={provider}
             model={model}

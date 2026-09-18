@@ -1,3 +1,4 @@
+import { useAddonPlatform } from "@/lib/addons/platform";
 import { lazy, useCallback, useEffect, useRef } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
@@ -50,6 +51,7 @@ const RenameWorkspaceDialog = lazy(() =>
 );
 
 function App() {
+  useAddonPlatform();
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const isLoading = useAuthStore((s) => s.isLoading);
   const sessionStatus = useAuthStore((s) => s.sessionStatus);
