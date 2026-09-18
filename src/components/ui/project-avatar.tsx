@@ -53,7 +53,7 @@ export function ProjectAvatar({
 
   const hasImage = !!resolvedUrl && !imgFailed;
   const hasColor = !!color;
-  const shapeClass = shape === "circle" ? "rounded-full" : "rounded";
+  const shapeClass = shape === "circle" ? "rounded-full" : "rounded-sm";
 
   if (hasImage) {
     return (

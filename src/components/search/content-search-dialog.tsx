@@ -205,7 +205,7 @@ export function ContentSearchDialog() {
                 <button
                   key={`${match.file_path}:${match.line_number}:${idx}`}
                   data-match-index={idx}
-                  className={`flex w-full items-baseline gap-2 rounded px-2 py-0.5 text-left font-mono text-body-sm ${
+                  className={`flex w-full items-baseline gap-2 rounded-sm px-2 py-0.5 text-left font-mono text-body-sm ${
                     idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50"
                   }`}
                   onClick={() => openFile(match.file_path)}

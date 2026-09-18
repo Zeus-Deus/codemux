@@ -91,7 +91,7 @@ export function ProviderStatusNotice({
             type="button"
             aria-label={`Dismiss ${label} provider status`}
             onClick={() => dismiss(provider)}
-            className="shrink-0 rounded p-0.5 opacity-60 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+            className="shrink-0 rounded-sm p-0.5 opacity-60 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           >
             <X className="h-3.5 w-3.5" aria-hidden />
           </button>

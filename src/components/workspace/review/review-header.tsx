@@ -99,7 +99,7 @@ export function ReviewHeader({
         </span>
         <span
           className={cn(
-            "shrink-0 rounded px-1.5 py-[3px] font-semibold",
+            "shrink-0 rounded-sm px-1.5 py-[3px] font-semibold",
             tzMeta,
             pill.className,
           )}
@@ -170,7 +170,7 @@ export function ReviewHeader({
             <button
               type="button"
               aria-label="Pull request actions"
-              className="flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+              className="flex size-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
             >
               <MoreHorizontal className="size-3.5" />
             </button>

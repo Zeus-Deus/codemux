@@ -107,7 +107,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
           </span>
           <span
             className={cn(
-              "shrink-0 rounded-[5px] px-2 py-0.5 text-label font-bold uppercase tracking-wide",
+              "shrink-0 rounded-sm px-2 py-0.5 text-label font-bold uppercase tracking-wide",
               tone.chipBg,
             )}
           >

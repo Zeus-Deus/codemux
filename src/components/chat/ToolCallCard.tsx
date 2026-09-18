@@ -128,7 +128,7 @@ export const ToolCallCard = memo(function ToolCallCard({
     expanded && !isPendingApproval && !isResponding && !isDenied;
 
   return (
-    <div className="overflow-hidden rounded-[10px] border border-border/60 bg-muted/40">
+    <div className="overflow-hidden rounded-lg border border-border/60 bg-muted/40">
       {/* Header row: tinted icon chip · mono command · status glyph ·
           chevron. `min-w-0 truncate` on the label lets long commands
           ellipsize rather than push the trailing glyphs off-screen. */}

@@ -70,7 +70,7 @@ export function SubagentView({
       {/* Read-only banner */}
       <div
         className={cn(
-          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-body-sm text-muted-foreground",
+          "mb-4 flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-body-sm text-muted-foreground",
           tone.softBg,
           tone.border,
         )}
@@ -156,7 +156,7 @@ function SubItem({
       );
     case "permission_request":
       return (
-        <div className="rounded-[9px] border border-border/60 bg-muted/40 px-3 py-2 text-label text-muted-foreground">
+        <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-label text-muted-foreground">
           {item.resolution.state === "failed"
             ? item.resolution.message
             : item.resolution.state === "pending"

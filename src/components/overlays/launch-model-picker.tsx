@@ -223,7 +223,7 @@ export function LaunchModelPicker({
           <button
             type="button"
             aria-label={isFav ? "Unfavorite model" : "Favorite model"}
-            className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-foreground/10"
+            className="flex size-5 shrink-0 items-center justify-center rounded-sm transition-colors hover:bg-foreground/10"
             onClick={(e) => {
               e.stopPropagation();
               if (providerKind) toggleFavorite(providerKind, model.id);

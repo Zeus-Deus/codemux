@@ -134,7 +134,7 @@ export function BrowserPeekOverlay() {
       aria-label="Background browser preview"
       className={cn(
         "absolute right-3.5 top-3.5 z-30 flex h-[300px] w-[440px] flex-col overflow-hidden",
-        "rounded-xl border border-border bg-popover shadow-2xl",
+        "rounded-lg border border-border bg-popover shadow-2xl",
         "animate-in fade-in slide-in-from-top-1 duration-150 ease-out",
       )}
     >

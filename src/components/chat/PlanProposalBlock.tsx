@@ -87,7 +87,7 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
     // border. Internal scroll surfaces (`pre`, `table`) still get
     // their own `overflow-x-auto` so scrollable content stays
     // interactive.
-    <div className="rounded-[11px] border border-border/60 bg-muted/40 p-3.5 space-y-3 overflow-hidden">
+    <div className="rounded-lg border border-border/60 bg-muted/40 p-3.5 space-y-3 overflow-hidden">
       <div className="text-label font-medium text-muted-foreground">Plan proposed</div>
 
       {plan !== null ? (

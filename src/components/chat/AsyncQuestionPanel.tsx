@@ -99,7 +99,7 @@ export function AsyncQuestionPanel({
                       type="button"
                       aria-label="Previous question set"
                       disabled={index === 0}
-                      className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                      className="rounded-sm p-1 hover:bg-muted disabled:opacity-30"
                       onClick={() =>
                         setSelectedId(pending[index - 1].question.id)
                       }
@@ -113,7 +113,7 @@ export function AsyncQuestionPanel({
                       type="button"
                       aria-label="Next question set"
                       disabled={index === pending.length - 1}
-                      className="rounded p-1 hover:bg-muted disabled:opacity-30"
+                      className="rounded-sm p-1 hover:bg-muted disabled:opacity-30"
                       onClick={() =>
                         setSelectedId(pending[index + 1].question.id)
                       }
@@ -127,7 +127,7 @@ export function AsyncQuestionPanel({
                   <button
                     type="button"
                     aria-label="Dismiss question"
-                    className="rounded p-1 text-muted-foreground hover:bg-muted"
+                    className="rounded-sm p-1 text-muted-foreground hover:bg-muted"
                     onClick={() =>
                       void act(selected.question.id, {
                         action: "dismiss",
@@ -227,7 +227,7 @@ function QuestionCard({
     return (
       <div className={CHAT_COLUMN_OUTER}>
         <div className={CHAT_COLUMN_INNER}>
-          <div className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-label">
+          <div className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-label">
             <p role="status">
               {resolution.status === "submitting"
                 ? "Submitting answer…"

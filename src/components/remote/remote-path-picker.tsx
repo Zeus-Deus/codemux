@@ -202,7 +202,7 @@ export function RemotePathPicker() {
                   <button
                     type="button"
                     className={cn(
-                      "rounded px-1 py-0.5 hover:bg-muted hover:text-foreground",
+                      "rounded-sm px-1 py-0.5 hover:bg-muted hover:text-foreground",
                       i === crumbs.length - 1 && "text-foreground",
                     )}
                     onClick={() => navigateTo(crumb.path)}
@@ -269,7 +269,7 @@ export function RemotePathPicker() {
                         disabled={!selectable}
                         onClick={() => handleEntryClick(entry)}
                         className={cn(
-                          "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-body",
+                          "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-body",
                           selectable
                             ? "hover:bg-muted"
                             : "cursor-default opacity-40",

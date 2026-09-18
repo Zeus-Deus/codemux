@@ -1227,7 +1227,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
+                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",

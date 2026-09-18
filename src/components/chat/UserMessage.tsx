@@ -168,7 +168,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Send now"
                   title="Interrupt current work and send this message now — progress so far is kept"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex h-4 w-4 items-center justify-center rounded-[4px] text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   <CornerDownLeft className="h-2.5 w-2.5" aria-hidden />
                 </button>
@@ -179,7 +179,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Cancel queued message"
                   title="Remove from queue and return to the composer"
                   onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                  className="inline-flex h-4 w-4 items-center justify-center rounded-[4px] text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   <X className="h-2.5 w-2.5" aria-hidden />
                 </button>

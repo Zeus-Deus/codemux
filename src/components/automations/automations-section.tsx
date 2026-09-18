@@ -399,7 +399,7 @@ export function AutomationsSection() {
     return (
       <div className="flex h-full min-h-[460px] items-center justify-center">
         <div className="max-w-sm space-y-4 text-center">
-          <div className="mx-auto flex size-14 items-center justify-center rounded-2xl border border-border/50 bg-muted/40">
+          <div className="mx-auto flex size-14 items-center justify-center rounded-lg border border-border/50 bg-muted/40">
             <CalendarClock className="size-6 text-muted-foreground/70" />
           </div>
           <div className="space-y-1.5">
@@ -790,7 +790,7 @@ function RunHistory({ automationId }: { automationId: number }) {
               ) : null}
               <span
                 className={cn(
-                  "ml-auto shrink-0 rounded px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
+                  "ml-auto shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
                   RUN_STATUS_BADGE[run.status] ?? "bg-muted text-muted-foreground",
                 )}
               >

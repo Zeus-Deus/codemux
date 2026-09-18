@@ -1139,7 +1139,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         {/* Center: prompt textarea with embedded controls */}
         <div className="relative px-3 pt-2 pb-3">
-          <div className="rounded-2xl border border-border bg-muted overflow-hidden">
+          <div className="rounded-lg border border-border bg-muted overflow-hidden">
             <Textarea
               ref={textareaRef}
               value={prompt}
@@ -1161,7 +1161,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   >
                     <span
                       className={cn(
-                        "flex size-5 shrink-0 items-center justify-center rounded",
+                        "flex size-5 shrink-0 items-center justify-center rounded-sm",
                         linkedIssue.state === "Open"
                           ? "bg-success/15 text-success"
                           : "bg-foreground/10 text-muted-foreground",

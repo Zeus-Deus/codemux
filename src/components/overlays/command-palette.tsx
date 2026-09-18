@@ -803,7 +803,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
           placeholder={`Search workspaces, conversations, commands…  (${COMMAND_MODE_PREFIX} for commands)`}
           className="h-8 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground/70"
         />
-        <kbd className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
+        <kbd className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground/70">
           esc
         </kbd>
       </div>
@@ -1013,7 +1013,7 @@ function PaletteItem({
  *  row is selected — the palette's one moving part. */
 function EnterBadge() {
   return (
-    <span className="hidden flex-none rounded-[5px] border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
+    <span className="hidden flex-none rounded-sm border border-accent-ember/30 bg-accent-ember/10 px-1.5 py-0.5 font-mono text-caption text-accent-ember group-data-selected/pal-row:inline-flex">
       ↵
     </span>
   );
@@ -1234,7 +1234,7 @@ function ThemeStudioItemRow({
   const Icon = row.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body text-muted-foreground">
@@ -1249,14 +1249,14 @@ function CommandItemRow({ row, onSelect }: { row: CommandRow; onSelect: () => vo
   const Icon = row.command.icon;
   return (
     <PaletteItem value={row.key} onSelect={onSelect}>
-      <span className="flex size-5 flex-none items-center justify-center rounded border border-border/60 text-muted-foreground/70">
+      <span className="flex size-5 flex-none items-center justify-center rounded-sm border border-border/60 text-muted-foreground/70">
         <Icon className="size-[11px]" />
       </span>
       <span className="min-w-0 flex-1 truncate text-body font-medium text-foreground/90">
         {row.command.label}
       </span>
       {row.keys && (
-        <span className="flex-none rounded-[5px] border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
+        <span className="flex-none rounded-sm border border-border/60 px-1.5 py-0.5 font-mono text-caption text-muted-foreground group-data-selected/pal-row:hidden">
           {row.keys}
         </span>
       )}
@@ -1303,7 +1303,7 @@ function PrPaletteItem({ row, onSelect }: { row: PrRow; onSelect: () => void }) 
 function FooterHint({ keys, label }: { keys: string; label: string }) {
   return (
     <span className="flex items-center gap-1.5 text-label text-muted-foreground/70">
-      <kbd className="rounded border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
+      <kbd className="rounded-sm border border-border/60 px-1.5 py-px font-mono text-caption text-muted-foreground">
         {keys}
       </kbd>
       {label}

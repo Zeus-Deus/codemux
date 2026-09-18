@@ -63,7 +63,7 @@ export function ThemeAnsiDots({ theme }: { theme: ThemeDefinition }) {
         (color, index) => (
           <span
             key={`${color}-${index}`}
-            className="size-[9px] rounded-[3px]"
+            className="size-[9px] rounded-sm"
             style={{ background: color }}
           />
         ),

@@ -522,7 +522,7 @@ function OverviewCard({
             >
               <span
                 className={cn(
-                  "h-2 w-2 shrink-0 rounded-[2px]",
+                  "h-2 w-2 shrink-0 rounded-sm",
                   seriesFill(provider.provider),
                 )}
                 aria-hidden

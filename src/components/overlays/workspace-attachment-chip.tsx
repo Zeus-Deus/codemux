@@ -61,11 +61,11 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
           src={convertFileSrc(path)}
           alt=""
           aria-hidden
-          className="size-5 shrink-0 rounded object-cover"
+          className="size-5 shrink-0 rounded-sm object-cover"
           onError={() => setThumbErrored(true)}
         />
       ) : (
-        <span className="flex size-5 shrink-0 items-center justify-center rounded bg-foreground/10 text-muted-foreground">
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-foreground/10 text-muted-foreground">
           {isImage ? (
             <ImageIcon className="h-3 w-3" />
           ) : (

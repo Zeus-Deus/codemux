@@ -78,7 +78,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   };
 
   const shortcutBadge = (
-    <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded border border-border text-muted-foreground font-sans">
+    <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded-sm border border-border text-muted-foreground font-sans">
       Ctrl+Shift+G
     </kbd>
   );

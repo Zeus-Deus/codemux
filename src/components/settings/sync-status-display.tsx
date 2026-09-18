@@ -133,8 +133,8 @@ function SyncStatusSkeleton() {
     <div className="flex items-center gap-3">
       <div className="h-4 w-4 animate-pulse rounded-full bg-muted" />
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="h-3.5 w-24 animate-pulse rounded bg-muted" />
-        <div className="h-3 w-32 animate-pulse rounded bg-muted/60" />
+        <div className="h-3.5 w-24 animate-pulse rounded-sm bg-muted" />
+        <div className="h-3 w-32 animate-pulse rounded-sm bg-muted/60" />
       </div>
     </div>
   );

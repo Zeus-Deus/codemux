@@ -501,7 +501,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 selectAndActivate();
               }}
               className={cn(
-                "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
+                "group/card relative mb-1.5 cursor-pointer rounded-lg border px-[11px] pt-[9px] pb-[10px]",
                 // select-none: a shift-click range gesture would otherwise
                 // drag a text highlight across every card it spans.
                 "select-none outline-none duration-150",
@@ -717,7 +717,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   <kbd
                     aria-hidden="true"
                     className={cn(
-                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
+                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-sm px-1",
                       "border border-border/80 bg-background/80 font-mono text-caption font-semibold leading-none tabular-nums text-foreground/80",
                       "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
                       "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
@@ -853,7 +853,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         : `${scProvider.nounTitle} — ${prState}`
                     }
                     className={cn(
-                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded-sm px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(

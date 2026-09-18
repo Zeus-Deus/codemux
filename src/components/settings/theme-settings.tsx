@@ -30,7 +30,7 @@ export function ThemeSettings() {
   const isCustom = customThemes.some((theme) => theme.id === activeTheme.id);
 
   return (
-    <div className="flex items-center gap-4 rounded-xl border border-border/60 bg-muted/30 px-4 py-3.5">
+    <div className="flex items-center gap-4 rounded-lg border border-border/60 bg-muted/30 px-4 py-3.5">
       <ThemeCoins theme={activeTheme} size={34} />
       <div className="min-w-0 flex-1 space-y-0.5">
         <p className="flex items-center gap-1.5 text-body font-semibold text-foreground">

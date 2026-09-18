@@ -225,7 +225,7 @@ export function DeleteWorktreeDialog({
             type="checkbox"
             checked={deleteBranch}
             onChange={(e) => setDeleteBranch(e.target.checked)}
-            className="rounded border-border"
+            className="rounded-sm border-border"
           />
           <span className="text-label text-muted-foreground">
             Also delete local branch
@@ -352,7 +352,7 @@ function MenuProjectAvatar({ project }: { project: MenuProject }) {
       imageUrl={appearance.imageUrl}
       cacheBust={appearance.imageVersion}
       shape="square"
-      className="size-[23px] rounded-[7px] text-label font-semibold"
+      className="size-[23px] rounded-md text-label font-semibold"
     />
   );
 }
@@ -386,7 +386,7 @@ function WorkspaceMenuHeader({
         <ProjectAvatar
           name={workspace.title}
           shape="square"
-          className="size-[23px] rounded-[7px] text-label font-semibold"
+          className="size-[23px] rounded-md text-label font-semibold"
         />
       )}
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -1285,7 +1285,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
               // touch more vertical breathing room; idle rows keep today's
               // compact one-liner treatment.
               isCard
-                ? "py-1.5 rounded-[10px] border"
+                ? "py-1.5 rounded-lg border"
                 : "py-1 rounded-lg hover:bg-muted/40",
               isWorking && "border-border/60 bg-muted/30",
               isPermission && "border-status-attention/25 bg-status-attention/5",
@@ -1319,7 +1319,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                               : `Open ${provider.noun} on ${provider.name} — ${prHumanState ?? ""}`
                           }
                           className={cn(
-                            "inline-flex items-center justify-center rounded transition-opacity",
+                            "inline-flex items-center justify-center rounded-sm transition-opacity",
                             workspace.pr_url ? "hover:opacity-70" : "cursor-not-allowed opacity-60",
                           )}
                         >
@@ -1550,12 +1550,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       tunnel (reconnecting / circuit-open). A healthy or local
                       workspace shows nothing here. */}
                   {tunnelKind === "reconnecting" && (
-                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-warning bg-warning/15">
+                    <span className="shrink-0 rounded-sm px-1 text-caption leading-[14px] text-warning bg-warning/15">
                       Reconnecting…
                     </span>
                   )}
                   {tunnelKind === "lost" && (
-                    <span className="shrink-0 rounded px-1 text-caption leading-[14px] text-danger bg-danger/15">
+                    <span className="shrink-0 rounded-sm px-1 text-caption leading-[14px] text-danger bg-danger/15">
                       Connection lost — re-push
                     </span>
                   )}

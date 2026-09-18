@@ -43,7 +43,7 @@ function ActionRow({ icon, label, keys, onClick }: ActionRowProps) {
       onClick={onClick}
       className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-body text-muted-foreground/80 transition-colors hover:bg-muted/60 hover:text-foreground"
     >
-      <span className="rounded p-1 text-muted-foreground/70 transition-colors group-hover:text-foreground">
+      <span className="rounded-sm p-1 text-muted-foreground/70 transition-colors group-hover:text-foreground">
         {icon}
       </span>
       <span className="flex-1 text-left">{label}</span>
