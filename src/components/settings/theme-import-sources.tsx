@@ -51,7 +51,7 @@ export function ThemeImportSourcePicker({
               aria-checked={selected}
               onClick={() => onChange(kind)}
               className={cn(
-                "flex h-9 items-center gap-2.5 rounded-md border px-2.5 text-left transition-colors",
+                "flex h-9 items-center gap-2.5 rounded-md border px-2.5 text-left transition-colors duration-150",
                 selected
                   ? "border-accent-ember bg-accent-ember/10"
                   : "border-border/60 bg-muted/30 hover:bg-muted/50",

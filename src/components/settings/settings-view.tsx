@@ -294,7 +294,7 @@ function OrbPreviewRow({
       <span className="flex-1 truncate text-body font-semibold text-foreground">
         {label}
       </span>
-      <span className="font-mono text-label text-muted-foreground">{elapsed}</span>
+      <span className="font-mono text-label text-muted-foreground tabular-nums">{elapsed}</span>
     </div>
   );
 }
@@ -311,7 +311,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
         active
           ? "bg-surface-3 text-foreground"
           : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
@@ -319,7 +319,7 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
     >
       <Icon
         className={cn(
-          "h-[15px] w-[15px] shrink-0 transition-colors",
+          "h-[15px] w-[15px] shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
             : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
@@ -429,7 +429,7 @@ function BrowserSection() {
           label="Profile storage"
           description="Total size of cached browser data, screenshots, and session files."
         >
-          <span className="text-body font-mono text-muted-foreground">
+          <span className="text-body font-mono text-muted-foreground tabular-nums">
             {dataSize === null ? "..." : formatBytes(dataSize)}
           </span>
         </SettingRow>
@@ -1000,7 +1000,7 @@ function PresetEditorSheet({
                         variant="ghost"
                         size="icon-xs"
                         onClick={() => removeCommand(i)}
-                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
                         aria-label="Remove command"
                       >
                         <X className="size-3.5" />
@@ -1844,7 +1844,7 @@ export function SettingsView() {
 
             <p className="text-body-sm text-muted-foreground/70 leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
-              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">
+              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">
                 Learn how to configure it for your tools
               </a>
             </p>
@@ -2154,7 +2154,7 @@ export function SettingsView() {
                     Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file
                     in your project root to share patterns with your team. When empty, defaults to{" "}
                     <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.env .env.* .env.local</code>.{" "}
-                    <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">Learn more</a>
+                    <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">Learn more</a>
                   </>
                 }
               >
@@ -2475,7 +2475,7 @@ function SortablePresetRow({
     >
       <button
         type="button"
-        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity"
+        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150"
         aria-label="Drag to reorder"
         title="Drag to reorder"
         onClick={(e) => e.stopPropagation()}
@@ -2513,7 +2513,7 @@ function SortablePresetRow({
             variant="ghost"
             size="icon-sm"
             title="Delete preset"
-            className="opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            className="opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
             onClick={(e) => {
               e.stopPropagation();
               onDelete();
@@ -2527,7 +2527,7 @@ function SortablePresetRow({
           size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
           className={cn(
-            "transition-opacity",
+            "transition-opacity duration-150",
             preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
           )}
           onClick={(e) => {

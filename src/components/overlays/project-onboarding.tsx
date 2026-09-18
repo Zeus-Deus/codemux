@@ -477,11 +477,11 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                           key={action.id}
                           type="button"
                           onClick={() => toggleAction(action.id)}
-                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors cursor-pointer"
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer"
                         >
                           <div
                             className={cn(
-                              "size-4 rounded-sm border shrink-0 flex items-center justify-center transition-colors",
+                              "size-4 rounded-sm border shrink-0 flex items-center justify-center transition-colors duration-150",
                               action.checked
                                 ? "bg-primary border-primary"
                                 : "border-border",
@@ -577,10 +577,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   open={teardownOpen}
                   onOpenChange={setTeardownOpen}
                 >
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors py-1">
+                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors duration-150 py-1">
                     <ChevronDown
                       className={cn(
-                        "size-3 transition-transform duration-200",
+                        "size-3 transition-transform duration-150",
                         !teardownOpen && "-rotate-90",
                       )}
                     />

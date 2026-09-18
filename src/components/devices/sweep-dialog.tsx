@@ -202,7 +202,7 @@ export function SweepDialog({ open, onOpenChange, candidates, knownBytes }: Prop
               <DialogTitle className="text-body-lg">
                 Sweep {count} settled {count === 1 ? "workspace" : "workspaces"}
                 {knownBytes !== null && knownBytes > 0 && (
-                  <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground">
+                  <span className="ml-1.5 font-mono text-label font-normal text-muted-foreground tabular-nums">
                     ~{formatBytes(knownBytes)}
                   </span>
                 )}

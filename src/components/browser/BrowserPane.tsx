@@ -941,7 +941,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
         )}
         {status !== "live" && hasFrame && (
           <div
-            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-200"
+            className="absolute right-2 top-2 z-10 flex items-center gap-1.5 rounded-full border border-border bg-card/90 px-2.5 py-1 shadow-sm backdrop-blur-sm animate-in fade-in duration-250"
             style={{ animationDelay: "400ms", animationFillMode: "backwards" }}
           >
             {status === "error" ? (

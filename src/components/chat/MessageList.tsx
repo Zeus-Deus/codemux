@@ -1808,11 +1808,11 @@ function TurnFoldRow({
         type="button"
         aria-expanded={expanded}
         onClick={() => onToggleTurnFold(turnId)}
-        className="flex items-center gap-1 rounded-md px-1 text-label tabular-nums text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+        className="flex items-center gap-1 rounded-md px-1 text-label tabular-nums text-muted-foreground transition-colors duration-150 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
       >
         <span>{label}</span>
         {failedCount > 0 ? (
-          <span className="text-status-attention">
+          <span className="text-status-attention tabular-nums">
             · {failedCount} failed
           </span>
         ) : null}

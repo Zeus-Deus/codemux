@@ -316,7 +316,7 @@ export function TypographySettings() {
           <button
             type="button"
             onClick={restoreDefaults}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground"
           >
             <RotateCcw className="size-3" aria-hidden />
             Restore defaults
@@ -462,7 +462,7 @@ function FontFamilyPicker({
         <button
           type="button"
           aria-label={`Font family: ${display}`}
-          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-[190px] sm:flex-none"
+          className="flex h-8 min-w-0 flex-1 items-center justify-between gap-2 rounded-lg border border-input bg-background/75 px-2.5 text-left text-body-sm text-foreground transition-colors duration-150 hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 sm:w-[190px] sm:flex-none"
         >
           <span className="min-w-0 truncate" style={{ fontFamily: fontStack(value, defaultStack) }}>
             {display}

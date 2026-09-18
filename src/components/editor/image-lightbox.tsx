@@ -74,7 +74,7 @@ export function ImageLightbox({ src, alt, href, onClose }: ImageLightboxProps) {
             type="button"
             data-testid="image-lightbox-open-external"
             onClick={() => void openExternalUrl(href)}
-            className="inline-flex h-[30px] items-center gap-1.5 rounded-md border-0 bg-white/10 px-3 text-body-sm font-medium text-white transition-colors hover:bg-white/20"
+            className="inline-flex h-[30px] items-center gap-1.5 rounded-md border-0 bg-white/10 px-3 text-body-sm font-medium text-white transition-colors duration-150 hover:bg-white/20"
           >
             <ExternalLink className="size-3.5" />
             Open in browser
@@ -85,7 +85,7 @@ export function ImageLightbox({ src, alt, href, onClose }: ImageLightboxProps) {
           aria-label="Close"
           data-testid="image-lightbox-close"
           onClick={onClose}
-          className="inline-flex size-[30px] items-center justify-center rounded-md border-0 bg-white/10 text-white transition-colors hover:bg-white/20"
+          className="inline-flex size-[30px] items-center justify-center rounded-md border-0 bg-white/10 text-white transition-colors duration-150 hover:bg-white/20"
         >
           <X className="size-4" />
         </button>

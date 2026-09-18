@@ -267,7 +267,7 @@ const TrailRail = memo(function TrailRail({
             onClick={() => jumpTo(entry.slotIndex)}
             onMouseEnter={(e) => showPreview(entryIndex, e.currentTarget)}
             onFocus={(e) => showPreview(entryIndex, e.currentTarget)}
-            className="group/tick flex w-full items-center justify-center py-[3px] outline-none"
+            className="group/tick flex w-full items-center justify-center py-[3px]"
           >
             <span
               ref={(node) => {

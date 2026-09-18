@@ -133,7 +133,7 @@ export function MarkdownLocalImage({
     >
       <button
         type="button"
-        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
         aria-label={`Open ${caption}`}
         onClick={() => setOpen(true)}
       >
@@ -148,7 +148,7 @@ export function MarkdownLocalImage({
               src={thumbnail.src}
               alt={caption}
               loading="lazy"
-              className="max-h-72 w-full object-contain transition-transform duration-200 group-hover:scale-[1.01]"
+              className="max-h-72 w-full object-contain transition-transform duration-150 group-hover:scale-[1.01]"
               onError={thumbnail.onError}
             />
           )}

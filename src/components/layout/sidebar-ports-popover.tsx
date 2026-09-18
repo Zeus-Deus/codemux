@@ -218,12 +218,12 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                       >
                         {port.label ?? port.process_name}
                       </span>
-                      <span className="text-caption text-muted-foreground/50 tabular-nums shrink-0 transition-opacity group-hover/port:opacity-0">
+                      <span className="text-caption text-muted-foreground/50 tabular-nums shrink-0 transition-opacity duration-150 group-hover/port:opacity-0">
                         {port.source === "docker"
                           ? port.process_name
                           : `PID ${port.pid}`}
                       </span>
-                      <div className="absolute right-2 flex items-center gap-0.5 opacity-0 group-hover/port:opacity-100 transition-opacity">
+                      <div className="absolute right-2 flex items-center gap-0.5 opacity-0 group-hover/port:opacity-100 transition-opacity duration-150">
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <button

@@ -32,12 +32,12 @@ export const MESSAGE_GROUP_CLASS = "group/message";
  */
 export const MESSAGE_ACTION_CLASS = [
   "flex items-center gap-0.5 rounded-sm text-caption text-muted-foreground",
-  "pointer-events-none opacity-0 transition-opacity",
+  "pointer-events-none opacity-0 transition-opacity duration-150",
   "hover:text-foreground",
   "group-hover/message:pointer-events-auto group-hover/message:opacity-100",
   "group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100",
   "focus-visible:pointer-events-auto focus-visible:opacity-100",
-  "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
   "pointer-coarse:pointer-events-auto pointer-coarse:opacity-100",
 ].join(" ");
 

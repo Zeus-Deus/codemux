@@ -168,7 +168,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Send now"
                   title="Interrupt current work and send this message now — progress so far is kept"
                   onClick={() => onSendQueuedNow(queued.queuedId)}
-                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors duration-150 hover:bg-muted/60 hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 >
                   <CornerDownLeft className="size-3" aria-hidden />
                 </button>
@@ -179,7 +179,7 @@ export const UserMessage = memo(function UserMessage({
                   aria-label="Cancel queued message"
                   title="Remove from queue and return to the composer"
                   onClick={() => onCancelQueued(queued.queuedId, item.text)}
-                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/55 transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 >
                   <X className="size-3" aria-hidden />
                 </button>
@@ -264,7 +264,7 @@ function ImageThumbnail({
       type="button"
       onClick={onOpen}
       aria-label="Open attached image"
-      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="cursor-pointer overflow-hidden rounded-lg border border-border/60 transition-opacity duration-150 hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
     >
       <img
         src={src}

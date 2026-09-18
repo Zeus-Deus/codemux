@@ -131,10 +131,10 @@ export function SyncStatusDisplay() {
 function SyncStatusSkeleton() {
   return (
     <div className="flex items-center gap-3">
-      <div className="size-4 animate-pulse rounded-full bg-muted" />
+      <div className="size-4 motion-safe:animate-pulse rounded-full bg-muted" />
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="h-3.5 w-24 animate-pulse rounded-sm bg-muted" />
-        <div className="h-3 w-32 animate-pulse rounded-sm bg-muted/60" />
+        <div className="h-3.5 w-24 motion-safe:animate-pulse rounded-sm bg-muted" />
+        <div className="h-3 w-32 motion-safe:animate-pulse rounded-sm bg-muted/60" />
       </div>
     </div>
   );

@@ -122,6 +122,36 @@ An implicit duration silently inherits 150ms, which is how eleven distinct
 durations ended up in one window. Name the properties that transition rather
 than using `transition-all`, and gate anything that loops on `motion-safe:`.
 
+## Focus
+
+One base-layer `:focus-visible` rule in `src/globals.css` gives every
+focusable element the same outline. Do not suppress it with `outline-none`
+unless focus is genuinely shown some other way — a dialog that takes focus as
+a whole, a command list whose selected row is filled, a bare input inside a
+container that carries `focus-within:`. Suppressing it *and* adding nothing is
+how 49 controls became unreachable by keyboard.
+
+When the ring has to hug a different shape, one recipe layers on top:
+
+```
+focus-visible:ring-2 focus-visible:ring-ring/60
+```
+
+## Scrollbars
+
+Two utilities, one intent each:
+
+- `thin-scrollbar` — a thin, quiet, always-present bar for a list that is
+  tall enough to keep one. It also reserves its gutter (`scrollbar-gutter:
+  stable`), so a growing list does not shove its own content sideways.
+- `no-scrollbar` — hides the bar outright, for a tab strip or rail that
+  scrolls by drag and wheel. It is a real utility from `shadcn/tailwind.css`;
+  a comment once claimed otherwise and three hand-rolled copies followed.
+
+Do not hand-roll `[scrollbar-width:…]` plus a `::-webkit-scrollbar` block:
+the two render differently on WebKitGTK, which is the engine this app ships
+on.
+
 ## Numbers
 
 Anything that ticks — timers, counts, sizes, percentages — carries
