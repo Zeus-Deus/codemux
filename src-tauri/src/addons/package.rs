@@ -177,8 +177,12 @@ mod tests {
             header.set_entry_type(kind);
             header.set_size(0);
             header.set_mode(0o777);
+            // Write the raw field: tar::Builder::append_data would sanitize or
+            // reject traversal itself, preventing us from testing our reader.
+            assert!(name.len() < 100);
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
             header.set_cksum();
-            tar.append_data(&mut header, name, &[][..]).unwrap();
+            tar.append(&header, &[][..]).unwrap();
         }
         let bytes = tar.into_inner().unwrap();
         let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -195,6 +199,16 @@ mod tests {
             ("manifest.json", tar::EntryType::Regular),
             ("plugin.js", tar::EntryType::Symlink),
             ("unexpected.exe", tar::EntryType::Regular),
+            ("../plugin.js", tar::EntryType::Regular),
+            ("/plugin.js", tar::EntryType::Regular),
+            ("C:/plugin.js", tar::EntryType::Regular),
+            ("..\\plugin.js", tar::EntryType::Regular),
+            ("//server/share/plugin.js", tar::EntryType::Regular),
+            ("plugin.js:stream", tar::EntryType::Regular),
+            ("PLUGIN.JS", tar::EntryType::Regular),
+            ("plugin.js", tar::EntryType::Link),
+            ("plugin.js", tar::EntryType::Fifo),
+            ("plugin.js", tar::EntryType::GNULongName),
         ] {
             assert!(Package::parse(archive(Some((name, kind))), None).is_err());
         }

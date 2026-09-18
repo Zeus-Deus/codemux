@@ -48,11 +48,23 @@ impl Git {
                 return Ok(summary.clone());
             }
         }
-        let _slot = self
-            .slots
-            .try_acquire()
-            .map_err(|_| ProtocolError::new(ErrorCode::ResourceLimit, "Too many Git requests"))?;
-        let bytes = run(&workspace.root, cancel).await?;
+        let slot =
+            self.slots.clone().try_acquire_owned().map_err(|_| {
+                ProtocolError::new(ErrorCode::ResourceLimit, "Too many Git requests")
+            })?;
+        // The broker can drop its request future before our cancellation select
+        // runs. Keep ownership (and the concurrency permit) in a separate task
+        // until the child is explicitly killed and reaped.
+        let job_cancel = cancel.child_token();
+        let _cancel_on_drop = job_cancel.clone().drop_guard();
+        let root = workspace.root.clone();
+        let job = tokio::spawn(async move {
+            let _slot = slot;
+            run(&root, &job_cancel).await
+        });
+        let bytes = job
+            .await
+            .map_err(|_| ProtocolError::new(ErrorCode::PluginStopped, "Git operation stopped"))??;
         let summary = parse(&bytes)?;
         *self.cache.lock().await = Some((key, Instant::now(), summary.clone()));
         Ok(summary)
@@ -158,11 +170,24 @@ async fn copy_metadata(
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     let work = async {
-        let file = match tokio::fs::File::open(source).await {
-            Ok(file) => file,
+        let metadata = match tokio::fs::symlink_metadata(source).await {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(snapshot_error(error)),
         };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(snapshot_error("Git metadata is not a regular file"));
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        // A repository must not strand a blocking filesystem worker by swapping
+        // an index/HEAD for a FIFO between metadata inspection and opening it.
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        let file = options.open(source).await.map_err(snapshot_error)?;
+        if !file.metadata().await.map_err(snapshot_error)?.is_file() {
+            return Err(snapshot_error("Git metadata is not a regular file"));
+        }
         let mut bytes = Vec::new();
         file.take(*remaining as u64 + 1)
             .read_to_end(&mut bytes)
@@ -568,6 +593,80 @@ mod tests {
         let summary = parse(&run(&linked, &CancellationToken::new()).await.unwrap()).unwrap();
         assert_eq!(summary.branch, None);
         assert_eq!(summary.paths, ["untracked"]);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_broker_request_cancels_and_reaps_its_blocked_git_child() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path());
+        let config = root.path().join(".git/config");
+        std::fs::remove_file(&config).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(config.as_os_str().as_bytes()).unwrap();
+        // Block real Git during config discovery without running repository code.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let git = Git::default();
+        let clone = git.clone();
+        let context = CancellationToken::new();
+        let token = context.clone();
+        let workspace = Workspace {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            root_name: "fixture".into(),
+            location: "local",
+            root: root.path().to_path_buf(),
+        };
+        let request = tokio::spawn(async move { clone.summary(&workspace, &token).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while git.slots.available_permits() == 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(git.slots.available_permits(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while git.slots.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Git job must kill/reap before releasing its permit");
+        assert!(
+            !context.is_cancelled(),
+            "Only the abandoned job is cancelled"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_snapshot_rejects_fifos_and_symlinks_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("metadata");
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        for attempt in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_millis(500),
+                copy_metadata(
+                    &source,
+                    &root.path().join("copy"),
+                    &mut 4096,
+                    &CancellationToken::new(),
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+            if attempt == 0 {
+                std::fs::remove_file(&source).unwrap();
+                std::os::unix::fs::symlink("/dev/null", &source).unwrap();
+            }
+        }
     }
     #[tokio::test]
     async fn unborn_repository_and_cancelled_context_are_handled() {

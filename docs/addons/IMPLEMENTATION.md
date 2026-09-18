@@ -21,7 +21,9 @@ standalone host tests, browser mocks, or the research probe is not release appro
 | 7 | Website pinned catalog, search/detail/handoff, author documentation | Draft [website #7](https://github.com/Zeus-Deus/codemux-sitev2/pull/7); build and affected tests pass |
 | 8 | Release hardening and complete acceptance evidence | Draft [#397](https://github.com/Zeus-Deus/codemux/pull/397); see unresolved gates below |
 
-Later PRs stack on their specified prerequisites. The native catalog reader and
+Later PRs stack on their specified prerequisites. Full desktop CI was enabled
+for the stack in PR 8; earlier draft heads do not each have full desktop CI
+evidence and must be revalidated as they are prepared for merging. The native catalog reader and
 transactional installer are included in the manager foundation because its grant,
 activation, removal and recovery paths must share one authority boundary. Catalog
 publication and Settings remain separate deliverables.
@@ -30,26 +32,37 @@ publication and Settings remain separate deliverables.
 
 - PR 1 hosted CI: Linux and Windows GNU host, manifest contracts, SDK callback
   integration all passed. Schema comparison normalizes Windows CRLF only.
-- Protocol: 10 focused tests pass, including atomic malformed UI rejection,
-  callback disposal, catalog ownership/release history and strict manifests.
+- Protocol: 11 focused tests pass, including atomic malformed UI rejection,
+  callback disposal, mutation/tree limits, catalog ownership/release history and
+  strict manifests. Raw archive validation covers traversal, absolute/Windows/UNC
+  paths, alternate data streams, case collisions, links and special entries.
 - Independent host: 3 real-process tests pass, covering absent ambient authority,
   parent EOF, stale/oversized IPC and hostile synchronous/asynchronous workloads.
 - SDK native integration passes: Preact view, batched Remote DOM updates,
   callback, scoped request, property removal and unmount.
-- Desktop manager: 36 focused native tests pass, including repository filter
+- Desktop manager: 39 focused native tests pass, including repository filter
   isolation, dropped/unresponsive child supervision, real SQLite page-limit
   failure, and recovery after interruption at eight durable update transitions.
+  Git cancellation also owns and reaps the child before releasing its permit,
+  and metadata snapshots reject nonregular files and symlinks.
   The interruption matrix preserves the old tuple before completion and the new
   tuple after the atomic completion marker; matching private data is checked.
-- Three explicitly enabled real-child tests passed again after Git and supervision changes:
+  Uninstall waits for an update at three transaction stages, then removes the
+  committed candidate and private state; restart does not restore it.
+- Four explicitly enabled real-child tests passed after the final changes:
   broker scope/disposal, Project Brief installer/Git/view/composer request, and
-  Issue Companion installer/view/recorded HTTP states/explicit draft action.
-  These tests supply the frontend effect result; they are not stock-app GUI E2E.
+  Issue Companion installer/view/recorded HTTP states/explicit draft action,
+  and quarantine of five hostile workloads plus unexpected child exit while a
+  second native plugin remains usable. Each failing generation is reaped within
+  two seconds, its context is revoked, and implicit restart is denied.
+  The example tests supply the frontend effect result; they are not stock-app GUI E2E.
 - Frontend TypeScript passes. 87 affected tests passed, plus 10 new tests for
   delayed effects during disable/remove/pause/workspace/thread/failure, stale
   inventory responses, update/rollback remounting and explicit retry. Composer
   tests include preservation of user input. Six repository theme/UUID checks and
-  a new Settings dialog Escape/focus regression test also pass. No theme or footer
+  Settings dialog Escape/focus and late composer-registration regression tests
+  also pass. Panels react to replacement or ambiguity in their workspace
+  composer registry. No theme or footer
   customization subsystem was repurposed.
 - Both examples build/check/pack with packed SDK/CLI tarballs. Issue Companion
   also builds/checks/packs outside the app checkout using those packages only.
@@ -64,14 +77,20 @@ publication and Settings remain separate deliverables.
 - Hosted desktop CI passed on Linux and Windows, including Windows native OS
   keyring and the installed independent packages. Initial frontend CI identified
   semantic-color and UUID-helper violations; both are corrected and checked.
+  The next run exposed Vitest discovering a Node-only ELF test: it is now named
+  outside Vitest's discovery pattern and still runs explicitly with Node. The
+  native TLS/recovery tests passed on Windows at `5a643feb`.
 - Windows NSIS installation, exact bundled-host digest, clean-environment SDK
   callbacks and five hostile workloads passed in [packaged CI](https://github.com/Zeus-Deus/codemux/actions/runs/35368002067).
   Maximum measured fault latency was 1011.9 ms on the 4-vCPU AMD EPYC runner.
   See [Windows payload evidence](evidence/packaged-windows.json), collected from
   commit `68e07cd1`; this does not establish desktop GUI behavior.
-- Linux deb/AppImage build succeeded. The deb payload passed SDK and hostile-host
-  checks. AppImage provenance initially failed because linuxdeploy patches ELF
-  RPATH; the corrected semantic provenance check awaits the next packaged run.
+- Linux deb and AppImage payloads passed at `5a643feb` in
+  [packaged CI](https://github.com/Zeus-Deus/codemux/actions/runs/35371843758):
+  exact deb digest, AppImage ELF provenance, SDK callbacks and five hostile
+  workloads in each. Maximum fault latency was 1005.4 ms on the 4-vCPU AMD EPYC
+  runner. See [Linux payload evidence](evidence/packaged-linux.json).
+  This resolves the linuxdeploy RPATH check failure; it is not desktop GUI E2E.
 - Standalone release-host timing: 20 samples each of five hostile workloads;
   maximum 1010.4 ms, activation-loop p95 1007.2 ms on Ryzen 5 7600 / Linux.
   See [machine-readable evidence](evidence/host-timing-linux.json). These are
@@ -132,6 +151,10 @@ publication and Settings remain separate deliverables.
   sections and symbol/dynamic-link semantics, allowing only the `$ORIGIN` RPATH
   relocation. Tests accept a real patchelf rewrite and reject changed program
   data or added dependencies. Deb and NSIS retain exact SHA-256 comparison.
+- A dropped Git broker future cancels a separately owned job; its concurrency
+  permit remains held until the child is killed and reaped. Unix metadata opens
+  reject symlinks and use nonblocking mode to prevent a swapped FIFO from
+  stranding the filesystem worker.
 - Frontend stop actions fence effects synchronously until inventory refresh
   completes. Older inventory responses cannot restore stale enabled state.
   Native generation changes remount views; failed releases still need explicit Retry.
@@ -140,15 +163,18 @@ publication and Settings remain separate deliverables.
 
 - Stock built-app E2E for both examples, including real frontend/native IPC,
   actual controlled draft insertion and core UI operation during hostile plugins.
-- Corrected Linux AppImage provenance/smoke and latest-commit packaged rerun.
-  Windows NSIS install/uninstall and bundled-host behavior passed; stock desktop
-  GUI launch and integration still require separate evidence.
+- Latest-commit packaged rerun after the final integration follow-ups. Linux
+  AppImage/deb and Windows NSIS payload behavior passed on recorded revisions;
+  stock desktop GUI launch and integration still require separate evidence.
 - Complete failure-injection matrix: disk-full boundaries, every journal/crash
   point, unexpected child exit/ignored shutdown, concurrent update/uninstall,
-  and delayed workspace/thread/composer races through the actual desktop.
-- Hosted rerun of the new native TLS and recovery tests on Windows. Native OS
-  credential checks pass on both platforms; installed-app cancellation races
-  and external network behavior remain part of desktop E2E.
+  and delayed workspace/thread/composer races through the actual desktop. Native
+  update/uninstall serialization and dropped Git requests are covered, but those
+  do not establish all installed-app race cases.
+- Latest-commit hosted native checks after the cancellation and concurrency
+  follow-ups. Native TLS, recovery and OS credential checks have passed on both
+  platforms; installed-app cancellation races and external network behavior
+  remain part of desktop E2E.
 - Complete keyboard/screen-reader, light/dark, small-window, chat-GUI-off and
   core pane restoration evidence; measured runtime fault and UI budgets with
   hardware/workload details.

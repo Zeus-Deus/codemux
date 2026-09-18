@@ -4,6 +4,7 @@ vi.mock("@/lib/addons/bridge", () => ({
   addonInvoke: vi.fn().mockResolvedValue(null),
   mountAddon: vi.fn(),
 }));
+import { registerAddonComposer } from "@/lib/addons/composer-registry";
 import { AddonView } from "./addon-view";
 import { addonInvoke, mountAddon } from "@/lib/addons/bridge";
 import { useAddonsStore } from "@/stores/addons-store";
@@ -64,6 +65,88 @@ describe("view lifecycle across native generations", () => {
       "addon_unmount",
       expect.objectContaining({ generation: "generation-2" }),
     );
+  });
+  it("rebinds a panel when its composer registers late, becomes ambiguous, or closes", async () => {
+    const cleanupComposers: Array<() => void> = [];
+    try {
+      render(
+        <AddonView id="test.plugin" view="panel" workspaceId="workspace" />,
+      );
+      await waitFor(() =>
+        expect(mountAddon).toHaveBeenLastCalledWith(
+          "test.plugin",
+          "panel",
+          "panels",
+          "workspace",
+          null,
+        ),
+      );
+      await act(async () => {
+        cleanupComposers.push(
+          registerAddonComposer("first", {
+            workspaceId: "workspace",
+            append: () => 1,
+          }),
+        );
+      });
+      await waitFor(() =>
+        expect(mountAddon).toHaveBeenLastCalledWith(
+          "test.plugin",
+          "panel",
+          "panels",
+          "workspace",
+          "first",
+        ),
+      );
+      await act(async () => {
+        cleanupComposers.push(
+          registerAddonComposer("second", {
+            workspaceId: "workspace",
+            append: () => 1,
+          }),
+        );
+      });
+      await waitFor(() =>
+        expect(mountAddon).toHaveBeenLastCalledWith(
+          "test.plugin",
+          "panel",
+          "panels",
+          "workspace",
+          null,
+        ),
+      );
+      await act(async () => {
+        cleanupComposers.shift()!();
+      });
+      await waitFor(() =>
+        expect(mountAddon).toHaveBeenLastCalledWith(
+          "test.plugin",
+          "panel",
+          "panels",
+          "workspace",
+          "second",
+        ),
+      );
+      await act(async () => {
+        cleanupComposers.shift()!();
+      });
+      await waitFor(() =>
+        expect(mountAddon).toHaveBeenLastCalledWith(
+          "test.plugin",
+          "panel",
+          "panels",
+          "workspace",
+          null,
+        ),
+      );
+      expect(addonInvoke).toHaveBeenCalledWith(
+        "addon_unmount",
+        expect.objectContaining({ viewId: "view-1" }),
+      );
+    } finally {
+      cleanup();
+      for (const remove of cleanupComposers) remove();
+    }
   });
   it("keeps a failed release inert until explicit retry changes its native status", async () => {
     render(<AddonView id="test.plugin" view="panel" workspaceId="workspace" />);

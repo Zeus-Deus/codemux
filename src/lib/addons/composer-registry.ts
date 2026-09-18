@@ -4,13 +4,27 @@ export interface ComposerTarget {
   append(text: string): number;
 }
 const composers = new Map<string, ComposerTarget>();
+const listeners = new Set<() => void>();
+export function subscribeAddonComposers(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+function changed() {
+  for (const listener of listeners) listener();
+}
 export function registerAddonComposer(
   id: string,
   target: ComposerTarget,
 ): () => void {
   composers.set(id, target);
+  changed();
   return () => {
-    if (composers.get(id) === target) composers.delete(id);
+    if (composers.get(id) === target) {
+      composers.delete(id);
+      changed();
+    }
   };
 }
 export function composerForWorkspace(workspaceId: string): string | null {

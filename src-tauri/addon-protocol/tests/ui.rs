@@ -53,3 +53,21 @@ fn nested_and_oversized_trees_fail_before_render() {
         .apply(&[json!([0,"~",{"id":"root","type":1,"element":"cmx-stack","children":children},0])])
         .is_err());
 }
+
+#[test]
+fn mutation_and_serialized_tree_limits_reject_atomically() {
+    let mut tree = Tree::default();
+    tree.apply(&[json!([0,"~",{"id":"text","type":3,"data":"original"},0])])
+        .unwrap();
+    let flood = vec![json!([2, "text", "changed"]); 1001];
+    assert!(tree.apply(&flood).is_err());
+    assert_eq!(tree.children[0].data.as_deref(), Some("original"));
+    let large = (0..9)
+        .map(|i| json!({"id":format!("child-{i}"),"type":3,"data":"x".repeat(32768)}))
+        .collect::<Vec<_>>();
+    assert!(tree
+        .apply(&[json!([0,"~",{"id":"large","type":1,"element":"cmx-stack","children":large},1])])
+        .is_err());
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].data.as_deref(), Some("original"));
+}

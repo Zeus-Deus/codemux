@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { addonTreeKey, useAddonsStore } from "@/stores/addons-store";
 import { addonInvoke, mountAddon } from "@/lib/addons/bridge";
-import { composerForWorkspace } from "@/lib/addons/composer-registry";
+import {
+  composerForWorkspace,
+  subscribeAddonComposers,
+} from "@/lib/addons/composer-registry";
 import {
   addonMessage,
   addonEnabled,
@@ -22,6 +25,11 @@ export function AddonView({
   kind?: "panels" | "composerViews";
   composerId?: string;
 }) {
+  const currentComposer = useSyncExternalStore(
+    subscribeAddonComposers,
+    () => composerId ?? composerForWorkspace(workspaceId),
+    () => null,
+  );
   const ready = useAddonsStore((s) => s.ready);
   const revision = useAddonsStore((s) => s.contextRevision);
   const hostEpoch = useAddonsStore((s) => s.hostEpochs[id] ?? 0);
@@ -59,13 +67,7 @@ export function AddonView({
         }));
       }
     };
-    void mountAddon(
-      id,
-      view,
-      kind,
-      workspaceId,
-      composerId ?? composerForWorkspace(workspaceId),
-    )
+    void mountAddon(id, view, kind, workspaceId, currentComposer)
       .then((result) => {
         target = result;
         if (closed) unmount();
@@ -83,7 +85,7 @@ export function AddonView({
     view,
     workspaceId,
     kind,
-    composerId,
+    currentComposer,
     ready,
     revision,
     canMount,
