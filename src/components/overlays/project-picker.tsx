@@ -158,7 +158,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
+          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
         >
           {selectedName ? (
             // `size="sm"` keeps the trigger pill the same height
@@ -197,7 +197,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                       onChange(g.projectPath, g.projectName);
                       setOpen(false);
                     }}
-                    className="text-xs gap-2"
+                    className="text-label gap-2"
                   >
                     <ProjectAvatar
                       name={g.projectName}
@@ -225,7 +225,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                       onChange(p.path, p.name);
                       setOpen(false);
                     }}
-                    className="text-xs gap-2"
+                    className="text-label gap-2"
                   >
                     <ProjectAvatar
                       name={p.name}
@@ -249,7 +249,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
             <button
               type="button"
               onClick={handleOpenProject}
-              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-label text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
             >
               <FolderOpen className="h-3.5 w-3.5" />
               Open project
@@ -260,7 +260,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                 setOpen(false);
                 setShowNewProjectScreen(true);
               }}
-              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-label text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
             >
               <FolderPlus className="h-3.5 w-3.5" />
               New project

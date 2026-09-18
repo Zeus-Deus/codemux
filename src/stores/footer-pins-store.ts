@@ -44,6 +44,8 @@ interface FooterPinsState {
   pins: FooterPin[];
   togglePin: (id: FooterActionId) => void;
   movePin: (id: FooterActionId, offset: -1 | 1) => void;
+  /** Move `id` into the slot currently held by `overId` (drag-and-drop). */
+  reorderPin: (id: FooterActionId, overId: FooterActionId) => void;
   setIcon: (id: FooterActionId, iconId?: FooterIconId) => void;
   reset: () => void;
 }
@@ -64,6 +66,16 @@ export const useFooterPinsStore = create<FooterPinsState>()(
           const to = from + offset;
           if (from < 0 || to < 0 || to >= pins.length) return state;
           [pins[from], pins[to]] = [pins[to], pins[from]];
+          return { pins };
+        }),
+      reorderPin: (id, overId) =>
+        set((state) => {
+          const from = state.pins.findIndex((pin) => pin.id === id);
+          const to = state.pins.findIndex((pin) => pin.id === overId);
+          if (from < 0 || to < 0 || from === to) return state;
+          const pins = [...state.pins];
+          const [moved] = pins.splice(from, 1);
+          pins.splice(to, 0, moved);
           return { pins };
         }),
       setIcon: (id, iconId) =>

@@ -111,7 +111,7 @@ export function PermissionsSection({ projectRoot }: Props) {
         description="Tool-permission rules persist approvals so the agent doesn't keep asking for the same tools."
       />
 
-      <p className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/5 px-3 py-2 text-xs text-muted-foreground">
+      <p className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/5 px-3 py-2 text-label text-muted-foreground">
         <AlertTriangle
           className="mt-0.5 h-3.5 w-3.5 shrink-0 text-status-working"
           aria-hidden
@@ -123,13 +123,13 @@ export function PermissionsSection({ projectRoot }: Props) {
       </p>
 
       {error && (
-        <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <p className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive">
           Failed to load rules: {error}
         </p>
       )}
 
       {rules === null ? (
-        <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+        <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
           Loading rules…
         </div>
@@ -188,7 +188,7 @@ function RuleGroup({
   return (
     <section>
       <header className="mb-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
           {group.heading}
         </h3>
         <p className="text-label text-muted-foreground/70 font-mono mt-0.5">
@@ -196,7 +196,7 @@ function RuleGroup({
         </p>
       </header>
       {group.rules.length === 0 ? (
-        <p className="text-xs text-muted-foreground/70 italic">
+        <p className="text-label text-muted-foreground/70 italic">
           No rules in this scope.
         </p>
       ) : (
@@ -212,11 +212,11 @@ function RuleGroup({
             >
               <BehaviorIcon behavior={rule.behavior} />
               <div className="min-w-0 flex-1">
-                <span className="font-mono text-sm text-foreground">
+                <span className="font-mono text-body text-foreground">
                   {rule.tool_name}
                 </span>
                 {rule.rule_content && (
-                  <span className="ml-2 font-mono text-xs text-muted-foreground">
+                  <span className="ml-2 font-mono text-label text-muted-foreground">
                     ({rule.rule_content})
                   </span>
                 )}
@@ -267,8 +267,8 @@ function BehaviorIcon({ behavior }: { behavior: PermissionRule["behavior"] }) {
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
     <div className="mb-6">
-      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-      <p className="text-sm text-muted-foreground mt-1">{description}</p>
+      <h2 className="text-body-lg font-semibold tracking-tight">{title}</h2>
+      <p className="text-body text-muted-foreground mt-1">{description}</p>
     </div>
   );
 }

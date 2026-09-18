@@ -49,7 +49,7 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
     // so the transcript doesn't keep showing interactive controls
     // after the user has acted.
     return (
-      <div className="py-0.5 text-xs text-muted-foreground">
+      <div className="py-0.5 text-label text-muted-foreground">
         {item.resolution.state === "failed"
           ? item.resolution.message
           : resolvedLabel(item.resolution.state)}
@@ -87,11 +87,11 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
     // border. Internal scroll surfaces (`pre`, `table`) still get
     // their own `overflow-x-auto` so scrollable content stays
     // interactive.
-    <div className="rounded-[11px] border border-border/60 bg-muted/40 p-3.5 space-y-3 overflow-hidden">
-      <div className="text-xs font-medium text-muted-foreground">Plan proposed</div>
+    <div className="rounded-lg border border-border/60 bg-muted/40 p-3.5 space-y-3 overflow-hidden">
+      <div className="text-label font-medium text-muted-foreground">Plan proposed</div>
 
       {plan !== null ? (
-        <div className="text-sm leading-relaxed text-foreground break-words">
+        <div className="text-body leading-relaxed text-foreground break-words">
           <ChatMarkdown>{plan}</ChatMarkdown>
         </div>
       ) : (
@@ -120,7 +120,7 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
           // foreground/background pair instead of the `--primary`
           // accent, so the card doesn't compete with the chat's tone.
           // Matches AskUserQuestionBlock's Submit and the Send button.
-          className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
+          className="bg-foreground text-background hover:bg-foreground/90"
           onClick={submitAccept}
           disabled={submitted}
         >
@@ -130,7 +130,6 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
           type="button"
           variant="outline"
           size="sm"
-          className="h-7 px-3 text-xs"
           onClick={submitReject}
           disabled={submitted}
         >

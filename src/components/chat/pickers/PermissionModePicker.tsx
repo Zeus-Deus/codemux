@@ -112,7 +112,7 @@ export function PermissionModePicker({
                     className="h-auto gap-2 py-2"
                   >
                     <div className="flex flex-1 flex-col min-w-0">
-                      <span className="text-xs text-foreground truncate">
+                      <span className="text-label text-foreground truncate">
                         {mode.label}
                       </span>
                       <span className="text-label text-muted-foreground/80 truncate">

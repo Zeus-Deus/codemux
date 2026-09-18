@@ -140,7 +140,7 @@ export function ChatMarkdownLink({
             This address will open in your system browser.
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-xs text-muted-foreground">
+        <div className="select-text break-all rounded-lg bg-muted px-3 py-2 font-mono text-label text-muted-foreground">
           {externalHref}
         </div>
         <AlertDialogFooter>

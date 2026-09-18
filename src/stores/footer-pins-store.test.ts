@@ -48,6 +48,27 @@ describe("footer preferences", () => {
     store.reset();
     expect(useFooterPinsStore.getState().pins).toEqual(DEFAULT_FOOTER_PINS);
   });
+  it("moves a dragged pin into the target slot in either direction", () => {
+    const ids = () => useFooterPinsStore.getState().pins.map((pin) => pin.id);
+    const { reorderPin } = useFooterPinsStore.getState();
+    reorderPin("codemux.automations.open", "codemux.pull-requests.open");
+    expect(ids()).toEqual([
+      "codemux.devices.open",
+      "codemux.pull-requests.open",
+      "codemux.automations.open",
+      "codemux.ports.open",
+    ]);
+    reorderPin("codemux.ports.open", "codemux.devices.open");
+    expect(ids()).toEqual([
+      "codemux.ports.open",
+      "codemux.devices.open",
+      "codemux.pull-requests.open",
+      "codemux.automations.open",
+    ]);
+    const before = useFooterPinsStore.getState().pins;
+    reorderPin("codemux.ports.open", "codemux.settings.appearance");
+    expect(useFooterPinsStore.getState().pins).toBe(before);
+  });
   it("recovers malformed and unsupported-version storage without losing store actions", async () => {
     for (const raw of [
       "{broken",

@@ -82,14 +82,15 @@ function RailWorkspaceItem({
         <button
           type="button"
           data-rail-ws={workspace.workspace_id}
+          data-active={isActive ? "true" : undefined}
           onClick={handleClick}
           aria-label={workspace.title}
           className={cn(
             "relative flex size-7 items-center justify-center rounded-lg border duration-150",
             "transition-[color,background-color,border-color,opacity]",
             isActive
-              ? "border-border bg-foreground/[0.09]"
-              : "border-transparent hover:bg-foreground/[0.04]",
+              ? "border-border bg-surface-3"
+              : "border-transparent hover:bg-surface-2",
             // The status dot inherits the dim along with the avatar, which is
             // the point: a quietly-working button should read as quieter as a
             // whole, not as a dim avatar wearing a full-strength badge.

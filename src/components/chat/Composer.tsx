@@ -232,9 +232,6 @@ interface Props {
    *  {@link MIN_TEXTAREA_PX} when `isDraft` (a spacious prompt card) and
    *  to a single line otherwise. */
   minTextareaPx?: number;
-  /** A follow-up is parked behind the active turn — keeps the pill
-   *  expanded. */
-  hasQueuedMessage?: boolean;
   /** A file drag is over the owning pane (not necessarily this card). A
    *  collapsed pill grows into a 74px drop target. */
   paneDragActive?: boolean;
@@ -420,7 +417,6 @@ export function Composer({
   belowComposerSlot,
   stripSlot,
   minTextareaPx,
-  hasQueuedMessage = false,
   paneDragActive = false,
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
@@ -2459,7 +2455,6 @@ export function Composer({
     focusWithin ||
     stagedAttachments.length > 0 ||
     mode !== "default" ||
-    hasQueuedMessage ||
     slashOpen ||
     mentionOpen ||
     attachOpen ||
@@ -2920,7 +2915,7 @@ export function Composer({
                     type="button"
                     data-testid="composer-continue-run-chip"
                     onClick={onContinueRun}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-label text-warning hover:bg-warning/25"
                   >
                     <RotateCw className="h-3 w-3" aria-hidden />
                     <span>Continue run</span>
@@ -3052,8 +3047,9 @@ export function Composer({
                         data-testid={`composer-attachment-token-${seg.basename}`}
                         data-loading={seg.isLoading || undefined}
                         data-error={seg.hasError || undefined}
+                        data-tint={seg.hasError ? "destructive" : "neutral"}
                         className={cn(
-                          "rounded-sm bg-foreground/10 text-foreground",
+                          "rounded-sm bg-surface-3 text-foreground",
                           seg.isLoading && "opacity-60",
                           seg.hasError &&
                             "bg-destructive/15 text-destructive",
@@ -3099,7 +3095,7 @@ export function Composer({
                           "rounded-sm",
                           seg.state === "open"
                             ? "bg-warning/15 text-warning"
-                            : "bg-foreground/10 text-muted-foreground",
+                            : "bg-surface-3 text-muted-foreground",
                           seg.isLoading && "opacity-60",
                           seg.hasError &&
                             "bg-destructive/15 text-destructive",
@@ -3122,7 +3118,7 @@ export function Composer({
                         ? "bg-primary/15 text-primary"
                         : seg.state === "merged"
                           ? "bg-chart-4/15 text-chart-4"
-                          : "bg-foreground/10 text-muted-foreground";
+                          : "bg-surface-3 text-muted-foreground";
                     return (
                       <span
                         key={i}

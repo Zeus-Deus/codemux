@@ -53,8 +53,7 @@ describe("AssistantAvatar", () => {
   it("keeps the ember wash for the ember-toned Claude mark", () => {
     const { container } = render(<AssistantAvatar provider="claude" />);
     const box = container.querySelector("[data-provider]") as HTMLElement;
-    expect(box.className).toContain("bg-accent-ember/15");
-    expect(box.className).not.toContain("bg-foreground/8");
+    expect(box).toHaveAttribute("data-wash", "ember");
   });
 
   it.each(["codex", "cursor", "grok", "opencode"] as const)(
@@ -62,8 +61,7 @@ describe("AssistantAvatar", () => {
     (provider) => {
       const { container } = render(<AssistantAvatar provider={provider} />);
       const box = container.querySelector("[data-provider]") as HTMLElement;
-      expect(box.className).toContain("bg-foreground/8");
-      expect(box.className).not.toContain("bg-accent-ember");
+      expect(box).toHaveAttribute("data-wash", "neutral");
     },
   );
 

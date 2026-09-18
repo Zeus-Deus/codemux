@@ -25,6 +25,7 @@ import {
 } from "@/lib/source-control";
 import { cn } from "@/lib/utils";
 import { tzBody, tzEyebrow, tzMeta, tzRowTitle } from "./review-ui";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 // ── Module-level cache ──
 //
@@ -213,7 +214,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               size="xs"
               variant="ghost"
               tabIndex={-1}
-              className={cn("h-[22px] px-2 text-muted-foreground hover:text-foreground", tzMeta)}
+              className={cn("text-muted-foreground hover:text-foreground", tzMeta)}
               onClick={handleView}
               title={`View on ${provider.name}`}
             >
@@ -226,7 +227,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
                 variant="ghost"
                 tabIndex={-1}
                 className={cn(
-                  "h-[22px] px-2 text-muted-foreground hover:text-foreground",
+                  "text-muted-foreground hover:text-foreground",
                   tzMeta,
                 )}
                 onClick={handleCheckout}
@@ -324,7 +325,7 @@ export function IncomingPrsView({
 
   return (
     <div className="flex flex-col">
-      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+      <PanelHeader className="gap-0 pl-2.5 pr-1">
         <span className={cn("font-medium text-muted-foreground tracking-wide truncate", tzBody)}>
           {provider.nounTitleCase}s
         </span>
@@ -333,13 +334,13 @@ export function IncomingPrsView({
             {prs.length}
           </span>
         )}
-      </div>
+      </PanelHeader>
 
       <div className="px-1.5 pt-1.5 pb-3">
         {error && (
           <div
             className={cn(
-              "mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2.5 py-2 text-danger",
+              "mx-1.5 mb-2 flex items-start gap-1.5 rounded-sm bg-danger/10 px-2.5 py-2 text-danger",
               tzBody,
             )}
           >
@@ -352,9 +353,9 @@ export function IncomingPrsView({
           <div className="flex flex-col gap-2 px-2 py-2">
             {[1, 2, 3].map((i) => (
               <div key={i} className="animate-pulse flex gap-2">
-                <div className="h-3 w-6 bg-muted rounded" />
-                <div className="h-3 flex-1 bg-muted rounded" />
-                <div className="h-3 w-12 bg-muted rounded" />
+                <div className="h-3 w-6 bg-muted rounded-sm" />
+                <div className="h-3 flex-1 bg-muted rounded-sm" />
+                <div className="h-3 w-12 bg-muted rounded-sm" />
               </div>
             ))}
           </div>

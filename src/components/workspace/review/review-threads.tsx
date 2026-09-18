@@ -77,7 +77,7 @@ function CopyButton({ text }: { text: string }) {
     <Button
       size="icon-xs"
       variant="ghost"
-      className="h-[18px] w-[18px] opacity-0 group-hover/comment:opacity-100 transition-opacity"
+      className="opacity-0 group-hover/comment:opacity-100 transition-opacity"
       onClick={handleCopy}
       title="Copy comment"
     >
@@ -96,7 +96,7 @@ function AnchorPill({ path, line }: { path: string | null; line: number | null }
   return (
     <span
       className={cn(
-        "font-mono bg-muted px-1.5 py-px rounded text-muted-foreground truncate",
+        "font-mono bg-muted px-1.5 py-px rounded-sm text-muted-foreground truncate",
         tzMeta,
       )}
     >
@@ -265,7 +265,7 @@ function ResolveButton({
   return (
     <button
       type="button"
-      className={cn(btnCard, "h-6 rounded px-2", tzMeta)}
+      className={cn(btnCard, "h-6 rounded-sm px-2", tzMeta)}
       data-testid={`thread-resolve-${thread.id}`}
       onClick={onToggle}
     >

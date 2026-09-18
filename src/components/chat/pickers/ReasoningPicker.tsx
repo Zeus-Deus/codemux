@@ -246,7 +246,7 @@ export function ReasoningPicker({
                       className="h-auto gap-2 py-2"
                     >
                       <div className="flex flex-1 flex-col min-w-0">
-                        <span className="text-xs text-foreground truncate">
+                        <span className="text-label text-foreground truncate">
                           {title}
                           {isDefault ? (
                             <span className="ml-1.5 text-muted-foreground/60">
@@ -290,7 +290,7 @@ export function ReasoningPicker({
                       onSelect={() => onContextWindowChange(option.value)}
                       className="h-9 gap-2 py-2"
                     >
-                      <span className="flex-1 min-w-0 truncate text-xs text-foreground">
+                      <span className="flex-1 min-w-0 truncate text-label text-foreground">
                         {option.label}
                         {isDefault ? (
                           <span className="ml-1.5 text-muted-foreground/60">
@@ -324,7 +324,7 @@ export function ReasoningPicker({
                   className="h-auto gap-2 py-2"
                 >
                   <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-xs text-foreground">
+                    <span className="text-label text-foreground">
                       Standard
                       <span className="ml-1.5 text-muted-foreground/60">
                         (default)
@@ -347,7 +347,7 @@ export function ReasoningPicker({
                   className="h-auto gap-2 py-2"
                 >
                   <div className="flex min-w-0 flex-1 flex-col">
-                    <span className="text-xs text-foreground">Fast</span>
+                    <span className="text-label text-foreground">Fast</span>
                     <span className="text-label text-muted-foreground/80">
                       Faster output at a premium usage rate
                     </span>

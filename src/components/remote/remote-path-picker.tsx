@@ -170,10 +170,10 @@ export function RemotePathPicker() {
         className="sm:max-w-[560px] bg-popover p-0 gap-0 overflow-hidden"
       >
         <DialogHeader className="px-5 pt-4 pb-2">
-          <DialogTitle className="text-sm">
+          <DialogTitle className="text-body">
             {request?.title ?? (isFileMode ? "Select files" : "Select folder")}
           </DialogTitle>
-          <DialogDescription className="text-xs text-muted-foreground">
+          <DialogDescription className="text-label text-muted-foreground">
             {isFileMode
               ? "Browse the host and choose one or more files."
               : "Browse the host and choose a folder."}
@@ -193,7 +193,7 @@ export function RemotePathPicker() {
             >
               <ArrowUp className="h-3.5 w-3.5" />
             </Button>
-            <div className="flex min-w-0 flex-1 items-center overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background/40 px-2 py-1 text-xs text-muted-foreground">
+            <div className="flex min-w-0 flex-1 items-center overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background/40 px-2 py-1 text-label text-muted-foreground">
               {crumbs.map((crumb, i) => (
                 <span key={crumb.path} className="flex items-center">
                   {i > 0 && (
@@ -202,7 +202,7 @@ export function RemotePathPicker() {
                   <button
                     type="button"
                     className={cn(
-                      "rounded px-1 py-0.5 hover:bg-muted hover:text-foreground",
+                      "rounded-sm px-1 py-0.5 hover:bg-muted hover:text-foreground",
                       i === crumbs.length - 1 && "text-foreground",
                     )}
                     onClick={() => navigateTo(crumb.path)}
@@ -220,7 +220,7 @@ export function RemotePathPicker() {
               value={pathInput}
               onChange={(e) => setPathInput(e.target.value)}
               placeholder="/absolute/path"
-              className="h-8 text-sm flex-1 font-mono"
+              className="h-8 text-body flex-1 font-mono"
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleManualGo();
               }}
@@ -228,7 +228,7 @@ export function RemotePathPicker() {
             <Button
               variant="outline"
               size="sm"
-              className="h-8 shrink-0"
+              className="shrink-0"
               onClick={handleManualGo}
               disabled={loading}
             >
@@ -236,8 +236,8 @@ export function RemotePathPicker() {
             </Button>
             <Button
               variant="outline"
-              size="icon-sm"
-              className="h-8 w-8 shrink-0"
+              size="icon"
+              className="shrink-0"
               onClick={() => navigateTo(currentPath)}
               disabled={loading || !currentPath}
               aria-label="Refresh"
@@ -253,9 +253,9 @@ export function RemotePathPicker() {
             <ScrollArea className="h-64">
               <div className="p-1">
                 {error ? (
-                  <div className="p-3 text-xs text-destructive">{error}</div>
+                  <div className="p-3 text-label text-destructive">{error}</div>
                 ) : entries.length === 0 && !loading ? (
-                  <div className="p-3 text-xs text-muted-foreground">
+                  <div className="p-3 text-label text-muted-foreground">
                     This folder is empty.
                   </div>
                 ) : (
@@ -269,7 +269,7 @@ export function RemotePathPicker() {
                         disabled={!selectable}
                         onClick={() => handleEntryClick(entry)}
                         className={cn(
-                          "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm",
+                          "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-body",
                           selectable
                             ? "hover:bg-muted"
                             : "cursor-default opacity-40",
@@ -302,7 +302,7 @@ export function RemotePathPicker() {
 
           {/* Footer */}
           <div className="flex items-center justify-between pt-1">
-            <label className="flex select-none items-center gap-1.5 text-xs text-muted-foreground">
+            <label className="flex select-none items-center gap-1.5 text-label text-muted-foreground">
               <input
                 type="checkbox"
                 checked={showHidden}

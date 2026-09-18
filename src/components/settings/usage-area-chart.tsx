@@ -366,7 +366,7 @@ export function UsageAreaChart({
               >
                 <span className="inline-flex items-center gap-2 text-foreground/85">
                   <span
-                    className="h-2 w-2 shrink-0 rounded-[2px]"
+                    className="h-2 w-2 shrink-0 rounded-sm"
                     style={{ background: s.color, opacity: s.opacity ?? 1 }}
                     aria-hidden
                   />

@@ -42,7 +42,7 @@ export function DevicesView() {
           variant="ghost"
           size="icon-sm"
           aria-label="Close devices"
-          className="text-muted-foreground hover:text-foreground hover:bg-foreground/[0.06]"
+          className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
           onClick={() => setShowDevices(false)}
         >
           <ArrowLeft className="h-4 w-4" />

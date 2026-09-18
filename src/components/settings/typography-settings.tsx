@@ -358,7 +358,7 @@ function TypographySurfaceCard({
   linkedLabel?: string;
 }) {
   return (
-    <div className="overflow-hidden rounded-xl border border-border/65 bg-card/35 shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_3%,transparent)]">
+    <div className="overflow-hidden rounded-lg border border-border/65 bg-card/35 shadow-[0_1px_0_color-mix(in_srgb,var(--foreground)_3%,transparent)]">
       <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3.5">
         <div className="flex min-w-[220px] flex-1 items-start gap-3">
           <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-background/80 text-muted-foreground">
@@ -569,7 +569,7 @@ function InterfacePreview({ family, size }: { family: string; size: number }) {
     <PreviewFrame>
       <div style={{ fontFamily: family, fontSize: size }}>
         <div className="flex items-center gap-2 border-b border-border/45 px-3 py-2">
-          <span className="size-2 rounded-[3px] bg-accent-ember" />
+          <span className="size-2 rounded-sm bg-accent-ember" />
           <span className="font-semibold tracking-[-0.01em]">Codemux</span>
           <span className="ml-auto text-[0.72em] text-muted-foreground">main</span>
         </div>
