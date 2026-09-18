@@ -1,33 +1,35 @@
 {
   "platform": "win32",
   "os": "10.0.26100",
-  "cpu": "AMD EPYC 9V74 80-Core Processor                ",
+  "cpu": "AMD EPYC 7763 64-Core Processor                ",
   "logicalCpus": 4,
-  "hostSha256": "e52ddcb7d3d5c982ab033c9a90a97a13b9ca5b341e1699037cc0bd602eda661a",
+  "hostSha256": "3bb02ce44d035459a3c6f6b4cadad112007d9f403ae9018380712b500363dd9a",
   "bundles": [
     {
       "format": ".exe",
+      "packagedSha256": "3bb02ce44d035459a3c6f6b4cadad112007d9f403ae9018380712b500363dd9a",
+      "provenance": "exact-sha256",
       "hostPath": "binaries\\codemux-addon-host-windows-x64.exe",
       "faults": [
         {
           "workload": "while(true){}",
-          "elapsedMs": 1011.8606999999993
+          "elapsedMs": 1016.4846999999991
         },
         {
           "workload": "function f(){f()} f()",
-          "elapsedMs": 10.281199999999444
+          "elapsedMs": 13.874699999998484
         },
         {
           "workload": "new ArrayBuffer(128*1024*1024)",
-          "elapsedMs": 8.343700000001263
+          "elapsedMs": 13.774599999998827
         },
         {
           "workload": "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
-          "elapsedMs": 1009.1594999999998
+          "elapsedMs": 1015.4512999999988
         },
         {
           "workload": "throw Error('fixture')",
-          "elapsedMs": 9.226599999999962
+          "elapsedMs": 13.554199999998673
         }
       ]
     }

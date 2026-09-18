@@ -10,8 +10,13 @@ layout only, not native plugin operation.
 - `settings-chat-gui-off.png`: Add-ons Settings remains available with chat GUI off.
 
 `host-timing-linux.json` contains standalone host timing samples.
-`packaged-windows.json` records installed NSIS payload checks from `68e07cd1`.
+`packaged-windows.json` records installed NSIS payload checks from `5a643feb`.
 `packaged-linux.json` records deb/AppImage payload checks from `5a643feb`.
 These JSON files cover runtime containment, not stock desktop GUI behavior.
 
 Native and packaged verification is tracked separately in ../IMPLEMENTATION.md.
+
+`ui-validation-linux.json` compares native validation before and after incremental
+content validation. Reproduce the workload with
+`cargo run --release -j 2 --manifest-path src-tauri/addon-protocol/Cargo.toml --example ui-validation-benchmark`.
+It excludes IPC and desktop rendering.

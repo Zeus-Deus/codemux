@@ -23,8 +23,8 @@ standalone host tests, browser mocks, or the research probe is not release appro
 
 Later PRs stack on their specified prerequisites. Full desktop CI was enabled
 for the stack in PR 8; earlier draft heads do not each have full desktop CI
-evidence and must be revalidated as they are prepared for merging. The native catalog reader and
-transactional installer are included in the manager foundation because its grant,
+evidence and must be revalidated as they are prepared for merging. The native
+catalog reader and transactional installer are included in the manager foundation because its grant,
 activation, removal and recovery paths must share one authority boundary. Catalog
 publication and Settings remain separate deliverables.
 
@@ -32,7 +32,7 @@ publication and Settings remain separate deliverables.
 
 - PR 1 hosted CI: Linux and Windows GNU host, manifest contracts, SDK callback
   integration all passed. Schema comparison normalizes Windows CRLF only.
-- Protocol: 11 focused tests pass, including atomic malformed UI rejection,
+- Protocol: 14 focused tests pass, including atomic malformed UI rejection,
   callback disposal, mutation/tree limits, catalog ownership/release history and
   strict manifests. Raw archive validation covers traversal, absolute/Windows/UNC
   paths, alternate data streams, case collisions, links and special entries.
@@ -62,8 +62,7 @@ publication and Settings remain separate deliverables.
   tests include preservation of user input. Six repository theme/UUID checks and
   Settings dialog Escape/focus and late composer-registration regression tests
   also pass. Panels react to replacement or ambiguity in their workspace
-  composer registry. No theme or footer
-  customization subsystem was repurposed.
+  composer registry. No theme or footer customization subsystem was repurposed.
 - Both examples build/check/pack with packed SDK/CLI tarballs. Issue Companion
   also builds/checks/packs outside the app checkout using those packages only.
 - Actual Linux Secret Service round-trip and deletion passed using a synthetic
@@ -74,17 +73,17 @@ publication and Settings remain separate deliverables.
   rejection, redirect/encoding/declared/streamed body limits, timeout/cancellation,
   concurrency release and private rolling quotas. The local fixture CA is trusted
   only by the test's client; no system trust or real credentials are used.
-- Hosted desktop CI passed on Linux and Windows, including Windows native OS
+- Hosted native desktop jobs passed on Linux and Windows, including Windows native OS
   keyring and the installed independent packages. Initial frontend CI identified
   semantic-color and UUID-helper violations; both are corrected and checked.
   The next run exposed Vitest discovering a Node-only ELF test: it is now named
   outside Vitest's discovery pattern and still runs explicitly with Node. The
   native TLS/recovery tests passed on Windows at `5a643feb`.
 - Windows NSIS installation, exact bundled-host digest, clean-environment SDK
-  callbacks and five hostile workloads passed in [packaged CI](https://github.com/Zeus-Deus/codemux/actions/runs/35368002067).
-  Maximum measured fault latency was 1011.9 ms on the 4-vCPU AMD EPYC runner.
+  callbacks and five hostile workloads passed in [packaged CI](https://github.com/Zeus-Deus/codemux/actions/runs/35371843758).
+  Maximum measured fault latency was 1016.5 ms on the 4-vCPU AMD EPYC runner.
   See [Windows payload evidence](evidence/packaged-windows.json), collected from
-  commit `68e07cd1`; this does not establish desktop GUI behavior.
+  commit `5a643feb`; this does not establish desktop GUI behavior.
 - Linux deb and AppImage payloads passed at `5a643feb` in
   [packaged CI](https://github.com/Zeus-Deus/codemux/actions/runs/35371843758):
   exact deb digest, AppImage ELF provenance, SDK callbacks and five hostile
@@ -155,6 +154,18 @@ publication and Settings remain separate deliverables.
   permit remains held until the child is killed and reaped. Unix metadata opens
   reject symlinks and use nonblocking mode to prevent a swapped FIFO from
   stranding the filesystem worker.
+- Release-mode validation of 1,000 text mutations in a valid 1,999-node,
+  222,790-byte tree measured 302–499 ms on this Linux Ryzen 5 7600 host.
+  Revalidating and serializing the entire tree after each content change made
+  the advertised batch ceiling too expensive. Content updates now account for
+  exact serialized-size deltas and validate only the changed value. Structural
+  and callback changes still validate the whole candidate. A 50 ms wall-clock
+  validation budget rejects an expensive batch atomically and quarantines the
+  generation through the existing resource-failure path. This extra bound is
+  justified by the measured native CPU cost; it does not replace desktop frame
+  timing or claim a universal latency on all machines. The same workload now
+  measures 2.5–3.9 ms; [before/after samples](evidence/ui-validation-linux.json)
+  and the reproducible protocol example are included.
 - Frontend stop actions fence effects synchronously until inventory refresh
   completes. Older inventory responses cannot restore stale enabled state.
   Native generation changes remount views; failed releases still need explicit Retry.
