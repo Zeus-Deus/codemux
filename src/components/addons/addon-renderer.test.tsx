@@ -116,6 +116,31 @@ describe("trusted add-on rendering", () => {
     fireEvent.keyDown(second, { key: "Home" });
     expect(document.activeElement).toBe(first);
   });
+  it("does not submit a containing form when a plugin Markdown link is activated", () => {
+    const submit = vi.fn();
+    const link = vi.fn();
+    render(
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          submit();
+        }}
+      >
+        <AddonRenderer
+          nodes={[
+            node("markdown", "cmx-markdown", {}, [
+              text("[Open](https://example.com)"),
+            ]),
+          ]}
+          event={vi.fn()}
+          link={link}
+        />
+      </form>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    expect(link).toHaveBeenCalledOnce();
+    expect(submit).not.toHaveBeenCalled();
+  });
   it("bounds mounted list rows even for the maximum 500-row input", () => {
     render(
       <AddonRenderer

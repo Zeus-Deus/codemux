@@ -7,6 +7,8 @@ pre-existing Hermes work and website changes are preserved.
 
 **Unreleased implementation. The acceptance matrix is not complete.** Passing
 standalone host tests, browser mocks, or the research probe is not release approval.
+The [acceptance evidence map](ACCEPTANCE.md) connects each matrix row to its
+checks and outstanding installed-app evidence.
 
 ## Ordered delivery
 
@@ -36,8 +38,11 @@ publication and Settings remain separate deliverables.
   Linux deb/AppImage and Windows NSIS. Maximum observed fault latencies are
   1007.0 ms and 1014.7 ms respectively. Recorded [Linux](evidence/packaged-linux-3045.json)
   and [Windows](evidence/packaged-windows-3045.json) results include source-run
-  provenance. Subsequent CI harness changes do not change production app code;
-  native desktop UI acceptance remains separate and pending.
+  provenance. Commits through `33acb551` subsequently changed the CI harness,
+  not production app code. A later renderer correction makes Markdown link
+  controls explicitly non-submitting: its containing-form regression failed
+  before the fix, then all six renderer tests and TypeScript passed. Installed
+  desktop UI acceptance of the final revision remains separate and pending.
 
 - PR 1 hosted CI: Linux and Windows GNU host, manifest contracts, SDK callback
   integration all passed. Schema comparison normalizes Windows CRLF only.
