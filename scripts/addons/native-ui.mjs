@@ -265,6 +265,105 @@ async function pluginHostCount() {
     .filter((name) => name.trim().startsWith("codemux-addon-h")).length;
 }
 let terminalProbe = 0;
+let credentialProbe;
+async function checkCredentialSettings() {
+  // Finish the real public-network test first, then close its view. This
+  // synthetic credential must never be sent to GitHub or another service.
+  await openCommand("Open Project Brief");
+  await hasText("Branch: main");
+  await openSettings();
+  await clickText(
+    "Configure / Permissions",
+    `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Issue Companion')))`,
+  );
+  const field = "#credential-github-token";
+  const secret = `ci-synthetic-only-${createHash("sha256").update(root).digest("hex")}`;
+  await type(field, secret);
+  assert.equal(
+    await script("return document.querySelector(arguments[0]).type", field),
+    "password",
+  );
+  const sessionOption = await script(
+    `return [...document.querySelectorAll('label')].find(e => e.innerText.includes('Store new values for this session only')).querySelector('input')`,
+  );
+  assert.equal(
+    await script("return arguments[0].checked", sessionOption),
+    false,
+  );
+  await clickText("Save");
+  if (process.platform === "linux") {
+    // The fresh runner's dbus session has no Secret Service. Confirm that the
+    // app does not silently fall back, then explicitly select its session mode.
+    await hasText("Credential store unavailable or locked");
+    assert.equal(
+      await script("return arguments[0].checked", sessionOption),
+      false,
+    );
+    assert.equal(
+      await script(
+        "return document.querySelector(arguments[0]).value.length",
+        field,
+      ),
+      secret.length,
+    );
+    await wd("POST", `/element/${elementId(sessionOption)}/click`, {});
+    await clickText("Save");
+  }
+  await until("credential field cleared after successful save", () =>
+    script(
+      "return document.querySelector(arguments[0]).value.length === 0",
+      field,
+    ),
+  );
+  const inventory = await native("addon_inventory");
+  const installationId = inventory.installed.find(
+    (i) => i.manifest.id === "codemux.issue-companion",
+  ).installationId;
+  assert.ok(!JSON.stringify(inventory).includes(secret));
+  assert.ok(
+    !JSON.stringify(
+      await native("addon_settings_get", { id: "codemux.issue-companion" }),
+    ).includes(secret),
+  );
+  if (process.platform === "win32") {
+    assert.ok(
+      (await run("cmdkey.exe", ["/list"])).includes(installationId),
+      "Synthetic token must use the real Windows credential backend",
+    );
+  }
+  credentialProbe = { secret, installationId };
+  evidence.credentials = {
+    maskedInput: true,
+    noSecretInInventoryOrSettings: true,
+    mode:
+      process.platform === "win32"
+        ? "native Windows credential store"
+        : "missing Secret Service, explicit session-only fallback",
+  };
+  await clickText("Installed");
+  await click('[aria-label="Close settings"]');
+}
+async function checkCredentialRemovalAndRedaction() {
+  assert.ok(credentialProbe);
+  if (process.platform === "win32")
+    assert.ok(
+      !(await run("cmdkey.exe", ["/list"])).includes(
+        credentialProbe.installationId,
+      ),
+      "Uninstall must delete the native Windows credential",
+    );
+  const dataHome =
+    process.platform === "win32"
+      ? env.APPDATA
+      : env.XDG_DATA_HOME || join(homedir(), ".local/share");
+  const paths = await files(join(dataHome, "codemux", "addons-v1"));
+  for (const path of [...paths, ...(await files(evidenceDir))])
+    assert.ok(
+      !(await readFile(path)).includes(Buffer.from(credentialProbe.secret)),
+      "A credential leaked into private plugin files or UI evidence",
+    );
+  evidence.credentials.removalAndFileRedaction = true;
+}
 async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
   await wd("DELETE", "/actions");
@@ -901,6 +1000,10 @@ try {
     true,
   );
   await step(
+    "06-host-credential-settings-and-explicit-fallback",
+    checkCredentialSettings,
+  );
+  await step(
     "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
     checkRemoteBoundary,
   );
@@ -1181,6 +1284,7 @@ try {
     assert.equal(await pluginHostCount(), 0);
     await click('[aria-label="Close settings"]');
     await checkCoreTerminal();
+    await checkCredentialRemovalAndRedaction();
   });
   await step(
     "11-corrupt-plugin-registry-does-not-block-core-startup",
