@@ -113,10 +113,10 @@ export function SidebarSetupBanner() {
             <Button
               variant="ghost"
               size="icon-xs"
-              className="shrink-0 h-5 w-5 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
+              className="shrink-0 -mr-1 -mt-0.5 text-muted-foreground hover:text-foreground"
               onClick={handleDismiss}
             >
-              <X className="h-3 w-3" />
+              <X className="size-3" />
             </Button>
           </div>
           <p className="text-label font-semibold text-foreground">Setup scripts</p>
@@ -127,7 +127,7 @@ export function SidebarSetupBanner() {
           <Button
             variant="outline"
             size="sm"
-            className="w-full mt-2.5 h-7 text-label"
+            className="w-full mt-2.5"
             onClick={handleConfigure}
           >
             Configure

@@ -34,21 +34,21 @@ export function SyncStateIcon({ state }: { state: SyncStateKind }) {
     case "idle":
       return (
         <CheckCircle2
-          className="h-4 w-4 shrink-0 text-status-open"
+          className="size-4 shrink-0 text-status-open"
           aria-label="Sync ready"
         />
       );
     case "syncing":
       return (
         <Loader2
-          className="h-4 w-4 shrink-0 animate-spin text-foreground"
+          className="size-4 shrink-0 animate-spin text-foreground"
           aria-label="Syncing"
         />
       );
     case "error":
       return (
         <AlertCircle
-          className="h-4 w-4 shrink-0 text-destructive"
+          className="size-4 shrink-0 text-destructive"
           aria-label="Sync error"
         />
       );
@@ -104,9 +104,9 @@ export function SyncStatusDisplay() {
           className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {isSyncing ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Loader2 className="size-3.5 animate-spin" />
           ) : (
-            <RefreshCw className="h-3.5 w-3.5" />
+            <RefreshCw className="size-3.5" />
           )}
           {buttonLabel}
         </button>
@@ -117,7 +117,7 @@ export function SyncStatusDisplay() {
           role="alert"
           className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-label text-foreground"
         >
-          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+          <AlertCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
           <span className="break-words">{status.lastError}</span>
         </div>
       )}
@@ -131,7 +131,7 @@ export function SyncStatusDisplay() {
 function SyncStatusSkeleton() {
   return (
     <div className="flex items-center gap-3">
-      <div className="h-4 w-4 animate-pulse rounded-full bg-muted" />
+      <div className="size-4 animate-pulse rounded-full bg-muted" />
       <div className="min-w-0 flex-1 space-y-1">
         <div className="h-3.5 w-24 animate-pulse rounded-sm bg-muted" />
         <div className="h-3 w-32 animate-pulse rounded-sm bg-muted/60" />

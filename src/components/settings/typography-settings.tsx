@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import type { AppearanceSettings } from "@/tauri/types";
 import { SegmentedControl, SubsectionHeader } from "./settings-primitives";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type TypographyField =
   | "interface_font_family"
@@ -362,7 +363,7 @@ function TypographySurfaceCard({
       <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3.5">
         <div className="flex min-w-[220px] flex-1 items-start gap-3">
           <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-background/80 text-muted-foreground">
-            <Icon className="size-3.5" strokeWidth={1.7} aria-hidden />
+            <Icon className="size-3.5" aria-hidden />
           </div>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -483,9 +484,9 @@ function FontFamilyPicker({
                 <span className="min-w-0 flex-1 truncate" style={{ fontFamily: defaultStack }}>
                   {defaultFamily}
                 </span>
-                <span className="text-micro uppercase tracking-[0.08em] text-muted-foreground/55">
+                <Eyebrow>
                   default
-                </span>
+                </Eyebrow>
                 {value === null ? <Check className="size-3.5" aria-hidden /> : null}
               </CommandItem>
             ) : null}

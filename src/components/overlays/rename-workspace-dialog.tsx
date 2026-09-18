@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { renameWorkspace } from "@/tauri/commands";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 export const WORKSPACE_NAME_MAX_LENGTH = 48;
 
@@ -216,19 +217,16 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               aria-label="Close rename workspace dialog"
               className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <X className="size-3" strokeWidth={1.6} />
+              <X className="size-3" />
             </button>
           </DialogClose>
         </div>
 
         <form onSubmit={(event) => void handleSubmit(event)}>
           <div className="flex flex-col gap-[9px] px-4 pt-4 pb-3.5">
-            <label
-              htmlFor="rename-workspace-name"
-              className="font-mono text-micro leading-none tracking-[0.16em] text-muted-foreground/60 uppercase"
-            >
-              Workspace name
-            </label>
+            <Eyebrow asChild className="leading-none">
+              <label htmlFor="rename-workspace-name">Workspace name</label>
+            </Eyebrow>
             <div
               ref={fieldRef}
               className={cn(
@@ -264,7 +262,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
                   }}
                   className="flex size-[18px] shrink-0 items-center justify-center rounded-sm text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <X className="size-2.5" strokeWidth={1.8} />
+                  <X className="size-3" />
                 </button>
               )}
               <span
@@ -326,7 +324,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               )}
             >
               <span>{submitting ? "Renaming…" : "Rename"}</span>
-              <CornerDownLeft className="size-[11px] opacity-75" strokeWidth={1.8} />
+              <CornerDownLeft className="size-[11px] opacity-75" />
             </button>
           </div>
         </form>

@@ -163,6 +163,7 @@ import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -836,7 +837,7 @@ function PresetEditorSheet({
         {/* Header */}
         <SheetHeader className="border-b p-4">
           <SheetTitle className="flex items-center gap-2 text-body">
-            <PresetIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
+            <PresetIcon icon={agentIcon} className="size-4 shrink-0" />
             {name || preset.name}
           </SheetTitle>
           <SheetDescription>
@@ -902,7 +903,7 @@ function PresetEditorSheet({
                     {agentOptions.map((a) => (
                       <SelectItem key={a.id} value={a.id}>
                         <span className="flex items-center gap-2">
-                          <PresetIcon icon={a.icon} className="h-3.5 w-3.5" />
+                          <PresetIcon icon={a.icon} className="size-3.5" />
                           {a.name}
                         </span>
                       </SelectItem>
@@ -1002,7 +1003,7 @@ function PresetEditorSheet({
                         className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
                         aria-label="Remove command"
                       >
-                        <X className="h-3.5 w-3.5" />
+                        <X className="size-3.5" />
                       </Button>
                     )}
                   </div>
@@ -1010,7 +1011,7 @@ function PresetEditorSheet({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
+                  className="mt-1 w-fit text-muted-foreground hover:text-foreground"
                   onClick={addCommand}
                 >
                   + Add command
@@ -1021,9 +1022,9 @@ function PresetEditorSheet({
 
           {/* Advanced section */}
           <div className="space-y-5 border-t border-border/40 pt-5">
-            <p className="text-label font-semibold uppercase tracking-[0.16em] text-muted-foreground/80">
+            <Eyebrow>
               Advanced
-            </p>
+            </Eyebrow>
 
             {/* Launch Mode */}
             <div className="space-y-2">
@@ -1195,7 +1196,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 text-label text-muted-foreground"
+          className="text-muted-foreground"
           onClick={() => {
             setAiCommitMessageCli(null).catch(console.error);
             storeSet("ai_commit_message_cli", "");
@@ -1207,7 +1208,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         </Button>
       ) : (
         <span className="flex items-center gap-1 whitespace-nowrap text-label text-muted-foreground">
-          <Sparkles className="h-3.5 w-3.5 text-primary/70" />
+          <Sparkles className="size-3.5 text-primary/70" />
           Utility agent
         </span>
       )}
@@ -1494,13 +1495,13 @@ export function SettingsView() {
                   <Button
                     variant="outline"
                     size="sm"
-                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50 gap-1.5"
+                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
                     onClick={() => {
                       signOut();
                       setShowSettings(false);
                     }}
                   >
-                    <LogOut className="h-3.5 w-3.5" />
+                    <LogOut className="size-3.5" />
                     Sign out
                   </Button>
                 </SettingsCard>
@@ -1648,9 +1649,9 @@ export function SettingsView() {
                   different things, so the toggle's effect is visible: with
                   it on they animate differently, with it off they match. */}
               <div className="mt-4">
-                <p className="mb-1.5 font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
+                <Eyebrow className="mb-1.5">
                   Preview
-                </p>
+                </Eyebrow>
                 <div className="flex max-w-[300px] flex-col gap-0.5 rounded-lg border border-border/60 bg-muted/30 p-1.5">
                   <OrbPreviewRow
                     activity={{ toolName: "Grep" }}
@@ -1685,7 +1686,7 @@ export function SettingsView() {
                     {editors.map((ed) => (
                       <SelectItem key={ed.id} value={ed.id}>
                         <span className="flex items-center gap-2">
-                          <EditorIcon id={ed.id} className="h-4 w-4" />
+                          <EditorIcon id={ed.id} className="size-4" />
                           {ed.name}
                         </span>
                       </SelectItem>
@@ -1713,7 +1714,7 @@ export function SettingsView() {
                       className="flex items-center justify-between gap-4 px-4 py-2.5"
                     >
                       <span className="flex items-center gap-2 text-body text-foreground">
-                        <EditorIcon id={ed.id} className="h-4 w-4" />
+                        <EditorIcon id={ed.id} className="size-4" />
                         {ed.name}
                       </span>
                       <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded-sm border border-border/40">
@@ -1742,7 +1743,7 @@ export function SettingsView() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 text-body-sm text-muted-foreground"
+                  className="text-muted-foreground"
                   onClick={() => setActiveSection("appearance")}
                 >
                   Open Appearance
@@ -1801,8 +1802,8 @@ export function SettingsView() {
                 title="Your presets"
                 description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
                 action={
-                  <Button variant="outline" size="sm" className="gap-1.5" onClick={handleNewPreset}>
-                    <Plus className="h-3.5 w-3.5" />
+                  <Button variant="outline" size="sm" onClick={handleNewPreset}>
+                    <Plus className="size-3.5" />
                     New preset
                   </Button>
                 }
@@ -2360,7 +2361,7 @@ export function SettingsView() {
           className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
           onClick={() => setShowSettings(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <div className="flex items-center gap-2 text-body-lg">
           <span className="font-semibold tracking-tight text-foreground">Settings</span>
@@ -2385,9 +2386,9 @@ export function SettingsView() {
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
-                <p className="px-4 pb-1.5 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+                <Eyebrow className="px-4 pb-1.5">
                   {group.label}
-                </p>
+                </Eyebrow>
                 <div className="space-y-px px-3">
                   {group.items.map((item) => (
                     <SettingsNavItem
@@ -2481,12 +2482,12 @@ function SortablePresetRow({
         {...attributes}
         {...listeners}
       >
-        <GripVertical className="h-3.5 w-3.5" />
+        <GripVertical className="size-3.5" />
       </button>
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
       <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/60">
-        <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+        <PresetIcon icon={preset.icon} className="size-3.5" />
       </span>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
@@ -2510,23 +2511,23 @@ function SortablePresetRow({
         {!preset.is_builtin && (
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-sm"
             title="Delete preset"
-            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            className="opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
             onClick={(e) => {
               e.stopPropagation();
               onDelete();
             }}
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="size-3.5" />
           </Button>
         )}
         <Button
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
           className={cn(
-            "h-7 w-7 transition-opacity",
+            "transition-opacity",
             preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
           )}
           onClick={(e) => {
@@ -2535,9 +2536,9 @@ function SortablePresetRow({
           }}
         >
           {preset.pinned ? (
-            <Star className="h-3.5 w-3.5 fill-current text-foreground" />
+            <Star className="size-3.5 fill-current text-foreground" />
           ) : (
-            <Star className="h-3.5 w-3.5 text-muted-foreground" />
+            <Star className="size-3.5 text-muted-foreground" />
           )}
         </Button>
       </div>

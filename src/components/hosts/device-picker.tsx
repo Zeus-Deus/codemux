@@ -107,9 +107,9 @@ export function DevicePicker({
           )}
         >
           {isLocal ? (
-            <Monitor className="h-3.5 w-3.5" />
+            <Monitor className="size-3.5" />
           ) : (
-            <Server className="h-3.5 w-3.5" />
+            <Server className="size-3.5" />
           )}
           {!iconOnly && (
             // Match the project picker's label shape exactly —
@@ -125,7 +125,7 @@ export function DevicePicker({
             />
           )}
           {!iconOnly && (
-            <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+            <ChevronDown className="size-3 opacity-40" />
           )}
         </button>
       </DropdownMenuTrigger>

@@ -82,7 +82,7 @@ export function LoginScreen() {
                 codemux
               </span>
             </div>
-            <Mail className="h-10 w-10 text-muted-foreground mb-4" />
+            <Mail className="size-10 text-muted-foreground mb-4" />
             <h2 className="text-body font-medium text-foreground mb-2">
               Check your email
             </h2>
@@ -160,7 +160,7 @@ export function LoginScreen() {
                   disabled={resetLoading}
                 >
                   {resetLoading && (
-                    <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                    <Loader2 className="size-4 animate-spin mr-1.5" />
                   )}
                   Send reset link
                 </Button>
@@ -216,9 +216,9 @@ export function LoginScreen() {
             disabled={isSigningIn}
           >
             {isSigningIn ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Loader2 className="size-4 animate-spin" />
             ) : (
-              <Github className="h-4 w-4" />
+              <Github className="size-4" />
             )}
             Continue with GitHub
           </Button>
@@ -303,7 +303,7 @@ export function LoginScreen() {
               disabled={isSigningIn}
             >
               {isSigningIn && (
-                <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                <Loader2 className="size-4 animate-spin mr-1.5" />
               )}
               {view === "signin" ? "Sign in" : "Create account"}
             </Button>

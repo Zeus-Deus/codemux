@@ -29,6 +29,7 @@ import { useUIStore, type ThemeStudioRequest } from "@/stores/ui-store";
 import { ThemePreviewShell } from "./theme-preview-shell";
 import { ThemeImportSourcePicker, type ThemeImportSourceKind } from "./theme-import-sources";
 import { ThemeMarketplacePanel } from "./theme-marketplace";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 const EMPTY_THEME_PAYLOADS: unknown[] = [];
 
@@ -366,9 +367,9 @@ function StudioBody({
         {/* Live preview — the reason the modal is 1000px wide */}
         <div className="flex min-w-0 flex-1 flex-col gap-2.5 bg-background p-[18px]">
           <div className="flex flex-none items-center gap-2.5">
-            <span className="font-mono text-caption font-semibold tracking-[0.1em] text-muted-foreground uppercase">
+            <Eyebrow>
               Live preview
-            </span>
+            </Eyebrow>
             <span className="h-px flex-1 bg-border/60" />
             <span className="text-label text-muted-foreground">
               {tab === "import" && !rolesOpen
@@ -393,7 +394,6 @@ function StudioBody({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-[31px] gap-1.5 text-body-sm"
               onClick={() => downloadTheme(savedTheme)}
             >
               <Download className="size-3" /> Export
@@ -406,17 +406,17 @@ function StudioBody({
               onClick={() => removeTheme(savedTheme)}
               aria-label={`Delete ${savedTheme.label}`}
             >
-              <Trash2 className="size-3" />
+              <Trash2 />
             </Button>
           </>
         )}
-        <Button type="button" variant="outline" size="sm" className="h-[31px] text-body-sm" onClick={onClose}>
+        <Button type="button" variant="outline" size="sm" onClick={onClose}>
           Cancel
         </Button>
         <Button
           type="button"
           size="sm"
-          className="h-[31px] gap-1.5 text-body-sm font-bold"
+          className="font-bold"
           onClick={saveTheme}
           disabled={!candidate}
         >
@@ -594,7 +594,6 @@ function ImportColumn({
               type="button"
               variant="outline"
               size="sm"
-              className="h-[25px] gap-1.5 px-2.5 text-label"
               onClick={onChooseFile}
             >
               <FileUp className="size-[11px]" /> Choose file
@@ -699,7 +698,7 @@ function RoleEditorColumn({
         onClick={onBack}
         className="inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
       >
-        <ChevronRight className="size-2.5 rotate-180" />
+        <ChevronRight className="size-3 rotate-180" />
         Back
       </button>
       <NameField value={label} onChange={onLabel} />
@@ -816,7 +815,7 @@ function EditRolesLink({ onClick }: { onClick: () => void }) {
       className="mt-auto inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
     >
       Edit roles by hand
-      <ChevronRight className="size-2.5" />
+      <ChevronRight className="size-3" />
     </button>
   );
 }

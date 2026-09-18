@@ -13,6 +13,7 @@ import {
   agentChatListSessions,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 const LIST_LIMIT = 50;
 
@@ -132,7 +133,7 @@ export function SessionHistoryList({
         }}
         data-testid="session-selector-new-chat"
       >
-        <Plus className="h-3.5 w-3.5" />
+        <Plus className="size-3.5" />
         New Chat
       </DropdownMenuItem>
       {footerItem}
@@ -149,7 +150,7 @@ export function SessionHistoryList({
       )}
       {buckets.map((bucket) => (
         <div key={bucket.key}>
-          <DropdownMenuLabel className="text-caption uppercase tracking-wider text-muted-foreground/70">
+          <DropdownMenuLabel className={eyebrowVariants({ tone: "muted" })}>
             {bucket.label}
           </DropdownMenuLabel>
           {bucket.sessions.map((session) => (
@@ -215,7 +216,7 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
           onDelete();
         }}
       >
-        <Trash2 className="h-3 w-3" />
+        <Trash2 className="size-3" />
       </button>
     </DropdownMenuItem>
   );

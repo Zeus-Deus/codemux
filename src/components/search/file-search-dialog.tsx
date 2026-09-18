@@ -152,7 +152,7 @@ export function FileSearchDialog() {
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (
@@ -174,7 +174,7 @@ export function FileSearchDialog() {
                 onClick={() => openFile(filePath)}
                 onMouseEnter={() => setSelectedIndex(idx)}
               >
-                <FileTypeIcon filename={fileName} className="h-3.5 w-3.5 opacity-75" />
+                <FileTypeIcon filename={fileName} className="size-3.5 opacity-75" />
                 <div className="min-w-0 flex-1">
                   <span className="font-medium">{fileName}</span>
                   {dirPath && (

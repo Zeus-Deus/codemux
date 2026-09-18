@@ -92,7 +92,7 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
                 data-testid="mcp-tool-modal-loading"
                 className="flex items-center gap-2 py-6 text-body text-muted-foreground"
               >
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                <Loader2 className="size-4 animate-spin" aria-hidden />
                 Loading tools…
               </div>
             ) : error ? (

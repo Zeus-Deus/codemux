@@ -28,6 +28,7 @@ import { Plug, Globe, X, Copy } from "lucide-react";
 import type { PortInfoSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type PortGroupKind = "workspace" | "docker" | "other";
 
@@ -151,12 +152,12 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
           <PopoverTrigger asChild>
             <Button
               variant="ghost"
-              size="icon-xs"
+              size={labeled ? "sm" : "icon-sm"}
               aria-label="Ports"
               className={cn(
-                "relative h-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
+                "relative text-muted-foreground hover:text-foreground hover:bg-sidebar-accent",
                 portCount > 0 && "text-foreground",
-                labeled ? "w-full justify-start gap-2 px-2 text-label" : "w-7",
+                labeled ? "w-full justify-start gap-2 text-label" : "",
               )}
             >
               <Icon className="size-[18px]" />
@@ -187,7 +188,7 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
             {portCount === 0 ? (
               <CommandEmpty>
                 <div className="flex flex-col items-center justify-center py-6 text-muted-foreground">
-                  <Plug className="h-5 w-5 mb-2 opacity-50" />
+                  <Plug className="size-5 mb-2 opacity-50" />
                   <span className="text-label">No active ports detected</span>
                 </div>
               </CommandEmpty>
@@ -196,9 +197,9 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                 <CommandGroup
                   key={group.key}
                   heading={
-                    <span className="text-caption uppercase tracking-wide text-muted-foreground/70">
+                    <Eyebrow>
                       {group.workspaceName}
-                    </span>
+                    </Eyebrow>
                   }
                 >
                   {group.ports.map((port) => (
@@ -231,10 +232,10 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                                 e.stopPropagation();
                                 openInBrowser(port);
                               }}
-                              className="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+                              className="flex size-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
                               aria-label="Open in browser pane"
                             >
-                              <Globe className="h-3 w-3" />
+                              <Globe className="size-3" />
                             </button>
                           </TooltipTrigger>
                           <TooltipContent side="top" sideOffset={4} className="text-label">
@@ -249,10 +250,10 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                                 e.stopPropagation();
                                 copyUrl(port);
                               }}
-                              className="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+                              className="flex size-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
                               aria-label="Copy URL"
                             >
-                              <Copy className="h-3 w-3" />
+                              <Copy className="size-3" />
                             </button>
                           </TooltipTrigger>
                           <TooltipContent side="top" sideOffset={4} className="text-label">
@@ -268,10 +269,10 @@ export function SidebarPortsPopover({ icon: Icon = Plug, labeled = false, toolti
                                   e.stopPropagation();
                                   handleKill(port);
                                 }}
-                                className="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-danger/15 hover:text-danger"
+                                className="flex size-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-danger/15 hover:text-danger"
                                 aria-label="Kill process"
                               >
-                                <X className="h-3 w-3" />
+                                <X className="size-3" />
                               </button>
                             </TooltipTrigger>
                             <TooltipContent side="top" sideOffset={4} className="text-label">

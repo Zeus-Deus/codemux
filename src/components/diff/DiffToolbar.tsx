@@ -15,6 +15,7 @@ import { useDiffStore, type DiffTabState } from "@/stores/diff-store";
 import { closeTab } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { TabSnapshot } from "@/tauri/types";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 interface Props {
   tabId: string;
@@ -50,7 +51,7 @@ export function DiffToolbar({
   };
 
   return (
-    <div className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2">
+    <PanelHeader className="gap-1 bg-card px-2">
       {/* File path */}
       <span className="text-label font-mono text-muted-foreground truncate min-w-0">
         {tab.filePath ?? "No file selected"}
@@ -64,7 +65,7 @@ export function DiffToolbar({
           aria-label="Edit file"
           title="Edit file"
         >
-          <Pencil className="h-3 w-3" />
+          <Pencil className="size-3" />
         </Button>
       )}
 
@@ -78,7 +79,7 @@ export function DiffToolbar({
               key={s}
               size="xs"
               variant={tab.section === s ? "secondary" : "ghost"}
-              className="h-5 px-1.5 text-caption"
+              className="text-caption"
               onClick={() => setSection(tabId, s)}
             >
               {s === "all" ? "All" : s === "against_base" ? (tab.baseBranch ? `vs ${tab.baseBranch}` : "Base") : s.charAt(0).toUpperCase() + s.slice(1)}
@@ -102,7 +103,7 @@ export function DiffToolbar({
           onClick={() => setLayout(tabId, "split")}
           title="Split view"
         >
-          <Columns2 className="h-3 w-3" />
+          <Columns2 className="size-3" />
         </Button>
         <Button
           size="icon-xs"
@@ -110,7 +111,7 @@ export function DiffToolbar({
           onClick={() => setLayout(tabId, "unified")}
           title="Unified view"
         >
-          <AlignJustify className="h-3 w-3" />
+          <AlignJustify className="size-3" />
         </Button>
       </div>
 
@@ -124,7 +125,7 @@ export function DiffToolbar({
         onClick={onPrevHunk}
         title="Previous change"
       >
-        <ChevronUp className="h-3 w-3" />
+        <ChevronUp className="size-3" />
       </Button>
       <Button
         size="icon-xs"
@@ -132,7 +133,7 @@ export function DiffToolbar({
         onClick={onNextHunk}
         title="Next change"
       >
-        <ChevronDown className="h-3 w-3" />
+        <ChevronDown className="size-3" />
       </Button>
 
       {/* Separator */}
@@ -146,7 +147,7 @@ export function DiffToolbar({
         disabled={fileCount <= 1}
         title="Previous file"
       >
-        <ChevronLeft className="h-3 w-3" />
+        <ChevronLeft className="size-3" />
       </Button>
       <span className="text-caption tabular-nums text-muted-foreground min-w-[28px] text-center">
         {fileCount > 0 ? `${fileIndex + 1}/${fileCount}` : "0/0"}
@@ -158,7 +159,7 @@ export function DiffToolbar({
         disabled={fileCount <= 1}
         title="Next file"
       >
-        <ChevronRight className="h-3 w-3" />
+        <ChevronRight className="size-3" />
       </Button>
 
       {/* Separator */}
@@ -171,7 +172,7 @@ export function DiffToolbar({
         onClick={() => toggleFocusMode(tabId)}
         title="Focus mode"
       >
-        <Target className="h-3 w-3" />
+        <Target className="size-3" />
       </Button>
 
       {/* Close */}
@@ -182,8 +183,8 @@ export function DiffToolbar({
         onClick={handleClose}
         title="Close diff"
       >
-        <X className="h-3 w-3" />
+        <X className="size-3" />
       </Button>
-    </div>
+    </PanelHeader>
   );
 }

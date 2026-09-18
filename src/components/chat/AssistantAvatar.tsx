@@ -53,7 +53,7 @@ export function AssistantAvatar({ provider }: Props) {
       data-wash="ember"
       className="flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-md bg-accent-ember/15 text-accent-ember"
     >
-      <Sparkle className="h-[15px] w-[15px]" strokeWidth={1.4} />
+      <Sparkle className="h-[15px] w-[15px]" />
     </span>
   );
 }

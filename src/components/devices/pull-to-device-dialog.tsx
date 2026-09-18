@@ -37,6 +37,7 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useHostsStore } from "@/stores/hosts-store";
 
 import { remoteProjectName } from "./use-device-cards";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -365,7 +366,6 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
               disabled={submitting}
             >
@@ -379,7 +379,6 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                 <Button
                   variant="secondary"
                   size="sm"
-                  className="h-7 gap-1.5 px-3 text-body-sm"
                   onClick={() => void handleSubmit()}
                   disabled={submitting}
                 >
@@ -498,7 +497,7 @@ function HostNotConfiguredBlock({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 px-2.5 text-body-sm gap-1.5 border-warning/30 hover:bg-warning/15"
+        className="border-warning/30 hover:bg-warning/15"
         onClick={() => {
           onClose();
           // TODO: deep-link to Settings → Devices when that route lands.
@@ -612,7 +611,6 @@ function SameBranchProjectBlock({
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-body-sm"
         onClick={onOpenExisting}
       >
         Open the existing workspace
@@ -628,7 +626,6 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-body-sm"
         onClick={onOpen}
       >
         Open it
@@ -656,7 +653,7 @@ function SummaryRow({
 }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-[68px] shrink-0 text-label uppercase tracking-wider text-muted-foreground/55">
+      <dt className={cn(eyebrowVariants(), "w-[68px] shrink-0")}>
         {label}
       </dt>
       <dd

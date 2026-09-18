@@ -43,6 +43,7 @@ import type {
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -455,7 +456,7 @@ export function MultiProviderModelPicker({
           // controls — not per-pill borders — carry the separation.
           className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-4 w-4 shrink-0" />
+          <ProviderLogo provider={provider} className="size-4 shrink-0" />
           <span className="max-w-[180px] truncate">
             {leafLabel ? (
               leafModelName(triggerLabel)
@@ -472,8 +473,7 @@ export function MultiProviderModelPicker({
             )}
           </span>
           <ChevronDown
-            className="-mx-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
-            strokeWidth={2.25}
+            className="-mx-0.5 size-3.5 shrink-0 opacity-70"
           />
         </button>
       </PopoverTrigger>
@@ -670,7 +670,7 @@ function ProviderRail({
                     )}
                   >
                     <Star
-                      className="h-5 w-5 shrink-0 text-status-working"
+                      className="size-5 shrink-0 text-status-working"
                       fill="currentColor"
                     />
                   </button>
@@ -728,7 +728,7 @@ function ProviderRail({
                   >
                     <ProviderLogo
                       provider={p.kind}
-                      className="h-5 w-5 shrink-0"
+                      className="size-5 shrink-0"
                     />
                   </button>
                 </TooltipTrigger>
@@ -839,7 +839,7 @@ function ModelRow({
           <span className="truncate">{model.label}</span>
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
-          <ProviderLogo provider={provider} className="h-2.5 w-2.5 shrink-0" />
+          <ProviderLogo provider={provider} className="size-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
           </span>
@@ -855,13 +855,9 @@ function ModelRow({
         </kbd>
       ) : null}
       {model.is_free ? (
-        <span
-          data-testid="model-row-free-badge"
-          className="mt-0.5 shrink-0 self-start rounded-sm border border-status-open/35 bg-status-open/15 px-1 py-px text-micro font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
-          aria-label="Free model"
-        >
+        <Eyebrow className="mt-0.5 shrink-0 self-start rounded-sm border border-status-open/35 bg-status-open/15 px-1 py-px leading-none text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open" data-testid="model-row-free-badge" aria-label="Free model">
           Free
-        </span>
+        </Eyebrow>
       ) : null}
       <button
         type="button"
@@ -896,7 +892,7 @@ function ModelRow({
         )}
       >
         <Star
-          className="h-3.5 w-3.5"
+          className="size-3.5"
           fill={isFavorite ? "currentColor" : "none"}
         />
       </button>

@@ -27,6 +27,7 @@ import {
 } from "@/tauri/commands";
 
 import { McpToolModal } from "./mcp-tool-modal";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 /** Slow-start threshold (ms). Servers stuck in `starting` longer than
  *  this surface a "taking longer than usual" hint. 3 s matches
@@ -134,7 +135,7 @@ export function McpSection({ projectRoot }: Props) {
           aria-label="Refresh MCP servers"
         >
           <RotateCw
-            className={cn("mr-1 h-3 w-3", loading && "animate-spin")}
+            className={cn("mr-1 size-3", loading && "animate-spin")}
             aria-hidden
           />
           Refresh
@@ -155,7 +156,7 @@ export function McpSection({ projectRoot }: Props) {
           data-testid="mcp-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+          <Loader2 className="size-4 animate-spin" aria-hidden />
           Loading MCP servers…
         </div>
       ) : servers.length === 0 && !error ? (
@@ -239,7 +240,7 @@ function ServerGroup({
   return (
     <section data-testid={`mcp-group-${source}`}>
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className={cn(eyebrowVariants())}>
           {sourceHeading(source)}
         </h3>
         <span className="text-caption text-muted-foreground/70">
@@ -367,7 +368,7 @@ function ServerRow({
       <Button
         variant="ghost"
         size="sm"
-        className="h-7 px-2 text-label opacity-0 transition-opacity group-hover:opacity-100"
+        className="opacity-0 transition-opacity group-hover:opacity-100"
         onClick={onView}
         data-testid={`mcp-row-${server.id}-view`}
       >
@@ -378,7 +379,6 @@ function ServerRow({
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-2 text-label"
           onClick={() =>
             void restartMcpServerCmd(server.id).catch((err) =>
               console.warn(`[mcp] restart ${server.id} failed:`, err),
@@ -447,7 +447,7 @@ function McpStatusBadge({
         data-testid={`mcp-row-${server.id}-status`}
         data-status={slow ? "starting-slow" : "starting"}
       >
-        <Loader2 className="size-2.5 animate-spin" aria-hidden />
+        <Loader2 className="size-3 animate-spin" aria-hidden />
         {slow ? "slow start — taking longer than usual" : "starting…"}
       </span>
     );

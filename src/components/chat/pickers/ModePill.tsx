@@ -88,7 +88,7 @@ export function ModePill({ mode, onRemove, onClick }: Props) {
       aria-label={`${config.label} mode active`}
       onClick={onClick}
     >
-      <Icon className="h-3 w-3" aria-hidden />
+      <Icon className="size-3" aria-hidden />
       <span>{config.label}</span>
       <button
         type="button"
@@ -101,7 +101,7 @@ export function ModePill({ mode, onRemove, onClick }: Props) {
         className="ml-0.5 rounded-sm p-0.5 hover:bg-surface-2"
         aria-label={`Remove ${config.label} mode`}
       >
-        <X className="h-2.5 w-2.5" />
+        <X className="size-3" />
       </button>
     </div>
   );

@@ -1167,7 +1167,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                           : "bg-surface-3 text-muted-foreground",
                       )}
                     >
-                      <CircleDot className="h-3 w-3" />
+                      <CircleDot className="size-3" />
                     </span>
                     <span className="font-mono tabular-nums text-muted-foreground">
                       #{linkedIssue.number}
@@ -1185,7 +1185,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         }
                       }}
                     >
-                      <X className="h-2.5 w-2.5" />
+                      <X className="size-3" />
                     </button>
                   </span>
                 )}
@@ -1239,16 +1239,16 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   >
                     {selectedAgent ? (
                       <>
-                        <PresetIcon icon={selectedAgent.icon} className="h-3.5 w-3.5" />
+                        <PresetIcon icon={selectedAgent.icon} className="size-3.5" />
                         {selectedAgent.name}
                       </>
                     ) : (
                       <>
-                        <PresetIcon icon="claude" className="h-3.5 w-3.5" />
+                        <PresetIcon icon="claude" className="size-3.5" />
                         Claude Code
                       </>
                     )}
-                    <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+                    <ChevronDown className="size-3 opacity-40" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="w-[200px]">
@@ -1261,10 +1261,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       }}
                       className="text-label gap-2"
                     >
-                      <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
+                      <PresetIcon icon={p.icon} className="size-3.5" />
                       <span className="flex-1">{p.name}</span>
                       {selectedAgentId === p.id && (
-                        <Check className="h-3.5 w-3.5 text-primary" />
+                        <Check className="size-3.5 text-primary" />
                       )}
                     </DropdownMenuItem>
                   ))}
@@ -1334,7 +1334,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         }
                       }}
                     >
-                      <Paperclip className="h-4 w-4" />
+                      <Paperclip className="size-4" />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top">Attach files</TooltipContent>
@@ -1353,7 +1353,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                           setPrPickerOpen(true);
                         }}
                       >
-                        <GitPullRequest className="h-4 w-4" />
+                        <GitPullRequest className="size-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="top">Link pull request</TooltipContent>
@@ -1373,7 +1373,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                           setIssuePickerOpen(true);
                         }}
                       >
-                        <CircleDot className="h-4 w-4" />
+                        <CircleDot className="size-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent side="top">Link issue</TooltipContent>
@@ -1390,7 +1390,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       onClick={handleSubmit}
                       disabled={!projectDir}
                     >
-                      <ArrowUp className="h-4 w-4" />
+                      <ArrowUp className="size-4" />
                     </button>
                   </TooltipTrigger>
                   <TooltipContent side="top">Create workspace</TooltipContent>

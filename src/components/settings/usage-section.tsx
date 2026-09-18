@@ -26,6 +26,7 @@ import type {
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How often to re-poll while the page is open. The ledger only grows
  *  when an agent is mid-turn, so this is about keeping an open settings
@@ -333,7 +334,7 @@ export function UsageSection() {
           >
             <RefreshCw
               className={cn(
-                "h-3.5 w-3.5",
+                "size-3.5",
                 (refreshing || scanning) && "animate-spin",
               )}
               aria-hidden
@@ -359,7 +360,7 @@ export function UsageSection() {
       {summary === null ? (
         !error && (
           <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            <Loader2 className="size-4 animate-spin" aria-hidden />
             Loading usage…
           </div>
         )
@@ -522,7 +523,7 @@ function OverviewCard({
             >
               <span
                 className={cn(
-                  "h-2 w-2 shrink-0 rounded-sm",
+                  "size-2 shrink-0 rounded-sm",
                   seriesFill(provider.provider),
                 )}
                 aria-hidden
@@ -559,9 +560,9 @@ function HeroStat({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       <span
         className={cn(
           "select-text font-mono text-[1.375rem] font-semibold leading-none tabular-nums tracking-tight xl:text-[1.6875rem]",
@@ -627,9 +628,9 @@ function CompositionRow({ composition }: { composition: UsageComposition }) {
             i > 0 && "border-l border-border/60 pl-5",
           )}
         >
-          <span className="font-mono text-caption font-semibold uppercase tracking-[0.09em] text-muted-foreground/70">
+          <Eyebrow>
             {cell.label}
-          </span>
+          </Eyebrow>
           <span className="select-text font-mono text-body-lg tabular-nums">
             {cell.value}
           </span>
@@ -666,9 +667,9 @@ function BreakdownCard({
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
       <div className="mb-3 flex items-center justify-between gap-4">
-        <p className="font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+        <Eyebrow>
           Breakdown
-        </p>
+        </Eyebrow>
         <SegmentedControl
           value={view}
           onChange={onViewChange}
@@ -721,9 +722,9 @@ function ModelRows({
           )}
         >
           {isKnownProvider(m.provider) ? (
-            <ProviderLogo provider={m.provider} className="h-3.5 w-3.5" />
+            <ProviderLogo provider={m.provider} className="size-3.5" />
           ) : (
-            <span className="h-3.5 w-3.5" aria-hidden />
+            <span className="size-3.5" aria-hidden />
           )}
           <span className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground">
             {m.model}
@@ -814,9 +815,9 @@ function CostConfidenceBlock({ confidence }: { confidence: CostConfidence }) {
   ];
   return (
     <div className="shrink-0 lg:w-[200px] lg:border-l lg:border-border/60 lg:pl-4">
-      <p className="mb-2 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+      <Eyebrow className="mb-2">
         Cost confidence
-      </p>
+      </Eyebrow>
       <div className="flex flex-col gap-1">
         {rows.map((r) => (
           <div key={r.label} className="flex items-baseline justify-between gap-3">
@@ -997,9 +998,9 @@ function ProviderLane({
 
         <span className="shrink-0 text-muted-foreground" aria-hidden>
           {open ? (
-            <ChevronUp className="h-3.5 w-3.5" />
+            <ChevronUp className="size-3.5" />
           ) : (
-            <ChevronDown className="h-3.5 w-3.5" />
+            <ChevronDown className="size-3.5" />
           )}
         </span>
       </button>

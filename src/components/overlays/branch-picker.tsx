@@ -214,9 +214,9 @@ export function BranchPicker({
           type="button"
           className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-label text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
         >
-          {isOpenMode ? <CornerDownRight className="h-3 w-3" /> : <GitBranch className="h-3 w-3" />}
+          {isOpenMode ? <CornerDownRight className="size-3" /> : <GitBranch className="size-3" />}
           <span className="max-w-[120px] truncate">{baseBranch}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown className="size-3 opacity-40" />
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-[380px] p-0" align="start">
@@ -277,7 +277,7 @@ export function BranchPicker({
           >
             {loading ? (
               <div className="flex items-center justify-center py-8 text-label text-muted-foreground">
-                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                <Loader2 className="mr-2 size-3.5 animate-spin" />
                 Loading branches...
               </div>
             ) : (

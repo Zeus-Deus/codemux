@@ -75,7 +75,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
           <Button
             type="button"
             size="sm"
-            className="h-7 px-3 text-label bg-foreground text-background hover:bg-foreground/90"
+            className="bg-foreground text-background hover:bg-foreground/90"
             onClick={allow}
           >
             Allow
@@ -84,7 +84,6 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             type="button"
             variant="outline"
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={allowSession}
           >
             Allow for session
@@ -93,7 +92,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={() => setDenying(true)}
           >
             Deny
@@ -117,7 +116,6 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
               type="button"
               variant="destructive"
               size="sm"
-              className="h-7 px-3 text-label"
               onClick={confirmDeny}
             >
               Confirm deny
@@ -126,7 +124,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
+              className="text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");

@@ -75,6 +75,7 @@ import type {
   SlotBody,
   TranscriptSlot,
 } from "./transcript-slots";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   messages: ChatViewItem[];
@@ -1300,10 +1301,10 @@ export const MessageList = memo(function MessageList({
           onClick={handleJumpToLatest}
           variant="secondary"
           size="sm"
-          className="absolute bottom-4 left-1/2 z-10 h-8 w-auto -translate-x-1/2 gap-1.5 rounded-full border border-border bg-card px-3.5 text-body-sm font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className="absolute bottom-4 left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
-          <ArrowDown className="h-3.5 w-3.5" aria-hidden />
+          <ArrowDown className="size-3.5" aria-hidden />
         </Button>
       )}
       </div>
@@ -1443,7 +1444,7 @@ function RunStalledNotice({ silentForSecs }: { silentForSecs: number }) {
       data-testid="run-stalled-notice"
       className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-body-sm text-warning"
     >
-      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
       <span>
         No activity for {minutes}m — the agent may have stopped.
       </span>
@@ -1734,9 +1735,9 @@ function renderAssistantBody(
           return (
             <div className="space-y-1">
               {handlers.subagentName && (
-                <div className="font-mono text-label font-semibold uppercase tracking-wide text-muted-foreground">
+                <Eyebrow>
                   From subagent {handlers.subagentName}
-                </div>
+                </Eyebrow>
               )}
               <PermissionRequestBlock item={item} onDecide={handlers.handleDecide} />
             </div>

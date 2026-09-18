@@ -159,25 +159,25 @@ export function EmptyWorkspaceState() {
         {/* Action rows */}
         <div className="mx-auto grid w-full gap-0.5">
           <ActionRow
-            icon={<Terminal className="h-4 w-4" />}
+            icon={<Terminal className="size-4" />}
             label="Open Terminal"
             keys={["Ctrl", "T"]}
             onClick={handleOpenTerminal}
           />
           <ActionRow
-            icon={<Globe className="h-4 w-4" />}
+            icon={<Globe className="size-4" />}
             label="Open Browser"
             keys={["Ctrl", "Alt", "B"]}
             onClick={handleOpenBrowser}
           />
           <ActionRow
-            icon={<ExternalLink className="h-4 w-4" />}
+            icon={<ExternalLink className="size-4" />}
             label="Open in Editor"
             keys={["Ctrl", "Shift", "E"]}
             onClick={handleOpenInEditor}
           />
           <ActionRow
-            icon={<Search className="h-4 w-4" />}
+            icon={<Search className="size-4" />}
             label="Search Files"
             keys={["Ctrl", "Shift", "P"]}
             onClick={handleSearchFiles}
@@ -193,7 +193,7 @@ export function EmptyWorkspaceState() {
             onClick={handleDeleteWorkspace}
             className="flex items-center gap-1.5 text-label text-muted-foreground/40 transition-colors hover:text-muted-foreground"
           >
-            <Trash2 className="h-3 w-3" />
+            <Trash2 className="size-3" />
             {canRemoveWorktree ? "Delete workspace" : "Close workspace"}
           </button>
         </div>

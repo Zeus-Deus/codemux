@@ -49,7 +49,6 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
     >
       <ListTodo
         className="size-[15px] shrink-0 text-muted-foreground"
-        strokeWidth={1.6}
         aria-hidden
       />
       <span className="min-w-0 flex-1 truncate text-label text-foreground/80">
@@ -67,7 +66,6 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
           </span>
           <ChevronRight
             className="size-3 shrink-0 text-muted-foreground"
-            strokeWidth={1.7}
             aria-hidden
           />
         </>

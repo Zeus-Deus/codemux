@@ -191,13 +191,13 @@ export function RemotePathPicker() {
               disabled={atRoot || loading}
               aria-label="Up one level"
             >
-              <ArrowUp className="h-3.5 w-3.5" />
+              <ArrowUp className="size-3.5" />
             </Button>
             <div className="flex min-w-0 flex-1 items-center overflow-x-auto whitespace-nowrap rounded-md border border-border bg-background/40 px-2 py-1 text-label text-muted-foreground">
               {crumbs.map((crumb, i) => (
                 <span key={crumb.path} className="flex items-center">
                   {i > 0 && (
-                    <ChevronRight className="mx-0.5 h-3 w-3 opacity-50" />
+                    <ChevronRight className="mx-0.5 size-3 opacity-50" />
                   )}
                   <button
                     type="button"
@@ -228,7 +228,7 @@ export function RemotePathPicker() {
             <Button
               variant="outline"
               size="sm"
-              className="h-8 shrink-0"
+              className="shrink-0"
               onClick={handleManualGo}
               disabled={loading}
             >
@@ -236,14 +236,14 @@ export function RemotePathPicker() {
             </Button>
             <Button
               variant="outline"
-              size="icon-sm"
-              className="h-8 w-8 shrink-0"
+              size="icon"
+              className="shrink-0"
               onClick={() => navigateTo(currentPath)}
               disabled={loading || !currentPath}
               aria-label="Refresh"
             >
               <RefreshCw
-                className={cn("h-3.5 w-3.5", loading && "animate-spin")}
+                className={cn("size-3.5", loading && "animate-spin")}
               />
             </Button>
           </div>
@@ -277,9 +277,9 @@ export function RemotePathPicker() {
                         )}
                       >
                         {entry.is_dir ? (
-                          <Folder className="h-3.5 w-3.5 shrink-0 text-status-remote/80" />
+                          <Folder className="size-3.5 shrink-0 text-status-remote/80" />
                         ) : (
-                          <FileIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
                         )}
                         <span
                           className={cn(
@@ -290,7 +290,7 @@ export function RemotePathPicker() {
                           {entry.name}
                         </span>
                         {entry.is_dir && (
-                          <ChevronRight className="ml-auto h-3.5 w-3.5 shrink-0 opacity-30" />
+                          <ChevronRight className="ml-auto size-3.5 shrink-0 opacity-30" />
                         )}
                       </button>
                     );
@@ -307,7 +307,7 @@ export function RemotePathPicker() {
                 type="checkbox"
                 checked={showHidden}
                 onChange={toggleHidden}
-                className="h-3 w-3 accent-primary"
+                className="size-3 accent-primary"
               />
               Show hidden
             </label>

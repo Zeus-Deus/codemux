@@ -43,7 +43,6 @@ function StatusGlyph({ task }: { task: TaskSnapshotItem }) {
     return (
       <CircleCheck
         className="size-4 text-status-open"
-        strokeWidth={1.8}
         aria-hidden
       />
     );
@@ -52,7 +51,6 @@ function StatusGlyph({ task }: { task: TaskSnapshotItem }) {
     return (
       <LoaderCircle
         className="size-[15px] animate-spin text-status-working"
-        strokeWidth={1.9}
         aria-hidden
       />
     );

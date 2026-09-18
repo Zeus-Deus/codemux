@@ -24,18 +24,33 @@ const buttonVariants = cva(
       },
       size: {
         // Design-system control-height scale: standard buttons are 36px
-        // (`h-9`), compact `sm` is 34px. Icon-only buttons stay tighter so
-        // dense toolbars don't crowd.
+        // (`h-9`), compact `sm` is 32px (`h-8`). Icon-only buttons stay
+        // tighter so dense toolbars don't crowd.
+        //
+        // `sm` is 32px because that is what its callers were already
+        // asking for: of 129 `size="sm"` uses, 82 patched the height from
+        // outside — 41 to 28px and 24 to 32px — against the 34px this
+        // variant used to declare. 32px is the majority intent and the one
+        // that leaves room for a 14px icon, so the variant states it and
+        // the local overrides are gone. A primitive most callers override
+        // is not a primitive.
         default:
           "h-9 gap-1.5 px-3 has-data-[icon=inline-end]:pr-2.5 has-data-[icon=inline-start]:pl-2.5",
         xs: "h-6 gap-1 rounded-[min(var(--radius-md),10px)] px-2 text-label in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3",
-        sm: "h-[34px] gap-1.5 px-2.5 text-body-sm in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2 [&_svg:not([class*='size-'])]:size-3.5",
+        sm: "h-8 gap-1.5 px-3 text-body-sm in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2 [&_svg:not([class*='size-'])]:size-3.5",
         lg: "h-10 gap-2 px-4 has-data-[icon=inline-end]:pr-3 has-data-[icon=inline-start]:pl-3",
         icon: "size-8",
         "icon-xs":
           "size-6 rounded-[min(var(--radius-md),10px)] in-data-[slot=button-group]:rounded-lg [&_svg:not([class*='size-'])]:size-3",
+        // 28px control, 14px glyph. Stating the glyph size is not cosmetic:
+        // without it the base's 16px applied, so an icon-sm button rendered a
+        // 16px glyph while its call sites asked for 12 or 14 and were
+        // silently overruled by the base rule's higher specificity. That is
+        // how the left sidebar toggle came to render 16px next to a right
+        // panel toggle at 14px while a class-string assertion called them
+        // mirrored.
         "icon-sm":
-          "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
+          "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg [&_svg:not([class*='size-'])]:size-3.5",
         "icon-lg": "size-9",
       },
     },

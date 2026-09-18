@@ -398,7 +398,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
           data-workspace-working-icon
           aria-hidden
           className="size-3.5"
-          strokeWidth={2}
         />
       )}
       {isNeeds && (
@@ -409,7 +408,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       {isMonitoring && (
         <span className="size-1.5 rounded-full bg-status-monitoring" />
       )}
-      {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
+      {isDone && <Check className="size-3" />}
       {isWorking ? (
         <>
           {/* Keep only the stable label in the live region. The elapsed value
@@ -611,7 +610,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       "text-caption font-semibold leading-[15px] text-status-open",
                     )}
                   >
-                    <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    <AlarmClock className="size-3" />
                     Woke
                   </span>
                 )}
@@ -649,9 +648,9 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     className={eyebrowGlyphClass}
                   >
                     {pinned ? (
-                      <PinOff className="size-3" strokeWidth={1.5} />
+                      <PinOff className="size-3" />
                     ) : (
-                      <Pin className="size-3" strokeWidth={1.5} />
+                      <Pin className="size-3" />
                     )}
                   </button>
                 {canSnooze && (
@@ -667,7 +666,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         title="Snooze"
                         className={eyebrowGlyphClass}
                       >
-                        <AlarmClock className="size-3" strokeWidth={1.5} />
+                        <AlarmClock className="size-3" />
                       </button>
                     </DropdownMenuTrigger>
                     {/* Radix portals this into document.body, but React events
@@ -721,7 +720,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         "transition-colors duration-150 hover:text-foreground",
                       )}
                     >
-                      <Check className="size-[11px]" strokeWidth={2.1} />
+                      <Check className="size-[11px]" />
                       Settle
                     </button>
                   )}
@@ -937,7 +936,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           : "text-status-open",
                       )}
                     >
-                      <Terminal className="size-3" strokeWidth={1.7} />
+                      <Terminal className="size-3" />
                     </span>
                   )}
                   {providers.map((p) => (
@@ -945,7 +944,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       key={p}
                       provider={p}
                       className={cn(
-                        "h-3.5 w-3.5 transition-[opacity,filter]",
+                        "size-3.5 transition-[opacity,filter]",
                         visuallyReceded
                           ? "opacity-35 grayscale group-hover/card:opacity-80 group-hover/card:grayscale-0 group-focus-within/card:opacity-80 group-focus-within/card:grayscale-0"
                           : "opacity-80",

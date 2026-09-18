@@ -63,6 +63,7 @@ import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/ui-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How long a just-finished row keeps its place in the live list. */
 export const COMPLETION_LINGER_MS = 8000;
@@ -407,7 +408,6 @@ function RowGlyph({ view }: { view: SubagentView }) {
               ? "text-status-working/80"
               : "text-status-open",
         )}
-        strokeWidth={2.4}
         aria-hidden
       />
     </span>
@@ -724,9 +724,9 @@ function PromptDivider({ text }: { text: string }) {
 
 function SectionHeader({ label }: { label: string }) {
   return (
-    <span className="shrink-0 font-mono text-caption tracking-[0.14em] text-muted-foreground/70 uppercase">
+    <Eyebrow className="shrink-0">
       {label}
-    </span>
+    </Eyebrow>
   );
 }
 

@@ -89,7 +89,7 @@ export function ProjectImageDialog({
               <div className="flex items-center gap-1 text-label text-muted-foreground/70 mt-0.5">
                 {isWebsite && (
                   <>
-                    <Globe className="h-3 w-3 shrink-0" />
+                    <Globe className="size-3 shrink-0" />
                     <span className="truncate">
                       Using favicon for {resolved.domain}
                     </span>
@@ -97,7 +97,7 @@ export function ProjectImageDialog({
                 )}
                 {isDirect && (
                   <>
-                    <ImageIcon className="h-3 w-3 shrink-0" />
+                    <ImageIcon className="size-3 shrink-0" />
                     <span className="truncate">Direct image URL</span>
                   </>
                 )}
@@ -133,11 +133,11 @@ export function ProjectImageDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 px-2 text-label text-muted-foreground hover:text-destructive"
+              className="text-muted-foreground hover:text-destructive"
               onClick={handleClear}
               disabled={!initialValue}
             >
-              <Trash2 className="h-3.5 w-3.5 mr-1.5" />
+              <Trash2 className="size-3.5 mr-1.5" />
               Remove image
             </Button>
             <div className="flex items-center gap-2">

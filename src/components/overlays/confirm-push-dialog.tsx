@@ -127,7 +127,6 @@ export function ConfirmPushDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
             >
               Cancel
@@ -135,7 +134,6 @@ export function ConfirmPushDialog({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 gap-1.5 px-3 text-body-sm"
               onClick={handleConfirm}
             >
               <ArrowUpRight className="size-3" />

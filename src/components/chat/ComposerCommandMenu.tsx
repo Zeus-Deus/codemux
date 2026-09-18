@@ -132,7 +132,7 @@ export function ComposerCommandMenu({
       >
         <div className="flex items-center gap-2.5 border-b border-border/60 px-3 py-2.5">
           <Search
-            className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+            className="size-3.5 shrink-0 text-muted-foreground"
             aria-hidden
           />
           <CommandPrimitive.Input
@@ -212,14 +212,14 @@ export function ComposerCommandMenu({
                     >
                       <span
                         className={cn(
-                          "flex h-6 w-6 shrink-0 items-center justify-center rounded-sm",
+                          "flex size-6 shrink-0 items-center justify-center rounded-sm",
                           tone.chip,
                         )}
                       >
                         {Icon && (
                           <Icon
                             className={cn(
-                              "h-3.5 w-3.5",
+                              "size-3.5",
                               // Per-item override (e.g. state-coloured
                               // issue icons) wins; else the row's tone.
                               item.iconClassName ?? tone.icon,

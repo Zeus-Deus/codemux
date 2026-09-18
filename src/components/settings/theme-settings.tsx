@@ -47,7 +47,7 @@ export function ThemeSettings() {
         type="button"
         variant="outline"
         size="sm"
-        className="h-[30px] flex-none gap-1.5 text-body-sm"
+        className="flex-none"
         onClick={() => openCommandPaletteWith("theme")}
       >
         Change
@@ -57,7 +57,7 @@ export function ThemeSettings() {
         type="button"
         variant="outline"
         size="sm"
-        className="h-[30px] flex-none text-body-sm"
+        className="flex-none"
         onClick={() =>
           openThemeStudio(source === "omarchy" && omarchy
             ? { mode: "generate", copyTheme: activeTheme }

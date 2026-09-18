@@ -111,7 +111,6 @@ export function IssueDetailPopover({
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 text-label"
                 onClick={fetchIssue}
               >
                 Retry
@@ -172,10 +171,10 @@ export function IssueDetailPopover({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="w-full justify-center gap-1.5 text-label"
+                  className="w-full justify-center"
                   onClick={() => openUrl(fullIssue.url)}
                 >
-                  <ExternalLink className="h-3 w-3" />
+                  <ExternalLink className="size-3" />
                   Open on {provider.name}
                 </Button>
               )}

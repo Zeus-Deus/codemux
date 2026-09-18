@@ -17,6 +17,7 @@ import { listToolPermissions, removeToolPermission } from "@/tauri/commands";
 import type { PermissionRule } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 interface Props {
   /** Active workspace's project root, or null when no project is
@@ -113,7 +114,7 @@ export function PermissionsSection({ projectRoot }: Props) {
 
       <p className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/5 px-3 py-2 text-label text-muted-foreground">
         <AlertTriangle
-          className="mt-0.5 h-3.5 w-3.5 shrink-0 text-status-working"
+          className="mt-0.5 size-3.5 shrink-0 text-status-working"
           aria-hidden
         />
         <span>
@@ -130,7 +131,7 @@ export function PermissionsSection({ projectRoot }: Props) {
 
       {rules === null ? (
         <div className="flex items-center gap-2 py-6 text-body text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+          <Loader2 className="size-4 animate-spin" aria-hidden />
           Loading rules…
         </div>
       ) : (
@@ -188,7 +189,7 @@ function RuleGroup({
   return (
     <section>
       <header className="mb-2">
-        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className={cn(eyebrowVariants())}>
           {group.heading}
         </h3>
         <p className="text-label text-muted-foreground/70 font-mono mt-0.5">
@@ -228,7 +229,7 @@ function RuleGroup({
                 className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
                 onClick={() => onRemove(rule)}
               >
-                <Trash2 className="h-3.5 w-3.5" />
+                <Trash2 className="size-3.5" />
               </Button>
             </li>
           ))}
@@ -243,21 +244,21 @@ function BehaviorIcon({ behavior }: { behavior: PermissionRule["behavior"] }) {
     case "allow":
       return (
         <Check
-          className="h-3.5 w-3.5 shrink-0 text-status-open"
+          className="size-3.5 shrink-0 text-status-open"
           aria-label="Allow"
         />
       );
     case "deny":
       return (
         <X
-          className="h-3.5 w-3.5 shrink-0 text-destructive"
+          className="size-3.5 shrink-0 text-destructive"
           aria-label="Deny"
         />
       );
     case "ask":
       return (
         <HelpCircle
-          className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+          className="size-3.5 shrink-0 text-muted-foreground"
           aria-label="Ask"
         />
       );

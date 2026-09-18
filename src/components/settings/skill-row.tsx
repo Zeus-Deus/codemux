@@ -72,7 +72,7 @@ export function SkillRow({
       )}
     >
       <BookOpen
-        className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+        className="size-3.5 shrink-0 text-muted-foreground"
         aria-hidden
       />
       <div className="min-w-0 flex-1">
@@ -104,7 +104,7 @@ export function SkillRow({
                   className="inline-flex items-center text-muted-foreground/70 hover:text-muted-foreground"
                   aria-label="Symlinked skill"
                 >
-                  <Link2 className="h-3 w-3" aria-hidden />
+                  <Link2 className="size-3" aria-hidden />
                 </span>
               </TooltipTrigger>
               <TooltipContent side="top">
@@ -135,10 +135,9 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-label"
               onClick={onView}
             >
-              <Eye className="mr-1 h-3 w-3" aria-hidden />
+              <Eye className="mr-1 size-3" aria-hidden />
               View
             </Button>
           )}
@@ -146,11 +145,10 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-label"
               onClick={onOpenFile}
               aria-label={`Open ${skill.name} in editor`}
             >
-              <ExternalLink className="h-3 w-3" aria-hidden />
+              <ExternalLink className="size-3" aria-hidden />
             </Button>
           )}
         </div>

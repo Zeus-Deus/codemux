@@ -25,6 +25,7 @@ import {
   useHomeDir,
 } from "@/stores/app-store";
 import { useForceDelete } from "@/hooks/use-force-delete";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Settings → Archive.
@@ -156,7 +157,7 @@ function DeleteArchivedDialog({
 
         {forceMessage !== null && (
           <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <AlertTriangle className="size-3.5 shrink-0" />
             {forceMessage}
           </div>
         )}
@@ -194,7 +195,6 @@ function DeleteArchivedDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -202,7 +202,6 @@ function DeleteArchivedDialog({
           <Button
             variant={isRoot ? "secondary" : "destructive"}
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => void confirm()}
           >
             {forceMessage !== null
@@ -278,18 +277,17 @@ function ArchivedEntryRow({
         <Button
           variant="secondary"
           size="sm"
-          className="h-7 px-2.5 text-label"
           disabled={unarchiving}
           onClick={() => void handleUnarchive()}
         >
-          <ArchiveRestore className="h-3.5 w-3.5" />
+          <ArchiveRestore className="size-3.5" />
           Unarchive
         </Button>
         {isRoot ? (
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-2.5 text-label text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={onDeleteRequest}
           >
             Remove from archive
@@ -302,7 +300,7 @@ function ArchivedEntryRow({
             aria-label={`Delete archived workspace "${entry.title}"`}
             onClick={onDeleteRequest}
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="size-3.5" />
           </Button>
         )}
       </div>
@@ -339,7 +337,7 @@ export function ArchiveSection() {
   if (archived.length === 0) {
     return (
       <div className="flex flex-col items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-10 text-center">
-        <Archive className="h-5 w-5 text-muted-foreground/50" />
+        <Archive className="size-5 text-muted-foreground/50" />
         <p className="text-body text-muted-foreground">
           No archived workspaces
         </p>
@@ -355,12 +353,9 @@ export function ArchiveSection() {
     <div className="space-y-8">
       {groups.map((group, idx) => (
         <section key={group.path} className={cn(idx === 0 && "mt-0")}>
-          <p
-            className="mb-3 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55"
-            title={group.path}
-          >
+          <Eyebrow className="mb-3" title={group.path}>
             {group.label}
-          </p>
+          </Eyebrow>
           <div className="space-y-2">
             {group.entries.map((entry) => (
               <ArchivedEntryRow

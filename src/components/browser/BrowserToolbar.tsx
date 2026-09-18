@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
 import { agentBrowserRun } from "@/tauri/commands";
 import { normalizeBrowserUrl, runBrowserNav } from "./browser-nav";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 interface Props {
   browserId: string;
@@ -47,14 +48,14 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
   };
 
   return (
-    <div className="flex h-7 shrink-0 items-center gap-0.5 border-b border-border/50 bg-card px-1">
+    <PanelHeader className="gap-0.5 bg-card px-1">
       <Button
         variant="ghost"
         size="icon-xs"
         aria-label="Back"
         onClick={() => runBrowserNav(cmdId, "back").catch(console.error)}
       >
-        <ArrowLeft className="h-3 w-3" />
+        <ArrowLeft className="size-3" />
       </Button>
       <Button
         variant="ghost"
@@ -62,7 +63,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         aria-label="Forward"
         onClick={() => runBrowserNav(cmdId, "forward").catch(console.error)}
       >
-        <ArrowRight className="h-3 w-3" />
+        <ArrowRight className="size-3" />
       </Button>
       <Button
         variant="ghost"
@@ -71,9 +72,9 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         onClick={() => runBrowserNav(cmdId, "reload").catch(console.error)}
       >
         {navigating || loading ? (
-          <Loader2 className="h-3 w-3 animate-spin" />
+          <Loader2 className="size-3 animate-spin" />
         ) : (
-          <RotateCw className="h-3 w-3" />
+          <RotateCw className="size-3" />
         )}
       </Button>
       <Button
@@ -84,7 +85,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         className={inspectorActive ? "bg-primary/20 text-primary" : ""}
         onClick={onInspectorToggle}
       >
-        <Crosshair className="h-3 w-3" />
+        <Crosshair className="size-3" />
       </Button>
       <Input
         value={urlInput}
@@ -94,6 +95,6 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         placeholder="Enter URL..."
         className="h-6 flex-1 text-label bg-background border-none px-2"
       />
-    </div>
+    </PanelHeader>
   );
 }

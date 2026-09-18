@@ -57,6 +57,7 @@ import type {
   TerminalPreset,
 } from "@/tauri/types";
 import { toast } from "@/lib/toast";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 /** Translate a "drop position N in the pinned-only bar" into the
  *  splice index inside the GLOBAL preset Vec the backend stores.
@@ -387,9 +388,9 @@ function PresetBarImpl({
   const requestNewPreset = useUIStore.getState().requestNewPreset;
 
   return (
-    <div
+    <PanelHeader
       ref={scrollerRef}
-      className="flex items-center h-8 border-b border-border bg-background px-2 gap-0.5 shrink-0 overflow-x-auto"
+      className="bg-background px-2 gap-0.5 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
     >
       {/* Settings gear */}
@@ -412,11 +413,11 @@ function PresetBarImpl({
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onClick={() => requestNewPreset()}>
-            <Plus className="h-4 w-4" />
+            <Plus className="size-4" />
             <span>New Preset</span>
           </DropdownMenuItem>
           <DropdownMenuItem onClick={() => setShowSettings(true, "presets")}>
-            <Settings className="h-4 w-4" />
+            <Settings className="size-4" />
             <span>Manage Presets</span>
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -486,7 +487,7 @@ function PresetBarImpl({
           <RunButton workspaceId={workspaceId} />
         </>
       )}
-    </div>
+    </PanelHeader>
   );
 }
 
@@ -523,7 +524,7 @@ function PresetButton({
       aria-disabled={disabled}
       onClick={onClick}
     >
-      <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+      <PresetIcon icon={preset.icon} className="size-3.5" />
       <span className="truncate max-w-[120px]">{preset.name}</span>
     </Button>
   );

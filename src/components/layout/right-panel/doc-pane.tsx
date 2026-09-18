@@ -88,7 +88,7 @@ export function DocPane({
             onClick={onSearchFiles}
             className="flex h-[31px] shrink-0 items-center gap-[7px] border-b border-border/60 px-2.5 text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground/80"
           >
-            <Search className="size-3" strokeWidth={1.6} aria-hidden />
+            <Search className="size-3" aria-hidden />
             Search files
           </button>
           <div className="min-h-0 flex-1">

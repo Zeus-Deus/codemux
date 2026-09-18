@@ -109,7 +109,7 @@ function RailWorkspaceItem({
             <Pin
               role="img"
               aria-label="Pinned workspace"
-              className="absolute bottom-0.5 left-0.5 size-2.5 rounded-sm bg-sidebar p-px text-muted-foreground"
+              className="absolute bottom-0.5 left-0.5 size-3 rounded-sm bg-sidebar p-px text-muted-foreground"
             />
           )}
           {status && (

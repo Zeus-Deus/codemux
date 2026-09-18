@@ -402,7 +402,6 @@ function CustomHostsEditor() {
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => {
                 setAdding(false);
                 setDraftHost("");
@@ -415,7 +414,6 @@ function CustomHostsEditor() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={handleAdd}
             >
               Add
@@ -428,7 +426,7 @@ function CustomHostsEditor() {
           variant="ghost"
           size="sm"
           onClick={() => setAdding(true)}
-          className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+          className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
         >
           <Plus className="size-3.5" />
           Add self-hosted server

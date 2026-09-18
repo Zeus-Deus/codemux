@@ -67,9 +67,9 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
       ) : (
         <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-surface-3 text-muted-foreground">
           {isImage ? (
-            <ImageIcon className="h-3 w-3" />
+            <ImageIcon className="size-3" />
           ) : (
-            <FileText className="h-3 w-3" />
+            <FileText className="size-3" />
           )}
         </span>
       )}
@@ -80,7 +80,7 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
         className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-foreground"
         onClick={onRemove}
       >
-        <X className="h-2.5 w-2.5" />
+        <X className="size-3" />
       </button>
     </span>
   );

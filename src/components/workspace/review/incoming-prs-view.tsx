@@ -25,6 +25,7 @@ import {
 } from "@/lib/source-control";
 import { cn } from "@/lib/utils";
 import { tzBody, tzEyebrow, tzMeta, tzRowTitle } from "./review-ui";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 // ── Module-level cache ──
 //
@@ -65,11 +66,11 @@ function ChecksIndicator({ status }: { status: string | null }) {
   if (!status) return null;
   switch (status) {
     case "success":
-      return <Check className="h-3 w-3 text-success" />;
+      return <Check className="size-3 text-success" />;
     case "failure":
-      return <X className="h-3 w-3 text-danger" />;
+      return <X className="size-3 text-danger" />;
     case "pending":
-      return <Circle className="h-2.5 w-2.5 fill-warning text-warning" />;
+      return <Circle className="size-3 fill-warning text-warning" />;
     default:
       return null;
   }
@@ -213,11 +214,11 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               size="xs"
               variant="ghost"
               tabIndex={-1}
-              className={cn("h-[22px] px-2 text-muted-foreground hover:text-foreground", tzMeta)}
+              className={cn("text-muted-foreground hover:text-foreground", tzMeta)}
               onClick={handleView}
               title={`View on ${provider.name}`}
             >
-              <ExternalLink className="h-3 w-3 mr-0.5" />
+              <ExternalLink className="size-3 mr-0.5" />
               View
             </Button>
             {pr.head_branch && (
@@ -226,13 +227,13 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
                 variant="ghost"
                 tabIndex={-1}
                 className={cn(
-                  "h-[22px] px-2 text-muted-foreground hover:text-foreground",
+                  "text-muted-foreground hover:text-foreground",
                   tzMeta,
                 )}
                 onClick={handleCheckout}
                 title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
               >
-                <GitBranch className="h-3 w-3 mr-0.5" />
+                <GitBranch className="size-3 mr-0.5" />
                 {existingWs ? "Switch" : "Checkout"}
               </Button>
             )}
@@ -324,7 +325,7 @@ export function IncomingPrsView({
 
   return (
     <div className="flex flex-col">
-      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+      <PanelHeader className="gap-0 pl-2.5 pr-1">
         <span className={cn("font-medium text-muted-foreground tracking-wide truncate", tzBody)}>
           {provider.nounTitleCase}s
         </span>
@@ -333,7 +334,7 @@ export function IncomingPrsView({
             {prs.length}
           </span>
         )}
-      </div>
+      </PanelHeader>
 
       <div className="px-1.5 pt-1.5 pb-3">
         {error && (
@@ -343,7 +344,7 @@ export function IncomingPrsView({
               tzBody,
             )}
           >
-            <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
+            <AlertCircle className="size-3 mt-0.5 shrink-0" />
             <span className="break-words">{error}</span>
           </div>
         )}
@@ -362,7 +363,7 @@ export function IncomingPrsView({
 
         {!loading && !error && prs.length === 0 && (
           <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-            <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
+            <GitPullRequest className="size-7 opacity-25 mb-2" />
             <p className={tzBody}>No open {provider.nounPlural}</p>
           </div>
         )}

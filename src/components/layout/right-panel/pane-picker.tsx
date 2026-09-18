@@ -49,10 +49,7 @@ export function PanePicker({ surfaces }: { surfaces: SurfaceAction[] }) {
                 "hover:border-border hover:bg-surface-2",
               )}
             >
-              <surface.icon
-                className="mb-2 size-[18px] text-foreground/70"
-                strokeWidth={1.5}
-              />
+              <surface.icon className="mb-2 size-[18px] text-foreground/70" />
               <span className="text-body font-medium text-foreground">
                 {surface.label}
               </span>

@@ -376,10 +376,11 @@ describe("DraftChatSurface", () => {
       const header = getByTestId("draft-surface-header");
       expect(header).toBeInTheDocument();
       expect(header.textContent).toContain("Agent Chat");
-      // Height is the shared panel-header contract's business, not this
-      // test's: what matters here is that the band exists and is ruled
-      // off from the transcript below it.
-      expect(header.className).toContain("border-b");
+      // The band is the shared primitive's in-flow variant — same height
+      // and same rule as the materialized pane's header, which is the
+      // whole point of borrowing the silhouette.
+      expect(header).toHaveAttribute("data-slot", "panel-header");
+      expect(header).toHaveAttribute("data-variant", "inline");
     });
 
     it("suppresses the header band in GUI chrome (Agent Chat Beta ON) — the titlebar draft pill covers it", async () => {
