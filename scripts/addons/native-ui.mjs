@@ -277,13 +277,31 @@ try {
           ? `scripts/addons/fixtures/${slug}/${id}-1.0.0.cmxaddon`
           : `examples/addons/${slug}/${id}-1.0.0.cmxaddon`,
       );
-      // One-shot, chooser-only seam. Restore before the real review command.
+      // Tauri defines invoke as non-writable. Intercept only the exact chooser
+      // transport URL, then restore fetch before the real review command. No
+      // addon command, plugin HTTP request, or broker result is intercepted.
       await script(
-        `const original = window.__TAURI_INTERNALS__.invoke; const path = arguments[0]; window.__TAURI_INTERNALS__.invoke = function(command, args, options) { if (command === 'plugin:dialog|open') { window.__TAURI_INTERNALS__.invoke = original; return Promise.resolve(path); } return original(command, args, options); };`,
+        `const original = window.fetch;
+        const path = arguments[0];
+        const chooserUrl = window.__TAURI_INTERNALS__.convertFileSrc('plugin:dialog|open', 'ipc');
+        window.__addonChooserConsumed = false;
+        const selectFixture = function(input, options) {
+          if (input === chooserUrl) {
+            window.fetch = original;
+            window.__addonChooserConsumed = true;
+            return Promise.resolve(new Response(JSON.stringify(path), {
+              status: 200, headers: {'Content-Type': 'application/json', 'Tauri-Response': 'ok'}
+            }));
+          }
+          return original.call(this, input, options);
+        };
+        window.fetch = selectFixture;
+        if (window.fetch !== selectFixture) throw Error('Chooser fixture could not be installed');`,
         path,
       );
       await clickText("Import package");
       await hasText(`Review ${title}`);
+      assert.equal(await script("return window.__addonChooserConsumed"), true);
       await hasText("SHA-256");
       await capture(`review-${slug}`);
       await clickText("Accept and install");
@@ -470,7 +488,7 @@ try {
 } catch (error) {
   evidence.status = "failed";
   evidence.error = String(error);
-  if (session) await capture("failure").catch(() => {});
+  if (session) await capture("failure").catch((error) => { evidence.captureError = String(error); });
   throw error;
 } finally {
   if (session) await wd("DELETE", "").catch(() => {});
