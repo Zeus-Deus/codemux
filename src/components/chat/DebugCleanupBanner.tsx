@@ -25,7 +25,7 @@ export function DebugCleanupBanner({ onCleanup, busy = false }: Props) {
       <div
         className={cn(
           CHAT_COLUMN_INNER,
-          "flex items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-xs"
+          "flex items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-label"
         )}
       >
         <Bug className="size-3.5 text-danger" aria-hidden />
@@ -33,7 +33,7 @@ export function DebugCleanupBanner({ onCleanup, busy = false }: Props) {
         <Button
           size="sm"
           variant="outline"
-          className="ml-auto h-6 text-xs"
+          className="ml-auto h-6 text-label"
           onClick={onCleanup}
           disabled={busy}
         >

@@ -156,10 +156,10 @@ export function SkillsSection({ projectRoot }: Props) {
     <div>
       <div className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-base font-semibold tracking-tight">Skills</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <h2 className="text-body-lg font-semibold tracking-tight">Skills</h2>
+          <p className="mt-1 text-body text-muted-foreground">
             Skills are reusable instruction sets you can select with{" "}
-            <code className="font-mono text-xs">/skill-name</code>. Discovered
+            <code className="font-mono text-label">/skill-name</code>. Discovered
             from your installed providers (Claude, Codex, OpenCode) and
             Codemux's own skills folder. Provider-native automatic discovery
             remains controlled by each provider.
@@ -182,10 +182,10 @@ export function SkillsSection({ projectRoot }: Props) {
 
       <div className="mb-4 flex items-center justify-between rounded-md border border-border/50 p-3">
         <div className="min-w-0 flex-1">
-          <Label htmlFor="include-plugins" className="text-sm font-medium">
+          <Label htmlFor="include-plugins" className="text-body font-medium">
             Include plugin-bundled skills
           </Label>
-          <p className="mt-0.5 text-xs text-muted-foreground">
+          <p className="mt-0.5 text-label text-muted-foreground">
             Plugin skills come from{" "}
             <code className="font-mono text-label">~/.claude/plugins/</code>,
             including marketplace and external installs.
@@ -199,7 +199,7 @@ export function SkillsSection({ projectRoot }: Props) {
         />
       </div>
 
-      <p className="mb-4 text-xs text-muted-foreground">
+      <p className="mb-4 text-label text-muted-foreground">
         Each row controls whether the skill is available in Codemux. Turning it
         off does not change provider configuration, so its native provider may
         still discover or invoke it automatically.
@@ -208,14 +208,14 @@ export function SkillsSection({ projectRoot }: Props) {
       {error && (
         <p
           data-testid="skills-error"
-          className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive"
         >
           Failed to load skills: {error}
         </p>
       )}
 
       {adapterErrors.length > 0 && (
-        <div className="mb-4 rounded-md border border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <div className="mb-4 rounded-md border border-border/50 bg-muted/30 px-3 py-2 text-label text-muted-foreground">
           Some provider catalogs could not be refreshed. Readable filesystem
           skills are still available.
           <ul className="mt-1 list-inside list-disc">
@@ -231,7 +231,7 @@ export function SkillsSection({ projectRoot }: Props) {
       {loading && !loaded ? (
         <div
           data-testid="skills-loading"
-          className="flex items-center gap-2 py-6 text-sm text-muted-foreground"
+          className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
           Loading skills…
@@ -239,11 +239,11 @@ export function SkillsSection({ projectRoot }: Props) {
       ) : skills.length === 0 && !error ? (
         <p
           data-testid="skills-empty"
-          className="py-6 text-center text-sm text-muted-foreground"
+          className="py-6 text-center text-body text-muted-foreground"
         >
           No skills found. Skills live in{" "}
-          <code className="font-mono text-xs">~/.claude/skills/</code>,{" "}
-          <code className="font-mono text-xs">~/.codex/skills/</code>, and the
+          <code className="font-mono text-label">~/.claude/skills/</code>,{" "}
+          <code className="font-mono text-label">~/.codex/skills/</code>, and the
           per-project equivalents.
         </p>
       ) : (
@@ -295,14 +295,14 @@ function ConflictsSection({
   return (
     <section data-testid="skills-conflicts">
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-status-working dark:text-status-working">
+        <h3 className="text-label font-semibold uppercase tracking-wider text-status-working dark:text-status-working">
           Naming conflicts
         </h3>
         <span className="text-caption text-muted-foreground/70">
           {entries.length} name{entries.length === 1 ? "" : "s"} clashing
         </span>
       </header>
-      <p className="mb-3 text-xs text-muted-foreground">
+      <p className="mb-3 text-label text-muted-foreground">
         These skill names appear in more than one source. Codemux gives each
         definition an exact qualified command.
       </p>
@@ -313,7 +313,7 @@ function ConflictsSection({
             className="rounded-md border border-status-working/30 bg-status-working/5 p-2"
             data-testid={`conflict-group-${name}`}
           >
-            <div className="mb-1.5 px-1 text-xs font-mono text-foreground">
+            <div className="mb-1.5 px-1 text-label font-mono text-foreground">
               /{name}{" "}
               <span className="text-muted-foreground">
                 ({skills.length} sources)
@@ -353,7 +353,7 @@ function ConflictRow({
   // inline (no hover required) since that's the whole point here.
   return (
     <div className="group flex items-center gap-3 px-2 py-1.5">
-      <span className="flex-1 truncate text-xs">
+      <span className="flex-1 truncate text-label">
         <span className="font-mono text-foreground">
           {skillTokenFor(skill, conflictSkills)}
         </span>
@@ -370,7 +370,7 @@ function ConflictRow({
         <button
           type="button"
           onClick={onView}
-          className="rounded px-2 py-0.5 text-xs hover:bg-foreground/10"
+          className="rounded-sm px-2 py-0.5 text-label hover:bg-surface-2"
         >
           View
         </button>
@@ -378,7 +378,7 @@ function ConflictRow({
           type="button"
           onClick={onOpenFile}
           aria-label={`Open ${skill.name} in editor`}
-          className="rounded px-1 py-0.5 hover:bg-foreground/10"
+          className="rounded-sm px-1 py-0.5 hover:bg-surface-2"
         >
           ↗
         </button>
@@ -405,7 +405,7 @@ function SkillsGroupSection({
   return (
     <section>
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
           {heading}
         </h3>
         <span className="text-caption text-muted-foreground/70">

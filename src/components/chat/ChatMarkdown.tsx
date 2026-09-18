@@ -99,7 +99,7 @@ const proseClasses = [
   // don't feel like a doc page.
   "prose-p:my-2 prose-p:leading-relaxed",
   "prose-headings:mt-4 prose-headings:mb-2 prose-headings:leading-snug",
-  "prose-h1:text-[1.05em] prose-h2:text-[1.05em] prose-h3:text-base prose-h4:text-base",
+  "prose-h1:text-[1.05em] prose-h2:text-[1.05em] prose-h3:text-body-lg prose-h4:text-body-lg",
   "prose-ul:my-2 prose-ol:my-2",
   "prose-li:my-0.5 prose-li:leading-relaxed",
   // List markers — padding-left keeps markers inside the list box

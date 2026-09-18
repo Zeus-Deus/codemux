@@ -1121,6 +1121,9 @@ export interface WorkspaceSnapshot {
    *  means "no PRs found" — or, for a snapshot persisted before the field
    *  existed, "read the scalars instead"; `workspacePrs()` handles both. */
   prs?: WorkspacePrRef[];
+  /** Branch this worktree was created from. `null` / absent for checkouts
+   *  of an existing branch and for workspaces created before the field. */
+  base_branch?: string | null;
   /** Which hosting product this checkout's remotes point at — `"github"`,
    *  `"gitlab"`, `"bitbucket"`, `"azure_devops"`. `null` when there is no
    *  remote or the host isn't recognised.

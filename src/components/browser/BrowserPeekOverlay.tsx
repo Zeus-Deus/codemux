@@ -134,7 +134,7 @@ export function BrowserPeekOverlay() {
       aria-label="Background browser preview"
       className={cn(
         "absolute right-3.5 top-3.5 z-30 flex h-[300px] w-[440px] flex-col overflow-hidden",
-        "rounded-xl border border-border bg-popover shadow-2xl",
+        "rounded-lg border border-border bg-popover shadow-2xl",
         "animate-in fade-in slide-in-from-top-1 duration-150 ease-out",
       )}
     >
@@ -152,7 +152,7 @@ export function BrowserPeekOverlay() {
               type="button"
               onClick={handlePromote}
               aria-label="Open in side panel"
-              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.09] hover:text-foreground"
+              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
               <ExternalLink className="h-3.5 w-3.5" aria-hidden />
             </button>
@@ -165,7 +165,7 @@ export function BrowserPeekOverlay() {
           type="button"
           onClick={() => close(activeWorkspaceId)}
           aria-label="Close preview"
-          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.09] hover:text-foreground"
+          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
         >
           <X className="h-3.5 w-3.5" aria-hidden />
         </button>

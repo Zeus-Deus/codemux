@@ -113,7 +113,7 @@ export function LaunchReasoningPicker({
       onSelect={() => onPick(opt.value)}
       className="h-9 gap-2 py-2"
     >
-      <span className="flex-1 min-w-0 truncate text-xs text-foreground">
+      <span className="flex-1 min-w-0 truncate text-label text-foreground">
         {opt.label}
       </span>
       <Check

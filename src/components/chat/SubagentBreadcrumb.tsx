@@ -42,7 +42,7 @@ export function SubagentBreadcrumb({
       <button
         type="button"
         onClick={onBack}
-        className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-[7px] px-2 text-body-sm font-semibold text-muted-foreground hover:bg-foreground/[0.08] hover:text-foreground"
+        className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-md px-2 text-body-sm font-semibold text-muted-foreground hover:bg-surface-2 hover:text-foreground"
       >
         <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
         Orchestrator
@@ -64,7 +64,7 @@ export function SubagentBreadcrumb({
         <span className="truncate">{name}</span>
       </span>
       {subagent.model && (
-        <span className="shrink-0 rounded-[5px] bg-foreground/[0.07] px-1.5 py-0.5 font-mono text-label text-muted-foreground">
+        <span className="shrink-0 rounded-sm bg-surface-2 px-1.5 py-0.5 font-mono text-label text-muted-foreground">
           {subagent.model}
         </span>
       )}

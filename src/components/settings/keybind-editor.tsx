@@ -331,7 +331,7 @@ function KeybindRow({
         {entry.isCustom && !isRecording && (
           <button
             onClick={onReset}
-            className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity p-1 rounded hover:bg-muted/60"
+            className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity p-1 rounded-sm hover:bg-muted/60"
             title="Reset to default"
           >
             <RotateCcw className="h-3 w-3" />

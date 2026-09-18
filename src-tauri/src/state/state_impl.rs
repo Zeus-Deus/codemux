@@ -570,6 +570,12 @@ pub struct WorkspaceSnapshot {
     /// the scalars.
     #[serde(default)]
     pub prs: Vec<WorkspacePr>,
+    /// Branch this worktree was created from (the explicit base, or the
+    /// repo's checked-out branch when none was given). Recorded once at
+    /// create time; `None` for checkouts of an existing branch and for
+    /// workspaces created before this field existed. Additive.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// Which hosting product this checkout's remotes point at
     /// (`"github"`, `"gitlab"`, …), as classified by
     /// `crate::git_provider::detect_provider`. `None` means no remote,
@@ -1581,6 +1587,7 @@ impl AppStateStore {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
@@ -1666,6 +1673,7 @@ impl AppStateStore {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
@@ -1742,6 +1750,7 @@ impl AppStateStore {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
@@ -1849,6 +1858,7 @@ impl AppStateStore {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
@@ -1998,6 +2008,7 @@ impl AppStateStore {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,
@@ -2696,6 +2707,19 @@ impl AppStateStore {
         workspace.pr_url = pr_url;
         workspace.pr_head_branch = pr_head_branch;
         true
+    }
+
+    /// Record the branch a worktree workspace was created from. Set once at
+    /// create time; callers emit app state themselves.
+    pub fn set_workspace_base_branch(&self, workspace_id: &str, base_branch: Option<String>) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.base_branch = base_branch;
+        }
     }
 
     /// Stamp the detected hosting product on a workspace. Kept separate
@@ -5685,6 +5709,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

@@ -301,8 +301,9 @@ describe("SidebarRailWorkspaces", () => {
       b.getAttribute("data-rail-ws"),
     );
     expect(ids).toEqual(["ws-3", "ws-1"]);
-    expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
   });
 
@@ -338,8 +339,9 @@ describe("SidebarRailWorkspaces", () => {
 
     const active = container.querySelector('[data-rail-ws="ws-2"]')!;
     const inactive = container.querySelector('[data-rail-ws="ws-1"]')!;
-    expect(active).toHaveClass("border-border", "bg-foreground/[0.09]");
-    expect(inactive).not.toHaveClass("bg-foreground/[0.09]");
+    expect(active).toHaveAttribute("data-active", "true");
+    expect(active).toHaveClass("border-border");
+    expect(inactive).not.toHaveAttribute("data-active");
     // Selection is neutral now — no ember on any rail button.
     for (const btn of container.querySelectorAll("[data-rail-ws]")) {
       expect(btn.className).not.toMatch(/accent-ember/);
@@ -357,12 +359,13 @@ describe("SidebarRailWorkspaces", () => {
     pendingActiveWorkspaceId = "ws-2";
     const { container } = await renderRail();
 
-    expect(container.querySelector('[data-rail-ws="ws-2"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-2"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
     expect(
       container.querySelector('[data-rail-ws="ws-1"]'),
-    ).not.toHaveClass("bg-foreground/[0.09]");
+    ).not.toHaveAttribute("data-active");
   });
 
   it("keeps the snapshot's selection when the pending workspace is unknown", async () => {
@@ -372,8 +375,9 @@ describe("SidebarRailWorkspaces", () => {
     pendingActiveWorkspaceId = "ws-brand-new";
     const { container } = await renderRail();
 
-    expect(container.querySelector('[data-rail-ws="ws-1"]')).toHaveClass(
-      "bg-foreground/[0.09]",
+    expect(container.querySelector('[data-rail-ws="ws-1"]')).toHaveAttribute(
+      "data-active",
+      "true",
     );
   });
 

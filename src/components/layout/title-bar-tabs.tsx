@@ -73,7 +73,7 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
 // the band-wide control token, shared with the panel toggle and the 28px
 // icon buttons.
 const PILL_BASE = cn(
-  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-xs transition-colors",
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-label transition-colors",
   BAND_CONTROL_RADIUS,
 );
 const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");

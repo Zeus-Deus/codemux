@@ -1142,7 +1142,7 @@ export function RemoteAccessSection() {
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1 space-y-1.5">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-medium">Enable remote access</h3>
+              <h3 className="text-body font-medium">Enable remote access</h3>
               {running && (
                 <Badge
                   variant="outline"
@@ -1153,7 +1153,7 @@ export function RemoteAccessSection() {
                 </Badge>
               )}
             </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
+            <p className="text-label leading-relaxed text-muted-foreground">
               Turning this on starts a server that listens on{" "}
               <span className="font-medium text-foreground">
                 every network interface
@@ -1227,7 +1227,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
+                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",

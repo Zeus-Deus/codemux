@@ -44,9 +44,9 @@ export function PanePicker({ surfaces }: { surfaces: SurfaceAction[] }) {
               data-testid={`right-panel-picker-${surface.id}`}
               onClick={surface.onOpen}
               className={cn(
-                "flex w-full flex-col items-start rounded-xl border border-border/70 bg-card p-3 text-left",
+                "flex w-full flex-col items-start rounded-lg border border-border/70 bg-card p-3 text-left",
                 "transition-colors duration-[120ms]",
-                "hover:border-border hover:bg-foreground/5",
+                "hover:border-border hover:bg-surface-2",
               )}
             >
               <surface.icon

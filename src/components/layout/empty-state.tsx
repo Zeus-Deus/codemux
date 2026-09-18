@@ -27,26 +27,26 @@ export function EmptyState() {
         <button
           type="button"
           onClick={() => openProject()}
-          className="w-[400px] rounded-xl border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-colors hover:border-foreground/30 hover:bg-card"
+          className="w-[400px] rounded-lg border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-colors hover:border-foreground/30 hover:bg-card"
         >
           <FolderOpen className="h-8 w-8 mx-auto mb-3 text-muted-foreground" />
-          <div className="text-sm font-medium text-foreground">
+          <div className="text-body font-medium text-foreground">
             Open Project
           </div>
-          <div className="text-xs text-muted-foreground mt-1">
+          <div className="text-label text-muted-foreground mt-1">
             Open a local folder with your code
           </div>
         </button>
 
         {/* New project link */}
         <div className="mt-6 flex flex-col items-center gap-2">
-          <span className="text-xs text-muted-foreground/60">
+          <span className="text-label text-muted-foreground/60">
             Or start a new project
           </span>
           <Button
             variant="ghost"
             size="sm"
-            className="text-xs text-muted-foreground hover:text-foreground"
+            className="text-label text-muted-foreground hover:text-foreground"
             onClick={() => setShowNewProjectScreen(true)}
           >
             <Plus className="h-3.5 w-3.5 mr-1" />

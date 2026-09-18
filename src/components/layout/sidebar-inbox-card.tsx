@@ -519,7 +519,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 selectAndActivate();
               }}
               className={cn(
-                "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
+                "group/card relative mb-1.5 cursor-pointer rounded-lg border px-[11px] pt-[9px] pb-[10px]",
                 // select-none: a shift-click range gesture would otherwise
                 // drag a text highlight across every card it spans.
                 "select-none outline-none duration-150",
@@ -529,10 +529,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 // the rise-in keyframe — with nothing here to fight it.
                 "transition-[color,background-color,border-color]",
                 isActive
-                  ? "border-border bg-foreground/[0.09]"
+                  ? "border-border bg-surface-3"
                   : isNeeds
-                    ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
-                    : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
+                    ? "border-status-attention/30 bg-transparent hover:bg-surface-2"
+                    : "border-transparent bg-transparent hover:bg-surface-2 focus-visible:border-border",
                 // Multi-select layers a ring over whatever the card already
                 // is, so "checked for a bulk action" never has to compete with
                 // "this is the workspace you're looking at" for the same
@@ -686,7 +686,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       {snoozePresets.map((preset) => (
                         <DropdownMenuItem
                           key={preset.id}
-                          className="gap-4 text-xs"
+                          className="gap-4 text-label"
                           onSelect={() =>
                             onSnooze(workspace.workspace_id, preset.at)
                           }
@@ -735,7 +735,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   <kbd
                     aria-hidden="true"
                     className={cn(
-                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-[5px] px-1",
+                      "inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-sm px-1",
                       "border border-border/80 bg-background/80 font-mono text-caption font-semibold leading-none tabular-nums text-foreground/80",
                       "shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--foreground)_8%,transparent)]",
                       "animate-in fade-in-0 zoom-in-95 duration-100 motion-reduce:animate-none",
@@ -867,7 +867,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                     disabled={!primaryPr?.url}
                     aria-label={prSetLabel(scProvider, prs, prSummary, prState)}
                     className={cn(
-                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-caption font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded-sm px-1 py-px font-mono text-caption font-medium",
                       "transition-colors duration-150",
                       visuallyReceded
                         ? cn(
@@ -876,7 +876,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                           )
                         : prStatusTextClass(prState),
                       primaryPr?.url
-                        ? "hover:bg-foreground/[0.055]"
+                        ? "hover:bg-surface-2"
                         : // `cursor-default`, not `pointer-events-none`: the
                           // chip is already `disabled`, so it swallows the
                           // click. Letting pointer events pass through instead
@@ -966,7 +966,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   {workspace.notification_count > 0 && (
                     <span
                       className={cn(
-                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-caption font-bold text-muted-foreground",
+                        "flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-surface-3 px-1 text-caption font-bold text-muted-foreground",
                         "transition-opacity duration-150",
                         visuallyReceded &&
                           "opacity-70 group-hover/card:opacity-100 group-focus-within/card:opacity-100",

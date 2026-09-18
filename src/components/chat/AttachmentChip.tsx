@@ -28,8 +28,22 @@ import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { utilitySummaryFallbackLabel } from "@/lib/agent-chat/session-handoff";
 import type { Attachment, AttachmentKind } from "@/stores/agent-chat-store";
 
+/** The named tint a chip wears. The name is the contract — the classes
+ *  are the current expression of it — so a chip's identity survives a
+ *  token migration and is assertable without reading a class string. */
+type ChipTint =
+  | "neutral"
+  | "muted"
+  | "warning"
+  | "primary"
+  | "accent"
+  | "merged"
+  | "destructive";
+
 interface KindConfig {
   icon: LucideIcon;
+  /** Named tint, surfaced on the chip as `data-tint`. */
+  tint: ChipTint;
   /** Tailwind classes — bg + text. 15% opacity fill matches ModePill
    *  per the chat-ui chip token. Note: chat-ui skill technically
    *  reserves accent for the app shell only, but ModePill set the
@@ -43,26 +57,32 @@ interface KindConfig {
 const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
   file: {
     icon: FileIcon,
-    className: "bg-foreground/10 text-foreground border-border/60",
+    tint: "neutral",
+    className: "bg-surface-3 text-foreground border-border/60",
   },
   folder: {
     icon: FolderOpen,
-    className: "bg-foreground/10 text-foreground border-border/60",
+    tint: "neutral",
+    className: "bg-surface-3 text-foreground border-border/60",
   },
   issue: {
     icon: CircleDot,
+    tint: "warning",
     className: "bg-warning/15 text-warning border-warning/25",
   },
   pr: {
     icon: GitPullRequest,
+    tint: "primary",
     className: "bg-primary/15 text-primary border-primary/25",
   },
   image: {
     icon: ImageIcon,
+    tint: "accent",
     className: "bg-accent/15 text-accent-foreground border-accent/30",
   },
   session: {
     icon: MessagesSquare,
+    tint: "primary",
     className: "bg-primary/10 text-primary border-primary/20",
   },
 };
@@ -73,28 +93,47 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
  *  billboard. Merged PRs get a one-off purple fallback so a merged
  *  ref is still visually distinct from a closed/draft one — matches
  *  the picker's GitMerge tint. */
-function classNameForAttachment(attachment: Attachment): string {
+function tintForAttachment(attachment: Attachment): {
+  tint: ChipTint;
+  className: string;
+} {
   const state = attachment.metadata.state;
   if (
     attachment.kind === "session" &&
     attachment.metadata.handoffKind === "direct"
   ) {
     return attachment.metadata.summaryError === "utility_model_required"
-      ? "bg-warning/10 text-warning border-warning/25"
-      : "bg-muted/70 text-muted-foreground border-border/70";
+      ? {
+          tint: "warning",
+          className: "bg-warning/10 text-warning border-warning/25",
+        }
+      : {
+          tint: "muted",
+          className: "bg-muted/70 text-muted-foreground border-border/70",
+        };
   }
   if (attachment.kind === "issue" && state === "closed") {
-    return "bg-foreground/10 text-muted-foreground border-border/60";
+    return {
+      tint: "neutral",
+      className: "bg-surface-3 text-muted-foreground border-border/60",
+    };
   }
   if (attachment.kind === "pr") {
     if (state === "merged") {
-      return "bg-chart-4/15 text-chart-4 border-chart-4/25";
+      return {
+        tint: "merged",
+        className: "bg-chart-4/15 text-chart-4 border-chart-4/25",
+      };
     }
     if (state === "closed" || state === "draft") {
-      return "bg-foreground/10 text-muted-foreground border-border/60";
+      return {
+        tint: "neutral",
+        className: "bg-surface-3 text-muted-foreground border-border/60",
+      };
     }
   }
-  return KIND_CONFIG[attachment.kind].className;
+  const config = KIND_CONFIG[attachment.kind];
+  return { tint: config.tint, className: config.className };
 }
 
 /** Step 8 Stage 7 — rough token estimate for the tooltip preview.
@@ -228,6 +267,8 @@ export function AttachmentChip({
   const showPreview =
     previewUrl !== null && !previewFailed && !metadata.isLoading;
 
+  const { tint, className: tintClassName } = tintForAttachment(attachment);
+
   const chip = (
     <div
       className={cn(
@@ -235,7 +276,7 @@ export function AttachmentChip({
         // each staged ref the card look the design applies to the
         // green issue chip; the per-kind tint below sets both fill and
         // border colour.
-        "inline-flex items-center border text-xs",
+        "inline-flex items-center border text-label",
         // With a thumbnail the chip drops the full pill radius and insets
         // the preview by 3px — a rounded rect reads as "this is a
         // picture", and a 22px-tall thumbnail inside a pill would poke
@@ -243,11 +284,12 @@ export function AttachmentChip({
         showPreview
           ? "gap-2 rounded-md py-[3px] pl-[3px] pr-2"
           : "gap-1.5 rounded-full px-2.5 py-1",
-        classNameForAttachment(attachment),
+        tintClassName,
       )}
       role="status"
       aria-label={`${attachment.kind} attachment: ${metadata.label}`}
       data-attachment-kind={attachment.kind}
+      data-tint={tint}
       data-truncated={isTruncatedFile || undefined}
       data-expanded={expandActive || undefined}
       data-preview={showPreview || undefined}
@@ -272,14 +314,14 @@ export function AttachmentChip({
           aria-label={`Expand ${metadata.label}`}
           title="Click to expand"
           data-testid="attachment-chip-preview-trigger"
-          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-[3px] outline-none focus-visible:ring-1 focus-visible:ring-current"
+          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-current"
         >
           <img
             src={previewUrl}
             alt=""
             aria-hidden
             data-testid="attachment-chip-thumbnail"
-            className="h-[22px] w-[30px] shrink-0 rounded-[3px] border border-foreground/10 object-cover"
+            className="h-[22px] w-[30px] shrink-0 rounded-sm border border-hairline-strong object-cover"
             onError={() => setPreviewFailed(true)}
           />
           <span className="truncate max-w-[200px]">{metadata.label}</span>
@@ -331,8 +373,8 @@ export function AttachmentChip({
             onToggleExpand?.(attachment.id);
           }}
           className={cn(
-            "ml-0.5 rounded p-0.5 hover:bg-foreground/10",
-            expandActive && "bg-foreground/10",
+            "ml-0.5 rounded-sm p-0.5 hover:bg-surface-2",
+            expandActive && "bg-surface-3",
           )}
           aria-label={expandTooltip}
           aria-pressed={expandActive}
@@ -348,7 +390,7 @@ export function AttachmentChip({
           e.stopPropagation();
           onRemove(attachment.id);
         }}
-        className="ml-0.5 rounded p-0.5 hover:bg-foreground/10"
+        className="ml-0.5 rounded-sm p-0.5 hover:bg-surface-2"
         aria-label={`Remove ${metadata.label}`}
       >
         <X className="h-2.5 w-2.5" />
@@ -391,7 +433,7 @@ export function AttachmentChip({
               alt=""
               aria-hidden
               data-testid="attachment-chip-tooltip-preview"
-              className="mb-1 max-h-[180px] max-w-[260px] rounded border border-foreground/10 object-contain"
+              className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-hairline-strong object-contain"
             />
           )}
           <div className="font-mono text-label truncate max-w-[260px]">

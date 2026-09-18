@@ -3,6 +3,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 
+import { geometryFingerprint } from "@/lib/geometry-fingerprint";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("./pickers/MultiProviderModelPicker", () => ({
@@ -98,18 +99,15 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(btn).toBeInTheDocument();
   });
 
-  it("the + button matches the Send button shape (34px circle)", () => {
+  it("the + button matches the Send button shape", () => {
     renderFooter({ onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");
     const send = screen.getByRole("button", { name: "Send" });
-    // Both share the same fixed circle dimensions; identical shape
-    // is what makes them read as a visual pair.
-    expect(attach.className).toContain("h-[34px]");
-    expect(attach.className).toContain("w-[34px]");
+    // Both share the same circle; identical shape is what makes them read
+    // as a visual pair. The pairing is the contract — not the diameter.
+    expect(geometryFingerprint(attach)).toBe(geometryFingerprint(send));
+    expect(geometryFingerprint(attach)).not.toBe("");
     expect(attach.className).toContain("rounded-full");
-    expect(send.className).toContain("h-[34px]");
-    expect(send.className).toContain("w-[34px]");
-    expect(send.className).toContain("rounded-full");
   });
 
   it("pins attach left and the session controls + send right, around a flexible gap", () => {
@@ -118,7 +116,6 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     const gap = screen.getByTestId("composer-gap");
     const attach = screen.getByTestId("composer-attach-button");
     const send = screen.getByRole("button", { name: "Send" });
-    expect(row.className).toContain("h-[42px]");
     expect(gap.className).toContain("flex-1");
     expect(gap).toHaveTextContent("gap text");
     expect(row.firstElementChild).toBe(attach);
@@ -317,8 +314,8 @@ describe("ComposerFooter — context-window meter", () => {
   it("matches the send button's circle shape", () => {
     renderFooter({ contextUsage: { used_tokens: 1_000, max_tokens: 200_000 } });
     const meter = screen.getByTestId("context-usage-trigger");
-    expect(meter.className).toContain("h-[34px]");
-    expect(meter.className).toContain("w-[34px]");
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(geometryFingerprint(meter)).toBe(geometryFingerprint(send));
     expect(meter.className).toContain("rounded-full");
   });
 

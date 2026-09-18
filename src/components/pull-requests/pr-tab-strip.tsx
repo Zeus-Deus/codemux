@@ -77,7 +77,7 @@ export function PrTabStrip({
               }
             }}
             className={cn(
-              "group flex h-[25px] shrink-0 cursor-default items-center gap-1.5 rounded-[5px] px-2.5",
+              "group flex h-[25px] shrink-0 cursor-default items-center gap-1.5 rounded-sm px-2.5",
               active ? "bg-card" : "hover:bg-muted/40",
             )}
             onClick={() => onSelect(row)}
@@ -120,7 +120,7 @@ export function PrTabStrip({
             type="button"
             aria-label="Open another pull request"
             data-testid="pr-tab-add"
-            className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
           >
             <Plus className="size-3" />
           </button>
@@ -181,7 +181,7 @@ export function PrTabStrip({
         aria-label="Open in browser"
         data-testid="pr-tab-open-browser"
         onClick={onOpenInBrowser}
-        className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+        className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
       >
         <ExternalLink className="size-3" />
       </button>

@@ -96,7 +96,7 @@ function AnchorPill({ path, line }: { path: string | null; line: number | null }
   return (
     <span
       className={cn(
-        "font-mono bg-muted px-1.5 py-px rounded text-muted-foreground truncate",
+        "font-mono bg-muted px-1.5 py-px rounded-sm text-muted-foreground truncate",
         tzMeta,
       )}
     >
@@ -265,7 +265,7 @@ function ResolveButton({
   return (
     <button
       type="button"
-      className={cn(btnCard, "h-6 rounded px-2", tzMeta)}
+      className={cn(btnCard, "h-6 rounded-sm px-2", tzMeta)}
       data-testid={`thread-resolve-${thread.id}`}
       onClick={onToggle}
     >

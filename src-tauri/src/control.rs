@@ -2067,6 +2067,7 @@ mod tests {
             pr_url: None,
             pr_head_branch: None,
             prs: Vec::new(),
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

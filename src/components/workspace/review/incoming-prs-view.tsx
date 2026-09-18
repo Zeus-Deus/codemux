@@ -339,7 +339,7 @@ export function IncomingPrsView({
         {error && (
           <div
             className={cn(
-              "mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2.5 py-2 text-danger",
+              "mx-1.5 mb-2 flex items-start gap-1.5 rounded-sm bg-danger/10 px-2.5 py-2 text-danger",
               tzBody,
             )}
           >
@@ -352,9 +352,9 @@ export function IncomingPrsView({
           <div className="flex flex-col gap-2 px-2 py-2">
             {[1, 2, 3].map((i) => (
               <div key={i} className="animate-pulse flex gap-2">
-                <div className="h-3 w-6 bg-muted rounded" />
-                <div className="h-3 flex-1 bg-muted rounded" />
-                <div className="h-3 w-12 bg-muted rounded" />
+                <div className="h-3 w-6 bg-muted rounded-sm" />
+                <div className="h-3 flex-1 bg-muted rounded-sm" />
+                <div className="h-3 w-12 bg-muted rounded-sm" />
               </div>
             ))}
           </div>

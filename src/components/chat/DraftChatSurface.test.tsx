@@ -376,7 +376,9 @@ describe("DraftChatSurface", () => {
       const header = getByTestId("draft-surface-header");
       expect(header).toBeInTheDocument();
       expect(header.textContent).toContain("Agent Chat");
-      expect(header.className).toContain("h-7");
+      // Height is the shared panel-header contract's business, not this
+      // test's: what matters here is that the band exists and is ruled
+      // off from the transcript below it.
       expect(header.className).toContain("border-b");
     });
 
@@ -449,7 +451,7 @@ describe("DraftChatSurface", () => {
       const chip = getByTestId("composer-attachment-token-Composer.tsx");
       expect(chip).toBeInTheDocument();
       expect(chip.textContent).toBe("@Composer.tsx");
-      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip).toHaveAttribute("data-tint", "neutral");
     });
 
     it("the inline mirror chip vanishes when the file token is removed from the draft text", () => {

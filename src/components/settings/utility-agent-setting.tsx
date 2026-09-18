@@ -65,7 +65,7 @@ export function UtilityAgentSetting() {
         value={mode}
         onValueChange={(value) => setMode(value as UtilityAgentMode)}
       >
-        <SelectTrigger className="h-9 w-[104px] bg-muted/35 text-xs">
+        <SelectTrigger className="h-9 w-[104px] bg-muted/35 text-label">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>

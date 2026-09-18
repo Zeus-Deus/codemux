@@ -139,7 +139,7 @@ export function ModelPicker({
                     onChange(model.id);
                     setOpen(false);
                   }}
-                  className="min-h-9 gap-2 text-xs"
+                  className="min-h-9 gap-2 text-label"
                 >
                   <ProviderLogo
                     provider={provider}
