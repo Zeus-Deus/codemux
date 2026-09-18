@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { cpus, totalmem, release } from "node:os";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -25,7 +26,14 @@ await mkdir(evidenceDir, { recursive: true });
 const evidence = {
   commit: process.env.GITHUB_SHA,
   platform: process.platform,
+  hardware: {
+    osRelease: release(),
+    cpu: cpus()[0]?.model,
+    logicalCpus: cpus().length,
+    memoryBytes: totalmem(),
+  },
   checks: [],
+  failedChecks: [],
   seams: [
     "Synthetic loopback account API; no real account or credentials",
     "Native file chooser selection supplies package fixture path; all addon IPC remains native",
@@ -68,6 +76,7 @@ async function run(executable, args, options = {}) {
   try {
     const result = await child.done;
     assert.equal(result.code, 0, `${executable}: ${result.output}`);
+    return result.output;
   } finally {
     clearTimeout(timer);
   }
@@ -230,6 +239,48 @@ async function typeComposer(value) {
     ),
   );
 }
+async function pluginHostCount() {
+  // Read-only inventory on the disposable job VM, including orphaned hosts.
+  if (process.platform === "win32") {
+    return Number(
+      (
+        await run("powershell.exe", [
+          "-NoProfile",
+          "-Command",
+          "@(Get-Process | Where-Object { $_.ProcessName -like 'codemux-addon-host*' }).Count",
+        ])
+      ).trim(),
+    );
+  }
+  return (await run("ps", ["-eo", "comm="]))
+    .split("\n")
+    .filter((name) => name.trim().startsWith("codemux-addon-h")).length;
+}
+let terminalProbe = 0;
+async function checkCoreTerminal() {
+  const marker = `CODEMUX_CORE_${++terminalProbe}`;
+  await wd("DELETE", "/actions");
+  await click(".xterm-screen");
+  await type("textarea.xterm-helper-textarea", `echo ${marker}`);
+  await wd("POST", "/actions", {
+    actions: [
+      {
+        type: "key",
+        id: "keyboard",
+        actions: [
+          { type: "keyDown", value: "\uE007" },
+          { type: "keyUp", value: "\uE007" },
+        ],
+      },
+    ],
+  });
+  await until("native terminal command returned", () =>
+    script(
+      `return [...document.querySelectorAll('.xterm')].some(e => e.innerText.replace(/\\s+/g, '').split(arguments[0]).length >= 3)`,
+      marker,
+    ),
+  );
+}
 async function shortcut(key) {
   await wd("POST", "/actions", {
     actions: [
@@ -259,11 +310,17 @@ async function capture(name) {
     );
   }
 }
-async function step(name, fn) {
+async function step(name, fn, continueAfterFailure = false) {
   console.log(`Native UI: ${name}`);
-  await fn();
-  evidence.checks.push(name);
-  await capture(name);
+  try {
+    await fn();
+    evidence.checks.push(name);
+    await capture(name);
+  } catch (error) {
+    if (!continueAfterFailure) throw error;
+    evidence.failedChecks.push({ name, error: String(error) });
+    await capture(`${name}-failed`);
+  }
 }
 async function openSettings() {
   await shortcut(",");
@@ -347,6 +404,13 @@ try {
   );
   await element('button[aria-label="Menu"]');
   await step("01-settings", openSettings);
+  assert.deepEqual((await native("addon_inventory")).installed, []);
+  assert.equal(
+    await pluginHostCount(),
+    0,
+    "Clean startup must have no plugin hosts",
+  );
+  evidence.checks.push("01-no-plugin-hosts-at-clean-start");
   for (const [slug, title, id] of [
     ["project-brief", "Project Brief", "codemux.project-brief"],
     ["issue-companion", "Issue Companion", "codemux.issue-companion"],
@@ -393,6 +457,12 @@ try {
       );
     });
   }
+  assert.equal(
+    await pluginHostCount(),
+    0,
+    "Enabling inert contributions must not eagerly start hosts",
+  );
+  evidence.checks.push("02-enabled-plugins-remain-lazy");
   await step("03-disable-enable", async () => {
     const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Project Brief')))`;
     await clickText("Disable", article);
@@ -491,22 +561,31 @@ try {
     if (value.pane_id === paneId) return value;
     return Object.values(value).map(findPane).find(Boolean) ?? null;
   };
-  const threadId = await until("normal chat pane binding", async () =>
-    findPane(await native("get_app_state"))?.thread_id,
+  const threadId = await until(
+    "normal chat pane binding",
+    async () => findPane(await native("get_app_state"))?.thread_id,
   );
   await hasText("Session error");
   const messagesBefore = await native("agent_chat_list_messages", { threadId });
-  assert.ok(!messagesBefore.some((row) => JSON.parse(row).type === "user_message"));
+  assert.ok(
+    !messagesBefore.some((row) => JSON.parse(row).type === "user_message"),
+  );
   const sessionsBefore = await native("agent_chat_list_sessions", {
     workspaceId,
   });
   async function assertNoSubmission() {
     // Session lists omit rows without an SDK cursor. Check the actual bound
     // thread's persisted messages too; an unchanged empty list alone is weak.
-    assert.deepEqual(await native("agent_chat_list_messages", { threadId }), messagesBefore,
-      "Plugin operations must not persist or submit a prompt");
+    assert.deepEqual(
+      await native("agent_chat_list_messages", { threadId }),
+      messagesBefore,
+      "Plugin operations must not persist or submit a prompt",
+    );
     assert.equal(findPane(await native("get_app_state"))?.thread_id, threadId);
-    assert.deepEqual(await native("agent_chat_list_sessions", { workspaceId }), sessionsBefore);
+    assert.deepEqual(
+      await native("agent_chat_list_sessions", { workspaceId }),
+      sessionsBefore,
+    );
   }
   await capture("04-core-chat-ready");
   await step("04-project-brief-native-git", async () => {
@@ -526,28 +605,43 @@ try {
       ),
     );
   });
-  await step("06-issue-companion-native-https", async () => {
-    await openCommand("Open Issue Companion");
-    // Public, read-only HTTPS through the production DNS/TLS broker. No token,
-    // intercepted fetch, or fixture-only origin exception. A rate limit fails
-    // this gate visibly instead of treating an error state as a successful fetch.
-    await element('section[aria-label="Add-on view"] select');
-    await clickText(
-      "Add to draft",
-      `document.querySelector('section[aria-label="Add-on view"]')`,
-    );
-    await until("issue appended to actual draft", () =>
-      script(
-        `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('https://github.com/octocat/Hello-World/issues/'))`,
-      ),
-    );
-  });
+  await step(
+    "06-issue-companion-native-https",
+    async () => {
+      await openCommand("Open Issue Companion");
+      // Public, read-only HTTPS through the production DNS/TLS broker. No token,
+      // intercepted fetch, or fixture-only origin exception. A rate limit fails
+      // this gate visibly instead of treating an error state as a successful fetch.
+      await element('section[aria-label="Add-on view"] select');
+      await clickText(
+        "Add to draft",
+        `document.querySelector('section[aria-label="Add-on view"]')`,
+      );
+      await until("issue appended to actual draft", () =>
+        script(
+          `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('https://github.com/octocat/Hello-World/issues/'))`,
+        ),
+      );
+    },
+    true,
+  );
   await step("07-no-auto-submit", async () => {
     await assertNoSubmission();
     await openSettings();
     await hasText("Pause all add-ons");
     await clickText("Pause all add-ons");
     await until("paused", async () => (await native("addon_inventory")).paused);
+    await until(
+      "all native plugin processes reaped",
+      async () => (await pluginHostCount()) === 0,
+    );
+    await clickText("Appearance");
+    await hasText("Theme");
+    await capture("07-paused-core-appearance");
+    await click('[aria-label="Close settings"]');
+    await checkCoreTerminal();
+    await capture("07-paused-core-terminal");
+    await openSettings();
     await clickText("Resume add-ons");
     await until(
       "resumed",
@@ -600,6 +694,7 @@ try {
           marker,
         ),
       );
+      await checkCoreTerminal();
       await openCommand("Open Project Brief");
       await hasText("Branch: main");
       await clickText(
@@ -613,6 +708,8 @@ try {
       await assertNoSubmission();
     });
   }
+  if (evidence.failedChecks.length)
+    throw Error("One or more native acceptance gates failed; see failedChecks");
   evidence.status = "passed";
 } catch (error) {
   evidence.status = "failed";

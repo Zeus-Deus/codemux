@@ -32,6 +32,21 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- [Stock Windows GUI acceptance](https://github.com/Zeus-Deus/codemux/actions/runs/35386068123)
+  passes against saved installer `603a7352` (PR merge for e95b13cf), harness
+  `cc1327df`: native review/import, configuration, enable/disable, real Git,
+  public HTTPS, both examples appending to the controlled existing draft,
+  unchanged persisted messages, pause/resume, and typing/healthy-plugin use
+  after the blocking fixture faults. GUI fault observation was 704.0 ms.
+  [Exact provenance and steps](evidence/native-ui-windows-603a7352.json),
+  [Project Brief](evidence/native-project-brief-windows.png),
+  [Issue Companion](evidence/native-issue-companion-windows.png). This saved
+  package has only one hostile command; it does not verify the five-command
+  fixture or subsequent source changes. Linux in the same run passes Brief's
+  real draft operation, then receives GitHub's rate-limit error. No mocked
+  HTTP response is substituted and its network gate remains failed.
+
+
 - Full desktop [CI at `3045f47f`](https://github.com/Zeus-Deus/codemux/actions/runs/35376157828)
   passes on Linux and Windows, including 5,610 frontend tests on Linux. The same
   revision passes [all installer payload checks](https://github.com/Zeus-Deus/codemux/actions/runs/35376157749):
@@ -233,8 +248,9 @@ with a debug port enabled only by an executable-specific policy on the
 disposable Windows runner. The runner starts elevated, and [Microsoft documents](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security)
 that elevated hosts ignore environment overrides. The harness refuses to
 replace existing policy and removes its value after use. No
-production test hook or app configuration change is introduced. Both platforms
-require a passing retry.
+production test hook or app configuration change is introduced. Windows subsequently passes the saved-installer flow at `cc1327df`, as
+recorded above. Linux still needs a successful public HTTPS request, and both
+platforms need the final-source/five-workload installer run.
 It currently targets import/review, enable/disable, both example views and draft
 insertion, read-only public GitHub HTTPS, no auto-submit, pause/resume, and an
 independently packaged five-workload fixture while typing in the core draft
