@@ -63,6 +63,7 @@ function adapter({ manifest, send, now }: Transport) {
       receiver: RemoteReceiver;
       callbacks: Map<string, Function>;
       ids: Map<Function, string>;
+      acknowledge(revision: number): void;
     }
   >();
   function request<T>(operation: string, params: unknown): Promise<T> {
@@ -154,10 +155,10 @@ function adapter({ manifest, send, now }: Transport) {
   const unmount = (viewId: string) => {
     const view = views.get(viewId);
     if (!view) return;
+    views.delete(viewId);
     render(null, view.root);
     view.callbacks.clear();
     view.ids.clear();
-    views.delete(viewId);
   };
   const fail = () => {
     throw new PluginError("INVALID_MESSAGE", "Invalid runtime operation");
@@ -209,7 +210,20 @@ function adapter({ manifest, send, now }: Transport) {
         const receiver = new RemoteReceiver();
         const callbacks = new Map<string, Function>();
         const ids = new Map<Function, string>();
-        views.set(p.viewId, { root, receiver, callbacks, ids });
+        let sentRevision = 0;
+        let acknowledgedRevision = 0;
+        views.set(p.viewId, {
+          root,
+          receiver,
+          callbacks,
+          ids,
+          acknowledge(revision) {
+            if (!Number.isSafeInteger(revision) || revision > sentRevision)
+              fail();
+            acknowledgedRevision = Math.max(acknowledgedRevision, revision);
+            flush();
+          },
+        });
         // Preact can emit many individual mutations during one commit. Batch one
         // microtask, with a bound before enqueueing, so native validation sees the
         // commit atomically rather than consuming the two-batch queue per node.
@@ -217,6 +231,13 @@ function adapter({ manifest, send, now }: Transport) {
         let scheduled = false;
         const flush = () => {
           scheduled = false;
+          if (!views.has(p.viewId)) {
+            queued = [];
+            return;
+          }
+          // One batch in flight; keep ordered, bounded mutations until the
+          // trusted renderer acknowledges it. Slow rendering is not a fault.
+          if (acknowledgedRevision < sentRevision) return;
           const records = queued;
           queued = [];
           if (records.length === 0) return;
@@ -300,10 +321,12 @@ function adapter({ manifest, send, now }: Transport) {
             [...views.values()].reduce((n, v) => n + v.callbacks.size, 0) > 4096
           )
             throw new PluginError("RESOURCE_LIMIT", "Callback limit");
+          sentRevision++;
           send("ui.patch", { viewId: p.viewId, records: serialized });
         };
         root.connect({
           mutate(records) {
+            if (!views.has(p.viewId)) return;
             if (queued.length + records.length > 1000)
               throw new PluginError("RESOURCE_LIMIT", "Mutation limit");
             queued.push(...records);
@@ -324,6 +347,9 @@ function adapter({ manifest, send, now }: Transport) {
       }
       case "view.unmount":
         unmount(p.viewId);
+        break;
+      case "ui.ack":
+        views.get(p.viewId)?.acknowledge(p.revision);
         break;
       case "ui.event": {
         const fn = views.get(p.viewId)?.callbacks.get(p.callbackId);

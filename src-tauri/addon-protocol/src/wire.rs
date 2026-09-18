@@ -102,6 +102,7 @@ impl Envelope {
                     "view.mount",
                     "view.unmount",
                     "ui.event",
+                    "ui.ack",
                     "workspace.changed",
                     "settings.changed",
                     "deactivate",

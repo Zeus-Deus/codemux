@@ -61,6 +61,14 @@ fn direction_generation_and_response_shape_are_enforced() {
     assert!(Envelope::parse(&bytes, Some("current"), true).is_ok());
     assert!(Envelope::parse(&bytes, Some("stale"), true).is_err());
     assert!(Envelope::parse(&bytes, Some("current"), false).is_err());
+    let acknowledgement = serde_json::to_vec(&json!({
+        "jsonrpc":"2.0", "generation":"current", "id":2, "method":"ui.ack",
+        "params":{"viewId":"view", "revision":1}
+    }))
+    .unwrap();
+    assert!(Envelope::parse(&acknowledgement, Some("current"), false).is_ok());
+    assert!(Envelope::parse(&acknowledgement, Some("current"), true).is_err());
+    assert!(Envelope::parse(&acknowledgement, Some("stale"), false).is_err());
     for extra in [
         json!({"result":null}),
         json!({"id":"1"}),

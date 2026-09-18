@@ -1315,8 +1315,16 @@ impl Manager {
         if revision > view.revision {
             return Err(ProtocolError::invalid("Invalid UI acknowledgement"));
         }
-        view.acknowledged = view.acknowledged.max(revision);
-        Ok(())
+        if revision <= view.acknowledged {
+            return Ok(());
+        }
+        view.acknowledged = revision;
+        drop(views);
+        running
+            .host
+            .send("ui.ack", json!({"viewId":view_id,"revision":revision}))
+            .await
+            .map(|_| ())
     }
     pub async fn ui_link(
         &self,
