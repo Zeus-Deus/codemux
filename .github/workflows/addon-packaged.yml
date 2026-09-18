@@ -5,6 +5,18 @@ on:
     paths:
       [
         "scripts/addons/**",
+        "packages/plugin-*/**",
+        "examples/addons/**",
+        "src/components/addons/**",
+        "src/components/settings/addons-settings*",
+        "src/components/chat/Composer.tsx",
+        "src/components/layout/right-panel.tsx",
+        "src/components/overlays/command-palette.tsx",
+        "src/lib/addons/**",
+        "src/stores/addons-store.ts",
+        "src-tauri/src/addons/**",
+        "src-tauri/src/commands/addons.rs",
+        "src-tauri/addon-protocol/**",
         "src-tauri/addon-host/**",
         "src-tauri/tauri.conf.json",
         "scripts/build-addon-host.sh",

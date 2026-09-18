@@ -223,6 +223,7 @@ export function AddonRenderer({ nodes, event, link }: Props) {
                 img: () => null,
                 a: ({ href, children }) => (
                   <button
+                    type="button"
                     className="underline underline-offset-2"
                     disabled={!href?.startsWith("https://")}
                     onClick={() => href && link(node, href)}
