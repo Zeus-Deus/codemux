@@ -133,6 +133,7 @@ const env = {
 let session;
 let driver;
 let desktop;
+let windowsDebugPolicy = false;
 const endpoint = "http://127.0.0.1:4444";
 async function request(method, path, body) {
   const response = await fetch(endpoint + path, {
@@ -202,6 +203,33 @@ async function type(css, value) {
   );
   await wd("POST", `/element/${elementId(el)}/value`, { text: value });
 }
+async function typeComposer(value) {
+  // Use explicit paired keys and release prior modifier state. Verify the
+  // controlled value before invoking a plugin, so driver input cannot be
+  // mistaken for a plugin draft-preservation or auto-submit failure.
+  await wd("DELETE", "/actions");
+  await click(composer);
+  await wd("POST", "/actions", {
+    actions: [
+      {
+        type: "key",
+        id: "keyboard",
+        actions: [...value].flatMap((value) => [
+          { type: "keyDown", value },
+          { type: "keyUp", value },
+          { type: "pause", duration: 20 },
+        ]),
+      },
+    ],
+  });
+  await until("controlled composer input", () =>
+    script(
+      `return [...document.querySelectorAll(arguments[0])].some(e => e.value.includes(arguments[1]))`,
+      composer,
+      value,
+    ),
+  );
+}
 async function shortcut(key) {
   await wd("POST", "/actions", {
     actions: [
@@ -258,8 +286,16 @@ try {
   if (process.platform === "win32") {
     // The standard driver-launch path times out for this stock Windows app.
     // Microsoft's documented attach mode keeps the same binary and gives us
-    // the owned process's startup diagnostics. The debug port exists only in
-    // this disposable CI child environment, never in product configuration.
+    // the owned process's startup diagnostics. Elevated runners ignore env
+    // overrides, so the app-specific policy is temporary and CI-only.
+    await run("powershell.exe", [
+      "-NoProfile",
+      "-File",
+      "scripts/addons/windows-webview-debug.ps1",
+      "-Mode",
+      "enable",
+    ]);
+    windowsDebugPolicy = true;
     desktop = start(application, [], {
       env: {
         ...env,
@@ -286,7 +322,7 @@ try {
       "ms:edgeOptions": { debuggerAddress: "127.0.0.1:9231" },
     };
     evidence.windowsDriverMode =
-      "Microsoft WebView2 attach (CI child environment only)";
+      "Microsoft WebView2 attach (app-specific disposable runner policy)";
   } else {
     driver = start("tauri-driver", ["--port", "4444"], { env });
     capabilities = { "tauri:options": { application } };
@@ -458,7 +494,7 @@ try {
   await step("05-project-brief-real-draft", async () => {
     // WebDriver translates a newline to Enter; never send a submit key. The
     // plugin itself appends its multiline text through the real draft adapter.
-    await type(composer, "Existing draft <literal> ");
+    await typeComposer("Existing draft <literal> ");
     await clickText("Add to draft");
     await until("literal draft appended", () =>
       script(
@@ -525,7 +561,7 @@ try {
       await openCommand(command.title);
       const started = performance.now();
       const marker = ` Core input after ${command.id}.`;
-      await type(composer, marker);
+      await typeComposer(marker);
       await until(
         "hostile runtime quarantined",
         async () =>
@@ -571,12 +607,31 @@ try {
   throw error;
 } finally {
   if (process.platform === "win32" && desktop) {
-    await run("powershell.exe", ["-NoProfile", "-File", "scripts/addons/windows-ui-diagnostics.ps1", "-DesktopPid", String(desktop.pid), "-EvidenceDirectory", evidenceDir]).catch((error) => {
+    await run("powershell.exe", [
+      "-NoProfile",
+      "-File",
+      "scripts/addons/windows-ui-diagnostics.ps1",
+      "-DesktopPid",
+      String(desktop.pid),
+      "-EvidenceDirectory",
+      evidenceDir,
+    ]).catch((error) => {
       evidence.diagnosticsError = String(error);
     });
   }
   if (session) await wd("DELETE", "").catch(() => {});
   for (const child of owned) child.kill();
+  if (windowsDebugPolicy) {
+    await run("powershell.exe", [
+      "-NoProfile",
+      "-File",
+      "scripts/addons/windows-webview-debug.ps1",
+      "-Mode",
+      "disable",
+    ]).catch((error) => {
+      evidence.policyCleanupError = String(error);
+    });
+  }
   if (driver) {
     const result = await Promise.race([
       driver.done.catch((error) => ({ code: null, output: String(error) })),

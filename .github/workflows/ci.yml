@@ -446,6 +446,10 @@ jobs:
           export CODEMUX_TEST_ADDON_HOST="$PWD/src-tauri/binaries/codemux-addon-host-$suffix"
           cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::manager::tests::native_ -- --ignored --test-threads=2
 
+      - name: Native full-filesystem add-on recovery
+        if: runner.os == 'Linux'
+        run: bash scripts/addons/full-filesystem.sh
+
       - name: Windows native credential backend
         if: runner.os == 'Windows'
         run: cargo test -j 2 --locked --manifest-path src-tauri/Cargo.toml --lib addons::credentials::tests::native_os_backend_roundtrip_and_deletion -- --ignored --test-threads=2
