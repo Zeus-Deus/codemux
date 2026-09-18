@@ -180,6 +180,7 @@ async function element(css) {
     wd("POST", "/element", { using: "css selector", value: css }),
   );
 }
+const composer = '[data-testid="composer-body"] textarea';
 const elementId = (el) => el["element-6066-11e4-a52e-4f735466cecf"];
 async function clickText(value, scope = "document") {
   const el = await until(`click ${value}`, () =>
@@ -444,7 +445,7 @@ try {
   await shortcut("k");
   await type('[role="combobox"]', "synthetic-project");
   await click(`[role="option"][data-value="ws:${workspaceId}"]`);
-  await element("textarea");
+  await element(composer);
   const sessionsBefore = await native("agent_chat_list_sessions", {
     workspaceId,
   });
@@ -457,11 +458,11 @@ try {
   await step("05-project-brief-real-draft", async () => {
     // WebDriver translates a newline to Enter; never send a submit key. The
     // plugin itself appends its multiline text through the real draft adapter.
-    await type("textarea", "Existing draft <literal> ");
+    await type(composer, "Existing draft <literal> ");
     await clickText("Add to draft");
     await until("literal draft appended", () =>
       script(
-        `return [...document.querySelectorAll('textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('draft-context.txt'))`,
+        `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('draft-context.txt'))`,
       ),
     );
   });
@@ -477,7 +478,7 @@ try {
     );
     await until("issue appended to actual draft", () =>
       script(
-        `return [...document.querySelectorAll('textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('https://github.com/octocat/Hello-World/issues/'))`,
+        `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.startsWith('Existing draft <literal>') && e.value.includes('Project:') && e.value.includes('https://github.com/octocat/Hello-World/issues/'))`,
       ),
     );
   });
@@ -524,7 +525,7 @@ try {
       await openCommand(command.title);
       const started = performance.now();
       const marker = ` Core input after ${command.id}.`;
-      await type("textarea", marker);
+      await type(composer, marker);
       await until(
         "hostile runtime quarantined",
         async () =>
@@ -539,7 +540,7 @@ try {
       });
       await until("core input accepted", () =>
         script(
-          `return [...document.querySelectorAll('textarea')].some(e => e.value.includes(arguments[0]))`,
+          `return [...document.querySelectorAll('[data-testid="composer-body"] textarea')].some(e => e.value.includes(arguments[0]))`,
           marker,
         ),
       );
@@ -569,6 +570,11 @@ try {
     });
   throw error;
 } finally {
+  if (process.platform === "win32" && desktop) {
+    await run("powershell.exe", ["-NoProfile", "-File", "scripts/addons/windows-ui-diagnostics.ps1", "-DesktopPid", String(desktop.pid), "-EvidenceDirectory", evidenceDir]).catch((error) => {
+      evidence.diagnosticsError = String(error);
+    });
+  }
   if (session) await wd("DELETE", "").catch(() => {});
   for (const child of owned) child.kill();
   if (driver) {
