@@ -28,6 +28,9 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = ["codegen"] }
 
 [dependencies]
+codemux-addon-protocol = { path = "addon-protocol" }
+semver = "1"
+tar = "0.4"
 # The `test` feature exposes `tauri::test::MockRuntime` in normal (non-dev)
 # builds. `codemux serve` hosts the full command surface on MockRuntime to run
 # headless (no display server) — see src/web_remote/serve.rs. The feature is
@@ -69,7 +72,7 @@ log = "0.4"
 # filter. Used by the new-workspace dialog's paste-to-attach flow.
 tauri-plugin-clipboard-manager = "2"
 rand = "0.8"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
@@ -163,6 +166,14 @@ rpassword = "7"
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 web-push = { version = "0.11", default-features = false }
 openssl = "0.10"
+
+[target.'cfg(windows)'.dependencies.keyring]
+version = "=3.6.3"
+features = ["windows-native"]
+
+[target.'cfg(target_os = "linux")'.dependencies.keyring]
+version = "=3.6.3"
+features = ["async-secret-service", "tokio", "crypto-rust"]
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

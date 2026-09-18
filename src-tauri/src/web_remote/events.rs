@@ -41,6 +41,9 @@ impl EventHub {
     /// Subscribe `conn_id` to `event`, registering the backing desktop
     /// listener if this is the first subscriber for that event name.
     pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
+        if event.starts_with("addon_") || event.starts_with("addon:") {
+            return;
+        }
         let mut map = self.inner.lock().unwrap();
         let entry = map.entry(event.to_string()).or_insert_with(|| {
             let inner = self.inner.clone();
@@ -158,5 +161,20 @@ mod tests {
         let inner: Arc<Mutex<HashMap<String, EventEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         // Must not panic when no one is listening.
         fan_out(&inner, "nobody-home", "{}");
+    }
+}
+
+#[cfg(test)]
+mod addons_boundary_tests {
+    use super::*;
+    #[test]
+    fn addon_streams_never_register_remote_subscribers() {
+        let app = tauri::test::mock_app();
+        let hub = EventHub::default();
+        let (out, _) = tokio::sync::mpsc::unbounded_channel();
+        for name in ["addon_ui", "addon:ui", "addon_future"] {
+            hub.subscribe(app.handle(), 1, name, out.clone());
+            assert_eq!(hub.subscriber_count(name), 0);
+        }
     }
 }

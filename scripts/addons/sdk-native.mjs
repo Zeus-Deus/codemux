@@ -28,6 +28,10 @@ try {
  const request=await until(m=>m.method==='host.request');assert.equal(request.params.operation,'composer.appendText');assert.equal(request.params.params.context,'trusted-interaction');assert.equal(request.params.params.text,'From SDK');
  child.stdin.write(JSON.stringify({jsonrpc:'2.0',generation:'sdk-native',id:request.id,result:1})+'\n');
  const update=await until(m=>m.method==='ui.patch');assert.match(JSON.stringify(update),/"1"/);
+ // Preact clears custom-element properties with an empty string. The public
+ // runtime must normalize removal and deliver one bounded commit to the host.
+ assert.ok(update.params.records.some(r=>r[0]===3 && r[2]==='direction' && r[3]===null));
+ assert.equal(update.params.records.filter(r=>r[0]===3).length>=1,true);
  send('view.unmount',{viewId:'view1'});await until(m=>m.method==='ui.patch');
  send('deactivate',{});child.stdin.end();
  console.log('PASS: native SDK view, callback, scoped request, update, unmount');

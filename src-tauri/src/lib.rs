@@ -9,6 +9,7 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 #[cfg(not(debug_assertions))]
 pub const APP_DIR_NAME: &str = "codemux";
 
+pub mod addons;
 pub mod agent_capability;
 pub mod active_workspace_persistence;
 pub mod agent_context;
@@ -333,6 +334,9 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                if let Some(manager) = app.state::<commands::addons::AddonState>().existing() {
+                    tauri::async_runtime::block_on(manager.shutdown());
+                }
                 if let Err(error) = active_workspace_persistence::flush_latest(app) {
                     eprintln!("[codemux::selection] shutdown flush failed: {error}");
                 }
@@ -390,6 +394,7 @@ fn build_core_app<R: tauri::Runtime>(
         // Mode is managed state so commands and the setup closure can gate
         // display-coupled behavior on it.
         .manage(mode)
+        .manage(commands::addons::AddonState::default())
         .manage(state::AppStateStore::default())
         // Live per-host reachability for the Devices page. Filled by
         // `hosts_inventory` (Unix only); on Windows every host reads as
@@ -2277,6 +2282,37 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::addons::addon_inventory,
+            commands::addons::addon_import_review,
+            commands::addons::addon_accept_review,
+            commands::addons::addon_cancel_review,
+            commands::addons::addon_remove,
+            commands::addons::addon_rollback,
+            commands::addons::addon_enable,
+            commands::addons::addon_resume,
+            commands::addons::addon_catalog,
+            commands::addons::addon_catalog_review,
+            commands::addons::addon_retry_cleanup,
+            commands::addons::addon_developer_mode,
+            commands::addons::addon_development_review,
+            commands::addons::addon_development_reload,
+            commands::addons::addon_settings_get,
+            commands::addons::addon_subscribe,
+            commands::addons::addon_pause_all,
+            commands::addons::addon_disable,
+            commands::addons::addon_context_changed,
+            commands::addons::addon_composer_closed,
+            commands::addons::addon_composer_register,
+            commands::addons::addon_execute,
+            commands::addons::addon_mount,
+            commands::addons::addon_unmount,
+            commands::addons::addon_ui_event,
+            commands::addons::addon_ui_link,
+            commands::addons::addon_ui_ack,
+            commands::addons::addon_effect_result,
+            commands::addons::addon_effect_claim,
+            commands::addons::addon_settings_set,
+            commands::addons::addon_credential_set,
             diagnostics::get_performance_diagnostics,
             commands::get_current_theme,
             commands::get_omarchy_theme,
