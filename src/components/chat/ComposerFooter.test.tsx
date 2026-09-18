@@ -341,3 +341,28 @@ describe("ComposerFooter — context-window meter", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("message delivery while working", () => {
+  it("keeps both Queue and Stop discoverable", () => {
+    const onSubmit = vi.fn();
+    renderFooter({ streaming: true, onDeliveryChange: vi.fn(), onSubmit });
+    expect(screen.getByRole("button", { name: "Message delivery: Queue" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Queue message" }));
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: /Stop/ })).toBeInTheDocument();
+  });
+  it("offers an explicit interruption separately from safe steering", () => {
+    renderFooter({ streaming: true, delivery: "interrupt", onDeliveryChange: vi.fn() });
+    expect(screen.getByRole("button", { name: "Interrupt and send" })).toBeInTheDocument();
+  });
+});
+
+describe("provider steering capability", () => {
+  it("explains why safe steering is disabled without hiding queue or interruption", () => {
+    renderFooter({ streaming: true, supportsSteering: false, onDeliveryChange: vi.fn() });
+    fireEvent.click(screen.getByRole("button", { name: "Message delivery: Queue" }));
+    expect(screen.getByRole("option", { name: /Steer \/steer/ })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText(/Safe steering is unavailable for this provider/)).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /^Interrupt and send/ })).not.toHaveAttribute("aria-disabled", "true");
+  });
+});

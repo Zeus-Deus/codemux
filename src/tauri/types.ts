@@ -1000,6 +1000,7 @@ export interface PermissionModeOption {
 }
 
 export interface ProviderChatCapabilities {
+  supports_steering?: boolean;
   models: ChatModelInfo[];
   effort_granularity: EffortGranularity;
   effort_label_map: Record<string, string>;

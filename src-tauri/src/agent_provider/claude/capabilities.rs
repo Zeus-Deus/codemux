@@ -316,6 +316,7 @@ fn claude_permission_modes() -> Vec<PermissionModeOption> {
 /// must be preserved verbatim during any future live-merge pass.
 pub fn claude_fallback_capabilities() -> ProviderChatCapabilities {
     ProviderChatCapabilities {
+        supports_steering: false,
         models: models(),
         effort_granularity: EffortGranularity::PerSession,
         effort_label_map: claude_effort_label_map(),
@@ -566,6 +567,7 @@ fn build_capabilities_from_live(live: Vec<ApiModel>) -> ProviderChatCapabilities
         })
         .collect();
     ProviderChatCapabilities {
+        supports_steering: false,
         models: merged,
         effort_granularity: EffortGranularity::PerSession,
         effort_label_map: claude_effort_label_map(),
@@ -897,6 +899,7 @@ fn build_capabilities_from_sdk(
     append_missing_maintained_families(&mut merged);
     dedupe_default_alias(&mut merged);
     ProviderChatCapabilities {
+        supports_steering: false,
         models: merged,
         effort_granularity: EffortGranularity::PerSession,
         effort_label_map: claude_effort_label_map(),

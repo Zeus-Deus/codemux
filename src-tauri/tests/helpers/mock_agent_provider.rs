@@ -171,6 +171,7 @@ impl AgentProvider for MockAgentProvider {
             checkpoint.commit().await;
         }
         Ok(TurnStartResult {
+            steered: false,
             turn_id: TurnId("mock-turn".into()),
             queued_id: None,
         })

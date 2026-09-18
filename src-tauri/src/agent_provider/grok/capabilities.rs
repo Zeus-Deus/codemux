@@ -315,6 +315,7 @@ pub(crate) fn build_capabilities(
     }
 
     Ok(ProviderChatCapabilities {
+        supports_steering: false,
         models,
         effort_granularity: EffortGranularity::PerTurn,
         effort_label_map,

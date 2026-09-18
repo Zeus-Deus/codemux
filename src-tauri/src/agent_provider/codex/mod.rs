@@ -285,14 +285,44 @@ impl AgentProvider for CodexAgentProvider {
         })?;
         Ok(match session.enqueue_or_send(input).await? {
             crate::agent_provider::SendOutcome::Started(turn_id) => TurnStartResult {
+                steered: false,
                 turn_id,
                 queued_id: None,
             },
             crate::agent_provider::SendOutcome::Queued(queued_id) => TurnStartResult {
+                steered: false,
                 turn_id: TurnId(String::new()),
                 queued_id: Some(queued_id),
             },
         })
+    }
+
+    async fn steer_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&input.thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound {
+                thread_id: input.thread_id.clone(),
+            })?;
+        session.steer_turn(input).await
+    }
+
+    async fn steer_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&thread_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound { thread_id })?;
+        session.steer_queued(&queued_id).await
     }
 
     async fn interrupt_turn(

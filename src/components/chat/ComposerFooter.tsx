@@ -1,3 +1,5 @@
+import type { MessageDelivery } from "@/lib/agent-chat/message-delivery";
+import { MessageDeliveryPicker } from "./MessageDeliveryPicker";
 import {
   ArrowUp,
   Check,
@@ -41,6 +43,9 @@ interface Props {
   ultrathinkInBodyText: boolean;
   streaming: boolean;
   canSubmit: boolean;
+  delivery?: MessageDelivery;
+  supportsSteering?: boolean;
+  onDeliveryChange?: (value: MessageDelivery) => void;
   showProviderPicker: boolean;
   /** When false, hides the Stop button even while streaming. Used by
    *  the draft surface to avoid exposing a no-op Stop affordance
@@ -116,6 +121,9 @@ export function ComposerFooter({
   ultrathinkInBodyText,
   streaming,
   canSubmit,
+  delivery = "queue",
+  supportsSteering = false,
+  onDeliveryChange,
   showProviderPicker,
   showStopButton = true,
   mode,
@@ -300,7 +308,13 @@ export function ComposerFooter({
           </>
         )}
 
+        {streaming && onDeliveryChange && <MessageDeliveryPicker value={delivery} supportsSteering={supportsSteering} disabled={controlsDisabled} onChange={onDeliveryChange} />}
         {streaming && showStopButton ? (
+          <>
+          {onDeliveryChange && <button type="button" onClick={onSubmit} disabled={!canSubmit} aria-label={delivery === "interrupt" ? "Interrupt and send" : delivery === "steer" ? "Steer" : "Queue message"}
+            title={delivery === "interrupt" ? "Stop current work and send" : delivery === "steer" ? "Guide the current task without stopping tools" : "Send after this turn finishes"}
+            className={cn(ROUND_CONTROL, "bg-primary/90 text-primary-foreground disabled:opacity-30 disabled:cursor-not-allowed")}><ArrowUp className="size-4" /></button>}
+
           <button
             type="button"
             onClick={onStop}
@@ -314,6 +328,7 @@ export function ComposerFooter({
           >
             <Square className="size-3" fill="currentColor" />
           </button>
+          </>
         ) : (
           <button
             type="button"
