@@ -152,17 +152,27 @@ pub(super) fn fixture_archive() -> Vec<u8> {
     tests::archive(None)
 }
 #[cfg(test)]
+pub(super) fn fixture_archive_with_source(source: &[u8]) -> Vec<u8> {
+    tests::archive_with_source(None, source)
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     pub(super) fn archive(extra: Option<(&str, tar::EntryType)>) -> Vec<u8> {
+        archive_with_source(extra, b"globalThis.__shouldNotRun = true;")
+    }
+    pub(super) fn archive_with_source(
+        extra: Option<(&str, tar::EntryType)>,
+        source: &[u8],
+    ) -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
         for (name, contents) in [
             (
                 "manifest.json",
                 include_bytes!("../../addon-protocol/fixtures/hello.json").as_slice(),
             ),
-            ("plugin.js", b"globalThis.__shouldNotRun = true;".as_slice()),
+            ("plugin.js", source),
             ("README.md", b"readme".as_slice()),
             ("LICENSE", b"MIT".as_slice()),
         ] {

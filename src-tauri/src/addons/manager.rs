@@ -1528,6 +1528,83 @@ mod tests {
     }
     #[tokio::test]
     #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_uninstall_during_activation_reaps_the_candidate_before_removing_state() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        // This fixture yields activation without registering ready. The test can
+        // release it deterministically over its owned host's protocol; no public
+        // application test bypass or timing-sensitive JS sleep is introduced.
+        let source = b"__codemuxRegister({}, ({send}) => m => {if(m.method==='command.execute')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let package = root.path().join("activation.cmxaddon");
+        std::fs::write(
+            &package,
+            super::super::package::fixture_archive_with_source(source),
+        )
+        .unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let review = reviews.prepare_local(&manager, &package).unwrap();
+        let mut installation = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        installation.desired_enabled = true;
+        manager.save(&installation).unwrap();
+        {
+            let activation = manager.ensure_active(&installation.manifest.id);
+            tokio::pin!(activation);
+            let running = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    result = &mut activation => panic!("activation completed before release: {}", result.is_ok()),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+                if let Some(running) = manager.running.lock().await.get(&installation.manifest.id).cloned() {
+                    break running;
+                }
+            }
+        }).await.expect("native activation starts");
+            assert!(!running.activated.load(Ordering::Acquire));
+            let removal = manager.remove(&installation.manifest.id, false);
+            tokio::pin!(removal);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut removal)
+                    .await
+                    .is_err()
+            );
+            running
+                .host
+                .send("command.execute", json!({"id":"hello"}))
+                .await
+                .unwrap();
+            let (activated, removed) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(&mut activation, &mut removal)
+            })
+            .await
+            .expect("activation and removal serialize");
+            activated.unwrap();
+            assert!(removed.unwrap().is_empty());
+            assert!(running.stopped.is_cancelled());
+            assert!(manager.running.lock().await.is_empty());
+            assert!(manager.list().unwrap().is_empty());
+            assert!(!manager
+                .root
+                .join("state")
+                .join(&installation.installation_id)
+                .exists());
+            assert!(manager
+                .ensure_active(&installation.manifest.id)
+                .await
+                .is_err());
+        }
+        drop(manager);
+        assert!(Manager::open(root.path().join("private"), test_host_path())
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
     async fn native_delayed_effects_cannot_outlive_their_target_or_installation() {
         for action in [
             "workspace",
