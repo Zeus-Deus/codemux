@@ -1,11 +1,11 @@
 {
-  "commit": "98081809efacfa1142d06e48bb2d33186d2a0f62",
-  "platform": "win32",
+  "commit": "a9cbe22b1c807f8c8d6481b7db8ea7847c068842",
+  "platform": "linux",
   "hardware": {
-    "osRelease": "10.0.26100",
-    "cpu": "Intel(R) Xeon(R) 6973P-C",
+    "osRelease": "6.8.0-1064-azure",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
     "logicalCpus": 4,
-    "memoryBytes": 17174360064
+    "memoryBytes": 16765411328
   },
   "checks": [
     "01-settings",
@@ -30,14 +30,13 @@
   "installerBuild": {
     "commit": "603a73527c98883937296904e66b20c4744a1abe",
     "run": "35379118363",
-    "platform": "win32"
+    "platform": "linux"
   },
-  "installerSha256": "d589dd5dd4bab1fae45fd2c5706fd6dc3bb9383ab503b5f5533b25beee979fca",
-  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "installerSha256": "6bdfb6e2d5551e0790ea80edbe83becd2c7ee9b91756c39ade363197059e7d8a",
   "hostileWorkloads": [
     {
       "command": "block",
-      "uiObservationMs": 643.6728999999978
+      "uiObservationMs": 1195.4971750000004
     }
   ],
   "status": "passed"

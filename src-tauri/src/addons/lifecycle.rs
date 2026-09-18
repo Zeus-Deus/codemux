@@ -1213,7 +1213,7 @@ mod tests {
                     tokio::time::timeout(std::time::Duration::from_secs(5), &mut transaction)
                         .await
                         .expect("full filesystem must not strand transaction")
-                        .is_ok();
+                        .ok();
                 std::fs::remove_file(filler_path).unwrap();
                 completed
             };
@@ -1223,13 +1223,10 @@ mod tests {
             drop(manager);
             let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
             let installed = reopened.installation(&old.manifest.id).unwrap();
+            let expected = completed.as_ref().unwrap_or(&old);
+            assert_eq!(installed.digest, expected.digest, "{stage}");
             assert_eq!(
-                installed.digest,
-                if completed {
-                    review.digest
-                } else {
-                    old.digest.clone()
-                },
+                installed.data_generation, expected.data_generation,
                 "{stage}"
             );
             assert_eq!(installed.installation_id, old.installation_id, "{stage}");
@@ -1247,7 +1244,10 @@ mod tests {
                 serde_json::json!({"value":"original"}),
                 "{stage}"
             );
-            println!("{stage}: real ENOSPC; committed={completed}; tuple preserved");
+            println!(
+                "{stage}: real ENOSPC; committed={}; tuple preserved",
+                completed.is_some()
+            );
         }
     }
     #[tokio::test]

@@ -1,7 +1,8 @@
 # Plugin platform implementation ledger
 
 Requirements: [engineering specification](BUILD-SPEC.md), revision 2, all 14 chapters.
-Desktop baseline: `797a834c`. Website baseline: `27cfa19` on the existing
+Desktop integration baseline: `09966161` after the isolated ordered rebase
+(original baseline `797a834c`). Website baseline: `27cfa19` on the existing
 `feat/site-revamp` branch (includes the latest main). Both use isolated worktrees;
 pre-existing Hermes work and website changes are preserved.
 
@@ -32,20 +33,39 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
-- [Stock Windows GUI acceptance](https://github.com/Zeus-Deus/codemux/actions/runs/35386068123)
-  passes against saved installer `603a7352` (PR merge for e95b13cf), harness
-  `cc1327df`: native review/import, configuration, enable/disable, real Git,
-  public HTTPS, both examples appending to the controlled existing draft,
-  unchanged persisted messages, pause/resume, and typing/healthy-plugin use
-  after the blocking fixture faults. GUI fault observation was 704.0 ms.
-  [Exact provenance and steps](evidence/native-ui-windows-603a7352.json),
-  [Project Brief](evidence/native-project-brief-windows.png),
-  [Issue Companion](evidence/native-issue-companion-windows.png). This saved
-  package has only one hostile command; it does not verify the five-command
-  fixture or subsequent source changes. Linux in the same run passes Brief's
-  real draft operation, then receives GitHub's rate-limit error. No mocked
-  HTTP response is substituted and its network gate remains failed.
-
+- Stock installed-app GUI flows pass on [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35388617257)
+  and [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35387729205),
+  using saved installer `603a7352`. Both independently import the example archives,
+  configure Issue Companion, render actual Git and public GitHub HTTPS results,
+  append to an existing controlled draft without changing persisted messages,
+  and verify zero hosts on clean startup, lazy enablement, and pause.
+  Core Appearance and real terminal commands work while paused and after a
+  blocking plugin fault; the healthy plugin and composer remain usable.
+  GUI fault observations including input/driver overhead were 1195.5 ms Linux
+  and 643.7 ms Windows. [Linux provenance](evidence/native-ui-linux-603a7352.json),
+  [Windows provenance](evidence/native-ui-windows-603a7352.json),
+  [native Linux HTTPS/draft screenshot](evidence/native-issue-companion-linux.png).
+  These installers have one hostile command and predate subsequent fixes.
+  Neither run establishes the final-source five-workload release gate.
+- [Linux CI at `278df894`](https://github.com/Zeus-Deus/codemux/actions/runs/35386904270)
+  passes actual ENOSPC injection in a disposable 16 MiB tmpfs at package-write,
+  package-staged, journal-saved, data-snapshotted, registry-switched and activated.
+  Each failed transaction recovers the previous release/grant/private-state tuple.
+  The test now additionally checks the exact recovered data-generation identity;
+  that stronger assertion awaits CI. The same run passes Linux Rust and both
+  frontend suites, but Windows Rust exposes a same-size Git edit missed by the
+  freshly timestamped index snapshot; the timestamp-preserving fix awaits Windows CI.
+- The rebase preserves current mobile Settings, responsive panel, remote command
+  policy and composer delivery logic. TypeScript and 166 focused integration/UI
+  tests pass. Native cargo check and 40 focused tests pass (7 explicit ignored
+  environment/integration tests are counted separately). All four real-host
+  manager integrations pass with the freshly packed SDK/example archives.
+- Real native SDK regression failed before and passes after render backpressure:
+  two completed callbacks can wait behind an unacknowledged render without
+  exhausting the host queue. Trusted acknowledgements release one ordered batch;
+  closing a view discards pending mutations and ignores late acknowledgements.
+  Native two-batch, 1000-mutation, traffic and memory bounds remain unchanged.
+  The wire permits `ui.ack` only from host to child for the current generation.
 
 - Full desktop [CI at `3045f47f`](https://github.com/Zeus-Deus/codemux/actions/runs/35376157828)
   passes on Linux and Windows, including 5,610 frontend tests on Linux. The same
@@ -235,8 +255,7 @@ the hostile fixture, disable/enable and native configuration persistence.
 [Partial evidence](evidence/native-ui-linux-partial.json) records exact installer
 and harness revisions. Project Brief rendered real Git data, but the count
 assertion exposed missing repository-local exclude rules in the private Git
-snapshot. The run failed there; draft, HTTPS and hostile-GUI steps remain
-unverified. [Native review](evidence/native-package-review.png) and
+snapshot. That early run failed there and did not verify draft, HTTPS or hostile-GUI steps. [Native review](evidence/native-package-review.png) and
 [configuration](evidence/native-settings-configuration.png) screenshots use only
 synthetic runner data. A later [Linux retry](https://github.com/Zeus-Deus/codemux/actions/runs/35383319034)
 passes the Git assertion with a versioned ignore fixture, then stops because
@@ -249,8 +268,8 @@ disposable Windows runner. The runner starts elevated, and [Microsoft documents]
 that elevated hosts ignore environment overrides. The harness refuses to
 replace existing policy and removes its value after use. No
 production test hook or app configuration change is introduced. Windows subsequently passes the saved-installer flow at `cc1327df`, as
-recorded above. Linux still needs a successful public HTTPS request, and both
-platforms need the final-source/five-workload installer run.
+recorded above; Linux subsequently passes with harness `a9cbe22b`. Both
+platforms still need the final-source/five-workload installer run.
 It currently targets import/review, enable/disable, both example views and draft
 insertion, read-only public GitHub HTTPS, no auto-submit, pause/resume, and an
 independently packaged five-workload fixture while typing in the core draft
