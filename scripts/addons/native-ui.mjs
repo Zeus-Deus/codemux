@@ -367,6 +367,13 @@ try {
     launchMode: null,
     threadId: null,
   });
+  // Native setup creates the workspace, but only a normal frontend activation
+  // dismisses the startup Home draft. Select the real workspace via the palette
+  // instead of mutating the app's client stores from the test.
+  await shortcut("k");
+  await type('[role="combobox"]', "synthetic-project");
+  await click(`[role="option"][data-value="ws:${workspaceId}"]`);
+  await element("textarea");
   const sessionsBefore = await native("agent_chat_list_sessions", {
     workspaceId,
   });

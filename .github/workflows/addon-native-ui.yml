@@ -1,5 +1,10 @@
 name: Retry native add-on UI acceptance
 on:
+  pull_request:
+    paths:
+      - scripts/addons/native-ui.mjs
+      - scripts/addons/install-webdriver.ps1
+      - .github/workflows/addon-native-ui.yml
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -10,7 +15,28 @@ permissions:
   contents: read
   actions: read
 jobs:
+  harness-syntax:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: node --check scripts/addons/native-ui.mjs
+      - name: Verify refusal outside disposable CI
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          const result = spawnSync(process.execPath, ['scripts/addons/native-ui.mjs'], {
+            env: { ...process.env, GITHUB_ACTIONS: 'false' }, encoding: 'utf8'
+          });
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, /Requires disposable GitHub CI/);
+          JS
   native-ui:
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
