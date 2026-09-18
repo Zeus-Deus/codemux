@@ -686,12 +686,27 @@ async function openSettings() {
 async function openCommand(title) {
   await shortcut("k");
   await type('[role="combobox"]', title);
-  await until(title, () =>
-    script(
-      `return [...document.querySelectorAll('[role="option"]')].find(e => e.innerText.includes(arguments[0])) ?? null`,
-      title,
-    ),
-  ).then((el) => wd("POST", `/element/${elementId(el)}/click`, {}));
+  // Inventory refresh after rollback can replace a palette option between
+  // locating it and the WebDriver click. Retry only a stale-element rejection
+  // (the driver did not dispatch that click), never a possibly completed action.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const el = await until(title, () =>
+      script(
+        `return [...document.querySelectorAll('[role="option"]')].find(e => e.innerText.includes(arguments[0])) ?? null`,
+        title,
+      ),
+    );
+    try {
+      await wd("POST", `/element/${elementId(el)}/click`, {});
+      return;
+    } catch (error) {
+      if (
+        attempt === 2 ||
+        !String(error).includes('"error":"stale element reference"')
+      )
+        throw error;
+    }
+  }
 }
 async function checkOfficialUpdater(phase) {
   // Read-only check through the stock app's official updater. Never download,
