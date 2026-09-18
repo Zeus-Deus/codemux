@@ -1,6 +1,7 @@
 // CI-only WebDriver acceptance against an installed, unmodified release app.
 // Never run on a developer profile. No embedded driver or production test hooks.
 import assert from "node:assert/strict";
+import { reversionFixture } from "./reversion-fixture.mjs";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpus, totalmem, release, homedir } from "node:os";
@@ -266,6 +267,183 @@ async function pluginHostCount() {
 }
 let terminalProbe = 0;
 let credentialProbe;
+async function choosePackage(path) {
+  await script(
+    `const original = window.fetch;
+    const path = arguments[0];
+    const url = window.__TAURI_INTERNALS__.convertFileSrc('plugin:dialog|open', 'ipc');
+    window.fetch = function(input, options) {
+      if (input === url) {
+        window.fetch = original;
+        return Promise.resolve(new Response(JSON.stringify(path), {
+          status: 200, headers: {'Content-Type': 'application/json', 'Tauri-Response': 'ok'}
+        }));
+      }
+      return original.call(this, input, options);
+    };`,
+    path,
+  );
+}
+async function checkNativeUpdateRollback() {
+  const id = "codemux.project-brief";
+  const article = `([...document.querySelectorAll('article')].find(e => e.innerText.includes('Project Brief')))`;
+  const original = await readFile(
+    resolve(
+      "examples/addons/project-brief/codemux.project-brief-1.0.0.cmxaddon",
+    ),
+  );
+  const path = join(root, "watched-brief.cmxaddon");
+  await writeFile(path, original);
+  await click('[aria-label="Developer mode"]');
+  await choosePackage(path);
+  await clickText("Select development package");
+  await hasText("Review Project Brief");
+  const replace = await script(
+    `return [...document.querySelectorAll('[role="dialog"] label')].find(e => e.innerText.includes('Replace the existing source')).querySelector('input')`,
+  );
+  await wd("POST", `/element/${elementId(replace)}/click`, {});
+  await clickText("Accept and install");
+  await until(
+    "selected development source",
+    async () => (await native("addon_inventory")).developmentPackage === id,
+  );
+  await until("development review closed", () =>
+    script(`return !document.querySelector('[role="dialog"]')`),
+  );
+  const installed = async () =>
+    (await native("addon_inventory")).installed.find(
+      (i) => i.manifest.id === id,
+    );
+  const before = await installed();
+  await click('[aria-label="Close settings"]');
+  await openCommand("Open Project Brief");
+  await hasText("Branch: main");
+  const checkbox = 'section[aria-label="Add-on view"] input[type="checkbox"]';
+  await click(checkbox);
+  await until("private preference off", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === false`,
+      checkbox,
+    ),
+  );
+  // Remount to observe persisted private storage rather than just local UI state.
+  await click('[aria-label="Close Project Brief"]');
+  await openCommand("Open Project Brief");
+  await until("private preference persisted", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === false`,
+      checkbox,
+    ),
+  );
+  await openSettings();
+  await writeFile(path + ".next", reversionFixture(original, "1.0.1"));
+  await rename(path + ".next", path);
+  const updated = await until("same-access native update", async () => {
+    const value = await installed();
+    return (
+      value.manifest.version === "1.0.1" &&
+      value.status === "enabled-running" &&
+      value
+    );
+  });
+  assert.equal(updated.installationId, before.installationId);
+  assert.deepEqual(updated.source, before.source);
+  assert.equal(updated.previous.digest, before.digest);
+  assert.equal(updated.previous.dataGeneration, before.dataGeneration);
+  assert.notEqual(updated.dataGeneration, before.dataGeneration);
+  // Expanded access must show review and cancellation must leave the active
+  // release, grant and private data generation untouched.
+  await writeFile(
+    path + ".next",
+    reversionFixture(original, "1.0.2", "external.open"),
+  );
+  await rename(path + ".next", path);
+  await hasText("Review Project Brief");
+  await hasText("Open HTTPS links after your interaction");
+  await wd("POST", "/actions", {
+    actions: [
+      {
+        type: "key",
+        id: "review-cancel",
+        actions: [
+          { type: "keyDown", value: "\ue00c" },
+          { type: "keyUp", value: "\ue00c" },
+        ],
+      },
+    ],
+  });
+  await until("expanded-access review cancelled", () =>
+    script(`return !document.querySelector('[role="dialog"]')`),
+  );
+  const cancelled = await installed();
+  assert.equal(cancelled.digest, updated.digest);
+  assert.deepEqual(cancelled.grant, updated.grant);
+  assert.equal(cancelled.dataGeneration, updated.dataGeneration);
+  await click('[aria-label="Developer mode"]');
+  await until(
+    "watch disabled",
+    async () => !(await native("addon_inventory")).developerMode,
+  );
+  await click('[aria-label="Close settings"]');
+  await openCommand("Open Project Brief");
+  await until("updated release has previous preference", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === false`,
+      checkbox,
+    ),
+  );
+  await click(checkbox);
+  await until("updated private preference on", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === true`,
+      checkbox,
+    ),
+  );
+  await click('[aria-label="Close Project Brief"]');
+  await openCommand("Open Project Brief");
+  await until("updated preference persisted", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === true`,
+      checkbox,
+    ),
+  );
+  await openSettings();
+  await clickText("Rollback", article);
+  await hasText("Restore 1.0.0?");
+  await clickText("Restore previous release");
+  const restored = await until("native rollback completed", async () => {
+    const value = await installed();
+    return (
+      value.manifest.version === "1.0.0" &&
+      value.digest === before.digest &&
+      value
+    );
+  });
+  assert.equal(restored.installationId, before.installationId);
+  assert.notEqual(restored.dataGeneration, updated.dataGeneration);
+  await until("rollback dialog closed", () =>
+    script(`return !document.querySelector('[role="dialog"]')`),
+  );
+  await click('[aria-label="Close settings"]');
+  await openCommand("Open Project Brief");
+  await until("rollback restores matching private snapshot", () =>
+    script(
+      `return document.querySelector(arguments[0])?.checked === false`,
+      checkbox,
+    ),
+  );
+  await click(checkbox);
+  await checkCoreTerminal();
+  evidence.nativeUpdates = {
+    sameAccess: true,
+    activeHost: true,
+    expandedAccessReview: true,
+    cancellation: true,
+    rollbackMatchingPrivateData: true,
+    developerModeOff: true,
+  };
+  await openSettings();
+}
 async function corePaneDeck() {
   return script(
     `return [...document.querySelectorAll('[data-testid="right-panel-tabs-content"] button[aria-pressed]')].map(e => ({ title: e.title, active: e.getAttribute('aria-pressed') === 'true' })).filter(e => !['Project Brief', 'Issue Companion'].includes(e.title))`,
@@ -1225,6 +1403,10 @@ try {
     await capture("08-virtualized-native-plugin-list");
     await openSettings();
   });
+  await step(
+    "09-native-update-review-and-matching-data-rollback",
+    checkNativeUpdateRollback,
+  );
   await step(
     "09-paused-restart-preserves-installations-and-settings",
     async () => {
