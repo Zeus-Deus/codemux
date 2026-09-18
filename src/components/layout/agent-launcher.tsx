@@ -71,7 +71,7 @@ function TitlebarPinToggle({
       {!pinned && (
         <span
           data-testid={`launcher-destination-${presetId}`}
-          className="font-mono text-caption tracking-[0.02em] text-muted-foreground/70 transition-opacity group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
+          className="font-mono text-caption tracking-[0.02em] text-muted-foreground/70 transition-opacity duration-150 group-hover/command-item:opacity-0 group-data-selected/command-item:opacity-0"
         >
           {destination}
         </span>
@@ -89,7 +89,7 @@ function TitlebarPinToggle({
           useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
         }}
         className={cn(
-          "flex size-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          "flex size-5 shrink-0 items-center justify-center rounded-sm transition-[color,opacity] duration-150 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
           pinned
             ? "text-accent-ember hover:text-accent-ember/80"
             : "absolute right-0 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 group-hover/command-item:opacity-100 group-data-selected/command-item:opacity-100 hover:text-foreground",
@@ -369,7 +369,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
           aria-label="Launch an agent"
           data-testid="agent-launcher-trigger"
           className={cn(
-            "flex size-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
             BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"
@@ -533,7 +533,7 @@ export function DraftAgentLauncher({ draft }: DraftAgentLauncherProps) {
           data-testid="draft-agent-launcher-trigger"
           disabled={draft.promoting}
           className={cn(
-            "flex size-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
             BAND_CONTROL_RADIUS,
             open
               ? "bg-accent text-foreground"

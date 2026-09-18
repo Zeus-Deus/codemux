@@ -29,7 +29,7 @@ export function LoginScreen() {
     return (
       <div className="relative flex h-screen w-screen items-center justify-center bg-background">
         <WindowChrome />
-        <div className="text-xl font-semibold text-foreground animate-pulse opacity-80">
+        <div className="text-xl font-semibold text-foreground motion-safe:animate-pulse opacity-80">
           codemux
         </div>
       </div>
@@ -100,7 +100,7 @@ export function LoginScreen() {
             </Button>
             <button
               type="button"
-              className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors"
+              className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
               onClick={() => switchView("signin")}
             >
               Back to sign in
@@ -169,7 +169,7 @@ export function LoginScreen() {
             {!resetSent && (
               <button
                 type="button"
-                className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors"
+                className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
                 onClick={() => switchView("signin")}
               >
                 Back to sign in
@@ -273,7 +273,7 @@ export function LoginScreen() {
               <div className="flex justify-end">
                 <button
                   type="button"
-                  className="text-label text-muted-foreground hover:text-foreground transition-colors"
+                  className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
                   onClick={() => switchView("forgot-password")}
                 >
                   Forgot password?
@@ -312,7 +312,7 @@ export function LoginScreen() {
           {/* Toggle sign-in / sign-up */}
           <button
             type="button"
-            className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors"
+            className="mt-4 text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
             onClick={() =>
               switchView(view === "signin" ? "signup" : "signin")
             }

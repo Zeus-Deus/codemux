@@ -923,7 +923,7 @@ function ProviderLane({
         type="button"
         onClick={onToggle}
         aria-expanded={open}
-        className="flex w-full items-center gap-4 py-3.5 text-left transition-colors hover:bg-accent/20"
+        className="flex w-full items-center gap-4 py-3.5 text-left transition-colors duration-150 hover:bg-accent/20"
       >
         {/* Widens with the column so provider plan labels do not truncate;
             the model rows below indent to match. */}

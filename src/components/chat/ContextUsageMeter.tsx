@@ -101,8 +101,8 @@ export function ContextUsageMeter({
                   // so the footer's right cluster stays on one optical
                   // baseline.
                   "inline-flex h-[34px] w-[34px] items-center justify-center rounded-full",
-                  "text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground",
-                  "outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                  "text-muted-foreground transition-colors duration-150 hover:bg-muted/60 hover:text-foreground",
+                  "outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                   warning && "text-danger hover:text-danger",
                 )}
               >

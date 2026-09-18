@@ -153,7 +153,7 @@ export function BrowserPeekOverlay() {
               type="button"
               onClick={handlePromote}
               aria-label="Open in side panel"
-              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
+              className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
             >
               <ExternalLink className="size-3.5" aria-hidden />
             </button>
@@ -166,7 +166,7 @@ export function BrowserPeekOverlay() {
           type="button"
           onClick={() => close(activeWorkspaceId)}
           aria-label="Close preview"
-          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
+          className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
         >
           <X className="size-3.5" aria-hidden />
         </button>

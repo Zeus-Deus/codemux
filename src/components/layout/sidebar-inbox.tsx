@@ -94,7 +94,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
- *  the divider. Matches the card wrapper's `duration-200`. */
+ *  the divider. Matches the card wrapper's `duration-250`. */
 const SETTLE_ANIM_MS = 200;
 /** How long the rise-in ease on a just-settled / just-un-settled row is kept
  *  before the marker clears. */
@@ -415,7 +415,7 @@ function ShelfHeader({
       onClick={onToggle}
       aria-expanded={!collapsed}
       aria-label={`${label} (${count})`}
-      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3 outline-none"
+      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
       <ChevronRight
         aria-hidden="true"
@@ -1926,7 +1926,7 @@ export function SidebarInbox() {
                   </span>
                 </DropdownMenuItem>
               </div>
-              <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+              <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
                 {projectGroups.map((group) => (
                   <ProjectFilterItem
                     key={group.projectPath}
@@ -2043,7 +2043,7 @@ export function SidebarInbox() {
             key={pw.id}
             className={cn(
               "flex items-center gap-2 px-2 py-2 text-body",
-              pw.status === "failed" ? "opacity-60" : "animate-pulse opacity-70",
+              pw.status === "failed" ? "opacity-60" : "motion-safe:animate-pulse opacity-70",
             )}
           >
             {pw.status === "creating" ? (

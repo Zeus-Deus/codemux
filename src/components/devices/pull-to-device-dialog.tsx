@@ -437,7 +437,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors"
+        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors duration-150"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />

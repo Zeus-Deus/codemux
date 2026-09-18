@@ -498,7 +498,30 @@ body.pane-resizing iframe {
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border;
+    }
+  /* One focus ring for the whole app.
+   *
+   * This used to be `outline-ring/50` on `*`, which sets only the outline
+   * *colour* — no style and no width — so it painted nothing and 49
+   * controls that killed their outline with `outline-none` and added no
+   * replacement were genuinely unreachable by keyboard. The rule below is
+   * the real thing: one width, one offset, one colour, applied wherever
+   * the browser decides focus should be visible.
+   *
+   * `:focus-visible` (not `:focus`) is deliberate — a mouse click on a
+   * card should not light a ring, a Tab to it must.
+   *
+   * Components that need the ring to hug a different shape still layer
+   * `focus-visible:ring-2 focus-visible:ring-ring/60` on top; that is the
+   * one recipe, and it composes with this outline rather than replacing
+   * it. Surfaces that take programmatic focus as a whole (a dialog, a
+   * command list, a menu item with its own selected fill) keep their
+   * `outline-none`, because a ring around a whole dialog is noise.
+   */
+  :focus-visible {
+    outline: 2px solid color-mix(in oklch, var(--ring) 60%, transparent);
+    outline-offset: 1px;
     }
   /* A root-scoped highlight supplies the default through the CSS highlight
    * inheritance model while still allowing a deliberate descendant override.
@@ -864,6 +887,12 @@ body.pane-resizing iframe {
  * always show one (the command palette). Hiding it outright would strand the
  * user with no sense of how much list is left, and the platform default slab
  * is far too heavy inside a 640px popover. */
+/* Deliberately no `scrollbar-gutter` here. This rule is unlayered, so it
+ * outranks every Tailwind utility no matter the specificity — putting the
+ * gutter in it silently overrode MessageList's `stable both-edges` (which
+ * keeps the centred chat column centred) and forced a 7px inset onto every
+ * dropdown and context menu, including ones that never scroll. The
+ * scrollers that actually shift content ask for the gutter themselves. */
 .thin-scrollbar {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--border) 90%, transparent) transparent;

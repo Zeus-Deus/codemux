@@ -93,7 +93,7 @@ export function MergeSheet({
                 onClick={() => pickMethod(strategy.id)}
                 data-testid={`merge-strategy-${strategy.id}`}
                 className={cn(
-                  "rounded-md px-2.5 py-1.5 transition-colors",
+                  "rounded-md px-2.5 py-1.5 transition-colors duration-150",
                   tzMetaNum,
                   method === strategy.id
                     ? "bg-card font-semibold text-foreground"
@@ -121,7 +121,7 @@ export function MergeSheet({
               onChange={(e) => setTitle(e.target.value)}
               data-testid="merge-commit-title"
               className={cn(
-                "h-[34px] rounded-md border-0 bg-muted/50 px-2.5 text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                "h-[34px] rounded-md border-0 bg-muted/50 px-2.5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 tzBodyLg,
               )}
             />
@@ -142,7 +142,7 @@ export function MergeSheet({
               rows={4}
               data-testid="merge-commit-body"
               className={cn(
-                "resize-y rounded-md border-0 bg-muted/50 px-2.5 py-2 leading-relaxed text-foreground outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+                "resize-y rounded-md border-0 bg-muted/50 px-2.5 py-2 leading-relaxed text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 tzBody,
               )}
             />

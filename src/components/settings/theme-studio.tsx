@@ -295,7 +295,7 @@ function StudioBody({
                 aria-checked={tab === value}
                 onClick={() => setTab(value)}
                 className={cn(
-                  "inline-flex h-[26px] items-center rounded-md px-3.5 text-body-sm font-semibold transition-colors",
+                  "inline-flex h-[26px] items-center rounded-md px-3.5 text-body-sm font-semibold transition-colors duration-150",
                   tab === value
                     ? "bg-foreground text-background"
                     : "text-muted-foreground hover:text-foreground",
@@ -530,7 +530,7 @@ function ContrastReadout({ theme }: { theme: ThemeDefinition }) {
       )}
     >
       <Check className={cn("size-3 flex-none", ok ? "text-status-open" : "text-warning")} />
-      <span className="text-label text-muted-foreground">
+      <span className="text-label text-muted-foreground tabular-nums">
         Body text {body.toFixed(1)}:1 · accent on surface {accent.toFixed(1)}:1
       </span>
     </div>
@@ -696,7 +696,7 @@ function RoleEditorColumn({
       <button
         type="button"
         onClick={onBack}
-        className="inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+        className="inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors duration-150 hover:text-foreground"
       >
         <ChevronRight className="size-3 rotate-180" />
         Back
@@ -812,7 +812,7 @@ function EditRolesLink({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="mt-auto inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+      className="mt-auto inline-flex w-fit items-center gap-1.5 text-body-sm font-semibold text-muted-foreground transition-colors duration-150 hover:text-foreground"
     >
       Edit roles by hand
       <ChevronRight className="size-3" />

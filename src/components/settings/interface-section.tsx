@@ -127,7 +127,7 @@ export function InterfaceSection() {
         <button
           type="button"
           onClick={() => setShowDetails((v) => !v)}
-          className="text-label text-muted-foreground hover:text-foreground transition-colors"
+          className="text-label text-muted-foreground hover:text-foreground transition-colors duration-150"
           aria-expanded={showDetails}
         >
           {showDetails ? "Hide details" : "What's included →"}

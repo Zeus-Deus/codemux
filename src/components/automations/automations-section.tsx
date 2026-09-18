@@ -459,7 +459,7 @@ export function AutomationsSection() {
                     setDraft(null);
                   }}
                   className={cn(
-                    "group/row flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors",
+                    "group/row flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors duration-150",
                     active ? "bg-muted" : "hover:bg-muted/40",
                   )}
                 >
@@ -473,7 +473,7 @@ export function AutomationsSection() {
                           : "Enabled"
                     }
                     className={cn(
-                      "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors",
+                      "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors duration-150",
                       !automation.enabled
                         ? "bg-muted-foreground/40"
                         : automation.last_run_status === "failed"
@@ -485,7 +485,7 @@ export function AutomationsSection() {
                     <span className="flex items-center gap-1.5">
                       <span
                         className={cn(
-                          "min-w-0 flex-1 truncate text-body transition-colors",
+                          "min-w-0 flex-1 truncate text-body transition-colors duration-150",
                           active
                             ? "text-foreground"
                             : "text-muted-foreground group-hover/row:text-foreground",
@@ -1053,7 +1053,7 @@ function ScheduleField({
         </span>
         <button
           type="button"
-          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors"
+          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors duration-150"
           onClick={() => {
             if (draft.rawMode) {
               patch({ rawMode: false });
@@ -1197,7 +1197,7 @@ function RepoAccessRow({
           <button
             type="button"
             onClick={check}
-            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors"
+            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors duration-150"
           >
             Check again
           </button>

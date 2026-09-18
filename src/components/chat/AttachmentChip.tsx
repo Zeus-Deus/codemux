@@ -315,7 +315,7 @@ export function AttachmentChip({
           aria-label={`Expand ${metadata.label}`}
           title="Click to expand"
           data-testid="attachment-chip-preview-trigger"
-          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-current"
+          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-current"
         >
           <img
             src={previewUrl}

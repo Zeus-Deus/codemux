@@ -63,7 +63,7 @@ export function SkillRow({
       data-testid={`skill-row-${skill.id}`}
       data-enabled={enabled}
       className={cn(
-        "group flex items-center gap-3 px-3 py-2 transition-colors",
+        "group flex items-center gap-3 px-3 py-2 transition-colors duration-150",
         "hover:bg-accent/30",
         // Disabled skills render at half-opacity so users can see
         // they're still discovered but won't fire — the per-row
@@ -127,7 +127,7 @@ export function SkillRow({
         <div
           className={cn(
             "flex items-center gap-1",
-            "opacity-0 transition-opacity",
+            "opacity-0 transition-opacity duration-150",
             "group-hover:opacity-100 focus-within:opacity-100",
           )}
         >

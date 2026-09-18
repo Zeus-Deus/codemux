@@ -77,7 +77,7 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
       <button
         type="button"
         aria-label={`Remove ${label}`}
-        className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-foreground"
+        className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
         onClick={onRemove}
       >
         <X className="size-3" />

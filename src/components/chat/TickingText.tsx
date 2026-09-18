@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
+import { cn } from "@/lib/utils";
+
 /** Wall-clock cadence for elapsed-time labels. */
 const DEFAULT_INTERVAL_MS = 1000;
 
@@ -64,5 +66,17 @@ export function TickingText({
 
   // Rendered empty: the text is owned imperatively by the effects above, so
   // React must never claim knowledge of these children.
-  return <span ref={nodeRef} className={className} data-testid={testId} />;
+  //
+  // `tabular-nums` is not optional here and is deliberately not left to
+  // callers: this component exists to retick a number once a second, and
+  // proportional digits make everything beside it step sideways on the
+  // 0s -> 1m boundary. A caller can still override the figure style
+  // through `className`.
+  return (
+    <span
+      ref={nodeRef}
+      className={cn("tabular-nums", className)}
+      data-testid={testId}
+    />
+  );
 }

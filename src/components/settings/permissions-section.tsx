@@ -206,7 +206,7 @@ function RuleGroup({
             <li
               key={`${rule.scope}-${rule.behavior}-${rule.tool_name}-${rule.rule_content ?? ""}-${idx}`}
               className={cn(
-                "group flex items-center gap-3 px-3 py-2 transition-colors",
+                "group flex items-center gap-3 px-3 py-2 transition-colors duration-150",
                 idx > 0 && "border-t border-border/40",
                 "hover:bg-accent/30",
               )}
@@ -226,7 +226,7 @@ function RuleGroup({
                 variant="ghost"
                 size="icon-xs"
                 aria-label="Remove rule"
-                className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
                 onClick={() => onRemove(rule)}
               >
                 <Trash2 className="size-3.5" />

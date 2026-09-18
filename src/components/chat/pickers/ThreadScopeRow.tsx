@@ -58,7 +58,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
 
 const GHOST_BTN =
-  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground outline-none transition-colors hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
 
 /** Location-picker row geometry, shared by the Home row and the project
  *  rows so both sections line up on the same baseline. */
@@ -509,7 +509,7 @@ function LocationControl({
             className="text-label"
           />
           <CommandList
-            className="max-h-[280px] min-h-0 flex-1 overflow-y-auto p-1.5 pb-0 [scrollbar-width:thin]"
+            className="max-h-[280px] min-h-0 flex-1 overflow-y-auto p-1.5 pb-0 thin-scrollbar"
             onWheel={(e) => e.stopPropagation()}
           >
             {noMatches && (
@@ -578,7 +578,7 @@ function LocationControl({
                   handleSelectProject(result.path);
                 }
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground"
             >
               <FolderPlus className="size-3.5" />
               Open another project…
@@ -634,7 +634,7 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("current")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-surface-2"
         >
           <Folder className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
@@ -655,7 +655,7 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("worktree")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-surface-2"
         >
           <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
@@ -860,19 +860,19 @@ function BranchControl({
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors duration-150",
                 filterMode === "all"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
               )}
               onClick={() => setFilterMode("all")}
             >
-              All <span className="text-caption opacity-60">{allCount}</span>
+              All <span className="text-caption opacity-60 tabular-nums">{allCount}</span>
             </button>
             <button
               type="button"
               className={cn(
-                "flex-1 rounded-md px-2 py-1 text-label transition-colors",
+                "flex-1 rounded-md px-2 py-1 text-label transition-colors duration-150",
                 filterMode === "worktrees"
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -880,11 +880,11 @@ function BranchControl({
               onClick={() => setFilterMode("worktrees")}
             >
               Worktrees{" "}
-              <span className="text-caption opacity-60">{worktreeCount}</span>
+              <span className="text-caption opacity-60 tabular-nums">{worktreeCount}</span>
             </button>
           </div>
           <CommandList
-            className="max-h-[280px] overflow-y-auto [scrollbar-width:thin]"
+            className="max-h-[280px] overflow-y-auto thin-scrollbar [scrollbar-gutter:stable]"
             onWheel={(e) => e.stopPropagation()}
           >
             <CommandEmpty>
