@@ -2969,14 +2969,14 @@ export function Composer({
                     data-testid="composer-command-chip"
                     data-command-kind={pendingCommand.kind}
                     role="status"
-                    className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-accent-ember/15 px-2.5 py-1 text-xs text-accent-ember"
+                    className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-accent-ember/15 px-2.5 py-1 text-label text-accent-ember"
                   >
                     {/* Same icon the popup row carried, so the chip is
                         recognisably the thing the user just picked. */}
                     {pendingCommand.kind === "skill" ? (
-                      <BookOpen className="h-3 w-3 shrink-0" aria-hidden />
+                      <BookOpen className="size-3 shrink-0" aria-hidden />
                     ) : (
-                      <SquareSlash className="h-3 w-3 shrink-0" aria-hidden />
+                      <SquareSlash className="size-3 shrink-0" aria-hidden />
                     )}
                     <span className="shrink-0 font-medium">
                       Runs {pendingCommand.token}
