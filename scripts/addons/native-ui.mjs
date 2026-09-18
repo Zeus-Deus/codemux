@@ -260,7 +260,29 @@ let terminalProbe = 0;
 async function checkCoreTerminal() {
   const marker = `CODEMUX_CORE_${++terminalProbe}`;
   await wd("DELETE", "/actions");
-  await click(".xterm-screen");
+  const screen = await element(".xterm-screen");
+  const rect = await wd("GET", `/element/${elementId(screen)}/rect`);
+  // The shell-starting badge covers the centre of a narrow terminal. Focus
+  // its visible first row using a real pointer action, not a DOM focus bypass.
+  await wd("POST", "/actions", {
+    actions: [
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          {
+            type: "pointerMove",
+            origin: "viewport",
+            x: Math.round(rect.x + 12),
+            y: Math.round(rect.y + 12),
+          },
+          { type: "pointerDown", button: 0 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ],
+  });
   await type("textarea.xterm-helper-textarea", `echo ${marker}`);
   await wd("POST", "/actions", {
     actions: [
