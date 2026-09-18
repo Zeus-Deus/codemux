@@ -35,7 +35,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   useSyncedSettingsStore,
@@ -1249,7 +1249,7 @@ export function SettingsView() {
 
   const activeWorkspace = useAppStore((s) => {
     const st = s.appState;
-    return st?.workspaces.find((w) => w.workspace_id === st.active_workspace_id);
+    return st?.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(s));
   });
   const projectRoot = activeWorkspace?.project_root ?? null;
   const projectName = projectRoot ? basename(projectRoot) || "Project" : "Project";

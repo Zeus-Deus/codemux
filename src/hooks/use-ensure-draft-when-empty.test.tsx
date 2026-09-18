@@ -18,7 +18,8 @@ vi.mock("@/stores/feature-flags", () => ({
   ),
 }));
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: Object.assign(
     vi.fn((selector) =>
       selector({ appState: appStateSnapshot, homeDir: homeDirSnapshot }),

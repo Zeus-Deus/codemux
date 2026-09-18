@@ -682,6 +682,7 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 override_mode,
                 initial_prompt,
                 model_selection,
+                None,
             )
             .map(|()| serde_json::json!({ "ok": true }))
         }

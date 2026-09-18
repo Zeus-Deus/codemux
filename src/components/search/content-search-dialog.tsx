@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchInFiles } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
@@ -95,7 +95,7 @@ export function ContentSearchDialog() {
       // every backend tick).
       const appState = useAppStore.getState().appState;
       const ws = appState?.workspaces.find(
-        (w) => w.workspace_id === appState.active_workspace_id,
+        (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
       );
       if (!ws) return;
       try {

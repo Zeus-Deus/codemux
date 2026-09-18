@@ -414,7 +414,9 @@ fn build_core_app<R: tauri::Runtime>(
         // entry point used by `opencode_list_models`; the server is
         // not spawned until the first call. Shutting Codemux down
         // drops this state, which `kill_on_drop`-kills the child.
-        .manage(std::sync::Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new()))
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::opencode::OpenCodeServerManager::new(),
+        ))
         // Step 12 Stage 9 — Codex capability cache. Holds the
         // memoised `model/list` harvest so the picker doesn't
         // re-spawn `codex app-server` on every render. Empty on app
@@ -2263,6 +2265,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::get_app_state,
             commands::create_workspace,
             commands::create_empty_workspace,
+            commands::materialize_chat_workspace,
             commands::get_or_create_home_workspace,
             commands::regenerate_mcp_config,
             mcp_server::repair_inactive_mcp_configs,
@@ -2282,6 +2285,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,
             commands::activate_workspace,
+            commands::touch_workspace,
             commands::rename_workspace,
             commands::set_workspace_muted,
             commands::set_workspace_pinned,

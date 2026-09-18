@@ -162,6 +162,7 @@ describe("materializeAndSend", () => {
       // plus a best-effort rename.
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
         skipSetup: true,
+        initialChat: { provider: "claude", thread_id: draft.threadId },
       });
       expect(renameWorkspace).toHaveBeenCalledWith("ws-home", "hello world");
       expect(actions.markPromoted).toHaveBeenCalledWith(draft.draftId, {
@@ -218,7 +219,7 @@ describe("materializeAndSend", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
       expect(agentChatCreatePane).toHaveBeenCalledWith(
         "ws-project",
         "claude",
@@ -273,7 +274,7 @@ describe("materializeAndSend", () => {
       await materializeAndSend(draft, "   ", "/projects/foo", actions);
 
       await flushAutoName();
-      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
       expect(generateBranchName).not.toHaveBeenCalled();
       expect(renameWorkspace).not.toHaveBeenCalled();
     });
@@ -308,6 +309,7 @@ describe("materializeAndSend", () => {
       await materializeAndSend(draft, "   ", "/home/user", actions);
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
         skipSetup: true,
+        initialChat: { provider: "claude", thread_id: draft.threadId },
       });
       expect(renameWorkspace).not.toHaveBeenCalled();
     });
@@ -832,6 +834,9 @@ describe("materializeAndSend", () => {
         "main",
         null,
         null,
+        null,
+        null,
+        { provider: "claude", thread_id: draft.threadId },
       );
       // The project's own checkout is never touched.
       expect(createEmptyWorkspace).not.toHaveBeenCalled();
@@ -920,6 +925,9 @@ describe("materializeAndSend", () => {
         "main",
         null,
         null,
+        null,
+        null,
+        { provider: "claude", thread_id: draft.threadId },
       );
     });
 
@@ -955,6 +963,9 @@ describe("materializeAndSend", () => {
         "main",
         null,
         null,
+        null,
+        null,
+        { provider: "claude", thread_id: draft.threadId },
       );
     });
 
@@ -990,6 +1001,9 @@ describe("materializeAndSend", () => {
         "develop",
         null,
         null,
+        null,
+        null,
+        { provider: "claude", thread_id: draft.threadId },
       );
     });
 
@@ -1016,7 +1030,7 @@ describe("materializeAndSend", () => {
       expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
       expect(generateRandomBranchName).not.toHaveBeenCalled();
       // Falls through to the ordinary project-target path.
-      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
       // `generateBranchName` IS called here now — but only to title the
       // workspace, never to cut a branch. The no-worktree assertion above
       // is the invariant; the namer is no longer a proxy for it.
@@ -1047,6 +1061,7 @@ describe("materializeAndSend", () => {
       expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
         skipSetup: true,
+        initialChat: { provider: "claude", thread_id: draft.threadId },
       });
     });
 
@@ -1253,7 +1268,7 @@ describe("materializeWithPreset", () => {
       const result = await materializeWithPreset(draft, preset, "ship it", actions);
 
       expect(result.success).toBe(true);
-      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", undefined);
       expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
       expect(applyPreset).toHaveBeenCalledWith(
         "ws-project",
@@ -1405,7 +1420,7 @@ describe("materializeWithPreset", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo", { initialChat: { provider: "claude", thread_id: draft.threadId } });
       expect(activateWorkspace).toHaveBeenCalledWith("ws-project");
       expect(agentChatCreatePane).toHaveBeenCalledWith(
         "ws-project",
@@ -1441,6 +1456,7 @@ describe("materializeWithPreset", () => {
       // getOrCreateHomeWorkspace) and renamed to the prompt.
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
         skipSetup: true,
+        initialChat: { provider: "claude", thread_id: draft.threadId },
       });
       expect(renameWorkspace).toHaveBeenCalledWith("ws-home", "hi");
       expect(agentChatCreatePane).toHaveBeenCalledWith(

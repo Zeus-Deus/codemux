@@ -154,7 +154,8 @@ vi.mock("@/components/ui/hover-card", () => {
 const { appStateHolder } = vi.hoisted(() => ({
   appStateHolder: { current: null as unknown },
 }));
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
     selector({
       appState: appStateHolder.current,

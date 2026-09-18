@@ -72,3 +72,39 @@ describe("workspace removal commands", () => {
     expect(wasActivatedLocally("ws-theirs")).toBe(false);
   });
 });
+
+describe("remote activation", () => {
+  it("touches without invoking desktop activation and persists only the newest successful selection", async () => {
+    const { useAppStore, selectActiveWorkspaceId } = await import("@/stores/app-store");
+    const remoteWindow = window as Window & { __CODEMUX_REMOTE__?: boolean };
+    remoteWindow.__CODEMUX_REMOTE__ = true;
+    const previous = useAppStore.getState();
+    try {
+      useAppStore.setState({
+        appState: {
+          active_workspace_id: "desktop",
+          workspaces: ["desktop", "phone", "tablet"].map((workspace_id) => ({ workspace_id })),
+        } as import("./types").AppStateSnapshot,
+        remoteActiveWorkspaceId: "desktop", pendingActiveWorkspaceId: null,
+      });
+      let resolveFirst!: () => void;
+      mockInvoke.mockImplementationOnce(() => new Promise<void>((resolve) => { resolveFirst = resolve; }));
+      const first = activateWorkspace("phone");
+      await activateWorkspace("tablet");
+      resolveFirst();
+      await first;
+      expect(mockInvoke).toHaveBeenCalledWith("touch_workspace", { workspaceId: "phone" });
+      expect(mockInvoke).not.toHaveBeenCalledWith("activate_workspace", expect.anything());
+      expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("tablet");
+      expect(useAppStore.getState().appState?.active_workspace_id).toBe("desktop");
+
+      mockInvoke.mockRejectedValueOnce(new Error("disconnected"));
+      await expect(activateWorkspace("phone")).rejects.toThrow("disconnected");
+      expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("tablet");
+    } finally {
+      delete remoteWindow.__CODEMUX_REMOTE__;
+      useAppStore.setState(previous, true);
+      localStorage.clear();
+    }
+  });
+});

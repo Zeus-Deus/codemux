@@ -93,7 +93,7 @@ import {
   providerRef,
   providerRefLabel,
 } from "@/lib/source-control";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import {
   useTunnelStatusStore,
   tunnelStatusKind,
@@ -518,7 +518,7 @@ export function WorkspaceContextMenuItems({
     (state) => state.requestRenameWorkspace,
   );
   const isActiveWorkspace = useAppStore(
-    (s) => s.appState?.active_workspace_id === workspace.workspace_id,
+    (s) => selectActiveWorkspaceId(s) === workspace.workspace_id,
   );
   const editors = useDetectedEditors();
   // Const alias so the discriminant narrowing survives into the preset map's

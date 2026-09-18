@@ -1,15 +1,10 @@
 /**
  * Which workspaces THIS client brought into view.
  *
- * Every client — the desktop window and each remote web client — talks to
- * one backend and reads one app-state snapshot, including a single shared
- * `active_workspace_id`. So "the active workspace is empty" is not a fact
- * about this client: when the desktop creates a workspace and switches to
- * it, every other client sees that switch too, and any client-local guard
- * (an in-flight ref, a draft pointer) is blind to what the others are
- * already doing. Auto-repair effects that react to the active workspace
- * therefore fan out — each client injects its own pane into a workspace
- * the first one is still populating.
+ * The desktop and remote clients share workspace data, but each remote
+ * client owns its selection. A view seeded on connect can still encounter a
+ * workspace another client is filling. Only explicit local navigation may
+ * authorize auto-repair of an empty workspace after boot.
  *
  * This is the missing half of that check: a client may only auto-repair a
  * workspace it itself navigated to. Recorded inside the `activateWorkspace`
