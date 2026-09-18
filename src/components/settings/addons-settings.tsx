@@ -32,7 +32,7 @@ import {
 } from "@/lib/addons/types";
 function Capabilities({ manifest }: { manifest: AddonManifest }) {
   return (
-    <div className="space-y-3 text-sm">
+    <div className="space-y-3 text-body">
       <h4 className="font-medium">Requested access</h4>
       {!manifest.permissions.length && !manifest.http.length ? (
         <p className="text-muted-foreground">
@@ -96,13 +96,13 @@ function Credentials({
   return (
     <section className="space-y-3 border-t pt-5">
       <h3 className="font-medium">Credentials</h3>
-      <p className="text-sm text-muted-foreground">
+      <p className="text-body text-muted-foreground">
         Values stay in CodeMux’s credential store and are attached only to the
         declared service. Add-ons cannot read them.
       </p>
       {installation.manifest.credentials.map((field) => (
         <div key={field.id} className="space-y-2">
-          <label className="text-sm" htmlFor={`credential-${field.id}`}>
+          <label className="text-body" htmlFor={`credential-${field.id}`}>
             {field.label}
           </label>
           <div className="flex gap-2">
@@ -138,10 +138,10 @@ function Credentials({
               Save
             </Button>
           </div>
-          <p className="text-xs text-muted-foreground">{field.origin}</p>
+          <p className="text-label text-muted-foreground">{field.origin}</p>
         </div>
       ))}
-      <label className="flex items-center gap-2 text-sm">
+      <label className="flex items-center gap-2 text-body">
         <input
           type="checkbox"
           checked={session}
@@ -178,11 +178,11 @@ function Configure({
       </Button>
       <div>
         <h2 className="text-xl font-semibold">{installation.manifest.name}</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-body text-muted-foreground">
           {installation.manifest.description}
         </p>
       </div>
-      <div className="grid gap-1 text-sm">
+      <div className="grid gap-1 text-body">
         <span>
           {installation.source.kind === "catalog"
             ? "Catalog source"
@@ -192,7 +192,7 @@ function Configure({
         <span className="break-all text-muted-foreground">
           {installation.manifest.repository}
         </span>
-        <code className="break-all text-xs text-muted-foreground">
+        <code className="break-all text-label text-muted-foreground">
           SHA-256 {installation.digest}
         </code>
       </div>
@@ -219,7 +219,7 @@ function Configure({
         >
           <h3 className="font-medium">Configuration</h3>
           {installation.manifest.settings.map((field) => (
-            <label key={field.id} className="grid gap-2 text-sm">
+            <label key={field.id} className="grid gap-2 text-body">
               {field.label}
               {field.type === "boolean" ? (
                 <Switch
@@ -263,7 +263,7 @@ function Configure({
           <div className="flex items-center gap-3">
             <Button disabled={busy}>Save settings</Button>
             {saved && (
-              <span role="status" className="text-sm text-muted-foreground">
+              <span role="status" className="text-body text-muted-foreground">
                 Saved
               </span>
             )}
@@ -274,7 +274,7 @@ function Configure({
       {installation.failure && (
         <div
           role="alert"
-          className="rounded-lg border border-destructive/30 p-3 text-sm"
+          className="rounded-lg border border-destructive/30 p-3 text-body"
         >
           {installation.failure}
         </div>
@@ -330,7 +330,7 @@ export function AddonsSettings() {
     return (
       <div className="space-y-3">
         <h2 className="text-xl font-semibold">Add-ons</h2>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-body text-muted-foreground">
           Add-ons run in the local desktop app. Installation and plugin
           operations are unavailable in a remote browser.
         </p>
@@ -341,7 +341,7 @@ export function AddonsSettings() {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-xl font-semibold">Add-ons</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-body text-muted-foreground">
             Optional tools for your projects and conversations.
           </p>
         </div>
@@ -361,18 +361,18 @@ export function AddonsSettings() {
       {(error || state.error) && (
         <p
           role="alert"
-          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"
+          className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-body"
         >
           {error || state.error}
         </p>
       )}
       {state.paused && (
-        <p role="status" className="rounded-lg border bg-muted/40 p-3 text-sm">
+        <p role="status" className="rounded-lg border bg-muted/40 p-3 text-body">
           All add-ons are paused. Your installed packages and settings are kept.
         </p>
       )}
       {!!state.warnings?.length && (
-        <div role="status" className="space-y-2 rounded-lg border p-3 text-sm">
+        <div role="status" className="space-y-2 rounded-lg border p-3 text-body">
           {state.warnings.map((warning) => (
             <p key={warning}>{warning}</p>
           ))}
@@ -466,7 +466,7 @@ export function AddonsSettings() {
             <div className="rounded-xl border border-dashed px-6 py-12 text-center">
               <Puzzle className="mx-auto size-7 text-muted-foreground" />
               <h3 className="mt-4 font-medium">Make room for your workflow</h3>
-              <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
+              <p className="mx-auto mt-2 max-w-md text-body text-muted-foreground">
                 Add-ons can add project panels, commands, and composer actions.
                 Browse reviewed releases or import a package to review its
                 access before enabling it.
@@ -491,7 +491,7 @@ export function AddonsSettings() {
                           {item.manifest.version}
                         </span>
                       </h3>
-                      <p className="mt-1 text-xs text-muted-foreground">
+                      <p className="mt-1 text-label text-muted-foreground">
                         {item.manifest.author.name} ·{" "}
                         {item.source.kind === "local"
                           ? "Local / unverified"
@@ -503,11 +503,11 @@ export function AddonsSettings() {
                       <ShieldCheck className="size-4 text-muted-foreground" />
                     )}
                   </div>
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-body text-muted-foreground">
                     {item.manifest.description}
                   </p>
                   {item.failure && (
-                    <p className="text-sm text-destructive">{item.failure}</p>
+                    <p className="text-body text-destructive">{item.failure}</p>
                   )}
                   <div className="flex flex-wrap gap-2">
                     <Button
@@ -589,8 +589,8 @@ export function AddonsSettings() {
         <section className="space-y-3 border-t pt-5">
           <div className="flex items-center justify-between gap-4">
             <div>
-              <h3 className="text-sm font-medium">Developer mode</h3>
-              <p className="mt-1 text-xs text-muted-foreground">
+              <h3 className="text-body font-medium">Developer mode</h3>
+              <p className="mt-1 text-label text-muted-foreground">
                 Watch one package you select. Off by default each time CodeMux
                 starts.
               </p>
@@ -608,7 +608,7 @@ export function AddonsSettings() {
           </div>
           {state.developerMode && (
             <>
-              <p className="text-xs text-muted-foreground">
+              <p className="text-label text-muted-foreground">
                 Validated local builds reload with the access you accepted.
                 Changed access needs a new review. CodeMux does not run package
                 scripts or discover source folders.
@@ -719,22 +719,22 @@ export function AddonsSettings() {
           </DialogHeader>
           {review && (
             <>
-              <p className="text-sm">{review.manifest.description}</p>
+              <p className="text-body">{review.manifest.description}</p>
               {review.development && (
-                <p className="rounded border p-3 text-sm">
+                <p className="rounded-sm border p-3 text-body">
                   Development package. Once enabled, CodeMux watches this
                   selected file for validated local rebuilds. Permission changes
                   still need review.
                 </p>
               )}
-              <p className="text-xs text-muted-foreground">
+              <p className="text-label text-muted-foreground">
                 Author: {review.manifest.author.name} · License:{" "}
                 {review.manifest.license}
               </p>
               <Capabilities manifest={review.manifest} />
-              <code className="break-all text-xs">SHA-256 {review.digest}</code>
+              <code className="break-all text-label">SHA-256 {review.digest}</code>
               {review.replacesSource && (
-                <label className="flex items-start gap-2 text-sm">
+                <label className="flex items-start gap-2 text-body">
                   <input
                     type="checkbox"
                     checked={replace}
@@ -744,7 +744,7 @@ export function AddonsSettings() {
                   grants and private data will not carry over.
                 </label>
               )}
-              <label className="flex items-center gap-2 text-sm">
+              <label className="flex items-center gap-2 text-body">
                 <input
                   type="checkbox"
                   checked={enable}
@@ -753,7 +753,7 @@ export function AddonsSettings() {
                 Enable after installation
               </label>
               {review.retainedData && (
-                <label className="flex items-start gap-2 text-sm">
+                <label className="flex items-start gap-2 text-body">
                   <input
                     type="checkbox"
                     checked={restoreData}
@@ -800,7 +800,7 @@ export function AddonsSettings() {
               keep private data.
             </DialogDescription>
           </DialogHeader>
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-body">
             <input
               type="checkbox"
               checked={keep}
