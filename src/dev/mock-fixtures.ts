@@ -287,6 +287,7 @@ function makeWorkspace(seed: WorkspaceSeed): WorkspaceSnapshot {
     pr_number: seed.pr_number ?? null,
     pr_state: seed.pr_state ?? null,
     pr_url: seed.pr_url ?? null,
+    prs: seed.prs ?? undefined,
     // Absent means GitHub, matching the frontend's back-compat rule, so
     // only the deliberately-GitLab seeds set this.
     provider_kind: seed.provider_kind ?? null,
@@ -579,6 +580,47 @@ const wsCodemuxMonitoring = (() => {
   };
 })();
 
+/** A workspace that split one plan into a stack of pull requests — the shape
+ *  an agent produces when it is asked for reviewable increments: a branch and
+ *  a PR per concern, each based on the one below it. The early PRs have landed
+ *  while the later ones are still in review, so the card must read as *open*
+ *  and must not settle. Note the checkout itself sits on a branch with no PR
+ *  of its own: the stack branches were cut with `git branch` and never checked
+ *  out, which is precisely the case a single `pr_number` could not see. */
+const wsCodemuxStack = makeWorkspace({
+  workspace_id: "ws-codemux-stack",
+  title: "design-system-pass",
+  cwd: `${HOME}/.codemux/worktrees/codemux/design-system-pass`,
+  worktree_path: `${HOME}/.codemux/worktrees/codemux/design-system-pass`,
+  project_root: codemuxRoot,
+  project_uid: codemuxUid,
+  workspace_kind: "worktree",
+  git_branch: "design-system-pass",
+  git_ahead: 9,
+  git_additions: 612,
+  git_deletions: 288,
+  git_changed_files: 27,
+  prs: [
+    "MERGED",
+    "MERGED",
+    "MERGED",
+    "MERGED",
+    "OPEN",
+    "OPEN",
+    "OPEN",
+    "OPEN",
+    "OPEN",
+  ].map((state, i) => ({
+    number: 372 + i,
+    state,
+    url: `https://github.com/example/codemux/pull/${372 + i}`,
+    head_branch: `ui-pass/0${i + 1}`,
+    base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+    source: "worktree" as const,
+    checkout_branch: "design-system-pass",
+  })),
+});
+
 const wsCodemuxPorts = makeWorkspace({
   workspace_id: "ws-codemux-ports",
   title: "port-detection",
@@ -870,6 +912,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxChatLive,
   wsCodemuxMonitoring,
   wsCodemuxPorts,
+  wsCodemuxStack,
   wsCodemuxWorkflowApproval,
   wsCodemuxWorkflowRunning,
   wsCodemuxWorkflowComplete,

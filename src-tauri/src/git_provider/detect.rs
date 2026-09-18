@@ -498,7 +498,7 @@ pub(crate) fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
 /// answer (for example, a repository with no remotes) from a subprocess
 /// failure. Provider refreshers use that distinction to cache authoritative
 /// negative detection while preserving last-known UI state on failures.
-fn run_git_allow_empty(repo_path: &Path, args: &[&str]) -> Result<String, ()> {
+pub(crate) fn run_git_allow_empty(repo_path: &Path, args: &[&str]) -> Result<String, ()> {
     let mut cmd = crate::execution::host_command("git");
     cmd.args(args).current_dir(repo_path);
     sanitize_gui_env_std(&mut cmd);

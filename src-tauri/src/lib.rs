@@ -233,6 +233,23 @@ mod window_background_tests {
     }
 }
 
+/// Convert host PR rows into the snapshot's stored shape.
+pub(crate) fn workspace_pr_rows(
+    prs: Vec<crate::github::SourcedPr>,
+) -> Vec<crate::state::WorkspacePr> {
+    prs.into_iter()
+        .map(|entry| crate::state::WorkspacePr {
+            number: entry.pr.number,
+            state: entry.pr.display_state(),
+            url: entry.pr.url,
+            head_branch: entry.pr.head_branch,
+            base_branch: entry.pr.base_branch,
+            source: Some(entry.source),
+            checkout_branch: entry.checkout_branch,
+        })
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     diagnostics::record_startup_milestone("startup.run-enter");
@@ -1918,7 +1935,7 @@ fn build_core_app<R: tauri::Runtime>(
                                 "background.pr-poll.queue-delay",
                                 queued_at.elapsed(),
                             );
-                            provider_for_pr.workspace_pull_request(&path_for_pr)
+                            provider_for_pr.workspace_pull_requests(&path_for_pr)
                         })
                         .await;
 
@@ -1941,28 +1958,20 @@ fn build_core_app<R: tauri::Runtime>(
                                 // emits at most one snapshot per pass, so an
                                 // update that does not set the flag is an
                                 // update the renderer never hears about.
-                                match github::branch_pr_outcome(lookup) {
-                                    github::BranchPrOutcome::Write(pr) => {
-                                        changed |= state.update_workspace_pr_info(
+                                match github::workspace_prs_outcome(lookup) {
+                                    github::WorkspacePrsOutcome::Write(prs) => {
+                                        changed |= state.update_workspace_prs(
                                             &workspace_id,
-                                            Some(pr.number),
-                                            Some(pr.display_state()),
-                                            Some(pr.url),
-                                            pr.head_branch,
+                                            workspace_pr_rows(prs),
                                         );
                                         refreshed += 1;
                                     }
-                                    github::BranchPrOutcome::Clear => {
-                                        changed |= state.update_workspace_pr_info(
-                                            &workspace_id,
-                                            None,
-                                            None,
-                                            None,
-                                            None,
-                                        );
+                                    github::WorkspacePrsOutcome::Clear => {
+                                        changed |=
+                                            state.update_workspace_prs(&workspace_id, Vec::new());
                                         refreshed += 1;
                                     }
-                                    github::BranchPrOutcome::Preserve => {}
+                                    github::WorkspacePrsOutcome::Preserve => {}
                                 }
                             }
                             Err(e) => {
