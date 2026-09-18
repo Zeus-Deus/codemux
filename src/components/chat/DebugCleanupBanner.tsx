@@ -25,15 +25,15 @@ export function DebugCleanupBanner({ onCleanup, busy = false }: Props) {
       <div
         className={cn(
           CHAT_COLUMN_INNER,
-          "flex items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-xs"
+          "flex items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-label"
         )}
       >
         <Bug className="size-3.5 text-danger" aria-hidden />
         <span>Debug markers detected in this project.</span>
         <Button
-          size="sm"
+          size="xs"
           variant="outline"
-          className="ml-auto h-6 text-xs"
+          className="ml-auto"
           onClick={onCleanup}
           disabled={busy}
         >

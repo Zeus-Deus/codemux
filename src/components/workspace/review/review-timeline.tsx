@@ -347,7 +347,7 @@ function AgentEntry({
             data-testid="timeline-open-thread"
             onClick={() => onOpenThread(run)}
             className={cn(
-              "rounded border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors hover:bg-accent/50 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              "rounded-sm border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors hover:bg-accent/50 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
               tzMeta,
             )}
           >

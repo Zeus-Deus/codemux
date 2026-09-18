@@ -116,7 +116,7 @@ export function ConfirmPushDialog({
               type="checkbox"
               checked={dontAskAgain}
               onChange={(e) => setDontAskAgain(e.target.checked)}
-              className="rounded border-border"
+              className="rounded-sm border-border"
             />
             <span className="text-body-sm text-muted-foreground">
               Don't ask again for {host.name}
@@ -127,7 +127,6 @@ export function ConfirmPushDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
             >
               Cancel
@@ -135,7 +134,6 @@ export function ConfirmPushDialog({
             <Button
               variant="secondary"
               size="sm"
-              className="h-7 gap-1.5 px-3 text-body-sm"
               onClick={handleConfirm}
             >
               <ArrowUpRight className="size-3" />

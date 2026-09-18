@@ -123,7 +123,7 @@ function AccountValue({ account }: { account: string }) {
       onClick={() => setRevealed((v) => !v)}
       title={revealed ? "Hide account" : "Click to reveal account"}
       aria-label={revealed ? "Hide account name" : "Reveal account name"}
-      className="font-mono text-body-sm text-foreground/90 rounded px-1 -mx-1 hover:bg-muted/60 transition-colors"
+      className="font-mono text-body-sm text-foreground/90 rounded-sm px-1 -mx-1 hover:bg-muted/60 transition-colors"
     >
       {revealed ? account : maskAccount(account)}
     </button>
@@ -180,7 +180,7 @@ function ProviderRow({
             onClick={() => setOpen((v) => !v)}
             aria-label={open ? "Hide details" : "Show details"}
             aria-expanded={open}
-            className="shrink-0 rounded p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors"
+            className="shrink-0 rounded-sm p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors"
           >
             <ChevronRight
               className={cn(
@@ -402,7 +402,6 @@ function CustomHostsEditor() {
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => {
                 setAdding(false);
                 setDraftHost("");
@@ -415,7 +414,6 @@ function CustomHostsEditor() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={handleAdd}
             >
               Add
@@ -428,7 +426,7 @@ function CustomHostsEditor() {
           variant="ghost"
           size="sm"
           onClick={() => setAdding(true)}
-          className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+          className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
         >
           <Plus className="size-3.5" />
           Add self-hosted server

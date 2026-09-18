@@ -32,7 +32,7 @@ export const UserInputAnswer = memo(function UserInputAnswer({
   // or a future decision shape we don't parse) — fall back to the
   // original muted marker so the row is never blank.
   if (lines.length === 0) {
-    return <div className="py-0.5 text-xs text-muted-foreground">Answered</div>;
+    return <div className="py-0.5 text-label text-muted-foreground">Answered</div>;
   }
 
   // With a single question the value speaks for itself; with several,
@@ -42,7 +42,7 @@ export const UserInputAnswer = memo(function UserInputAnswer({
   return (
     <div className="flex justify-end">
       <div className="flex max-w-[82%] flex-col items-end gap-1">
-        <div className="flex flex-col gap-2 rounded-[14px_14px_5px_14px] border border-border/60 bg-card px-[15px] py-[11px] text-sm leading-relaxed text-foreground">
+        <div className="flex flex-col gap-2 rounded-[14px_14px_5px_14px] border border-border/60 bg-card px-[15px] py-[11px] text-body leading-relaxed text-foreground">
           {lines.map((line, i) => (
             <div key={i} className="flex flex-col gap-0.5">
               {showHeaders && line.header ? (

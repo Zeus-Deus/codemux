@@ -142,7 +142,7 @@ function DeleteArchivedDialog({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} className="max-w-[360px]">
         <DialogHeader>
-          <DialogTitle className="text-sm">
+          <DialogTitle className="text-body">
             {isRoot
               ? <>Remove &ldquo;{entry.title}&rdquo; from archive?</>
               : <>Delete &ldquo;{entry.title}&rdquo;?</>}
@@ -155,7 +155,7 @@ function DeleteArchivedDialog({
         </DialogHeader>
 
         {forceMessage !== null && (
-          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-label text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             {forceMessage}
           </div>
@@ -168,9 +168,9 @@ function DeleteArchivedDialog({
                 type="checkbox"
                 checked={deleteWorktree}
                 onChange={(e) => setDeleteWorktree(e.target.checked)}
-                className="rounded border-border"
+                className="rounded-sm border-border"
               />
-              <span className="text-xs text-muted-foreground">
+              <span className="text-label text-muted-foreground">
                 Also delete worktree from disk
               </span>
             </label>
@@ -180,9 +180,9 @@ function DeleteArchivedDialog({
                   type="checkbox"
                   checked={deleteBranch}
                   onChange={(e) => setDeleteBranch(e.target.checked)}
-                  className="rounded border-border"
+                  className="rounded-sm border-border"
                 />
-                <span className="text-xs text-muted-foreground">
+                <span className="text-label text-muted-foreground">
                   Also delete local branch
                 </span>
               </label>
@@ -194,7 +194,6 @@ function DeleteArchivedDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -202,7 +201,6 @@ function DeleteArchivedDialog({
           <Button
             variant={isRoot ? "secondary" : "destructive"}
             size="sm"
-            className="h-7 px-3 text-xs"
             onClick={() => void confirm()}
           >
             {forceMessage !== null
@@ -251,18 +249,18 @@ function ArchivedEntryRow({
             {entry.title}
           </span>
           {isRoot && (
-            <span className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground bg-muted border border-border/60">
+            <span className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-muted-foreground bg-muted border border-border/60">
               repo root
             </span>
           )}
           {entry.git_branch && (
-            <span className="shrink-0 truncate max-w-48 rounded bg-muted px-1.5 font-mono text-caption leading-[16px] text-muted-foreground">
+            <span className="shrink-0 truncate max-w-48 rounded-sm bg-muted px-1.5 font-mono text-caption leading-[16px] text-muted-foreground">
               {entry.git_branch}
             </span>
           )}
           {isStale && (
             <span
-              className="shrink-0 rounded px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
+              className="shrink-0 rounded-sm px-1.5 text-caption leading-[16px] text-muted-foreground/60 bg-muted/60"
               title="Archived more than 30 days ago"
             >
               stale
@@ -278,7 +276,6 @@ function ArchivedEntryRow({
         <Button
           variant="secondary"
           size="sm"
-          className="h-7 px-2.5 text-xs"
           disabled={unarchiving}
           onClick={() => void handleUnarchive()}
         >
@@ -289,7 +286,7 @@ function ArchivedEntryRow({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={onDeleteRequest}
           >
             Remove from archive

@@ -328,7 +328,7 @@ export function HostsSection() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+      <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
         Loading hosts…
       </div>
@@ -481,7 +481,6 @@ export function HostsSection() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-7 px-3 text-body-sm"
                   onClick={() => {
                     setDraft(null);
                     setDraftKind(null);
@@ -494,7 +493,6 @@ export function HostsSection() {
                   type="button"
                   variant="secondary"
                   size="sm"
-                  className="h-7 px-3 text-body-sm"
                   onClick={handleAdd}
                 >
                   Add
@@ -506,7 +504,7 @@ export function HostsSection() {
               type="button"
               variant="ghost"
               size="sm"
-              className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
               onClick={() => {
                 setDraft({ name: "", ssh_target: "" });
                 setDraftKind(null);
@@ -575,7 +573,6 @@ export function HostsSection() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={handleCancelEdit}
               >
                 <X className="size-3.5" />
@@ -585,7 +582,6 @@ export function HostsSection() {
                 type="button"
                 variant="secondary"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={handleSaveEdit}
               >
                 <Check className="size-3.5" />
@@ -621,7 +617,7 @@ export function HostsSection() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="h-8 text-body-sm gap-1.5 shrink-0"
+                  className="shrink-0"
                   disabled={testingId === selected.id}
                   onClick={() => void handleTestConnection(selected)}
                 >
@@ -661,7 +657,6 @@ export function HostsSection() {
                         type="button"
                         variant="secondary"
                         size="sm"
-                        className="h-8 text-body-sm"
                         disabled={installingId === selected.id}
                         onClick={() =>
                           void handleInstallRemote(
@@ -703,7 +698,7 @@ export function HostsSection() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="h-8 text-body-sm gap-1.5 shrink-0"
+                  className="shrink-0"
                   disabled={reinstallingId === selected.id}
                   onClick={() => void handleReinstallRemote(selected)}
                 >
@@ -727,7 +722,6 @@ export function HostsSection() {
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm"
                 onClick={() => handleStartEdit(selected)}
               >
                 <Pencil className="size-3.5" />
@@ -737,7 +731,7 @@ export function HostsSection() {
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="h-8 gap-1.5 text-body-sm text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                 onClick={() => void handleDelete(selected)}
               >
                 <Trash2 className="size-3.5" />

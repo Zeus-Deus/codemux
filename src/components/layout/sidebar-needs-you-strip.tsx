@@ -206,7 +206,7 @@ export function SidebarNeedsYouStrip({
 
   return (
     <div
-      className="mx-1.5 mt-1.5 mb-1.5 rounded-[10px] border border-status-attention/25 bg-status-attention/5 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-200"
+      className="mx-1.5 mt-1.5 mb-1.5 rounded-lg border border-status-attention/25 bg-status-attention/5 px-2 py-[7px] animate-in fade-in slide-in-from-top-1 duration-200"
       role="region"
       aria-label="Workspaces needing you"
     >
@@ -229,7 +229,7 @@ export function SidebarNeedsYouStrip({
                 key={workspace.workspace_id}
                 type="button"
                 onClick={() => jumpToWorkspace(workspace.workspace_id, projectPath)}
-                className="group/needs flex items-center gap-2 rounded px-1 py-[3px] text-left hover:bg-foreground/5 transition-colors"
+                className="group/needs flex items-center gap-2 rounded-sm px-1 py-[3px] text-left hover:bg-surface-2 transition-colors"
                 aria-label={`Jump to ${workspace.title} — waiting for your input`}
               >
                 <ProjectAvatar

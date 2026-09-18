@@ -409,7 +409,6 @@ function PairingPanel({
               type="button"
               variant="outline"
               size="sm"
-              className="gap-1.5"
               disabled={regenerating}
               onClick={onRegenerate}
             >
@@ -468,7 +467,7 @@ function PendingRow({
         <Button
           type="button"
           size="sm"
-          className="h-7 gap-1.5 bg-status-open/90 text-status-open-foreground hover:bg-status-open"
+          className="bg-status-open/90 text-status-open-foreground hover:bg-status-open"
           disabled={busy}
           onClick={onApprove}
         >
@@ -479,7 +478,7 @@ function PendingRow({
           type="button"
           size="sm"
           variant="ghost"
-          className="h-7 text-muted-foreground hover:text-status-attention"
+          className="text-muted-foreground hover:text-status-attention"
           disabled={busy}
           onClick={onReject}
         >
@@ -541,7 +540,7 @@ function DeviceRow({
         type="button"
         size="sm"
         variant="ghost"
-        className="h-7 shrink-0 gap-1.5 text-muted-foreground hover:text-status-attention"
+        className="shrink-0 text-muted-foreground hover:text-status-attention"
         disabled={busy}
         onClick={onRevoke}
       >
@@ -1142,7 +1141,7 @@ export function RemoteAccessSection() {
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1 space-y-1.5">
             <div className="flex items-center gap-2">
-              <h3 className="text-sm font-medium">Enable remote access</h3>
+              <h3 className="text-body font-medium">Enable remote access</h3>
               {running && (
                 <Badge
                   variant="outline"
@@ -1153,7 +1152,7 @@ export function RemoteAccessSection() {
                 </Badge>
               )}
             </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
+            <p className="text-label leading-relaxed text-muted-foreground">
               Turning this on starts a server that listens on{" "}
               <span className="font-medium text-foreground">
                 every network interface
@@ -1227,7 +1226,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
+                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -1279,8 +1278,7 @@ export function RemoteAccessSection() {
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
-                  className="h-9"
+                  size="default"
                   disabled={
                     !portDirty || !portValidation.valid || portPending || rebindBusy
                   }
@@ -1524,7 +1522,7 @@ export function RemoteAccessSection() {
                 <Button
                   type="button"
                   size="sm"
-                  className="shrink-0 gap-1.5"
+                  className="shrink-0"
                   disabled={pairingPending}
                   onClick={handleCreatePairing}
                 >
@@ -1577,7 +1575,7 @@ export function RemoteAccessSection() {
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-7 gap-1.5 text-muted-foreground hover:text-status-attention"
+                  className="text-muted-foreground hover:text-status-attention"
                   disabled={revokingAll}
                   onClick={handleRevokeAll}
                 >

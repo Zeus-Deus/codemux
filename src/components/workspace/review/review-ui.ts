@@ -111,7 +111,7 @@ export const btnQuiet = `${BASE} bg-transparent text-muted-foreground hover:text
  * its box never changes between states.
  */
 const BASE_XS =
-  "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded border-0 " +
+  "inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded-sm border-0 " +
   "px-2 text-body-sm font-medium transition-colors outline-none " +
   "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
 

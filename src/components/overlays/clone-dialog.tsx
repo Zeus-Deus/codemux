@@ -78,7 +78,7 @@ export function CloneDialog() {
         className="sm:max-w-[460px] bg-popover p-0 gap-0 overflow-hidden"
       >
         <DialogHeader className="px-5 pt-4 pb-2">
-          <DialogTitle className="text-sm">Clone Repository</DialogTitle>
+          <DialogTitle className="text-body">Clone Repository</DialogTitle>
           <DialogDescription className="sr-only">
             Clone a git repository
           </DialogDescription>
@@ -86,14 +86,14 @@ export function CloneDialog() {
 
         <div className="px-5 pb-4 space-y-3">
           <div className="space-y-1.5">
-            <label className="text-xs text-muted-foreground">
+            <label className="text-label text-muted-foreground">
               Repository URL
             </label>
             <Input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://github.com/user/repo.git"
-              className="h-8 text-sm"
+              className="h-8 text-body"
               autoFocus
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleClone();
@@ -102,18 +102,18 @@ export function CloneDialog() {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs text-muted-foreground">Directory</label>
+            <label className="text-label text-muted-foreground">Directory</label>
             <div className="flex gap-1.5">
               <Input
                 value={targetDir}
                 onChange={(e) => setTargetDir(e.target.value)}
                 placeholder={repoName || "~/project-name"}
-                className="h-8 text-sm flex-1 font-mono"
+                className="h-8 text-body flex-1 font-mono"
               />
               <Button
                 variant="outline"
                 size="sm"
-                className="h-8 shrink-0"
+                className="shrink-0"
                 onClick={handlePickDir}
               >
                 <FolderOpen className="h-3.5 w-3.5" />
@@ -122,13 +122,13 @@ export function CloneDialog() {
           </div>
 
           {error && (
-            <div className="p-2 rounded-md bg-destructive/10 border border-destructive/20 text-xs text-destructive">
+            <div className="p-2 rounded-md bg-destructive/10 border border-destructive/20 text-label text-destructive">
               {error}
             </div>
           )}
 
           {cloning && (
-            <div className="rounded-md border border-border/50 bg-foreground/5 px-3 py-2.5">
+            <div className="rounded-md border border-border/50 bg-surface-2 px-3 py-2.5">
               <CloneProgressRow progress={cloneProgress} />
               <p className="mt-2 text-label text-muted-foreground">
                 Cloning — this can take a while on slow connections…

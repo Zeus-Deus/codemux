@@ -135,7 +135,7 @@ export function WorkspaceResourceSection({
         <button
           type="button"
           onClick={() => toggleProject(project.projectId)}
-          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-foreground/[0.04] transition-colors"
+          className="group w-full flex items-center justify-between px-2 py-1.5 hover:bg-surface-2 transition-colors"
           aria-label={isProjectCollapsed ? "Expand project" : "Collapse project"}
         >
           <div className="flex items-center gap-1 min-w-0 mr-2">
@@ -165,7 +165,7 @@ export function WorkspaceResourceSection({
 
             return (
               <div key={workspace.workspace_id}>
-                <div className="group flex items-center hover:bg-foreground/[0.04] transition-colors">
+                <div className="group flex items-center hover:bg-surface-2 transition-colors">
                   {hasSessions ? (
                     <button
                       type="button"
@@ -215,7 +215,7 @@ export function WorkspaceResourceSection({
                         type="button"
                         key={session.session_id}
                         onClick={() => navigateToSession(session.session_id)}
-                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-foreground/[0.04] transition-colors text-left"
+                        className="w-full flex items-center justify-between pl-12 pr-3.5 py-1 hover:bg-surface-2 transition-colors text-left"
                       >
                         <div className="flex items-center gap-1.5 min-w-0 mr-2">
                           <span className="h-1 w-1 shrink-0 rounded-full bg-muted-foreground/40" />

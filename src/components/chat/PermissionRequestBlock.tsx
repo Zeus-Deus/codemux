@@ -26,7 +26,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
 
   if (item.resolution.state === "resolved") {
     return (
-      <div className="py-0.5 text-xs text-muted-foreground">
+      <div className="py-0.5 text-label text-muted-foreground">
         {resolvedLabel(item.resolution.decision)}
       </div>
     );
@@ -34,13 +34,13 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
 
   if (item.resolution.state === "responding") {
     return (
-      <div className="py-0.5 text-xs text-muted-foreground">Pending…</div>
+      <div className="py-0.5 text-label text-muted-foreground">Pending…</div>
     );
   }
 
   if (item.resolution.state === "failed") {
     return (
-      <div className="py-0.5 text-xs text-muted-foreground">
+      <div className="py-0.5 text-label text-muted-foreground">
         {item.resolution.message}
       </div>
     );
@@ -58,8 +58,8 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
   };
 
   return (
-    <div className="rounded-[10px] border border-border/60 bg-muted/40 p-3 space-y-2">
-      <div className="text-xs text-muted-foreground">
+    <div className="rounded-lg border border-border/60 bg-muted/40 p-3 space-y-2">
+      <div className="text-label text-muted-foreground">
         Approval requested{toolName ? `: ${toolName}` : ""}
       </div>
       {inputText && (
@@ -75,7 +75,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
           <Button
             type="button"
             size="sm"
-            className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
+            className="bg-foreground text-background hover:bg-foreground/90"
             onClick={allow}
           >
             Allow
@@ -84,7 +84,6 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             type="button"
             variant="outline"
             size="sm"
-            className="h-7 px-3 text-xs"
             onClick={allowSession}
           >
             Allow for session
@@ -93,7 +92,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={() => setDenying(true)}
           >
             Deny
@@ -105,7 +104,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             placeholder="Reason (optional)"
-            className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-xs text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
+            className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-label text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
             rows={2}
           />
           {/* Confirm-deny is the sole sanctioned use of --danger in
@@ -117,7 +116,6 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
               type="button"
               variant="destructive"
               size="sm"
-              className="h-7 px-3 text-xs"
               onClick={confirmDeny}
             >
               Confirm deny
@@ -126,7 +124,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+              className="text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");

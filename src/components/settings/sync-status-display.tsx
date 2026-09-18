@@ -85,14 +85,14 @@ export function SyncStatusDisplay() {
       <div className="flex items-center gap-3">
         <SyncStateIcon state={status.state} />
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium">{stateLabel(status.state)}</div>
+          <div className="text-body font-medium">{stateLabel(status.state)}</div>
           {status.lastSyncAt && (
-            <div className="text-xs text-muted-foreground">
+            <div className="text-label text-muted-foreground">
               Last synced {relativeTime(status.lastSyncAt)}
             </div>
           )}
           {status.state === "syncing" && status.startedAt && (
-            <div className="text-xs text-muted-foreground">
+            <div className="text-label text-muted-foreground">
               Started {relativeTime(status.startedAt)}
             </div>
           )}
@@ -101,7 +101,7 @@ export function SyncStatusDisplay() {
           type="button"
           onClick={syncNow}
           disabled={isSyncing}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-label font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
         >
           {isSyncing ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -115,7 +115,7 @@ export function SyncStatusDisplay() {
       {status.state === "error" && status.lastError && (
         <div
           role="alert"
-          className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-foreground"
+          className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-label text-foreground"
         >
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
           <span className="break-words">{status.lastError}</span>
@@ -133,8 +133,8 @@ function SyncStatusSkeleton() {
     <div className="flex items-center gap-3">
       <div className="h-4 w-4 animate-pulse rounded-full bg-muted" />
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="h-3.5 w-24 animate-pulse rounded bg-muted" />
-        <div className="h-3 w-32 animate-pulse rounded bg-muted/60" />
+        <div className="h-3.5 w-24 animate-pulse rounded-sm bg-muted" />
+        <div className="h-3 w-32 animate-pulse rounded-sm bg-muted/60" />
       </div>
     </div>
   );

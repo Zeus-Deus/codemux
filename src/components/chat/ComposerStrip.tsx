@@ -102,6 +102,11 @@ export interface StripGoal {
   } | null;
 }
 
+/** One strip row's resting height. Exported so the occupant row, the goal
+ *  row and the tests all read the same value from one place instead of
+ *  three copies of a pixel literal. */
+export const STRIP_ROW_HEIGHT = "h-[34px]";
+
 /** Rows are 34px; four fit before the list scrolls (4 × 34 + 3 × 3). */
 const OPEN_MAX_HEIGHT = "max-h-[145px]";
 
@@ -116,43 +121,43 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 const STRIP_CHIP =
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-[8px] bg-foreground/[0.05] px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09] hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
 // Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
 const GOAL_FOCUS = "outline-none focus-visible:ring-1 focus-visible:ring-ring";
 /** Quiet text action (Copy, Clear beside Resume). */
 const GOAL_CHIP = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-[6px] px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Clear when it is the strongest action in the row. */
 const GOAL_CHIP_OUTLINE = cn(
   GOAL_CHIP,
-  "border border-foreground/[0.16] text-foreground/85",
+  "border border-hairline-strong text-foreground/85",
 );
 /** Hide and the `+n` pill: filled, with a trailing chevron. */
 const GOAL_CHIP_FILLED = cn(
   GOAL_CHIP,
-  "bg-foreground/[0.07] px-[7px] text-foreground/80 hover:bg-foreground/[0.11]",
+  "bg-surface-2 px-[7px] text-foreground/80 hover:bg-surface-3",
 );
 /** The resting chevron and the overflow trigger: icon only, no fill. */
 const GOAL_ICON_BUTTON = cn(
-  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
+  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Resume is the one solid control in the strip: an interrupted goal is the
  *  only occupant that asks for a decision. */
 const GOAL_RESUME = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-[6px] bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
+  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-sm bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
   GOAL_FOCUS,
 );
 const GOAL_META =
   "shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground";
 const GOAL_LINK = cn(
-  "inline-flex shrink-0 items-center gap-[5px] rounded-[4px] transition-colors hover:text-foreground",
+  "inline-flex shrink-0 items-center gap-[5px] rounded-sm transition-colors hover:text-foreground",
   GOAL_FOCUS,
 );
-const GOAL_MENU_ITEM = "h-[26px] rounded-[6px] px-2 py-0 text-body-sm";
+const GOAL_MENU_ITEM = "h-[26px] rounded-sm px-2 py-0 text-body-sm";
 
 /**
  * The one strip docked above the composer pill. It mirrors the scope
@@ -377,7 +382,10 @@ function StripRowView({
       data-testid="composer-strip-row"
       data-kind={kind}
       data-row-id={row.id}
-      className="flex h-[34px] shrink-0 items-center gap-2.5 px-2"
+      className={cn(
+        "flex shrink-0 items-center gap-2.5 px-2",
+        STRIP_ROW_HEIGHT,
+      )}
     >
       <span className="flex size-5 shrink-0 items-center justify-center">
         <StripMarkView mark={row.mark} />
@@ -466,7 +474,7 @@ function GoalRowView({
       data-open={open || undefined}
       className="flex shrink-0 flex-col"
     >
-      <div className="flex h-[34px] items-center gap-2 px-2">
+      <div className={cn("flex items-center gap-2 px-2", STRIP_ROW_HEIGHT)}>
         <span className="flex size-5 shrink-0 items-center justify-center">
           {interrupted ? (
             <GoalPauseGlyph className="text-status-working" />
@@ -481,7 +489,7 @@ function GoalRowView({
           aria-controls={open ? detailsId : undefined}
           onClick={onToggle}
           className={cn(
-            "flex min-w-0 flex-1 items-center gap-2 self-stretch rounded-[6px] text-left",
+            "flex min-w-0 flex-1 items-center gap-2 self-stretch rounded-sm text-left",
             GOAL_FOCUS,
           )}
         >
@@ -621,7 +629,7 @@ function GoalRowView({
           {interrupted && (
             <div
               data-testid="composer-strip-goal-sends"
-              className="flex min-w-0 items-center gap-2 rounded-[8px] border border-border/70 bg-foreground/[0.02] px-[9px] py-1.5"
+              className="flex min-w-0 items-center gap-2 rounded-md border border-border/70 bg-surface-1 px-[9px] py-1.5"
             >
               <span className="shrink-0 font-mono text-caption font-semibold tracking-[0.08em] text-muted-foreground uppercase">
                 sends
@@ -636,7 +644,7 @@ function GoalRowView({
                 type="button"
                 onClick={strip.onEditResume}
                 className={cn(
-                  "shrink-0 rounded-[4px] font-mono text-label text-muted-foreground transition-colors hover:text-foreground",
+                  "shrink-0 rounded-sm font-mono text-label text-muted-foreground transition-colors hover:text-foreground",
                   GOAL_FOCUS,
                 )}
               >
@@ -676,7 +684,7 @@ function GoalRowView({
                         aria-controls={listOpen ? listId : undefined}
                         onClick={onToggleList}
                         className={cn(
-                          "min-w-0 truncate rounded-[4px] text-left transition-colors hover:text-foreground",
+                          "min-w-0 truncate rounded-sm text-left transition-colors hover:text-foreground",
                           GOAL_FOCUS,
                         )}
                       >

@@ -1,11 +1,27 @@
 import { useState, useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  DndContext,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
@@ -51,7 +67,11 @@ import {
   getFooterAction,
   isFooterActionAvailable,
 } from "@/lib/footer-actions";
-import { useFooterPinsStore, type FooterPin } from "@/stores/footer-pins-store";
+import {
+  useFooterPinsStore,
+  type FooterPin,
+} from "@/stores/footer-pins-store";
+import type { FooterActionId } from "@/lib/footer-actions";
 import { CustomizeFooterDialog } from "./customize-footer-dialog";
 import { useFooterAvailability } from "./footer-availability";
 
@@ -108,7 +128,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
   );
 
   return (
-    <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-[12px] border-t border-border/70 bg-background/50 px-3.5">
+    <div className="-mx-1.5 mt-1.5 flex h-8 items-center gap-2 rounded-b-lg border-t border-border/70 bg-background/50 px-3.5">
       <span className="font-mono text-caption text-muted-foreground/70">
         Codemux {version ? `v${version}` : ""}
       </span>
@@ -125,7 +145,7 @@ function AppMenuFooter({ version }: { version: string | null }) {
             // `tone` is a fixed status colour, so hover has to *deepen* it on
             // a light rail and *lift* it on a dark one — a single
             // `brightness-125` washes the label out to nothing on white.
-            "flex items-center gap-1.5 rounded-[5px] px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
+            "flex items-center gap-1.5 rounded-sm px-1 text-label transition-colors hover:brightness-90 dark:hover:brightness-125",
             tone,
           )}
         >
@@ -165,15 +185,15 @@ function AppMenu({
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
-              size="icon-xs"
+              size="icon-sm"
               aria-label="Menu"
-              className="h-7 w-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+              className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
             >
               <Settings className="size-[18px]" />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+        <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
           Menu
         </TooltipContent>
       </Tooltip>
@@ -297,11 +317,10 @@ function FooterDestination({
   const button = (
     <Button
       variant="ghost"
-      size={labeled ? "sm" : "icon-xs"}
+      size={labeled ? "sm" : "icon-sm"}
       aria-label={action.label}
       className={cn(
-        "h-7 shrink-0 rounded-[7px] text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-        labeled ? "gap-1.5 px-2 text-body-sm" : "w-7",
+        "shrink-0 text-muted-foreground hover:bg-surface-2 hover:text-foreground",
         fullWidth && "w-full justify-start",
       )}
       onClick={() =>
@@ -319,10 +338,45 @@ function FooterDestination({
   return (
     <Tooltip>
       <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
+      <TooltipContent side={tooltipSide} sideOffset={4} className="text-label">
         {action.label}
       </TooltipContent>
     </Tooltip>
+  );
+}
+
+/**
+ * A footer icon that can be dragged to a new slot. The wrapper is only the
+ * drag handle: the 5px activation distance keeps a plain click reaching the
+ * inner button, and dnd-kit swallows the click that ends a real drag.
+ * `attributes` is not spread so the inner button stays the only focusable,
+ * semantic control.
+ */
+function SortableFooterDestination({
+  pin,
+  tooltipSide,
+}: {
+  pin: FooterPin;
+  tooltipSide: "top" | "right";
+}) {
+  const { listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: pin.id });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid={`footer-pin-${pin.id}`}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+      }}
+      {...listeners}
+      className={cn(
+        "shrink-0 touch-none",
+        isDragging && "relative z-10 opacity-60",
+      )}
+    >
+      <FooterDestination pin={pin} tooltipSide={tooltipSide} />
+    </div>
   );
 }
 
@@ -365,9 +419,21 @@ export function SidebarFooterBar() {
   const visible = availablePins.slice(0, visibleCount);
   const overflow = availablePins.slice(visibleCount);
   const tooltipSide = collapsed ? "right" : "top";
+  const reorderPin = useFooterPinsStore((s) => s.reorderPin);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
+  const handleDragEnd = ({ active, over }: DragEndEvent) => {
+    if (over && active.id !== over.id)
+      reorderPin(active.id as FooterActionId, over.id as FooterActionId);
+  };
 
   return (
-    <>
+    // Footer labels are plain text, so they never need to stay open for the
+    // pointer to travel into them. Radix's hoverable-content grace area would
+    // otherwise keep the previous icon's label up — and ignore the next icon —
+    // while the pointer slides sideways along the strip.
+    <TooltipProvider disableHoverableContent>
       <div
         ref={container}
         data-testid="sidebar-footer"
@@ -384,9 +450,30 @@ export function SidebarFooterBar() {
           tooltipSide={tooltipSide}
           onCustomize={() => setCustomizing(true)}
         />
-        {visible.map((pin) => (
-          <FooterDestination key={pin.id} pin={pin} tooltipSide={tooltipSide} />
-        ))}
+        {/* Destinations reorder by drag; the menu stays outside the sortable
+            list so it always anchors the start. */}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={visible.map((pin) => pin.id)}
+            strategy={
+              collapsed
+                ? verticalListSortingStrategy
+                : horizontalListSortingStrategy
+            }
+          >
+            {visible.map((pin) => (
+              <SortableFooterDestination
+                key={pin.id}
+                pin={pin}
+                tooltipSide={tooltipSide}
+              />
+            ))}
+          </SortableContext>
+        </DndContext>
         {overflow.length > 0 && (
           <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
             <PopoverTrigger asChild>
@@ -405,7 +492,7 @@ export function SidebarFooterBar() {
               align="start"
               className="w-64 p-2"
             >
-              <p className="px-2 py-1 text-xs font-medium text-muted-foreground">
+              <p className="px-2 py-1 text-label font-medium text-muted-foreground">
                 Footer destinations
               </p>
               <div className="thin-scrollbar max-h-[50vh] overflow-y-auto p-1">
@@ -430,6 +517,6 @@ export function SidebarFooterBar() {
           onOpenChange={setCustomizing}
         />
       )}
-    </>
+    </TooltipProvider>
   );
 }

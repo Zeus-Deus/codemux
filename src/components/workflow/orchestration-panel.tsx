@@ -97,7 +97,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
               type="button"
               onClick={() => setLevel("phases")}
               aria-label="Back to phases"
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-foreground/[0.08] hover:text-foreground"
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground"
             >
               <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
             </button>
@@ -107,7 +107,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
           </span>
           <span
             className={cn(
-              "shrink-0 rounded-[5px] px-2 py-0.5 text-label font-bold uppercase tracking-wide",
+              "shrink-0 rounded-sm px-2 py-0.5 text-label font-bold uppercase tracking-wide",
               tone.chipBg,
             )}
           >

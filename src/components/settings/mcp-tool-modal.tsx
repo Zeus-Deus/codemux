@@ -72,7 +72,7 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
               <DialogTitle className="flex items-center gap-2">
                 <span>{server.name}</span>
                 {isRunning && (
-                  <span className="text-xs text-muted-foreground font-normal">
+                  <span className="text-label text-muted-foreground font-normal">
                     {runtime?.status.kind === "running"
                       ? `${runtime.status.toolCount} tool${
                           runtime.status.toolCount === 1 ? "" : "s"
@@ -81,7 +81,7 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
                   </span>
                 )}
               </DialogTitle>
-              <DialogDescription className="font-mono text-xs">
+              <DialogDescription className="font-mono text-label">
                 {server.command}{" "}
                 {server.args.length > 0 ? server.args.join(" ") : ""}
               </DialogDescription>
@@ -90,7 +90,7 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
             {loading ? (
               <div
                 data-testid="mcp-tool-modal-loading"
-                className="flex items-center gap-2 py-6 text-sm text-muted-foreground"
+                className="flex items-center gap-2 py-6 text-body text-muted-foreground"
               >
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
                 Loading tools…
@@ -98,14 +98,14 @@ export function McpToolModal({ server, runtime, onClose }: Props) {
             ) : error ? (
               <p
                 data-testid="mcp-tool-modal-error"
-                className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                className="rounded-md bg-destructive/10 px-3 py-2 text-label text-destructive"
               >
                 Failed to load tools: {error}
               </p>
             ) : tools.length === 0 ? (
               <p
                 data-testid="mcp-tool-modal-empty"
-                className="py-6 text-center text-sm text-muted-foreground"
+                className="py-6 text-center text-body text-muted-foreground"
               >
                 {isRunning
                   ? "No tools exposed by this server."
@@ -138,10 +138,10 @@ function ToolRow({ tool }: { tool: McpTool }) {
     >
       <div className="flex items-center gap-2">
         <Wrench className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        <code className="text-xs font-mono">{tool.prefixedName}</code>
+        <code className="text-label font-mono">{tool.prefixedName}</code>
       </div>
       {tool.description && (
-        <p className="ml-5 mt-1 text-xs text-muted-foreground">
+        <p className="ml-5 mt-1 text-label text-muted-foreground">
           {tool.description}
         </p>
       )}

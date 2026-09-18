@@ -79,7 +79,7 @@ export function SkillRow({
         <div className="flex items-center gap-2">
           <span
             className={cn(
-              "truncate text-sm font-medium text-foreground",
+              "truncate text-body font-medium text-foreground",
               !enabled && "line-through decoration-muted-foreground/50",
             )}
           >
@@ -88,7 +88,7 @@ export function SkillRow({
           {!enabled && (
             <span
               data-testid="skill-row-disabled-badge"
-              className="rounded bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
+              className="rounded-sm bg-muted px-1.5 py-0.5 text-caption font-medium text-muted-foreground"
             >
               Disabled
             </span>
@@ -115,7 +115,7 @@ export function SkillRow({
           )}
         </div>
         {skill.description && (
-          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+          <p className="mt-0.5 truncate text-label text-muted-foreground">
             {skill.description}
           </p>
         )}
@@ -135,7 +135,6 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-xs"
               onClick={onView}
             >
               <Eye className="mr-1 h-3 w-3" aria-hidden />
@@ -146,7 +145,6 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-xs"
               onClick={onOpenFile}
               aria-label={`Open ${skill.name} in editor`}
             >

@@ -31,12 +31,15 @@ export function AssistantAvatar({ provider }: Props) {
       <span
         aria-hidden
         data-provider={provider}
+        // The wash is stated as intent, not inferred from a class string:
+        // tests assert which wash a mark gets, the ladder owns the value.
+        data-wash={provider === "claude" ? "ember" : "neutral"}
         className={cn(
-          "flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-[9px]",
+          "flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-md",
           // Match the mark: ember wash for the ember-toned Claude mark,
           // a subtle neutral wash for the other provider marks.
           // Both token-based so they track the theme.
-          provider === "claude" ? "bg-accent-ember/15" : "bg-foreground/8",
+          provider === "claude" ? "bg-accent-ember/15" : "bg-surface-3",
         )}
       >
         <ProviderLogo provider={provider} className="h-[15px] w-[15px]" />
@@ -47,7 +50,8 @@ export function AssistantAvatar({ provider }: Props) {
   return (
     <span
       aria-hidden
-      className="flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-[9px] bg-accent-ember/15 text-accent-ember"
+      data-wash="ember"
+      className="flex h-[29px] w-[29px] shrink-0 items-center justify-center rounded-md bg-accent-ember/15 text-accent-ember"
     >
       <Sparkle className="h-[15px] w-[15px]" strokeWidth={1.4} />
     </span>

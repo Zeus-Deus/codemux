@@ -109,7 +109,7 @@ export function ComposerCommandMenu({
         // Anchored bottom-left to the `+` trigger, 8px above the
         // composer card, content-width — never stretched across it.
         "absolute bottom-full left-2 z-[60] mb-2 w-[360px]",
-        "overflow-hidden rounded-[13px] border border-border",
+        "overflow-hidden rounded-lg border border-border",
         "bg-popover text-popover-foreground shadow-2xl",
         "rise-in",
       )}
@@ -163,7 +163,7 @@ export function ComposerCommandMenu({
         )}
         <CommandPrimitive.List className="max-h-[340px] overflow-x-hidden overflow-y-auto p-1.5 outline-none">
           {items.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+            <div className="px-3 py-6 text-center text-label text-muted-foreground">
               No matches
             </div>
           ) : (
@@ -258,7 +258,7 @@ export function ComposerCommandMenu({
                           {item.rightAdornment}
                         </span>
                       ) : item.command ? (
-                        <span className="ml-auto shrink-0 rounded-[5px] bg-foreground/[0.06] px-1.5 py-0.5 font-mono text-label text-muted-foreground">
+                        <span className="ml-auto shrink-0 rounded-sm bg-surface-2 px-1.5 py-0.5 font-mono text-label text-muted-foreground">
                           {item.command}
                         </span>
                       ) : null}

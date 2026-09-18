@@ -7,6 +7,7 @@ import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import { closePane, splitPane } from "@/tauri/commands";
 import type { PaneNodeSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -45,9 +46,9 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
   };
 
   return (
-    <header
+    <PanelHeader
       className={cn(
-        "flex h-7 shrink-0 items-center gap-1 border-b border-border/50 px-1.5 transition-colors",
+        "gap-1 px-1.5 transition-colors",
         isActive ? "bg-card" : "bg-background",
       )}
       onPointerDown={onPointerDown}
@@ -68,7 +69,7 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
             onNewChat={handleNewChat}
           />
         ) : (
-          <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
+          <span className="px-1.5 text-label text-muted-foreground">Agent Chat</span>
         )}
       </div>
       {/* Match the muted-at-rest / lift-on-hover dialect the rest of
@@ -107,6 +108,6 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <X className="h-3.5 w-3.5" />
         </Button>
       </div>
-    </header>
+    </PanelHeader>
   );
 }
