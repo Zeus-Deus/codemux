@@ -176,7 +176,7 @@ function WorkflowApprovalCard({
         <Button
           type="button"
           size="sm"
-          className="h-[33px] px-3.5 text-label bg-foreground text-background hover:bg-foreground/90"
+          className="bg-foreground text-background hover:bg-foreground/90"
           onClick={runOnce}
           disabled={isResponding}
         >
@@ -186,7 +186,6 @@ function WorkflowApprovalCard({
           type="button"
           variant="outline"
           size="sm"
-          className="h-[33px] px-3.5 text-label"
           onClick={runAlways}
           disabled={isResponding}
         >
@@ -196,7 +195,7 @@ function WorkflowApprovalCard({
           type="button"
           variant="outline"
           size="sm"
-          className="h-[33px] px-3 text-label bg-transparent"
+          className="bg-transparent"
           onClick={() => setScriptOpen(true)}
         >
           View script
@@ -205,7 +204,7 @@ function WorkflowApprovalCard({
           type="button"
           variant="ghost"
           size="sm"
-          className="ml-auto h-[33px] px-3 text-label text-muted-foreground hover:text-foreground"
+          className="ml-auto text-muted-foreground hover:text-foreground"
           onClick={deny}
           disabled={isResponding}
         >

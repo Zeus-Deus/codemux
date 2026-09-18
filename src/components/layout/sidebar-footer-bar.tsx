@@ -185,9 +185,9 @@ function AppMenu({
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
-              size="icon-xs"
+              size="icon-sm"
               aria-label="Menu"
-              className="h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-surface-2"
+              className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
             >
               <Settings className="size-[18px]" />
             </Button>
@@ -317,11 +317,10 @@ function FooterDestination({
   const button = (
     <Button
       variant="ghost"
-      size={labeled ? "sm" : "icon-xs"}
+      size={labeled ? "sm" : "icon-sm"}
       aria-label={action.label}
       className={cn(
-        "h-7 shrink-0 rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground",
-        labeled ? "gap-1.5 px-2 text-body-sm" : "w-7",
+        "shrink-0 text-muted-foreground hover:bg-surface-2 hover:text-foreground",
         fullWidth && "w-full justify-start",
       )}
       onClick={() =>

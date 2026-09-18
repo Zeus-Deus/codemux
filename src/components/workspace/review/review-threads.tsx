@@ -77,7 +77,7 @@ function CopyButton({ text }: { text: string }) {
     <Button
       size="icon-xs"
       variant="ghost"
-      className="h-[18px] w-[18px] opacity-0 group-hover/comment:opacity-100 transition-opacity"
+      className="opacity-0 group-hover/comment:opacity-100 transition-opacity"
       onClick={handleCopy}
       title="Copy comment"
     >

@@ -300,7 +300,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
           <Button
             type="button"
             size="sm"
-            className="h-7 px-3 text-label bg-foreground text-background hover:bg-foreground/90"
+            className="bg-foreground text-background hover:bg-foreground/90"
             onClick={() => handleAllow("once")}
           >
             Allow
@@ -311,7 +311,6 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-7 px-3 text-label"
               >
                 Allow always
                 <ChevronDown className="ml-1 h-3 w-3" aria-hidden />
@@ -342,7 +341,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={() => setDenying(true)}
           >
             Deny
@@ -365,7 +364,6 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               type="button"
               variant="destructive"
               size="sm"
-              className="h-7 px-3 text-label"
               onClick={confirmDeny}
             >
               Confirm deny
@@ -374,7 +372,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
               type="button"
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-label text-muted-foreground hover:text-foreground"
+              className="text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");

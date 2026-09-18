@@ -1300,7 +1300,7 @@ export const MessageList = memo(function MessageList({
           onClick={handleJumpToLatest}
           variant="secondary"
           size="sm"
-          className="absolute bottom-4 left-1/2 z-10 h-8 w-auto -translate-x-1/2 gap-1.5 rounded-full border border-border bg-card px-3.5 text-body-sm font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className="absolute bottom-4 left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
           <ArrowDown className="h-3.5 w-3.5" aria-hidden />

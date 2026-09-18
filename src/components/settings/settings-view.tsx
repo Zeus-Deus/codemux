@@ -1010,7 +1010,7 @@ function PresetEditorSheet({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
+                  className="mt-1 w-fit text-muted-foreground hover:text-foreground"
                   onClick={addCommand}
                 >
                   + Add command
@@ -1195,7 +1195,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 text-label text-muted-foreground"
+          className="text-muted-foreground"
           onClick={() => {
             setAiCommitMessageCli(null).catch(console.error);
             storeSet("ai_commit_message_cli", "");
@@ -1494,7 +1494,7 @@ export function SettingsView() {
                   <Button
                     variant="outline"
                     size="sm"
-                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50 gap-1.5"
+                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
                     onClick={() => {
                       signOut();
                       setShowSettings(false);
@@ -1742,7 +1742,7 @@ export function SettingsView() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 text-body-sm text-muted-foreground"
+                  className="text-muted-foreground"
                   onClick={() => setActiveSection("appearance")}
                 >
                   Open Appearance
@@ -1801,7 +1801,7 @@ export function SettingsView() {
                 title="Your presets"
                 description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
                 action={
-                  <Button variant="outline" size="sm" className="gap-1.5" onClick={handleNewPreset}>
+                  <Button variant="outline" size="sm" onClick={handleNewPreset}>
                     <Plus className="h-3.5 w-3.5" />
                     New preset
                   </Button>
@@ -2510,9 +2510,9 @@ function SortablePresetRow({
         {!preset.is_builtin && (
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-sm"
             title="Delete preset"
-            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            className="opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
             onClick={(e) => {
               e.stopPropagation();
               onDelete();
@@ -2523,10 +2523,10 @@ function SortablePresetRow({
         )}
         <Button
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
           className={cn(
-            "h-7 w-7 transition-opacity",
+            "transition-opacity",
             preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
           )}
           onClick={(e) => {

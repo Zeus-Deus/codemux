@@ -46,7 +46,7 @@ export function EmptyState() {
           <Button
             variant="ghost"
             size="sm"
-            className="text-label text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={() => setShowNewProjectScreen(true)}
           >
             <Plus className="h-3.5 w-3.5 mr-1" />

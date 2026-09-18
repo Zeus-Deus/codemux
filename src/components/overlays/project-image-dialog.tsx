@@ -133,7 +133,7 @@ export function ProjectImageDialog({
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 px-2 text-label text-muted-foreground hover:text-destructive"
+              className="text-muted-foreground hover:text-destructive"
               onClick={handleClear}
               disabled={!initialValue}
             >

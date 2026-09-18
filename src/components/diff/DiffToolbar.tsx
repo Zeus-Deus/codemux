@@ -78,7 +78,7 @@ export function DiffToolbar({
               key={s}
               size="xs"
               variant={tab.section === s ? "secondary" : "ghost"}
-              className="h-5 px-1.5 text-caption"
+              className="text-caption"
               onClick={() => setSection(tabId, s)}
             >
               {s === "all" ? "All" : s === "against_base" ? (tab.baseBranch ? `vs ${tab.baseBranch}` : "Base") : s.charAt(0).toUpperCase() + s.slice(1)}

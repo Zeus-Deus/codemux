@@ -664,7 +664,7 @@ export function ChangesPanel({
           <Button
             variant="ghost"
             size="xs"
-            className="h-6 text-caption text-muted-foreground hover:text-foreground"
+            className="text-caption text-muted-foreground hover:text-foreground"
             onClick={handleAbortMerge}
             disabled={busy !== null}
           >
@@ -674,7 +674,7 @@ export function ChangesPanel({
             <Button
               size="xs"
               variant="ghost"
-              className="h-6 text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
+              className="text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
               onClick={handleContinueMerge}
               disabled={busy !== null}
             >
@@ -696,7 +696,7 @@ export function ChangesPanel({
                 <Button
                   size="xs"
                   variant="ghost"
-                  className="h-6 text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
+                  className="text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                   onClick={async () => {
                     await initialize();
                     refresh();
@@ -770,7 +770,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
+                className="text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
@@ -779,7 +779,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption text-muted-foreground hover:text-foreground"
+                className="text-caption text-muted-foreground hover:text-foreground"
                 onClick={() => {
                   const msg = consumeMessage(workspace.workspace_id) ?? generatedMsg;
                   setEditedMsg(msg);
@@ -822,7 +822,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
+                className="text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
@@ -956,7 +956,7 @@ function SmartCommitButton({
         size="sm"
         variant="ghost"
         className={cn(
-          "flex-1 h-8 text-label gap-1.5 rounded-r-none border-r-0",
+          "flex-1 rounded-r-none border-r-0",
           fillCls,
         )}
         onClick={primary.action}
@@ -968,13 +968,16 @@ function SmartCommitButton({
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
-            size="sm"
+            // `icon` is the 32px square rung: same height as the `sm`
+            // primary half beside it, and no padding to override — a
+            // segmented pair has to share a baseline.
+            size="icon"
             variant="ghost"
-            className={cn("h-8 w-7 px-0 rounded-l-none border-l-0", fillCls)}
+            className={cn("rounded-l-none border-l-0", fillCls)}
             aria-label="More actions"
             disabled={busy !== null}
           >
-            <ChevronDown className="size-3" />
+            <ChevronDown className="size-3.5" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-[200px]">

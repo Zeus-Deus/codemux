@@ -135,7 +135,6 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-label"
               onClick={onView}
             >
               <Eye className="mr-1 h-3 w-3" aria-hidden />
@@ -146,7 +145,6 @@ export function SkillRow({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-2 text-label"
               onClick={onOpenFile}
               aria-label={`Open ${skill.name} in editor`}
             >

@@ -236,7 +236,6 @@ export function DeleteWorktreeDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -244,7 +243,6 @@ export function DeleteWorktreeDialog({
           <Button
             variant="destructive"
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => void confirm()}
           >
             {forceMessage !== null ? "Force delete" : "Delete"}

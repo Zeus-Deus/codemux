@@ -194,7 +194,6 @@ function DeleteArchivedDialog({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => handleOpenChange(false)}
           >
             Cancel
@@ -202,7 +201,6 @@ function DeleteArchivedDialog({
           <Button
             variant={isRoot ? "secondary" : "destructive"}
             size="sm"
-            className="h-7 px-3 text-label"
             onClick={() => void confirm()}
           >
             {forceMessage !== null
@@ -278,7 +276,6 @@ function ArchivedEntryRow({
         <Button
           variant="secondary"
           size="sm"
-          className="h-7 px-2.5 text-label"
           disabled={unarchiving}
           onClick={() => void handleUnarchive()}
         >
@@ -289,7 +286,7 @@ function ArchivedEntryRow({
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 px-2.5 text-label text-muted-foreground hover:text-foreground"
+            className="text-muted-foreground hover:text-foreground"
             onClick={onDeleteRequest}
           >
             Remove from archive

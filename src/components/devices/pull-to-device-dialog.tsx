@@ -365,7 +365,6 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 px-3 text-body-sm"
               onClick={() => onOpenChange(false)}
               disabled={submitting}
             >
@@ -379,7 +378,6 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                 <Button
                   variant="secondary"
                   size="sm"
-                  className="h-7 gap-1.5 px-3 text-body-sm"
                   onClick={() => void handleSubmit()}
                   disabled={submitting}
                 >
@@ -498,7 +496,7 @@ function HostNotConfiguredBlock({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 px-2.5 text-body-sm gap-1.5 border-warning/30 hover:bg-warning/15"
+        className="border-warning/30 hover:bg-warning/15"
         onClick={() => {
           onClose();
           // TODO: deep-link to Settings → Devices when that route lands.
@@ -612,7 +610,6 @@ function SameBranchProjectBlock({
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-body-sm"
         onClick={onOpenExisting}
       >
         Open the existing workspace
@@ -628,7 +625,6 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-body-sm"
         onClick={onOpen}
       >
         Open it
