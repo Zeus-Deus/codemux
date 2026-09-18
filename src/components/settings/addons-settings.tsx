@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
@@ -30,6 +30,27 @@ import {
   type AddonManifest,
   type AddonReview,
 } from "@/lib/addons/types";
+// These controlled dialogs have no Radix Trigger. Restore their actual opener,
+// and keep Escape from also reaching the window-level Settings close shortcut.
+function AddonDialogContent(props: ComponentProps<typeof DialogContent>) {
+  const opener = useRef<HTMLElement | null>(null);
+  return (
+    <DialogContent
+      {...props}
+      onOpenAutoFocus={() => {
+        opener.current =
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+      }}
+      onCloseAutoFocus={(event) => {
+        event.preventDefault();
+        if (opener.current?.isConnected) opener.current.focus();
+      }}
+      onEscapeKeyDown={(event) => event.stopPropagation()}
+    />
+  );
+}
 function Capabilities({ manifest }: { manifest: AddonManifest }) {
   return (
     <div className="space-y-3 text-body">
@@ -666,7 +687,7 @@ export function AddonsSettings() {
         </section>
       )}
       <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>Install from link or ID</DialogTitle>
             <DialogDescription>
@@ -690,7 +711,6 @@ export function AddonsSettings() {
           >
             <Input
               aria-label="Add-on install link or ID"
-              autoFocus
               value={target}
               onChange={(e) => setTarget(e.target.value)}
               placeholder="codemux.project-brief"
@@ -701,7 +721,7 @@ export function AddonsSettings() {
               </Button>
             </DialogFooter>
           </form>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={review !== null}
@@ -712,7 +732,7 @@ export function AddonsSettings() {
           }
         }}
       >
-        <DialogContent className="max-h-[85vh] overflow-auto">
+        <AddonDialogContent className="max-h-[85vh] overflow-auto">
           <DialogHeader>
             <DialogTitle>Review {review?.manifest.name}</DialogTitle>
             <DialogDescription>
@@ -789,7 +809,7 @@ export function AddonsSettings() {
               </DialogFooter>
             </>
           )}
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={remove !== null}
@@ -797,7 +817,7 @@ export function AddonsSettings() {
           if (!value && !busy) setRemove(null);
         }}
       >
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>Remove {remove?.manifest.name}?</DialogTitle>
             <DialogDescription>
@@ -831,7 +851,7 @@ export function AddonsSettings() {
               Remove add-on
             </Button>
           </DialogFooter>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={rollback !== null}
@@ -839,7 +859,7 @@ export function AddonsSettings() {
           if (!value && !busy) setRollback(null);
         }}
       >
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>
               Restore {rollback?.previous?.manifest.version}?
@@ -865,7 +885,7 @@ export function AddonsSettings() {
               Restore previous release
             </Button>
           </DialogFooter>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
     </div>
   );

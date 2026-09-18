@@ -7,6 +7,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { cpus, platform, release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fault } from "./host-limits.mjs";
+import { verifyAppImageElf } from "./elf-provenance.mjs";
 const bundleRoot = resolve(
   process.argv[2] ?? "src-tauri/target/release/bundle",
 );
@@ -15,9 +16,8 @@ const hostName =
   process.platform === "win32"
     ? "codemux-addon-host-windows-x64.exe"
     : "codemux-addon-host-linux-x64";
-const expected = createHash("sha256")
-  .update(await readFile(`src-tauri/binaries/${hostName}`))
-  .digest("hex");
+const releaseHost = await readFile(`src-tauri/binaries/${hostName}`);
+const expected = createHash("sha256").update(releaseHost).digest("hex");
 assert.match(
   await readFile(`src-tauri/binaries/.${hostName}.profile`, "utf8"),
   /^profile=release$/m,
@@ -75,13 +75,20 @@ try {
       "Installer must contain exactly one platform host",
     );
     const host = hosts[0];
-    assert.equal(
-      createHash("sha256")
-        .update(await readFile(host))
-        .digest("hex"),
-      expected,
-      "Installer host differs from release build",
-    );
+    const packagedBytes = await readFile(host);
+    const packagedSha256 = createHash("sha256")
+      .update(packagedBytes)
+      .digest("hex");
+    let provenance = "exact-sha256";
+    if (format === ".AppImage" && packagedSha256 !== expected) {
+      provenance = verifyAppImageElf(releaseHost, packagedBytes);
+    } else {
+      assert.equal(
+        packagedSha256,
+        expected,
+        "Installer host differs from release build",
+      );
+    }
     run(process.execPath, ["scripts/addons/sdk-native.mjs", host]);
     const workloads = [
       "while(true){}",
@@ -98,9 +105,15 @@ try {
       });
     evidence.bundles.push({
       format,
+      packagedSha256,
+      provenance,
       hostPath: host.slice(unpack.length + 1),
       faults,
     });
+    await writeFile(
+      "addon-packaged-evidence.json",
+      JSON.stringify(evidence, null, 2) + "\n",
+    );
     if (format === ".exe") {
       const uninstall = (await files(unpack)).find((file) =>
         /uninstall\.exe$/i.test(file),
@@ -114,7 +127,7 @@ try {
     JSON.stringify(evidence, null, 2) + "\n",
   );
   console.log(
-    "PASS: installer payload digests, clean-environment SDK callbacks and packaged hostile-runtime deadlines",
+    "PASS: installer host provenance, clean-environment SDK callbacks and packaged hostile-runtime deadlines",
   );
 } finally {
   await rm(root, {

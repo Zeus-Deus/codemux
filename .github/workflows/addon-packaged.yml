@@ -2,7 +2,7 @@ name: Packaged add-on runtime
 on:
   workflow_dispatch:
   pull_request:
-    paths: ['scripts/addons/packaged-smoke.mjs', 'scripts/addons/host-limits.mjs', 'scripts/addons/sdk-native.mjs', 'src-tauri/addon-host/**', 'src-tauri/tauri.conf.json', 'scripts/build-addon-host.sh', '.github/workflows/addon-packaged.yml']
+    paths: ['scripts/addons/packaged-smoke.mjs', 'scripts/addons/elf-provenance.mjs', 'scripts/addons/host-limits.mjs', 'scripts/addons/sdk-native.mjs', 'src-tauri/addon-host/**', 'src-tauri/tauri.conf.json', 'scripts/build-addon-host.sh', '.github/workflows/addon-packaged.yml']
 permissions:
   contents: read
 concurrency:
@@ -59,6 +59,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          cache-on-failure: true
           key: addon-packaged-${{ matrix.os }}
 
       - name: Setup Node
@@ -81,6 +82,10 @@ jobs:
             addon_host=src-tauri/binaries/codemux-addon-host-linux-x64
           fi
           node scripts/addons/sdk-native.mjs "$addon_host"
+
+      - name: Verify AppImage provenance checks
+        if: runner.os == 'Linux'
+        run: node --test scripts/addons/elf-provenance.test.mjs
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

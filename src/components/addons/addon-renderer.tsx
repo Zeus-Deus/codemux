@@ -40,8 +40,8 @@ const spacing: Record<string, string> = {
 const colors: Record<string, string> = {
   default: "text-foreground",
   muted: "text-muted-foreground",
-  success: "text-emerald-600 dark:text-emerald-400",
-  warning: "text-amber-600 dark:text-amber-400",
+  success: "text-success",
+  warning: "text-warning",
   danger: "text-destructive",
   accent: "text-primary",
 };

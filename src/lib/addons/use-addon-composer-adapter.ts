@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { randomUUID } from "@/lib/uuid";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useAddonsStore } from "@/stores/addons-store";
 import { addonInvoke } from "./bridge";
@@ -12,10 +13,7 @@ export function useAddonComposerAdapter(
   onDraftChange: (text: string) => void,
 ) {
   const enabled = useFeatureFlags((s) => s.enableAgentChat);
-  const id = useMemo(
-    () => crypto.randomUUID(),
-    [workspaceId, threadId, enabled],
-  );
+  const id = useMemo(() => randomUUID(), [workspaceId, threadId, enabled]);
   const [registered, setRegistered] = useState(false);
   const latest = useRef({ draft, onDraftChange });
   const revision = useRef(0);
