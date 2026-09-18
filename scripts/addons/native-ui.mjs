@@ -861,6 +861,14 @@ try {
 } catch (error) {
   evidence.status = "failed";
   evidence.error = String(error);
+  if (session) {
+    // Installation metadata contains no credential values. Record the real
+    // manager's state so a missing contribution can be distinguished from a
+    // driver locator failure or a quarantined plugin.
+    evidence.failureInventory = await native("addon_inventory").catch(
+      () => null,
+    );
+  }
   if (session)
     await capture("failure").catch((error) => {
       evidence.captureError = String(error);
