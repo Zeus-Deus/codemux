@@ -367,6 +367,20 @@ async function openCommand(title) {
     ),
   ).then((el) => wd("POST", `/element/${elementId(el)}/click`, {}));
 }
+async function checkOfficialUpdater(phase) {
+  // Read-only check through the stock app's official updater. Never download,
+  // install or relaunch another version underneath this acceptance run.
+  const update = await native("plugin:updater|check", { timeout: 15000 });
+  if (update) {
+    assert.equal(typeof update.version, "string");
+    await native("plugin:resources|close", { rid: update.rid });
+  }
+  (evidence.officialUpdater ??= []).push({
+    phase,
+    available: !!update,
+    version: update?.version ?? null,
+  });
+}
 async function createNativeSession() {
   const created = await request("POST", "/session", {
     capabilities: { alwaysMatch: capabilities },
@@ -488,6 +502,52 @@ try {
     "Clean startup must have no plugin hosts",
   );
   evidence.checks.push("01-no-plugin-hosts-at-clean-start");
+  await step(
+    "01-official-updater-without-plugins",
+    () => checkOfficialUpdater("clean"),
+    true,
+  );
+  await step("01-keyboard-dialog-focus-and-core-themes", async () => {
+    await clickText("Install from link / ID");
+    const input = await element('[aria-label="Add-on install link or ID"]');
+    await until("install dialog autofocus", () =>
+      script("return document.activeElement === arguments[0]", input),
+    );
+    await wd("POST", "/actions", {
+      actions: [
+        {
+          type: "key",
+          id: "keyboard",
+          actions: [
+            { type: "keyDown", value: "\uE00C" },
+            { type: "keyUp", value: "\uE00C" },
+          ],
+        },
+      ],
+    });
+    await until("install dialog dismissed", () =>
+      script("return !document.querySelector('[role=dialog]')"),
+    );
+    assert.equal(
+      await script("return document.activeElement?.innerText.trim()"),
+      "Install from link / ID",
+    );
+    await hasText("Import package");
+    for (const [theme, scheme] of [
+      ["Graphite Light", "light"],
+      ["Ember", "dark"],
+    ]) {
+      await openCommand(theme);
+      await until(`${scheme} theme applied`, () =>
+        script(
+          "return document.documentElement.style.colorScheme === arguments[0]",
+          scheme,
+        ),
+      );
+      await hasText("Import package");
+      await capture(`01-addons-settings-${scheme}`);
+    }
+  });
   for (const [slug, title, id] of [
     ["project-brief", "Project Brief", "codemux.project-brief"],
     ["issue-companion", "Issue Companion", "codemux.issue-companion"],
@@ -720,6 +780,11 @@ try {
       "all native plugin processes reaped",
       async () => (await pluginHostCount()) === 0,
     );
+    await step(
+      "07-official-updater-while-plugins-paused",
+      () => checkOfficialUpdater("paused"),
+      true,
+    );
     await clickText("Appearance");
     await hasText("Theme");
     await capture("07-paused-core-appearance");
@@ -845,28 +910,47 @@ try {
       await openSettings();
     },
   );
-  await step("09-classic-interface-keeps-plugin-panels-and-core-terminal", async () => {
-    // Use the same persisted native setting as Settings → Interface, then
-    // restart the owned app. No client store or plugin capability is overridden.
-    await native("set_agent_chat_enabled", { enabled: false });
-    await restartNativeSession();
-    assert.equal((await native("get_feature_flags")).enable_agent_chat, false);
-    await openSettings();
-    await hasText("Project Brief");
-    await click('[aria-label="Close settings"]');
-    await checkCoreTerminal();
-    assert.equal(await script(`return document.querySelectorAll(${JSON.stringify(composer)}).length`), 0);
-    assert.equal(await script(`return document.querySelectorAll('[aria-label="Close add-on accessory"]').length`), 0);
-    await openCommand("Open Project Brief");
-    await hasText("Branch: main");
-    await clickText("Add to draft", `document.querySelector('section[aria-label="Add-on view"]')`);
-    await hasText("No chat composer is available");
-    await capture("09-classic-interface-panel-without-composer");
-    await native("set_agent_chat_enabled", { enabled: true });
-    await restartNativeSession();
-    await element(composer);
-    await openSettings();
-  });
+  await step(
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    async () => {
+      // Use the same persisted native setting as Settings → Interface, then
+      // restart the owned app. No client store or plugin capability is overridden.
+      await native("set_agent_chat_enabled", { enabled: false });
+      await restartNativeSession();
+      assert.equal(
+        (await native("get_feature_flags")).enable_agent_chat,
+        false,
+      );
+      await openSettings();
+      await hasText("Project Brief");
+      await click('[aria-label="Close settings"]');
+      await checkCoreTerminal();
+      assert.equal(
+        await script(
+          `return document.querySelectorAll(${JSON.stringify(composer)}).length`,
+        ),
+        0,
+      );
+      assert.equal(
+        await script(
+          `return document.querySelectorAll('[aria-label="Close add-on accessory"]').length`,
+        ),
+        0,
+      );
+      await openCommand("Open Project Brief");
+      await hasText("Branch: main");
+      await clickText(
+        "Add to draft",
+        `document.querySelector('section[aria-label="Add-on view"]')`,
+      );
+      await hasText("No chat composer is available");
+      await capture("09-classic-interface-panel-without-composer");
+      await native("set_agent_chat_enabled", { enabled: true });
+      await restartNativeSession();
+      await element(composer);
+      await openSettings();
+    },
+  );
   await step("10-remove-packages-keeps-core-usable", async () => {
     for (const title of [
       "Issue Companion",
