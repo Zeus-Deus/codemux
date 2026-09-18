@@ -183,14 +183,29 @@ function Configure({
   onError: (message: string) => void;
 }) {
   const [settings, setSettings] = useState<Record<string, unknown>>({});
+  const [configuration, setConfiguration] = useState<
+    "loading" | "ready" | "failed"
+  >("loading");
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   useEffect(() => {
+    let live = true;
     void addonInvoke<Record<string, unknown>>("addon_settings_get", {
       id: installation.manifest.id,
     })
-      .then(setSettings)
-      .catch((e) => onError(addonMessage(e)));
+      .then((value) => {
+        if (!live) return;
+        setSettings(value);
+        setConfiguration("ready");
+      })
+      .catch((e) => {
+        if (!live) return;
+        setConfiguration("failed");
+        onError(addonMessage(e));
+      });
+    return () => {
+      live = false;
+    };
   }, [installation.installationId]);
   return (
     <div className="space-y-6">
@@ -223,6 +238,7 @@ function Configure({
           className="space-y-4 border-t pt-5"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (configuration !== "ready" || busy) return;
             setBusy(true);
             setSaved(false);
             try {
@@ -239,11 +255,17 @@ function Configure({
           }}
         >
           <h3 className="font-medium">Configuration</h3>
+          {configuration === "loading" && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Loading configuration…
+            </p>
+          )}
           {installation.manifest.settings.map((field) => (
             <label key={field.id} className="grid gap-2 text-sm">
               {field.label}
               {field.type === "boolean" ? (
                 <Switch
+                  disabled={configuration !== "ready" || busy}
                   aria-label={field.label}
                   checked={settings[field.id] === true}
                   onCheckedChange={(value) =>
@@ -252,6 +274,7 @@ function Configure({
                 />
               ) : field.type === "enum" ? (
                 <select
+                  disabled={configuration !== "ready" || busy}
                   className="rounded-md border bg-background p-2"
                   value={String(settings[field.id] ?? field.default)}
                   onChange={(e) =>
@@ -264,6 +287,7 @@ function Configure({
                 </select>
               ) : (
                 <Input
+                  disabled={configuration !== "ready" || busy}
                   type={field.type === "integer" ? "number" : "text"}
                   min={field.type === "integer" ? field.min : undefined}
                   max={field.type === "integer" ? field.max : undefined}
@@ -282,7 +306,9 @@ function Configure({
             </label>
           ))}
           <div className="flex items-center gap-3">
-            <Button disabled={busy}>Save settings</Button>
+            <Button disabled={configuration !== "ready" || busy}>
+              Save settings
+            </Button>
             {saved && (
               <span role="status" className="text-sm text-muted-foreground">
                 Saved
@@ -414,7 +440,7 @@ export function AddonsSettings() {
       )}
       {installation ? (
         <Configure
-          key={installation.installationId}
+          key={`${installation.installationId}/${installation.digest}/${installation.dataGeneration}`}
           installation={installation}
           back={() => setSelected(null)}
           onError={setError}
