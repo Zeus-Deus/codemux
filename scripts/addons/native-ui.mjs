@@ -858,6 +858,70 @@ try {
       await assertNoSubmission();
     });
   }
+  await step("08-bounded-list-rendering-and-frame-budget", async () => {
+    const load = join(project, "ui-load");
+    await mkdir(load);
+    for (let i = 0; i < 500; i++)
+      await writeFile(
+        join(load, `${String(i).padStart(3, "0")}.txt`),
+        "Synthetic UI workload\n",
+      );
+    await click('[aria-label="Close settings"]');
+    await openCommand("Open Project Brief");
+    // The public Git API deliberately caches summaries for one second.
+    await delay(1100);
+    const view = `document.querySelector('section[aria-label="Add-on view"]')`;
+    await clickText("Refresh", view);
+    await hasText("501 untracked");
+    await hasText("Showing the first 500 changed paths.");
+    const rows = await script(
+      `return ${view}.querySelectorAll('[role="listitem"]').length`,
+    );
+    assert.ok(
+      rows > 0 && rows <= 14,
+      "The trusted list must virtualize 500 paths",
+    );
+    await script(`window.__addonFrameProbe = {gaps: [], active: true, last: performance.now()};
+      const probe = window.__addonFrameProbe;
+      const tick = now => {
+        if (!probe.active || probe.gaps.length >= 3000) return;
+        probe.gaps.push(now - probe.last); probe.last = now; requestAnimationFrame(tick);
+      }; requestAnimationFrame(tick);`);
+    const refreshMs = [];
+    for (let i = 0; i < 5; i++) {
+      const started = performance.now();
+      await clickText("Refresh", view);
+      await hasText("501 untracked");
+      refreshMs.push(performance.now() - started);
+      await typeComposer(` Render probe ${i}.`);
+      await delay(300);
+    }
+    const gaps = await script(
+      `const p = window.__addonFrameProbe; p.active = false; delete window.__addonFrameProbe; return p.gaps;`,
+    );
+    assert.ok(
+      gaps.length >= 30,
+      "A visible native WebView must supply frame samples",
+    );
+    gaps.sort((a, b) => a - b);
+    const p95FrameGapMs = gaps[Math.floor((gaps.length - 1) * 0.95)];
+    evidence.uiRendering = {
+      workload: "500 visible-model paths, five real Git refreshes while typing",
+      renderedRows: rows,
+      frameSamples: gaps.length,
+      p95FrameGapMs,
+      maxFrameGapMs: gaps.at(-1),
+      refreshMs,
+      p95FrameGapBudgetMs: 100,
+    };
+    assert.ok(
+      p95FrameGapMs <= 100,
+      "Shared-runner UI frame p95 exceeds the recorded 100 ms budget",
+    );
+    await assertNoSubmission();
+    await capture("08-virtualized-native-plugin-list");
+    await openSettings();
+  });
   await step(
     "09-paused-restart-preserves-installations-and-settings",
     async () => {
