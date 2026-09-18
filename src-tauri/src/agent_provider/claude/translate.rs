@@ -782,24 +782,27 @@ fn translate_rate_limit_event(
         auth_mode: Some(PlanAuthMode::Subscription),
     }];
 
-    // A `rejected` status is the one rate-limit reading the user must see in
-    // the transcript: the provider refused the turn. `PlanUsageUpdated` alone
-    // cannot say it — `forward_event` intercepts that variant for the quota
-    // store and returns before persistence and fan-out — so the legacy
-    // warning is emitted ALONGSIDE it. `src/lib/agent-chat/runtime-notice.ts`
-    // keys the "Usage limit reached" notice off exactly this pair
-    // (`message == "rate limit event"` plus
-    // `original_payload.rate_limit_info.status == "rejected"`); changing
-    // either string here silently deletes that notice.
+    // A `rejected` status means the provider refused the turn: the
+    // subscription usage limit is hit. `PlanUsageUpdated` alone cannot say
+    // that — `forward_event` intercepts that variant for the quota store and
+    // returns before persistence and fan-out — so a dedicated
+    // `UsageLimitReached` rides alongside it. It carries the reset the
+    // provider REPORTED (never an invented one); `forward_event` decides
+    // whether to arm an automatic resume and fills `auto_resume_at_ms`.
     if info.get("status").and_then(|v| v.as_str()) == Some(RATE_LIMIT_REJECTED_STATUS) {
-        events.extend(warning(thread_id, RATE_LIMIT_WARNING_MESSAGE, msg));
+        events.push(ProviderRuntimeEvent::UsageLimitReached {
+            thread_id: thread_id.clone(),
+            provider: ProviderKind::Claude,
+            resets_at_ms,
+            auto_resume_at_ms: None,
+            window: raw_kind.map(|s| s.to_string()),
+        });
     }
 
     events
 }
 
-/// Warning text the transcript-notice classifier matches on. See
-/// `src/lib/agent-chat/runtime-notice.ts`.
+/// Warning text for a rate-limit payload whose shape we do not recognize.
 const RATE_LIMIT_WARNING_MESSAGE: &str = "rate limit event";
 
 /// `rate_limit_info.status` value meaning the provider stopped the run.
@@ -2613,31 +2616,59 @@ mod tests {
     /// `forward_event` intercepts `PlanUsageUpdated` for the quota store and
     /// returns BEFORE persistence and fan-out, so a rejected rate-limit event
     /// that decoded into nothing else would never reach the transcript. The
-    /// assertions below are the full wire contract
-    /// `src/lib/agent-chat/runtime-notice.ts` reads — event tag, warning
-    /// message, and the nested `rate_limit_info.status` — checked on the
-    /// SERIALIZED payload, which is what the frontend actually receives.
+    /// assertions below are the wire contract the frontend reads, checked on
+    /// the SERIALIZED payload, which is what the frontend actually receives.
     #[test]
-    fn rejected_rate_limit_event_also_emits_the_transcript_notice_warning() {
+    fn rejected_rate_limit_event_emits_usage_limit_reached() {
         let msg = json!({
             "type": "rate_limit_event",
-            "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour"}
+            "rate_limit_info": {
+                "status": "rejected",
+                "rateLimitType": "five_hour",
+                "utilization": 1.0,
+                "resetsAt": 1_800_000_000_i64,
+            }
         });
         let events = translate_sdk_message(&tid(), &msg);
         assert_eq!(
             events.len(),
             2,
-            "a rejected event carries BOTH quota state and a user-facing notice"
+            "a rejected event carries BOTH quota state and the usage-limit notice"
         );
         assert!(
             matches!(&events[0], ProviderRuntimeEvent::PlanUsageUpdated { .. }),
             "quota state still flows to the meter"
         );
 
-        let wire = serde_json::to_value(&events[1]).expect("serialize warning");
-        assert_eq!(wire["type"], "runtime_warning");
-        assert_eq!(wire["message"], "rate limit event");
-        assert_eq!(wire["original_payload"]["rate_limit_info"]["status"], "rejected");
+        let wire = serde_json::to_value(&events[1]).expect("serialize notice");
+        assert_eq!(wire["type"], "usage_limit_reached");
+        assert_eq!(wire["provider"], "claude");
+        assert_eq!(wire["resets_at_ms"], 1_800_000_000_000_i64);
+        assert_eq!(wire["window"], "five_hour");
+        assert!(
+            wire["auto_resume_at_ms"].is_null(),
+            "arming is the command layer's decision, never the adapter's"
+        );
+    }
+
+    /// A rejection without a reported reset still surfaces, with the reset
+    /// left unknown rather than guessed.
+    #[test]
+    fn rejected_rate_limit_event_without_reset_reports_unknown_reset() {
+        let msg = json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "rejected"}
+        });
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(matches!(
+            &events[1],
+            ProviderRuntimeEvent::UsageLimitReached {
+                resets_at_ms: None,
+                window: None,
+                auto_resume_at_ms: None,
+                ..
+            }
+        ));
     }
 
     /// The mirror case: an informational reading must NOT spam the transcript.

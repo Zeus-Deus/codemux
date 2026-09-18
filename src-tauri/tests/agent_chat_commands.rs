@@ -2078,3 +2078,119 @@ async fn async_question_command_claims_once_and_keeps_other_providers_disabled()
         }
     }
 }
+
+// ── Usage-limit auto-resume ──
+
+fn rate_limited_turn(thread: &str, turn: &str) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::TurnCompleted {
+        thread_id: ThreadId(thread.into()),
+        turn_id: TurnId(turn.into()),
+        status: TurnStatus::Error {
+            subtype: "rate_limit".into(),
+            message: "usage limit".into(),
+        },
+        usage: None,
+    }
+}
+
+fn persisted_types(db: &DatabaseStore, thread: &str) -> Vec<serde_json::Value> {
+    db.list_agent_chat_messages(thread)
+        .iter()
+        .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+        .collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// A provider that reports the limit only through a `rate_limit` turn
+/// status gets a notice synthesized ahead of the settled turn, with the
+/// reset taken from its last quota reading and the resume armed centrally.
+#[test]
+fn rate_limited_turn_synthesizes_an_armed_usage_limit_notice() {
+    use codemux_lib::agent_provider::{PlanUsageWindow, PlanWindowKind};
+    use codemux_lib::commands::usage::PlanQuotaStore;
+
+    let app = mock_app_with_chat_state();
+    let quota = PlanQuotaStore::default();
+    let reset = now_ms() + 60 * 60 * 1000;
+    quota.record(
+        "codex",
+        vec![PlanUsageWindow {
+            kind: PlanWindowKind::FiveHour,
+            used_pct: 100.0,
+            resets_at_ms: Some(reset),
+            label: Some("five_hour".into()),
+        }],
+        None,
+        None,
+        0,
+    );
+    app.manage(quota);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("thread-limit", "ws", Some("/repo"), "codex")
+        .unwrap();
+
+    forward_event(&handle, rate_limited_turn("thread-limit", "turn-1"));
+
+    let rows = persisted_types(&db, "thread-limit");
+    assert_eq!(rows.len(), 2, "notice + settled turn: {rows:?}");
+    assert_eq!(rows[0]["type"], "usage_limit_reached");
+    assert_eq!(rows[0]["provider"], "codex");
+    assert_eq!(rows[0]["resets_at_ms"], reset);
+    assert_eq!(rows[0]["window"], "five_hour");
+    assert_eq!(rows[0]["auto_resume_at_ms"], reset + 45_000);
+    assert_eq!(rows[1]["type"], "turn_completed");
+
+    let armed = db.get_agent_chat_usage_resume("thread-limit").unwrap();
+    assert_eq!(armed.resume_at_ms, Some(reset + 45_000));
+    assert_eq!(armed.attempts, 0);
+}
+
+/// A provider that already emitted its own notice this turn does not get a
+/// second one when the turn then settles with `rate_limit`; a repeat of the
+/// same notice is dropped; a disabled setting reports without arming.
+#[test]
+fn usage_limit_notice_is_deduped_per_turn_and_respects_the_setting() {
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("thread-dedupe", "ws", Some("/repo"), "claude")
+        .unwrap();
+    db.set_setting("agents.auto_resume_usage_limit", "false")
+        .unwrap();
+
+    let reset = now_ms() + 60 * 60 * 1000;
+    let notice = || ProviderRuntimeEvent::UsageLimitReached {
+        thread_id: ThreadId("thread-dedupe".into()),
+        provider: ProviderKind::Claude,
+        resets_at_ms: Some(reset),
+        auto_resume_at_ms: None,
+        window: Some("five_hour".into()),
+    };
+    forward_event(&handle, notice());
+    forward_event(&handle, notice());
+    forward_event(&handle, rate_limited_turn("thread-dedupe", "turn-1"));
+
+    let rows = persisted_types(&db, "thread-dedupe");
+    let notices: Vec<_> = rows
+        .iter()
+        .filter(|r| r["type"] == "usage_limit_reached")
+        .collect();
+    assert_eq!(notices.len(), 1, "{rows:?}");
+    assert!(notices[0]["auto_resume_at_ms"].is_null(), "setting is off");
+    assert!(db.get_agent_chat_usage_resume("thread-dedupe").is_none());
+
+    // The next turn may raise its own notice again.
+    forward_event(&handle, notice());
+    let count = persisted_types(&db, "thread-dedupe")
+        .iter()
+        .filter(|r| r["type"] == "usage_limit_reached")
+        .count();
+    assert_eq!(count, 2);
+}

@@ -1071,6 +1071,74 @@ describe("MessageList dead-run detection (issue #154)", () => {
   });
 });
 
+describe("MessageList usage limit", () => {
+  const userTurn: ChatViewItem = {
+    kind: "user_message",
+    id: "um-1",
+    seq: 0,
+    text: "port the importer",
+  };
+
+  it("records the stop as one quiet line with the window and reset time", () => {
+    const now = new Date();
+    const reset = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+      23,
+      40,
+    ).getTime();
+    renderList([
+      userTurn,
+      { kind: "usage_limit", id: "ul-1", seq: 1, resetsAtMs: reset, window: "five_hour" },
+      {
+        kind: "turn_ended",
+        id: "te-1",
+        seq: 2,
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "rate_limit", message: "usage limit" },
+        usageLimited: true,
+      },
+    ]);
+    const record = screen.getByTestId("usage-limit-record");
+    expect(record).toHaveTextContent(
+      "Usage limit reached · 5-hour limit · resets 23:40",
+    );
+    expect(record.querySelector("button")).toBeNull();
+    // The closing error is silent: the record already says it.
+    expect(screen.queryByText(/Turn ended/)).toBeNull();
+  });
+
+  it("an unknown reset reads just 'Usage limit reached'", () => {
+    renderList([
+      userTurn,
+      { kind: "usage_limit", id: "ul-1", seq: 1, resetsAtMs: null, window: null },
+    ]);
+    expect(screen.getByTestId("usage-limit-record")).toHaveTextContent(
+      /^Usage limit reached$/,
+    );
+  });
+
+  it("renders the automatic resume turn as a divider that discloses its text", () => {
+    const text =
+      "[Resumed automatically after a provider usage limit reset. Continue the task.]";
+    renderList([
+      userTurn,
+      { kind: "user_message", id: "um-2", seq: 1, text },
+    ]);
+    const divider = screen.getByTestId("auto-resume-divider");
+    expect(divider).toHaveTextContent(
+      "Resumed automatically after usage limit reset",
+    );
+    expect(screen.queryByText(text)).toBeNull();
+    const toggle = divider.querySelector("button")!;
+    expect(toggle).toHaveAttribute("title", text);
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("auto-resume-divider-text")).toHaveTextContent(text);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
 describe("MessageList new-turn scroll contract", () => {
   const userTurn: ChatViewItem = {
     kind: "user_message",

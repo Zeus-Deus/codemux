@@ -14,6 +14,9 @@
  *  overloaded, …). The remainder is a short human-readable reason. */
 const ASSISTANT_ERROR_PREFIX = "assistant error: ";
 
+/** The assistant error a usage-limit stop reports. */
+const RATE_LIMIT_REASON = "rate_limit";
+
 /** Contract prefix the Claude adapter stamps on the warning it emits when
  *  the sidecar couldn't resume a stale session and transparently rebuilt a
  *  fresh one. The remainder is the ready-to-render notice text. */
@@ -33,11 +36,14 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  * Map a `runtime_warning` to a user-facing notice string, or `null` when
  * it should stay console-only.
  *
- * - `"rate limit event"` → a notice only when
+ * - `"rate limit event"` (legacy persisted rows only; current adapters emit
+ *   `usage_limit_reached` instead) → a notice only when
  *   `rate_limit_info.status === "rejected"` (the provider actually
  *   stopped the run); an informational rate-limit tick is null.
  * - `"assistant error: <reason>"` → `"Provider error: <reason>"` (the
- *   SDK's enumerated assistant errors, e.g. rate_limit / overloaded).
+ *   SDK's enumerated assistant errors, e.g. overloaded). `rate_limit` is
+ *   null: a usage-limit stop arrives as `usage_limit_reached`, which owns
+ *   the transcript record and the resume affordance.
  * - `"resume-fallback: <text>"` → `<text>` (stale-session recovery: the
  *   remainder is already user-ready copy explaining the fresh session).
  * - anything else → null (SDK debug noise).
@@ -52,7 +58,9 @@ export function runtimeNoticeFromWarning(
       : null;
   }
   if (message.startsWith(ASSISTANT_ERROR_PREFIX)) {
-    return "Provider error: " + message.slice(ASSISTANT_ERROR_PREFIX.length);
+    const reason = message.slice(ASSISTANT_ERROR_PREFIX.length);
+    if (reason === RATE_LIMIT_REASON) return null;
+    return "Provider error: " + reason;
   }
   if (message.startsWith(RESUME_FALLBACK_PREFIX)) {
     return message.slice(RESUME_FALLBACK_PREFIX.length);

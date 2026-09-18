@@ -53,6 +53,12 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // output); on trades that for no sideways scrolling. Supplies each block's
   // default, applied as `data-wrap` on the card — see ChatCodeBlock.tsx.
   "chat.code_wrap": "false",
+  // Whether a run the provider stopped on a subscription usage limit resumes
+  // on its own once the provider's reported reset time passes. Read by the
+  // backend when it schedules the resume (at most two automatic attempts
+  // before it waits for the user); the composer strip always offers a
+  // manual Resume either way.
+  "agents.auto_resume_usage_limit": "true",
 };
 
 /** Color palette variant. */
@@ -169,6 +175,11 @@ export const selectSidebarAutoSettleDays = (s: SettingsStore): number | null => 
 export const selectChatCodeWrap = (s: SettingsStore): boolean =>
   (s.settings["chat.code_wrap"] ?? SETTINGS_DEFAULTS["chat.code_wrap"]!) ===
   "true";
+
+/** Whether usage-limited runs resume automatically at the reset. Default on. */
+export const selectAutoResumeUsageLimit = (s: SettingsStore): boolean =>
+  (s.settings["agents.auto_resume_usage_limit"] ??
+    SETTINGS_DEFAULTS["agents.auto_resume_usage_limit"]!) !== "false";
 
 /** Whether agent orbs follow the current activity. Default on; off pins
  *  every orb to the neutral working state. */

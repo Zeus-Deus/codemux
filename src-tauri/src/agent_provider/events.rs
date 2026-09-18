@@ -800,7 +800,42 @@ pub enum ProviderRuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_mode: Option<PlanAuthMode>,
     },
+    /// The provider stopped the run because the subscription usage limit
+    /// was hit.
+    ///
+    /// Providers emit this with `auto_resume_at_ms: None`; the command
+    /// layer (`forward_event`) is the single place that decides whether an
+    /// automatic resume is armed and fills the field in before the event is
+    /// persisted and fanned out. Persisted so hydrate replays the notice
+    /// (and its countdown) after a restart.
+    UsageLimitReached {
+        thread_id: ThreadId,
+        provider: ProviderKind,
+        /// When the provider says the limit lifts, unix ms. `None` when
+        /// the provider did not report it.
+        #[serde(default)]
+        resets_at_ms: Option<i64>,
+        /// When Codemux will resume the thread automatically, unix ms.
+        /// `None` = not armed (setting off, reset unknown / past / too far
+        /// out, or automatic attempts exhausted).
+        #[serde(default)]
+        auto_resume_at_ms: Option<i64>,
+        /// Which quota window was exhausted, as the provider names it
+        /// (e.g. `"five_hour"`, `"seven_day"`). `None` when unknown.
+        #[serde(default)]
+        window: Option<String>,
+    },
+    /// A previously armed automatic resume for this thread was disarmed —
+    /// by the user, because the user started driving the thread, or
+    /// because the automatic dispatch failed. The UI falls back to the
+    /// manual resume affordance. Persisted so hydrate does not resurrect a
+    /// stale countdown.
+    UsageResumeCancelled { thread_id: ThreadId },
 }
+
+/// Turn-error subtype providers stamp on a [`TurnStatus::Error`] when the
+/// run stopped because the account's usage limit was hit.
+pub const RATE_LIMIT_SUBTYPE: &str = "rate_limit";
 
 /// Turn-error subtype stamped on the synthetic [`TurnStatus::Error`] a
 /// provider watchdog emits when its child process dies mid-turn. The
@@ -1082,6 +1117,91 @@ mod tests {
             }
             other => panic!("expected RunStalled, got {other:?}"),
         }
+    }
+
+    // ── Usage-limit wire form ──
+
+    #[test]
+    fn usage_limit_reached_wire_shape_round_trips() {
+        let event = ProviderRuntimeEvent::UsageLimitReached {
+            thread_id: ThreadId("t1".into()),
+            provider: ProviderKind::Claude,
+            resets_at_ms: Some(1_800_000_000_000),
+            auto_resume_at_ms: Some(1_800_000_045_000),
+            window: Some("five_hour".into()),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "usage_limit_reached",
+                "thread_id": "t1",
+                "provider": "claude",
+                "resets_at_ms": 1_800_000_000_000_i64,
+                "auto_resume_at_ms": 1_800_000_045_000_i64,
+                "window": "five_hour",
+            })
+        );
+        let back: ProviderRuntimeEvent = serde_json::from_value(v).unwrap();
+        match back {
+            ProviderRuntimeEvent::UsageLimitReached {
+                provider,
+                resets_at_ms,
+                auto_resume_at_ms,
+                window,
+                ..
+            } => {
+                assert_eq!(provider, ProviderKind::Claude);
+                assert_eq!(resets_at_ms, Some(1_800_000_000_000));
+                assert_eq!(auto_resume_at_ms, Some(1_800_000_045_000));
+                assert_eq!(window.as_deref(), Some("five_hour"));
+            }
+            other => panic!("expected UsageLimitReached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_limit_reached_unknowns_serialize_as_null_and_default_when_absent() {
+        let event = ProviderRuntimeEvent::UsageLimitReached {
+            thread_id: ThreadId("t1".into()),
+            provider: ProviderKind::Codex,
+            resets_at_ms: None,
+            auto_resume_at_ms: None,
+            window: None,
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert!(v["resets_at_ms"].is_null());
+        assert!(v["auto_resume_at_ms"].is_null());
+        assert!(v["window"].is_null());
+        let minimal: ProviderRuntimeEvent = serde_json::from_value(json!({
+            "type": "usage_limit_reached",
+            "thread_id": "t1",
+            "provider": "codex",
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            ProviderRuntimeEvent::UsageLimitReached {
+                resets_at_ms: None,
+                auto_resume_at_ms: None,
+                window: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn usage_resume_cancelled_wire_shape_round_trips() {
+        let event = ProviderRuntimeEvent::UsageResumeCancelled {
+            thread_id: ThreadId("t1".into()),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v, json!({"type": "usage_resume_cancelled", "thread_id": "t1"}));
+        let back: ProviderRuntimeEvent = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            back,
+            ProviderRuntimeEvent::UsageResumeCancelled { thread_id } if thread_id.0 == "t1"
+        ));
     }
 
     // ── child_exit_events ordering ──

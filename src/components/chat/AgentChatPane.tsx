@@ -91,6 +91,8 @@ import {
 import { useProviderRuntimeIntent } from "@/stores/provider-runtime-intent-store";
 import {
   agentChatCancelQueuedTurn,
+  agentChatCancelUsageResume,
+  agentChatResumeAfterUsageLimit,
   agentChatSendQueuedTurnNow,
   agentChatGetSession,
   agentChatGetSessionContext,
@@ -153,6 +155,7 @@ import {
   sessionErrorOccupant,
   useMonitoringOccupant,
   useSubagentOccupant,
+  useUsageLimitOccupant,
 } from "./use-composer-strip-occupants";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
@@ -3578,6 +3581,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     () => sessionErrorOccupant(messages, transcriptStreaming),
     [messages, transcriptStreaming],
   );
+  // Usage-limit row: the provider stopped the run on a plan limit. The
+  // backend owns the resume text (`/goal resume` on goal threads) and the
+  // schedule; this row only shows it and asks for it.
+  const usageLimit = useAgentChatStore((s) =>
+    threadId ? (s.threads[threadId]?.usageLimit ?? null) : null,
+  );
+  const usageLimitProvider = usageLimit?.provider ?? null;
+  const handleUsageResume = useCallback(async () => {
+    if (!threadId || !usageLimitProvider) return;
+    await agentChatResumeAfterUsageLimit(usageLimitProvider, threadId);
+  }, [threadId, usageLimitProvider]);
+  const handleUsageCancel = useCallback(async () => {
+    if (!threadId || !usageLimitProvider) return;
+    await agentChatCancelUsageResume(usageLimitProvider, threadId);
+  }, [threadId, usageLimitProvider]);
+  const usageOccupant = useUsageLimitOccupant({
+    usageLimit,
+    threadId,
+    streaming: transcriptStreaming,
+    onResume: handleUsageResume,
+    onCancel: handleUsageCancel,
+  });
+  // While the usage row stands, it is the only resume affordance: the
+  // Continue chip and an interrupted goal's own Resume both stand down.
+  const resumableInterrupted = interrupted && usageLimit === null;
   // Goal row: the thread's standing `/goal`, recorded by the reducer from the
   // user's own turn. It goes amber only when the run was cut off mid-turn —
   // the same signal as the transcript's "Run interrupted" divider.
@@ -3601,7 +3629,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   } | null>(null);
   // Where an interrupted run stopped. Scanned only while the goal is cut off,
   // so streaming deltas never pay for it.
-  const goalCutOff = storedGoal !== null && interrupted && !transcriptStreaming;
+  const goalCutOff =
+    storedGoal !== null && resumableInterrupted && !transcriptStreaming;
   const goalLastRun = useMemo(
     () => (goalCutOff ? goalLastActivity(messages) : null),
     [goalCutOff, messages],
@@ -3614,7 +3643,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const stripGoal = useMemo<StripGoal | null>(() => {
     const goal = resolveThreadGoal(
       storedGoal,
-      interrupted && !transcriptStreaming,
+      resumableInterrupted && !transcriptStreaming,
     );
     if (!goal || !threadId) return null;
     const phrases = buildGoalPhrases({
@@ -3673,7 +3702,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
   }, [
     storedGoal,
-    interrupted,
+    resumableInterrupted,
     transcriptStreaming,
     threadId,
     providerCommands,
@@ -3691,6 +3720,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       goal={stripGoal}
       occupants={[
         errorOccupant,
+        usageOccupant,
         monitoringOccupant,
         subagentOccupant,
         queuedOccupant(queued, handleCancelQueued),
@@ -3792,6 +3822,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       placeholderOverride={
         enteredSubagent ? "Steering goes to the orchestrator…" : undefined
       }
+      hasActiveGoal={hasGoal}
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
       stripSlot={stripEl}
@@ -3819,7 +3850,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       sending={isSending}
       // Dead-run recovery (issue #154): a Continue chip in the composer
       // strip when the last run died and nothing is in flight.
-      interrupted={interrupted}
+      interrupted={resumableInterrupted}
       onContinueRun={handleContinueRun}
       contextUsage={contextUsage}
       contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}

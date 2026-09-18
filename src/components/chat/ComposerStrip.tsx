@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Clock,
   EllipsisVertical,
+  Hourglass,
 } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 
@@ -30,10 +31,11 @@ import { TickingText } from "./TickingText";
 /** Which occupant leads the collapsed strip. Lower wins. */
 export const STRIP_PRIORITY = {
   error: 0,
-  monitoring: 1,
-  running: 2,
-  finished: 3,
-  queued: 4,
+  usage: 1,
+  monitoring: 2,
+  running: 3,
+  finished: 4,
+  queued: 5,
 } as const;
 
 export type StripOccupantKind = keyof typeof STRIP_PRIORITY;
@@ -44,13 +46,18 @@ export type StripMark =
   | { kind: "monitoring" }
   | { kind: "finished" }
   | { kind: "queued" }
-  | { kind: "error" };
+  | { kind: "error" }
+  | { kind: "usage" };
 
 export interface StripAction {
   label: string;
   onClick: () => void;
   disabled?: boolean;
   title?: string;
+  /** `solid` is the row's one decision (the goal-style Resume); `quiet` is
+   *  a text-only secondary. Default: the standard filled chip. */
+  tone?: "solid" | "quiet";
+  testId?: string;
 }
 
 /** One row. Slots are fixed so every occupant lines up on the same grid:
@@ -61,7 +68,18 @@ export interface StripRow {
   mark: StripMark;
   label: string;
   detail?: string | null;
+  /** A detail that is a pure function of the clock (a countdown), repainted
+   *  on its own interval without re-rendering the strip. */
+  liveDetail?: {
+    compute: (now: number) => string;
+    intervalMs: number;
+    testId?: string;
+  } | null;
+  /** Static trailing meta in the elapsed slot, e.g. `at 23:41`. */
+  meta?: string | null;
   elapsed?: (now: number) => string;
+  /** Sits before `action` (e.g. a quiet Cancel beside Try now). */
+  secondaryAction?: StripAction | null;
   action?: StripAction | null;
 }
 
@@ -140,8 +158,8 @@ const GOAL_ICON_BUTTON = cn(
   "inline-flex size-[26px] shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-foreground/[0.07] hover:text-foreground",
   GOAL_FOCUS,
 );
-/** Resume is the one solid control in the strip: an interrupted goal is the
- *  only occupant that asks for a decision. */
+/** Resume is the one solid control in the strip: only an interrupted goal
+ *  or a lifted usage limit asks for that decision. */
 const GOAL_RESUME = cn(
   "inline-flex h-[26px] shrink-0 items-center justify-center rounded-[6px] bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
   GOAL_FOCUS,
@@ -180,9 +198,13 @@ export function ComposerStrip({
   occupants: ReadonlyArray<StripOccupant | null | undefined | false>;
   goal?: StripGoal | null;
 }) {
-  const present = occupants
+  const all = occupants
     .filter((o): o is StripOccupant => !!o && o.rows.length > 0)
     .sort((a, b) => STRIP_PRIORITY[a.kind] - STRIP_PRIORITY[b.kind]);
+  // A usage-limit stop is a decision, not background activity, so a goal
+  // never folds it into `+n`: it takes its own row above the goal.
+  const pinned = goal ? all.filter((o) => o.kind === "usage") : [];
+  const present = goal ? all.filter((o) => o.kind !== "usage") : all;
   const rows = present.flatMap((occupant) =>
     occupant.rows.map((row) => ({ row, kind: occupant.kind })),
   );
@@ -217,6 +239,9 @@ export function ComposerStrip({
   }, [anyOpen]);
 
   if (total === 0 && !goal) return null;
+  const pinnedRows = pinned.flatMap((occupant) =>
+    occupant.rows.map((row) => ({ row, kind: occupant.kind })),
+  );
 
   const lead = present[0];
   const interrupted = goal?.goal.status === "interrupted";
@@ -281,6 +306,9 @@ export function ComposerStrip({
         )}
         {goal ? (
           <ul aria-label="Pending activity" className="relative flex flex-col">
+            {pinnedRows.map(({ row, kind }) => (
+              <StripRowView key={row.id} row={row} kind={kind} trailing={null} />
+            ))}
             <GoalRowView
               strip={goal}
               open={goalOpen}
@@ -358,6 +386,8 @@ function occupantSummary(present: StripOccupant[]): string | null {
         return "monitoring";
       case "error":
         return "session error";
+      case "usage":
+        return "usage limit";
     }
   });
   return parts.length > 0 ? parts.join(" · ") : null;
@@ -385,32 +415,60 @@ function StripRowView({
       <span className="max-w-[40%] shrink-0 truncate whitespace-nowrap text-body-sm font-semibold text-foreground/80">
         {row.label}
       </span>
-      <span
-        className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
-        title={row.detail ?? undefined}
-      >
-        {row.detail}
-      </span>
+      {row.liveDetail ? (
+        <TickingText
+          testId={row.liveDetail.testId}
+          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground tabular-nums"
+          compute={row.liveDetail.compute}
+          intervalMs={row.liveDetail.intervalMs}
+        />
+      ) : (
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-label text-muted-foreground"
+          title={row.detail ?? undefined}
+        >
+          {row.detail}
+        </span>
+      )}
+      {row.meta && (
+        <span className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground tabular-nums">
+          {row.meta}
+        </span>
+      )}
       {row.elapsed && (
         <TickingText
           className="shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground"
           compute={row.elapsed}
         />
       )}
-      {row.action && (
-        <button
-          type="button"
-          data-testid="composer-strip-action"
-          disabled={row.action.disabled}
-          title={row.action.title}
-          onClick={row.action.onClick}
-          className={STRIP_CHIP}
-        >
-          {row.action.label}
-        </button>
+      {row.secondaryAction && (
+        <StripActionButton action={row.secondaryAction} />
       )}
+      {row.action && <StripActionButton action={row.action} />}
       {trailing}
     </li>
+  );
+}
+
+function StripActionButton({ action }: { action: StripAction }) {
+  return (
+    <button
+      type="button"
+      data-testid={action.testId ?? "composer-strip-action"}
+      disabled={action.disabled}
+      title={action.title}
+      onClick={action.onClick}
+      className={cn(
+        action.tone === "solid"
+          ? GOAL_RESUME
+          : action.tone === "quiet"
+            ? GOAL_CHIP
+            : STRIP_CHIP,
+        "disabled:pointer-events-none disabled:opacity-50",
+      )}
+    >
+      {action.label}
+    </button>
   );
 }
 
@@ -792,6 +850,14 @@ function StripMarkView({ mark }: { mark: StripMark }) {
       return (
         <Clock
           className="size-3.5 text-muted-foreground"
+          strokeWidth={1.8}
+          aria-hidden
+        />
+      );
+    case "usage":
+      return (
+        <Hourglass
+          className="size-3.5 text-status-working"
           strokeWidth={1.8}
           aria-hidden
         />

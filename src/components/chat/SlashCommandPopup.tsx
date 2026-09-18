@@ -293,6 +293,15 @@ export function SlashCommandPopup({
                       ) : (
                         <>
                       <span className="text-foreground">{item.label}</span>
+                      {item.argumentHint &&
+                        // The description already falls back to
+                        // `/<name> <hint>`; don't repeat it.
+                        item.description !==
+                          `${item.command} ${item.argumentHint}` && (
+                          <span className="truncate font-mono text-label text-muted-foreground/70">
+                            {item.argumentHint}
+                          </span>
+                        )}
                       {item.description && (
                         <span className="truncate text-xs text-muted-foreground">
                           {item.description}

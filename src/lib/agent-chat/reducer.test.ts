@@ -2947,3 +2947,144 @@ describe("agent-chat reducer — interim turn ends (provider yields on backgroun
     expect(turnEnds(settled)[0]).not.toHaveProperty("interim");
   });
 });
+
+describe("usage limit", () => {
+  const limitEvent = (
+    overrides: Partial<Extract<ProviderRuntimeEvent, { type: "usage_limit_reached" }>> = {},
+  ): ProviderRuntimeEvent => ({
+    type: "usage_limit_reached",
+    thread_id: "t1",
+    provider: "claude",
+    resets_at_ms: 5_000_000,
+    auto_resume_at_ms: 5_060_000,
+    window: "five_hour",
+    ...overrides,
+  });
+  const rateLimitEnd: ProviderRuntimeEvent = {
+    type: "turn_completed",
+    thread_id: "t1",
+    turn_id: "turn-1",
+    status: { kind: "error", subtype: "rate_limit", message: "usage limit" },
+    usage: null,
+  };
+  const clock: Clock = () => 1_000;
+
+  it("sets the standing limit and appends a usage_limit record", () => {
+    const state = runEvents([limitEvent()], undefined, clock);
+    expect(state.usageLimit).toEqual({
+      provider: "claude",
+      resetsAtMs: 5_000_000,
+      autoResumeAtMs: 5_060_000,
+      window: "five_hour",
+      at: 1_000,
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      kind: "usage_limit",
+      resetsAtMs: 5_000_000,
+      window: "five_hour",
+    });
+  });
+
+  it("reads omitted fields as null", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "usage_limit_reached",
+      thread_id: "t1",
+      provider: "codex",
+    });
+    expect(state.usageLimit).toMatchObject({
+      resetsAtMs: null,
+      autoResumeAtMs: null,
+      window: null,
+    });
+    expect(state.messages[0]).toMatchObject({ resetsAtMs: null, window: null });
+  });
+
+  it("a cancelled resume disarms but keeps the limit", () => {
+    const state = runEvents([
+      limitEvent(),
+      { type: "usage_resume_cancelled", thread_id: "t1" },
+    ]);
+    expect(state.usageLimit).toMatchObject({
+      resetsAtMs: 5_000_000,
+      autoResumeAtMs: null,
+    });
+    const idle = createEmptyThreadState();
+    expect(
+      applyEvent(idle, { type: "usage_resume_cancelled", thread_id: "t1" }),
+    ).toBe(idle);
+  });
+
+  it("the closing turn_completed keeps the limit and records a silent boundary", () => {
+    const state = runEvents([limitEvent(), rateLimitEnd]);
+    expect(state.usageLimit).not.toBeNull();
+    expect(state.streaming).toBe(false);
+    expect(state.interrupted).toBe(false);
+    const end = state.messages[state.messages.length - 1];
+    expect(end).toMatchObject({ kind: "turn_ended", usageLimited: true });
+    expect(state.messages.filter((m) => m.kind === "turn_ended")).toHaveLength(1);
+  });
+
+  it("a rate_limit error with no usage record stays a visible turn end", () => {
+    const state = runEvents([rateLimitEnd]);
+    expect(state.messages[0]).toMatchObject({ kind: "turn_ended" });
+    expect(state.messages[0]).not.toHaveProperty("usageLimited");
+  });
+
+  it("any new user turn clears it: optimistic send, fan-out and dispatch", () => {
+    const limited = runEvents([limitEvent(), rateLimitEnd]);
+    expect(appendUserMessage(limited, "go on").usageLimit).toBeNull();
+    expect(
+      applyEvent(limited, {
+        type: "user_message",
+        thread_id: "t1",
+        text: "[Resumed automatically after a provider usage limit reset.]",
+      }).usageLimit,
+    ).toBeNull();
+    const queued = applyEvent(limited, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q1",
+      client_nonce: null,
+      text: "later",
+    });
+    expect(queued.usageLimit).not.toBeNull();
+    expect(
+      applyEvent(queued, {
+        type: "queued_turn_dispatched",
+        thread_id: "t1",
+        queued_id: "q1",
+        turn_id: "turn-2",
+        text: "later",
+      }).usageLimit,
+    ).toBeNull();
+  });
+
+  it("hydrate replay reaches the same answer as the live fold", () => {
+    const rows = (events: ProviderRuntimeEvent[]) =>
+      events.map((e) => JSON.stringify(e));
+    const userRow: ProviderRuntimeEvent = {
+      type: "user_message",
+      thread_id: "t1",
+      text: "port the importer",
+    };
+    const standing = replayPayloads(rows([userRow, limitEvent(), rateLimitEnd]));
+    expect(standing.usageLimit).toMatchObject({ autoResumeAtMs: 5_060_000 });
+    expect(standing.interrupted).toBe(false);
+
+    const cancelled = replayPayloads(
+      rows([
+        userRow,
+        limitEvent(),
+        rateLimitEnd,
+        { type: "usage_resume_cancelled", thread_id: "t1" },
+      ]),
+    );
+    expect(cancelled.usageLimit).toMatchObject({ autoResumeAtMs: null });
+
+    const answered = replayPayloads(
+      rows([userRow, limitEvent(), rateLimitEnd, { ...userRow, text: "resume" }]),
+    );
+    expect(answered.usageLimit).toBeNull();
+  });
+});

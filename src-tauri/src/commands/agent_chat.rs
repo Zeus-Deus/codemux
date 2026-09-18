@@ -2271,8 +2271,37 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     provider: ProviderKind,
     input: SendTurnCommandInput,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
+    send_turn_with_origin(app, provider, input, TurnOrigin::User).await
+}
+
+/// Who initiated a turn going through [`send_turn_with_origin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOrigin {
+    /// The user typed and sent it. Counts as user activity: any pending
+    /// usage-limit resume on the thread is forgotten.
+    User,
+    /// A usage-limit resume (scheduled or the manual "Resume now"). Must
+    /// NOT count as user activity, or the scheduler's own dispatch would
+    /// reset the attempt cap it is bounded by.
+    UsageResume,
+}
+
+/// The one send path behind [`agent_chat_send_turn`] and the usage-limit
+/// resume dispatch: session ensure/resume, skill rendering, checkpointing,
+/// queue semantics, user-message persistence and fan-out are identical for
+/// both; only `origin` differs.
+pub async fn send_turn_with_origin<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    input: SendTurnCommandInput,
+    origin: TurnOrigin,
+) -> Result<crate::agent_provider::TurnStartResult, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    if origin == TurnOrigin::User {
+        let db: State<'_, DatabaseStore> = app.state();
+        super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+    }
     // Auto-resume: if the provider's session map has no live session for
     // this thread (e.g. the app was restarted), rebuild it from the
     // persisted row before the turn so the user never sees a
@@ -2520,6 +2549,11 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    {
+        // Promoting a queued turn is the user driving the thread.
+        let db: State<'_, DatabaseStore> = app.state();
+        super::usage_resume::forget_on_user_activity(&db, &thread_id.0);
+    }
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     impl_
@@ -5131,7 +5165,7 @@ fn saturating_usage_i64(value: u64) -> i64 {
 /// [`spawn_event_bridge`]. As a side effect, persists the SDK session
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
-pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent) {
+pub fn forward_event<R: Runtime>(app: &AppHandle<R>, mut event: ProviderRuntimeEvent) {
     // Row id of whatever this event wrote to `agent_chat_messages`, if
     // anything. Persistence happens BEFORE fan-out (below), so the live
     // payload can carry the durable position of its own row — that is
@@ -5317,6 +5351,34 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                 let _ = std::fs::remove_file(&image.path);
             }
         }
+    }
+    // Usage-limit auto-resume. A notice is armed centrally here (the single
+    // owner of the schedule) before it is persisted, so the stored and
+    // fanned-out copies carry the same `auto_resume_at_ms`. Providers that
+    // signal the limit only through a `rate_limit` turn status get a notice
+    // synthesized ahead of their `TurnCompleted`, so hydrate replays the
+    // notice before the settled turn.
+    if matches!(event, ProviderRuntimeEvent::UsageLimitReached { .. })
+        && !super::usage_resume::arm_usage_limit_event(app, &mut event)
+    {
+        return; // Duplicate of this turn's notice.
+    }
+    if let ProviderRuntimeEvent::TurnCompleted {
+        thread_id, status, ..
+    } = &event
+    {
+        if matches!(
+            status,
+            crate::agent_provider::TurnStatus::Error { subtype, .. }
+                if subtype == crate::agent_provider::events::RATE_LIMIT_SUBTYPE
+        ) {
+            if let Some(notice) =
+                super::usage_resume::synthesize_for_rate_limited_turn(app, thread_id)
+            {
+                forward_event(app, notice);
+            }
+        }
+        super::usage_resume::end_turn(thread_id);
     }
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
@@ -6320,7 +6382,11 @@ fn map_event_to_pane_status(
         // A stall is advisory only — the run may well be fine (a long quiet
         // tool call). The sidebar dot must NOT change; the amber transcript
         // notice is the entire signal.
-        | ProviderRuntimeEvent::RunStalled { .. } => None,
+        | ProviderRuntimeEvent::RunStalled { .. }
+        // A usage-limit notice rides alongside the turn's own settlement,
+        // which already moves the dot; the resume schedule is not liveness.
+        | ProviderRuntimeEvent::UsageLimitReached { .. }
+        | ProviderRuntimeEvent::UsageResumeCancelled { .. } => None,
         // A workflow launching/completing doesn't itself imply a pane
         // status transition — the subagents it spawns and the turn it
         // runs within already drive `Working`/`Review` via their own
@@ -6807,6 +6873,11 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
                 status: crate::agent_provider::SessionStatus::Error { .. },
                 ..
             }
+            // Usage-limit notices and their cancellation persist so hydrate
+            // replays the notice (and a still-pending countdown) after a
+            // restart, and never resurrects a cancelled one.
+            | ProviderRuntimeEvent::UsageLimitReached { .. }
+            | ProviderRuntimeEvent::UsageResumeCancelled { .. }
     )
     // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
     // MINTED from a row `persist_user_message` has already written, and
@@ -6958,7 +7029,9 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
         | ProviderRuntimeEvent::PlanUsageUpdated { thread_id, .. }
-        | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::RunStalled { thread_id, .. }
+        | ProviderRuntimeEvent::UsageLimitReached { thread_id, .. }
+        | ProviderRuntimeEvent::UsageResumeCancelled { thread_id } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }
