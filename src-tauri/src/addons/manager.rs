@@ -1519,6 +1519,97 @@ mod tests {
             .is_err());
     }
     #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_runtime_faults_quarantine_one_plugin_and_preserve_another() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let mut healthy_manifest = manifest.clone();
+        healthy_manifest.id = "example.healthy".into();
+        let healthy_install = installed(healthy_manifest);
+        manager.save(&healthy_install).unwrap();
+        let healthy_source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let healthy = manager
+            .activate(healthy_install, healthy_source.into(), false)
+            .await
+            .unwrap();
+        let failing_installation = installed(manifest.clone());
+        for code in [
+            "throw Error('private failure details')",
+            "while(true){}",
+            "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+            "function f(){f()} f()",
+            "new ArrayBuffer(128*1024*1024)",
+            // Ask only the child to exit: the manager has no pending stop and
+            // must treat the resulting EOF as an unexpected runtime failure.
+            "",
+        ] {
+            let installation = failing_installation.clone();
+            manager.save(&installation).unwrap();
+            let source = format!("__codemuxRegister({{}}, ({{send}}) => m => {{if(m.method==='activate')send('ready',{{phase:'activated',registrations:['commands/hello']}});else if(m.method==='command.execute'){{{code}}}}});");
+            let failing = manager.activate(installation, source, false).await.unwrap();
+            let context = manager.context_handle(&failing, None, None).await.unwrap();
+            let start = Instant::now();
+            failing
+                .host
+                .send(
+                    if code.is_empty() {
+                        "deactivate"
+                    } else {
+                        "command.execute"
+                    },
+                    json!({"id":"hello"}),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), failing.stopped.cancelled())
+                .await
+                .expect("fault contained and child reaped within two seconds");
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert!(matches!(
+                manager.installation(&manifest.id).unwrap().status,
+                Status::FailedDisabled
+            ));
+            assert!(manager
+                .contexts
+                .lock()
+                .await
+                .get(&context, failing.generation())
+                .is_err());
+            assert!(
+                manager.ensure_active(&manifest.id).await.is_err(),
+                "a fault cannot auto-restart the plugin"
+            );
+            assert!(!healthy.cancel.is_cancelled());
+            assert_eq!(manager.running.lock().await.len(), 1);
+            manager
+                .request(
+                    &healthy,
+                    "storage.set",
+                    json!({"scope":"global","key":"alive","value":true}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .request(
+                        &healthy,
+                        "storage.get",
+                        json!({"scope":"global","key":"alive"})
+                    )
+                    .await
+                    .unwrap(),
+                json!(true)
+            );
+        }
+        manager.shutdown().await;
+        assert!(manager.running.lock().await.is_empty());
+    }
+    #[tokio::test]
     #[ignore = "Build the independent Project Brief package and host first"]
     async fn native_project_brief_package_uses_installer_git_ui_and_composer_broker() {
         let root = tempfile::tempdir().unwrap();

@@ -54,7 +54,13 @@ struct Pending {
 pub struct Reviews {
     pending: Mutex<HashMap<String, Pending>>,
     #[cfg(test)]
-    interruption: Mutex<Option<(&'static str, Arc<tokio::sync::Notify>)>>,
+    interruption: Mutex<
+        Option<(
+            &'static str,
+            Arc<tokio::sync::Notify>,
+            Option<Arc<tokio::sync::Notify>>,
+        )>,
+    >,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,13 +104,17 @@ impl Reviews {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|(expected, _)| *expected == stage)
-            .map(|(_, notify)| notify.clone());
-        if let Some(notify) = notify {
+            .filter(|(expected, _, _)| *expected == stage)
+            .map(|(_, notify, resume)| (notify.clone(), resume.clone()));
+        if let Some((notify, resume)) = notify {
             notify.notify_one();
             // The test drops this transaction future here, exactly as an
             // interrupted process would abandon it without error-path cleanup.
-            std::future::pending::<()>().await;
+            if let Some(resume) = resume {
+                resume.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
         }
     }
     pub fn prepare_local(&self, manager: &Manager, path: &Path) -> Result<Review> {
@@ -1152,7 +1162,7 @@ mod tests {
                 .prepare(&manager, package_version("2.0.0"), old.source.clone())
                 .unwrap();
             let reached = Arc::new(tokio::sync::Notify::new());
-            *reviews.interruption.lock().unwrap() = Some((stage, reached.clone()));
+            *reviews.interruption.lock().unwrap() = Some((stage, reached.clone(), None));
             tokio::select! {
                 result = reviews.accept(&manager, &review.token, false, false) => panic!("{stage}: transaction completed before interruption: {}", result.is_ok()),
                 _ = reached.notified() => {},
@@ -1203,6 +1213,82 @@ mod tests {
                 0,
                 "{stage}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn uninstall_waits_for_update_and_removes_the_committed_candidate() {
+        for stage in [
+            "data-snapshotted",
+            "registry-switched",
+            "completion-committed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let reviews = Reviews::default();
+            let first = reviews
+                .prepare(
+                    &manager,
+                    package_version("1.0.0"),
+                    Source::Local {
+                        identity: Uuid::new_v4().to_string(),
+                    },
+                )
+                .unwrap();
+            let old = reviews
+                .accept(&manager, &first.token, false, false)
+                .await
+                .unwrap();
+            let review = reviews
+                .prepare(&manager, package_version("2.0.0"), old.source.clone())
+                .unwrap();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *reviews.interruption.lock().unwrap() =
+                Some((stage, reached.clone(), Some(resume.clone())));
+            let update = reviews.accept(&manager, &review.token, false, false);
+            tokio::pin!(update);
+            tokio::select! {
+                result = &mut update => panic!("{stage}: update escaped checkpoint: {}", result.is_ok()),
+                _ = reached.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => panic!("{stage}: checkpoint not reached"),
+            }
+            let removal = manager.remove(&old.manifest.id, false);
+            tokio::pin!(removal);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut removal)
+                    .await
+                    .is_err(),
+                "{stage}: removal overlapped update"
+            );
+            resume.notify_one();
+            let (updated, removed) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::join!(&mut update, &mut removal)
+                })
+                .await
+                .expect("serialized operations finish");
+            assert_eq!(updated.unwrap().digest, review.digest, "{stage}");
+            assert!(removed.unwrap().is_empty(), "{stage}");
+            assert!(manager.list().unwrap().is_empty(), "{stage}");
+            assert!(
+                !manager
+                    .root
+                    .join("state")
+                    .join(&old.installation_id)
+                    .exists(),
+                "{stage}"
+            );
+            assert!(
+                !manager
+                    .root
+                    .join("packages")
+                    .join(&old.manifest.id)
+                    .join(&review.digest)
+                    .exists(),
+                "{stage}"
+            );
+            let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            assert!(reopened.list().unwrap().is_empty(), "{stage}");
         }
     }
     #[test]
