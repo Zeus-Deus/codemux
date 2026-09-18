@@ -111,7 +111,7 @@ export function SidebarDevicesButton({
           aria-label="Devices"
           data-testid="sidebar-devices"
           onClick={() => setShowDevices(true)}
-          className={cn("relative h-7 rounded-md text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-label" : "w-7")}
+          className={cn("relative h-7 rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground", labeled ? "w-full justify-start gap-2 px-2 text-label" : "w-7")}
         >
           <Icon className="size-[15px]" />
           {labeled && "Devices"}

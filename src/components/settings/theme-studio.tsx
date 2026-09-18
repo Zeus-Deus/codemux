@@ -502,7 +502,7 @@ function SolvedRoles({ theme }: { theme: ThemeDefinition }) {
         {swatches.map((color, index) => (
           <span
             key={`${color}-${index}`}
-            className="h-[22px] rounded-sm border border-foreground/10"
+            className="h-[22px] rounded-sm border border-hairline-strong"
             style={{ background: normalizeColor(color, normalizeColor(theme.roles.background) ?? "#000") ?? color }}
           />
         ))}

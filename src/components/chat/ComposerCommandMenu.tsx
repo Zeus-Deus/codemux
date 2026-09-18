@@ -258,7 +258,7 @@ export function ComposerCommandMenu({
                           {item.rightAdornment}
                         </span>
                       ) : item.command ? (
-                        <span className="ml-auto shrink-0 rounded-sm bg-foreground/[0.06] px-1.5 py-0.5 font-mono text-label text-muted-foreground">
+                        <span className="ml-auto shrink-0 rounded-sm bg-surface-2 px-1.5 py-0.5 font-mono text-label text-muted-foreground">
                           {item.command}
                         </span>
                       ) : null}

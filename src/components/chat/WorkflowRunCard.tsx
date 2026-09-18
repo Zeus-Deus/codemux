@@ -144,7 +144,7 @@ function WorkflowApprovalCard({
               key={`${phase.title}-${i}`}
               className="flex items-center gap-2.5 text-body-sm"
             >
-              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-sm bg-foreground/[0.08] font-mono text-caption font-semibold text-muted-foreground">
+              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-sm bg-surface-3 font-mono text-caption font-semibold text-muted-foreground">
                 {i + 1}
               </span>
               <span className="flex-1 font-medium text-foreground/90">
@@ -294,7 +294,7 @@ function WorkflowRunningRow({
           onOpenPanel();
         }
       }}
-      className="cursor-pointer overflow-hidden rounded-lg border border-border bg-foreground/[0.025] hover:border-muted-foreground/60"
+      className="cursor-pointer overflow-hidden rounded-lg border border-border bg-surface-1 hover:border-muted-foreground/60"
     >
       <div className="flex items-center gap-2.5 px-3.5 py-2.5">
         {/* Stands for the whole run, like the Subagents card header, so it

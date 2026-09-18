@@ -187,7 +187,7 @@ function AppMenu({
               variant="ghost"
               size="icon-xs"
               aria-label="Menu"
-              className="h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+              className="h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-surface-2"
             >
               <Settings className="size-[18px]" />
             </Button>
@@ -320,7 +320,7 @@ function FooterDestination({
       size={labeled ? "sm" : "icon-xs"}
       aria-label={action.label}
       className={cn(
-        "h-7 shrink-0 rounded-md text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+        "h-7 shrink-0 rounded-md text-muted-foreground hover:bg-surface-2 hover:text-foreground",
         labeled ? "gap-1.5 px-2 text-body-sm" : "w-7",
         fullWidth && "w-full justify-start",
       )}

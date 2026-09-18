@@ -57,7 +57,7 @@ import {
 const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
 
 const GHOST_BTN =
-  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground outline-none transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-medium text-muted-foreground outline-none transition-colors hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
 
 /** Location-picker row geometry, shared by the Home row and the project
  *  rows so both sections line up on the same baseline. */
@@ -577,7 +577,7 @@ function LocationControl({
                   handleSelectProject(result.path);
                 }
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground"
             >
               <FolderPlus className="size-3.5" />
               Open another project…
@@ -633,7 +633,7 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("current")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <Folder className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">
@@ -654,7 +654,7 @@ function CheckoutControl({
         <button
           type="button"
           onClick={() => onChangeCheckoutMode("worktree")}
-          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.08]"
+          className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-surface-2"
         >
           <GitFork className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 flex-1">

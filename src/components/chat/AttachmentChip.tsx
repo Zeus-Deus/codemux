@@ -58,12 +58,12 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
   file: {
     icon: FileIcon,
     tint: "neutral",
-    className: "bg-foreground/10 text-foreground border-border/60",
+    className: "bg-surface-3 text-foreground border-border/60",
   },
   folder: {
     icon: FolderOpen,
     tint: "neutral",
-    className: "bg-foreground/10 text-foreground border-border/60",
+    className: "bg-surface-3 text-foreground border-border/60",
   },
   issue: {
     icon: CircleDot,
@@ -115,7 +115,7 @@ function tintForAttachment(attachment: Attachment): {
   if (attachment.kind === "issue" && state === "closed") {
     return {
       tint: "neutral",
-      className: "bg-foreground/10 text-muted-foreground border-border/60",
+      className: "bg-surface-3 text-muted-foreground border-border/60",
     };
   }
   if (attachment.kind === "pr") {
@@ -128,7 +128,7 @@ function tintForAttachment(attachment: Attachment): {
     if (state === "closed" || state === "draft") {
       return {
         tint: "neutral",
-        className: "bg-foreground/10 text-muted-foreground border-border/60",
+        className: "bg-surface-3 text-muted-foreground border-border/60",
       };
     }
   }
@@ -321,7 +321,7 @@ export function AttachmentChip({
             alt=""
             aria-hidden
             data-testid="attachment-chip-thumbnail"
-            className="h-[22px] w-[30px] shrink-0 rounded-sm border border-foreground/10 object-cover"
+            className="h-[22px] w-[30px] shrink-0 rounded-sm border border-hairline-strong object-cover"
             onError={() => setPreviewFailed(true)}
           />
           <span className="truncate max-w-[200px]">{metadata.label}</span>
@@ -373,8 +373,8 @@ export function AttachmentChip({
             onToggleExpand?.(attachment.id);
           }}
           className={cn(
-            "ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10",
-            expandActive && "bg-foreground/10",
+            "ml-0.5 rounded-sm p-0.5 hover:bg-surface-2",
+            expandActive && "bg-surface-3",
           )}
           aria-label={expandTooltip}
           aria-pressed={expandActive}
@@ -390,7 +390,7 @@ export function AttachmentChip({
           e.stopPropagation();
           onRemove(attachment.id);
         }}
-        className="ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10"
+        className="ml-0.5 rounded-sm p-0.5 hover:bg-surface-2"
         aria-label={`Remove ${metadata.label}`}
       >
         <X className="h-2.5 w-2.5" />
@@ -433,7 +433,7 @@ export function AttachmentChip({
               alt=""
               aria-hidden
               data-testid="attachment-chip-tooltip-preview"
-              className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-foreground/10 object-contain"
+              className="mb-1 max-h-[180px] max-w-[260px] rounded-sm border border-hairline-strong object-contain"
             />
           )}
           <div className="font-mono text-label truncate max-w-[260px]">

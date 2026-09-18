@@ -324,7 +324,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
               className={cn(
                 "-mr-0.5 flex size-5 shrink-0 items-center justify-center rounded-md",
                 "text-muted-foreground opacity-0 transition-[opacity,color,background-color]",
-                "hover:bg-foreground/[0.07] hover:text-foreground",
+                "hover:bg-surface-2 hover:text-foreground",
                 "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
                 "group-hover/draft:opacity-100",
               )}

@@ -229,7 +229,7 @@ export function SidebarNeedsYouStrip({
                 key={workspace.workspace_id}
                 type="button"
                 onClick={() => jumpToWorkspace(workspace.workspace_id, projectPath)}
-                className="group/needs flex items-center gap-2 rounded-sm px-1 py-[3px] text-left hover:bg-foreground/5 transition-colors"
+                className="group/needs flex items-center gap-2 rounded-sm px-1 py-[3px] text-left hover:bg-surface-2 transition-colors"
                 aria-label={`Jump to ${workspace.title} — waiting for your input`}
               >
                 <ProjectAvatar

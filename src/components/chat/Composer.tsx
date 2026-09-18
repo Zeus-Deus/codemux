@@ -3048,7 +3048,7 @@ export function Composer({
                         data-error={seg.hasError || undefined}
                         data-tint={seg.hasError ? "destructive" : "neutral"}
                         className={cn(
-                          "rounded-sm bg-foreground/10 text-foreground",
+                          "rounded-sm bg-surface-3 text-foreground",
                           seg.isLoading && "opacity-60",
                           seg.hasError &&
                             "bg-destructive/15 text-destructive",
@@ -3094,7 +3094,7 @@ export function Composer({
                           "rounded-sm",
                           seg.state === "open"
                             ? "bg-warning/15 text-warning"
-                            : "bg-foreground/10 text-muted-foreground",
+                            : "bg-surface-3 text-muted-foreground",
                           seg.isLoading && "opacity-60",
                           seg.hasError &&
                             "bg-destructive/15 text-destructive",
@@ -3117,7 +3117,7 @@ export function Composer({
                         ? "bg-primary/15 text-primary"
                         : seg.state === "merged"
                           ? "bg-chart-4/15 text-chart-4"
-                          : "bg-foreground/10 text-muted-foreground";
+                          : "bg-surface-3 text-muted-foreground";
                     return (
                       <span
                         key={i}

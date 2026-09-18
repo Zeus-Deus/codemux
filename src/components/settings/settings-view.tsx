@@ -312,8 +312,8 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       className={cn(
         "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
-          ? "bg-foreground/[0.09] text-foreground"
-          : "text-muted-foreground/90 hover:bg-foreground/[0.06] hover:text-foreground",
+          ? "bg-surface-3 text-foreground"
+          : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
       )}
     >
       <Icon

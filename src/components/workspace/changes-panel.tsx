@@ -674,7 +674,7 @@ export function ChangesPanel({
             <Button
               size="xs"
               variant="ghost"
-              className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+              className="h-6 text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
               onClick={handleContinueMerge}
               disabled={busy !== null}
             >
@@ -696,7 +696,7 @@ export function ChangesPanel({
                 <Button
                   size="xs"
                   variant="ghost"
-                  className="h-6 text-caption bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                  className="h-6 text-caption bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                   onClick={async () => {
                     await initialize();
                     refresh();
@@ -770,7 +770,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="h-6 text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(generatedMsg)}
                 disabled={busy !== null}
               >
@@ -822,7 +822,7 @@ export function ChangesPanel({
               <Button
                 size="xs"
                 variant="ghost"
-                className="h-6 text-caption flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                className="h-6 text-caption flex-1 bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60"
                 onClick={() => finalizeCommit(editedMsg)}
                 disabled={!editedMsg.trim() || busy !== null}
               >
@@ -948,7 +948,7 @@ function SmartCommitButton({
   // when the action button blends with the card surface rather than
   // competing with it.
   const fillCls =
-    "bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60";
+    "bg-surface-2 hover:bg-surface-3 text-foreground border border-border/60";
 
   return (
     <div className="flex items-stretch gap-px rounded-md overflow-hidden">

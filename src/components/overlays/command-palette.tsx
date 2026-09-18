@@ -1139,7 +1139,7 @@ function ConversationItem({
       onSelect={onSelect}
       className="h-[58px] py-1.5"
     >
-      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-foreground/[0.025] text-muted-foreground/80">
+      <span className="flex size-6 flex-none items-center justify-center rounded-md border border-border/60 bg-surface-1 text-muted-foreground/80">
         <Icon className="size-3" />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">

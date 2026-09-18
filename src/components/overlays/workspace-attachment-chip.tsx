@@ -65,7 +65,7 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
           onError={() => setThumbErrored(true)}
         />
       ) : (
-        <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-foreground/10 text-muted-foreground">
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-surface-3 text-muted-foreground">
           {isImage ? (
             <ImageIcon className="h-3 w-3" />
           ) : (
@@ -77,7 +77,7 @@ export function WorkspaceAttachmentChip({ path, onRemove }: Props) {
       <button
         type="button"
         aria-label={`Remove ${label}`}
-        className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-foreground/10 hover:text-foreground"
+        className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-foreground"
         onClick={onRemove}
       >
         <X className="h-2.5 w-2.5" />
