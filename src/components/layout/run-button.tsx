@@ -78,7 +78,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
   };
 
   const shortcutBadge = (
-    <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded border border-border text-muted-foreground font-sans">
+    <kbd className="ml-1 text-caption leading-none bg-muted px-1 py-0.5 rounded-sm border border-border text-muted-foreground font-sans">
       Ctrl+Shift+G
     </kbd>
   );
@@ -110,7 +110,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               type="button"
               onClick={isConfigured ? handleRun : handleConfigure}
               className={cn(
-                "flex h-7 items-center gap-1.5 px-2 text-xs font-semibold text-foreground",
+                "flex h-7 items-center gap-1.5 px-2 text-label font-semibold text-foreground",
                 BAND_CONTROL_RADIUS,
                 BAND_CONTROL_HOVER,
                 !isConfigured && "text-muted-foreground",
@@ -137,7 +137,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
                 BAND_CONTROL_HOVER,
               )}
             >
-              <ChevronDown className="h-3 w-3" />
+              <ChevronDown className="size-3" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>

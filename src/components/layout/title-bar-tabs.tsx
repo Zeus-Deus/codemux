@@ -49,10 +49,10 @@ type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 const EMPTY_PANE_STATUSES: Record<string, PaneStatus> = {};
 
 const tabKindIcon: Record<TabKind, React.ReactNode> = {
-  terminal: <Terminal className="h-3 w-3" />,
-  browser: <Globe className="h-3 w-3" />,
-  diff: <GitCompare className="h-3 w-3" />,
-  editor: <FileCode className="h-3 w-3" />,
+  terminal: <Terminal className="size-3" />,
+  browser: <Globe className="size-3" />,
+  diff: <GitCompare className="size-3" />,
+  editor: <FileCode className="size-3" />,
 };
 
 function collectPaneIds(node: PaneNodeSnapshot): string[] {
@@ -61,8 +61,8 @@ function collectPaneIds(node: PaneNodeSnapshot): string[] {
 }
 
 function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
-  if (isChat) return <MessageSquare className="h-3 w-3" />;
-  if (tab.icon) return <PresetIcon icon={tab.icon} className="h-3 w-3" />;
+  if (isChat) return <MessageSquare className="size-3" />;
+  if (tab.icon) return <PresetIcon icon={tab.icon} className="size-3" />;
   return tabKindIcon[tab.kind];
 }
 
@@ -73,14 +73,14 @@ function tabIcon(tab: TabSnapshot, isChat: boolean): React.ReactNode {
 // the band-wide control token, shared with the panel toggle and the 28px
 // icon buttons.
 const PILL_BASE = cn(
-  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-xs transition-colors",
+  "group/tab flex h-7 shrink-0 items-center gap-1 pl-2.5 pr-1 text-label transition-colors duration-150",
   BAND_CONTROL_RADIUS,
 );
 const PILL_ACTIVE = cn(BAND_ACTIVE_FILL, "text-foreground font-semibold");
 const PILL_INACTIVE =
   "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
 const CLOSE_BTN =
-  "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
+  "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
 interface TitleBarTabsProps {
   workspace: WorkspaceSnapshot;
@@ -149,8 +149,7 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
   return (
     <div
       ref={setScrollerNode}
-      className="relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
-      style={{ scrollbarWidth: "none" }}
+      className="no-scrollbar relative flex min-w-0 items-center gap-[2px] overflow-x-auto"
       data-testid="titlebar-tabs-scroll"
     >
       {dragTabId && dropIndicatorLeft !== null && (
@@ -261,7 +260,7 @@ function TitleBarTab({
             : "opacity-0 group-hover/tab:opacity-100 focus-visible:opacity-100",
         )}
       >
-        <X className="h-3 w-3" />
+        <X className="size-3" />
       </button>
     </div>
   );
@@ -313,13 +312,13 @@ function ActiveChatTab({
               data-testid="titlebar-chat-tab-trigger"
             >
               <span className="shrink-0 opacity-90">
-                <MessageSquare className="h-3 w-3" />
+                <MessageSquare className="size-3" />
               </span>
               <span className="max-w-[130px] truncate">{tab.title}</span>
               {status && <StatusIndicator status={status} />}
               <ChevronDown
                 className={cn(
-                  "h-3 w-3 shrink-0 opacity-60 transition-transform",
+                  "size-3 shrink-0 opacity-60 transition-transform duration-150",
                   open && "rotate-180",
                 )}
               />
@@ -349,7 +348,7 @@ function ActiveChatTab({
           title="Close tab"
           className={cn(CLOSE_BTN, "opacity-70")}
         >
-          <X className="h-3 w-3" />
+          <X className="size-3" />
         </button>
       </div>
     </>

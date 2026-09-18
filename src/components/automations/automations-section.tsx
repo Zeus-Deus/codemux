@@ -46,6 +46,7 @@ import {
   type HostView,
   type RepoAccessResult,
 } from "@/tauri/commands";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** A project currently open in the Codemux sidebar — the source for
  *  the project picker. */
@@ -388,7 +389,7 @@ export function AutomationsSection() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+      <div className="flex items-center justify-center py-12 text-body text-muted-foreground">
         <Loader2 className="mr-2 size-4 animate-spin" />
         Loading automations…
       </div>
@@ -401,7 +402,7 @@ export function AutomationsSection() {
     return (
       <div className="flex h-full min-h-[460px] items-center justify-center">
         <div className="max-w-sm space-y-4 text-center">
-          <div className="mx-auto flex size-14 items-center justify-center rounded-2xl border border-border/50 bg-muted/40">
+          <div className="mx-auto flex size-14 items-center justify-center rounded-lg border border-border/50 bg-muted/40">
             <CalendarClock className="size-6 text-muted-foreground/70" />
           </div>
           <div className="space-y-1.5">
@@ -418,7 +419,6 @@ export function AutomationsSection() {
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 gap-1.5 text-body"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -436,9 +436,9 @@ export function AutomationsSection() {
       {/* Sidebar */}
       <div style={{display: mobile ? "none" : undefined}} className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
         <div className="mb-3 flex items-end justify-between gap-2">
-          <p className="text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+          <Eyebrow>
             Automations
-          </p>
+          </Eyebrow>
           <span className="text-label text-muted-foreground/60 tabular-nums">
             {automations.length}
           </span>
@@ -462,7 +462,7 @@ export function AutomationsSection() {
                     setDraft(null);
                   }}
                   className={cn(
-                    "group/row flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors",
+                    "group/row flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors duration-150",
                     active ? "bg-muted" : "hover:bg-muted/40",
                   )}
                 >
@@ -476,7 +476,7 @@ export function AutomationsSection() {
                           : "Enabled"
                     }
                     className={cn(
-                      "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors",
+                      "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors duration-150",
                       !automation.enabled
                         ? "bg-muted-foreground/40"
                         : automation.last_run_status === "failed"
@@ -488,7 +488,7 @@ export function AutomationsSection() {
                     <span className="flex items-center gap-1.5">
                       <span
                         className={cn(
-                          "min-w-0 flex-1 truncate text-body transition-colors",
+                          "min-w-0 flex-1 truncate text-body transition-colors duration-150",
                           active
                             ? "text-foreground"
                             : "text-muted-foreground group-hover/row:text-foreground",
@@ -518,7 +518,7 @@ export function AutomationsSection() {
             type="button"
             variant="ghost"
             size="sm"
-            className="w-full justify-start gap-2 h-8 px-2.5 text-body text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
+            className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -616,9 +616,9 @@ function AutomationDetail({
             {automation.enabled ? "Enabled" : "Paused"}
           </span>
           {automation.dirty && (
-            <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-caption font-medium uppercase tracking-wider text-warning">
+            <Eyebrow className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-warning">
               Pending sync
-            </span>
+            </Eyebrow>
           )}
         </div>
         <p className="text-body-sm text-muted-foreground/85">
@@ -638,9 +638,9 @@ function AutomationDetail({
       </div>
 
       <div className="space-y-1.5">
-        <p className="text-label font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+        <Eyebrow>
           Prompt
-        </p>
+        </Eyebrow>
         <div className="select-text rounded-lg border border-border/60 bg-muted/30 p-3 text-body text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
           {automation.prompt}
         </div>
@@ -654,7 +654,6 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onEdit}
           >
@@ -665,7 +664,6 @@ function AutomationDetail({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-body-sm"
             disabled={busy}
             onClick={onToggleEnabled}
           >
@@ -686,7 +684,7 @@ function AutomationDetail({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm text-destructive hover:bg-destructive/10 hover:text-destructive"
+          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
           disabled={busy}
           onClick={onDelete}
         >
@@ -701,9 +699,9 @@ function AutomationDetail({
 function FactCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5">
-      <p className="text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+      <Eyebrow>
         {label}
-      </p>
+      </Eyebrow>
       <p className="mt-1 text-body text-foreground/90 tabular-nums">{value}</p>
     </div>
   );
@@ -752,9 +750,9 @@ function RunHistory({ automationId }: { automationId: number }) {
   return (
     <div className="space-y-1.5">
       <div className="flex items-baseline justify-between">
-        <p className="text-label font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+        <Eyebrow>
           Run history
-        </p>
+        </Eyebrow>
         {runs.length > 0 && (
           <span className="text-label text-muted-foreground/50 tabular-nums">
             {runs.length}
@@ -793,7 +791,7 @@ function RunHistory({ automationId }: { automationId: number }) {
               ) : null}
               <span
                 className={cn(
-                  "ml-auto shrink-0 rounded px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
+                  "ml-auto shrink-0 rounded-sm px-1.5 py-0.5 text-caption font-medium uppercase tracking-wide",
                   RUN_STATUS_BADGE[run.status] ?? "bg-muted text-muted-foreground",
                 )}
               >
@@ -945,7 +943,6 @@ function AutomationForm({
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm"
           disabled={busy}
           onClick={onCancel}
         >
@@ -956,7 +953,6 @@ function AutomationForm({
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 gap-1.5 text-body-sm"
           disabled={busy || !canSave}
           onClick={onSave}
         >
@@ -1060,7 +1056,7 @@ function ScheduleField({
         </span>
         <button
           type="button"
-          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors"
+          className="shrink-0 text-label text-muted-foreground/70 hover:text-foreground transition-colors duration-150"
           onClick={() => {
             if (draft.rawMode) {
               patch({ rawMode: false });
@@ -1204,7 +1200,7 @@ function RepoAccessRow({
           <button
             type="button"
             onClick={check}
-            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors"
+            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors duration-150"
           >
             Check again
           </button>

@@ -151,7 +151,7 @@ export function NewProjectScreen() {
           size="sm"
           onClick={() => setShowNewProjectScreen(false)}
         >
-          <ArrowLeft className="h-4 w-4 mr-1" />
+          <ArrowLeft className="size-4 mr-1" />
           Back
         </Button>
       </div>
@@ -163,7 +163,7 @@ export function NewProjectScreen() {
 
           {/* Location */}
           <div>
-            <label className="block text-sm font-medium text-foreground mb-2">
+            <label className="block text-body font-medium text-foreground mb-2">
               Location
             </label>
             <div className="flex gap-2">
@@ -171,7 +171,7 @@ export function NewProjectScreen() {
                 value={parentDir}
                 onChange={(e) => setParentDir(e.target.value)}
                 placeholder="~/Projects"
-                className="flex-1 font-mono text-xs"
+                className="flex-1 font-mono text-label"
                 disabled={loading}
               />
               <Button
@@ -181,7 +181,7 @@ export function NewProjectScreen() {
                 disabled={loading}
                 className="shrink-0"
               >
-                <FolderOpen className="h-4 w-4" />
+                <FolderOpen className="size-4" />
               </Button>
             </div>
           </div>
@@ -199,23 +199,23 @@ export function NewProjectScreen() {
                     setError(null);
                   }}
                   className={cn(
-                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors",
+                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors duration-150",
                     selected
-                      ? "border-foreground/50 bg-foreground/5"
+                      ? "border-foreground/50 bg-surface-2"
                       : "border-border/50 hover:border-border hover:bg-accent/30",
                   )}
                 >
                   <option.icon
                     className={cn(
-                      "h-6 w-6",
+                      "size-6",
                       selected ? "text-foreground" : "text-muted-foreground",
                     )}
                   />
                   <div>
-                    <div className="text-sm font-medium text-foreground">
+                    <div className="text-body font-medium text-foreground">
                       {option.label}
                     </div>
-                    <div className="text-xs text-muted-foreground mt-0.5">
+                    <div className="text-label text-muted-foreground mt-0.5">
                       {option.description}
                     </div>
                   </div>
@@ -227,7 +227,7 @@ export function NewProjectScreen() {
           {/* Mode-specific fields */}
           {mode === "empty" && (
             <div>
-              <label className="block text-sm font-medium text-foreground mb-2">
+              <label className="block text-body font-medium text-foreground mb-2">
                 Repository Name
               </label>
               <Input
@@ -246,7 +246,7 @@ export function NewProjectScreen() {
           {mode === "clone" && (
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">
+                <label className="block text-body font-medium text-foreground mb-2">
                   Repository URL
                 </label>
                 <Input
@@ -261,7 +261,7 @@ export function NewProjectScreen() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">
+                <label className="block text-body font-medium text-foreground mb-2">
                   Repository Name
                 </label>
                 <Input
@@ -277,13 +277,13 @@ export function NewProjectScreen() {
           {/* Error */}
           {error && (
             <div className="flex items-start gap-2 rounded-md px-4 py-3 bg-destructive/10 border border-destructive/20">
-              <span className="flex-1 text-sm text-destructive">{error}</span>
+              <span className="flex-1 text-body text-destructive">{error}</span>
               <button
                 type="button"
                 onClick={() => setError(null)}
-                className="shrink-0 rounded p-0.5 text-destructive/70 hover:text-destructive transition-colors"
+                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
-                <X className="h-3.5 w-3.5" />
+                <X className="size-3.5" />
               </button>
             </div>
           )}
@@ -292,7 +292,7 @@ export function NewProjectScreen() {
               with phase + percent + a determinate bar so a slow clone
               never looks hung. */}
           {cloning && (
-            <div className="rounded-md border border-border/50 bg-foreground/5 px-4 py-3">
+            <div className="rounded-md border border-border/50 bg-surface-2 px-4 py-3">
               <CloneProgressRow progress={cloneProgress} />
             </div>
           )}
@@ -300,12 +300,12 @@ export function NewProjectScreen() {
           {/* Submit */}
           <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
             {cloning && (
-              <span className="mr-auto text-xs text-muted-foreground">
+              <span className="mr-auto text-label text-muted-foreground">
                 Cloning — this can take a while on slow connections…
               </span>
             )}
             <Button onClick={handleCreate} disabled={loading} size="sm" className="bg-foreground text-background hover:bg-foreground/90">
-              {loading && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              {loading && <Loader2 className="size-3 animate-spin mr-1" />}
               {loading
                 ? mode === "clone"
                   ? "Cloning..."

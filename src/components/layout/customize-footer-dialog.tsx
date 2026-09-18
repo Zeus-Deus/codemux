@@ -23,6 +23,8 @@ import {
 } from "@/lib/footer-actions";
 import { useFooterPinsStore, type FooterPin } from "@/stores/footer-pins-store";
 import { useFooterAvailability } from "./footer-availability";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { cn } from "@/lib/utils";
 
 function IconPicker({ pin }: { pin: FooterPin }) {
   const [open, setOpen] = useState(false);
@@ -46,7 +48,7 @@ function IconPicker({ pin }: { pin: FooterPin }) {
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-64 p-3" align="start">
-        <p className="mb-2 text-xs font-medium">Choose a bundled icon</p>
+        <p className="mb-2 text-label font-medium">Choose a bundled icon</p>
         <Button
           variant="ghost"
           size="sm"
@@ -101,12 +103,12 @@ export function CustomizeFooterDialog({
             Keep your frequent destinations close. Changes save on this device.
           </DialogDescription>
         </DialogHeader>
-        <div className="thin-scrollbar min-h-0 overflow-y-auto px-6 py-4">
-          <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 overflow-y-auto px-6 py-4">
+          <h3 className={cn(eyebrowVariants(), "mb-3")}>
             Pinned destinations · {pins.length}
           </h3>
           {pins.length === 0 && (
-            <p className="py-3 text-sm text-muted-foreground">
+            <p className="py-3 text-body text-muted-foreground">
               No pins yet. Your app menu stays in the footer.
             </p>
           )}
@@ -125,11 +127,11 @@ export function CustomizeFooterDialog({
                 >
                   <IconPicker pin={pin} />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">
+                    <p className="truncate text-body font-medium">
                       {action.label}
                     </p>
                     {!available && (
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-label text-muted-foreground">
                         Hidden until available
                       </p>
                     )}
@@ -166,7 +168,7 @@ export function CustomizeFooterDialog({
               );
             })}
           </ol>
-          <h3 className="mb-3 mt-6 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          <h3 className={cn(eyebrowVariants(), "mb-3 mt-6")}>
             Add a destination
           </h3>
           <Input
@@ -181,7 +183,7 @@ export function CustomizeFooterDialog({
                 key={action.id}
                 type="button"
                 aria-label={`Pin ${action.label}`}
-                className="flex w-full items-center gap-3 rounded-md px-2 py-2 text-left text-sm hover:bg-muted focus-visible:outline-ring"
+                className="flex w-full items-center gap-3 rounded-md px-2 py-2 text-left text-body hover:bg-muted focus-visible:outline-ring"
                 onClick={() => togglePin(action.id)}
               >
                 <action.icon className="size-4 text-muted-foreground" />
@@ -190,7 +192,7 @@ export function CustomizeFooterDialog({
               </button>
             ))}
             {available.length === 0 && (
-              <p className="py-3 text-sm text-muted-foreground">
+              <p className="py-3 text-body text-muted-foreground">
                 No matching destinations to add.
               </p>
             )}

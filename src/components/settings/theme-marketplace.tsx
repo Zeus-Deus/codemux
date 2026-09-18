@@ -100,7 +100,7 @@ export function ThemeMarketplacePanel({
         Search the Marketplace
       </span>
 
-      <label className="flex h-[34px] items-center gap-2 rounded-[9px] border border-border bg-muted/30 px-2.5">
+      <label className="flex h-[34px] items-center gap-2 rounded-md border border-border bg-muted/30 px-2.5">
         <Search className="size-3 flex-none text-muted-foreground" />
         <input
           value={query}
@@ -135,7 +135,7 @@ export function ThemeMarketplacePanel({
                   type="button"
                   onClick={() => openExtension(theme)}
                   className={cn(
-                    "flex items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left transition-colors",
+                    "flex items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left transition-colors duration-150",
                     open ? "bg-muted" : "hover:bg-muted/60",
                   )}
                 >
@@ -165,7 +165,7 @@ export function ThemeMarketplacePanel({
                         key={variant.label}
                         type="button"
                         onClick={() => onPick(variant.content, variant.label)}
-                        className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-body-sm text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                        className="flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-body-sm text-muted-foreground transition-colors duration-150 hover:bg-muted/60 hover:text-foreground"
                       >
                         <span className="min-w-0 flex-1 truncate">{variant.label}</span>
                         {/* What the manifest declared. The parser re-derives

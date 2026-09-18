@@ -6344,7 +6344,8 @@ fn map_event_to_pane_status(
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
         // Ledger rows are the same: pure accounting, no liveness signal.
-        ProviderRuntimeEvent::ContextUsageUpdated { .. }
+        ProviderRuntimeEvent::ContextCompactionChanged { .. }
+        | ProviderRuntimeEvent::ContextUsageUpdated { .. }
         | ProviderRuntimeEvent::UsageRecorded { .. }
         // Plan quota is an account-level reading, not thread liveness.
         | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
@@ -6986,6 +6987,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ContextCompactionChanged { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }
@@ -8112,6 +8114,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             pr_head_branch: None,
+            base_branch: None,
             provider_kind: None,
             linked_issue: None,
             notifications_muted: false,

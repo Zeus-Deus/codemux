@@ -128,12 +128,12 @@ export function MarkdownLocalImage({
 
   return (
     <span
-      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-xl border border-border/70 bg-card shadow-sm"
+      className="not-prose my-3 block max-w-2xl overflow-hidden rounded-lg border border-border/70 bg-card shadow-sm"
       data-chat-local-image
     >
       <button
         type="button"
-        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="group block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60"
         aria-label={`Open ${caption}`}
         onClick={() => setOpen(true)}
       >
@@ -141,19 +141,19 @@ export function MarkdownLocalImage({
           {thumbnail.failed || !thumbnail.src ? (
             <span className="flex flex-col items-center gap-2 py-10 text-muted-foreground">
               <ImageOff className="size-6 opacity-50" aria-hidden />
-              <span className="text-xs">Image unavailable</span>
+              <span className="text-label">Image unavailable</span>
             </span>
           ) : (
             <img
               src={thumbnail.src}
               alt={caption}
               loading="lazy"
-              className="max-h-72 w-full object-contain transition-transform duration-200 group-hover:scale-[1.01]"
+              className="max-h-72 w-full object-contain transition-transform duration-150 group-hover:scale-[1.01]"
               onError={thumbnail.onError}
             />
           )}
         </span>
-        <span className="flex min-w-0 items-center gap-2 border-t border-border/60 px-3 py-2 text-xs">
+        <span className="flex min-w-0 items-center gap-2 border-t border-border/60 px-3 py-2 text-label">
           <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <span className="min-w-0 flex-1 truncate font-medium text-foreground">
             {children ?? caption}
@@ -184,7 +184,7 @@ function ExpandedImage({ path, caption }: { path: string; caption: string }) {
     return (
       <span className={IMAGE_LIGHTBOX_FALLBACK_CLASS}>
         <ImageOff className="size-8 opacity-50" aria-hidden />
-        <span className="text-sm">Failed to load {caption}</span>
+        <span className="text-body">Failed to load {caption}</span>
       </span>
     );
   }

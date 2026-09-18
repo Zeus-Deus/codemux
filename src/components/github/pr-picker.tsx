@@ -10,6 +10,7 @@ import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Pull-request picker, mirroring `IssuePickerPanel`.
@@ -57,22 +58,22 @@ function PrRow({
       data-state={pr.state.toLowerCase()}
       data-draft={pr.is_draft || undefined}
       className={cn(
-        "group/row flex items-center gap-2 px-2 py-1.5 cursor-pointer rounded-sm transition-colors",
+        "group/row flex items-center gap-2 px-2 py-1.5 cursor-pointer rounded-sm transition-colors duration-150",
         isFocused ? "bg-accent" : "hover:bg-accent/50",
       )}
       onClick={onSelect}
       onMouseEnter={onMouseEnter}
     >
       <PrStatusIcon state={effectivePrState(pr)} className="shrink-0" />
-      <span className="text-muted-foreground text-[0.75rem] shrink-0 font-mono tabular-nums">
+      <span className="text-muted-foreground text-label shrink-0 font-mono tabular-nums">
         {providerRef(provider, pr.number)}
       </span>
-      <span className="text-[0.8rem] text-foreground truncate min-w-0 flex-1">
+      <span className="text-body-sm text-foreground truncate min-w-0 flex-1">
         {pr.title}
       </span>
       <span
         className={cn(
-          "text-muted-foreground text-[0.7rem] shrink-0 select-none transition-opacity",
+          "text-muted-foreground text-caption shrink-0 select-none transition-opacity duration-150",
           isFocused ? "opacity-100" : "opacity-0 group-hover/row:opacity-100",
         )}
       >
@@ -85,9 +86,9 @@ function PrRow({
 function SkeletonRow() {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
-      <div className="size-3.5 rounded-full bg-muted animate-pulse shrink-0" />
-      <div className="h-3 w-8 rounded bg-muted animate-pulse shrink-0" />
-      <div className="h-3 flex-1 rounded bg-muted animate-pulse" />
+      <div className="size-3.5 rounded-full bg-muted motion-safe:animate-pulse shrink-0" />
+      <div className="h-3 w-8 rounded-sm bg-muted motion-safe:animate-pulse shrink-0" />
+      <div className="h-3 flex-1 rounded-sm bg-muted motion-safe:animate-pulse" />
     </div>
   );
 }
@@ -244,9 +245,9 @@ export function PrPickerPanel({
   return (
     <div onKeyDown={handleKeyDown} data-testid="pr-picker-panel">
       <div className="flex items-center justify-between px-3 pt-2.5 pb-1">
-        <span className="text-[0.7rem] font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Open Pull Requests
-        </span>
+        </Eyebrow>
       </div>
 
       <div className="px-2 pb-1.5">
@@ -257,7 +258,7 @@ export function PrPickerPanel({
             value={search}
             onChange={(e) => handleSearchChange(e.target.value)}
             placeholder={`Search ${provider.shortNoun}s… (or type a number)`}
-            className="flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
+            className="flex-1 bg-transparent text-label text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
           />
         </div>
       </div>
@@ -272,7 +273,7 @@ export function PrPickerPanel({
           </>
         ) : error ? (
           <div className="px-3 py-4 text-center">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-label text-muted-foreground">
               {error.includes("not authenticated") || error.includes("auth")
                 ? `Connect ${provider.name} to link ${provider.shortNoun}s`
                 : error.includes("not installed")
@@ -281,7 +282,7 @@ export function PrPickerPanel({
             </p>
           </div>
         ) : displayPrs.length === 0 ? (
-          <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+          <div className="px-3 py-4 text-center text-label text-muted-foreground">
             {search.trim()
               ? `No ${provider.shortNoun}s found`
               : `No open ${provider.shortNoun}s`}
@@ -299,8 +300,8 @@ export function PrPickerPanel({
           ))
         )}
         {directSearching && displayPrs.length > 0 && (
-          <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-[0.65rem]">
-            <Loader2 className="h-3 w-3 animate-spin" />
+          <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
+            <Loader2 className="size-3 animate-spin" />
             Searching…
           </div>
         )}

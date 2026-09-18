@@ -424,6 +424,8 @@ export interface ChatThreadState {
    *  "when this session learned about the plan", not the original wall
    *  time — good enough for the panel's "last update" caption. */
   tasksUpdatedAt: number | null;
+  /** Transient, provider-confirmed context summarization. */
+  compacting: boolean;
   streaming: boolean;
   pendingRequestIds: string[];
   /** Next `seq` to assign to a freshly-appended item. Strictly
@@ -479,6 +481,7 @@ export function emptyThreadState(): ChatThreadState {
     messages: [],
     tasks: null,
     tasksUpdatedAt: null,
+    compacting: false,
     streaming: false,
     pendingRequestIds: [],
     nextSeq: 0,

@@ -1,14 +1,18 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { ChatViewItem } from "@/lib/agent-chat/types";
+import { useUIStore } from "@/stores/ui-store";
 
 import {
   StreamingMarker,
-  deriveStreamingLabel,
+  deriveStreamingStatus,
   deriveTurnStartedAt,
 } from "./StreamingMarker";
+
+const deriveStreamingLabel = (messages: ChatViewItem[]) =>
+  deriveStreamingStatus(messages).label;
 
 afterEach(() => {
   cleanup();
@@ -132,5 +136,64 @@ describe("deriveStreamingLabel — waiting on background work", () => {
         toolCall(2),
       ]),
     ).toBe("Running Read…");
+  });
+});
+
+
+it("announces summarization ahead of transcript-derived activity", () => {
+  const { rerender } = render(<StreamingMarker messages={[toolCall(1)]} compacting />);
+  expect(screen.getByRole("status", { name: "Agent is summarizing context" })).toHaveTextContent("Summarizing context…");
+  expect(screen.queryByText("Running Read…")).toBeNull();
+  rerender(<StreamingMarker messages={[toolCall(1)]} />);
+  expect(screen.getByText("Running Read…")).toBeInTheDocument();
+});
+
+describe("StreamingMarker — waiting label opens the Subagents panel", () => {
+  const waitingMessages = (): ChatViewItem[] => [
+    userMsg(0),
+    {
+      kind: "subagent_run",
+      id: "sr-1",
+      seq: 1,
+      turn_id: "t1",
+      subagents: [
+        { id: "a", status: "running", items: [] },
+        { id: "b", status: "running", backgroundTask: true, items: [] },
+      ],
+    } as unknown as ChatViewItem,
+    {
+      kind: "assistant_message",
+      id: "a2",
+      seq: 2,
+      turn_id: "t1",
+      text: "Waiting…",
+      streaming: false,
+    },
+  ];
+
+  const initialState = useUIStore.getState();
+  afterEach(() => {
+    useUIStore.setState(initialState, true);
+  });
+
+  it("opens the Subagents tab for the workspace on click", () => {
+    render(<StreamingMarker messages={waitingMessages()} workspaceId="ws-1" />);
+    const button = screen.getByRole("button", { name: "View 2 background tasks" });
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(button);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("subagents");
+    expect(button).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("stays plain text without a workspace or while the tail is live", () => {
+    render(<StreamingMarker messages={waitingMessages()} />);
+    expect(screen.getByText("Waiting on 2 background tasks…")).toBeInTheDocument();
+    expect(screen.queryByRole("button")).toBeNull();
+    cleanup();
+    render(
+      <StreamingMarker messages={[userMsg(0), toolCall(1)]} workspaceId="ws-1" />,
+    );
+    expect(screen.getByText("Running Read…")).toBeInTheDocument();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

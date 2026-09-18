@@ -1,5 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { geometryFingerprint } from "@/lib/geometry-fingerprint";
 import {
   act,
   cleanup,
@@ -359,18 +360,24 @@ describe("TitleBar chrome gating", () => {
 
     const sidebarToggle = getByRole("button", { name: "Toggle sidebar" });
     const panelToggle = getByRole("button", { name: "Open panel" });
-    const sidebarIcon = sidebarToggle.querySelector(".lucide-panel-left");
-    const panelIcon = panelToggle.querySelector(".lucide-panel-right");
+    const sidebarIcon = sidebarToggle.querySelector(
+      ".lucide-panel-left",
+    ) as Element;
+    const panelIcon = panelToggle.querySelector(
+      ".lucide-panel-right",
+    ) as Element;
     expect(sidebarIcon).toBeInTheDocument();
     expect(panelIcon).toBeInTheDocument();
     expect(sidebarToggle).toHaveClass("size-7");
     expect(panelToggle).toHaveClass("size-7");
     expect(sidebarToggle).toHaveClass("text-muted-foreground");
     expect(panelToggle).toHaveClass("text-muted-foreground");
-    expect(sidebarIcon).toHaveClass("h-3.5", "w-3.5");
-    expect(panelIcon).toHaveClass("size-3.5");
-    expect(sidebarIcon).toHaveAttribute("stroke-width", "2");
-    expect(panelIcon).toHaveAttribute("stroke-width", "2");
+    // Mirrored means identical: the same box. Stroke weight is one
+    // base-layer rule for the whole app, so neither glyph carries one.
+    expect(geometryFingerprint(sidebarIcon)).toBe(
+      geometryFingerprint(panelIcon),
+    );
+    expect(sidebarIcon).toHaveClass("size-3.5");
   });
 
   it("keeps the open right-panel toggle frameless", () => {

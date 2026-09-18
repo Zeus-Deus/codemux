@@ -632,6 +632,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       return {
         messages: t?.messages ?? EMPTY_MESSAGES,
         streaming: t?.streaming ?? false,
+        compacting: t?.compacting ?? false,
         // Dead-run detection (issue #154): the stall notice + interrupted /
         // Continue affordances read straight off the thread slice.
         stalled: t?.stalled ?? null,
@@ -640,7 +641,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       };
     }),
   );
-  const { messages, streaming, stalled, interrupted, activeTurnId } = timeline;
+  const { messages, streaming, compacting, stalled, interrupted, activeTurnId } = timeline;
   const settings = useAgentChatStore(
     useShallow((s) => {
       const t = threadId ? s.threads[threadId] : undefined;
@@ -3432,7 +3433,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // strip never changes shape across the first send.
     <div className={SCOPE_STRIP_INSET}>
       <div className={SCOPE_STRIP} data-mobile-scope-strip>
-        <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-0.5 text-label font-medium text-muted-foreground">
           <span
             className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
             title={workspaceProjectRoot}
@@ -3798,7 +3799,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       zone1Override={zone1Override}
       belowComposerSlot={mobile ? null : belowComposerSlot}
       stripSlot={stripEl}
-      hasQueuedMessage={queued.length > 0}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
@@ -3927,6 +3927,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             <ChatTranscript
               messages={messages}
               streaming={transcriptStreaming}
+              compacting={compacting}
               stalled={stalled}
               interrupted={interrupted}
               sendAnchor={sendAnchor}

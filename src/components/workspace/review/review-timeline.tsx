@@ -347,7 +347,7 @@ function AgentEntry({
             data-testid="timeline-open-thread"
             onClick={() => onOpenThread(run)}
             className={cn(
-              "rounded border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors hover:bg-accent/50 focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+              "rounded-sm border-0 bg-card px-2 py-1 text-foreground/90 outline-none transition-colors duration-150 hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring/60",
               tzMeta,
             )}
           >
@@ -399,7 +399,7 @@ export function TimelineFilterPicker({
           type="button"
           data-testid="timeline-filter"
           className={cn(
-            "border-0 bg-transparent py-2 text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[1.5px] focus-visible:ring-ring/60",
+            "border-0 bg-transparent py-2 text-muted-foreground outline-none transition-colors duration-150 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60",
             tzMetaNum,
           )}
         >

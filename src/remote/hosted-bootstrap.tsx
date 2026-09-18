@@ -251,7 +251,8 @@ function hostOf(url: string): string {
 
 // ── Screens ─────────────────────────────────────────────────────────
 
-function HostedScreen(props: {
+/** Exported for the screen tests; `bootstrapHosted` is the only caller. */
+export function HostedScreen(props: {
   state: HostedState;
   flow: HostedFlow;
   apiHost: string;
@@ -281,10 +282,98 @@ function HostedScreen(props: {
       body = <Spinner title="Connected" detail="Loading…" />;
       break;
   }
+  const signedOut = state.phase === "signin";
   return (
     <div style={overlayStyle}>
-      <div style={{ width: "100%", maxWidth: 420 }}>{body}</div>
+      <div style={columnStyle}>
+        <HostedHeader tagline={signedOut} />
+        {body}
+        {signedOut && <SignedOutFooter />}
+      </div>
     </div>
+  );
+}
+
+/**
+ * Page-level identity for the hosted client.
+ *
+ * Someone who follows a link to the hosted origin without an account lands on
+ * this screen first, so it has to say what it is before it asks for
+ * credentials. The mark and wordmark show on every bootstrap phase; the line
+ * of context only while signed out, where it is the only thing explaining the
+ * page.
+ */
+function HostedHeader(props: { tagline: boolean }): React.ReactElement {
+  return (
+    <header style={headerStyle}>
+      <div style={wordmarkRowStyle}>
+        <CodemuxMark />
+        <span style={wordmarkStyle}>Codemux</span>
+      </div>
+      {props.tagline && (
+        <p style={taglineStyle}>
+          The web client for a desktop you’ve connected.
+        </p>
+      )}
+    </header>
+  );
+}
+
+/**
+ * The way out for a visitor with no account and no connected machine: a link
+ * back to the marketing site, and the one command that makes a desktop show up
+ * in the picker behind this form.
+ */
+function SignedOutFooter(): React.ReactElement {
+  return (
+    <div style={footerStyle}>
+      <p style={footerLineStyle}>
+        Don’t have a machine set up yet?{" "}
+        <a href="https://codemux.org" style={footerLinkStyle}>
+          codemux.org →
+        </a>
+      </p>
+      <p style={footerLineStyle}>
+        Already running Codemux? Run <code style={inlineCodeStyle}>codemux connect</code>{" "}
+        on that desktop to make it reachable here.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Codemux bracket-fork logomark, inline so the pre-app screen still ships no
+ * external assets (`src/assets/codemux-logomark.svg` is a fixed near-white and
+ * would vanish on a stored light palette). Strokes take `currentColor`; the two
+ * fork nodes take the ember accent, the one brand colour the card already uses.
+ */
+function CodemuxMark(): React.ReactElement {
+  const ember = "var(--accent-ember, oklch(0.705 0.152 47))";
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 40 40"
+      fill="none"
+      aria-hidden="true"
+      style={{ flexShrink: 0 }}
+    >
+      <path
+        d="M6 10 L14 20 L6 30"
+        stroke="currentColor"
+        strokeWidth="2.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M18 20 H24 M24 20 L32 12 M24 20 L32 28"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+      />
+      <circle cx="32" cy="12" r="2.5" fill={ember} />
+      <circle cx="32" cy="28" r="2.5" fill={ember} />
+    </svg>
   );
 }
 
@@ -306,10 +395,9 @@ function SignInForm(props: {
 
   return (
     <div style={cardStyle}>
-      <div style={titleStyle}>Sign in to connect</div>
+      <div style={titleStyle}>Sign in</div>
       <div style={subtitleStyle}>
-        Use your Codemux account to reach a desktop you have set up for remote
-        access.
+        Use the same Codemux account you signed in with on the desktop.
       </div>
       {canGithub && (
         <>
@@ -497,26 +585,81 @@ function Spinner(props: { title: string; detail: string }): React.ReactElement {
           animation: "codemux-hosted-spin 0.8s linear infinite",
         }}
       />
-      <div style={{ fontSize: 14.5, fontWeight: 600, marginBottom: 6 }}>
-        {props.title}
-      </div>
-      <div
-        style={{
-          fontSize: 12.5,
-          lineHeight: 1.5,
-          color: bootstrapColors.mutedForeground,
-        }}
-      >
-        {props.detail}
-      </div>
+      <div style={titleStyle}>{props.title}</div>
+      <div style={{ ...subtitleStyle, marginBottom: 0 }}>{props.detail}</div>
     </div>
   );
 }
 
 // ── Local styles ────────────────────────────────────────────────────
 
-const titleStyle: React.CSSProperties = {
+const columnStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  width: "100%",
+  maxWidth: 420,
+};
+
+const headerStyle: React.CSSProperties = {
+  textAlign: "center",
+  marginBottom: 18,
+};
+
+const wordmarkRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 8,
+};
+
+/** The one step up the scale from {@link titleStyle}: this is the page, the
+ *  card titles below it are sections of it. */
+const wordmarkStyle: React.CSSProperties = {
   fontSize: 17,
+  fontWeight: 600,
+  letterSpacing: "-0.01em",
+};
+
+const taglineStyle: React.CSSProperties = {
+  margin: "6px 0 0",
+  fontSize: 13,
+  lineHeight: 1.5,
+  color: bootstrapColors.mutedForeground,
+};
+
+const footerStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+  width: "100%",
+  maxWidth: 380,
+  marginTop: 16,
+  textAlign: "center",
+};
+
+const footerLineStyle: React.CSSProperties = {
+  margin: 0,
+  fontSize: 12.5,
+  lineHeight: 1.5,
+  color: bootstrapColors.mutedForeground,
+};
+
+const footerLinkStyle: React.CSSProperties = {
+  color: bootstrapColors.foreground,
+  fontWeight: 500,
+  textDecoration: "underline",
+  textUnderlineOffset: 2,
+};
+
+const inlineCodeStyle: React.CSSProperties = {
+  fontFamily: "var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)",
+  fontSize: "0.95em",
+  color: bootstrapColors.foreground,
+};
+
+const titleStyle: React.CSSProperties = {
+  fontSize: 14.5,
   fontWeight: 600,
   letterSpacing: "-0.01em",
   marginBottom: 6,

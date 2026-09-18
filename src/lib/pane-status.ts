@@ -49,13 +49,13 @@ export const STATUS_TEXT_CLASS: Record<ActivePaneStatus, string> = {
 
 /** Matching dot colour, with the attention pulse the inbox and rail use.
  *
- *  The monitoring dot is deliberately steady — no `animate-pulse`. A watch
+ *  The monitoring dot is deliberately steady — no `motion-safe:animate-pulse`. A watch
  *  loop is background presence, not progress, and a pulsing dot is the app's
  *  vocabulary for "look at me". A workspace babysitting CI overnight should be
  *  something the eye can rest on. */
 export const STATUS_DOT_CLASS: Record<ActivePaneStatus, string> = {
   working: "bg-status-working",
-  permission: "bg-status-attention animate-pulse",
+  permission: "bg-status-attention motion-safe:animate-pulse",
   monitoring: "bg-status-monitoring",
   review: "bg-status-open",
 };

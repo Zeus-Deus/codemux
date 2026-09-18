@@ -42,7 +42,7 @@ export function MobileWorkspaceActions({
   return (
     <>
       <div className="mobile-workspace-actions">
-        <p className="px-2 text-xs text-muted-foreground truncate">
+        <p className="px-2 text-label text-muted-foreground truncate">
           {workspace.title}
         </p>
         <button

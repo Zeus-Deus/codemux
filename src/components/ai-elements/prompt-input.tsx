@@ -1300,7 +1300,7 @@ export const PromptInputSelectTrigger = ({
 }: PromptInputSelectTriggerProps) => (
   <SelectTrigger
     className={cn(
-      "border-none bg-transparent font-medium text-muted-foreground shadow-none transition-colors",
+      "border-none bg-transparent font-medium text-muted-foreground shadow-none transition-colors duration-150",
       "hover:bg-accent hover:text-foreground aria-expanded:bg-accent aria-expanded:text-foreground",
       className
     )}
@@ -1390,7 +1390,7 @@ export const PromptInputTabLabel = ({
   // oxlint-disable-next-line eslint-plugin-jsx-a11y(heading-has-content)
   <h3
     className={cn(
-      "mb-2 px-3 font-medium text-muted-foreground text-xs",
+      "mb-2 px-3 font-medium text-muted-foreground text-label",
       className
     )}
     {...props}
@@ -1414,7 +1414,7 @@ export const PromptInputTabItem = ({
 }: PromptInputTabItemProps) => (
   <div
     className={cn(
-      "flex items-center gap-2 px-3 py-2 text-xs hover:bg-accent",
+      "flex items-center gap-2 px-3 py-2 text-label hover:bg-accent",
       className
     )}
     {...props}

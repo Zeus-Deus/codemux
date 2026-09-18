@@ -28,10 +28,9 @@ export function ImageViewer({ filePath }: Props) {
           <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
             <ImageOff
               className="size-[18px] text-muted-foreground/60"
-              strokeWidth={1.5}
             />
           </div>
-          <p className="text-xs font-medium text-foreground">
+          <p className="text-label font-medium text-foreground">
             Failed to load image
           </p>
           <p className="mt-1.5 break-all font-mono text-label leading-[1.55] text-muted-foreground">

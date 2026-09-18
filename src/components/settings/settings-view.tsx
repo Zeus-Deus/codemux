@@ -166,6 +166,7 @@ import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { TypographySettings } from "./typography-settings";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -289,14 +290,14 @@ function OrbPreviewRow({
   elapsed: string;
 }) {
   return (
-    <div className="flex items-center gap-2.5 rounded-[8px] px-2.5 py-2">
+    <div className="flex items-center gap-2.5 rounded-md px-2.5 py-2">
       <span className="flex size-5 shrink-0 items-center justify-center">
         <AgentOrb size={20} {...activity} aria-hidden />
       </span>
       <span className="flex-1 truncate text-body font-semibold text-foreground">
         {label}
       </span>
-      <span className="font-mono text-label text-muted-foreground">{elapsed}</span>
+      <span className="font-mono text-label text-muted-foreground tabular-nums">{elapsed}</span>
     </div>
   );
 }
@@ -313,15 +314,15 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       onClick={onClick}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-body font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
         active
-          ? "bg-foreground/[0.09] text-foreground"
-          : "text-muted-foreground/90 hover:bg-foreground/[0.06] hover:text-foreground",
+          ? "bg-surface-3 text-foreground"
+          : "text-muted-foreground/90 hover:bg-surface-2 hover:text-foreground",
       )}
     >
       <Icon
         className={cn(
-          "h-[15px] w-[15px] shrink-0 transition-colors",
+          "h-[15px] w-[15px] shrink-0 transition-colors duration-150",
           active
             ? "text-foreground/85"
             : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
@@ -431,7 +432,7 @@ function BrowserSection() {
           label="Profile storage"
           description="Total size of cached browser data, screenshots, and session files."
         >
-          <span className="text-sm font-mono text-muted-foreground">
+          <span className="text-body font-mono text-muted-foreground tabular-nums">
             {dataSize === null ? "..." : formatBytes(dataSize)}
           </span>
         </SettingRow>
@@ -479,7 +480,7 @@ function BrowserSection() {
 // the composer's rounded-full pills. tailwind-merge lets these override the
 // pickers' built-in pill classes (rounded-full, text-label, etc.).
 const LAUNCH_FIELD_TRIGGER =
-  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-sm font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
+  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-body font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
 
 /** Wrap a string as a double-quoted shell argument. */
 function quotePrompt(value: string): string {
@@ -838,8 +839,8 @@ function PresetEditorSheet({
       >
         {/* Header */}
         <SheetHeader className="border-b p-4">
-          <SheetTitle className="flex items-center gap-2 text-sm">
-            <PresetIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
+          <SheetTitle className="flex items-center gap-2 text-body">
+            <PresetIcon icon={agentIcon} className="size-4 shrink-0" />
             {name || preset.name}
           </SheetTitle>
           <SheetDescription>
@@ -851,7 +852,7 @@ function PresetEditorSheet({
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
           {/* Name */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Name</label>
+            <label className="text-body font-medium">Name</label>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -863,7 +864,7 @@ function PresetEditorSheet({
 
           {/* Description */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Description</label>
+            <label className="text-body font-medium">Description</label>
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -875,7 +876,7 @@ function PresetEditorSheet({
 
           {/* Type — agent launcher vs raw command */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Type</label>
+            <label className="text-body font-medium">Type</label>
             <Select value={structured ? "structured" : "raw"} onValueChange={handleModeChange}>
               <SelectTrigger className="h-9">
                 <SelectValue />
@@ -885,7 +886,7 @@ function PresetEditorSheet({
                 <SelectItem value="raw">Raw command</SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-xs text-muted-foreground">
+            <p className="text-label text-muted-foreground">
               {structured
                 ? "Pick an agent, model, and prompt — Codemux builds the command."
                 : "Type the exact shell command(s) to run."}
@@ -896,7 +897,7 @@ function PresetEditorSheet({
             <div className="space-y-5">
               {/* Agent */}
               <div className="space-y-2">
-                <label className="text-sm font-medium">Agent</label>
+                <label className="text-body font-medium">Agent</label>
                 <Select value={selectedAgentId} onValueChange={handleAgentChange}>
                   <SelectTrigger className="h-9">
                     <SelectValue placeholder="Select an agent" />
@@ -905,7 +906,7 @@ function PresetEditorSheet({
                     {agentOptions.map((a) => (
                       <SelectItem key={a.id} value={a.id}>
                         <span className="flex items-center gap-2">
-                          <PresetIcon icon={a.icon} className="h-3.5 w-3.5" />
+                          <PresetIcon icon={a.icon} className="size-3.5" />
                           {a.name}
                         </span>
                       </SelectItem>
@@ -924,7 +925,7 @@ function PresetEditorSheet({
               {launchFamily ? (
                 <>
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Model</label>
+                    <label className="text-body font-medium">Model</label>
                     <LaunchModelPicker
                       providerKind={launchProviderKind}
                       models={launchModels}
@@ -937,7 +938,7 @@ function PresetEditorSheet({
                   {(reasoningOptions.length > 0 ||
                     launchContextOptions.length > 0) && (
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Reasoning</label>
+                      <label className="text-body font-medium">Reasoning</label>
                       <LaunchReasoningPicker
                         reasoningOptions={reasoningOptions}
                         selectedReasoning={effectiveReasoning}
@@ -955,14 +956,14 @@ function PresetEditorSheet({
                       />
                     </div>
                   )}
-                  <p className="text-xs text-muted-foreground">
+                  <p className="text-label text-muted-foreground">
                     Applied at launch. Leave on Default to use the agent's default.
                   </p>
                 </>
               ) : (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Model</label>
-                  <p className="text-xs text-muted-foreground">
+                  <label className="text-body font-medium">Model</label>
+                  <p className="text-label text-muted-foreground">
                     Model selection isn't available for this agent.
                   </p>
                 </div>
@@ -970,15 +971,15 @@ function PresetEditorSheet({
 
               {/* Prompt */}
               <div className="space-y-2">
-                <label className="text-sm font-medium">Prompt</label>
+                <label className="text-body font-medium">Prompt</label>
                 <Textarea
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
                   onBlur={() => save()}
                   placeholder="e.g. pull the latest changes and resolve any conflicts"
-                  className="min-h-[72px] text-sm"
+                  className="min-h-[72px] text-body"
                 />
-                <p className="text-xs text-muted-foreground">
+                <p className="text-label text-muted-foreground">
                   Sent to the agent as its first instruction. Leave blank to just launch the agent.
                 </p>
               </div>
@@ -986,7 +987,7 @@ function PresetEditorSheet({
           ) : (
             /* Raw commands */
             <div className="space-y-2">
-              <label className="text-sm font-medium">Commands</label>
+              <label className="text-body font-medium">Commands</label>
               <div className="flex flex-col gap-1.5">
                 {commands.map((cmd, i) => (
                   <div key={i} className="group/cmd flex items-center gap-2">
@@ -995,17 +996,17 @@ function PresetEditorSheet({
                       onChange={(e) => handleCommandChange(i, e.target.value)}
                       onBlur={handleCommandBlur}
                       placeholder="e.g. bun run dev"
-                      className="h-9 flex-1 font-mono text-sm"
+                      className="h-9 flex-1 font-mono text-body"
                     />
                     {commands.length > 1 && (
                       <Button
                         variant="ghost"
                         size="icon-xs"
                         onClick={() => removeCommand(i)}
-                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
                         aria-label="Remove command"
                       >
-                        <X className="h-3.5 w-3.5" />
+                        <X className="size-3.5" />
                       </Button>
                     )}
                   </div>
@@ -1013,7 +1014,7 @@ function PresetEditorSheet({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
+                  className="mt-1 w-fit text-muted-foreground hover:text-foreground"
                   onClick={addCommand}
                 >
                   + Add command
@@ -1024,13 +1025,13 @@ function PresetEditorSheet({
 
           {/* Advanced section */}
           <div className="space-y-5 border-t border-border/40 pt-5">
-            <p className="text-label font-semibold uppercase tracking-[0.16em] text-muted-foreground/80">
+            <Eyebrow>
               Advanced
-            </p>
+            </Eyebrow>
 
             {/* Launch Mode */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">Launch Mode</label>
+              <label className="text-body font-medium">Launch Mode</label>
               <Select
                 value={launchMode}
                 onValueChange={(v: LaunchMode) => {
@@ -1052,7 +1053,7 @@ function PresetEditorSheet({
                 preset; configurable after the preset is created). */}
             {!isDraft && (
             <div className="space-y-3">
-              <label className="text-sm font-medium">Auto-run</label>
+              <label className="text-body font-medium">Auto-run</label>
               <div className="space-y-4">
                 <div className="flex items-start gap-3">
                   <Switch
@@ -1064,8 +1065,8 @@ function PresetEditorSheet({
                     className="mt-0.5"
                   />
                   <div className="space-y-0.5">
-                    <p className="text-sm font-medium">When creating a workspace</p>
-                    <p className="text-xs text-muted-foreground">
+                    <p className="text-body font-medium">When creating a workspace</p>
+                    <p className="text-label text-muted-foreground">
                       Automatically launch this preset for new workspaces.
                     </p>
                   </div>
@@ -1080,8 +1081,8 @@ function PresetEditorSheet({
                     className="mt-0.5"
                   />
                   <div className="space-y-0.5">
-                    <p className="text-sm font-medium">When opening a new tab</p>
-                    <p className="text-xs text-muted-foreground">
+                    <p className="text-body font-medium">When opening a new tab</p>
+                    <p className="text-label text-muted-foreground">
                       Automatically launch this preset for new tabs.
                     </p>
                   </div>
@@ -1093,8 +1094,8 @@ function PresetEditorSheet({
             {/* Pinned */}
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <p className="text-sm font-medium">Show in preset bar</p>
-                <p className="text-xs text-muted-foreground">
+                <p className="text-body font-medium">Show in preset bar</p>
+                <p className="text-label text-muted-foreground">
                   Pin this preset to the quick-launch bar
                 </p>
               </div>
@@ -1198,7 +1199,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 text-label text-muted-foreground"
+          className="text-muted-foreground"
           onClick={() => {
             setAiCommitMessageCli(null).catch(console.error);
             storeSet("ai_commit_message_cli", "");
@@ -1210,7 +1211,7 @@ function AiCommitMessageAgentRow({ disabled }: { disabled: boolean }) {
         </Button>
       ) : (
         <span className="flex items-center gap-1 whitespace-nowrap text-label text-muted-foreground">
-          <Sparkles className="h-3.5 w-3.5 text-primary/70" />
+          <Sparkles className="size-3.5 text-primary/70" />
           Utility agent
         </span>
       )}
@@ -1468,11 +1469,11 @@ export function SettingsView() {
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
-                    <span className="select-text text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
+                    <span className="select-text text-body text-muted-foreground">{authUser.name ?? "—"}</span>
                   </SettingRow>
                 </>
               ) : (
-                <div className="py-4 text-sm text-muted-foreground">
+                <div className="py-4 text-body text-muted-foreground">
                   Not signed in. Close settings and sign in to manage your account.
                 </div>
               )}
@@ -1498,13 +1499,13 @@ export function SettingsView() {
                   <Button
                     variant="outline"
                     size="sm"
-                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50 gap-1.5"
+                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50"
                     onClick={() => {
                       signOut();
                       setShowSettings(false);
                     }}
                   >
-                    <LogOut className="h-3.5 w-3.5" />
+                    <LogOut className="size-3.5" />
                     Sign out
                   </Button>
                 </SettingsCard>
@@ -1652,10 +1653,10 @@ export function SettingsView() {
                   different things, so the toggle's effect is visible: with
                   it on they animate differently, with it off they match. */}
               <div className="mt-4">
-                <p className="mb-1.5 font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground/55 uppercase">
+                <Eyebrow className="mb-1.5">
                   Preview
-                </p>
-                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-[11px] border border-border/60 bg-muted/30 p-1.5">
+                </Eyebrow>
+                <div className="flex max-w-[300px] flex-col gap-0.5 rounded-lg border border-border/60 bg-muted/30 p-1.5">
                   <OrbPreviewRow
                     activity={{ toolName: "Grep" }}
                     label="Fix scroll pinning on send"
@@ -1689,7 +1690,7 @@ export function SettingsView() {
                     {editors.map((ed) => (
                       <SelectItem key={ed.id} value={ed.id}>
                         <span className="flex items-center gap-2">
-                          <EditorIcon id={ed.id} className="h-4 w-4" />
+                          <EditorIcon id={ed.id} className="size-4" />
                           {ed.name}
                         </span>
                       </SelectItem>
@@ -1717,10 +1718,10 @@ export function SettingsView() {
                       className="flex items-center justify-between gap-4 px-4 py-2.5"
                     >
                       <span className="flex items-center gap-2 text-body text-foreground">
-                        <EditorIcon id={ed.id} className="h-4 w-4" />
+                        <EditorIcon id={ed.id} className="size-4" />
                         {ed.name}
                       </span>
-                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded border border-border/40">
+                      <code className="text-label text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded-sm border border-border/40">
                         {ed.command}
                       </code>
                     </div>
@@ -1746,7 +1747,7 @@ export function SettingsView() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 text-body-sm text-muted-foreground"
+                  className="text-muted-foreground"
                   onClick={() => setActiveSection("appearance")}
                 >
                   Open Appearance
@@ -1805,8 +1806,8 @@ export function SettingsView() {
                 title="Your presets"
                 description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
                 action={
-                  <Button variant="outline" size="sm" className="gap-1.5" onClick={handleNewPreset}>
-                    <Plus className="h-3.5 w-3.5" />
+                  <Button variant="outline" size="sm" onClick={handleNewPreset}>
+                    <Plus className="size-3.5" />
                     New preset
                   </Button>
                 }
@@ -1821,7 +1822,7 @@ export function SettingsView() {
                     items={presetStore.presets.map((p) => p.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <div className="overflow-hidden rounded-xl border border-border/60">
+                    <div className="overflow-hidden rounded-lg border border-border/60">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -1847,7 +1848,7 @@ export function SettingsView() {
 
             <p className="text-body-sm text-muted-foreground/70 leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
-              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">
+              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">
                 Learn how to configure it for your tools
               </a>
             </p>
@@ -2142,7 +2143,7 @@ export function SettingsView() {
               <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
                 <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
                 <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
-                  A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemux/config.json</code> file was found.
+                  A <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemux/config.json</code> file was found.
                   File-based configuration takes precedence over these settings.
                 </p>
               </SettingsCard>
@@ -2154,17 +2155,17 @@ export function SettingsView() {
                 helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
                 caption={
                   <>
-                    Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file
+                    Create a <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file
                     in your project root to share patterns with your team. When empty, defaults to{" "}
-                    <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
-                    <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">Learn more</a>
+                    <code className="font-mono text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.env .env.* .env.local</code>.{" "}
+                    <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors duration-150">Learn more</a>
                   </>
                 }
               >
                 {hasIncludeFile && (
                   <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
                     <p className="text-body-sm text-muted-foreground/90 leading-relaxed">
-                      This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file —
+                      This project has a <code className="font-mono text-label bg-background/60 border border-border/40 px-1.5 py-0.5 rounded-sm">.codemuxinclude</code> file —
                       those patterns take priority over the settings below.
                     </p>
                   </SettingsCard>
@@ -2209,7 +2210,7 @@ export function SettingsView() {
                 helper={
                   <>
                     A command to start your dev server, triggered via{" "}
-                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded font-mono">Ctrl+Shift+G</kbd>.
+                    <kbd className="text-label bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded-sm font-mono">Ctrl+Shift+G</kbd>.
                   </>
                 }
               >
@@ -2372,7 +2373,7 @@ export function SettingsView() {
           className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
           onClick={() => setShowSettings(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <div className="flex items-center gap-2 text-body-lg">
           <span className="font-semibold tracking-tight text-foreground">Settings</span>
@@ -2398,9 +2399,9 @@ export function SettingsView() {
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
-                <p className="px-4 pb-1.5 font-mono text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
+                <Eyebrow className="px-4 pb-1.5">
                   {group.label}
-                </p>
+                </Eyebrow>
                 <div className="space-y-px px-3">
                   {group.items.map((item) => (
                     <SettingsNavItem
@@ -2428,7 +2429,7 @@ export function SettingsView() {
             {sectionAvailable ? renderSection() : (
               <div role="status" className="space-y-2">
                 <h2 className="text-lg font-semibold">Settings section unavailable</h2>
-                <p className="text-sm text-muted-foreground">This section is hidden or no longer available. Choose a section from Settings.</p>
+                <p className="text-body text-muted-foreground">This section is hidden or no longer available. Choose a section from Settings.</p>
               </div>
             )}
           </div>
@@ -2487,19 +2488,19 @@ function SortablePresetRow({
     >
       <button
         type="button"
-        className="p-1 rounded text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity"
+        className="p-1 rounded-sm text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150"
         aria-label="Drag to reorder"
         title="Drag to reorder"
         onClick={(e) => e.stopPropagation()}
         {...attributes}
         {...listeners}
       >
-        <GripVertical className="h-3.5 w-3.5" />
+        <GripVertical className="size-3.5" />
       </button>
       {/* Glyph tile — the agent icon seated in a rounded tile, per the
           design's preset rows. */}
       <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/60">
-        <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+        <PresetIcon icon={preset.icon} className="size-3.5" />
       </span>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
@@ -2523,23 +2524,23 @@ function SortablePresetRow({
         {!preset.is_builtin && (
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-sm"
             title="Delete preset"
-            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            className="opacity-0 group-hover/preset:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
             onClick={(e) => {
               e.stopPropagation();
               onDelete();
             }}
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="size-3.5" />
           </Button>
         )}
         <Button
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
           className={cn(
-            "h-7 w-7 transition-opacity",
+            "transition-opacity duration-150",
             preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
           )}
           onClick={(e) => {
@@ -2548,9 +2549,9 @@ function SortablePresetRow({
           }}
         >
           {preset.pinned ? (
-            <Star className="h-3.5 w-3.5 fill-current text-foreground" />
+            <Star className="size-3.5 fill-current text-foreground" />
           ) : (
-            <Star className="h-3.5 w-3.5 text-muted-foreground" />
+            <Star className="size-3.5 text-muted-foreground" />
           )}
         </Button>
       </div>

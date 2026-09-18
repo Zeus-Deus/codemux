@@ -492,7 +492,7 @@ export function ReviewCodeTab({
               data-testid={`diff-layout-${id}`}
               onClick={() => pickLayout(id)}
               className={cn(
-                "rounded px-2.5 py-1 capitalize transition-colors",
+                "rounded-sm px-2.5 py-1 capitalize transition-colors duration-150",
                 tzMetaNum,
                 layout === id
                   ? "bg-background font-semibold text-foreground"
@@ -509,7 +509,7 @@ export function ReviewCodeTab({
           data-testid="whitespace-toggle"
           onClick={() => pickWhitespace(!hideWhitespace)}
           className={cn(
-            "rounded border-0 px-2.5 py-1 transition-colors",
+            "rounded-sm border-0 px-2.5 py-1 transition-colors duration-150",
             tzMetaNum,
             hideWhitespace
               ? "bg-accent-ember/15 font-semibold text-accent-ember"
@@ -658,7 +658,7 @@ function PendingNote({
           <span
             data-testid="note-moved-badge"
             className={cn(
-              "rounded bg-muted/60 px-1.5 py-0.5 font-mono text-muted-foreground",
+              "rounded-sm bg-muted/60 px-1.5 py-0.5 font-mono text-muted-foreground",
               tzEyebrow,
             )}
           >
@@ -669,7 +669,7 @@ function PendingNote({
           <span
             data-testid="note-unanchored-label"
             className={cn(
-              "rounded bg-status-working/15 px-1.5 py-0.5 font-semibold text-status-working",
+              "rounded-sm bg-status-working/15 px-1.5 py-0.5 font-semibold text-status-working",
               tzEyebrow,
             )}
           >

@@ -34,7 +34,7 @@ export function DiffView({
   let lineNo = 0;
 
   return (
-    <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
+    <div className="overflow-hidden rounded-lg border border-border/60 bg-muted/40">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-[13px] py-[9px]">
         <span className="flex min-w-0 items-center gap-2 font-mono text-body-sm text-muted-foreground">
           {fileMeta ? (
@@ -44,8 +44,7 @@ export function DiffView({
           ) : (
             <>
               <FileText
-                className="h-3 w-3 shrink-0 text-muted-foreground/70"
-                strokeWidth={1.4}
+                className="size-3 shrink-0 text-muted-foreground/70"
                 aria-hidden
               />
               <span className="truncate">{filename ?? "diff"}</span>
@@ -106,9 +105,9 @@ function CopyButton({ text }: { text: string }) {
       className="flex text-muted-foreground/70 hover:text-foreground"
     >
       {copied ? (
-        <Check className="h-3.5 w-3.5 text-status-open" strokeWidth={1.5} aria-hidden />
+        <Check className="size-3.5 text-status-open" aria-hidden />
       ) : (
-        <Copy className="h-3.5 w-3.5" strokeWidth={1.5} aria-hidden />
+        <Copy className="size-3.5" aria-hidden />
       )}
     </button>
   );

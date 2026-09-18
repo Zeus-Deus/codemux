@@ -12,7 +12,7 @@ export function TabDropIndicator({ left }: { left: number }) {
       style={{ left: left - 1, width: 2 }}
       data-testid="tab-drop-indicator"
     >
-      <div className="-mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-foreground/70" />
+      <div className="-mt-0.5 size-1.5 shrink-0 rounded-full bg-foreground/70" />
       <div className="w-px flex-1 rounded-full bg-foreground/40" />
     </div>
   );

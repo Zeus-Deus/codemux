@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
 import { dbGetUiState } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 export interface LiveEntry {
   workspace: WorkspaceSnapshot;
@@ -64,9 +65,9 @@ export function SidebarLiveSection({ entries, activeWorkspaceId }: Props) {
       aria-label="Live agents"
     >
       <div className="flex items-center gap-1.5 px-2 pb-1 pt-1">
-        <span className="font-mono text-caption font-semibold uppercase tracking-[0.14em] text-accent-ember">
+        <Eyebrow tone="accent">
           LIVE
-        </span>
+        </Eyebrow>
         <span className="font-mono text-caption font-semibold tracking-[0.14em] text-muted-foreground">
           · {entries.length}
         </span>

@@ -55,7 +55,7 @@ export function ImageLightbox({
               type="button"
               aria-label="Close expanded image"
               title="Click the image to close"
-              className="block w-fit max-w-full cursor-zoom-out overflow-hidden rounded-xl bg-[#090909] shadow-2xl ring-1 ring-white/15 outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+              className="block w-fit max-w-full cursor-zoom-out overflow-hidden rounded-lg bg-[#090909] shadow-2xl ring-1 ring-white/15 outline-none focus-visible:ring-2 focus-visible:ring-white/70"
             >
               {children}
             </button>
@@ -66,9 +66,9 @@ export function ImageLightbox({
               type="button"
               aria-label="Close image preview"
               title="Close image preview (Esc)"
-              className="absolute top-2.5 right-2.5 z-10 flex size-9 items-center justify-center rounded-full bg-black/70 text-white shadow-lg ring-1 ring-white/25 backdrop-blur-md transition-[background-color,transform] hover:bg-black/90 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              className="absolute top-2.5 right-2.5 z-10 flex size-9 items-center justify-center rounded-full bg-black/70 text-white shadow-lg ring-1 ring-white/25 backdrop-blur-md transition-[background-color,transform] duration-150 hover:bg-black/90 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
             >
-              <X className="size-4.5" aria-hidden />
+              <X className="size-4" aria-hidden />
             </button>
           </DialogClose>
         </div>

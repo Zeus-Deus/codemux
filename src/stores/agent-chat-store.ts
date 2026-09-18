@@ -445,6 +445,8 @@ function replayIntoSlice(
     ...base,
     ...replayed,
     messages,
+    // Keep live activity across a remount only while the backend confirms the run.
+    compacting: replayed.streaming && base.compacting,
     // Follow the goal's source turn onto its adopted id, or Jump would
     // target a row key that no longer exists.
     goal: remapGoalSource(replayed.goal, replayed.messages, messages),
@@ -733,6 +735,7 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       const migrated: ChatThreadSlice = {
         ...existing,
         streaming: false,
+        compacting: false,
         activeTurnId: null,
         pendingRequestIds: [],
         // The cursor belongs to the OLD thread's rows. The restart /

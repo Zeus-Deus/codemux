@@ -56,12 +56,13 @@ export const overlayStyle: React.CSSProperties = {
   inset: 0,
   zIndex: 2147483645,
   display: "flex",
+  // Keep the top reachable on short phone viewports while following the keyboard.
   alignItems: "safe center",
   height: "var(--mobile-height, 100dvh)",
   top: "var(--mobile-top, 0px)",
   justifyContent: "center",
-  padding: 24,
   overflowY: "auto",
+  padding: 24,
   background: BOOT_BG,
   color: BOOT_FG,
   fontFamily: "var(--font-sans, system-ui, -apple-system, sans-serif)",
@@ -74,7 +75,11 @@ export const cardStyle: React.CSSProperties = {
   border: `1px solid ${BOOT_HAIRLINE}`,
   borderRadius: 14,
   padding: 28,
-  boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+  // Depth, not a smudge. The stored palette may be light, where a 45%-black
+  // drop shadow reads as a grey haze around a white card on a white canvas;
+  // this is soft enough to disappear there and still lift the card off a dark
+  // one, which the hairline border alone does not.
+  boxShadow: "0 10px 30px rgba(0,0,0,0.18)",
 };
 
 export const inputStyle: React.CSSProperties = {

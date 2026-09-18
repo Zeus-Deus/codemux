@@ -59,7 +59,7 @@ export function WindowControls() {
         className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
         onClick={() => appWindow.minimize()}
       >
-        <Minus className="h-3 w-3" />
+        <Minus className="size-3" />
       </button>
       <button
         type="button"
@@ -68,9 +68,9 @@ export function WindowControls() {
         onClick={() => appWindow.toggleMaximize()}
       >
         {isMaximized ? (
-          <Copy className="h-3 w-3" />
+          <Copy className="size-3" />
         ) : (
-          <Square className="h-2.5 w-2.5" />
+          <Square className="size-3" />
         )}
       </button>
       <button
@@ -79,7 +79,7 @@ export function WindowControls() {
         className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-destructive hover:text-destructive-foreground"
         onClick={() => appWindow.close()}
       >
-        <X className="h-3.5 w-3.5" />
+        <X className="size-3.5" />
       </button>
     </div>
   );

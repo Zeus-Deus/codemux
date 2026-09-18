@@ -183,7 +183,7 @@ export function MobileSessionSheet({
                   <span className="min-w-0 flex-1">
                     <span className="block truncate font-medium">{title}</span>
                     {(paneStatus || dirty) && (
-                      <span className="block text-xs text-muted-foreground">
+                      <span className="block text-label text-muted-foreground">
                         {[
                           paneStatus && STATUS_LABEL[paneStatus],
                           dirty && "Unsaved changes",

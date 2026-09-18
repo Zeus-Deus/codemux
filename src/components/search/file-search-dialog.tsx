@@ -141,22 +141,22 @@ export function FileSearchDialog() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search files by name..."
-            className="h-9 text-sm"
+            className="h-9 text-body"
           />
         </div>
         <div ref={listRef} className="max-h-[50vh] overflow-y-auto p-1.5">
           {!query.trim() && (
-            <p className="text-xs text-muted-foreground text-center py-8">
+            <p className="text-label text-muted-foreground text-center py-8">
               Type a file name to search
             </p>
           )}
           {query.trim() && loading && (
             <div className="flex justify-center py-8">
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
             </div>
           )}
           {query.trim() && !loading && results.length === 0 && (
-            <p className="text-xs text-muted-foreground text-center py-8">
+            <p className="text-label text-muted-foreground text-center py-8">
               No matching files
             </p>
           )}
@@ -168,17 +168,17 @@ export function FileSearchDialog() {
             return (
               <button
                 key={filePath}
-                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm ${
+                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-body ${
                   idx === selectedIndex ? "bg-accent" : "hover:bg-accent/50"
                 }`}
                 onClick={() => openFile(filePath)}
                 onMouseEnter={() => setSelectedIndex(idx)}
               >
-                <FileTypeIcon filename={fileName} className="h-3.5 w-3.5 opacity-75" />
+                <FileTypeIcon filename={fileName} className="size-3.5 opacity-75" />
                 <div className="min-w-0 flex-1">
                   <span className="font-medium">{fileName}</span>
                   {dirPath && (
-                    <span className="ml-2 text-xs text-muted-foreground truncate">
+                    <span className="ml-2 text-label text-muted-foreground truncate">
                       {dirPath}
                     </span>
                   )}

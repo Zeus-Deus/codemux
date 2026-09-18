@@ -1386,7 +1386,20 @@ function applyEventInner(
   if (event.type !== "run_stalled" && state.stalled !== null) {
     state = { ...state, stalled: null };
   }
+  // A terminal event clears this even if the provider omitted its end signal.
+  // Child output and metadata do not end the parent's compaction.
+  if (
+    state.compacting &&
+    (event.type === "turn_completed" ||
+      (event.type === "session_state_changed" && event.status.status !== "running"))
+  ) {
+    state = { ...state, compacting: false };
+  }
   switch (event.type) {
+    case "context_compaction_changed":
+      return state.compacting === event.active
+        ? state
+        : { ...state, compacting: event.active };
     case "questions_asked": {
       if (
         state.messages.some(

@@ -17,6 +17,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 import { LazyBoundary } from "@/components/ui/lazy-boundary";
+import { PanelHeader } from "@/components/ui/panel-header";
 
 const TerminalPane = React.lazy(() =>
   import("@/components/terminal/TerminalPane").then((module) => ({
@@ -329,7 +330,7 @@ function PaneNodeImpl({
           {showTerminalContext && (
             <span
               className={cn(
-                "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-xs shadow-sm ring-1 ring-border/30 backdrop-blur-md",
+                "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-label shadow-sm ring-1 ring-border/30 backdrop-blur-md",
                 isActive
                   ? "bg-card/70 text-muted-foreground"
                   : "bg-background/65 text-muted-foreground/70",
@@ -468,25 +469,25 @@ function PaneNodeImpl({
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
-        <header
-          className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
+        <PanelHeader
+          className={cn("gap-1 cursor-grab active:cursor-grabbing transition-colors duration-150", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
-          <span className="flex-1 truncate text-xs text-muted-foreground">
+          <span className="flex-1 truncate text-label text-muted-foreground">
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
             <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="h-3.5 w-3.5" />
+              <SplitSquareHorizontal className="size-3.5" />
             </Button>
             <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="h-3.5 w-3.5" />
+              <SplitSquareVertical className="size-3.5" />
             </Button>
             <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="h-3.5 w-3.5" />
+              <X className="size-3.5" />
             </Button>
           </div>
-        </header>
+        </PanelHeader>
         <div className="flex-1 min-h-0 overflow-hidden">
           <LazyBoundary label="browser" className="h-full">
             <BrowserPane

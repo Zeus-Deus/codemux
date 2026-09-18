@@ -173,7 +173,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
               <span className="block truncate font-semibold">
                 {workspace.title}
               </span>
-              <span className="block truncate text-xs text-muted-foreground">
+              <span className="block truncate text-label text-muted-foreground">
                 {connection === "reconnecting"
                   ? "Reconnecting…"
                   : connection === "offline"
@@ -281,7 +281,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                       <span className="block truncate font-medium">
                         {w.title}
                       </span>
-                      <span className="block truncate text-xs text-muted-foreground mt-1">
+                      <span className="block truncate text-label text-muted-foreground mt-1">
                         {(w.project_root ?? w.cwd).split(/[\\/]/).pop()} ·{" "}
                         {status
                           ? STATUS_LABEL[status]
@@ -290,7 +290,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                             : "Ready"}
                       </span>
                       {w.git_changed_files > 0 && (
-                        <span className="block text-xs text-muted-foreground mt-1">
+                        <span className="block text-label text-muted-foreground mt-1">
                           {w.git_changed_files} changed files
                         </span>
                       )}
@@ -428,7 +428,7 @@ export function MobileShell({ overlays }: { overlays: ReactNode }) {
                 </button>
               </div>
               <div className="mobile-workspace-context">
-                <span className="text-xs text-muted-foreground">
+                <span className="text-label text-muted-foreground">
                   {workspace.git_branch ?? workspace.cwd}
                 </span>
                 <WorkspaceStatusCluster />

@@ -279,7 +279,7 @@ export function PullRequestsView() {
           className="text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           onClick={() => mobile && mobileDetail ? setMobileDetail(false) : setShowPullRequests(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <span className={cn("font-semibold tracking-tight text-foreground", tzPageTitle)}>
           Pull requests
@@ -320,7 +320,7 @@ export function PullRequestsView() {
           aria-label="Resize the list"
           data-testid="pr-list-resizer"
           onPointerDown={startResize}
-          className="w-1 shrink-0 cursor-col-resize transition-colors hover:bg-foreground/20"
+          className="w-1 shrink-0 cursor-col-resize transition-colors duration-150 hover:bg-foreground/20"
         />
 
         <div

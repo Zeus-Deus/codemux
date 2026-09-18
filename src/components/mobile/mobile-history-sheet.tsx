@@ -110,14 +110,14 @@ export function MobileHistorySheet({
               aria-label={`Jump to turn ${entry.turnIndex + 1}: ${entry.userText || "Image or attachment"}`}
               onClick={() => void jump(entry)}
             >
-              <span className="text-xs text-muted-foreground">
+              <span className="text-label text-muted-foreground">
                 Turn {entry.turnIndex + 1}
               </span>
               <span className="line-clamp-3 font-medium">
                 {entry.userText || "Image or attachment"}
               </span>
               {entry.replySnippet && (
-                <span className="line-clamp-1 text-xs text-muted-foreground">
+                <span className="line-clamp-1 text-label text-muted-foreground">
                   {entry.replySnippet}
                 </span>
               )}
@@ -132,7 +132,7 @@ export function MobileHistorySheet({
             </button>
           )}
           {filtered.length === 0 && (
-            <p className="px-2 py-8 text-center text-sm text-muted-foreground">
+            <p className="px-2 py-8 text-center text-body text-muted-foreground">
               {entries.length
                 ? "No matching prompts."
                 : source
