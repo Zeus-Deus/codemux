@@ -255,6 +255,7 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
       url: `https://github.com/u/r/pull/${372 + i}`,
       head_branch: `ui-pass/0${i + 1}`,
       base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+      source: "worktree" as const,
     }));
     const primaryFirst = [stack[4], ...stack.slice(0, 4), ...stack.slice(5)];
     const { container } = renderBody(

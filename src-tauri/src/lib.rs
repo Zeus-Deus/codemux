@@ -235,15 +235,16 @@ mod window_background_tests {
 
 /// Convert host PR rows into the snapshot's stored shape.
 pub(crate) fn workspace_pr_rows(
-    prs: Vec<crate::github::PullRequestInfo>,
+    prs: Vec<crate::github::SourcedPr>,
 ) -> Vec<crate::state::WorkspacePr> {
     prs.into_iter()
-        .map(|pr| crate::state::WorkspacePr {
-            number: pr.number,
-            state: pr.display_state(),
-            url: pr.url,
-            head_branch: pr.head_branch,
-            base_branch: pr.base_branch,
+        .map(|entry| crate::state::WorkspacePr {
+            number: entry.pr.number,
+            state: entry.pr.display_state(),
+            url: entry.pr.url,
+            head_branch: entry.pr.head_branch,
+            base_branch: entry.pr.base_branch,
+            source: Some(entry.source),
         })
         .collect()
 }

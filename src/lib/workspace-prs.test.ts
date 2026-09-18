@@ -9,7 +9,7 @@ import {
   type WorkspacePrRef,
 } from "./workspace-prs";
 import { providerForWorkspace } from "./source-control";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type { WorkspacePrSource, WorkspaceSnapshot } from "@/tauri/types";
 
 const github = providerForWorkspace({ provider_kind: "github" });
 
@@ -18,6 +18,7 @@ function pr(
   state: string,
   head?: string,
   base?: string,
+  source?: WorkspacePrSource,
 ): WorkspacePrRef {
   return {
     number,
@@ -25,6 +26,7 @@ function pr(
     url: `https://github.com/u/r/pull/${number}`,
     head_branch: head ?? `branch-${number}`,
     base_branch: base ?? "main",
+    ...(source ? { source } : {}),
   };
 }
 
@@ -37,6 +39,7 @@ function stackOfNine(states: string[]): WorkspacePrRef[] {
       state,
       `ui-pass/0${i + 1}`,
       i === 0 ? "main" : `ui-pass/0${i}`,
+      "worktree",
     ),
   );
 }
@@ -156,28 +159,53 @@ describe("prSetSummary", () => {
 });
 
 describe("prsDescribeThisCheckout", () => {
-  it("trusts a set of more than one even when HEAD is on none of them", () => {
+  it("trusts worktree-owned PRs even when HEAD is on none of them", () => {
     // Exactly the stack case: the agent cut nine branches with `git branch`
-    // and left the worktree on its original branch. The side-branch fallback
-    // can only ever contribute one PR, so anything larger came from
-    // worktree-owned discovery and is this workspace's own work.
+    // and left the worktree on its original branch. The backend attributed
+    // them by reachability from HEAD, so they are this checkout's own work.
     const prs = stackOfNine(Array(9).fill("MERGED"));
     expect(prsDescribeThisCheckout(prs, "goal-passpage-space-task")).toBe(true);
   });
 
-  it("still guards a lone side-branch association", () => {
+  it("still guards the current branch's PR against a stale association", () => {
+    // Right after a branch switch the minute-long PR poll can still be
+    // describing the branch the user just left.
     expect(
-      prsDescribeThisCheckout([pr(1, "MERGED", "side-branch")], "my-branch"),
+      prsDescribeThisCheckout([pr(1, "MERGED", "old", "main", "branch")], "new"),
     ).toBe(false);
     expect(
-      prsDescribeThisCheckout([pr(1, "MERGED", "my-branch")], "my-branch"),
+      prsDescribeThisCheckout([pr(1, "MERGED", "same", "main", "branch")], "same"),
     ).toBe(true);
+  });
+
+  it("never lets a side-branch badge drive lifecycle, even on a matching name", () => {
+    expect(
+      prsDescribeThisCheckout(
+        [pr(1, "MERGED", "my-branch", "main", "side_branch")],
+        "my-branch",
+      ),
+    ).toBe(false);
+  });
+
+  it("requires every PR to qualify, so one weak association can't carry the rest", () => {
+    // Does not depend on the set's size: the backend only adds a side-branch
+    // PR when nothing else was found, but the rule no longer relies on that.
+    const prs = [
+      pr(1, "MERGED", "stack/01", "main", "worktree"),
+      pr(2, "MERGED", "elsewhere", "main", "side_branch"),
+    ];
+    expect(prsDescribeThisCheckout(prs, "ws")).toBe(false);
+  });
+
+  it("keeps the old rule for state persisted before sources existed", () => {
+    expect(prsDescribeThisCheckout([pr(1, "MERGED", "side")], "mine")).toBe(false);
+    expect(prsDescribeThisCheckout([pr(1, "MERGED", "mine")], "mine")).toBe(true);
   });
 
   it("treats an unknown branch on either side as a match", () => {
     // A detached HEAD during a rebase must not un-associate a workspace from
     // its own PR for the length of the rebase.
-    expect(prsDescribeThisCheckout([pr(1, "OPEN", "b")], null)).toBe(true);
+    expect(prsDescribeThisCheckout([pr(1, "OPEN", "b", "main", "branch")], null)).toBe(true);
     expect(prsDescribeThisCheckout([], "my-branch")).toBe(true);
   });
 });

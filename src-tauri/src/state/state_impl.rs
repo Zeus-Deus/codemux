@@ -467,6 +467,11 @@ pub struct WorkspacePr {
     /// it is fetched and dropped — because it is what makes a stack legible:
     /// a PR whose base is another PR's head is stacked on it.
     pub base_branch: Option<String>,
+    /// How this PR was attributed to the workspace, which decides whether
+    /// lifecycle rules may act on it. `None` only on state persisted before
+    /// the field existed, read by the frontend as the old single-PR rules.
+    #[serde(default)]
+    pub source: Option<crate::github::PrSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

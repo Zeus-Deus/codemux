@@ -193,6 +193,7 @@ function stackPrs(states: string[]): WorkspacePrRef[] {
     url: `https://github.com/u/r/pull/${372 + i}`,
     head_branch: `ui-pass/0${i + 1}`,
     base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+    source: "worktree" as const,
   }));
 }
 

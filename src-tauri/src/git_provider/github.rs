@@ -12,6 +12,7 @@ use super::provider::{Capabilities, OperationCapabilities, SourceControlProvider
 use crate::github::{
     self, CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, IncomingPrItem, InlineReviewComment,
     PrOverviewStats, PrReviewThread, PrTimelineEvent, PrsOverview, PullRequestInfo, ReviewComment,
+    SourcedPr,
 };
 use crate::github_cache;
 
@@ -57,7 +58,7 @@ impl SourceControlProvider for GitHubProvider {
         github::get_workspace_pr(repo_path)
     }
 
-    fn workspace_pull_requests(&self, repo_path: &Path) -> Result<Vec<PullRequestInfo>, String> {
+    fn workspace_pull_requests(&self, repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
         github::get_workspace_prs(repo_path)
     }
 

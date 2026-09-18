@@ -850,7 +850,16 @@ export interface WorkspacePrRef {
   /** The branch this PR merges into. A PR whose base is another PR's head in
    *  the same set is stacked on it. */
   base_branch?: string | null;
+  /** How the backend attributed this PR to the workspace:
+   *  - `branch` — the checked-out branch's own PR;
+   *  - `worktree` — a branch reachable from this worktree's HEAD and not yet
+   *    upstream, i.e. this checkout's own work (typically a stack layer);
+   *  - `side_branch` — the recently-checked-out fallback, a badge only.
+   *  Absent on state persisted before the field existed. */
+  source?: WorkspacePrSource | null;
 }
+
+export type WorkspacePrSource = "branch" | "worktree" | "side_branch";
 
 export type GhStatus =
   | { status: "NotInstalled" }

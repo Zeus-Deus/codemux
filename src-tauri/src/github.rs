@@ -1700,6 +1700,33 @@ fn worktree_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, Str
     })
 }
 
+/// Why a PR belongs to a workspace — which decides what may be concluded
+/// from it.
+///
+/// Carried to the frontend on every stored PR so the lifecycle rules there
+/// read the provenance directly, instead of inferring it from how many PRs
+/// happen to be in the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrSource {
+    /// The checked-out branch's own PR. Branch identity owns the badge.
+    Branch,
+    /// A PR on a branch reachable from this worktree's HEAD and not yet in the
+    /// upstream default branch — this checkout's own work, typically one layer
+    /// of a stack. As strong as `Branch`.
+    Worktree,
+    /// The recently-checked-out fallback: a PR opened from a branch this
+    /// worktree visited and left. Worth a badge, never worth a conclusion.
+    SideBranch,
+}
+
+/// A PR together with how it was attributed to the workspace.
+#[derive(Debug, Clone)]
+pub struct SourcedPr {
+    pub pr: PullRequestInfo,
+    pub source: PrSource,
+}
+
 /// The branches this worktree owns, oldest commit first.
 ///
 /// `refs/heads` is shared by every worktree of a repository, so "the local
@@ -1716,57 +1743,39 @@ fn worktree_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, Str
 /// reflog fallback alone is not enough: it scans *checkouts*, and an agent
 /// cutting a branch per commit never checks any of them out.
 ///
-/// Ordered by committer date so a stack comes back bottom-up, which is the
-/// order a reviewer reads it in.
+/// One git process in the common case. The exclusion ref is not probed for
+/// first: the query is simply run against `origin/<default>`, and only if git
+/// rejects that ref does it retry against the local default branch. That is
+/// why this uses the empty-aware runner — "the ref exists and nothing is
+/// owned" and "the ref does not exist" must not collapse into one answer.
 ///
-/// Returns empty rather than guessing whenever the default branch is unknown
-/// or has no local ref to exclude against: with no exclusion the query
-/// degenerates to "every branch in the repo", and over-claiming another
-/// workspace's PRs is a worse failure than showing none.
-fn worktree_owned_branches(repo_path: &Path, lookup: &BranchPrLookup) -> Vec<String> {
-    let Some(default_branch) = lookup.default_branch.as_deref() else {
+/// Returns empty rather than guessing when neither ref exists: with no
+/// exclusion the query degenerates to "every branch in the repo", and
+/// over-claiming another workspace's PRs is a worse failure than showing none.
+///
+/// Known limit: a worktree created *from another worktree's branch* has that
+/// branch in its history, and so claims its PRs too.
+fn worktree_owned_branches(repo_path: &Path, default_branch: &str) -> Vec<String> {
+    let query = |exclude: &str| {
+        crate::git_provider::detect::run_git_allow_empty(
+            repo_path,
+            &[
+                "for-each-ref",
+                "--merged",
+                "HEAD",
+                "--no-merged",
+                exclude,
+                "--sort=committerdate",
+                "--format=%(refname:short)",
+                "refs/heads/",
+            ],
+        )
+    };
+    let output = query(&format!("refs/remotes/origin/{default_branch}"))
+        .or_else(|_| query(&format!("refs/heads/{default_branch}")));
+    let Ok(output) = output else {
         return Vec::new();
     };
-    let remote_ref = format!("refs/remotes/origin/{default_branch}");
-    let exclude = if run_git_optional(
-        repo_path,
-        &["rev-parse", "--verify", "--quiet", &remote_ref],
-    )
-    .is_some()
-    {
-        format!("origin/{default_branch}")
-    } else if run_git_optional(
-        repo_path,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{default_branch}"),
-        ],
-    )
-    .is_some()
-    {
-        default_branch.to_string()
-    } else {
-        return Vec::new();
-    };
-
-    let Some(output) = run_git_optional(
-        repo_path,
-        &[
-            "for-each-ref",
-            "--merged",
-            "HEAD",
-            "--no-merged",
-            &exclude,
-            "--sort=committerdate",
-            "--format=%(refname:short)",
-            "refs/heads/",
-        ],
-    ) else {
-        return Vec::new();
-    };
-
     output
         .lines()
         .map(str::trim)
@@ -1776,7 +1785,72 @@ fn worktree_owned_branches(repo_path: &Path, lookup: &BranchPrLookup) -> Vec<Str
         .collect()
 }
 
-/// Every PR this workspace owns, primary first.
+/// Every `branch.<name>.remote` and `remote.<name>.url` in one read.
+///
+/// Fork disambiguation needs both per branch, and asking git key by key cost
+/// three processes per stack branch per poll. The whole answer is a handful
+/// of lines, so it is read once and looked up in memory.
+#[derive(Debug, Default)]
+struct RemoteConfig {
+    branch_remote: HashMap<String, String>,
+    remote_url: HashMap<String, String>,
+}
+
+impl RemoteConfig {
+    fn read(repo_path: &Path) -> Self {
+        // `--get-regexp` exits non-zero when nothing matches; an empty config
+        // is the correct reading of that, not an error.
+        let text = crate::git_provider::detect::run_git_allow_empty(
+            repo_path,
+            &[
+                "config",
+                "--get-regexp",
+                r"^(branch\..*\.remote|remote\..*\.url)$",
+            ],
+        )
+        .unwrap_or_default();
+        Self::parse(&text)
+    }
+
+    /// Branch names keep their dots and slashes (`branch.ui-pass/01.remote`),
+    /// so the name is everything between the fixed prefix and suffix.
+    fn parse(text: &str) -> Self {
+        let mut config = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once(' ') else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            if let Some(name) = key
+                .strip_prefix("branch.")
+                .and_then(|rest| rest.strip_suffix(".remote"))
+            {
+                config.branch_remote.insert(name.to_string(), value);
+            } else if let Some(name) = key
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.strip_suffix(".url"))
+            {
+                config.remote_url.insert(name.to_string(), value);
+            }
+        }
+        config
+    }
+
+    /// Same answer as [`resolve_branch_head_owner`], from memory.
+    fn head_owner(&self, branch: &str) -> Option<String> {
+        let tracking_url = self
+            .branch_remote
+            .get(branch)
+            .filter(|remote| remote.as_str() != ".")
+            .and_then(|remote| self.remote_url.get(remote));
+        branch_head_owner_filter(
+            tracking_url.map(String::as_str),
+            self.remote_url.get("origin").map(String::as_str),
+        )
+    }
+}
+
+/// Every PR this workspace owns, primary first, each tagged with why.
 ///
 /// A workspace produces a set, not a single PR: an agent handed a multi-part
 /// plan routinely lands a branch and a PR per concern. [`get_workspace_pr`]
@@ -1784,45 +1858,71 @@ fn worktree_owned_branches(repo_path: &Path, lookup: &BranchPrLookup) -> Vec<Str
 /// has this workspace actually opened", which is what the sidebar needs in
 /// order to say *nine PRs, four merged* instead of naming one of them.
 ///
-/// The primary is the current branch's own PR when it has one — branch
-/// identity still owns the badge — and otherwise the first still-open PR in
-/// the stack, falling back to the oldest. An already-merged bottom-of-stack
-/// is a poor summary of a stack that still has open work above it.
+/// Worktree-owned discovery is skipped on the repository default branch, for
+/// the same reason the side-branch fallback is: a checkout of `main` is not a
+/// unit of work, and branches reachable from it but not yet pushed are
+/// ordinary local history rather than anything it opened.
+///
+/// Cost per poll: one `for-each-ref`, plus — only when some owned branch has
+/// PR rows — one `git config` read and a repo-wide PR list memoized across
+/// workspaces. Nothing here is memoized per workspace, deliberately: the only
+/// callers are the 60s poller and a manual refresh, so a cache sized to the
+/// poll interval would expire before the next poll could use it.
 ///
 /// Error contract matches [`get_workspace_pr`] exactly: `Err` means the
 /// lookup could not answer and the stored set must be preserved, while an
 /// empty vector is the authoritative "this workspace has no PRs".
-pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<PullRequestInfo>, String> {
+pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<SourcedPr>, String> {
     let lookup = resolve_branch_pr(repo_path)?;
 
-    let mut prs: Vec<PullRequestInfo> = Vec::new();
+    let mut prs: Vec<SourcedPr> = Vec::new();
     if let Some(pr) = lookup.pr.clone() {
-        prs.push(pr);
+        prs.push(SourcedPr {
+            pr,
+            source: PrSource::Branch,
+        });
     }
 
-    let owned: Vec<String> = worktree_owned_branches(repo_path, &lookup)
-        .into_iter()
-        .filter(|branch| branch != &lookup.branch)
-        .collect();
+    let owned: Vec<String> = match lookup.default_branch.as_deref() {
+        Some(default_branch) if !lookup.is_default_branch() => {
+            worktree_owned_branches(repo_path, default_branch)
+                .into_iter()
+                .filter(|branch| branch != &lookup.branch)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
 
     if !owned.is_empty() {
         // A failure here must not erase the current branch's own answer, so
         // the extra branches are best-effort: no rows means no extras.
         if let Ok(rows) = worktree_pr_list(repo_path) {
             let all: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
-            for branch in &owned {
-                let matching: Vec<PullRequestInfo> = all
-                    .iter()
-                    .filter(|pr| pr.head_branch.as_deref() == Some(branch.as_str()))
-                    .cloned()
-                    .collect();
-                if matching.is_empty() {
-                    continue;
-                }
-                let owner = resolve_branch_head_owner(repo_path, branch);
-                if let Some(pr) = select_branch_pr(matching, branch, owner.as_deref(), false) {
-                    if !prs.iter().any(|existing| existing.number == pr.number) {
-                        prs.push(pr);
+            let with_rows: Vec<(&String, Vec<PullRequestInfo>)> = owned
+                .iter()
+                .map(|branch| {
+                    let matching = all
+                        .iter()
+                        .filter(|pr| pr.head_branch.as_deref() == Some(branch.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (branch, matching)
+                })
+                .filter(|(_, matching)| !matching.is_empty())
+                .collect();
+            // Read only once something needs disambiguating — the usual owned
+            // branch has no PR and should cost no config read at all.
+            if !with_rows.is_empty() {
+                let config = RemoteConfig::read(repo_path);
+                for (branch, matching) in with_rows {
+                    let owner = config.head_owner(branch);
+                    if let Some(pr) = select_branch_pr(matching, branch, owner.as_deref(), false) {
+                        if !prs.iter().any(|existing| existing.pr.number == pr.number) {
+                            prs.push(SourcedPr {
+                                pr,
+                                source: PrSource::Worktree,
+                            });
+                        }
                     }
                 }
             }
@@ -1833,11 +1933,14 @@ pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<PullRequestInfo>, Strin
     // fallback run, on the same terms as `get_workspace_pr`.
     if prs.is_empty() && !lookup.is_default_branch() {
         if let Some(pr) = get_side_branch_pr(repo_path, &lookup).unwrap_or(None) {
-            prs.push(pr);
+            prs.push(SourcedPr {
+                pr,
+                source: PrSource::SideBranch,
+            });
         }
     }
 
-    promote_primary_pr(&mut prs, &lookup.branch);
+    promote_primary_pr(&mut prs);
     Ok(prs)
 }
 
@@ -1845,11 +1948,14 @@ pub fn get_workspace_prs(repo_path: &Path) -> Result<Vec<PullRequestInfo>, Strin
 ///
 /// The current branch's PR wins outright; otherwise the first open one does.
 /// Order is otherwise preserved, so the rest of the stack stays bottom-up.
-fn promote_primary_pr(prs: &mut [PullRequestInfo], current_branch: &str) {
+fn promote_primary_pr(prs: &mut [SourcedPr]) {
     let primary = prs
         .iter()
-        .position(|pr| pr.head_branch.as_deref() == Some(current_branch))
-        .or_else(|| prs.iter().position(|pr| !is_historical_pr_state(&pr.state)));
+        .position(|entry| entry.source == PrSource::Branch)
+        .or_else(|| {
+            prs.iter()
+                .position(|entry| !is_historical_pr_state(&entry.pr.state))
+        });
     if let Some(index) = primary {
         prs[..=index].rotate_right(1);
     }
@@ -1860,13 +1966,13 @@ fn promote_primary_pr(prs: &mut [PullRequestInfo], current_branch: &str) {
 /// lookup must never be mistaken for an authoritative empty set.
 #[derive(Debug, Clone)]
 pub enum WorkspacePrsOutcome {
-    Write(Vec<PullRequestInfo>),
+    Write(Vec<SourcedPr>),
     Clear,
     Preserve,
 }
 
 /// Single decision point shared by the poller and `refresh_workspace_pr`.
-pub fn workspace_prs_outcome(lookup: Result<Vec<PullRequestInfo>, String>) -> WorkspacePrsOutcome {
+pub fn workspace_prs_outcome(lookup: Result<Vec<SourcedPr>, String>) -> WorkspacePrsOutcome {
     match lookup {
         Ok(prs) if prs.is_empty() => WorkspacePrsOutcome::Clear,
         Ok(prs) => WorkspacePrsOutcome::Write(prs),
@@ -5263,8 +5369,15 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         assert!(parse_rate_limit(r#"{"message":"Bad credentials"}"#).is_err());
     }
 
-    fn numbers(prs: &[PullRequestInfo]) -> Vec<u32> {
-        prs.iter().map(|pr| pr.number).collect()
+    fn sourced(number: u32, state: &str, branch: &str, source: PrSource) -> SourcedPr {
+        SourcedPr {
+            pr: branch_pr(number, state, branch, "2026-01-01T00:00:00Z", None),
+            source,
+        }
+    }
+
+    fn numbers(prs: &[SourcedPr]) -> Vec<u32> {
+        prs.iter().map(|entry| entry.pr.number).collect()
     }
 
     #[test]
@@ -5273,16 +5386,10 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         // whose PR already merged must keep naming that PR, not jump to an
         // unrelated open one further down the stack.
         let mut prs = vec![
-            branch_pr(10, "OPEN", "stack/a", "2026-01-01T00:00:00Z", None),
-            branch_pr(
-                11,
-                "MERGED",
-                "feature/current",
-                "2026-01-02T00:00:00Z",
-                None,
-            ),
+            sourced(10, "OPEN", "stack/a", PrSource::Worktree),
+            sourced(11, "MERGED", "feature/current", PrSource::Branch),
         ];
-        promote_primary_pr(&mut prs, "feature/current");
+        promote_primary_pr(&mut prs);
         assert_eq!(numbers(&prs), vec![11, 10]);
     }
 
@@ -5291,12 +5398,12 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
         // No PR on the checked-out branch: the bottom of the stack has
         // merged, so the first PR still carrying work is the better summary.
         let mut prs = vec![
-            branch_pr(20, "MERGED", "stack/01", "2026-01-01T00:00:00Z", None),
-            branch_pr(21, "MERGED", "stack/02", "2026-01-02T00:00:00Z", None),
-            branch_pr(22, "OPEN", "stack/03", "2026-01-03T00:00:00Z", None),
-            branch_pr(23, "OPEN", "stack/04", "2026-01-04T00:00:00Z", None),
+            sourced(20, "MERGED", "stack/01", PrSource::Worktree),
+            sourced(21, "MERGED", "stack/02", PrSource::Worktree),
+            sourced(22, "OPEN", "stack/03", PrSource::Worktree),
+            sourced(23, "OPEN", "stack/04", PrSource::Worktree),
         ];
-        promote_primary_pr(&mut prs, "workspace-branch");
+        promote_primary_pr(&mut prs);
         // 22 promoted; the rest keep their bottom-up stack order.
         assert_eq!(numbers(&prs), vec![22, 20, 21, 23]);
     }
@@ -5304,10 +5411,10 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
     #[test]
     fn primary_leaves_a_fully_merged_stack_alone() {
         let mut prs = vec![
-            branch_pr(30, "MERGED", "stack/01", "2026-01-01T00:00:00Z", None),
-            branch_pr(31, "CLOSED", "stack/02", "2026-01-02T00:00:00Z", None),
+            sourced(30, "MERGED", "stack/01", PrSource::Worktree),
+            sourced(31, "CLOSED", "stack/02", PrSource::Worktree),
         ];
-        promote_primary_pr(&mut prs, "workspace-branch");
+        promote_primary_pr(&mut prs);
         assert_eq!(numbers(&prs), vec![30, 31]);
     }
 
@@ -5323,10 +5430,186 @@ build\tcompile\t2026-08-16T09:00:03.000Z done";
             workspace_prs_outcome(Err("gh exploded".into())),
             WorkspacePrsOutcome::Preserve
         ));
-        let one = vec![branch_pr(40, "OPEN", "b", "2026-01-01T00:00:00Z", None)];
+        let one = vec![sourced(40, "OPEN", "b", PrSource::Branch)];
         match workspace_prs_outcome(Ok(one)) {
             WorkspacePrsOutcome::Write(prs) => assert_eq!(numbers(&prs), vec![40]),
             other => panic!("expected Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_config_reads_branch_names_with_slashes_and_dots() {
+        let config = RemoteConfig::parse(
+            "branch.ui-pass/01.remote origin\n\
+             branch.fix.v1.2.remote fork\n\
+             branch.local-only.remote .\n\
+             remote.origin.url git@github.com:acme/app.git\n\
+             remote.fork.url https://github.com/someone/app.git\n",
+        );
+        // Same repository as origin: no owner filter needed.
+        assert_eq!(config.head_owner("ui-pass/01"), None);
+        // A fork branch is scoped to the fork's owner.
+        assert_eq!(config.head_owner("fix.v1.2").as_deref(), Some("someone"));
+        // "." means "tracks a local branch" — never a remote owner.
+        assert_eq!(config.head_owner("local-only"), None);
+        // No tracking config at all.
+        assert_eq!(config.head_owner("never-pushed"), None);
+    }
+
+    /// Real repositories, real worktrees. This is the rule the whole feature
+    /// rests on, so it is exercised against git rather than a stubbed answer.
+    mod worktree_discovery {
+        use super::super::worktree_owned_branches;
+        use std::path::Path;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        /// Commits get explicit, increasing timestamps: the result is sorted
+        /// by committer date, and commits made within the same second would
+        /// otherwise leave the order to chance.
+        fn git(dir: &Path, args: &[&str], at: u32) {
+            let date = format!("2026-01-01T00:{:02}:{:02}Z", at / 60, at % 60);
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git spawn");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn commit(dir: &Path, file: &str, at: u32) {
+            std::fs::write(dir.join(file), file).unwrap();
+            git(dir, &["add", "."], at);
+            git(dir, &["commit", "-qm", file], at);
+        }
+
+        fn identity(dir: &Path) {
+            git(dir, &["config", "user.email", "test@example.com"], 0);
+            git(dir, &["config", "user.name", "Test"], 0);
+            git(dir, &["config", "commit.gpgsign", "false"], 0);
+        }
+
+        /// An upstream with one commit on `main`, cloned so `origin/main`
+        /// exists the way it does in every real workspace.
+        fn cloned_repo(tmp: &TempDir) -> std::path::PathBuf {
+            let upstream = tmp.path().join("upstream");
+            std::fs::create_dir_all(&upstream).unwrap();
+            git(&upstream, &["init", "-q", "--initial-branch=main"], 0);
+            identity(&upstream);
+            commit(&upstream, "README.md", 1);
+
+            let repo = tmp.path().join("repo");
+            git(
+                tmp.path(),
+                &[
+                    "clone",
+                    "-q",
+                    upstream.to_str().unwrap(),
+                    repo.to_str().unwrap(),
+                ],
+                2,
+            );
+            identity(&repo);
+            repo
+        }
+
+        #[test]
+        fn finds_a_stack_cut_with_git_branch_and_never_checked_out() {
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            let wt = tmp.path().join("wt");
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "ws-branch",
+                    wt.to_str().unwrap(),
+                ],
+                3,
+            );
+
+            // The agent's move: a commit per concern, a branch cut at each,
+            // HEAD never leaving `ws-branch`.
+            commit(&wt, "one.txt", 10);
+            git(&wt, &["branch", "stack/01"], 10);
+            commit(&wt, "two.txt", 20);
+            git(&wt, &["branch", "stack/02"], 20);
+            commit(&wt, "three.txt", 30);
+            git(&wt, &["branch", "stack/03"], 30);
+            // One more commit so `ws-branch` has its own tip, not stack/03's.
+            commit(&wt, "four.txt", 40);
+
+            // A neighbouring workspace's branch, in the same shared refs/heads
+            // but not reachable from this worktree's HEAD.
+            git(&repo, &["branch", "neighbour", "main"], 50);
+            commit(&repo, "neighbour.txt", 50);
+
+            assert_eq!(
+                worktree_owned_branches(&wt, "main"),
+                vec!["stack/01", "stack/02", "stack/03", "ws-branch"],
+            );
+        }
+
+        #[test]
+        fn excludes_branches_already_in_the_upstream_default() {
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            // Reachable from HEAD, but also from origin/main — shipped work.
+            git(&repo, &["branch", "old-work", "main"], 3);
+            git(&repo, &["checkout", "-q", "-b", "fresh"], 4);
+            commit(&repo, "fresh.txt", 5);
+
+            assert_eq!(worktree_owned_branches(&repo, "main"), vec!["fresh"]);
+        }
+
+        #[test]
+        fn falls_back_to_the_local_default_when_there_is_no_remote() {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("solo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-q", "--initial-branch=main"], 0);
+            identity(&repo);
+            commit(&repo, "README.md", 1);
+            git(&repo, &["checkout", "-q", "-b", "feature"], 2);
+            commit(&repo, "feature.txt", 3);
+
+            assert_eq!(worktree_owned_branches(&repo, "main"), vec!["feature"]);
+        }
+
+        #[test]
+        fn claims_nothing_when_the_default_branch_cannot_be_found() {
+            // With no exclusion ref the query would be "every branch in the
+            // repository". Showing nothing is the safe failure.
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            git(&repo, &["checkout", "-q", "-b", "feature"], 3);
+            commit(&repo, "feature.txt", 4);
+
+            assert!(worktree_owned_branches(&repo, "trunk").is_empty());
+        }
+
+        #[test]
+        fn a_clean_worktree_owns_nothing() {
+            let tmp = TempDir::new().unwrap();
+            let repo = cloned_repo(&tmp);
+            let wt = tmp.path().join("wt");
+            git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "idle", wt.to_str().unwrap()],
+                3,
+            );
+            // `idle` sits exactly on origin/main, so it is already "shipped".
+            assert!(worktree_owned_branches(&wt, "main").is_empty());
         }
     }
 }

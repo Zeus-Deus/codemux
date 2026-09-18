@@ -616,6 +616,7 @@ const wsCodemuxStack = makeWorkspace({
     url: `https://github.com/example/codemux/pull/${372 + i}`,
     head_branch: `ui-pass/0${i + 1}`,
     base_branch: i === 0 ? "main" : `ui-pass/0${i}`,
+    source: "worktree" as const,
   })),
 });
 

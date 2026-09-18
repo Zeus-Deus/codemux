@@ -106,24 +106,38 @@ export function prSetSummary(prs: readonly WorkspacePrRef[]): PrSetSummary {
 
 /** May lifecycle rules act on this workspace's PRs?
  *
- *  A single association can be the backend's weaker side-branch badge — a PR
- *  opened from a branch this worktree merely visited — and settling a checkout
- *  on the strength of that is wrong, so it still goes through
- *  `isPrOnCurrentBranch`.
+ *  Read off each PR's `source`, which the backend records at the point it
+ *  attributes the PR, so the answer never depends on how many PRs happen to be
+ *  in the set:
  *
- *  A set of more than one never can be. The side-branch fallback contributes at
- *  most one PR and only when nothing else was found, so anything larger came
- *  from worktree-owned discovery, where every branch is by construction
- *  reachable from this checkout's own HEAD. Those are this workspace's own
- *  commits regardless of which branch is checked out right now, which is
- *  exactly the stack case: the agent cut nine branches and left HEAD on none of
- *  them. */
+ *  - `worktree` PRs are this checkout's own work by construction — their
+ *    branches are reachable from its HEAD — whichever branch is checked out.
+ *    That is the stack case: the agent cut nine branches and left HEAD on none.
+ *  - `branch` PRs still go through `isPrOnCurrentBranch`. The PR poll runs on
+ *    its own minute-long cadence, so right after a branch switch the stored
+ *    association can briefly describe the branch the user just left; the
+ *    comparison keeps that window from settling the new checkout.
+ *  - `side_branch` PRs never qualify: a PR from a branch this worktree merely
+ *    visited says nothing about whether its own work is finished.
+ *
+ *  Every PR must qualify, so one weak association cannot carry the rest.
+ *  State persisted before `source` existed has none, and keeps the old rule. */
 export function prsDescribeThisCheckout(
   prs: readonly WorkspacePrRef[],
   gitBranch: string | null | undefined,
 ): boolean {
-  if (prs.length > 1) return true;
-  return isPrOnCurrentBranch(prs[0]?.head_branch, gitBranch);
+  if (prs.length === 0) return isPrOnCurrentBranch(null, gitBranch);
+  return prs.every((pr) => {
+    switch (pr.source) {
+      case "worktree":
+        return true;
+      case "side_branch":
+        return false;
+      default:
+        // "branch", or no recorded source at all.
+        return isPrOnCurrentBranch(pr.head_branch, gitBranch);
+    }
+  });
 }
 
 /** Is this PR stacked on another PR in the same set?
