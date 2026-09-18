@@ -542,6 +542,10 @@ async function checkCredentialSettings() {
       field,
     ),
   );
+  assert.ok(
+    !(await text()).includes("Credential store unavailable or locked"),
+    "A successful explicit fallback must clear its stale failure",
+  );
   const inventory = await native("addon_inventory");
   const installationId = inventory.installed.find(
     (i) => i.manifest.id === "codemux.issue-companion",
@@ -1414,6 +1418,46 @@ try {
       p95FrameGapMs <= 100,
       "Shared-runner UI frame p95 exceeds the recorded 100 ms budget",
     );
+    const list = 'section[aria-label="Add-on view"] [role="list"]';
+    const positions = () =>
+      script(
+        `return [...document.querySelector(arguments[0]).querySelectorAll('[role="listitem"]')].map(e => ({size:Number(e.getAttribute('aria-setsize')),position:Number(e.getAttribute('aria-posinset'))}))`,
+        list,
+      );
+    assert.ok(
+      (await positions()).every((row) => row.size === 500 && row.position >= 1),
+    );
+    assert.equal(
+      await script(
+        `return document.querySelector(arguments[0]).getAttribute('aria-label')`,
+        list,
+      ),
+      "Add-on list",
+    );
+    await click(list);
+    await wd("DELETE", "/actions");
+    await wd("POST", "/actions", {
+      actions: [
+        {
+          type: "key",
+          id: "list-keyboard",
+          actions: [
+            { type: "keyDown", value: "\ue010" },
+            { type: "keyUp", value: "\ue010" },
+          ],
+        },
+      ],
+    });
+    await until("keyboard reaches the final virtual row", async () =>
+      (await positions()).some((row) => row.position === 500),
+    );
+    assert.ok((await positions()).length <= 14);
+    evidence.virtualListAccessibility = {
+      label: "Add-on list",
+      setSize: 500,
+      keyboardEndPosition: 500,
+      boundedRows: true,
+    };
     await assertNoSubmission();
     await capture("08-virtualized-native-plugin-list");
     await openSettings();
