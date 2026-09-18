@@ -36,3 +36,12 @@ and `dist/types.d.ts`; `schema/manifest.json` is generated from the Rust contrac
 The desktop performs semantic validation in addition to schema validation.
 Components accept token-based properties, never CSS or arbitrary HTML. Hooks are
 Preact hooks. Browser libraries requiring a real browser DOM are unsupported.
+
+## Rendering limits
+
+A mounted view is limited to 2,000 nodes, depth 32, and 256 KiB of serialized
+state. A batch may contain at most 1,000 mutations; intermediate states must also
+fit the limits. Native validation has a 50 ms wall-clock budget per batch. A
+resource violation rejects the whole batch and stops that plugin generation.
+Prefer small updates to existing content over replacing large subtrees. These
+ceilings are bounds, not a guaranteed update rate on every machine.
