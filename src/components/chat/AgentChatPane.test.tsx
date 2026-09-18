@@ -1249,11 +1249,16 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
   it("keeps the parent-bound composer mounted while entered", () => {
     const { container } = render(<AgentChatPane pane={pane} />);
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    const region = () => container.querySelector('[data-testid="composer"]')!.parentElement!;
+    expect(region()).toHaveClass("absolute");
     fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
     // Drill-in swaps the transcript body but the composer stays parent-bound
     // (design: "steering goes to the orchestrator").
     expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    expect(region()).not.toHaveClass("absolute");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(region()).toHaveClass("absolute");
   });
 
   it("hides the composer's running-subagents strip while drilled into a subagent, and shows it again on Esc", () => {

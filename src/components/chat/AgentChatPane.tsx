@@ -3988,7 +3988,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               cards inside opt themselves back in. */}
           <div
             ref={composerRegionRef}
-            className="pointer-events-none absolute inset-x-0 bottom-0 z-10 pt-3.5"
+            className={
+              // Only the parent transcript reserves space for an overlay.
+              // Keep drill-in in normal flow so its final rows remain visible.
+              enteredSubagent
+                ? "pt-3.5"
+                : "pointer-events-none absolute inset-x-0 bottom-0 z-10 pt-3.5"
+            }
           >
             {pendingInputPanelEl}
             {threadId && (
