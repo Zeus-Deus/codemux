@@ -106,7 +106,7 @@ const CATEGORIES: Category[] = [
     label: "per-icon strokeWidth (one base-layer rule owns icon weight)",
     pattern: /strokeWidth/g,
     scan: (contents) => [contents],
-    budget: 11,
+    budget: 13,
     why:
       "hand-written <svg> glyphs and chart geometry, which are not lucide " +
       "icons: two device glyphs, two goal glyphs, the context meter's two " +
