@@ -122,10 +122,17 @@ describe("Composer pill collapse", () => {
       ],
     }],
     ["an active mode pill", { mode: "plan" }],
-    ["a queued message", { hasQueuedMessage: true }],
   ])("expands for %s", (_name, props) => {
     const { wrapper } = renderComposer(props);
     expect(wrapper()).toHaveAttribute("data-expanded");
+  });
+
+  it("stays collapsed while a queued message waits in the strip", () => {
+    const { wrapper } = renderComposer({
+      streaming: true,
+      stripSlot: <div>Queued follow-up</div>,
+    });
+    expect(wrapper()).not.toHaveAttribute("data-expanded");
   });
 
   it("expands on focus, collapses on blur — but never within 400ms of a send", () => {

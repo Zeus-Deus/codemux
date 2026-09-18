@@ -3795,7 +3795,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
       stripSlot={stripEl}
-      hasQueuedMessage={queued.length > 0}
       paneDragActive={paneDragDepth > 0}
       tasks={taskSummary}
       tasksOpen={rightPanelTab === "tasks"}
