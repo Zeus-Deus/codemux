@@ -108,6 +108,7 @@ import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
+import { COMPOSER_OVERLAY_CARD } from "./composer-overlay";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -2717,7 +2718,7 @@ export function Composer({
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
-      <div className={CHAT_COLUMN_INNER}>
+      <div className={cn(CHAT_COLUMN_INNER, COMPOSER_OVERLAY_CARD)}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
