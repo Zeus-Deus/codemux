@@ -971,6 +971,14 @@ try {
             (i) => i.manifest.name === title,
           ),
       );
+      // The native transaction completes before the Settings refresh and
+      // dialog exit animation. Wait for the actual UI before the next click.
+      await until(`removal dialog and ${title} card closed`, () =>
+        script(
+          `return !document.querySelector('[role="dialog"]') && ![...document.querySelectorAll('article')].some(e => e.innerText.includes(arguments[0]))`,
+          title,
+        ),
+      );
     }
     assert.equal(await pluginHostCount(), 0);
     await click('[aria-label="Close settings"]');
