@@ -359,6 +359,8 @@ impl Reviews {
         if directory.exists() {
             Package::read(&directory.join("package.cmxaddon"), Some(&candidate.digest))?;
         }
+        #[cfg(test)]
+        self.checkpoint("package-write").await;
         if !directory.exists() {
             let staging = manager
                 .root
@@ -1114,6 +1116,139 @@ mod tests {
                 .unwrap();
         }
         Package::parse(archive.into_inner().unwrap().finish().unwrap(), None).unwrap()
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Requires a bounded disposable CI tmpfs; scripts/addons/full-filesystem.sh"]
+    async fn full_filesystem_preserves_release_data_and_grant_tuple() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let base = std::path::PathBuf::from(std::env::var_os("CODEMUX_TEST_FULL_FS").unwrap());
+        let path = std::ffi::CString::new(base.as_os_str().as_bytes()).unwrap();
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) }, 0);
+        let fs = unsafe { fs.assume_init() };
+        assert_eq!(fs.f_type, libc::TMPFS_MAGIC);
+        assert!(
+            fs.f_blocks * fs.f_bsize as u64 <= 32 * 1024 * 1024,
+            "Refuse to fill a filesystem larger than the dedicated CI fixture"
+        );
+        for stage in [
+            "package-write",
+            "package-staged",
+            "journal-saved",
+            "data-snapshotted",
+            "registry-switched",
+            "activated",
+        ] {
+            let root = tempfile::tempdir_in(&base).unwrap();
+            let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let reviews = Reviews::default();
+            let first = reviews
+                .prepare(
+                    &manager,
+                    package_version("1.0.0"),
+                    Source::Local {
+                        identity: Uuid::new_v4().to_string(),
+                    },
+                )
+                .unwrap();
+            let old = reviews
+                .accept(&manager, &first.token, false, false)
+                .await
+                .unwrap();
+            let state_path = |record: &Installation| {
+                root.path()
+                    .join("private/state")
+                    .join(&record.installation_id)
+                    .join(&record.data_generation)
+                    .join("state.sqlite")
+            };
+            Storage::open(&state_path(&old))
+                .unwrap()
+                .set(
+                    "global",
+                    "fixture",
+                    &serde_json::json!({"value":"original"}),
+                )
+                .unwrap();
+            let review = reviews
+                .prepare(&manager, package_version("2.0.0"), old.source.clone())
+                .unwrap();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *reviews.interruption.lock().unwrap() =
+                Some((stage, reached.clone(), Some(resume.clone())));
+            let completed = {
+                let transaction = reviews.accept(&manager, &review.token, false, false);
+                tokio::pin!(transaction);
+                tokio::select! {
+                    result = &mut transaction => panic!("{stage}: completed before fill: {}", result.is_ok()),
+                    _ = reached.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => panic!("{stage}: checkpoint not reached"),
+                }
+                let filler_path = root.path().join("fill.bin");
+                let mut filler = std::fs::File::create(&filler_path).unwrap();
+                let block = [0u8; 4096];
+                loop {
+                    match filler.write_all(&block) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            assert_eq!(
+                                error.raw_os_error(),
+                                Some(libc::ENOSPC),
+                                "{stage}: {error}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                drop(filler);
+                resume.notify_one();
+                let completed =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut transaction)
+                        .await
+                        .expect("full filesystem must not strand transaction")
+                        .is_ok();
+                std::fs::remove_file(filler_path).unwrap();
+                completed
+            };
+            // The registry may reuse allocated pages even with zero free blocks.
+            // Whether commit succeeds or fails, recovery must select one whole
+            // release/data/grant tuple, never a mixture or a lost installation.
+            drop(manager);
+            let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let installed = reopened.installation(&old.manifest.id).unwrap();
+            assert_eq!(
+                installed.digest,
+                if completed {
+                    review.digest
+                } else {
+                    old.digest.clone()
+                },
+                "{stage}"
+            );
+            assert_eq!(installed.installation_id, old.installation_id, "{stage}");
+            assert_eq!(installed.source, old.source, "{stage}");
+            assert_eq!(
+                installed.grant.as_ref().unwrap().digest,
+                installed.digest,
+                "{stage}"
+            );
+            assert_eq!(
+                Storage::open(&state_path(&installed))
+                    .unwrap()
+                    .get("global", "fixture")
+                    .unwrap(),
+                serde_json::json!({"value":"original"}),
+                "{stage}"
+            );
+            println!("{stage}: real ENOSPC; committed={completed}; tuple preserved");
+        }
     }
     #[tokio::test]
     async fn interrupted_update_recovers_at_every_durable_transition() {

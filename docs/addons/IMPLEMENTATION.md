@@ -197,6 +197,12 @@ publication and Settings remain separate deliverables.
   completes. Older inventory responses cannot restore stale enabled state.
   Native generation changes remount views; failed releases still need explicit Retry.
 
+- Eleven lifecycle tests and `cargo check` pass with a new ignored real-ENOSPC
+  test. CI mounts a dedicated 16 MiB tmpfs and fills it at six transaction
+  boundaries. Both script and test refuse local/persistent runners, and the
+  test rejects a non-tmpfs or volume larger than 32 MiB. The native full-volume
+  run is pending; compiling an ignored test is not disk-full evidence.
+
 ## Unresolved release gates
 
 Native desktop UI acceptance now has a CI-only external `tauri-driver` harness
@@ -223,7 +229,10 @@ WebKit screenshot capture times out after the terminal canvas appears; text
 queries still work. [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35383388810)
 stops at driver session creation. The harness now captures Linux's actual X
 display and uses Microsoft's [documented WebView2 attach mode](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webdriver#step-4b-attaching-microsoft-edge-webdriver-to-a-running-webview2-app)
-with a debug port enabled only in the disposable CI child environment. No
+with a debug port enabled only by an executable-specific policy on the
+disposable Windows runner. The runner starts elevated, and [Microsoft documents](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security)
+that elevated hosts ignore environment overrides. The harness refuses to
+replace existing policy and removes its value after use. No
 production test hook or app configuration change is introduced. Both platforms
 require a passing retry.
 It currently targets import/review, enable/disable, both example views and draft
