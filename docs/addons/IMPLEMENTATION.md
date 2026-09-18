@@ -60,6 +60,10 @@ publication and Settings remain separate deliverables.
   tests pass. Native cargo check and 40 focused tests pass (7 explicit ignored
   environment/integration tests are counted separately). All four real-host
   manager integrations pass with the freshly packed SDK/example archives.
+  Current main's design-token contract exposed raw plugin font/radius classes;
+  these now use the shared tokens in their original UI/Settings milestones.
+  TypeScript and 22 affected/token-contract tests pass, and the localhost mock
+  Settings/catalog layout was visually checked with the bundled fonts.
 - Real native SDK regression failed before and passes after render backpressure:
   two completed callbacks can wait behind an unacknowledged render without
   exhausting the host queue. Trusted acknowledgements release one ordered batch;

@@ -256,7 +256,7 @@ function Configure({
         >
           <h3 className="font-medium">Configuration</h3>
           {configuration === "loading" && (
-            <p role="status" className="text-sm text-muted-foreground">
+            <p role="status" className="text-body text-muted-foreground">
               Loading configuration…
             </p>
           )}
