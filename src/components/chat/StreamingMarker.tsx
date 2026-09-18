@@ -117,16 +117,15 @@ function WaitingLabel({
       aria-pressed={selected}
       aria-label={`View ${waiting} background task${waiting === 1 ? "" : "s"}`}
       className={cn(
-        "group/waiting -mx-1 flex min-w-0 items-baseline gap-1.5 rounded-md px-1 text-left transition-colors hover:bg-foreground/[0.035] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
-        selected && "bg-foreground/[0.055]",
+        "group/waiting -mx-1 flex min-w-0 items-baseline gap-1.5 rounded-md px-1 text-left transition-colors duration-150 hover:bg-surface-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70",
+        selected && "bg-surface-2",
       )}
     >
       <span className="shimmer truncate text-body font-semibold">{label}</span>
-      <span className="flex shrink-0 items-center gap-0.5 self-center text-caption font-medium text-muted-foreground/70 transition-colors group-hover/waiting:text-foreground/80">
+      <span className="flex shrink-0 items-center gap-0.5 self-center text-caption font-medium text-muted-foreground/70 transition-colors duration-150 group-hover/waiting:text-foreground/80">
         View
         <ChevronRight
-          className="size-3 transition-transform group-hover/waiting:translate-x-0.5"
-          strokeWidth={1.7}
+          className="size-3 transition-transform duration-150 group-hover/waiting:translate-x-0.5"
           aria-hidden
         />
       </span>

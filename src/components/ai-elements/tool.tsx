@@ -83,7 +83,7 @@ const statusLabels: Record<ToolPart["state"], string> = {
 const statusIcons: Record<ToolPart["state"], ReactNode> = {
   "approval-requested": <ClockIcon className="size-4 text-status-working" />,
   "approval-responded": <CheckCircleIcon className="size-4 text-status-remote" />,
-  "input-available": <ClockIcon className="size-4 animate-pulse" />,
+  "input-available": <ClockIcon className="size-4 motion-safe:animate-pulse" />,
   "input-streaming": <CircleIcon className="size-4" />,
   "output-available": <CheckCircleIcon className="size-4 text-status-open" />,
   "output-denied": <XCircleIcon className="size-4 text-status-attention" />,
@@ -121,7 +121,7 @@ export const ToolHeader = ({
         <span className="font-medium text-body">{title ?? derivedName}</span>
         {getStatusBadge(state)}
       </div>
-      <ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+      <ChevronDownIcon className="size-4 text-muted-foreground transition-transform duration-150 group-data-[state=open]:rotate-180" />
     </CollapsibleTrigger>
   );
 };

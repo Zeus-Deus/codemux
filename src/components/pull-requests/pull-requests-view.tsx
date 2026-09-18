@@ -315,7 +315,7 @@ export function PullRequestsView() {
           aria-label="Resize the list"
           data-testid="pr-list-resizer"
           onPointerDown={startResize}
-          className="w-1 shrink-0 cursor-col-resize transition-colors hover:bg-foreground/20"
+          className="w-1 shrink-0 cursor-col-resize transition-colors duration-150 hover:bg-foreground/20"
         />
 
         <div

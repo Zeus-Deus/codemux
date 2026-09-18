@@ -87,7 +87,7 @@ function RailWorkspaceItem({
           aria-label={workspace.title}
           className={cn(
             "relative flex size-7 items-center justify-center rounded-lg border duration-150",
-            "transition-[color,background-color,border-color,opacity]",
+            "transition-[color,background-color,border-color,opacity] duration-150",
             isActive
               ? "border-border bg-surface-3"
               : "border-transparent hover:bg-surface-2",
@@ -233,7 +233,7 @@ export function SidebarRailWorkspaces() {
     .map(({ ws }) => ws);
 
   return (
-    <div className="flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="no-scrollbar flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1">
       <SidebarRailDrafts catalog={sidebarDraftCatalog} />
       {railWorkspaces.map((ws) => {
         const repo = repoByWorkspace.get(ws.workspace_id);

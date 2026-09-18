@@ -533,7 +533,7 @@ export function MultiProviderModelPicker({
                   OpenCode federates ~150 connected-upstream models on
                   a fully-configured machine — without a scrollbar
                   half the list is unreachable). */}
-              <CommandList className="max-h-none flex-1 overflow-y-auto [&]:[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
+              <CommandList className="max-h-none flex-1 overflow-y-auto thin-scrollbar [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
                 <CommandEmpty>
                   <ModelListEmptyState
                     railKey={railKey}
@@ -663,7 +663,7 @@ function ProviderRail({
                     aria-label="Favorites"
                     aria-pressed={selected === "favorites"}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
                       "hover:bg-muted",
                       selected === "favorites" &&
                         "bg-background text-foreground shadow-sm",
@@ -677,7 +677,7 @@ function ProviderRail({
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
                   Favorites
-                  <span className="ml-2 text-muted-foreground">
+                  <span className="ml-2 text-muted-foreground tabular-nums">
                     {favoritesCount}
                   </span>
                 </TooltipContent>
@@ -718,7 +718,7 @@ function ProviderRail({
                     aria-label={p.label}
                     aria-pressed={isSelected}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
                       "hover:bg-muted",
                       isSelected && "bg-background text-foreground shadow-sm",
                       isUnavailable &&
@@ -736,7 +736,7 @@ function ProviderRail({
                   <div className="flex items-center gap-2">
                     <span>{p.label}</span>
                     {!isUnavailable && count > 0 ? (
-                      <span className="text-muted-foreground">{count}</span>
+                      <span className="text-muted-foreground tabular-nums">{count}</span>
                     ) : null}
                   </div>
                   {parsedError ? (
@@ -885,7 +885,7 @@ function ModelRow({
           // Always visible (not hover-revealed): a dim outline star on
           // every row keeps the favoriting affordance discoverable and
           // the row layout stable.
-          "shrink-0 rounded-sm p-1 transition-colors hover:bg-accent",
+          "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-accent",
           isFavorite
             ? "text-status-working"
             : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",

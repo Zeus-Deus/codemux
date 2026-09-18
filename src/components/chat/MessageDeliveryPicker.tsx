@@ -33,7 +33,7 @@ export function MessageDeliveryPicker({
           disabled={disabled}
           aria-label={`Message delivery: ${selected.label}`}
           title={selected.description}
-          className="inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40"
+          className="inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-full px-2 text-label text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:opacity-40"
         >
           <Icon className="size-3.5" aria-hidden />
           <span>{value === "interrupt" ? "Interrupt" : selected.label}</span>
@@ -65,7 +65,7 @@ export function MessageDeliveryPicker({
                   >
                     <OptionIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
                     <span className="min-w-0 flex-1">
-                      <span className="flex items-center justify-between text-xs">
+                      <span className="flex items-center justify-between text-label">
                         <span>{option.label}</span>
                         <span className="text-muted-foreground">/{option.value}</span>
                       </span>

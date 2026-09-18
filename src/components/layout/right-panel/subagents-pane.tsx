@@ -443,7 +443,7 @@ function SubagentRow({
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       className={cn(
-        "overflow-hidden transition-[max-height,opacity] duration-[250ms] ease-out",
+        "overflow-hidden transition-[max-height,opacity] duration-250 ease-out",
         phase === "collapsing"
           ? "max-h-0 opacity-0"
           : "max-h-[120px] opacity-100",

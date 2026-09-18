@@ -122,13 +122,13 @@ const SWEEP_STYLE = {
 } as React.CSSProperties;
 
 const STRIP_CHIP =
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors hover:bg-surface-2 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-1 rounded-md bg-surface-1 px-2.5 text-label font-semibold text-foreground/80 outline-none transition-colors duration-150 hover:bg-surface-2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 disabled:pointer-events-none disabled:opacity-50";
 
 // Goal row controls, drawn to Canvas-12 2a / 4a: 26px, 6px corners, 11px/600.
-const GOAL_FOCUS = "outline-none focus-visible:ring-1 focus-visible:ring-ring";
+const GOAL_FOCUS = "outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 /** Quiet text action (Copy, Clear beside Resume). */
 const GOAL_CHIP = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
+  "inline-flex h-[26px] shrink-0 items-center justify-center gap-[5px] rounded-sm px-2 text-label font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Clear when it is the strongest action in the row. */
@@ -143,19 +143,19 @@ const GOAL_CHIP_FILLED = cn(
 );
 /** The resting chevron and the overflow trigger: icon only, no fill. */
 const GOAL_ICON_BUTTON = cn(
-  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground",
+  "inline-flex size-[26px] shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground",
   GOAL_FOCUS,
 );
 /** Resume is the one solid control in the strip: an interrupted goal is the
  *  only occupant that asks for a decision. */
 const GOAL_RESUME = cn(
-  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-sm bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] hover:brightness-110",
+  "inline-flex h-[26px] shrink-0 items-center justify-center rounded-sm bg-status-working px-2.5 text-label font-bold text-status-working-foreground transition-[filter] duration-150 hover:brightness-110",
   GOAL_FOCUS,
 );
 const GOAL_META =
-  "shrink-0 whitespace-nowrap font-mono text-label text-muted-foreground";
+  "shrink-0 whitespace-nowrap font-mono text-label tabular-nums text-muted-foreground";
 const GOAL_LINK = cn(
-  "inline-flex shrink-0 items-center gap-[5px] rounded-sm transition-colors hover:text-foreground",
+  "inline-flex shrink-0 items-center gap-[5px] rounded-sm transition-colors duration-150 hover:text-foreground",
   GOAL_FOCUS,
 );
 const GOAL_MENU_ITEM = "h-[26px] rounded-sm px-2 py-0 text-body-sm";
@@ -306,7 +306,7 @@ export function ComposerStrip({
                   id={listId}
                   aria-label="Other activity"
                   className={cn(
-                    "flex flex-col gap-[3px] overflow-y-auto [scrollbar-width:thin]",
+                    "flex flex-col gap-[3px] overflow-y-auto thin-scrollbar [scrollbar-gutter:stable]",
                     OPEN_MAX_HEIGHT,
                   )}
                 >
@@ -329,7 +329,7 @@ export function ComposerStrip({
             className={cn(
               "relative flex flex-col gap-[3px]",
               open &&
-                `${OPEN_MAX_HEIGHT} overflow-y-auto [scrollbar-width:thin]`,
+                `${OPEN_MAX_HEIGHT} overflow-y-auto thin-scrollbar`,
             )}
           >
             {(open ? rows : [{ row: lead.summary, kind: lead.kind }]).map(
@@ -622,7 +622,7 @@ function GoalRowView({
           data-testid="composer-strip-goal-details"
           className="flex flex-col gap-[7px] pt-px pr-2.5 pb-[3px] pl-9"
         >
-          <p className="max-h-[102px] overflow-y-auto whitespace-pre-wrap break-words text-body-sm leading-[1.55] text-foreground/[0.82] [scrollbar-width:thin]">
+          <p className="max-h-[102px] overflow-y-auto whitespace-pre-wrap break-words text-body-sm leading-[1.55] text-foreground/[0.82] thin-scrollbar">
             {goal.text}
           </p>
           {interrupted && (
@@ -643,7 +643,7 @@ function GoalRowView({
                 type="button"
                 onClick={strip.onEditResume}
                 className={cn(
-                  "shrink-0 rounded-sm font-mono text-label text-muted-foreground transition-colors hover:text-foreground",
+                  "shrink-0 rounded-sm font-mono text-label text-muted-foreground transition-colors duration-150 hover:text-foreground",
                   GOAL_FOCUS,
                 )}
               >
@@ -682,7 +682,7 @@ function GoalRowView({
                         aria-controls={listOpen ? listId : undefined}
                         onClick={onToggleList}
                         className={cn(
-                          "min-w-0 truncate rounded-sm text-left transition-colors hover:text-foreground",
+                          "min-w-0 truncate rounded-sm text-left transition-colors duration-150 hover:text-foreground",
                           GOAL_FOCUS,
                         )}
                       >

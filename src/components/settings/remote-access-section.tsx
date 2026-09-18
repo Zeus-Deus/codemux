@@ -206,7 +206,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
     return (
       <details className="group rounded-md border border-border/50 bg-muted/20 px-3 py-2">
         <summary className="flex cursor-pointer list-none items-center gap-1.5 text-body font-semibold text-foreground marker:content-none">
-          <span className="text-muted-foreground/70 transition-transform group-open:rotate-90">
+          <span className="text-muted-foreground/70 transition-transform duration-150 group-open:rotate-90">
             ›
           </span>
           {group.title}
@@ -312,7 +312,7 @@ function PairingPanel({
       type="button"
       onClick={() => setSelectedHost(e.host)}
       className={cn(
-        "rounded-full border px-2.5 py-1 text-label font-medium transition-colors",
+        "rounded-full border px-2.5 py-1 text-label font-medium transition-colors duration-150",
         e.host === selectedHost
           ? "border-accent-ember/40 bg-accent-ember/10 text-accent-ember"
           : "border-border/60 text-muted-foreground hover:text-foreground",
@@ -382,7 +382,7 @@ function PairingPanel({
               {otherEndpoints.length > 0 && (
                 <details className="group">
                   <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-label font-medium text-muted-foreground marker:content-none hover:text-foreground">
-                    <span className="transition-transform group-open:rotate-90">
+                    <span className="transition-transform duration-150 group-open:rotate-90">
                       ›
                     </span>
                     Other addresses ({otherEndpoints.length})
@@ -1227,7 +1227,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors disabled:opacity-60",
+                        "rounded-md px-3 py-1.5 text-body font-medium transition-colors duration-150 disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -1566,7 +1566,7 @@ export function RemoteAccessSection() {
               <div className="flex items-center gap-2">
                 <SubHeading>Paired devices</SubHeading>
                 {connectedCount > 0 && (
-                  <span className="text-label font-medium text-status-open">
+                  <span className="text-label font-medium text-status-open tabular-nums">
                     {connectedCount} connected
                   </span>
                 )}

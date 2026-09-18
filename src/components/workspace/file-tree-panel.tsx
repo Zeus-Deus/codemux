@@ -74,7 +74,7 @@ const TreeNode = memo(function TreeNode({
   const children = dirContents.get(entry.path);
 
   const row =
-    "flex h-[22px] w-full items-center gap-1.5 rounded-sm pr-1.5 text-left text-label transition-colors duration-[120ms]";
+    "flex h-[22px] w-full items-center gap-1.5 rounded-sm pr-1.5 text-left text-label transition-colors duration-100";
 
   if (entry.is_dir) {
     return (
@@ -91,7 +91,7 @@ const TreeNode = memo(function TreeNode({
         >
           <ChevronRight
             className={cn(
-              "size-3 shrink-0 text-foreground/35 transition-transform",
+              "size-3 shrink-0 text-foreground/35 transition-transform duration-150",
               isExpanded && "rotate-90",
             )}
           />

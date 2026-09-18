@@ -139,7 +139,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
 
   return (
     <div
-      className="group px-2.5 py-2 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
+      className="group px-2.5 py-2 hover:bg-muted/40 rounded-sm transition-colors duration-150 cursor-default min-w-0"
       onClick={openOnPage}
     >
       <div className="flex items-center gap-1.5 min-w-0 h-[22px]">
@@ -352,7 +352,7 @@ export function IncomingPrsView({
         {loading && (
           <div className="flex flex-col gap-2 px-2 py-2">
             {[1, 2, 3].map((i) => (
-              <div key={i} className="animate-pulse flex gap-2">
+              <div key={i} className="motion-safe:animate-pulse flex gap-2">
                 <div className="h-3 w-6 bg-muted rounded-sm" />
                 <div className="h-3 flex-1 bg-muted rounded-sm" />
                 <div className="h-3 w-12 bg-muted rounded-sm" />
@@ -382,7 +382,7 @@ export function IncomingPrsView({
             {prs.length >= 50 && (
               <button
                 className={cn(
-                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors text-left",
+                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors duration-150 text-left",
                   tzMeta,
                 )}
                 onClick={() => {

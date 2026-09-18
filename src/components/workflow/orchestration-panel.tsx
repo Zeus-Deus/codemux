@@ -195,7 +195,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
 function Stat({ label, value }: { label: string; value: ReactNode }) {
   return (
     <span className="flex flex-col">
-      <span className="font-mono text-body font-semibold text-foreground">{value}</span>
+      <span className="font-mono text-body font-semibold tabular-nums text-foreground">{value}</span>
       <Eyebrow>{label}</Eyebrow>
     </span>
   );

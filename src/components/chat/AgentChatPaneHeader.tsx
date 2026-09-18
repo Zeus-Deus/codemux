@@ -48,7 +48,7 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
   return (
     <PanelHeader
       className={cn(
-        "gap-1 px-1.5 transition-colors",
+        "gap-1 px-1.5 transition-colors duration-150",
         isActive ? "bg-card" : "bg-background",
       )}
       onPointerDown={onPointerDown}

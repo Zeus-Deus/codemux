@@ -166,12 +166,12 @@ function ThisDeviceRow({ workspaceCount }: { workspaceCount: number }) {
         <button
           type="button"
           onClick={() => setSweepOpen(true)}
-          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors hover:bg-status-working/[0.17]"
+          className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md bg-status-working/[0.11] px-2.5 py-[5px] text-label font-semibold text-status-working transition-colors duration-150 hover:bg-status-working/[0.17]"
         >
           <Trash2 className="size-3" aria-hidden />
           Sweep {count} settled
           {knownBytes !== null && knownBytes > 0 && (
-            <span className="font-medium text-status-working/80">
+            <span className="font-medium text-status-working/80 tabular-nums">
               · ~{formatBytes(knownBytes)}
             </span>
           )}
@@ -314,7 +314,7 @@ function DeviceCardView({
             // it (`sidebarPrimary` is the brand accent, and its foreground is
             // solved against it) — a literal white only ever cleared 2.8:1 on
             // the dark ember and would not survive a light theme's darker one.
-            className="shrink-0 rounded-md bg-accent-ember px-3 py-1.5 text-label font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] hover:brightness-110"
+            className="shrink-0 rounded-md bg-accent-ember px-3 py-1.5 text-label font-semibold text-sidebar-primary-foreground shadow-[0_2px_8px_rgba(0,0,0,0.25)] transition-[filter] duration-150 hover:brightness-110"
           >
             Connect
           </button>
@@ -322,7 +322,7 @@ function DeviceCardView({
           <ChevronRight
             aria-hidden
             className={cn(
-              "size-[11px] shrink-0 text-muted-foreground/70 transition-transform",
+              "size-[11px] shrink-0 text-muted-foreground/70 transition-transform duration-150",
               expanded && "rotate-90",
             )}
           />
@@ -414,7 +414,7 @@ function ProjectCluster({
             disabled={pulling}
             onClick={() => onPullProject(project.projectUid!, project.name)}
             title="Pull this project's repo root and all its worktrees to this device"
-            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-[3px] text-caption font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:opacity-60"
           >
             {pulling ? (
               <Loader2 className="size-[9px] animate-spin" aria-hidden />
@@ -555,7 +555,7 @@ function RowAction({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="rounded-md bg-surface-2 px-[9px] py-1 text-caption font-semibold text-muted-foreground transition-colors hover:bg-surface-3 hover:text-foreground disabled:opacity-60"
+      className="rounded-md bg-surface-2 px-[9px] py-1 text-caption font-semibold text-muted-foreground transition-colors duration-150 hover:bg-surface-3 hover:text-foreground disabled:opacity-60"
     >
       {children}
     </button>
@@ -569,7 +569,7 @@ function AddDeviceRow({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors hover:bg-surface-2 hover:text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 rounded-lg bg-surface-1 p-2.5 text-body-sm font-semibold text-muted-foreground/70 transition-colors duration-150 hover:bg-surface-2 hover:text-muted-foreground"
     >
       <Plus className="size-3" aria-hidden />
       Add device

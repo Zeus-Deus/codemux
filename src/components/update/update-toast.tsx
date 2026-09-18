@@ -109,7 +109,7 @@ export function UpdateToast() {
             <p className="text-body font-semibold mb-2.5">Downloading update…</p>
             <div className="bg-muted rounded-full h-2 overflow-hidden">
               <div
-                className="bg-primary h-full rounded-full transition-all duration-200"
+                className="bg-primary h-full rounded-full transition-[width] duration-250"
                 style={{ width: `${downloadProgress}%` }}
               />
             </div>

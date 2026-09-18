@@ -253,7 +253,7 @@ export function SidebarProjectGroup({
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
-            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-body font-medium hover:bg-muted/40 transition-colors cursor-pointer rounded-lg"
+            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-body font-medium hover:bg-muted/40 transition-colors duration-150 cursor-pointer rounded-lg"
             draggable={!!onProjectDragStart}
             onDragStart={onProjectDragStart}
             data-project-header-path={projectPath}
@@ -284,7 +284,7 @@ export function SidebarProjectGroup({
 
             {/* Count — visible at rest, fades on hover so the + can
                 take its slot without ever colliding. */}
-            <span className="text-label text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
+            <span className="text-label text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity duration-150 group-hover/proj:opacity-0">
               {visibleCount}
             </span>
 
@@ -294,7 +294,7 @@ export function SidebarProjectGroup({
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  className="absolute right-7 opacity-0 group-hover/proj:opacity-100 transition-opacity"
+                  className="absolute right-7 opacity-0 group-hover/proj:opacity-100 transition-opacity duration-150"
                   aria-label="New workspace"
                   onClick={handlePlusClick}
                 >
@@ -422,7 +422,7 @@ export function SidebarProjectGroup({
           key={pw.id}
           className={cn(
             "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-body",
-            pw.status === "failed" ? "opacity-60" : "opacity-70 animate-pulse",
+            pw.status === "failed" ? "opacity-60" : "opacity-70 motion-safe:animate-pulse",
           )}
         >
           {pw.status === "creating" ? (

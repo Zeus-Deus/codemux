@@ -377,7 +377,7 @@ function PinnedPresetTile({
             // The tinted treatments stay: these tiles are shortcuts to
             // *launch* something, so unlike Run and the editor launcher
             // they keep a fill that says which agent family they belong to.
-            "flex size-7 shrink-0 items-center justify-center transition-colors",
+            "flex size-7 shrink-0 items-center justify-center transition-colors duration-150",
             BAND_CONTROL_RADIUS,
             variant === "ember"
               ? "border border-accent-ember/40 bg-accent-ember/14 text-accent-ember hover:bg-accent-ember/20"

@@ -862,7 +862,7 @@ export function WorkspaceContextMenuItems({
         <span
           aria-hidden
           className={cn(
-            "ml-auto flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors",
+            "ml-auto flex h-3.5 w-6 shrink-0 items-center rounded-full p-0.5 transition-colors duration-150",
             workspace.notifications_muted
               ? "justify-end bg-accent-ember/70"
               : "bg-surface-3",
@@ -1279,7 +1279,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
             onClick={handleActivate}
             onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleActivate(); }}
             className={cn(
-              "group/row mx-1.5 flex pl-[18px] pr-2 text-body cursor-pointer relative transition-colors",
+              "group/row mx-1.5 flex pl-[18px] pr-2 text-body cursor-pointer relative transition-colors duration-150",
               // Cards (working / needs-you / done) gain a soft container and a
               // touch more vertical breathing room; idle rows keep today's
               // compact one-liner treatment.
@@ -1318,7 +1318,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                               : `Open ${provider.noun} on ${provider.name} — ${prHumanState ?? ""}`
                           }
                           className={cn(
-                            "inline-flex items-center justify-center rounded-sm transition-opacity",
+                            "inline-flex items-center justify-center rounded-sm transition-opacity duration-150",
                             workspace.pr_url ? "hover:opacity-70" : "cursor-not-allowed opacity-60",
                           )}
                         >
@@ -1442,7 +1442,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                             type="button"
                             onClick={(e) => e.stopPropagation()}
                             aria-label={`${shippedCount} shipped`}
-                            className="flex items-center gap-1 font-mono text-label leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
+                            className="flex items-center gap-1 font-mono text-label leading-none tabular-nums text-muted-foreground select-none transition-transform duration-150 group-hover/row:-translate-x-8"
                           >
                             <span className="text-status-open">✓</span>
                             {shippedCount} shipped
@@ -1498,7 +1498,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     {workspace.notification_count > 0 && (
                       <Badge
                         variant="outline"
-                        className="text-caption tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px] transition-opacity group-hover/row:opacity-0"
+                        className="text-caption tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px] transition-opacity duration-150 group-hover/row:opacity-0"
                       >
                         {workspace.notification_count}
                       </Badge>
@@ -1565,7 +1565,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       // Fade out with the diff stats on hover so the issue
                       // chip never collides with the ahead/behind glyphs as
                       // it slides left to clear the archive button.
-                      "transition-opacity group-hover/row:opacity-0",
+                      "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_behind > 0 && (
                         <span className="text-warning/80">↓{workspace.git_behind}</span>
@@ -1582,7 +1582,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   {hasDiff && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums ml-auto",
-                      "transition-opacity group-hover/row:opacity-0",
+                      "transition-opacity duration-150 group-hover/row:opacity-0",
                     )}>
                       {workspace.git_additions > 0 && (
                         <span className="text-success/80">+{workspace.git_additions}</span>
@@ -1619,7 +1619,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       // would also watch layout properties, so every row in
                       // the sidebar scroller pays for hover work it never
                       // does.
-                      "transition-[transform,background-color,box-shadow] group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
+                      "transition-[transform,background-color,box-shadow] duration-150 group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
                     )}>
                       {workspace.notifications_muted && (
                         <Tooltip>
@@ -1659,7 +1659,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
             <Button
               variant="ghost"
               size="icon-xs"
-              className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
+              className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity duration-150 bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
               onClick={(e) => {
                 e.stopPropagation();
                 if (e.shiftKey && canDelete) {

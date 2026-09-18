@@ -25,7 +25,7 @@ export function CollapsibleSection({
   return (
     <div className="py-1">
       <button
-        className="flex w-full items-center justify-between px-1.5 py-1 hover:bg-accent/30 rounded-sm transition-colors"
+        className="flex w-full items-center justify-between px-1.5 py-1 hover:bg-accent/30 rounded-sm transition-colors duration-150"
         onClick={() => setOpen(!open)}
       >
         <div className="flex items-center gap-1.5 min-w-0">

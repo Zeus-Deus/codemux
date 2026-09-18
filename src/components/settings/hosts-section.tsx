@@ -366,7 +366,7 @@ export function HostsSection() {
                   type="button"
                   onClick={() => setSelectedId(host.id)}
                   className={cn(
-                    "group/host flex w-full items-center gap-2.5 rounded-md px-2.5 h-8 text-left text-body transition-colors",
+                    "group/host flex w-full items-center gap-2.5 rounded-md px-2.5 h-8 text-left text-body transition-colors duration-150",
                     selectedId === host.id
                       ? "bg-muted text-foreground"
                       : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
@@ -375,7 +375,7 @@ export function HostsSection() {
                   <span
                     aria-hidden
                     className={cn(
-                      "size-1.5 shrink-0 rounded-full transition-colors",
+                      "size-1.5 shrink-0 rounded-full transition-colors duration-150",
                       isOnline ? "bg-success" : "bg-muted-foreground/40",
                     )}
                   />
@@ -411,7 +411,7 @@ export function HostsSection() {
                       type="button"
                       onClick={() => setDraftKind(kind.id)}
                       className={cn(
-                        "flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors",
+                        "flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors duration-150",
                         draftKind === kind.id
                           ? "border-status-remote/40 bg-status-remote/10 text-foreground"
                           : "border-border/60 bg-background/40 text-muted-foreground hover:border-border hover:bg-muted/30 hover:text-foreground",
@@ -758,7 +758,7 @@ function AutoInstallToggle() {
     setEnabled(localStorage.getItem(AUTO_INSTALL_KEY) === "1");
   }, []);
   return (
-    <label className="mt-3 flex items-start gap-2 text-body-sm text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors">
+    <label className="mt-3 flex items-start gap-2 text-body-sm text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors duration-150">
       <input
         type="checkbox"
         className="mt-0.5 size-3 shrink-0 accent-foreground"

@@ -368,7 +368,7 @@ function ConflictRow({
           </span>
         )}
       </span>
-      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
         <button
           type="button"
           onClick={onView}

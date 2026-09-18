@@ -107,21 +107,21 @@ const LABEL =
 
 const FIELD =
   `w-full rounded-md border-0 bg-muted/60 px-2.5 py-2 ${tzRowTitle} text-foreground ` +
-  "outline-none transition-colors placeholder:text-muted-foreground/70 " +
-  "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+  "outline-none transition-colors duration-150 placeholder:text-muted-foreground/70 " +
+  "focus-visible:ring-2 focus-visible:ring-ring/60";
 
 /** A chip on the card background — the description's helpers. */
 const CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-sm border-0 bg-card px-2.5 " +
   `${tzMeta} text-foreground/90 transition-colors hover:bg-accent/50 ` +
-  "disabled:opacity-50 outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+  "disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-ring/60";
 
 /** A chip that is an invitation rather than an action. */
 const DASHED_CHIP =
   "inline-flex h-[24px] shrink-0 items-center gap-1 rounded-full border border-dashed " +
   `border-border px-2.5 ${tzBody} text-muted-foreground transition-colors ` +
   "hover:border-foreground/40 hover:text-foreground outline-none " +
-  "focus-visible:ring-[1.5px] focus-visible:ring-ring/60";
+  "focus-visible:ring-2 focus-visible:ring-ring/60";
 
 export interface CreatePrFormProps {
   cwd: string;
@@ -284,7 +284,7 @@ export function CreatePrForm({
             type="button"
             aria-label="Back"
             onClick={onCancel}
-            className="-ml-1 flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            className="-ml-1 flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
           >
             <ChevronLeft className="size-3.5" />
           </button>
@@ -409,7 +409,7 @@ export function CreatePrForm({
               <button
                 type="button"
                 aria-label={`Remove ${reviewer}`}
-                className="text-muted-foreground transition-colors hover:text-foreground"
+                className="text-muted-foreground transition-colors duration-150 hover:text-foreground"
                 onClick={() => setReviewers(reviewers.filter((r) => r !== reviewer))}
               >
                 <X className="size-3" />
@@ -432,7 +432,7 @@ export function CreatePrForm({
             <input
               ref={reviewerInputRef}
               aria-label="Reviewer handle"
-              className={`h-[24px] w-28 rounded-full border-0 bg-muted/60 px-2.5 ${tzBody} outline-none focus-visible:ring-[1.5px] focus-visible:ring-ring/60`}
+              className={`h-[24px] w-28 rounded-full border-0 bg-muted/60 px-2.5 ${tzBody} outline-none focus-visible:ring-2 focus-visible:ring-ring/60`}
               value={reviewerDraft}
               placeholder="handle"
               onChange={(event) => setReviewerDraft(event.target.value)}

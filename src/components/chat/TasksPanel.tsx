@@ -159,7 +159,7 @@ export function TasksPanel({
                 <li
                   key={task.task_id}
                   className={cn(
-                    "flex items-start gap-2 rounded-lg px-2 py-1.5 transition-colors",
+                    "flex items-start gap-2 rounded-lg px-2 py-1.5 transition-colors duration-150",
                     task.status === "in_progress" && "bg-status-working/8",
                     task.status === "completed" && "bg-status-open/8",
                     task.status === "pending" && "hover:bg-surface-2",
@@ -242,7 +242,7 @@ export function TasksPaneActions({ snapshot }: { snapshot: TasksSnapshot }) {
         type="button"
         onClick={handleCopy}
         data-testid="tasks-copy"
-        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground"
+        className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-label font-semibold text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground"
       >
         {copied ? (
           <Check className="size-3" aria-hidden />

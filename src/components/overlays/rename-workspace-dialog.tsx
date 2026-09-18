@@ -215,7 +215,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <button
               type="button"
               aria-label="Close rename workspace dialog"
-              className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/65 transition-colors duration-150 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
             >
               <X className="size-3" />
             </button>
@@ -260,7 +260,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
                     setTouched(true);
                     inputRef.current?.focus();
                   }}
-                  className="flex size-[18px] shrink-0 items-center justify-center rounded-sm text-muted-foreground/65 transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="flex size-[18px] shrink-0 items-center justify-center rounded-sm text-muted-foreground/65 transition-colors duration-150 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
                 >
                   <X className="size-3" />
                 </button>
@@ -301,7 +301,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
             <DialogClose asChild>
               <button
                 type="button"
-                className="flex h-[31px] shrink-0 items-center rounded-lg px-[13px] text-body font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex h-[31px] shrink-0 items-center rounded-lg px-[13px] text-body font-medium text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
               >
                 Cancel
               </button>
@@ -311,7 +311,7 @@ function RenameWorkspaceDialogBody({ workspaceId }: { workspaceId: string }) {
               disabled={submitting}
               aria-disabled={!isDirty || isError}
               className={cn(
-                "flex h-[31px] shrink-0 items-center gap-2 rounded-lg pr-3 pl-[13px] text-body font-semibold tracking-[-0.005em] transition-[background-color,opacity,filter] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                "flex h-[31px] shrink-0 items-center gap-2 rounded-lg pr-3 pl-[13px] text-body font-semibold tracking-[-0.005em] transition-[background-color,opacity,filter] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
                 isDirty && !isError
                   // The ink on the brand accent comes from the palette, not
                   // from a literal: a light theme darkens its ember, and

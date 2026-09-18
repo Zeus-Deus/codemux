@@ -103,7 +103,7 @@ export function CustomizeFooterDialog({
             Keep your frequent destinations close. Changes save on this device.
           </DialogDescription>
         </DialogHeader>
-        <div className="thin-scrollbar min-h-0 overflow-y-auto px-6 py-4">
+        <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 overflow-y-auto px-6 py-4">
           <h3 className={cn(eyebrowVariants(), "mb-3")}>
             Pinned destinations · {pins.length}
           </h3>
