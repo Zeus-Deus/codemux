@@ -845,6 +845,28 @@ try {
       await openSettings();
     },
   );
+  await step("09-classic-interface-keeps-plugin-panels-and-core-terminal", async () => {
+    // Use the same persisted native setting as Settings → Interface, then
+    // restart the owned app. No client store or plugin capability is overridden.
+    await native("set_agent_chat_enabled", { enabled: false });
+    await restartNativeSession();
+    assert.equal((await native("get_feature_flags")).enable_agent_chat, false);
+    await openSettings();
+    await hasText("Project Brief");
+    await click('[aria-label="Close settings"]');
+    await checkCoreTerminal();
+    assert.equal(await script(`return document.querySelectorAll(${JSON.stringify(composer)}).length`), 0);
+    assert.equal(await script(`return document.querySelectorAll('[aria-label="Close add-on accessory"]').length`), 0);
+    await openCommand("Open Project Brief");
+    await hasText("Branch: main");
+    await clickText("Add to draft", `document.querySelector('section[aria-label="Add-on view"]')`);
+    await hasText("No chat composer is available");
+    await capture("09-classic-interface-panel-without-composer");
+    await native("set_agent_chat_enabled", { enabled: true });
+    await restartNativeSession();
+    await element(composer);
+    await openSettings();
+  });
   await step("10-remove-packages-keeps-core-usable", async () => {
     for (const title of [
       "Issue Companion",
