@@ -161,7 +161,7 @@ function DeckTabChip({
       className={cn(
         // No border, no shadow, no ring — the fill is the whole signal.
         "group/tab relative flex h-[26px] shrink-0 items-center rounded-md",
-        "transition-colors duration-[120ms]",
+        "transition-colors duration-100",
         active
           ? "bg-surface-3 font-semibold text-foreground"
           : "font-medium text-foreground/42 hover:bg-surface-2 hover:text-foreground/70",
@@ -181,7 +181,7 @@ function DeckTabChip({
           active ? "pr-[20px]" : "pr-[9px]",
         )}
       >
-        <Icon className="size-[13px] shrink-0" strokeWidth={1.6} />
+        <Icon className="size-[13px] shrink-0" />
         <span className="max-w-[140px] truncate">{tab.label}</span>
         {badge}
       </button>
@@ -196,7 +196,7 @@ function DeckTabChip({
           className={cn(
             // Overlays the tab's right edge rather than taking a layout
             // slot, so revealing it on hover doesn't shove the row around.
-            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-sm transition-opacity",
+            "absolute right-[3px] top-1/2 flex size-[15px] -translate-y-1/2 items-center justify-center rounded-sm transition-opacity duration-150",
             "hover:bg-surface-3 focus-visible:opacity-100",
             active
               ? "opacity-50 hover:opacity-100"
@@ -208,7 +208,7 @@ function DeckTabChip({
                 ),
           )}
         >
-          <X className="size-[10px]" strokeWidth={1.8} />
+          <X className="size-[10px]" />
         </button>
     </div>
   );
@@ -429,13 +429,14 @@ export const PaneTabStrip = memo(function PaneTabStrip({
 
   const tabRun = (
     <>
-      {/* `no-scrollbar` is referenced elsewhere in the tree but never
-          defined, so the hiding is spelled out here rather than trusted.
+      {/* `no-scrollbar` is a real utility (shadcn/tailwind.css, imported by
+          globals.css) — an earlier comment here claimed it was undefined,
+          which is what spawned three hand-rolled copies of it.
           `scroll-px-4` keeps a tab scrolled into view clear of the fade. */}
       <div
         ref={setScrollerNode}
         data-testid="right-panel-tabs-scroll"
-        className="relative flex min-w-0 scroll-px-4 items-center overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="no-scrollbar relative flex min-w-0 scroll-px-4 items-center overflow-x-auto"
         style={mask ? { maskImage: mask, WebkitMaskImage: mask } : undefined}
       >
         <div
@@ -467,9 +468,9 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             type="button"
             aria-label="Open pane"
             data-testid="right-panel-add-pane"
-            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-[120ms] hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
+            className="ml-[3px] flex size-[24px] shrink-0 items-center justify-center rounded-md text-foreground/42 transition-colors duration-100 hover:bg-surface-2 hover:text-foreground data-[state=open]:bg-surface-3 data-[state=open]:text-foreground"
           >
-            <Plus className="size-[13px]" strokeWidth={1.7} />
+            <Plus className="size-[13px]" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -488,7 +489,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
               className="h-[30px] rounded-md px-[9px] text-body font-medium"
               onClick={surface.onOpen}
             >
-              <surface.icon className="size-[14px]" strokeWidth={1.5} />
+              <surface.icon className="size-[14px]" />
               {surface.label}
             </DropdownMenuItem>
           ))}
@@ -497,7 +498,7 @@ export const PaneTabStrip = memo(function PaneTabStrip({
             className="h-[30px] rounded-md px-[9px] text-body font-medium"
             onClick={onOpenFile}
           >
-            <Search className="size-[14px]" strokeWidth={1.5} />
+            <Search className="size-[14px]" />
             Open file…
             {openFileKeys && (
               <DropdownMenuShortcut className="font-mono text-caption">

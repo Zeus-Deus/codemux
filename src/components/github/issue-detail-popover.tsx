@@ -66,8 +66,8 @@ export function IssueDetailPopover({
           type="button"
           className={cn(
             variant === "chip"
-              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors hover:bg-muted"
-              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors",
+              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-label font-semibold text-foreground/80 transition-colors duration-150 hover:bg-muted"
+              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors duration-150",
           )}
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); }}
@@ -174,7 +174,7 @@ export function IssueDetailPopover({
                   className="w-full justify-center"
                   onClick={() => openUrl(fullIssue.url)}
                 >
-                  <ExternalLink className="h-3 w-3" />
+                  <ExternalLink className="size-3" />
                   Open on {provider.name}
                 </Button>
               )}

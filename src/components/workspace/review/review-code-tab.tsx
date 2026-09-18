@@ -492,7 +492,7 @@ export function ReviewCodeTab({
               data-testid={`diff-layout-${id}`}
               onClick={() => pickLayout(id)}
               className={cn(
-                "rounded-sm px-2.5 py-1 capitalize transition-colors",
+                "rounded-sm px-2.5 py-1 capitalize transition-colors duration-150",
                 tzMetaNum,
                 layout === id
                   ? "bg-background font-semibold text-foreground"
@@ -509,7 +509,7 @@ export function ReviewCodeTab({
           data-testid="whitespace-toggle"
           onClick={() => pickWhitespace(!hideWhitespace)}
           className={cn(
-            "rounded-sm border-0 px-2.5 py-1 transition-colors",
+            "rounded-sm border-0 px-2.5 py-1 transition-colors duration-150",
             tzMetaNum,
             hideWhitespace
               ? "bg-accent-ember/15 font-semibold text-accent-ember"

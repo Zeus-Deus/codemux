@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 import { findingTone, workflowAgentTone } from "./workflow-tone";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** A label "looks like a file path" when it has no spaces and ends in a
  *  short extension — good enough to gate the "Open {file}" affordance
@@ -92,12 +93,12 @@ export function WorkflowAgentDetail({
         )}
       >
         {running ? (
-          <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+          <span className="flex size-5 shrink-0 items-center justify-center">
             {/* One agent, so this orb can carry its actual activity. */}
             <AgentOrb size={20} {...subagentOrbActivity(agent)} aria-hidden />
           </span>
         ) : (
-          <CheckCircle2 className={cn("h-4 w-4 shrink-0", tone.text)} strokeWidth={1.8} aria-hidden />
+          <CheckCircle2 className={cn("size-4 shrink-0", tone.text)} aria-hidden />
         )}
         <div className="min-w-0 flex-1">
           <div className="truncate font-mono text-body-sm font-semibold text-foreground">{label}</div>
@@ -195,8 +196,8 @@ export function WorkflowAgentDetail({
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-1.5 font-mono text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+    <Eyebrow className="mb-1.5">
       {children}
-    </div>
+    </Eyebrow>
   );
 }

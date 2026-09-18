@@ -85,11 +85,11 @@ export function PermissionModePicker({
             aria-label={iconOnly ? `Access: ${label}` : undefined}
             title={iconOnly ? `Access: ${label}` : undefined}
           >
-            <Lock className="h-4 w-4" />
+            <Lock className="size-4" />
             {!iconOnly && (
               <span className="max-w-[140px] truncate">{label}</span>
             )}
-            <ChevronDown className="h-3 w-3 opacity-50" />
+            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent
@@ -121,7 +121,7 @@ export function PermissionModePicker({
                     </div>
                     <Check
                       className={cn(
-                        "h-3.5 w-3.5 text-muted-foreground",
+                        "size-3.5 text-muted-foreground",
                         current === mode.value ? "opacity-100" : "opacity-0",
                       )}
                     />

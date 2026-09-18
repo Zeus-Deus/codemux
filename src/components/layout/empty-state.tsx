@@ -27,9 +27,9 @@ export function EmptyState() {
         <button
           type="button"
           onClick={() => openProject()}
-          className="w-[400px] rounded-lg border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-colors hover:border-foreground/30 hover:bg-card"
+          className="w-[400px] rounded-lg border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-colors duration-150 hover:border-foreground/30 hover:bg-card"
         >
-          <FolderOpen className="h-8 w-8 mx-auto mb-3 text-muted-foreground" />
+          <FolderOpen className="size-8 mx-auto mb-3 text-muted-foreground" />
           <div className="text-body font-medium text-foreground">
             Open Project
           </div>
@@ -49,7 +49,7 @@ export function EmptyState() {
             className="text-muted-foreground hover:text-foreground"
             onClick={() => setShowNewProjectScreen(true)}
           >
-            <Plus className="h-3.5 w-3.5 mr-1" />
+            <Plus className="size-3.5 mr-1" />
             New Project
           </Button>
         </div>

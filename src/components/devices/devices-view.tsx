@@ -45,7 +45,7 @@ export function DevicesView() {
           className="text-muted-foreground hover:text-foreground hover:bg-surface-2"
           onClick={() => setShowDevices(false)}
         >
-          <ArrowLeft className="h-4 w-4" />
+          <ArrowLeft className="size-4" />
         </Button>
         <span className="text-body font-bold tracking-tight text-foreground">
           Devices

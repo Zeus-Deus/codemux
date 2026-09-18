@@ -151,7 +151,7 @@ export function NewProjectScreen() {
           size="sm"
           onClick={() => setShowNewProjectScreen(false)}
         >
-          <ArrowLeft className="h-4 w-4 mr-1" />
+          <ArrowLeft className="size-4 mr-1" />
           Back
         </Button>
       </div>
@@ -181,7 +181,7 @@ export function NewProjectScreen() {
                 disabled={loading}
                 className="shrink-0"
               >
-                <FolderOpen className="h-4 w-4" />
+                <FolderOpen className="size-4" />
               </Button>
             </div>
           </div>
@@ -199,7 +199,7 @@ export function NewProjectScreen() {
                     setError(null);
                   }}
                   className={cn(
-                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors",
+                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors duration-150",
                     selected
                       ? "border-foreground/50 bg-surface-2"
                       : "border-border/50 hover:border-border hover:bg-accent/30",
@@ -207,7 +207,7 @@ export function NewProjectScreen() {
                 >
                   <option.icon
                     className={cn(
-                      "h-6 w-6",
+                      "size-6",
                       selected ? "text-foreground" : "text-muted-foreground",
                     )}
                   />
@@ -281,9 +281,9 @@ export function NewProjectScreen() {
               <button
                 type="button"
                 onClick={() => setError(null)}
-                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors"
+                className="shrink-0 rounded-sm p-0.5 text-destructive/70 hover:text-destructive transition-colors duration-150"
               >
-                <X className="h-3.5 w-3.5" />
+                <X className="size-3.5" />
               </button>
             </div>
           )}
@@ -305,7 +305,7 @@ export function NewProjectScreen() {
               </span>
             )}
             <Button onClick={handleCreate} disabled={loading} size="sm" className="bg-foreground text-background hover:bg-foreground/90">
-              {loading && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              {loading && <Loader2 className="size-3 animate-spin mr-1" />}
               {loading
                 ? mode === "clone"
                   ? "Cloning..."

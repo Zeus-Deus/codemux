@@ -173,7 +173,7 @@ export function ComposerFooter({
           aria-expanded={attachOpen}
           title="Attach (file, folder, mode, …)"
         >
-          <Plus className="h-4 w-4" strokeWidth={2.25} />
+          <Plus className="size-4" />
         </button>
       )}
 
@@ -220,7 +220,7 @@ export function ComposerFooter({
                   : undefined
               }
               className={cn(
-                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors",
+                "inline-flex h-[34px] shrink-0 items-center gap-1.5 rounded-lg border-0 px-2.5 text-body font-medium leading-none transition-colors duration-150",
                 modelLeafLabel && "w-[34px] justify-center px-0",
                 tasks.running
                   ? "bg-status-working/8 text-status-working hover:bg-status-working/15"
@@ -307,12 +307,12 @@ export function ComposerFooter({
             className={cn(
               ROUND_CONTROL,
               "bg-destructive/90 text-destructive-foreground shadow-xs shadow-destructive/25",
-              "transition-all duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
+              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
             aria-label="Stop"
             title="Stop"
           >
-            <Square className="h-3 w-3" fill="currentColor" />
+            <Square className="size-3" fill="currentColor" />
           </button>
         ) : (
           <button
@@ -322,13 +322,13 @@ export function ComposerFooter({
             className={cn(
               ROUND_CONTROL,
               "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
-              "transition-all duration-150 hover:scale-105 hover:bg-primary active:scale-100",
+              "transition-[transform,background-color,color] duration-150 hover:scale-105 hover:bg-primary active:scale-100",
               "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
             )}
             aria-label="Send"
             title="Send"
           >
-            <ArrowUp className="h-4 w-4" strokeWidth={2.25} />
+            <ArrowUp className="size-4" />
           </button>
         )}
       </div>

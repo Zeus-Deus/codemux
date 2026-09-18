@@ -2710,7 +2710,7 @@ export function Composer({
             // (drag-state border + tinted background, plus focus-within
             // border shift) so the compositor only has work to do on
             // those changes.
-            "transition-[box-shadow,border-color,background-color]",
+            "transition-[box-shadow,border-color,background-color] duration-150",
             "focus-within:bg-[color-mix(in_oklab,var(--muted)_60%,var(--background))] focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
@@ -2917,7 +2917,7 @@ export function Composer({
                     onClick={onContinueRun}
                     className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-label text-warning hover:bg-warning/25"
                   >
-                    <RotateCw className="h-3 w-3" aria-hidden />
+                    <RotateCw className="size-3" aria-hidden />
                     <span>Continue run</span>
                   </button>
                 )}
@@ -3020,8 +3020,7 @@ export function Composer({
                   // (next two utilities) so only the textarea's scrollbar
                   // is ever visible to the user.
                   "overflow-y-auto",
-                  "[scrollbar-width:none]",
-                  "[&::-webkit-scrollbar]:hidden",
+                  "no-scrollbar",
                 )}
               >
                 {highlightSegments.map((seg, i) => {

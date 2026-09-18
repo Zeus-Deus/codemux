@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { sessionProviderLabel } from "@/lib/agent-chat/session-mentions";
 import { utilitySummaryFallbackLabel } from "@/lib/agent-chat/session-handoff";
 import type { Attachment, AttachmentKind } from "@/stores/agent-chat-store";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** The named tint a chip wears. The name is the contract — the classes
  *  are the current expression of it — so a chip's identity survives a
@@ -296,7 +297,7 @@ export function AttachmentChip({
     >
       {metadata.isLoading ? (
         <Loader2
-          className="h-3 w-3 animate-spin"
+          className="size-3 animate-spin"
           aria-hidden
           data-testid="attachment-chip-spinner"
         />
@@ -314,7 +315,7 @@ export function AttachmentChip({
           aria-label={`Expand ${metadata.label}`}
           title="Click to expand"
           data-testid="attachment-chip-preview-trigger"
-          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-1 focus-visible:ring-current"
+          className="flex min-w-0 cursor-zoom-in items-center gap-2 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-current"
         >
           <img
             src={previewUrl}
@@ -327,7 +328,7 @@ export function AttachmentChip({
           <span className="truncate max-w-[200px]">{metadata.label}</span>
         </button>
       ) : (
-        <Icon className="h-3 w-3" aria-hidden />
+        <Icon className="size-3" aria-hidden />
       )}
       {!showPreview && (
         <span className="truncate max-w-[200px]">{metadata.label}</span>
@@ -335,12 +336,9 @@ export function AttachmentChip({
       {attachment.kind === "session" &&
         !metadata.isLoading &&
         metadata.handoffKind && (
-          <span
-            className="border-l border-current/15 pl-1.5 text-micro font-medium uppercase tracking-[0.08em] opacity-70"
-            data-testid="session-handoff-kind"
-          >
+          <Eyebrow className="border-l border-current/15 pl-1.5 opacity-70" data-testid="session-handoff-kind">
             {metadata.handoffKind === "summary" ? "Summary" : "Direct"}
-          </span>
+          </Eyebrow>
         )}
       {lineCountLabel && (
         <span className="text-caption opacity-70" aria-hidden>
@@ -381,7 +379,7 @@ export function AttachmentChip({
           title={expandTooltip}
           data-testid="attachment-chip-expand"
         >
-          <ChevronsUpDown className="h-2.5 w-2.5" />
+          <ChevronsUpDown className="size-3" />
         </button>
       )}
       <button
@@ -393,7 +391,7 @@ export function AttachmentChip({
         className="ml-0.5 rounded-sm p-0.5 hover:bg-surface-2"
         aria-label={`Remove ${metadata.label}`}
       >
-        <X className="h-2.5 w-2.5" />
+        <X className="size-3" />
       </button>
       {/* Portals its content, so it costs the chip row no layout. */}
       {showPreview && previewUrl && (

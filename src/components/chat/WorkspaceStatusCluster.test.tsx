@@ -185,7 +185,6 @@ describe("WorkspaceStatusCluster", () => {
     const icon = chip.querySelector("svg");
     expect(icon).toHaveClass("text-status-open");
     expect(icon).toHaveAttribute("width", "14");
-    expect(icon).toHaveAttribute("stroke-width", "1.75");
     await userEvent.click(chip);
     expect(mocks.openUrl).toHaveBeenCalledWith(
       "https://github.com/org/repo/pull/172",
@@ -351,7 +350,6 @@ describe("WorkspaceStatusCluster", () => {
     expect(indicator.querySelector(".cm-blink")).not.toBeInTheDocument();
     const icon = indicator.querySelector("svg");
     expect(icon).toHaveClass("size-3.5");
-    expect(icon).toHaveAttribute("stroke-width", "1.75");
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
     await userEvent.click(indicator);
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);

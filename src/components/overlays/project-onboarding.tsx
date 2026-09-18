@@ -52,6 +52,7 @@ import {
 } from "@/tauri/commands";
 import type { WorktreeInfo, DetectedSetup, BranchDetail } from "@/tauri/types";
 import { randomUUID } from "@/lib/uuid";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -346,7 +347,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
             aria-label="Skip onboarding"
             className="absolute top-4 right-4 z-10 text-muted-foreground hover:text-foreground"
           >
-            <X className="h-4 w-4" />
+            <X className="size-4" />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">Skip (Esc)</TooltipContent>
@@ -369,7 +370,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       key={wt.path}
                       className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-label font-mono text-muted-foreground max-w-[180px]"
                     >
-                      <GitBranch className="h-3 w-3 shrink-0" />
+                      <GitBranch className="size-3 shrink-0" />
                       <span className="truncate">{branch}</span>
                     </span>
                   );
@@ -399,9 +400,9 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           <div className="w-full max-w-3xl space-y-6">
             {/* ── Header ── */}
             <div className="space-y-1.5">
-              <p className="text-label uppercase tracking-wide text-muted-foreground">
+              <Eyebrow>
                 Step {step === "workspace" ? 1 : 2} of 2
-              </p>
+              </Eyebrow>
               <h1 className="text-2xl font-semibold text-foreground">
                 {step === "workspace" && "Create your first workspace"}
                 {step === "setup" && "Setup script"}
@@ -432,7 +433,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                 {/* Branch name — editable, with inline base branch picker */}
                 <div className="rounded-md border border-border/60 bg-card/40 px-3 py-1.5 text-body">
                   <div className="flex items-center gap-2 text-muted-foreground">
-                    <GitBranch className="h-3.5 w-3.5 shrink-0" />
+                    <GitBranch className="size-3.5 shrink-0" />
                     <input
                       type="text"
                       value={generatedBranch}
@@ -458,7 +459,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     className="bg-foreground text-background hover:bg-foreground/90"
                   >
                     Continue
-                    <ChevronRight className="h-4 w-4" />
+                    <ChevronRight className="size-4" />
                   </Button>
                 </div>
               </div>
@@ -476,18 +477,18 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                           key={action.id}
                           type="button"
                           onClick={() => toggleAction(action.id)}
-                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors cursor-pointer"
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-muted/40 transition-colors duration-150 cursor-pointer"
                         >
                           <div
                             className={cn(
-                              "h-4 w-4 rounded-sm border shrink-0 flex items-center justify-center transition-colors",
+                              "size-4 rounded-sm border shrink-0 flex items-center justify-center transition-colors duration-150",
                               action.checked
                                 ? "bg-primary border-primary"
                                 : "border-border",
                             )}
                           >
                             {action.checked && (
-                              <Check className="h-3 w-3 text-primary-foreground" />
+                              <Check className="size-3 text-primary-foreground" />
                             )}
                           </div>
                           <div className="flex flex-col min-w-0">
@@ -576,10 +577,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   open={teardownOpen}
                   onOpenChange={setTeardownOpen}
                 >
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors py-1">
+                  <CollapsibleTrigger className="flex items-center gap-1.5 text-label text-muted-foreground/80 hover:text-muted-foreground transition-colors duration-150 py-1">
                     <ChevronDown
                       className={cn(
-                        "h-3 w-3 transition-transform duration-200",
+                        "size-3 transition-transform duration-150",
                         !teardownOpen && "-rotate-90",
                       )}
                     />
@@ -601,7 +602,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     variant="outline"
                     onClick={() => setStep("workspace")}
                   >
-                    <ChevronLeft className="h-4 w-4" />
+                    <ChevronLeft className="size-4" />
                     Back
                   </Button>
                   <div className="flex items-center gap-2">
@@ -618,7 +619,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       className="bg-foreground text-background hover:bg-foreground/90"
                     >
                       {isCreating ? "Creating..." : "Create workspace"}
-                      <ChevronRight className="h-4 w-4" />
+                      <ChevronRight className="size-4" />
                     </Button>
                   </div>
                 </div>

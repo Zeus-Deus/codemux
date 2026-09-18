@@ -108,7 +108,7 @@ export function PrTabStrip({
               }}
               className="hidden size-3 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground group-hover:flex"
             >
-              <X className="size-2.5" />
+              <X className="size-3" />
             </button>
           </span>
         );
@@ -120,7 +120,7 @@ export function PrTabStrip({
             type="button"
             aria-label="Open another pull request"
             data-testid="pr-tab-add"
-            className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
           >
             <Plus className="size-3" />
           </button>
@@ -181,7 +181,7 @@ export function PrTabStrip({
         aria-label="Open in browser"
         data-testid="pr-tab-open-browser"
         onClick={onOpenInBrowser}
-        className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+        className="flex size-5 shrink-0 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
       >
         <ExternalLink className="size-3" />
       </button>

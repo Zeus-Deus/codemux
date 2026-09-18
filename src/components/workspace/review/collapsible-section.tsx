@@ -25,12 +25,12 @@ export function CollapsibleSection({
   return (
     <div className="py-1">
       <button
-        className="flex w-full items-center justify-between px-1.5 py-1 hover:bg-accent/30 rounded-sm transition-colors"
+        className="flex w-full items-center justify-between px-1.5 py-1 hover:bg-accent/30 rounded-sm transition-colors duration-150"
         onClick={() => setOpen(!open)}
       >
         <div className="flex items-center gap-1.5 min-w-0">
           <ChevronRight
-            className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+            className={`size-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
           />
           <span className={cn("font-medium text-foreground truncate", tzRowTitle)}>
             {label}

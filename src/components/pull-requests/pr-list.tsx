@@ -272,7 +272,7 @@ export function PrList({
             applyPendingOrder();
             onRefresh();
           }}
-          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+          className="flex size-6 items-center justify-center rounded-sm text-muted-foreground transition-colors duration-150 hover:bg-accent/50 hover:text-foreground"
         >
           <RefreshCw className={cn("size-3.5", isLoading && "animate-spin")} />
         </button>
@@ -298,7 +298,7 @@ export function PrList({
               type="button"
               data-testid="pr-state-filter"
               className={cn(
-                "flex shrink-0 items-center gap-1 rounded-md bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors hover:bg-accent/50",
+                "flex shrink-0 items-center gap-1 rounded-md bg-muted/40 px-2.5 py-1.5 text-foreground/90 transition-colors duration-150 hover:bg-accent/50",
                 tzBody,
               )}
             >
@@ -377,7 +377,7 @@ export function PrList({
                   </span>
                   <span
                     className={cn(
-                      "font-mono font-semibold uppercase tracking-[0.07em] text-muted-foreground",
+                      "font-mono font-semibold uppercase tracking-eyebrow text-muted-foreground",
                       tzEyebrow,
                     )}
                   >
@@ -518,7 +518,7 @@ function GroupHeader({ id, count }: { id: "review" | "yours"; count: number }) {
       )}
       <span
         className={cn(
-          "font-mono font-semibold uppercase tracking-[0.07em] text-foreground/80",
+          "font-mono font-semibold uppercase tracking-eyebrow text-foreground/80",
           tzEyebrow,
         )}
       >

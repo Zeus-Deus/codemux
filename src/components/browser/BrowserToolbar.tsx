@@ -55,7 +55,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         aria-label="Back"
         onClick={() => runBrowserNav(cmdId, "back").catch(console.error)}
       >
-        <ArrowLeft className="h-3 w-3" />
+        <ArrowLeft className="size-3" />
       </Button>
       <Button
         variant="ghost"
@@ -63,7 +63,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         aria-label="Forward"
         onClick={() => runBrowserNav(cmdId, "forward").catch(console.error)}
       >
-        <ArrowRight className="h-3 w-3" />
+        <ArrowRight className="size-3" />
       </Button>
       <Button
         variant="ghost"
@@ -72,9 +72,9 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         onClick={() => runBrowserNav(cmdId, "reload").catch(console.error)}
       >
         {navigating || loading ? (
-          <Loader2 className="h-3 w-3 animate-spin" />
+          <Loader2 className="size-3 animate-spin" />
         ) : (
-          <RotateCw className="h-3 w-3" />
+          <RotateCw className="size-3" />
         )}
       </Button>
       <Button
@@ -85,7 +85,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         className={inspectorActive ? "bg-primary/20 text-primary" : ""}
         onClick={onInspectorToggle}
       >
-        <Crosshair className="h-3 w-3" />
+        <Crosshair className="size-3" />
       </Button>
       <Input
         value={urlInput}

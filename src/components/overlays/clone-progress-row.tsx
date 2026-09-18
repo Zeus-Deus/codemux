@@ -26,7 +26,7 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
       <div className="flex items-center justify-between gap-2 text-label">
         <span className="font-medium text-foreground">{phase}…</span>
         {determinate && (
-          <span className="font-mono text-muted-foreground">{percent}%</span>
+          <span className="font-mono text-muted-foreground tabular-nums">{percent}%</span>
         )}
       </div>
 
@@ -37,7 +37,7 @@ export function CloneProgressRow({ progress, className }: CloneProgressRowProps)
             style={{ width: `${percent}%` }}
           />
         ) : (
-          <div className="h-full w-full animate-pulse rounded-full bg-foreground/40" />
+          <div className="h-full w-full motion-safe:animate-pulse rounded-full bg-foreground/40" />
         )}
       </div>
 

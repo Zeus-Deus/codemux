@@ -31,7 +31,6 @@ export function VideoViewer({ filePath }: Props) {
           <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-muted/40">
             <VideoOff
               className="size-[18px] text-muted-foreground/60"
-              strokeWidth={1.5}
             />
           </div>
           <p className="text-label font-medium text-foreground">Can’t play this video</p>
@@ -66,7 +65,6 @@ export function VideoViewer({ filePath }: Props) {
         >
           <LoaderCircle
             className="size-[18px] animate-spin text-white/60"
-            strokeWidth={1.5}
             aria-label="Loading video"
           />
         </div>
@@ -82,7 +80,7 @@ export function VideoViewer({ filePath }: Props) {
         onLoadedData={markReady}
         onCanPlay={markReady}
         onError={() => setState("error")}
-        className={`max-h-full max-w-full rounded-md bg-black shadow-[0_16px_48px_rgba(0,0,0,0.45)] ring-1 ring-white/10 transition-opacity duration-200 ${
+        className={`max-h-full max-w-full rounded-md bg-black shadow-[0_16px_48px_rgba(0,0,0,0.45)] ring-1 ring-white/10 transition-opacity duration-250 ${
           state === "ready" ? "opacity-100" : "opacity-0"
         }`}
       >

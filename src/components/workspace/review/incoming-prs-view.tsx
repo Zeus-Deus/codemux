@@ -66,11 +66,11 @@ function ChecksIndicator({ status }: { status: string | null }) {
   if (!status) return null;
   switch (status) {
     case "success":
-      return <Check className="h-3 w-3 text-success" />;
+      return <Check className="size-3 text-success" />;
     case "failure":
-      return <X className="h-3 w-3 text-danger" />;
+      return <X className="size-3 text-danger" />;
     case "pending":
-      return <Circle className="h-2.5 w-2.5 fill-warning text-warning" />;
+      return <Circle className="size-3 fill-warning text-warning" />;
     default:
       return null;
   }
@@ -139,7 +139,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
 
   return (
     <div
-      className="group px-2.5 py-2 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
+      className="group px-2.5 py-2 hover:bg-muted/40 rounded-sm transition-colors duration-150 cursor-default min-w-0"
       onClick={openOnPage}
     >
       <div className="flex items-center gap-1.5 min-w-0 h-[22px]">
@@ -218,7 +218,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
               onClick={handleView}
               title={`View on ${provider.name}`}
             >
-              <ExternalLink className="h-3 w-3 mr-0.5" />
+              <ExternalLink className="size-3 mr-0.5" />
               View
             </Button>
             {pr.head_branch && (
@@ -233,7 +233,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) 
                 onClick={handleCheckout}
                 title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
               >
-                <GitBranch className="h-3 w-3 mr-0.5" />
+                <GitBranch className="size-3 mr-0.5" />
                 {existingWs ? "Switch" : "Checkout"}
               </Button>
             )}
@@ -344,7 +344,7 @@ export function IncomingPrsView({
               tzBody,
             )}
           >
-            <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
+            <AlertCircle className="size-3 mt-0.5 shrink-0" />
             <span className="break-words">{error}</span>
           </div>
         )}
@@ -352,7 +352,7 @@ export function IncomingPrsView({
         {loading && (
           <div className="flex flex-col gap-2 px-2 py-2">
             {[1, 2, 3].map((i) => (
-              <div key={i} className="animate-pulse flex gap-2">
+              <div key={i} className="motion-safe:animate-pulse flex gap-2">
                 <div className="h-3 w-6 bg-muted rounded-sm" />
                 <div className="h-3 flex-1 bg-muted rounded-sm" />
                 <div className="h-3 w-12 bg-muted rounded-sm" />
@@ -363,7 +363,7 @@ export function IncomingPrsView({
 
         {!loading && !error && prs.length === 0 && (
           <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
-            <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
+            <GitPullRequest className="size-7 opacity-25 mb-2" />
             <p className={tzBody}>No open {provider.nounPlural}</p>
           </div>
         )}
@@ -382,7 +382,7 @@ export function IncomingPrsView({
             {prs.length >= 50 && (
               <button
                 className={cn(
-                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors text-left",
+                  "text-muted-foreground/60 hover:text-foreground px-2.5 py-1.5 mt-1 transition-colors duration-150 text-left",
                   tzMeta,
                 )}
                 onClick={() => {

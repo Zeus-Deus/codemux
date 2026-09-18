@@ -140,7 +140,7 @@ export const ToolCallCard = memo(function ToolCallCard({
             isDenied && "opacity-50",
           )}
         >
-          <Icon className="h-3 w-3" strokeWidth={1.5} aria-hidden />
+          <Icon className="size-3" aria-hidden />
         </span>
         <div
           className={cn(
@@ -152,7 +152,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         </div>
         {glyph && (
           <glyph.Icon
-            className={cn("h-3.5 w-3.5 shrink-0", glyph.className)}
+            className={cn("size-3.5 shrink-0", glyph.className)}
             aria-hidden
           />
         )}
@@ -164,9 +164,9 @@ export const ToolCallCard = memo(function ToolCallCard({
             aria-label={expanded ? "Collapse" : "Expand"}
           >
             {expanded ? (
-              <ChevronDown className="h-3 w-3" />
+              <ChevronDown className="size-3" />
             ) : (
-              <ChevronRight className="h-3 w-3" />
+              <ChevronRight className="size-3" />
             )}
           </button>
         )}
@@ -313,7 +313,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
                 size="sm"
               >
                 Allow always
-                <ChevronDown className="ml-1 h-3 w-3" aria-hidden />
+                <ChevronDown className="ml-1 size-3" aria-hidden />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="text-label">

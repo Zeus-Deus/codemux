@@ -28,6 +28,8 @@ import { listen } from "@tauri-apps/api/event";
 
 import { SkillRow } from "./skill-row";
 import { SkillViewModal } from "./skill-view-modal";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
+import { cn } from "@/lib/utils";
 
 interface Props {
   /** Active workspace's project root (or null when no project is
@@ -173,7 +175,7 @@ export function SkillsSection({ projectRoot }: Props) {
           aria-label="Refresh skills"
         >
           <RotateCw
-            className={loading ? "mr-1 h-3 w-3 animate-spin" : "mr-1 h-3 w-3"}
+            className={loading ? "mr-1 size-3 animate-spin" : "mr-1 size-3"}
             aria-hidden
           />
           Refresh
@@ -233,7 +235,7 @@ export function SkillsSection({ projectRoot }: Props) {
           data-testid="skills-loading"
           className="flex items-center gap-2 py-6 text-body text-muted-foreground"
         >
-          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+          <Loader2 className="size-4 animate-spin" aria-hidden />
           Loading skills…
         </div>
       ) : skills.length === 0 && !error ? (
@@ -295,7 +297,7 @@ function ConflictsSection({
   return (
     <section data-testid="skills-conflicts">
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-label font-semibold uppercase tracking-wider text-status-working dark:text-status-working">
+        <h3 className={cn(eyebrowVariants(), "text-status-working dark:text-status-working")}>
           Naming conflicts
         </h3>
         <span className="text-caption text-muted-foreground/70">
@@ -366,7 +368,7 @@ function ConflictRow({
           </span>
         )}
       </span>
-      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
         <button
           type="button"
           onClick={onView}
@@ -405,7 +407,7 @@ function SkillsGroupSection({
   return (
     <section>
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-label font-semibold uppercase tracking-wider text-muted-foreground">
+        <h3 className={cn(eyebrowVariants())}>
           {heading}
         </h3>
         <span className="text-caption text-muted-foreground/70">

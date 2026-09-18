@@ -116,7 +116,7 @@ export function CloneDialog() {
                 className="shrink-0"
                 onClick={handlePickDir}
               >
-                <FolderOpen className="h-3.5 w-3.5" />
+                <FolderOpen className="size-3.5" />
               </Button>
             </div>
           </div>
@@ -151,7 +151,7 @@ export function CloneDialog() {
               disabled={!url.trim() || cloning}
               className="bg-foreground text-background hover:bg-foreground/90"
             >
-              {cloning && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              {cloning && <Loader2 className="size-3 animate-spin mr-1" />}
               {cloning ? "Cloning..." : "Clone"}
             </Button>
           </div>

@@ -53,7 +53,7 @@ export function PaneActionButton({
             size === "titlebar"
               ? "size-7 rounded-[min(var(--radius-md),12px)]"
               : "size-6 rounded-md",
-            "transition-colors duration-[120ms]",
+            "transition-colors duration-100",
             "disabled:pointer-events-none disabled:opacity-40",
             active
               ? "bg-surface-3 text-foreground"
@@ -64,7 +64,6 @@ export function PaneActionButton({
         >
           <Icon
             className={size === "titlebar" ? "size-3.5" : "size-[13px]"}
-            strokeWidth={size === "titlebar" ? 2 : 1.6}
           />
         </button>
       </TooltipTrigger>

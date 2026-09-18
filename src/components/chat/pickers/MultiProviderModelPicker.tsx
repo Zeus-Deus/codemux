@@ -43,6 +43,7 @@ import type {
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER, leafModelName } from "./footer-trigger";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -455,7 +456,7 @@ export function MultiProviderModelPicker({
           // controls — not per-pill borders — carry the separation.
           className={cn(FOOTER_TRIGGER, "min-w-[60px] shrink gap-1.5")}
         >
-          <ProviderLogo provider={provider} className="h-4 w-4 shrink-0" />
+          <ProviderLogo provider={provider} className="size-4 shrink-0" />
           <span className="max-w-[180px] truncate">
             {leafLabel ? (
               leafModelName(triggerLabel)
@@ -472,8 +473,7 @@ export function MultiProviderModelPicker({
             )}
           </span>
           <ChevronDown
-            className="-mx-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
-            strokeWidth={2.25}
+            className="-mx-0.5 size-3.5 shrink-0 opacity-70"
           />
         </button>
       </PopoverTrigger>
@@ -533,7 +533,7 @@ export function MultiProviderModelPicker({
                   OpenCode federates ~150 connected-upstream models on
                   a fully-configured machine — without a scrollbar
                   half the list is unreachable). */}
-              <CommandList className="max-h-none flex-1 overflow-y-auto [&]:[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
+              <CommandList className="max-h-none flex-1 overflow-y-auto thin-scrollbar [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
                 <CommandEmpty>
                   <ModelListEmptyState
                     railKey={railKey}
@@ -663,21 +663,21 @@ function ProviderRail({
                     aria-label="Favorites"
                     aria-pressed={selected === "favorites"}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
                       "hover:bg-muted",
                       selected === "favorites" &&
                         "bg-background text-foreground shadow-sm",
                     )}
                   >
                     <Star
-                      className="h-5 w-5 shrink-0 text-status-working"
+                      className="size-5 shrink-0 text-status-working"
                       fill="currentColor"
                     />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
                   Favorites
-                  <span className="ml-2 text-muted-foreground">
+                  <span className="ml-2 text-muted-foreground tabular-nums">
                     {favoritesCount}
                   </span>
                 </TooltipContent>
@@ -718,7 +718,7 @@ function ProviderRail({
                     aria-label={p.label}
                     aria-pressed={isSelected}
                     className={cn(
-                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors",
+                      "relative flex aspect-square w-full items-center justify-center rounded-sm transition-colors duration-150",
                       "hover:bg-muted",
                       isSelected && "bg-background text-foreground shadow-sm",
                       isUnavailable &&
@@ -728,7 +728,7 @@ function ProviderRail({
                   >
                     <ProviderLogo
                       provider={p.kind}
-                      className="h-5 w-5 shrink-0"
+                      className="size-5 shrink-0"
                     />
                   </button>
                 </TooltipTrigger>
@@ -736,7 +736,7 @@ function ProviderRail({
                   <div className="flex items-center gap-2">
                     <span>{p.label}</span>
                     {!isUnavailable && count > 0 ? (
-                      <span className="text-muted-foreground">{count}</span>
+                      <span className="text-muted-foreground tabular-nums">{count}</span>
                     ) : null}
                   </div>
                   {parsedError ? (
@@ -839,7 +839,7 @@ function ModelRow({
           <span className="truncate">{model.label}</span>
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-label text-muted-foreground/70">
-          <ProviderLogo provider={provider} className="h-2.5 w-2.5 shrink-0" />
+          <ProviderLogo provider={provider} className="size-2.5 shrink-0" />
           <span className="truncate" title={subtitle}>
             {subtitle}
           </span>
@@ -855,13 +855,9 @@ function ModelRow({
         </kbd>
       ) : null}
       {model.is_free ? (
-        <span
-          data-testid="model-row-free-badge"
-          className="mt-0.5 shrink-0 self-start rounded-sm border border-status-open/35 bg-status-open/15 px-1 py-px text-micro font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
-          aria-label="Free model"
-        >
+        <Eyebrow className="mt-0.5 shrink-0 self-start rounded-sm border border-status-open/35 bg-status-open/15 px-1 py-px leading-none text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open" data-testid="model-row-free-badge" aria-label="Free model">
           Free
-        </span>
+        </Eyebrow>
       ) : null}
       <button
         type="button"
@@ -889,14 +885,14 @@ function ModelRow({
           // Always visible (not hover-revealed): a dim outline star on
           // every row keeps the favoriting affordance discoverable and
           // the row layout stable.
-          "shrink-0 rounded-sm p-1 transition-colors hover:bg-accent",
+          "shrink-0 rounded-sm p-1 transition-colors duration-150 hover:bg-accent",
           isFavorite
             ? "text-status-working"
             : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",
         )}
       >
         <Star
-          className="h-3.5 w-3.5"
+          className="size-3.5"
           fill={isFavorite ? "currentColor" : "none"}
         />
       </button>

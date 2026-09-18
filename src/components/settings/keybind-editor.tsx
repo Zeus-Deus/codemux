@@ -21,6 +21,7 @@ import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
 } from "@/stores/synced-settings-store";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 /** How long to wait for a keypress before showing the timeout hint */
 const RECORDING_TIMEOUT_MS = 4000;
@@ -158,14 +159,14 @@ export function KeybindEditor() {
             onClick={resetAll}
             className="shrink-0"
           >
-            <RotateCcw className="h-3.5 w-3.5" />
+            <RotateCcw className="size-3.5" />
             Reset all
           </Button>
         )}
       </div>
 
       <div className="relative mb-6">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/60 pointer-events-none" />
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground/60 pointer-events-none" />
         <Input
           placeholder="Search shortcuts…"
           value={search}
@@ -222,8 +223,11 @@ function CategoryGroup({
 }) {
   return (
     <Collapsible defaultOpen className="border-b border-border/40 last:border-b-0 pb-1.5">
-      <CollapsibleTrigger className="group flex items-center gap-1.5 w-full pt-5 pb-2 text-caption font-semibold uppercase tracking-[0.14em] text-muted-foreground/60 hover:text-foreground transition-colors">
-        <ChevronDown className="h-3 w-3 transition-transform duration-150 group-data-[state=closed]:-rotate-90 opacity-60" />
+      <CollapsibleTrigger className={cn(
+          eyebrowVariants(),
+          "group flex items-center gap-1.5 w-full pt-5 pb-2 hover:text-foreground transition-colors duration-150",
+        )}>
+        <ChevronDown className="size-3 transition-transform duration-150 group-data-[state=closed]:-rotate-90 opacity-60" />
         {CATEGORY_LABELS[category]}
       </CollapsibleTrigger>
       <CollapsibleContent>
@@ -266,7 +270,7 @@ function KeybindRow({
   const isUnbound = activeKeys === "";
 
   return (
-    <div className="group/kb flex items-start justify-between gap-4 py-2 px-2 -mx-2 rounded-md hover:bg-muted/30 transition-colors">
+    <div className="group/kb flex items-start justify-between gap-4 py-2 px-2 -mx-2 rounded-md hover:bg-muted/30 transition-colors duration-150">
       <div className="space-y-0.5 min-w-0 flex-1 pt-1">
         <span className="text-body text-foreground">{entry.label}</span>
         {entry.description && (
@@ -329,10 +333,10 @@ function KeybindRow({
         {entry.isCustom && !isRecording && (
           <button
             onClick={onReset}
-            className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity p-1 rounded-sm hover:bg-muted/60"
+            className="opacity-0 group-hover/kb:opacity-100 text-muted-foreground/70 hover:text-foreground transition-opacity duration-150 p-1 rounded-sm hover:bg-muted/60"
             title="Reset to default"
           >
-            <RotateCcw className="h-3 w-3" />
+            <RotateCcw className="size-3" />
           </button>
         )}
 
@@ -341,9 +345,9 @@ function KeybindRow({
           ref={badgeRef}
           onClick={isRecording ? undefined : onStartRecording}
           className={cn(
-            "text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-all",
+            "text-body-sm font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-[color,background-color,border-color] duration-150",
             isRecording
-              ? "border-primary/40 bg-primary/10 text-primary-foreground animate-pulse cursor-default"
+              ? "border-primary/40 bg-primary/10 text-primary-foreground motion-safe:animate-pulse cursor-default"
               : isUnbound
                 ? "text-muted-foreground/50 border-dashed border-border bg-transparent hover:border-border hover:bg-muted/40 cursor-pointer"
                 : entry.isCustom

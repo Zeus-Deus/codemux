@@ -123,7 +123,7 @@ function AccountValue({ account }: { account: string }) {
       onClick={() => setRevealed((v) => !v)}
       title={revealed ? "Hide account" : "Click to reveal account"}
       aria-label={revealed ? "Hide account name" : "Reveal account name"}
-      className="font-mono text-body-sm text-foreground/90 rounded-sm px-1 -mx-1 hover:bg-muted/60 transition-colors"
+      className="font-mono text-body-sm text-foreground/90 rounded-sm px-1 -mx-1 hover:bg-muted/60 transition-colors duration-150"
     >
       {revealed ? account : maskAccount(account)}
     </button>
@@ -180,11 +180,11 @@ function ProviderRow({
             onClick={() => setOpen((v) => !v)}
             aria-label={open ? "Hide details" : "Show details"}
             aria-expanded={open}
-            className="shrink-0 rounded-sm p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors"
+            className="shrink-0 rounded-sm p-0.5 text-muted-foreground/60 hover:text-foreground hover:bg-muted/60 transition-colors duration-150"
           >
             <ChevronRight
               className={cn(
-                "size-3.5 transition-transform",
+                "size-3.5 transition-transform duration-150",
                 open && "rotate-90",
               )}
               aria-hidden
@@ -335,7 +335,7 @@ function CustomHostsEditor() {
             size="icon-xs"
             onClick={() => handleRemove(host)}
             aria-label={`Remove ${host}`}
-            className="shrink-0 opacity-0 group-hover/host:opacity-100 focus-visible:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            className="shrink-0 opacity-0 group-hover/host:opacity-100 focus-visible:opacity-100 transition-opacity duration-150 hover:bg-destructive/10 hover:text-destructive"
           >
             <X className="size-3.5" />
           </Button>

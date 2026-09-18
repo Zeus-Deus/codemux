@@ -88,12 +88,13 @@ import {
   useFrozenActiveDraftRow,
   useVisibleSidebarDraftCount,
 } from "./sidebar-draft-block";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
- *  the divider. Matches the card wrapper's `duration-200`. */
+ *  the divider. Matches the card wrapper's `duration-250`. */
 const SETTLE_ANIM_MS = 200;
 /** How long the rise-in ease on a just-settled / just-un-settled row is kept
  *  before the marker clears. */
@@ -414,18 +415,18 @@ function ShelfHeader({
       onClick={onToggle}
       aria-expanded={!collapsed}
       aria-label={`${label} (${count})`}
-      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3 outline-none"
+      className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
       <ChevronRight
         aria-hidden="true"
         className={cn(
-          "size-2.5 shrink-0 text-muted-foreground/70 transition-transform duration-150",
+          "size-3 shrink-0 text-muted-foreground/70 transition-transform duration-150",
           !collapsed && "rotate-90",
         )}
       />
-      <span className="font-mono text-caption uppercase tracking-[0.13em] text-muted-foreground/70">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       {showCount && (
         <span className="font-mono text-caption tabular-nums text-muted-foreground/70">
           ({count})
@@ -808,7 +809,7 @@ const SnoozeRow = memo(function SnoozeRow({
         />
         <AlarmClock
           aria-hidden="true"
-          className="h-3 w-3 shrink-0 text-muted-foreground/60"
+          className="size-3 shrink-0 text-muted-foreground/60"
         />
         <span className="min-w-0 flex-1 truncate text-label font-medium text-muted-foreground">
           {workspace.title}
@@ -837,7 +838,7 @@ const SnoozeRow = memo(function SnoozeRow({
             "group-hover/snoozed:inline-flex group-focus-within/snoozed:inline-flex",
           )}
         >
-          <AlarmClock className="h-2.5 w-2.5" />
+          <AlarmClock className="size-3" />
           Wake now
         </button>
       </div>
@@ -1925,7 +1926,7 @@ export function SidebarInbox() {
                   </span>
                 </DropdownMenuItem>
               </div>
-              <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-1.5">
+              <div className="thin-scrollbar [scrollbar-gutter:stable] min-h-0 flex-1 overflow-y-auto p-1.5">
                 {projectGroups.map((group) => (
                   <ProjectFilterItem
                     key={group.projectPath}
@@ -2042,13 +2043,13 @@ export function SidebarInbox() {
             key={pw.id}
             className={cn(
               "flex items-center gap-2 px-2 py-2 text-body",
-              pw.status === "failed" ? "opacity-60" : "animate-pulse opacity-70",
+              pw.status === "failed" ? "opacity-60" : "motion-safe:animate-pulse opacity-70",
             )}
           >
             {pw.status === "creating" ? (
-              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
             ) : (
-              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+              <AlertCircle className="size-3.5 shrink-0 text-destructive" />
             )}
             <span className="truncate text-label text-muted-foreground">
               {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}

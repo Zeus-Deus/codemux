@@ -201,16 +201,15 @@ export function ReasoningPicker({
               <Zap
                 aria-hidden
                 data-testid="fast-mode-indicator"
-                className="h-3.5 w-3.5 fill-current text-foreground/80"
-                strokeWidth={1.5}
+                className="size-3.5 fill-current text-foreground/80"
               />
             ) : reasoningLabel ? (
-              <Brain className="h-4 w-4" />
+              <Brain className="size-4" />
             ) : null}
             {!(iconOnly && (fastMode || reasoningLabel)) && (
               <span className="max-w-[200px] truncate">{triggerLabel}</span>
             )}
-            <ChevronDown className="h-3 w-3 opacity-50" />
+            <ChevronDown className="size-3 opacity-50" />
           </button>
         </PopoverTrigger>
         <PopoverContent
@@ -262,7 +261,7 @@ export function ReasoningPicker({
                       </div>
                       <Check
                         className={cn(
-                          "h-3.5 w-3.5 text-muted-foreground",
+                          "size-3.5 text-muted-foreground",
                           currentEffort === level
                             ? "opacity-100"
                             : "opacity-0",
@@ -300,7 +299,7 @@ export function ReasoningPicker({
                       </span>
                       <Check
                         className={cn(
-                          "h-3.5 w-3.5 text-muted-foreground",
+                          "size-3.5 text-muted-foreground",
                           currentContextWindow === option.value
                             ? "opacity-100"
                             : "opacity-0",
@@ -336,7 +335,7 @@ export function ReasoningPicker({
                   </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
+                      "size-3.5 text-muted-foreground",
                       fastMode ? "opacity-0" : "opacity-100",
                     )}
                   />
@@ -354,7 +353,7 @@ export function ReasoningPicker({
                   </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
+                      "size-3.5 text-muted-foreground",
                       fastMode ? "opacity-100" : "opacity-0",
                     )}
                   />

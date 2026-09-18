@@ -37,6 +37,7 @@ import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useHostsStore } from "@/stores/hosts-store";
 
 import { remoteProjectName } from "./use-device-cards";
+import { eyebrowVariants } from "@/components/ui/eyebrow";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -436,7 +437,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors"
+        className="flex w-full items-center gap-1 text-body-sm text-muted-foreground/75 hover:text-foreground transition-colors duration-150"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />
@@ -652,7 +653,7 @@ function SummaryRow({
 }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-[68px] shrink-0 text-label uppercase tracking-wider text-muted-foreground/55">
+      <dt className={cn(eyebrowVariants(), "w-[68px] shrink-0")}>
         {label}
       </dt>
       <dd

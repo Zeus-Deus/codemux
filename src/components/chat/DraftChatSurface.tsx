@@ -1245,7 +1245,6 @@ function DraftPendingConversation({
             <span className="flex w-[29px] shrink-0 justify-center">
               <LoaderCircle
                 className="h-[15px] w-[15px] animate-spin text-accent-ember"
-                strokeWidth={1.6}
                 aria-hidden
               />
             </span>

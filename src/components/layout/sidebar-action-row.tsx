@@ -121,7 +121,7 @@ export function SidebarActionRow() {
           onClick={() => setShowCommandPalette(true)}
           className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-md border border-border/60 bg-surface-1 px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
         >
-          <SearchIcon className="h-3.5 w-3.5 shrink-0" />
+          <SearchIcon className="size-3.5 shrink-0" />
           <span className="flex-1 text-left text-label">Search</span>
           {paletteKeys && (
             <kbd className="rounded-sm border border-border/60 px-1 py-px font-mono text-caption">

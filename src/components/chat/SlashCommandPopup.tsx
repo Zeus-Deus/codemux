@@ -265,12 +265,12 @@ export function SlashCommandPopup({
                         <span
                           className={cn(
                             item.stacked &&
-                              "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/35",
+                              "flex size-7 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/35",
                           )}
                         >
                         <Icon
                           className={cn(
-                            "h-3.5 w-3.5 shrink-0",
+                            "size-3.5 shrink-0",
                             // Per-item override (e.g. green for open
                             // issues) wins; otherwise default muted.
                             item.iconClassName ?? "text-muted-foreground",

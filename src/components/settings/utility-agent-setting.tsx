@@ -20,6 +20,7 @@ import {
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 export function UtilityAgentSetting() {
   const settings = useSettingsStore((state) => state.settings);
@@ -83,19 +84,19 @@ export function UtilityAgentSetting() {
             <>
               <ProviderLogo
                 provider={auto.provider}
-                className="h-4 w-4 shrink-0"
+                className="size-4 shrink-0"
               />
               <div className="min-w-0 text-left leading-tight">
                 <div className="truncate text-label font-medium text-foreground">
                   {auto.model}
                 </div>
-                <div className="text-micro uppercase tracking-[0.1em] text-muted-foreground/65">
+                <Eyebrow>
                   {auto.effort
                     ? `${auto.effort} reasoning`
                     : "fast utility pass"}
-                </div>
+                </Eyebrow>
               </div>
-              <Sparkles className="ml-auto h-3.5 w-3.5 text-primary/70" />
+              <Sparkles className="ml-auto size-3.5 text-primary/70" />
             </>
           ) : (
             <span className="text-label text-warning">

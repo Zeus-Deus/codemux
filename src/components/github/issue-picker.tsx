@@ -5,6 +5,7 @@ import { CircleDot, CircleCheck, Search, Loader2 } from "lucide-react";
 import { listGithubIssues, listGithubIssuesByPath } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
 import { fuzzyMatch } from "@/lib/fuzzy";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 function IssueRow({
   issue,
@@ -22,7 +23,7 @@ function IssueRow({
       role="option"
       aria-selected={isFocused}
       className={cn(
-        "group/row flex items-center gap-2 px-2 py-1.5 cursor-pointer rounded-sm transition-colors",
+        "group/row flex items-center gap-2 px-2 py-1.5 cursor-pointer rounded-sm transition-colors duration-150",
         isFocused ? "bg-accent" : "hover:bg-accent/50",
       )}
       onClick={onSelect}
@@ -41,7 +42,7 @@ function IssueRow({
       </span>
       <span
         className={cn(
-          "text-muted-foreground text-caption shrink-0 select-none transition-opacity",
+          "text-muted-foreground text-caption shrink-0 select-none transition-opacity duration-150",
           isFocused ? "opacity-100" : "opacity-0 group-hover/row:opacity-100",
         )}
       >
@@ -54,9 +55,9 @@ function IssueRow({
 function SkeletonRow() {
   return (
     <div className="flex items-center gap-2 px-2 py-1.5">
-      <div className="size-3.5 rounded-full bg-muted animate-pulse shrink-0" />
-      <div className="h-3 w-8 rounded-sm bg-muted animate-pulse shrink-0" />
-      <div className="h-3 flex-1 rounded-sm bg-muted animate-pulse" />
+      <div className="size-3.5 rounded-full bg-muted motion-safe:animate-pulse shrink-0" />
+      <div className="h-3 w-8 rounded-sm bg-muted motion-safe:animate-pulse shrink-0" />
+      <div className="h-3 flex-1 rounded-sm bg-muted motion-safe:animate-pulse" />
     </div>
   );
 }
@@ -222,9 +223,9 @@ export function IssuePickerPanel({
     <div onKeyDown={handleKeyDown} data-testid="issue-picker-panel">
       {/* Header */}
       <div className="flex items-center justify-between px-3 pt-2.5 pb-1">
-        <span className="text-caption font-semibold uppercase tracking-wider text-muted-foreground">
+        <Eyebrow>
           Open Issues
-        </span>
+        </Eyebrow>
       </div>
 
       {/* Search */}
@@ -277,7 +278,7 @@ export function IssuePickerPanel({
         )}
         {serverSearching && displayIssues.length > 0 && (
           <div className="flex items-center justify-center gap-1.5 py-2 text-muted-foreground/60 text-micro">
-            <Loader2 className="h-3 w-3 animate-spin" />
+            <Loader2 className="size-3 animate-spin" />
             Searching...
           </div>
         )}

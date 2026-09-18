@@ -99,6 +99,7 @@ import {
   workspaceRowSubtitle,
   workspaceSearchText,
 } from "./command-palette-model";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   open: boolean;
@@ -812,7 +813,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
       <div className="relative">
         <CommandPrimitive.List
           ref={listRef}
-          className="thin-scrollbar max-h-[352px] scroll-py-8 overflow-x-hidden overflow-y-auto py-1.5 pr-0.5 pl-1.5"
+          className="thin-scrollbar [scrollbar-gutter:stable] max-h-[352px] scroll-py-8 overflow-x-hidden overflow-y-auto py-1.5 pr-0.5 pl-1.5"
         >
           {totalShown === 0 && (
             <div className="flex flex-col items-center gap-1.5 px-5 py-11 text-center">
@@ -945,7 +946,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
             <FooterHint keys={COMMAND_MODE_PREFIX} label="commands" />
             <FooterHint keys={PR_MODE_PREFIX.trim()} label="pull requests" />
             <span className="flex-1" />
-            <span className="font-mono text-caption text-muted-foreground/70">
+            <span className="font-mono text-caption text-muted-foreground/70 tabular-nums">
               {resultCountLabel(totalShown)}
             </span>
           </>
@@ -974,11 +975,11 @@ function GroupHeader({
         !first && "mt-2",
       )}
     >
-      <span className="font-mono text-caption tracking-[0.15em] text-muted-foreground/70 uppercase">
+      <Eyebrow>
         {label}
-      </span>
+      </Eyebrow>
       <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-caption text-muted-foreground/50">{count}</span>
+      <span className="font-mono text-caption text-muted-foreground/50 tabular-nums">{count}</span>
     </div>
   );
 }

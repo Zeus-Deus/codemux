@@ -74,7 +74,7 @@ const TreeNode = memo(function TreeNode({
   const children = dirContents.get(entry.path);
 
   const row =
-    "flex h-[22px] w-full items-center gap-1.5 rounded-sm pr-1.5 text-left text-label transition-colors duration-[120ms]";
+    "flex h-[22px] w-full items-center gap-1.5 rounded-sm pr-1.5 text-left text-label transition-colors duration-100";
 
   if (entry.is_dir) {
     return (
@@ -91,14 +91,14 @@ const TreeNode = memo(function TreeNode({
         >
           <ChevronRight
             className={cn(
-              "h-3 w-3 shrink-0 text-foreground/35 transition-transform",
+              "size-3 shrink-0 text-foreground/35 transition-transform duration-150",
               isExpanded && "rotate-90",
             )}
           />
-          <Folder className="h-3.5 w-3.5 shrink-0 text-primary/70" />
+          <Folder className="size-3.5 shrink-0 text-primary/70" />
           <span className="truncate">{entry.name}</span>
           {isLoading && (
-            <Loader2 className="ml-auto h-2.5 w-2.5 shrink-0 animate-spin text-foreground/35" />
+            <Loader2 className="ml-auto size-3 shrink-0 animate-spin text-foreground/35" />
           )}
         </button>
         {isExpanded && children && (
@@ -147,7 +147,7 @@ const TreeNode = memo(function TreeNode({
       onClick={() => onClickFile(entry.path)}
     >
       <span className="w-3 shrink-0" />
-      <FileTypeIcon filename={entry.name} className="h-3.5 w-3.5 shrink-0 opacity-80" />
+      <FileTypeIcon filename={entry.name} className="size-3.5 shrink-0 opacity-80" />
       <span className="truncate">{entry.name}</span>
     </button>
   );

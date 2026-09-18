@@ -79,6 +79,7 @@ import type {
   GitBranchInfo,
   MergeState,
 } from "@/tauri/types";
+import { Eyebrow } from "@/components/ui/eyebrow";
 
 /** Which file sections the panel lists. Driven by the deck's pane-bar
  *  filter; `"all"` is the historic behavior. */
@@ -176,7 +177,7 @@ function FileRow({
               onOpenDiff(file.path, staged);
             }
           }}
-          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors"
+          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors duration-150"
         >
           <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
             {meta.icon}
@@ -188,7 +189,7 @@ function FileRow({
             )}
           </span>
           {(file.additions > 0 || file.deletions > 0) && (
-            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
+            <span className="shrink-0 flex items-center gap-1 text-caption tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity duration-150">
               {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
               {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
@@ -242,10 +243,10 @@ function FileSection({
   if (files.length === 0) return null;
   return (
     <div className="mb-2">
-      <div className="flex items-center px-2.5 h-5 text-caption font-medium tracking-wider uppercase text-muted-foreground/60">
+      <Eyebrow className="flex items-center px-2.5 h-5">
         <span>{label}</span>
         <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
-      </div>
+      </Eyebrow>
       <div className="flex flex-col">
         {files.map((file) => (
           <FileRow
@@ -276,13 +277,13 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
         <span className="ml-auto flex items-center gap-1.5 tabular-nums text-caption">
           {behind > 0 && (
             <span className="flex items-center gap-0.5 text-warning">
-              <ArrowDown className="size-2.5" />
+              <ArrowDown className="size-3" />
               {behind}
             </span>
           )}
           {ahead > 0 && (
             <span className="flex items-center gap-0.5 text-info">
-              <ArrowUp className="size-2.5" />
+              <ArrowUp className="size-3" />
               {ahead}
             </span>
           )}
