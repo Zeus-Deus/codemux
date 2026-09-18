@@ -280,12 +280,14 @@ async fn run(root: &Path, cancel: &CancellationToken) -> Result<Vec<u8>> {
         "shallow",
         "--show-object-format",
         "--show-toplevel",
+        "--git-path",
+        "info/exclude",
     ]);
     let locations = capture(discover, cancel, deadline).await?;
     let locations = std::str::from_utf8(&locations)
         .map_err(|_| ProtocolError::invalid("Unsupported Git path encoding"))?;
     let locations: Vec<_> = locations.lines().collect();
-    if locations.len() != 5 || !matches!(locations[3], "sha1" | "sha256") {
+    if locations.len() != 6 || !matches!(locations[3], "sha1" | "sha256") {
         return Err(ProtocolError::invalid(
             "Unsupported Git repository metadata",
         ));
@@ -329,6 +331,22 @@ async fn run(root: &Path, cancel: &CancellationToken) -> Result<Vec<u8>> {
     tokio::fs::write(private.path().join("packed-refs"), refs)
         .await
         .map_err(snapshot_error)?;
+    // Repository-local excludes are inert data, including the shared exclude
+    // path returned for linked worktrees. Preserve them through the same
+    // bounded regular-file snapshot used for the index; never copy executable
+    // repository config, hooks, or filters into the private Git directory.
+    tokio::fs::create_dir(private.path().join("info"))
+        .await
+        .map_err(snapshot_error)?;
+    let mut exclude_limit = OUTPUT_LIMIT;
+    copy_metadata(
+        Path::new(locations[5]),
+        &private.path().join("info/exclude"),
+        &mut exclude_limit,
+        cancel,
+        deadline,
+    )
+    .await?;
     let mut head_limit = 4096;
     copy_metadata(
         &git_dir.join("HEAD"),
@@ -592,6 +610,33 @@ mod tests {
         std::fs::write(linked.join("untracked"), "fixture").unwrap();
         let summary = parse(&run(&linked, &CancellationToken::new()).await.unwrap()).unwrap();
         assert_eq!(summary.branch, None);
+        assert_eq!(summary.paths, ["untracked"]);
+    }
+    #[tokio::test]
+    async fn snapshots_preserve_repository_excludes_in_main_and_linked_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        repository(&repo);
+        std::fs::write(repo.join(".git/info/exclude"), ".mcp.json\n").unwrap();
+        std::fs::write(repo.join(".mcp.json"), "{}").unwrap();
+        std::fs::write(repo.join("untracked"), "fixture").unwrap();
+        let summary = parse(&run(&repo, &CancellationToken::new()).await.unwrap()).unwrap();
+        assert_eq!(summary.paths, ["untracked"]);
+        let linked = root.path().join("linked");
+        fixture_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(linked.join(".mcp.json"), "{}").unwrap();
+        std::fs::write(linked.join("untracked"), "fixture").unwrap();
+        let summary = parse(&run(&linked, &CancellationToken::new()).await.unwrap()).unwrap();
         assert_eq!(summary.paths, ["untracked"]);
     }
     #[cfg(unix)]

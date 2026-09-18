@@ -8,7 +8,10 @@
   "api": "^1.0.0",
   "entry": "plugin.js",
   "platforms": ["linux-x64", "windows-x64"],
-  "author": { "name": "CodeMux CI", "url": "https://codemux.org" },
+  "author": {
+    "name": "CodeMux CI",
+    "url": "https://codemux.org"
+  },
   "repository": "https://github.com/Zeus-Deus/codemux",
   "license": "MIT",
   "permissions": [],
@@ -20,6 +23,26 @@
       {
         "id": "block",
         "title": "Run isolated blocking fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "throw",
+        "title": "Run isolated throwing fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "promises",
+        "title": "Run isolated promise fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "recurse",
+        "title": "Run isolated recursion fixture",
+        "requiresWorkspace": true
+      },
+      {
+        "id": "allocate",
+        "title": "Run isolated allocation fixture",
         "requiresWorkspace": true
       }
     ],
