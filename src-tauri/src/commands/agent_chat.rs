@@ -479,10 +479,19 @@ pub fn agent_chat_create_pane<R: Runtime>(
     cwd: Option<String>,
     launch_mode: Option<crate::presets::LaunchMode>,
     thread_id: Option<String>,
+    select: Option<bool>,
 ) -> Result<String, String> {
     feature_flag_on(&observability)?;
-    let pane_id =
-        state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode, thread_id)?;
+    let pane_id = state
+        .create_or_reuse_agent_chat_pane_with_selection(
+            &workspace_id,
+            provider,
+            cwd,
+            launch_mode,
+            thread_id,
+            select.unwrap_or(true),
+        )?
+        .0;
     // Emit either way: reusing an existing pane still moves the active
     // pane, tab, surface and workspace onto it, and those moves reach the
     // clients only through this emit.
@@ -502,6 +511,7 @@ pub fn agent_chat_close_pane<R: Runtime>(
     state: State<'_, AppStateStore>,
     observability: State<'_, ObservabilityStore>,
     pane_id: String,
+    select: Option<bool>,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
     // Capture the chat session bound to this pane *before* the tree
@@ -532,7 +542,7 @@ pub fn agent_chat_close_pane<R: Runtime>(
     }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
-    let _ = state.close_pane(&pane_id);
+    let _ = state.close_pane_with_selection(&pane_id, select.unwrap_or(true));
     if let Some(pair) = chat_thread {
         shutdown_agent_chat_threads(&app, vec![pair]);
     }
@@ -4449,6 +4459,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     observability: State<'_, ObservabilityStore>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
+    select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
     let record = db
@@ -4466,13 +4477,16 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     let pane_id = if let Some(existing) = state.agent_chat_pane_id_for_thread(&thread_id) {
         existing
     } else {
-        let pane_id = state.create_agent_chat_pane(
-            &record.workspace_id,
-            Some(provider),
-            record.cwd.clone(),
-            Some(crate::presets::LaunchMode::NewTab),
-            Some(thread_id.clone()),
-        )?;
+        let pane_id = state
+            .create_or_reuse_agent_chat_pane_with_selection(
+                &record.workspace_id,
+                Some(provider),
+                record.cwd.clone(),
+                Some(crate::presets::LaunchMode::NewTab),
+                Some(thread_id.clone()),
+                select.unwrap_or(true),
+            )?
+            .0;
         pane_id.0
     };
 
@@ -4499,7 +4513,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     if let Some(tab_id) = tab_id {
         state.activate_tab(&workspace_id, &tab_id)?;
     }
-    if !state.activate_pane(&pane_id) {
+    if !state.activate_pane_with_selection(&pane_id, select.unwrap_or(true)) {
         return Err(format!("conversation_pane_not_found: {pane_id}"));
     }
     crate::state::emit_app_state(&app);
@@ -6330,7 +6344,8 @@ fn map_event_to_pane_status(
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
         // Ledger rows are the same: pure accounting, no liveness signal.
-        ProviderRuntimeEvent::ContextUsageUpdated { .. }
+        ProviderRuntimeEvent::ContextCompactionChanged { .. }
+        | ProviderRuntimeEvent::ContextUsageUpdated { .. }
         | ProviderRuntimeEvent::UsageRecorded { .. }
         // Plan quota is an account-level reading, not thread liveness.
         | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
@@ -6954,6 +6969,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ContextCompactionChanged { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }

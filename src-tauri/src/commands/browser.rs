@@ -9,6 +9,16 @@ pub(crate) fn create_browser_pane_impl<R: tauri::Runtime>(
     pane_id: String,
     url: Option<String>,
 ) -> Result<String, String> {
+    create_browser_pane_impl_with_selection(app, state, pane_id, url, true)
+}
+
+pub(crate) fn create_browser_pane_impl_with_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppStateStore,
+    pane_id: String,
+    url: Option<String>,
+    select: bool,
+) -> Result<String, String> {
     // Check if this workspace has a detached agent browser session to reconnect to.
     let workspace_id = state.workspace_id_for_pane(&pane_id);
     let agent_session = workspace_id
@@ -22,7 +32,8 @@ pub(crate) fn create_browser_pane_impl<R: tauri::Runtime>(
         agent_session.as_ref().and_then(|s| s.current_url.clone())
     };
 
-    let (new_pane_id, browser_id) = state.create_browser_pane(&pane_id, effective_url.as_deref())?;
+    let (new_pane_id, browser_id) =
+        state.create_browser_pane_with_selection(&pane_id, effective_url.as_deref(), select)?;
 
     // Attach the agent session to the new pane for reconnection.
     if let (Some(wid), Some(_)) = (&workspace_id, &agent_session) {
@@ -51,8 +62,9 @@ pub fn create_browser_pane<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     pane_id: String,
     url: Option<String>,
+    select: Option<bool>,
 ) -> Result<String, String> {
-    create_browser_pane_impl(app, &state, pane_id, url)
+    create_browser_pane_impl_with_selection(app, &state, pane_id, url, select.unwrap_or(true))
 }
 
 /// Host this workspace's agent browser session in the right-panel deck.
@@ -80,12 +92,12 @@ pub async fn dock_browser_in_right_panel<R: tauri::Runtime>(
     state: State<'_, AppStateStore>,
     agent_browser: State<'_, AgentBrowserManager>,
     workspace_id: String,
+    select: Option<bool>,
 ) -> Result<crate::state::AgentBrowserSession, String> {
     let placeholder_port = state
         .agent_browser_stream_port_for_workspace(&workspace_id)
         .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
-    let session_for_naming =
-        state.resolve_agent_browser_session(&workspace_id, placeholder_port);
+    let session_for_naming = state.resolve_agent_browser_session(&workspace_id, placeholder_port);
     let stream_port = agent_browser
         .allocate_port(&session_for_naming.cli_session_name)
         .await
@@ -96,7 +108,7 @@ pub async fn dock_browser_in_right_panel<R: tauri::Runtime>(
     if let Some(pane_id) = adopted_pane {
         // Best-effort: the pane may already be gone (closed in the same
         // tick). The session is docked either way.
-        let _ = state.close_pane(&pane_id.0);
+        let _ = state.close_pane_with_selection(&pane_id.0, select.unwrap_or(true));
     }
 
     crate::state::emit_app_state(&app);

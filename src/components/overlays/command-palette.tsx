@@ -34,6 +34,7 @@ import {
 } from "@/components/settings/theme-swatches";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import {
+  selectActiveWorkspaceId,
   useAppStore,
   useHomeDir,
   useProjectGroupedWorkspaces,
@@ -344,7 +345,7 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
   // path and targeted replacement on the delta path they keep their identity
   // unless their own domain moved.
   const workspacesSlice = useAppStore((s) => s.appState?.workspaces);
-  const activeWorkspaceId = useAppStore((s) => s.appState?.active_workspace_id);
+  const activeWorkspaceId = useAppStore((s) => selectActiveWorkspaceId(s));
   const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
   const homeDir = useHomeDir();
   const hosts = useHosts();

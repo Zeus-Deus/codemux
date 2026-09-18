@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tauri::Manager;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Point every state-dir resolver at `tmp` and defuse boot side effects a
@@ -54,6 +55,7 @@ fn isolate_env(tmp: &std::path::Path) {
     }
     std::env::set_var("CODEMUX_DISABLE_PTY_DAEMON", "1");
     std::env::set_var("CODEMUX_API_URL", "http://127.0.0.1:1");
+    std::env::set_var("SHELL", "/bin/true");
     std::env::remove_var("DISPLAY");
     std::env::remove_var("WAYLAND_DISPLAY");
 }
@@ -174,6 +176,33 @@ fn serve_web_remote_pair_connect_and_invoke_roundtrip() {
         .expect("ws-ticket response carries a ticket")
         .to_string();
 
+    let second_ticket: Value = client
+        .post(format!("{base}/api/ws-ticket"))
+        .header("Authorization", format!("Bearer {session_token}"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let second_url = format!(
+        "ws://127.0.0.1:{bound_port}/ws?ticket={}",
+        second_ticket["ticket"].as_str().unwrap()
+    );
+    let state = handle.state::<codemux_lib::state::AppStateStore>();
+    let phone = state
+        .create_empty_workspace_at_path(tmp.path().join("phone"))
+        .0;
+    let tablet = state
+        .create_empty_workspace_at_path(tmp.path().join("tablet"))
+        .0;
+    let desktop = state
+        .create_empty_workspace_at_path(tmp.path().join("desktop"))
+        .0;
+    let cwd = tmp.path().display().to_string();
+    let observability = handle.state::<codemux_lib::observability::ObservabilityStore>();
+    let mut flags = observability.feature_flags();
+    flags.enable_agent_chat = true;
+    observability.set_feature_flags(flags);
+
     // ── 5. GET /ws?ticket=… → upgrade, invoke get_app_state, expect ok frame. ──
     let ws_url = format!("ws://127.0.0.1:{bound_port}/ws?ticket={ticket}");
     tauri::async_runtime::block_on(async move {
@@ -216,8 +245,192 @@ fn serve_web_remote_pair_connect_and_invoke_roundtrip() {
                 }
             }
         }
+
+        for (index, cmd) in [
+            "bootstrap_session",
+            "get_feature_flags",
+            "db_get_all_settings",
+            "get_presets",
+            "get_home_dir",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = remote_invoke(&mut socket, 100 + index as u64, cmd, json!({})).await;
+            assert_eq!(response["t"], "ok", "remote bootstrap {cmd}: {response}");
+        }
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&second_url).await.unwrap();
+        assert_eq!(
+            remote_invoke(
+                &mut socket,
+                2,
+                "touch_workspace",
+                json!({"workspaceId": phone, "__remoteClientId": "phone-client"})
+            )
+            .await["t"],
+            "ok"
+        );
+        assert_eq!(
+            remote_invoke(
+                &mut second,
+                2,
+                "touch_workspace",
+                json!({"workspaceId": tablet, "__remoteClientId": "tablet-client"})
+            )
+            .await["t"],
+            "ok"
+        );
+        let snapshot = remote_invoke(&mut socket, 3, "get_app_state", json!({})).await;
+        assert_eq!(snapshot["data"]["active_workspace_id"], desktop);
+
+        // Workspace, pane and binding arrive in a single state mutation. The
+        // bridge must override a client's attempt to select the desktop too.
+        let created = remote_invoke(
+            &mut socket,
+            4,
+            "materialize_chat_workspace",
+            json!({
+                "cwd": cwd, "skipSetup": true, "select": true,
+                "initialChat": {"provider": "claude", "thread_id": "remote-first-turn"}
+            }),
+        )
+        .await;
+        assert_eq!(created["t"], "ok", "{created}");
+        let workspace_id = created["data"]["workspace_id"].as_str().unwrap();
+        let snapshot = remote_invoke(&mut second, 3, "get_app_state", json!({})).await;
+        assert_eq!(snapshot["data"]["active_workspace_id"], desktop);
+        let workspace = snapshot["data"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["workspace_id"] == workspace_id)
+            .unwrap();
+        assert_eq!(
+            workspace["surfaces"][0]["root"]["thread_id"],
+            "remote-first-turn"
+        );
+        let pane_id = workspace["surfaces"][0]["root"]["pane_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            remote_invoke(
+                &mut socket,
+                5,
+                "activate_pane",
+                json!({"paneId": pane_id, "select": true})
+            )
+            .await["t"],
+            "ok"
+        );
+        assert_eq!(
+            handle
+                .state::<codemux_lib::state::AppStateStore>()
+                .active_workspace_id(),
+            desktop
+        );
+
+        for (index, cmd) in [
+            "activate_workspace",
+            "dev_agent_chat_spawn_test_pane",
+            "quit_app",
+            "remove_worktree",
+            "future_command",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let denied = remote_invoke(
+                &mut socket,
+                10 + index as u64,
+                cmd,
+                json!({"workspaceId": phone}),
+            )
+            .await;
+            assert_eq!(denied["t"], "err", "{cmd}: {denied}");
+            assert!(denied["error"].as_str().unwrap().contains("not allowed"));
+        }
+        let denied = remote_invoke(
+            &mut socket,
+            20,
+            "close_workspace_with_worktree",
+            json!({"workspaceId": workspace_id, "deleteWorktree": true}),
+        )
+        .await;
+        assert_eq!(denied["t"], "err");
+        assert_eq!(
+            handle
+                .state::<codemux_lib::state::AppStateStore>()
+                .active_workspace_id(),
+            desktop
+        );
+
+        let closed = remote_invoke(
+            &mut socket,
+            22,
+            "close_workspace",
+            json!({"workspaceId": workspace_id, "forceDelete": false}),
+        )
+        .await;
+        assert_eq!(closed["t"], "ok", "{closed}");
+        assert_eq!(
+            handle
+                .state::<codemux_lib::state::AppStateStore>()
+                .active_workspace_id(),
+            desktop
+        );
+
+        // The desktop still owns the shared id, including subsequent switches.
+        handle
+            .state::<codemux_lib::state::AppStateStore>()
+            .activate_workspace(&tablet);
+        assert_eq!(
+            remote_invoke(
+                &mut socket,
+                21,
+                "touch_workspace",
+                json!({"workspaceId": phone})
+            )
+            .await["t"],
+            "ok"
+        );
+        let snapshot = remote_invoke(&mut second, 4, "get_app_state", json!({})).await;
+        assert_eq!(snapshot["data"]["active_workspace_id"], tablet);
+        socket.close(None).await.unwrap();
+        second.close(None).await.unwrap();
     });
 
     // Keep the backend alive for the whole test.
     drop(app);
+}
+
+async fn remote_invoke(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    cmd: &str,
+    args: Value,
+) -> Value {
+    socket
+        .send(Message::Text(
+            json!({"t":"invoke", "id":id, "cmd":cmd, "args":args})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = socket.next().await.unwrap().unwrap();
+            if let Message::Text(text) = frame {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == id && (frame["t"] == "ok" || frame["t"] == "err") {
+                    return frame;
+                }
+            }
+        }
+    })
+    .await
+    .expect("remote invoke response")
 }

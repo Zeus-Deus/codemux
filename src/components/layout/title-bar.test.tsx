@@ -106,7 +106,8 @@ vi.mock("@/hooks/use-preset-store", () => ({
   usePresetStore: () => presetSnapshot,
 }));
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useActiveWorkspace: () => makeWorkspace(),
   useActiveWorkspaceId: () => state.workspaceId,
   useAppStore: vi.fn((sel: (s: unknown) => unknown) =>

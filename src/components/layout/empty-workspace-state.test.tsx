@@ -40,7 +40,8 @@ vi.mock("@/tauri/commands", () => ({
 
 vi.mock("@/lib/toast", () => ({ toast: mockToast }));
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: (selector: (s: typeof mockState) => unknown) =>
     selector(mockState),
 }));

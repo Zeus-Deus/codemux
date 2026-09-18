@@ -39,7 +39,8 @@ vi.mock("@/lib/toast", () => ({
 // The pane snapshot carries its own cwd, so the fallback branch never
 // fires; still, stub the store hook so the selector doesn't reach into
 // a real (empty) app state.
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: vi.fn((selector: (s: unknown) => unknown) =>
     selector({
       appState: {

@@ -534,7 +534,8 @@ const HOME_APP_STATE = {
 const mockAppState: { appState: unknown; homeDir: string | null } =
   { ...HOME_APP_STATE };
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: Object.assign(
     vi.fn((selector) => selector(mockAppState)),
     { getState: () => mockAppState },

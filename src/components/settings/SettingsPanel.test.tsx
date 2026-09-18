@@ -29,7 +29,8 @@ vi.mock("@/stores/ui-store", () => ({
     }),
 }));
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
       appState: {

@@ -109,6 +109,7 @@ describe("invoke roundtrip", () => {
     const p = transport.invoke("get_app_state", { a: 1 });
     const sent = ws.lastSent();
     expect(sent).toMatchObject({ t: "invoke", cmd: "get_app_state", args: { a: 1 } });
+    expect(sent.args).toMatchObject({ __remoteClientId: expect.stringMatching(/^[a-zA-Z0-9-]+$/) });
     ws.recvText({ t: "ok", id: sent.id, data: { ok: true } });
     await expect(p).resolves.toEqual({ ok: true });
   });

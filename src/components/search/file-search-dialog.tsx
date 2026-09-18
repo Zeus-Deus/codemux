@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
-import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchFileNames } from "@/tauri/commands";
 import { openRightPanelDoc } from "@/lib/open-right-panel-doc";
 import { openEditorTab } from "@/lib/open-editor-tab";
@@ -74,7 +74,7 @@ export function FileSearchDialog() {
       // getState read is irrelevant.
       const appState = useAppStore.getState().appState;
       const ws = appState?.workspaces.find(
-        (w) => w.workspace_id === appState.active_workspace_id,
+        (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
       );
       if (!ws) return;
       try {

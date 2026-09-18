@@ -188,6 +188,7 @@ function renderList(
   messages: ChatViewItem[],
   extra?: {
     showThinking?: boolean;
+    compacting?: boolean;
     streaming?: boolean;
     sessionStartedAt?: number;
     stalled?: { silentForSecs: number } | null;
@@ -2352,4 +2353,14 @@ describe("MessageList reading-back signal", () => {
     view.unmount();
     expect(onReadingBackChange).toHaveBeenLastCalledWith(false);
   });
+});
+
+it("shows summarization instead of the live activity line", () => {
+  renderList([
+    { kind: "user_message", id: "compact-u", seq: 0, text: "go" },
+    readCall(1, "/a"),
+    { ...readCall(2, "/b"), tool_name: "Bash", status: "running" },
+  ], { streaming: true, compacting: true });
+  expect(screen.getByRole("status", { name: "Agent is summarizing context" })).toBeInTheDocument();
+  expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
 });

@@ -1853,3 +1853,71 @@ describe("findWorkspaceIdForPane", () => {
     expect(findWorkspaceIdForPane({ appState: fresh }, "pb2")).toBe("ws-B");
   });
 });
+
+describe("remote workspace selection", () => {
+  const remoteWindow = window as Window & { __CODEMUX_REMOTE__?: boolean };
+  beforeEach(() => {
+    remoteWindow.__CODEMUX_REMOTE__ = true;
+    localStorage.clear();
+    useAppStore.setState({
+      appState: null, remoteActiveWorkspaceId: null,
+      pendingActiveWorkspaceId: null, pendingActivationAt: null,
+      lastSeenRevision: 0, backendInstance: null, deltaBuffer: new Map(),
+      resyncInFlight: false, gapWindowId: 0,
+    });
+  });
+  afterEach(() => {
+    delete remoteWindow.__CODEMUX_REMOTE__;
+    localStorage.clear();
+  });
+  const snapshot = (active: string, revision: number, ids = ["desktop", "phone", "tablet"]) => ({
+    ...makeAppState(ids.map((workspace_id) => makeWs({ workspace_id }))),
+    active_workspace_id: active, snapshot_revision: revision, snapshot_instance: "host-1",
+  });
+  const selected = () => selectActiveWorkspaceId(useAppStore.getState());
+
+  it("seeds once, keeps the shared snapshot, and ignores desktop snapshots and deltas", () => {
+    useAppStore.getState().setAppState(snapshot("desktop", 1));
+    expect(selected()).toBe("desktop");
+    useAppStore.getState().setRemoteActiveWorkspace("phone");
+    useAppStore.getState().setAppState(snapshot("tablet", 2));
+    expect(selected()).toBe("phone");
+    expect(useAppStore.getState().appState?.active_workspace_id).toBe("tablet");
+    useAppStore.getState().applyAppStateDelta(3, {
+      domain: "active_workspace", workspace_id: "desktop", previous_workspace_id: "tablet",
+      last_visited_at: 100, previous_last_visited_at: 100, cleared_review_pane_ids: [],
+    }, "host-1");
+    expect(selected()).toBe("phone");
+    expect(useAppStore.getState().appState?.active_workspace_id).toBe("desktop");
+  });
+
+  it("restores locally persisted selection and keeps it across backend restarts", () => {
+    useAppStore.getState().setAppState(snapshot("desktop", 8));
+    useAppStore.getState().setRemoteActiveWorkspace("phone");
+    useAppStore.setState({ appState: null, remoteActiveWorkspaceId: null, lastSeenRevision: 0 });
+    useAppStore.getState().setAppState(snapshot("tablet", 9));
+    expect(selected()).toBe("phone");
+    useAppStore.getState().setAppState({ ...snapshot("desktop", 1), snapshot_instance: "host-2" });
+    expect(selected()).toBe("phone");
+  });
+
+  it("falls back only when its selected workspace disappears", () => {
+    useAppStore.getState().setAppState(snapshot("desktop", 1));
+    useAppStore.getState().setRemoteActiveWorkspace("phone");
+    useAppStore.getState().setAppState(snapshot("tablet", 2, ["phone", "tablet"]));
+    expect(selected()).toBe("phone");
+    useAppStore.getState().setAppState(snapshot("tablet", 3, ["tablet"]));
+    expect(selected()).toBe("tablet");
+    useAppStore.getState().setAppState(snapshot("", 4, []));
+    expect(selected()).toBe("");
+  });
+
+  it("does not let a desktop delta confirm an in-flight remote activation", () => {
+    useAppStore.getState().setAppState(snapshot("desktop", 1));
+    useAppStore.getState().beginPendingActivation("phone");
+    useAppStore.getState().setAppState(snapshot("phone", 2));
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("phone");
+    useAppStore.getState().clearPendingActivation("phone");
+    expect(selected()).toBe("desktop");
+  });
+});

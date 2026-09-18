@@ -80,6 +80,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   messages: ChatViewItem[];
+  compacting?: boolean;
   /** Render the tail "working" shimmer marker as the last row inside the
    *  scroller content (design D9). Gated by `shouldShowThinkingIndicator`
    *  upstream so it never shows while an approval is pending or a row is
@@ -193,6 +194,7 @@ interface Props {
  */
 export const MessageList = memo(function MessageList({
   messages,
+  compacting = false,
   showThinking = false,
   streaming = false,
   stalled = null,
@@ -270,15 +272,16 @@ export const MessageList = memo(function MessageList({
   // new snapshots/expanded folds still use structural slot reuse (issue #129).
   const prevSlotsRef = useRef<TranscriptSlot[] | undefined>(undefined);
   const { slots, alwaysRenderKeys } = useMemo(() => {
+    // Compaction owns the live marker; settle the ordinary activity header.
     const next = getTranscriptPresentation(
       history,
-      streaming,
+      streaming && !compacting,
       expandedTurnIds,
       prevSlotsRef.current,
     );
     prevSlotsRef.current = next.slots;
     return next;
-  }, [expandedTurnIds, history, streaming]);
+  }, [expandedTurnIds, history, streaming, compacting]);
 
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
@@ -302,7 +305,7 @@ export const MessageList = memo(function MessageList({
   const tailItemVisible =
     tailItem != null && tailBody != null && slotBodyContains(tailBody, tailItem.id);
   const showLiveMarker =
-    (showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
+    (compacting || showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
     !tailIsWorkingActivity;
 
   const listRef = useRef<LegendListRef | null>(null);
@@ -1272,9 +1275,9 @@ export const MessageList = memo(function MessageList({
             <RunStalledNotice silentForSecs={stalled.silentForSecs} />
           </div>
         )}
-        {showLiveMarker && !(stalled && streaming) && (
+        {showLiveMarker && (compacting || !(stalled && streaming)) && (
           <div className="mt-[13px]">
-            <StreamingMarker messages={ordered} workspaceId={workspaceId} />
+            <StreamingMarker messages={ordered} compacting={compacting} workspaceId={workspaceId} />
           </div>
         )}
         {interrupted && !streaming && (
@@ -1284,7 +1287,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
+    [compacting, interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
   );
 
   return (

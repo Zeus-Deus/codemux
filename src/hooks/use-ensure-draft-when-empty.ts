@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useAppStore, useHomeDir } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore, useHomeDir } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { hasAnyPane } from "@/lib/pane-tree";
@@ -19,11 +19,11 @@ import {
  * surface tree on every tick under heavy load.
  */
 function selectEmptyWorkspaceFingerprint(
-  s: { appState: ReturnType<typeof useAppStore.getState>["appState"] },
+  s: Parameters<typeof selectActiveWorkspaceId>[0],
 ): string {
   const app = s.appState;
   if (!app) return "no-app-state";
-  const wsId = app.active_workspace_id;
+  const wsId = selectActiveWorkspaceId(s);
   if (!wsId) return "no-active-ws";
   const ws = app.workspaces.find((w) => w.workspace_id === wsId);
   if (!ws) return `ws-missing:${wsId}`;
@@ -61,10 +61,9 @@ function selectEmptyWorkspaceFingerprint(
  *    effect fires while the Tauri call is pending don't double-spawn.
  *  - The pane-spawn branch additionally requires that THIS client
  *    activated the workspace (`wasActivatedLocally`). The in-flight ref
- *    is client-local, but `active_workspace_id` is shared across every
- *    connected client, so without that check a remote client injects a
- *    duplicate pane into a workspace the desktop just created and is
- *    still populating. The Home-draft branch needs no such check — a
+ *    is client-local. Selection is also local for remote clients, but a
+ *    newly connected client can seed from a workspace another client is
+ *    still populating, so the explicit-navigation check remains useful. The Home-draft branch needs no such check — a
  *    draft is purely client-local state.
  */
 export function useEnsureDraftWhenEmpty() {
@@ -112,13 +111,15 @@ export function useEnsureDraftWhenEmpty() {
     // dep above ensures we only get here when the relevant slice
     // changed, but we still need the full workspace object to read
     // surfaces / surface ids.
-    const appState = useAppStore.getState().appState;
+    const storeState = useAppStore.getState();
+    const appState = storeState.appState;
+    const activeWorkspaceId = selectActiveWorkspaceId(storeState);
     if (!appState) return;
 
     if (!bootAdoptedRef.current) {
       bootAdoptedRef.current = true;
-      if (appState.active_workspace_id) {
-        noteLocalWorkspaceActivation(appState.active_workspace_id);
+      if (activeWorkspaceId) {
+        noteLocalWorkspaceActivation(activeWorkspaceId);
       }
     }
 
@@ -128,10 +129,10 @@ export function useEnsureDraftWhenEmpty() {
     // workspace that fallback lands on is ours to fill like any other we
     // navigated to. Consumed on this first snapshot after the command no
     // matter where we landed, so it never outlives the fallback it marks.
-    adoptLocalFallbackActivation(appState.active_workspace_id);
+    adoptLocalFallbackActivation(activeWorkspaceId ?? "");
 
     const activeWs = appState.workspaces.find(
-      (w) => w.workspace_id === appState.active_workspace_id,
+      (w) => w.workspace_id === activeWorkspaceId,
     );
     if (activeWs) {
       const activeSurface = activeWs.surfaces.find(
