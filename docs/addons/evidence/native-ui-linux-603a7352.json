@@ -1,0 +1,43 @@
+{
+  "commit": "a9cbe22b1c807f8c8d6481b7db8ea7847c068842",
+  "platform": "linux",
+  "hardware": {
+    "osRelease": "6.8.0-1064-azure",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "logicalCpus": 4,
+    "memoryBytes": 16765411328
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "603a73527c98883937296904e66b20c4744a1abe",
+    "run": "35379118363",
+    "platform": "linux"
+  },
+  "installerSha256": "6bdfb6e2d5551e0790ea80edbe83becd2c7ee9b91756c39ade363197059e7d8a",
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 1195.4971750000004
+    }
+  ],
+  "status": "passed"
+}

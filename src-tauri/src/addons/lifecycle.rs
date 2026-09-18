@@ -53,6 +53,14 @@ struct Pending {
 #[derive(Default)]
 pub struct Reviews {
     pending: Mutex<HashMap<String, Pending>>,
+    #[cfg(test)]
+    interruption: Mutex<
+        Option<(
+            &'static str,
+            Arc<tokio::sync::Notify>,
+            Option<Arc<tokio::sync::Notify>>,
+        )>,
+    >,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +97,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 impl Reviews {
+    #[cfg(test)]
+    async fn checkpoint(&self, stage: &'static str) {
+        let notify = self
+            .interruption
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(expected, _, _)| *expected == stage)
+            .map(|(_, notify, resume)| (notify.clone(), resume.clone()));
+        if let Some((notify, resume)) = notify {
+            notify.notify_one();
+            // The test drops this transaction future here, exactly as an
+            // interrupted process would abandon it without error-path cleanup.
+            if let Some(resume) = resume {
+                resume.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
     pub fn prepare_local(&self, manager: &Manager, path: &Path) -> Result<Review> {
         let package = Package::read(path, None)?;
         self.prepare(
@@ -331,6 +359,8 @@ impl Reviews {
         if directory.exists() {
             Package::read(&directory.join("package.cmxaddon"), Some(&candidate.digest))?;
         }
+        #[cfg(test)]
+        self.checkpoint("package-write").await;
         if !directory.exists() {
             let staging = manager
                 .root
@@ -353,6 +383,8 @@ impl Reviews {
             std::fs::create_dir_all(directory.parent().unwrap()).map_err(|_| unavailable())?;
             std::fs::rename(&staging, &directory).map_err(|_| unavailable())?;
         }
+        #[cfg(test)]
+        self.checkpoint("package-staged").await;
         let journal = manager
             .root
             .join("recovery")
@@ -366,6 +398,8 @@ impl Reviews {
             })
             .unwrap(),
         )?;
+        #[cfg(test)]
+        self.checkpoint("journal-saved").await;
         let result: Result<()> = async {
             active_review()?;
             manager.stop(id, None).await;
@@ -386,20 +420,28 @@ impl Reviews {
                     Storage::open(&previous)?.snapshot(&data.join("state.sqlite"))?;
                 }
             }
+            #[cfg(test)]
+            self.checkpoint("data-snapshotted").await;
             if enable {
                 manager
                     .activate(candidate.clone(), pending.package.source(), true)
                     .await?;
                 manager.stop(id, None).await;
             }
+            #[cfg(test)]
+            self.checkpoint("candidate-probed").await;
             active_review()?;
             manager.commit_replacement(old.as_ref(), &candidate)?;
+            #[cfg(test)]
+            self.checkpoint("registry-switched").await;
             if enable {
                 manager
                     .activate(candidate.clone(), pending.package.source(), false)
                     .await?;
                 candidate.status = Status::EnabledRunning;
             }
+            #[cfg(test)]
+            self.checkpoint("activated").await;
             active_review()?;
             // Completion and retirement of a replaced source share a durable
             // commit marker; recovery must never delete restored credentials.
@@ -452,7 +494,11 @@ impl Reviews {
             std::fs::remove_dir_all(journal.parent().unwrap()).map_err(|_| unavailable())?;
             return Err(error);
         }
+        #[cfg(test)]
+        self.checkpoint("completion-committed").await;
         std::fs::remove_dir_all(journal.parent().unwrap()).map_err(|_| unavailable())?;
+        #[cfg(test)]
+        self.checkpoint("journal-removed").await;
 
         manager
             .registry
@@ -780,6 +826,96 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn sqlite_full_during_update_preserves_the_previous_release_and_state() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        let reviews = Reviews::default();
+        let package = Package::parse(super::super::package::fixture_archive(), None).unwrap();
+        let first = reviews
+            .prepare(
+                &manager,
+                package,
+                Source::Local {
+                    identity: Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap();
+        let old = reviews
+            .accept(&manager, &first.token, false, false)
+            .await
+            .unwrap();
+        let state = manager
+            .root
+            .join("state")
+            .join(&old.installation_id)
+            .join(&old.data_generation)
+            .join("state.sqlite");
+        Storage::open(&state)
+            .unwrap()
+            .set("global", "value", &serde_json::json!("original"))
+            .unwrap();
+        let package = Package::parse(super::super::package::fixture_archive(), None).unwrap();
+        let mut files = package.files;
+        let mut manifest = package.manifest;
+        manifest.version = "2.0.0".into();
+        manifest
+            .settings
+            .push(codemux_addon_protocol::manifest::Setting::String {
+                id: "large-default".into(),
+                label: "Fixture".into(),
+                default: "x".repeat(4096),
+            });
+        files.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, bytes.as_slice())
+                .unwrap();
+        }
+        let candidate = Package::parse(tar.into_inner().unwrap().finish().unwrap(), None).unwrap();
+        let review = reviews
+            .prepare(&manager, candidate, old.source.clone())
+            .unwrap();
+        {
+            let db = manager.registry.lock().unwrap();
+            let pages: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
+            // SQLite now returns the real SQLITE_FULL error when this larger
+            // record requires another page. No production fault bypass exists.
+            db.pragma_update(None, "max_page_count", pages).unwrap();
+        }
+        let error = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .err()
+            .expect("update should hit SQLITE_FULL");
+        assert_eq!(error.data.code, ErrorCode::StorageUnavailable);
+        let restored = manager.installation(&old.manifest.id).unwrap();
+        assert_eq!(restored.digest, old.digest);
+        assert_eq!(restored.data_generation, old.data_generation);
+        assert_eq!(
+            Storage::open(&state)
+                .unwrap()
+                .get("global", "value")
+                .unwrap(),
+            serde_json::json!("original")
+        );
+        drop(manager);
+        let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+        assert_eq!(
+            reopened.installation(&old.manifest.id).unwrap().digest,
+            old.digest
+        );
+    }
+    #[tokio::test]
     async fn rollback_copies_matching_data_and_preserves_snapshot_on_activation_failure() {
         let root = tempfile::tempdir().unwrap();
         let manager =
@@ -956,6 +1092,339 @@ mod tests {
                 .data_generation,
             installed.data_generation
         );
+    }
+    fn package_version(version: &str) -> Package {
+        let package = Package::parse(super::super::package::fixture_archive(), None).unwrap();
+        let mut files = package.files;
+        let mut manifest = package.manifest;
+        manifest.version = version.into();
+        files.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, bytes.as_slice())
+                .unwrap();
+        }
+        Package::parse(archive.into_inner().unwrap().finish().unwrap(), None).unwrap()
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Requires a bounded disposable CI tmpfs; scripts/addons/full-filesystem.sh"]
+    async fn full_filesystem_preserves_release_data_and_grant_tuple() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(std::env::var("GITHUB_ACTIONS").as_deref(), Ok("true"));
+        assert_eq!(
+            std::env::var("RUNNER_ENVIRONMENT").as_deref(),
+            Ok("github-hosted")
+        );
+        let base = std::path::PathBuf::from(std::env::var_os("CODEMUX_TEST_FULL_FS").unwrap());
+        let path = std::ffi::CString::new(base.as_os_str().as_bytes()).unwrap();
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) }, 0);
+        let fs = unsafe { fs.assume_init() };
+        assert_eq!(fs.f_type, libc::TMPFS_MAGIC);
+        assert!(
+            fs.f_blocks * fs.f_bsize as u64 <= 32 * 1024 * 1024,
+            "Refuse to fill a filesystem larger than the dedicated CI fixture"
+        );
+        for stage in [
+            "package-write",
+            "package-staged",
+            "journal-saved",
+            "data-snapshotted",
+            "registry-switched",
+            "activated",
+        ] {
+            let root = tempfile::tempdir_in(&base).unwrap();
+            let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let reviews = Reviews::default();
+            let first = reviews
+                .prepare(
+                    &manager,
+                    package_version("1.0.0"),
+                    Source::Local {
+                        identity: Uuid::new_v4().to_string(),
+                    },
+                )
+                .unwrap();
+            let old = reviews
+                .accept(&manager, &first.token, false, false)
+                .await
+                .unwrap();
+            let state_path = |record: &Installation| {
+                root.path()
+                    .join("private/state")
+                    .join(&record.installation_id)
+                    .join(&record.data_generation)
+                    .join("state.sqlite")
+            };
+            Storage::open(&state_path(&old))
+                .unwrap()
+                .set(
+                    "global",
+                    "fixture",
+                    &serde_json::json!({"value":"original"}),
+                )
+                .unwrap();
+            let review = reviews
+                .prepare(&manager, package_version("2.0.0"), old.source.clone())
+                .unwrap();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *reviews.interruption.lock().unwrap() =
+                Some((stage, reached.clone(), Some(resume.clone())));
+            let completed = {
+                let transaction = reviews.accept(&manager, &review.token, false, false);
+                tokio::pin!(transaction);
+                tokio::select! {
+                    result = &mut transaction => panic!("{stage}: completed before fill: {}", result.is_ok()),
+                    _ = reached.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => panic!("{stage}: checkpoint not reached"),
+                }
+                let filler_path = root.path().join("fill.bin");
+                let mut filler = std::fs::File::create(&filler_path).unwrap();
+                let block = [0u8; 4096];
+                loop {
+                    match filler.write_all(&block) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            assert_eq!(
+                                error.raw_os_error(),
+                                Some(libc::ENOSPC),
+                                "{stage}: {error}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                drop(filler);
+                resume.notify_one();
+                let completed =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut transaction)
+                        .await
+                        .expect("full filesystem must not strand transaction")
+                        .ok();
+                std::fs::remove_file(filler_path).unwrap();
+                completed
+            };
+            // The registry may reuse allocated pages even with zero free blocks.
+            // Whether commit succeeds or fails, recovery must select one whole
+            // release/data/grant tuple, never a mixture or a lost installation.
+            drop(manager);
+            let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let installed = reopened.installation(&old.manifest.id).unwrap();
+            let expected = completed.as_ref().unwrap_or(&old);
+            assert_eq!(installed.digest, expected.digest, "{stage}");
+            assert_eq!(
+                installed.data_generation, expected.data_generation,
+                "{stage}"
+            );
+            assert_eq!(installed.installation_id, old.installation_id, "{stage}");
+            assert_eq!(installed.source, old.source, "{stage}");
+            assert_eq!(
+                installed.grant.as_ref().unwrap().digest,
+                installed.digest,
+                "{stage}"
+            );
+            assert_eq!(
+                Storage::open(&state_path(&installed))
+                    .unwrap()
+                    .get("global", "fixture")
+                    .unwrap(),
+                serde_json::json!({"value":"original"}),
+                "{stage}"
+            );
+            println!(
+                "{stage}: real ENOSPC; committed={}; tuple preserved",
+                completed.is_some()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn interrupted_update_recovers_at_every_durable_transition() {
+        for stage in [
+            "package-staged",
+            "journal-saved",
+            "data-snapshotted",
+            "candidate-probed",
+            "registry-switched",
+            "activated",
+            "completion-committed",
+            "journal-removed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let reviews = Reviews::default();
+            let first = reviews
+                .prepare(
+                    &manager,
+                    package_version("1.0.0"),
+                    Source::Local {
+                        identity: Uuid::new_v4().to_string(),
+                    },
+                )
+                .unwrap();
+            let old = reviews
+                .accept(&manager, &first.token, false, false)
+                .await
+                .unwrap();
+            let state_path = |record: &Installation| {
+                root.path()
+                    .join("private/state")
+                    .join(&record.installation_id)
+                    .join(&record.data_generation)
+                    .join("state.sqlite")
+            };
+            Storage::open(&state_path(&old))
+                .unwrap()
+                .set(
+                    "global",
+                    "fixture",
+                    &serde_json::json!({"value":"original"}),
+                )
+                .unwrap();
+            let review = reviews
+                .prepare(&manager, package_version("2.0.0"), old.source.clone())
+                .unwrap();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            *reviews.interruption.lock().unwrap() = Some((stage, reached.clone(), None));
+            tokio::select! {
+                result = reviews.accept(&manager, &review.token, false, false) => panic!("{stage}: transaction completed before interruption: {}", result.is_ok()),
+                _ = reached.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => panic!("{stage}: checkpoint not reached"),
+            }
+            drop(manager);
+            let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let installed = reopened.installation(&old.manifest.id).unwrap();
+            let complete = matches!(stage, "completion-committed" | "journal-removed");
+            assert_eq!(
+                installed.digest,
+                if complete {
+                    review.digest
+                } else {
+                    old.digest.clone()
+                },
+                "{stage}"
+            );
+            assert_eq!(installed.installation_id, old.installation_id, "{stage}");
+            assert_eq!(installed.source, old.source, "{stage}");
+            assert!(!installed.desired_enabled, "{stage}");
+            assert_eq!(
+                Storage::open(&state_path(&installed))
+                    .unwrap()
+                    .get("global", "fixture")
+                    .unwrap(),
+                serde_json::json!({"value":"original"}),
+                "{stage}"
+            );
+            assert_eq!(
+                installed.grant.as_ref().unwrap().digest,
+                installed.digest,
+                "{stage}"
+            );
+            if complete {
+                assert_eq!(
+                    installed.previous.as_ref().unwrap().data_generation,
+                    old.data_generation,
+                    "{stage}"
+                );
+            } else {
+                assert_eq!(installed.data_generation, old.data_generation, "{stage}");
+            }
+            assert_eq!(
+                std::fs::read_dir(root.path().join("private/recovery"))
+                    .unwrap()
+                    .count(),
+                0,
+                "{stage}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn uninstall_waits_for_update_and_removes_the_committed_candidate() {
+        for stage in [
+            "data-snapshotted",
+            "registry-switched",
+            "completion-committed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            let reviews = Reviews::default();
+            let first = reviews
+                .prepare(
+                    &manager,
+                    package_version("1.0.0"),
+                    Source::Local {
+                        identity: Uuid::new_v4().to_string(),
+                    },
+                )
+                .unwrap();
+            let old = reviews
+                .accept(&manager, &first.token, false, false)
+                .await
+                .unwrap();
+            let review = reviews
+                .prepare(&manager, package_version("2.0.0"), old.source.clone())
+                .unwrap();
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *reviews.interruption.lock().unwrap() =
+                Some((stage, reached.clone(), Some(resume.clone())));
+            let update = reviews.accept(&manager, &review.token, false, false);
+            tokio::pin!(update);
+            tokio::select! {
+                result = &mut update => panic!("{stage}: update escaped checkpoint: {}", result.is_ok()),
+                _ = reached.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => panic!("{stage}: checkpoint not reached"),
+            }
+            let removal = manager.remove(&old.manifest.id, false);
+            tokio::pin!(removal);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut removal)
+                    .await
+                    .is_err(),
+                "{stage}: removal overlapped update"
+            );
+            resume.notify_one();
+            let (updated, removed) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::join!(&mut update, &mut removal)
+                })
+                .await
+                .expect("serialized operations finish");
+            assert_eq!(updated.unwrap().digest, review.digest, "{stage}");
+            assert!(removed.unwrap().is_empty(), "{stage}");
+            assert!(manager.list().unwrap().is_empty(), "{stage}");
+            assert!(
+                !manager
+                    .root
+                    .join("state")
+                    .join(&old.installation_id)
+                    .exists(),
+                "{stage}"
+            );
+            assert!(
+                !manager
+                    .root
+                    .join("packages")
+                    .join(&old.manifest.id)
+                    .join(&review.digest)
+                    .exists(),
+                "{stage}"
+            );
+            let reopened = Manager::open(root.path().join("private"), "unused".into()).unwrap();
+            assert!(reopened.list().unwrap().is_empty(), "{stage}");
+        }
     }
     #[test]
     fn incomplete_update_restores_exact_previous_tuple_and_private_snapshot() {

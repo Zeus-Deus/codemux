@@ -21,6 +21,8 @@ fn invalid_batch_never_partially_commits() {
         json!([0,"~",{"id":"c","type":1,"element":"script"},0]),
         json!([3, "a", "href", "https://attacker", 2]),
         json!([3, "a", "dangerouslySetInnerHTML", null, 1]),
+        json!([3, "a", "label", "invalid mode", "property"]),
+        json!([3, "a", "label", "invalid mode", null]),
         json!([0,"~",{"id":"z","type":1,"element":"cmx-text","properties":{"style":null}},0]),
     ] {
         assert!(tree.apply(&[record]).is_err());
@@ -52,4 +54,52 @@ fn nested_and_oversized_trees_fail_before_render() {
     assert!(Tree::default()
         .apply(&[json!([0,"~",{"id":"root","type":1,"element":"cmx-stack","children":children},0])])
         .is_err());
+}
+
+#[test]
+fn mutation_and_serialized_tree_limits_reject_atomically() {
+    let mut tree = Tree::default();
+    tree.apply(&[json!([0,"~",{"id":"text","type":3,"data":"original"},0])])
+        .unwrap();
+    let flood = vec![json!([2, "text", "changed"]); 1001];
+    assert!(tree.apply(&flood).is_err());
+    assert_eq!(tree.children[0].data.as_deref(), Some("original"));
+    let large = (0..9)
+        .map(|i| json!({"id":format!("child-{i}"),"type":3,"data":"x".repeat(32768)}))
+        .collect::<Vec<_>>();
+    assert!(tree
+        .apply(&[json!([0,"~",{"id":"large","type":1,"element":"cmx-stack","children":large},1])])
+        .is_err());
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].data.as_deref(), Some("original"));
+}
+
+#[test]
+fn escaped_content_updates_cannot_exceed_the_intermediate_tree_limit() {
+    let mut children = (0..7)
+        .map(|i| json!({"id":format!("large-{i}"),"type":3,"data":"x".repeat(32768)}))
+        .collect::<Vec<_>>();
+    children.push(json!({"id":"target","type":3,"data":"original"}));
+    let mut tree = Tree::default();
+    tree.apply(&[
+        json!([0,"~",{"id":"root","type":1,"element":"cmx-stack","children":children},0]),
+    ])
+    .unwrap();
+    for update in [
+        vec![
+            json!([2, "target", "\n".repeat(32768)]),
+            json!([2, "target", "small again"]),
+        ],
+        vec![
+            json!([3, "root", "value", "\n".repeat(32768)]),
+            json!([3, "root", "value", null]),
+        ],
+    ] {
+        assert!(tree.apply(&update).is_err());
+        assert_eq!(
+            tree.children[0].children[7].data.as_deref(),
+            Some("original")
+        );
+        assert!(tree.children[0].properties.is_empty());
+    }
 }

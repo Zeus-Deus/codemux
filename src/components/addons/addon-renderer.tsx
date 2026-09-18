@@ -40,8 +40,8 @@ const spacing: Record<string, string> = {
 const colors: Record<string, string> = {
   default: "text-foreground",
   muted: "text-muted-foreground",
-  success: "text-emerald-600 dark:text-emerald-400",
-  warning: "text-amber-600 dark:text-amber-400",
+  success: "text-success",
+  warning: "text-warning",
   danger: "text-destructive",
   accent: "text-primary",
 };
@@ -97,12 +97,16 @@ function VirtualRows({
       tabIndex={0}
       role={headers ? "table" : "list"}
       aria-label={headers ? "Add-on table" : "Add-on list"}
-      aria-rowcount={headers ? rows.length : undefined}
+      aria-rowcount={headers ? rows.length + 1 : undefined}
       className="max-h-72 overflow-auto rounded-md border"
       onScroll={(e) => setTop(e.currentTarget.scrollTop)}
     >
       {headers && (
-        <div role="row" className="sticky top-0 z-10 flex bg-muted font-medium">
+        <div
+          role="row"
+          aria-rowindex={1}
+          className="sticky top-0 z-10 flex bg-muted font-medium"
+        >
           {headers.map((h, i) => (
             <span
               role="columnheader"
@@ -119,7 +123,9 @@ function VirtualRows({
         <div
           key={start + index}
           role={headers ? "row" : "listitem"}
-          aria-rowindex={headers ? start + index + 1 : undefined}
+          aria-rowindex={headers ? start + index + 2 : undefined}
+          aria-setsize={headers ? undefined : rows.length}
+          aria-posinset={headers ? undefined : start + index + 1}
           className="flex h-9 items-center border-b text-label"
         >
           {row.map((cell, i) => (
@@ -223,6 +229,7 @@ export function AddonRenderer({ nodes, event, link }: Props) {
                 img: () => null,
                 a: ({ href, children }) => (
                   <button
+                    type="button"
                     className="underline underline-offset-2"
                     disabled={!href?.startsWith("https://")}
                     onClick={() => href && link(node, href)}

@@ -1,9 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { addonTreeKey, useAddonsStore } from "@/stores/addons-store";
 import { addonInvoke, mountAddon } from "@/lib/addons/bridge";
-import { composerForWorkspace } from "@/lib/addons/composer-registry";
+import {
+  composerForWorkspace,
+  subscribeAddonComposers,
+} from "@/lib/addons/composer-registry";
 import {
   addonMessage,
+  addonEnabled,
   type AddonMount,
   type AddonNode,
 } from "@/lib/addons/types";
@@ -21,11 +25,18 @@ export function AddonView({
   kind?: "panels" | "composerViews";
   composerId?: string;
 }) {
+  const currentComposer = useSyncExternalStore(
+    subscribeAddonComposers,
+    () => composerId ?? composerForWorkspace(workspaceId),
+    () => null,
+  );
   const ready = useAddonsStore((s) => s.ready);
   const revision = useAddonsStore((s) => s.contextRevision);
+  const hostEpoch = useAddonsStore((s) => s.hostEpochs[id] ?? 0);
   const installation = useAddonsStore((s) =>
     s.installed.find((i) => i.manifest.id === id),
   );
+  const canMount = !!installation && addonEnabled(installation);
   const [mounted, setMounted] = useState<AddonMount | null>(null);
   const [error, setError] = useState<string | null>(null);
   const tree = useAddonsStore((s) =>
@@ -39,7 +50,7 @@ export function AddonView({
   useEffect(() => {
     setMounted(null);
     setError(null);
-    if (!ready || installation?.status === "failed-disabled") return;
+    if (!ready || !canMount) return;
     let closed = false;
     let target: AddonMount | null = null;
     const unmount = () => {
@@ -56,13 +67,7 @@ export function AddonView({
         }));
       }
     };
-    void mountAddon(
-      id,
-      view,
-      kind,
-      workspaceId,
-      composerId ?? composerForWorkspace(workspaceId),
-    )
+    void mountAddon(id, view, kind, workspaceId, currentComposer)
       .then((result) => {
         target = result;
         if (closed) unmount();
@@ -80,10 +85,13 @@ export function AddonView({
     view,
     workspaceId,
     kind,
-    composerId,
+    currentComposer,
     ready,
     revision,
-    installation?.status === "failed-disabled",
+    canMount,
+    hostEpoch,
+    installation?.digest,
+    installation?.dataGeneration,
   ]);
   useEffect(() => {
     if (tree)

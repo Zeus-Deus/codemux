@@ -90,6 +90,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
 ]
@@ -945,6 +946,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",

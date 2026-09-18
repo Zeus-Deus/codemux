@@ -31,9 +31,19 @@ struct Traffic {
     entries: VecDeque<(Instant, usize)>,
     total: usize,
 }
+#[cfg(test)]
+#[derive(Clone)]
+struct NativeFixture {
+    answers: Vec<std::net::SocketAddr>,
+    connect: std::net::SocketAddr,
+    trust_certificate: bool,
+    timeout: Duration,
+}
 #[derive(Clone)]
 pub struct Http {
     slots: Arc<Semaphore>,
+    #[cfg(test)]
+    native_fixture: Option<NativeFixture>,
     traffic: Arc<Mutex<Traffic>>,
     #[cfg(test)]
     fixture: Arc<Mutex<Option<VecDeque<Response>>>>,
@@ -44,6 +54,8 @@ impl Default for Http {
     fn default() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(4)),
+            #[cfg(test)]
+            native_fixture: None,
             traffic: Arc::new(Mutex::new(Traffic::default())),
             #[cfg(test)]
             fixture: Arc::new(Mutex::new(None)),
@@ -178,6 +190,12 @@ impl Http {
         })?;
         let url = validate(&request, grant)?;
         let host = url.host_str().ok_or_else(denied)?.to_string();
+        let timeout = Duration::from_secs(30);
+        #[cfg(test)]
+        let timeout = self
+            .native_fixture
+            .as_ref()
+            .map_or(timeout, |fixture| fixture.timeout);
         let work = async {
             #[cfg(test)]
             {
@@ -218,21 +236,49 @@ impl Http {
                     return Ok(response);
                 }
             }
-            let addresses = tokio::net::lookup_host((host.as_str(), 443))
-                .await
-                .map_err(|_| denied())?
-                .collect::<Vec<_>>();
+            let resolve = async {
+                let addresses = tokio::net::lookup_host((host.as_str(), 443))
+                    .await
+                    .map_err(|_| denied())?
+                    .collect::<Vec<_>>();
+                Ok::<_, ProtocolError>(addresses)
+            };
+            #[cfg(not(test))]
+            let addresses: Vec<std::net::SocketAddr> = resolve.await?;
+            #[cfg(test)]
+            let addresses: Vec<std::net::SocketAddr> = if let Some(fixture) = &self.native_fixture {
+                fixture.answers.clone()
+            } else {
+                resolve.await?
+            };
             if addresses.is_empty() || addresses.iter().any(|a| !public_address(a.ip())) {
                 return Err(denied());
             }
             // DNS is resolved once, vetted, then pinned while TLS still verifies hostname.
-            let client = reqwest::Client::builder()
+            #[cfg(test)]
+            let addresses = self
+                .native_fixture
+                .as_ref()
+                .map_or(addresses, |fixture| vec![fixture.connect]);
+            let builder = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(30))
-                .resolve_to_addrs(&host, &addresses)
-                .build()
-                .map_err(|_| denied())?;
+                .timeout(timeout)
+                .resolve_to_addrs(&host, &addresses);
+            #[cfg(test)]
+            let builder = if self
+                .native_fixture
+                .as_ref()
+                .is_some_and(|fixture| fixture.trust_certificate)
+            {
+                builder.add_root_certificate(
+                    reqwest::Certificate::from_der(include_bytes!("test-fixtures/http/ca.der"))
+                        .unwrap(),
+                )
+            } else {
+                builder
+            };
+            let client = builder.build().map_err(|_| denied())?;
             let method = match request.method {
                 HttpMethod::GET => reqwest::Method::GET,
                 HttpMethod::POST => reqwest::Method::POST,
@@ -311,7 +357,7 @@ impl Http {
                 body,
             })
         };
-        tokio::select! {_ = cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin request was cancelled")),result=tokio::time::timeout(Duration::from_secs(30),work)=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"HTTP request timed out"))?}
+        tokio::select! {_ = cancel.cancelled()=>Err(ProtocolError::new(ErrorCode::PluginStopped,"Plugin request was cancelled")),result=tokio::time::timeout(timeout,work)=>result.map_err(|_|ProtocolError::new(ErrorCode::Timeout,"HTTP request timed out"))?}
     }
 }
 #[cfg(test)]
@@ -394,3 +440,7 @@ mod tests {
         assert!(validate(&request, &grant).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "http_native_tests.rs"]
+mod native_tests;

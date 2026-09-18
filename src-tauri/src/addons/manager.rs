@@ -133,7 +133,7 @@ pub struct Running {
     activated: AtomicBool,
     cancel: CancellationToken,
     stopped: CancellationToken,
-    storage: StdMutex<Storage>,
+    storage: StdMutex<Option<Storage>>,
     settings: StdMutex<Value>,
     views: Mutex<HashMap<String, View>>,
     disposed_views: Mutex<HashSet<String>>,
@@ -164,7 +164,7 @@ pub struct Manager {
     pub credentials: Credentials,
     pub contexts: Mutex<Contexts>,
     pub(super) catalog_serial: Mutex<()>,
-    running: Mutex<HashMap<String, Arc<Running>>>,
+    running: Arc<Mutex<HashMap<String, Arc<Running>>>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     effects: Mutex<HashMap<String, PendingEffect>>,
     pub events: broadcast::Sender<UiEvent>,
@@ -209,7 +209,7 @@ impl Manager {
                 .map_err(storage_error)?;
             if entries.iter().any(|(installation, id)| {
                 uuid::Uuid::parse_str(installation).is_err()
-                    || !codemux_addon_protocol::manifest::local_id(id)
+                    || !codemux_addon_protocol::catalog::hex(id, 64)
             }) {
                 return Err(ProtocolError::invalid("Invalid credential index"));
             }
@@ -229,7 +229,7 @@ impl Manager {
             credentials: Credentials::with_configured(configured_credentials),
             contexts: Mutex::new(Contexts::default()),
             catalog_serial: Mutex::new(()),
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
             operations: Mutex::new(HashMap::new()),
             effects: Mutex::new(HashMap::new()),
             events,
@@ -444,7 +444,7 @@ impl Manager {
             activated: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             stopped: CancellationToken::new(),
-            storage: StdMutex::new(storage),
+            storage: StdMutex::new(Some(storage)),
             settings: StdMutex::new(settings),
             views: Mutex::new(HashMap::new()),
             disposed_views: Mutex::new(HashSet::new()),
@@ -635,7 +635,7 @@ impl Manager {
                 Some(running) => {
                     let stopped = running.stopped.clone();
                     drop(hosts);
-                    stopped.cancelled().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), stopped.cancelled()).await;
                     return;
                 }
                 None => None,
@@ -643,6 +643,11 @@ impl Manager {
         };
         let probe = running.as_ref().is_some_and(|r| r.probe);
         if let Some(running) = &running {
+            // Cancelled broker tasks and activation callers may still hold an
+            // Arc<Running>. Release SQLite explicitly instead of retaining its
+            // Windows file locks until those references happen to disappear.
+            // The same mutex serializes any already-entered storage operation.
+            running.storage.lock().unwrap().take();
             self.contexts
                 .lock()
                 .await
@@ -656,7 +661,32 @@ impl Manager {
                 generation: running.generation().into(),
                 message: failure.clone().unwrap_or_else(|| "Plugin stopped".into()),
             });
-            running.host.stop().await;
+            if !running.host.stop().await {
+                // A kernel-level termination delay must never make room for a
+                // second generation. Keep the cancelled instance registered
+                // until the supervisor confirms actual reaping.
+                if let Ok(mut installation) = self.installation(id) {
+                    installation.status = Status::FailedDisabled;
+                    installation.failure =
+                        Some("The plugin process has not exited; it remains quarantined".into());
+                    let _ = self.save(&installation);
+                }
+                let hosts = self.running.clone();
+                let instance = running.clone();
+                let id = id.to_owned();
+                tokio::spawn(async move {
+                    instance.host.reaped().await;
+                    let mut hosts = hosts.lock().await;
+                    if hosts
+                        .get(&id)
+                        .is_some_and(|r| r.generation() == instance.generation())
+                    {
+                        hosts.remove(&id);
+                    }
+                    instance.stopped.cancel();
+                });
+                return;
+            }
         }
         let _ = self.registry.lock().unwrap().execute(
             "DELETE FROM metadata WHERE key=?1",
@@ -914,6 +944,9 @@ impl Manager {
                     .as_str()
                     .ok_or_else(|| ProtocolError::invalid("Missing storage key"))?;
                 let mut storage = running.storage.lock().unwrap();
+                let storage = storage.as_mut().ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::PluginStopped, "Plugin storage is closed")
+                })?;
                 match operation {
                     "storage.get" => storage.get(&scope, key),
                     "storage.set" => {
@@ -954,7 +987,12 @@ impl Manager {
                         )
                     })?;
                 let credential = if let Some(id) = &grant.credential {
-                    self.credentials.get(&running.installation_id, id).await?
+                    self.credentials
+                        .get(
+                            &running.installation_id,
+                            &Credentials::key(id, &grant.origin),
+                        )
+                        .await?
                 } else {
                     None
                 };
@@ -1285,8 +1323,16 @@ impl Manager {
         if revision > view.revision {
             return Err(ProtocolError::invalid("Invalid UI acknowledgement"));
         }
-        view.acknowledged = view.acknowledged.max(revision);
-        Ok(())
+        if revision <= view.acknowledged {
+            return Ok(());
+        }
+        view.acknowledged = revision;
+        drop(views);
+        running
+            .host
+            .send("ui.ack", json!({"viewId":view_id,"revision":revision}))
+            .await
+            .map(|_| ())
     }
     pub async fn ui_link(
         &self,
@@ -1487,6 +1533,305 @@ mod tests {
             .running(&running.manifest.id, running.generation())
             .await
             .is_err());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_uninstall_during_activation_reaps_the_candidate_before_removing_state() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().join("private"), test_host_path()).unwrap();
+        // This fixture yields activation without registering ready. The test can
+        // release it deterministically over its owned host's protocol; no public
+        // application test bypass or timing-sensitive JS sleep is introduced.
+        let source = b"__codemuxRegister({}, ({send}) => m => {if(m.method==='command.execute')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let package = root.path().join("activation.cmxaddon");
+        std::fs::write(
+            &package,
+            super::super::package::fixture_archive_with_source(source),
+        )
+        .unwrap();
+        let reviews = super::super::lifecycle::Reviews::default();
+        let review = reviews.prepare_local(&manager, &package).unwrap();
+        let mut installation = reviews
+            .accept(&manager, &review.token, false, false)
+            .await
+            .unwrap();
+        installation.desired_enabled = true;
+        manager.save(&installation).unwrap();
+        {
+            let activation = manager.ensure_active(&installation.manifest.id);
+            tokio::pin!(activation);
+            let running = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    result = &mut activation => panic!("activation completed before release: {}", result.is_ok()),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+                if let Some(running) = manager.running.lock().await.get(&installation.manifest.id).cloned() {
+                    break running;
+                }
+            }
+        }).await.expect("native activation starts");
+            assert!(!running.activated.load(Ordering::Acquire));
+            let removal = manager.remove(&installation.manifest.id, false);
+            tokio::pin!(removal);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut removal)
+                    .await
+                    .is_err()
+            );
+            running
+                .host
+                .send("command.execute", json!({"id":"hello"}))
+                .await
+                .unwrap();
+            let (activated, removed) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(&mut activation, &mut removal)
+            })
+            .await
+            .expect("activation and removal serialize");
+            activated.unwrap();
+            let warnings = removed.unwrap();
+            assert!(warnings.is_empty(), "Removal cleanup: {warnings:?}");
+            assert!(running.stopped.is_cancelled());
+            // Keep this stale reference alive while checking cleanup. Windows
+            // must not depend on Arc drop to release private database handles.
+            assert!(running.storage.lock().unwrap().is_none());
+            assert!(manager.running.lock().await.is_empty());
+            assert!(manager.list().unwrap().is_empty());
+            assert!(!manager
+                .root
+                .join("state")
+                .join(&installation.installation_id)
+                .exists());
+            assert!(manager
+                .ensure_active(&installation.manifest.id)
+                .await
+                .is_err());
+        }
+        drop(manager);
+        assert!(Manager::open(root.path().join("private"), test_host_path())
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty());
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_delayed_effects_cannot_outlive_their_target_or_installation() {
+        for action in [
+            "workspace",
+            "close",
+            "replace",
+            "disable",
+            "remove",
+            "pause",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+            let mut manifest = Manifest::parse(
+                include_bytes!("../../addon-protocol/fixtures/hello.json"),
+                None,
+            )
+            .unwrap();
+            manifest.permissions.push(Permission::ComposerAppend);
+            let installation = installed(manifest);
+            manager.save(&installation).unwrap();
+            let source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+            let running = manager
+                .activate(installation, source.into(), false)
+                .await
+                .unwrap();
+            let composer = uuid::Uuid::new_v4().to_string();
+            manager
+                .contexts
+                .lock()
+                .await
+                .register_composer(composer.clone(), "original".into())
+                .unwrap();
+            let workspace = Workspace {
+                id: "original".into(),
+                name: "Original project".into(),
+                root_name: "project".into(),
+                location: "local",
+                root: root.path().into(),
+            };
+            let base = manager
+                .context_handle(&running, Some(workspace), Some(composer.clone()))
+                .await
+                .unwrap();
+            let interaction = manager
+                .contexts
+                .lock()
+                .await
+                .interact(&base, running.generation(), Instant::now())
+                .unwrap();
+            let mut events = manager.events.subscribe();
+            let broker = manager.clone();
+            let instance = running.clone();
+            let request = tokio::spawn(async move {
+                broker.request(&instance, "composer.appendText", json!({"context":interaction,"text":"Must never reach a replacement draft"})).await
+            });
+            let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let UiEvent::Effect {
+                        request_id, params, ..
+                    } = events.recv().await.unwrap()
+                    {
+                        assert_eq!(params["workspaceId"], "original");
+                        assert_eq!(params["composerId"], composer);
+                        break request_id;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            // Hold the frontend completion at the real native broker boundary.
+            // Neither the claim nor a late result may survive a target change.
+            assert!(manager
+                .claim_effect(&request_id, "forged-generation")
+                .await
+                .is_err());
+            match action {
+                "workspace" => manager.change_workspace(None).await,
+                "close" => manager.contexts.lock().await.revoke_composer(&composer),
+                "replace" => manager
+                    .contexts
+                    .lock()
+                    .await
+                    .register_composer(composer.clone(), "replacement".into())
+                    .unwrap(),
+                "disable" => {
+                    let mut installed = manager.installation(&running.manifest.id).unwrap();
+                    installed.desired_enabled = false;
+                    manager.save(&installed).unwrap();
+                    manager.stop(&running.manifest.id, None).await;
+                }
+                "remove" => {
+                    manager.remove(&running.manifest.id, false).await.unwrap();
+                }
+                "pause" => manager.pause_all().await,
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .claim_effect(&request_id, running.generation())
+                    .await
+                    .is_err(),
+                "late claim after {action}"
+            );
+            assert!(
+                manager
+                    .effect_result(&request_id, running.generation(), Ok(json!(1)))
+                    .await
+                    .is_err(),
+                "late completion after {action}"
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_err(), "delayed request after {action}");
+            assert!(manager.effects.lock().await.is_empty());
+            assert!(manager
+                .contexts
+                .lock()
+                .await
+                .get(&base, running.generation())
+                .is_err());
+            manager.shutdown().await;
+            assert!(manager.running.lock().await.is_empty());
+        }
+    }
+    #[tokio::test]
+    #[ignore = "Requires the independently built host; run scripts/addons/test-native.sh"]
+    async fn native_runtime_faults_quarantine_one_plugin_and_preserve_another() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Manager::open(root.path().into(), test_host_path()).unwrap();
+        let manifest = Manifest::parse(
+            include_bytes!("../../addon-protocol/fixtures/hello.json"),
+            None,
+        )
+        .unwrap();
+        let mut healthy_manifest = manifest.clone();
+        healthy_manifest.id = "example.healthy".into();
+        let healthy_install = installed(healthy_manifest);
+        manager.save(&healthy_install).unwrap();
+        let healthy_source = "__codemuxRegister({}, ({send}) => m => {if(m.method==='activate')send('ready',{phase:'activated',registrations:['commands/hello']});});";
+        let healthy = manager
+            .activate(healthy_install, healthy_source.into(), false)
+            .await
+            .unwrap();
+        let failing_installation = installed(manifest.clone());
+        for code in [
+            "throw Error('private failure details')",
+            "while(true){}",
+            "Promise.resolve().then(function loop(){Promise.resolve().then(loop)})",
+            "function f(){f()} f()",
+            "new ArrayBuffer(128*1024*1024)",
+            // Ask only the child to exit: the manager has no pending stop and
+            // must treat the resulting EOF as an unexpected runtime failure.
+            "",
+        ] {
+            let installation = failing_installation.clone();
+            manager.save(&installation).unwrap();
+            let source = format!("__codemuxRegister({{}}, ({{send}}) => m => {{if(m.method==='activate')send('ready',{{phase:'activated',registrations:['commands/hello']}});else if(m.method==='command.execute'){{{code}}}}});");
+            let failing = manager.activate(installation, source, false).await.unwrap();
+            let context = manager.context_handle(&failing, None, None).await.unwrap();
+            let start = Instant::now();
+            failing
+                .host
+                .send(
+                    if code.is_empty() {
+                        "deactivate"
+                    } else {
+                        "command.execute"
+                    },
+                    json!({"id":"hello"}),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), failing.stopped.cancelled())
+                .await
+                .expect("fault contained and child reaped within two seconds");
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert!(matches!(
+                manager.installation(&manifest.id).unwrap().status,
+                Status::FailedDisabled
+            ));
+            assert!(manager
+                .contexts
+                .lock()
+                .await
+                .get(&context, failing.generation())
+                .is_err());
+            assert!(
+                manager.ensure_active(&manifest.id).await.is_err(),
+                "a fault cannot auto-restart the plugin"
+            );
+            assert!(!healthy.cancel.is_cancelled());
+            assert_eq!(manager.running.lock().await.len(), 1);
+            manager
+                .request(
+                    &healthy,
+                    "storage.set",
+                    json!({"scope":"global","key":"alive","value":true}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .request(
+                        &healthy,
+                        "storage.get",
+                        json!({"scope":"global","key":"alive"})
+                    )
+                    .await
+                    .unwrap(),
+                json!(true)
+            );
+        }
+        manager.shutdown().await;
+        assert!(manager.running.lock().await.is_empty());
     }
     #[tokio::test]
     #[ignore = "Build the independent Project Brief package and host first"]

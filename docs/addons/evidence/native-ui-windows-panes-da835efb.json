@@ -1,0 +1,125 @@
+{
+  "commit": "d159f4d9155014409887f47ce03881f8accda9c6",
+  "platform": "win32",
+  "hardware": {
+    "osRelease": "10.0.26100",
+    "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "logicalCpus": 4,
+    "memoryBytes": 17174360064
+  },
+  "checks": [
+    "01-settings",
+    "01-no-plugin-hosts-at-clean-start",
+    "01-official-updater-without-plugins",
+    "01-keyboard-dialog-focus-and-core-themes",
+    "02-import-project-brief",
+    "02-import-issue-companion",
+    "02-import-fault-isolation",
+    "03-enabled-plugins-remain-lazy",
+    "03-disable-enable",
+    "03-issue-configuration",
+    "04-project-brief-native-git",
+    "05-project-brief-real-draft",
+    "06-issue-companion-native-https",
+    "06-host-credential-settings-and-explicit-fallback",
+    "07-paired-remote-cannot-invoke-or-subscribe-to-plugins",
+    "07-official-updater-while-plugins-paused",
+    "07-no-auto-submit",
+    "08-hostile-block-core-interactivity",
+    "08-hostile-throw-core-interactivity",
+    "08-hostile-promises-core-interactivity",
+    "08-hostile-recurse-core-interactivity",
+    "08-hostile-allocate-core-interactivity",
+    "08-bounded-list-rendering-and-frame-budget",
+    "09-paused-restart-preserves-installations-and-settings",
+    "09-classic-interface-keeps-plugin-panels-and-core-terminal",
+    "10-remove-packages-keeps-core-usable",
+    "11-corrupt-plugin-registry-does-not-block-core-startup"
+  ],
+  "failedChecks": [],
+  "seams": [
+    "Synthetic loopback account API; no real account or credentials",
+    "Native file chooser selection supplies package fixture path; all addon IPC remains native"
+  ],
+  "installerBuild": {
+    "commit": "da835efb4571b600465920b78ea946c980bc8f1a",
+    "run": "35386904258",
+    "platform": "win32"
+  },
+  "installerSha256": "5ee93418900dd3b7c0333e27676913afafd786d19fc65d64d348afe741d1a288",
+  "windowsDriverMode": "Microsoft WebView2 attach (app-specific disposable runner policy)",
+  "officialUpdater": [
+    {
+      "phase": "clean",
+      "available": false,
+      "version": null
+    },
+    {
+      "phase": "paused",
+      "available": false,
+      "version": null
+    }
+  ],
+  "credentials": {
+    "maskedInput": true,
+    "noSecretInInventoryOrSettings": true,
+    "mode": "native Windows credential store",
+    "removalAndFileRedaction": true
+  },
+  "remoteBoundary": {
+    "transport": "paired loopback HTTP/WebSocket against stock desktop",
+    "approval": "explicit desktop command",
+    "coreRpc": true,
+    "addonRpcDenied": true,
+    "coreEvents": true,
+    "addonEventsDenied": true
+  },
+  "hostileWorkloads": [
+    {
+      "command": "block",
+      "uiObservationMs": 720.1849999999977
+    },
+    {
+      "command": "throw",
+      "uiObservationMs": 847.4954999999973
+    },
+    {
+      "command": "promises",
+      "uiObservationMs": 783.7483999999968
+    },
+    {
+      "command": "recurse",
+      "uiObservationMs": 838.1077000000005
+    },
+    {
+      "command": "allocate",
+      "uiObservationMs": 798.1844999999958
+    }
+  ],
+  "uiRendering": {
+    "workload": "500 visible-model paths, five real Git refreshes while typing",
+    "renderedRows": 14,
+    "frameSamples": 397,
+    "p95FrameGapMs": 15.700000000004366,
+    "maxFrameGapMs": 15.700000000004366,
+    "refreshMs": [
+      320.7900000000009,
+      586.000199999995,
+      325.5833999999959,
+      328.9976999999999,
+      606.938900000001
+    ],
+    "p95FrameGapBudgetMs": 100
+  },
+  "corePaneRestoration": {
+    "preserved": [
+      "Files",
+      "Changes",
+      "Review"
+    ],
+    "paused": true,
+    "removed": true,
+    "noEmptyAccessorySpace": true
+  },
+  "status": "passed"
+}

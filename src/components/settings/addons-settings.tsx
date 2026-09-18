@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/dialog";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { AddonCatalog } from "@/components/addons/addon-catalog";
-import { useAddonsStore } from "@/stores/addons-store";
+import { beginAddonRevocation, useAddonsStore } from "@/stores/addons-store";
 import { addonInvoke } from "@/lib/addons/bridge";
 import { refreshAddons } from "@/lib/addons/platform";
 import {
@@ -30,6 +30,27 @@ import {
   type AddonManifest,
   type AddonReview,
 } from "@/lib/addons/types";
+// These controlled dialogs have no Radix Trigger. Restore their actual opener,
+// and keep Escape from also reaching the window-level Settings close shortcut.
+function AddonDialogContent(props: ComponentProps<typeof DialogContent>) {
+  const opener = useRef<HTMLElement | null>(null);
+  return (
+    <DialogContent
+      {...props}
+      onOpenAutoFocus={() => {
+        opener.current =
+          document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null;
+      }}
+      onCloseAutoFocus={(event) => {
+        event.preventDefault();
+        if (opener.current?.isConnected) opener.current.focus();
+      }}
+      onEscapeKeyDown={(event) => event.stopPropagation()}
+    />
+  );
+}
 function Capabilities({ manifest }: { manifest: AddonManifest }) {
   return (
     <div className="space-y-3 text-body">
@@ -128,6 +149,7 @@ function Credentials({
                     sessionOnly: session,
                   });
                   setValues({ ...values, [field.id]: "" });
+                  onError("");
                 } catch (e) {
                   onError(addonMessage(e));
                 } finally {
@@ -162,14 +184,29 @@ function Configure({
   onError: (message: string) => void;
 }) {
   const [settings, setSettings] = useState<Record<string, unknown>>({});
+  const [configuration, setConfiguration] = useState<
+    "loading" | "ready" | "failed"
+  >("loading");
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   useEffect(() => {
+    let live = true;
     void addonInvoke<Record<string, unknown>>("addon_settings_get", {
       id: installation.manifest.id,
     })
-      .then(setSettings)
-      .catch((e) => onError(addonMessage(e)));
+      .then((value) => {
+        if (!live) return;
+        setSettings(value);
+        setConfiguration("ready");
+      })
+      .catch((e) => {
+        if (!live) return;
+        setConfiguration("failed");
+        onError(addonMessage(e));
+      });
+    return () => {
+      live = false;
+    };
   }, [installation.installationId]);
   return (
     <div className="space-y-6">
@@ -202,6 +239,7 @@ function Configure({
           className="space-y-4 border-t pt-5"
           onSubmit={async (e) => {
             e.preventDefault();
+            if (configuration !== "ready" || busy) return;
             setBusy(true);
             setSaved(false);
             try {
@@ -218,11 +256,17 @@ function Configure({
           }}
         >
           <h3 className="font-medium">Configuration</h3>
+          {configuration === "loading" && (
+            <p role="status" className="text-body text-muted-foreground">
+              Loading configuration…
+            </p>
+          )}
           {installation.manifest.settings.map((field) => (
             <label key={field.id} className="grid gap-2 text-body">
               {field.label}
               {field.type === "boolean" ? (
                 <Switch
+                  disabled={configuration !== "ready" || busy}
                   aria-label={field.label}
                   checked={settings[field.id] === true}
                   onCheckedChange={(value) =>
@@ -231,6 +275,7 @@ function Configure({
                 />
               ) : field.type === "enum" ? (
                 <select
+                  disabled={configuration !== "ready" || busy}
                   className="rounded-md border bg-background p-2"
                   value={String(settings[field.id] ?? field.default)}
                   onChange={(e) =>
@@ -243,6 +288,7 @@ function Configure({
                 </select>
               ) : (
                 <Input
+                  disabled={configuration !== "ready" || busy}
                   type={field.type === "integer" ? "number" : "text"}
                   min={field.type === "integer" ? field.min : undefined}
                   max={field.type === "integer" ? field.max : undefined}
@@ -261,7 +307,9 @@ function Configure({
             </label>
           ))}
           <div className="flex items-center gap-3">
-            <Button disabled={busy}>Save settings</Button>
+            <Button disabled={configuration !== "ready" || busy}>
+              Save settings
+            </Button>
             {saved && (
               <span role="status" className="text-body text-muted-foreground">
                 Saved
@@ -300,7 +348,6 @@ export function AddonsSettings() {
   const showReview = (value: AddonReview) => {
     setRestoreData(false);
     setReplace(false);
-    setRestoreData(false);
     setEnable(true);
     setReview(value);
   };
@@ -313,7 +360,8 @@ export function AddonsSettings() {
       useAddonsStore.setState({ developmentReview: null });
     }
   }, [state.developmentReview]);
-  const perform = async (action: () => Promise<unknown>) => {
+  const perform = async (action: () => Promise<unknown>, revoke?: string) => {
+    const release = revoke ? beginAddonRevocation(revoke) : undefined;
     setBusy(true);
     setError("");
     try {
@@ -322,6 +370,7 @@ export function AddonsSettings() {
       setError(addonMessage(cause));
     } finally {
       await refreshAddons();
+      release?.();
       setBusy(false);
     }
   };
@@ -349,8 +398,10 @@ export function AddonsSettings() {
           variant="outline"
           disabled={busy}
           onClick={() => {
-            void perform(() =>
-              addonInvoke(state.paused ? "addon_resume" : "addon_pause_all"),
+            void perform(
+              () =>
+                addonInvoke(state.paused ? "addon_resume" : "addon_pause_all"),
+              state.paused ? undefined : "*",
             );
           }}
         >
@@ -390,7 +441,7 @@ export function AddonsSettings() {
       )}
       {installation ? (
         <Configure
-          key={installation.installationId}
+          key={`${installation.installationId}/${installation.digest}/${installation.dataGeneration}`}
           installation={installation}
           back={() => setSelected(null)}
           onError={setError}
@@ -541,14 +592,16 @@ export function AddonsSettings() {
                       variant="outline"
                       disabled={busy}
                       onClick={() =>
-                        void perform(() =>
-                          addonInvoke(
-                            item.desiredEnabled &&
-                              item.status !== "failed-disabled"
-                              ? "addon_disable"
-                              : "addon_enable",
-                            { id: item.manifest.id },
-                          ),
+                        void perform(
+                          () =>
+                            addonInvoke(
+                              item.desiredEnabled &&
+                                item.status !== "failed-disabled"
+                                ? "addon_disable"
+                                : "addon_enable",
+                              { id: item.manifest.id },
+                            ),
+                          item.desiredEnabled ? item.manifest.id : undefined,
                         )
                       }
                     >
@@ -661,7 +714,7 @@ export function AddonsSettings() {
         </section>
       )}
       <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>Install from link or ID</DialogTitle>
             <DialogDescription>
@@ -685,7 +738,6 @@ export function AddonsSettings() {
           >
             <Input
               aria-label="Add-on install link or ID"
-              autoFocus
               value={target}
               onChange={(e) => setTarget(e.target.value)}
               placeholder="codemux.project-brief"
@@ -696,7 +748,7 @@ export function AddonsSettings() {
               </Button>
             </DialogFooter>
           </form>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={review !== null}
@@ -707,7 +759,7 @@ export function AddonsSettings() {
           }
         }}
       >
-        <DialogContent className="max-h-[85vh] overflow-auto">
+        <AddonDialogContent className="max-h-[85vh] overflow-auto">
           <DialogHeader>
             <DialogTitle>Review {review?.manifest.name}</DialogTitle>
             <DialogDescription>
@@ -784,7 +836,7 @@ export function AddonsSettings() {
               </DialogFooter>
             </>
           )}
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={remove !== null}
@@ -792,7 +844,7 @@ export function AddonsSettings() {
           if (!value && !busy) setRemove(null);
         }}
       >
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>Remove {remove?.manifest.name}?</DialogTitle>
             <DialogDescription>
@@ -820,13 +872,13 @@ export function AddonsSettings() {
                   });
                   setRemove(null);
                   if (warnings.length) setError(warnings.join(" "));
-                })
+                }, remove!.manifest.id)
               }
             >
               Remove add-on
             </Button>
           </DialogFooter>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
       <Dialog
         open={rollback !== null}
@@ -834,7 +886,7 @@ export function AddonsSettings() {
           if (!value && !busy) setRollback(null);
         }}
       >
-        <DialogContent>
+        <AddonDialogContent>
           <DialogHeader>
             <DialogTitle>
               Restore {rollback?.previous?.manifest.version}?
@@ -860,7 +912,7 @@ export function AddonsSettings() {
               Restore previous release
             </Button>
           </DialogFooter>
-        </DialogContent>
+        </AddonDialogContent>
       </Dialog>
     </div>
   );

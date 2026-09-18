@@ -75,5 +75,8 @@ docs/addons/research-probe/probe-ui.bundle.js
 
 # Independent add-on build products
 examples/addons/*/plugin.js
+scripts/addons/fixtures/*/plugin.js
+addon-native-ui-evidence/
+addon-native-ui-build.json
 
 src-tauri/addon-catalog/target/
