@@ -68,6 +68,7 @@ import {
   useProviderCommandsStore,
 } from "@/stores/provider-commands-store";
 import {
+  selectActiveWorkspaceId,
   findWorkspaceIdForPane,
   useAppStore,
   useHomeDir,
@@ -326,7 +327,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
     const ws = s.appState.workspaces.find(
-      (w) => w.workspace_id === s.appState!.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     );
     return ws?.cwd ?? null;
   });
@@ -492,7 +493,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.project_root ?? ws?.cwd ?? null;
   });
@@ -504,7 +505,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.provider_kind ?? null;
   });
@@ -516,7 +517,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // `autoNameWorkspace` re-reads it after its AI call resolves, which is
   // the only moment the guard is meaningful.
   const paneWorkspaceId = useAppStore(
-    (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
+    (s) => workspaceIdForPane ?? selectActiveWorkspaceId(s) ?? null,
   );
   useEffect(() => {
     // A brand-new conversation has no transcript to hydrate; its composer is
@@ -541,7 +542,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const ws = s.appState.workspaces.find(
       (w) =>
         w.workspace_id ===
-        (workspaceIdForPane ?? s.appState!.active_workspace_id),
+        (workspaceIdForPane ?? selectActiveWorkspaceId(s)),
     );
     return ws?.git_branch ?? null;
   });
@@ -631,6 +632,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       return {
         messages: t?.messages ?? EMPTY_MESSAGES,
         streaming: t?.streaming ?? false,
+        compacting: t?.compacting ?? false,
         // Dead-run detection (issue #154): the stall notice + interrupted /
         // Continue affordances read straight off the thread slice.
         stalled: t?.stalled ?? null,
@@ -639,7 +641,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       };
     }),
   );
-  const { messages, streaming, stalled, interrupted, activeTurnId } = timeline;
+  const { messages, streaming, compacting, stalled, interrupted, activeTurnId } = timeline;
   const settings = useAgentChatStore(
     useShallow((s) => {
       const t = threadId ? s.threads[threadId] : undefined;
@@ -3720,9 +3722,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
   }, [paneDragDepth, resetPaneDrag]);
 
-  // Pin the transcript across composer height changes (the pill expanding,
-  // the strip opening): the content just above the composer stays put
-  // instead of sliding under it, and a reader at the live edge stays there.
+  // The composer region floats over the transcript so the thread reads
+  // through it while dimmed. Two jobs here, both driven off its measured
+  // height: publish it as `--composer-overlay-height` (the transcript's
+  // footer reserves exactly that much, so the tail can still be scrolled
+  // clear of the overlay), and re-pin a reader who was at the live edge when
+  // the region changed height (the pill expanding, a question card opening).
+  // Content above no longer slides as the region grows — it is out of flow —
+  // so the old scrollTop-by-delta correction would now double-count.
   const paneRootRef = useRef<HTMLDivElement | null>(null);
   const composerRegionRef = useRef<HTMLDivElement | null>(null);
   const hasTranscript = messages.length > 0 && !enteredSubagent;
@@ -3733,14 +3740,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!region || !root || typeof ResizeObserver === "undefined") return;
 
     let viewport: HTMLElement | null = null;
-    // Geometry as of the last scroll: by the time the observer fires, the
-    // viewport has already resized and the browser may have clamped it.
+    // Geometry as of the last scroll: by the time the observer fires the
+    // reserve has already changed, so "was at the end" has to be judged
+    // against the scrollHeight that was live when the reader last moved.
     let prevTop = 0;
     let prevClient = 0;
+    let prevScrollHeight = 0;
     const snapshot = () => {
       if (!viewport) return;
       prevTop = viewport.scrollTop;
       prevClient = viewport.clientHeight;
+      prevScrollHeight = viewport.scrollHeight;
     };
     const bind = () => {
       const next = root.querySelector<HTMLElement>(
@@ -3753,26 +3763,43 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       snapshot();
     };
 
-    let lastHeight = region.getBoundingClientRect().height;
+    let lastHeight = -1;
+    const publish = () => {
+      const height = region.getBoundingClientRect().height;
+      if (height === lastHeight) return false;
+      lastHeight = height;
+      root.style.setProperty("--composer-overlay-height", `${height}px`);
+      return true;
+    };
+    publish();
     bind();
     const observer = new ResizeObserver(() => {
-      const height = region.getBoundingClientRect().height;
-      const delta = height - lastHeight;
-      lastHeight = height;
+      const wasAtEnd = prevTop >= prevScrollHeight - prevClient - 2;
+      const changed = publish();
       bind();
-      if (!viewport || delta === 0) return;
-      const wasAtEnd = prevTop >= viewport.scrollHeight - prevClient - 2;
-      viewport.scrollTop = wasAtEnd
-        ? viewport.scrollHeight
-        : Math.max(0, prevTop + delta);
+      if (!viewport || !changed) return;
+      if (wasAtEnd) viewport.scrollTop = viewport.scrollHeight;
       snapshot();
     });
     observer.observe(region);
     return () => {
       observer.disconnect();
       viewport?.removeEventListener("scroll", snapshot);
+      root.style.removeProperty("--composer-overlay-height");
     };
   }, [hasTranscript]);
+
+  // Reading-back state is stamped straight onto the pane root instead of
+  // held in React state: it flips on scroll, and the composer subtree is
+  // expensive to re-render. The fade is then pure CSS descending from this
+  // attribute (see `.composer-overlay-card` in `globals.css`), so scrolling
+  // costs zero renders in a subtree that re-renders on every keystroke.
+  const handleReadingBackChange = useCallback((readingBack: boolean) => {
+    const root = paneRootRef.current;
+    if (!root) return;
+    if (readingBack) root.setAttribute("data-reading-back", "");
+    else root.removeAttribute("data-reading-back");
+  }, []);
 
   const composerEl = (
     <Composer
@@ -3924,6 +3951,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             <ChatTranscript
               messages={messages}
               streaming={transcriptStreaming}
+              compacting={compacting}
               stalled={stalled}
               interrupted={interrupted}
               sendAnchor={sendAnchor}
@@ -3947,13 +3975,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
               cwd={cwd}
+              onReadingBackChange={handleReadingBackChange}
             />
           )}
           {/* Composer region (design D10): groups the whole composer
               column — AskUserQuestion panel, debug banner, the strip and
-              the composer pill — below the scrolling transcript. Observed
-              to pin the transcript while it changes height. */}
-          <div ref={composerRegionRef} className="pt-3.5">
+              the composer pill. Floats over the bottom of the scrolling
+              transcript rather than sitting below it, so scrolling back
+              draws the thread through the dimmed composer instead of
+              through flat pane background. The transcript reserves the
+              region's measured height in its footer, so nothing is
+              permanently hidden underneath. Observed to publish that
+              height and to pin the live edge while it changes.
+              `pointer-events-none` keeps the empty column gutters
+              transparent to selection and clicks on the rows behind; the
+              cards inside opt themselves back in. */}
+          <div
+            ref={composerRegionRef}
+            className={
+              // Only the parent transcript reserves space for an overlay.
+              // Keep drill-in in normal flow so its final rows remain visible.
+              enteredSubagent
+                ? "pt-3.5"
+                : "pointer-events-none absolute inset-x-0 bottom-0 z-10 pt-3.5"
+            }
+          >
             {pendingInputPanelEl}
             {threadId && (
               <AsyncQuestionPanel
@@ -3967,7 +4013,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 )}
               />
             )}
-            {debugBannerEl}
+            {debugBannerEl && (
+              // Docked in a `pointer-events-none` region, so the banner's
+              // own buttons have to opt back in.
+              <div className="pointer-events-auto">{debugBannerEl}</div>
+            )}
             {composerEl}
           </div>
         </>

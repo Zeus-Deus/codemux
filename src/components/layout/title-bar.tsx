@@ -52,6 +52,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
+  selectActiveWorkspaceId,
   useActiveWorkspace,
   useActiveWorkspaceId,
   useAppStore,
@@ -100,7 +101,7 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
   const activeWorkspace = useAppStore(
     (s) =>
       s.appState?.workspaces.find(
-        (w) => w.workspace_id === s.appState?.active_workspace_id,
+        (w) => w.workspace_id === selectActiveWorkspaceId(s),
       ),
   );
 

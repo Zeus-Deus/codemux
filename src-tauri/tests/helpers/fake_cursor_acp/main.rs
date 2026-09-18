@@ -6,7 +6,10 @@
 //!
 //! Methods understood:
 //!   - `initialize` / `authenticate` → empty result.
-//!   - `session/new`  → `{sessionId, configOptions}`.
+//!   - `session/new`  → `{sessionId, configOptions}`, followed by the
+//!     `available_commands_update` the real CLI pushes once a session
+//!     exists. Entries carry only a name and description — this path has
+//!     no argument hints.
 //!   - `session/load` → empty result (ACP omits the id on purpose).
 //!   - `session/set_config_option` → echoes the config options back.
 //!   - `session/prompt` → behavior is chosen by the prompt text:
@@ -63,6 +66,23 @@ fn config_options() -> Value {
             ]
         }
     ])
+}
+
+fn available_commands(session_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "copy-request-id", "description": "Copy the request id"},
+                    {"name": "plan", "description": "Draft a plan (project)"}
+                ]
+            }
+        }
+    })
 }
 
 fn chunk(session_id: &str, text: &str) -> Value {
@@ -150,6 +170,9 @@ fn main() {
                         }
                     }));
                 }
+                // The catalogue lands after the session exists, never in
+                // the initialize result.
+                write_line(&available_commands("fake-cursor-session"));
             }
             "session/set_config_option" => {
                 if let Some(id) = id {

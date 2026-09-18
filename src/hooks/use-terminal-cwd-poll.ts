@@ -19,7 +19,7 @@
  */
 
 import { useEffect } from "react";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useTerminalCwdStore } from "@/stores/terminal-cwd-store";
 import { terminalSessionCwds } from "@/tauri/commands";
 import type { AppStateSnapshot, PaneNodeSnapshot } from "@/tauri/types";
@@ -82,7 +82,7 @@ export function useTerminalCwdPoll(): void {
       if (!appState) return;
 
       const workspace = appState.workspaces.find(
-        (w) => w.workspace_id === appState.active_workspace_id,
+        (w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()),
       );
       if (!workspace) return;
 

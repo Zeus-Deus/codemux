@@ -387,6 +387,11 @@ export type QuestionResolution =
     };
 
 export type ProviderRuntimeEvent =
+  | {
+      type: "context_compaction_changed";
+      thread_id: string;
+      active: boolean;
+    }
   | { type: "questions_asked"; thread_id: string; question: UserQuestionSet }
   | {
       type: "question_resolved";

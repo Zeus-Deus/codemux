@@ -479,10 +479,19 @@ pub fn agent_chat_create_pane<R: Runtime>(
     cwd: Option<String>,
     launch_mode: Option<crate::presets::LaunchMode>,
     thread_id: Option<String>,
+    select: Option<bool>,
 ) -> Result<String, String> {
     feature_flag_on(&observability)?;
-    let pane_id =
-        state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode, thread_id)?;
+    let pane_id = state
+        .create_or_reuse_agent_chat_pane_with_selection(
+            &workspace_id,
+            provider,
+            cwd,
+            launch_mode,
+            thread_id,
+            select.unwrap_or(true),
+        )?
+        .0;
     // Emit either way: reusing an existing pane still moves the active
     // pane, tab, surface and workspace onto it, and those moves reach the
     // clients only through this emit.
@@ -502,6 +511,7 @@ pub fn agent_chat_close_pane<R: Runtime>(
     state: State<'_, AppStateStore>,
     observability: State<'_, ObservabilityStore>,
     pane_id: String,
+    select: Option<bool>,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
     // Capture the chat session bound to this pane *before* the tree
@@ -532,7 +542,7 @@ pub fn agent_chat_close_pane<R: Runtime>(
     }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
-    let _ = state.close_pane(&pane_id);
+    let _ = state.close_pane_with_selection(&pane_id, select.unwrap_or(true));
     if let Some(pair) = chat_thread {
         shutdown_agent_chat_threads(&app, vec![pair]);
     }
@@ -3740,10 +3750,6 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
 pub async fn list_chat_provider_capabilities<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    opencode_manager: tauri::State<
-        '_,
-        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
-    >,
     codex_cache: tauri::State<
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
@@ -3861,10 +3867,11 @@ pub async fn agent_chat_provider_health(
 }
 
 /// List the provider-native slash commands available to a chat thread
-/// anchored at `cwd`. Claude discovers them through the Agent SDK, while
-/// Grok reads the official ACP initialize catalogue and any newer full
-/// snapshot observed by a running session. Providers without a discovery
-/// surface resolve to an empty list.
+/// anchored at `cwd`. Claude discovers them through the Agent SDK. ACP
+/// providers publish a full catalogue over `available_commands_update`,
+/// which running sessions record in the shared cache; Grok additionally
+/// answers with one at initialize, so it can be probed before any session
+/// exists. Only expose commands the current adapter can execute.
 ///
 /// Selecting one of these in the UI inserts the literal `/name ` text
 /// into the draft; the text is forwarded verbatim to the provider,
@@ -3878,9 +3885,9 @@ pub async fn list_chat_slash_commands(
         '_,
         std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
     >,
-    grok_slash_cache: tauri::State<
+    acp_slash_cache: tauri::State<
         '_,
-        std::sync::Arc<crate::agent_provider::grok::slash_commands::GrokSlashCommandCache>,
+        std::sync::Arc<crate::agent_provider::acp::slash_commands::AcpSlashCommandCache>,
     >,
 ) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
     match provider {
@@ -3892,13 +3899,36 @@ pub async fn list_chat_slash_commands(
                 }
                 .to_command_string()
             })?;
-            grok_slash_cache
-                .get_or_harvest(&binary_path, std::path::Path::new(&cwd))
+            acp_slash_cache
+                .get_or_harvest(
+                    crate::agent_provider::acp::session::AcpDialect::Grok,
+                    &binary_path,
+                    std::path::Path::new(&cwd),
+                )
                 .await
         }
-        // No discovery surface on these providers (yet) — empty list,
-        // not an error, so the popup renders without a failure footer.
-        ProviderKind::Codex | ProviderKind::Cursor | ProviderKind::OpenCode => Ok(Vec::new()),
+        // Cursor announces its catalogue only after `session/new`, so serve
+        // what a running session already published for this cwd. Do not add
+        // a probe here: it would have to open a real Cursor session just to
+        // read a menu, spawning a child process and writing Cursor's own
+        // session storage as a side effect.
+        ProviderKind::Cursor => Ok(acp_slash_cache
+            .cached(
+                crate::agent_provider::acp::session::AcpDialect::Cursor,
+                std::path::Path::new(&cwd),
+            )
+            .await),
+        // OpenCode lists commands through GET /command, but its prompt_async
+        // endpoint treats slash text literally. Native execution needs the
+        // separate command endpoint and project-scoped session lifecycle.
+        // Keep skills available through Codemux's existing skill inventory.
+        ProviderKind::OpenCode => Ok(Vec::new()),
+        // Codex has nothing to enumerate: upstream deleted custom prompts
+        // outright and skills took their place, and the slash commands its
+        // TUI still offers are interpreted by that TUI and never reach the
+        // model, so they mean nothing sent over the app-server protocol
+        // Codemux drives.
+        ProviderKind::Codex => Ok(Vec::new()),
     }
 }
 
@@ -4517,6 +4547,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     observability: State<'_, ObservabilityStore>,
     db: State<'_, DatabaseStore>,
     thread_id: String,
+    select: Option<bool>,
 ) -> Result<OpenAgentChatSearchResult, String> {
     feature_flag_on(&observability)?;
     let record = db
@@ -4534,13 +4565,16 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     let pane_id = if let Some(existing) = state.agent_chat_pane_id_for_thread(&thread_id) {
         existing
     } else {
-        let pane_id = state.create_agent_chat_pane(
-            &record.workspace_id,
-            Some(provider),
-            record.cwd.clone(),
-            Some(crate::presets::LaunchMode::NewTab),
-            Some(thread_id.clone()),
-        )?;
+        let pane_id = state
+            .create_or_reuse_agent_chat_pane_with_selection(
+                &record.workspace_id,
+                Some(provider),
+                record.cwd.clone(),
+                Some(crate::presets::LaunchMode::NewTab),
+                Some(thread_id.clone()),
+                select.unwrap_or(true),
+            )?
+            .0;
         pane_id.0
     };
 
@@ -4567,7 +4601,7 @@ pub async fn agent_chat_open_search_result<R: Runtime>(
     if let Some(tab_id) = tab_id {
         state.activate_tab(&workspace_id, &tab_id)?;
     }
-    if !state.activate_pane(&pane_id) {
+    if !state.activate_pane_with_selection(&pane_id, select.unwrap_or(true)) {
         return Err(format!("conversation_pane_not_found: {pane_id}"));
     }
     crate::state::emit_app_state(&app);
@@ -6421,7 +6455,8 @@ fn map_event_to_pane_status(
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
         // Ledger rows are the same: pure accounting, no liveness signal.
-        ProviderRuntimeEvent::ContextUsageUpdated { .. }
+        ProviderRuntimeEvent::ContextCompactionChanged { .. }
+        | ProviderRuntimeEvent::ContextUsageUpdated { .. }
         | ProviderRuntimeEvent::UsageRecorded { .. }
         // Plan quota is an account-level reading, not thread liveness.
         | ProviderRuntimeEvent::PlanUsageUpdated { .. } => None,
@@ -7045,6 +7080,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ContextCompactionChanged { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::UsageRecorded { thread_id, .. }

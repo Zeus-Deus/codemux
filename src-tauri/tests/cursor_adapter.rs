@@ -5,7 +5,10 @@
 //! lifecycle or model configuration behavior.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use codemux_lib::agent_provider::acp::session::AcpDialect;
+use codemux_lib::agent_provider::acp::slash_commands::AcpSlashCommandCache;
 use codemux_lib::agent_provider::cursor::{CursorAgentProvider, CursorProviderConfig};
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ProviderError, ProviderRuntimeEvent,
@@ -39,10 +42,21 @@ fn start_input(
 
 /// Provider wired to the `fake_cursor_acp` fixture instead of a real CLI.
 fn fixture_provider() -> CursorAgentProvider {
-    CursorAgentProvider::new(CursorProviderConfig {
-        binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
-        event_channel_capacity: 1024,
-    })
+    fixture_provider_with_commands().0
+}
+
+/// Same fixture provider, plus the command cache it shares with the IPC
+/// layer so a test can read what the live session published.
+fn fixture_provider_with_commands() -> (CursorAgentProvider, Arc<AcpSlashCommandCache>) {
+    let commands = Arc::new(AcpSlashCommandCache::new());
+    let provider = CursorAgentProvider::new_with_slash_command_cache(
+        CursorProviderConfig {
+            binary: PathBuf::from(env!("CARGO_BIN_EXE_fake_cursor_acp")),
+            event_channel_capacity: 1024,
+        },
+        Arc::clone(&commands),
+    );
+    (provider, commands)
 }
 
 fn fixture_start_input(thread_id: &str) -> StartSessionInput {
@@ -125,6 +139,56 @@ async fn cursor_turn_keeps_trailing_message_chunks() {
         .map(|index| format!("[{index}]"))
         .collect::<String>();
     assert_eq!(text, expected);
+    provider
+        .stop_session(ThreadId(thread_id.into()))
+        .await
+        .expect("stop fixture session");
+}
+
+/// The catalogue arrives as a plain `session/update` after `session/new`,
+/// before any turn is active, and its entries carry no argument hint. The
+/// session must record it anyway, under its own provider key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_session_update_populates_the_shared_command_cache() {
+    let (provider, commands) = fixture_provider_with_commands();
+    let thread_id = "cursor-available-commands";
+    let cwd = std::env::current_dir().expect("test cwd");
+
+    provider
+        .start_session(fixture_start_input(thread_id))
+        .await
+        .expect("start fixture session");
+
+    // The catalogue is pushed independently of the `session/new` response,
+    // so it can legitimately land a moment after the session is ready.
+    let published = timeout(Duration::from_secs(10), async {
+        loop {
+            let entries = commands.cached(AcpDialect::Cursor, &cwd).await;
+            if !entries.is_empty() {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session never published its command catalogue");
+
+    assert_eq!(
+        published
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy-request-id", "plan"]
+    );
+    assert!(published
+        .iter()
+        .all(|command| command.argument_hint.is_empty()));
+    assert_eq!(published[1].description, "Draft a plan (project)");
+    assert!(
+        commands.cached(AcpDialect::Grok, &cwd).await.is_empty(),
+        "one provider's catalogue must never be served for another"
+    );
+
     provider
         .stop_session(ThreadId(thread_id.into()))
         .await

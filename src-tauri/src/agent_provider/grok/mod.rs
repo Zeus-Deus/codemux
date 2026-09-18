@@ -1,7 +1,6 @@
 //! Grok Build provider using xAI's official ACP stdio server.
 
 pub mod capabilities;
-pub mod slash_commands;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,6 +12,7 @@ use futures_core::Stream;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::agent_provider::acp::session::{AcpDialect, AcpSession, AcpSpawnConfig};
+use crate::agent_provider::acp::slash_commands::AcpSlashCommandCache;
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderCapabilities, ProviderError, ProviderEventStream,
     ProviderKind, ProviderRuntimeEvent, ProviderSession, RequestId, SendOutcome, SendTurnInput,
@@ -36,22 +36,19 @@ impl Default for GrokProviderConfig {
 
 pub struct GrokAgentProvider {
     config: GrokProviderConfig,
-    slash_command_cache: Arc<slash_commands::GrokSlashCommandCache>,
+    slash_command_cache: Arc<AcpSlashCommandCache>,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<AcpSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
 
 impl GrokAgentProvider {
     pub fn new(config: GrokProviderConfig) -> Self {
-        Self::new_with_slash_command_cache(
-            config,
-            Arc::new(slash_commands::GrokSlashCommandCache::new()),
-        )
+        Self::new_with_slash_command_cache(config, Arc::new(AcpSlashCommandCache::new()))
     }
 
     pub fn new_with_slash_command_cache(
         config: GrokProviderConfig,
-        slash_command_cache: Arc<slash_commands::GrokSlashCommandCache>,
+        slash_command_cache: Arc<AcpSlashCommandCache>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity.max(16));
         Self {
@@ -150,7 +147,7 @@ impl AgentProvider for GrokAgentProvider {
             AcpSpawnConfig {
                 binary: self.config.binary.clone(),
                 dialect: AcpDialect::Grok,
-                grok_slash_command_cache: Some(Arc::clone(&self.slash_command_cache)),
+                slash_command_cache: Arc::clone(&self.slash_command_cache),
             },
             self.event_tx.clone(),
         )

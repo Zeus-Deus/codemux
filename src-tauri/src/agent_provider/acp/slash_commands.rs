@@ -1,9 +1,10 @@
-//! Dynamic slash-command discovery for Grok Build's ACP server.
+//! Dynamic slash-command discovery for ACP-backed providers.
 //!
-//! Grok publishes the initial full catalogue in
-//! `initialize._meta.availableCommands`, then may replace it with ACP's
-//! `available_commands_update`. Command names and argument hints stay opaque
-//! so a newer CLI can add commands without a Codemux release.
+//! An ACP agent publishes its catalogue as an `available_commands_update`
+//! session notification, and some agents additionally answer with a full
+//! catalogue in `initialize._meta.availableCommands`. Command names and
+//! argument hints stay opaque so a newer CLI can add commands without a
+//! Codemux release.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,36 +14,64 @@ use tokio::sync::Mutex;
 
 use crate::agent_provider::claude::slash_commands::ProviderSlashCommand;
 
-use super::capabilities::harvest_grok_initialize;
+use super::session::AcpDialect;
 
-/// This command silently broadens tool permissions inside Grok without
+/// This command silently broadens tool permissions inside the agent without
 /// updating Codemux's permission-mode control. Exposing it would leave the
 /// visible safety state out of sync with the child process.
 const ACP_UNSAFE_COMMANDS: &[&str] = &["always-approve"];
 
-/// Latest authoritative command snapshot for each workspace cwd.
+/// Latest authoritative command snapshot for each dialect and workspace cwd.
 ///
-/// The initialize-only probe fills a missing entry lazily. A running Grok
-/// session can replace the same entry from `available_commands_update`.
+/// A running session fills and replaces entries from
+/// `available_commands_update`; for dialects that also answer at initialize,
+/// a cheap probe fills a missing entry lazily.
+///
+/// The dialect is part of the key rather than bound to the cache instance:
+/// Tauri state is keyed by type, so a single managed cache is the only way
+/// for the command IPC and every running ACP session to share one snapshot
+/// without introducing a near-empty wrapper type per provider. Each caller
+/// already knows which dialect it speaks, and the key keeps one provider's
+/// catalogue from ever being served for another.
 #[derive(Debug, Default)]
-pub struct GrokSlashCommandCache {
-    inner: Mutex<HashMap<PathBuf, Vec<ProviderSlashCommand>>>,
+pub struct AcpSlashCommandCache {
+    inner: Mutex<HashMap<(AcpDialect, PathBuf), Vec<ProviderSlashCommand>>>,
 }
 
-impl GrokSlashCommandCache {
+impl AcpSlashCommandCache {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Read the snapshot a running session already published, without
+    /// probing.
+    ///
+    /// Agents that only announce their catalogue after `session/new` cannot
+    /// be probed for it: a probe would have to create a real session on the
+    /// agent side, which costs a child process and writes the agent's own
+    /// session storage — far too side-effecting for populating a composer
+    /// menu. Before any session has run for `cwd` the honest answer is an
+    /// empty list, which the popup renders without a failure footer.
+    pub async fn cached(&self, dialect: AcpDialect, cwd: &Path) -> Vec<ProviderSlashCommand> {
+        self.inner
+            .lock()
+            .await
+            .get(&(dialect, cwd.to_path_buf()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub async fn get_or_harvest(
         &self,
+        dialect: AcpDialect,
         binary_path: &Path,
         cwd: &Path,
     ) -> Result<Vec<ProviderSlashCommand>, String> {
+        let key = (dialect, cwd.to_path_buf());
         // Scoped so the guard is dropped before the probe below.
         {
             let entries = self.inner.lock().await;
-            if let Some(commands) = entries.get(cwd) {
+            if let Some(commands) = entries.get(&key) {
                 return Ok(commands.clone());
             }
         }
@@ -50,40 +79,63 @@ impl GrokSlashCommandCache {
         // The probe spawns a child process and can take seconds, so the lock
         // must NOT be held across it: live `available_commands_update`
         // notifications take the same lock on the session's notification task,
-        // and stalling those stalls the whole Grok stream for that session.
-        let initialized = harvest_grok_initialize(
-            binary_path,
-            Some(cwd.to_path_buf()),
-            "codemux-command-harvest",
-        )
-        .await
-        .map_err(|error| error.to_command_string())?;
+        // and stalling those stalls the whole stream for that session.
+        let Some(initialized) = harvest_initialize(dialect, binary_path, cwd).await? else {
+            return Ok(Vec::new());
+        };
         let commands = available_commands_from_value(&initialized).unwrap_or_default();
 
         // Anything that landed while the probe ran is newer than the probe's
         // snapshot — a live session update, or another probe that finished
         // later — so it wins and our result is discarded.
         let mut entries = self.inner.lock().await;
-        if let Some(existing) = entries.get(cwd) {
+        if let Some(existing) = entries.get(&key) {
             return Ok(existing.clone());
         }
-        entries.insert(cwd.to_path_buf(), commands.clone());
+        entries.insert(key, commands.clone());
         Ok(commands)
     }
 
     /// Apply one advertised full snapshot. An absent or malformed catalogue
     /// is ignored, while an explicitly empty array correctly clears it.
-    pub async fn replace_from_value(&self, cwd: &Path, value: &Value) -> bool {
+    pub async fn replace_from_value(
+        &self,
+        dialect: AcpDialect,
+        cwd: &Path,
+        value: &Value,
+    ) -> bool {
         let Some(commands) = available_commands_from_value(value) else {
             return false;
         };
-        self.inner.lock().await.insert(cwd.to_path_buf(), commands);
+        self.inner
+            .lock()
+            .await
+            .insert((dialect, cwd.to_path_buf()), commands);
         true
     }
+}
 
-    #[cfg(test)]
-    async fn get(&self, cwd: &Path) -> Option<Vec<ProviderSlashCommand>> {
-        self.inner.lock().await.get(cwd).cloned()
+/// Run the dialect's initialize-only probe, if it has one, and surface any
+/// failure in the provider's own error vocabulary so the composer's footer
+/// names the CLI the user actually has to install or log into.
+///
+/// `None` means the dialect announces its catalogue only over a live
+/// session, so there is nothing a cheap probe could learn.
+async fn harvest_initialize(
+    dialect: AcpDialect,
+    binary_path: &Path,
+    cwd: &Path,
+) -> Result<Option<Value>, String> {
+    match dialect {
+        AcpDialect::Cursor => Ok(None),
+        AcpDialect::Grok => crate::agent_provider::grok::capabilities::harvest_grok_initialize(
+            binary_path,
+            Some(cwd.to_path_buf()),
+            "codemux-command-harvest",
+        )
+        .await
+        .map(Some)
+        .map_err(|error| error.to_command_string()),
     }
 }
 
@@ -212,11 +264,12 @@ mod tests {
 
     #[tokio::test]
     async fn snake_case_live_update_replaces_the_full_snapshot() {
-        let cache = GrokSlashCommandCache::new();
+        let cache = AcpSlashCommandCache::new();
         let cwd = Path::new("/workspace");
         assert!(
             cache
                 .replace_from_value(
+                    AcpDialect::Grok,
                     cwd,
                     &json!({ "_meta": { "availableCommands": [{ "name": "old" }] } }),
                 )
@@ -225,6 +278,7 @@ mod tests {
         assert!(
             cache
                 .replace_from_value(
+                    AcpDialect::Grok,
                     cwd,
                     &json!({
                         "update": {
@@ -240,20 +294,105 @@ mod tests {
         );
 
         assert_eq!(
-            cache.get(cwd).await,
-            Some(vec![ProviderSlashCommand {
+            cache.cached(AcpDialect::Grok, cwd).await,
+            vec![ProviderSlashCommand {
                 name: "new".into(),
                 description: String::new(),
                 argument_hint: "<value>".into(),
-            }])
+            }]
         );
 
         assert!(
             !cache
-                .replace_from_value(cwd, &json!({ "update": { "unrelated": [] } }))
+                .replace_from_value(AcpDialect::Grok, cwd, &json!({ "update": { "unrelated": [] } }))
                 .await
         );
-        assert_eq!(cache.get(cwd).await.unwrap()[0].name, "new");
+        assert_eq!(cache.cached(AcpDialect::Grok, cwd).await[0].name, "new");
+    }
+
+    #[tokio::test]
+    async fn each_dialect_keeps_its_own_catalogue_for_the_same_cwd() {
+        let cache = AcpSlashCommandCache::new();
+        let cwd = Path::new("/workspace");
+        cache
+            .replace_from_value(
+                AcpDialect::Cursor,
+                cwd,
+                &json!({
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [{
+                            "name": "cursor-only",
+                            "description": "Cursor catalogue entry"
+                        }]
+                    }
+                }),
+            )
+            .await;
+        cache
+            .replace_from_value(
+                AcpDialect::Grok,
+                cwd,
+                &json!({ "_meta": { "availableCommands": [{ "name": "grok-only" }] } }),
+            )
+            .await;
+
+        assert_eq!(
+            cache.cached(AcpDialect::Cursor, cwd).await[0].name,
+            "cursor-only"
+        );
+        assert_eq!(cache.cached(AcpDialect::Grok, cwd).await[0].name, "grok-only");
+    }
+
+    #[test]
+    fn parses_a_standard_initialize_catalogue_without_vendor_metadata() {
+        let commands = available_commands_from_value(&json!({
+            "availableCommands": [{
+                "name": "review",
+                "description": "Review the diff",
+                "input": { "hint": "<path>" }
+            }]
+        }))
+        .expect("advertised catalogue");
+
+        assert_eq!(
+            commands,
+            vec![ProviderSlashCommand {
+                name: "review".into(),
+                description: "Review the diff".into(),
+                argument_hint: "<path>".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_update_entries_that_carry_no_argument_hint() {
+        let commands = available_commands_from_value(&json!({
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    { "name": "copy-request-id", "description": "Copy the request id" },
+                    { "name": "plan", "description": "Draft a plan (project)" }
+                ]
+            }
+        }))
+        .expect("advertised catalogue");
+
+        assert_eq!(
+            commands,
+            vec![
+                ProviderSlashCommand {
+                    name: "copy-request-id".into(),
+                    description: "Copy the request id".into(),
+                    argument_hint: String::new(),
+                },
+                ProviderSlashCommand {
+                    name: "plan".into(),
+                    description: "Draft a plan (project)".into(),
+                    argument_hint: String::new(),
+                },
+            ]
+        );
     }
 
     #[test]

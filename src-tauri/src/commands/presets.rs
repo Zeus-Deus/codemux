@@ -301,6 +301,7 @@ pub fn apply_preset<R: tauri::Runtime>(
     override_mode: Option<String>,
     initial_prompt: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
+    select: Option<bool>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -356,10 +357,8 @@ pub fn apply_preset<R: tauri::Runtime>(
             .commands
             .iter()
             .map(|cmd| {
-                let cmd = crate::agent_capability::apply_model_selection(
-                    cmd,
-                    model_selection.as_ref(),
-                );
+                let cmd =
+                    crate::agent_capability::apply_model_selection(cmd, model_selection.as_ref());
                 crate::agent_context::inject_agent_context(&cmd, &workspace_id)
             })
             .collect()
@@ -376,27 +375,34 @@ pub fn apply_preset<R: tauri::Runtime>(
             if initial_prompt.is_some() {
                 // Agent launch with prompt: rename tab, embed prompt in command
                 let snap = state.snapshot();
-                if let Some(ws) = snap.workspaces.iter().find(|w| w.workspace_id.0 == workspace_id) {
+                if let Some(ws) = snap
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == workspace_id)
+                {
                     let _ = state.rename_tab(&workspace_id, &ws.active_tab_id, preset.name.clone());
-                    let _ = state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
+                    let _ =
+                        state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
                 }
 
                 for command in &commands {
-                    if command.is_empty() { continue; }
-                    let (cmd, needs_pty_injection) =
-                        crate::branch_name::prepare_agent_command(
-                            &preset_id,
-                            command,
-                            initial_prompt.as_deref(),
-                        );
-                    state.update_terminal_session_command(&session_id, command.clone());
-                    write_command_when_ready(
-                        sessions_arc.clone(), session_id.clone(), cmd, 120,
+                    if command.is_empty() {
+                        continue;
+                    }
+                    let (cmd, needs_pty_injection) = crate::branch_name::prepare_agent_command(
+                        &preset_id,
+                        command,
+                        initial_prompt.as_deref(),
                     );
+                    state.update_terminal_session_command(&session_id, command.clone());
+                    write_command_when_ready(sessions_arc.clone(), session_id.clone(), cmd, 120);
                     if needs_pty_injection {
                         if let Some(ref prompt) = initial_prompt {
                             write_command_when_ready(
-                                sessions_arc.clone(), session_id.clone(), prompt.clone(), 1500,
+                                sessions_arc.clone(),
+                                session_id.clone(),
+                                prompt.clone(),
+                                1500,
                             );
                         }
                     }
@@ -431,8 +437,11 @@ pub fn apply_preset<R: tauri::Runtime>(
                         .unwrap_or_else(|| active_pane.clone())
                 };
 
-                let session_id =
-                    state.split_pane(&target_pane, crate::state::SplitDirection::Horizontal)?;
+                let session_id = state.split_pane_with_selection(
+                    &target_pane,
+                    crate::state::SplitDirection::Horizontal,
+                    select.unwrap_or(true),
+                )?;
 
                 terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 

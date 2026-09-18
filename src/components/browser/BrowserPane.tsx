@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { InspectorPanel } from "./InspectorPanel";
 import { Loader2, Globe } from "lucide-react";
@@ -220,7 +220,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
   const handleTellAgent = useCallback(async (selector: string) => {
     const appState = useAppStore.getState().appState;
     if (!appState) return;
-    const ws = appState.workspaces.find((w) => w.workspace_id === appState.active_workspace_id);
+    const ws = appState.workspaces.find((w) => w.workspace_id === selectActiveWorkspaceId(useAppStore.getState()));
     if (!ws) return;
     const surface = ws.surfaces.find((s) => s.surface_id === ws.active_surface_id);
     if (!surface) return;
@@ -360,7 +360,7 @@ export const BrowserPane = memo(function BrowserPane({ browserId, focused, visib
                   target:
                     traceWorkspaceId ??
                     workspaceId ??
-                    useAppStore.getState().appState?.active_workspace_id ??
+                    selectActiveWorkspaceId(useAppStore.getState()) ??
                     undefined,
                 });
               }

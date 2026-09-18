@@ -239,6 +239,36 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
+    if !super::policy::allowed(&cmd) {
+        let _ = out.send(err_text(id, "web-remote: command is not allowed"));
+        return;
+    }
+    let Some(args_map) = args.as_object_mut() else {
+        let _ = out.send(err_text(id, "web-remote: args must be an object"));
+        return;
+    };
+    if ["deleteWorktree", "deleteBranch", "forceDelete"]
+        .iter()
+        .any(|key| args_map.get(*key).and_then(Value::as_bool) == Some(true))
+    {
+        let _ = out.send(err_text(
+            id,
+            "web-remote: destructive workspace removal is not allowed",
+        ));
+        return;
+    }
+    // Identity is diagnostic, never authority; the server-issued connection id
+    // disambiguates even clients that supply the same label. Never log args.
+    let client = args_map
+        .remove("__remoteClientId")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .filter(|v| v.len() <= 64 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        .unwrap_or_else(|| "legacy".to_string());
+    eprintln!("[web-remote] client={client} connection={conn_id} invoke={id} command={cmd}");
+    // The bridge owns this option. A browser cannot opt back into selecting
+    // the desktop workspace through a creation or pane-focus command.
+    args_map.insert("select".into(), Value::Bool(false));
+
     // Route any channels this command opens back to *this* browser, tagging
     // them with whether this command's channel carries raw bytes.
     rewrite_channel_markers(&mut args, router, conn_id, out, is_raw_byte_stream(&cmd));

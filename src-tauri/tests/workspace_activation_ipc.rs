@@ -142,9 +142,37 @@ fn activate_and_cycle_both_persist_the_active_workspace() {
         "activate_workspace must persist the active workspace",
     );
 
-    let cycled = invoke(&webview, invoke_key, "cycle_workspace", json!({ "step": 1 }))
-        .expect("cycle_workspace should dispatch Ok");
-    let cycled = cycled.as_str().expect("cycle_workspace returns a workspace id");
+    invoke(
+        &webview,
+        invoke_key.clone(),
+        "touch_workspace",
+        json!({"workspaceId": second}),
+    )
+    .expect("remote touch should hydrate without selecting");
+    assert_eq!(state.active_workspace_id(), first);
+    assert_eq!(
+        db.get_ui_state("active_workspace").as_deref(),
+        Some(first.as_str())
+    );
+    assert!(invoke(
+        &webview,
+        invoke_key.clone(),
+        "touch_workspace",
+        json!({"workspaceId": "missing"})
+    )
+    .is_err());
+    assert_eq!(state.active_workspace_id(), first);
+
+    let cycled = invoke(
+        &webview,
+        invoke_key,
+        "cycle_workspace",
+        json!({ "step": 1 }),
+    )
+    .expect("cycle_workspace should dispatch Ok");
+    let cycled = cycled
+        .as_str()
+        .expect("cycle_workspace returns a workspace id");
 
     assert_eq!(
         state.snapshot().active_workspace_id.0,

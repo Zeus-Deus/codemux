@@ -915,6 +915,13 @@ pub struct AppStateSnapshot {
     pub config: CodemuxConfigSnapshot,
 }
 
+/// Initial chat binding published atomically with its workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitialChatPane {
+    pub provider: crate::agent_provider::ProviderKind,
+    pub thread_id: String,
+}
+
 pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
 }
@@ -1311,35 +1318,95 @@ impl AppStateStore {
     }
 
     pub fn activate_terminal_session(&self, session_id: &str) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
+        self.activate_terminal_session_with_selection(session_id, true)
+    }
 
-        // Locate first, mutate after: the switch bookkeeping needs the
-        // whole snapshot, so the target has to be named by index rather
-        // than held as a borrow into the workspace list.
-        let mut target: Option<(usize, usize, PaneId)> = None;
-        'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
-            for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
-                if let Some(pane_id) = find_terminal_pane_id(&surface.root, session_id) {
-                    target = Some((workspace_index, surface_index, pane_id));
-                    break 'search;
+    pub fn activate_terminal_session_with_selection(&self, session_id: &str, select: bool) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            // Locate first, mutate after: the switch bookkeeping needs the
+            // whole snapshot, so the target has to be named by index rather
+            // than held as a borrow into the workspace list.
+            let mut target: Option<(usize, usize, PaneId)> = None;
+            'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
+                for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
+                    if let Some(pane_id) = find_terminal_pane_id(&surface.root, session_id) {
+                        target = Some((workspace_index, surface_index, pane_id));
+                        break 'search;
+                    }
                 }
             }
+            let Some((workspace_index, surface_index, pane_id)) = target else {
+                return false;
+            };
+
+            let workspace = &mut snapshot.workspaces[workspace_index];
+            let workspace_id = workspace.workspace_id.clone();
+            workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
+            workspace.surfaces[surface_index].active_pane_id = pane_id;
+            // A session can be focused from another workspace (jump-to-session
+            // navigation): that is a workspace switch and owes the same visit
+            // bookkeeping as an explicit activation. Within the already-active
+            // workspace it is only a focus move — re-stamping would clear
+            // Review badges the user hasn't looked at.
+            if select && snapshot.active_workspace_id != workspace_id {
+                Self::record_workspace_switch(snapshot, &workspace_id.0);
+            }
+            true
+        })
+    }
+
+    /// Keep remote workspace mutations atomic with respect to selection too:
+    /// no snapshot or desktop activation can interleave with the mutation and
+    /// its selection preservation. Removing the desktop's workspace is the
+    /// sole exception: its normal fallback must remain valid.
+    fn with_workspace_selection<T>(
+        snapshot: &mut AppStateSnapshot,
+        select: bool,
+        mutate: impl FnOnce(&mut AppStateSnapshot) -> T,
+    ) -> T {
+        let desktop_selection = snapshot.active_workspace_id.clone();
+        let result = mutate(snapshot);
+        if !select
+            && (desktop_selection.0.is_empty()
+                || snapshot
+                    .workspaces
+                    .iter()
+                    .any(|w| w.workspace_id == desktop_selection))
+        {
+            snapshot.active_workspace_id = desktop_selection;
         }
-        let Some((workspace_index, surface_index, pane_id)) = target else {
+        result
+    }
+
+    /// Record a remote visit without moving the desktop selection or marking
+    /// the desktop's current workspace as departed.
+    pub fn touch_workspace(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        else {
             return false;
         };
-
-        let workspace = &mut snapshot.workspaces[workspace_index];
-        let workspace_id = workspace.workspace_id.clone();
-        workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
-        workspace.surfaces[surface_index].active_pane_id = pane_id;
-        // A session can be focused from another workspace (jump-to-session
-        // navigation): that is a workspace switch and owes the same visit
-        // bookkeeping as an explicit activation. Within the already-active
-        // workspace it is only a focus move — re-stamping would clear
-        // Review badges the user hasn't looked at.
-        if snapshot.active_workspace_id != workspace_id {
-            Self::record_workspace_switch(&mut snapshot, &workspace_id.0);
+        workspace.last_visited_at = Some(current_time_ms_signed());
+        workspace.notification_count = 0;
+        let pane_ids = workspace
+            .surfaces
+            .iter()
+            .find(|s| s.surface_id == workspace.active_surface_id)
+            .map(|s| collect_pane_ids_from_node(&s.root))
+            .unwrap_or_default();
+        for id in pane_ids {
+            if snapshot.pane_statuses.get(&id) == Some(&PaneStatus::Review) {
+                snapshot.pane_statuses.remove(&id);
+            }
+        }
+        for notification in &mut snapshot.notifications {
+            if notification.workspace_id.0 == workspace_id {
+                notification.read = true;
+            }
         }
         true
     }
@@ -1443,33 +1510,38 @@ impl AppStateStore {
     }
 
     pub fn activate_pane(&self, pane_id: &str) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
+        self.activate_pane_with_selection(pane_id, true)
+    }
 
-        // Same locate-then-mutate shape as `activate_terminal_session`,
-        // for the same borrow reason.
-        let mut target: Option<(usize, usize)> = None;
-        'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
-            for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
-                if pane_tree_contains_pane(&surface.root, pane_id) {
-                    target = Some((workspace_index, surface_index));
-                    break 'search;
+    pub fn activate_pane_with_selection(&self, pane_id: &str, select: bool) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            // Same locate-then-mutate shape as `activate_terminal_session`,
+            // for the same borrow reason.
+            let mut target: Option<(usize, usize)> = None;
+            'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
+                for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
+                    if pane_tree_contains_pane(&surface.root, pane_id) {
+                        target = Some((workspace_index, surface_index));
+                        break 'search;
+                    }
                 }
             }
-        }
-        let Some((workspace_index, surface_index)) = target else {
-            return false;
-        };
+            let Some((workspace_index, surface_index)) = target else {
+                return false;
+            };
 
-        let workspace = &mut snapshot.workspaces[workspace_index];
-        let workspace_id = workspace.workspace_id.clone();
-        workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
-        workspace.surfaces[surface_index].active_pane_id = PaneId(pane_id.to_string());
-        // Cross-workspace pane focus is a workspace switch; same-workspace
-        // focus is not (see `activate_terminal_session`).
-        if snapshot.active_workspace_id != workspace_id {
-            Self::record_workspace_switch(&mut snapshot, &workspace_id.0);
-        }
-        true
+            let workspace = &mut snapshot.workspaces[workspace_index];
+            let workspace_id = workspace.workspace_id.clone();
+            workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
+            workspace.surfaces[surface_index].active_pane_id = PaneId(pane_id.to_string());
+            // Cross-workspace pane focus is a workspace switch; same-workspace
+            // focus is not (see `activate_terminal_session`).
+            if select && snapshot.active_workspace_id != workspace_id {
+                Self::record_workspace_switch(snapshot, &workspace_id.0);
+            }
+            true
+        })
     }
 
     pub fn create_workspace(&self) -> WorkspaceId {
@@ -1510,8 +1582,18 @@ impl AppStateStore {
     /// Create a workspace with no tabs, surfaces, or terminal sessions.
     /// Used by "Add repository" so the empty workspace state shows.
     pub fn create_empty_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
+        self.create_empty_workspace_at_path_with_selection(cwd_path, true)
+    }
+
+    pub fn create_empty_workspace_at_path_with_selection(
+        &self,
+        cwd_path: PathBuf,
+        select: bool,
+    ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
-        Self::create_empty_workspace_at_path_locked(&mut snapshot, cwd_path)
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            Self::create_empty_workspace_at_path_locked(snapshot, cwd_path)
+        })
     }
 
     /// Body of [`Self::create_empty_workspace_at_path`], factored out so
@@ -1872,8 +1954,19 @@ impl AppStateStore {
         cwd_path: PathBuf,
         layout: WorkspacePresetLayout,
     ) -> WorkspaceId {
+        self.create_workspace_with_layout_with_selection(cwd_path, layout, true)
+    }
+
+    pub fn create_workspace_with_layout_with_selection(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+        select: bool,
+    ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
-        Self::create_workspace_with_layout_locked(&mut snapshot, cwd_path, layout)
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            Self::create_workspace_with_layout_locked(snapshot, cwd_path, layout)
+        })
     }
 
     /// Body of [`Self::create_workspace_with_layout`], factored out so
@@ -2029,75 +2122,133 @@ impl AppStateStore {
     where
         F: FnOnce(&AppStateSnapshot) -> Option<String>,
     {
-        let mut snapshot = self.inner.lock().unwrap();
-        if let Some(existing_id) = probe(&snapshot) {
-            return WorktreeWorkspaceClaim::Adopted(existing_id);
-        }
-        let workspace_id =
-            Self::create_workspace_with_layout_locked(&mut snapshot, cwd_path, layout);
-        if let Some(workspace) = snapshot
-            .workspaces
-            .iter_mut()
-            .find(|w| w.workspace_id == workspace_id)
-        {
-            workspace.worktree_path = Some(worktree_path);
-            workspace.title = title;
-        }
-        WorktreeWorkspaceClaim::Created(workspace_id)
+        self.adopt_or_create_worktree_workspace_with_selection(
+            cwd_path,
+            layout,
+            worktree_path,
+            title,
+            probe,
+            true,
+            None,
+        )
     }
 
-    pub fn create_browser_pane(&self, pane_id: &str, url: Option<&str>) -> Result<(PaneId, BrowserId), String> {
+    pub fn adopt_or_create_worktree_workspace_with_selection<F>(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+        worktree_path: String,
+        title: String,
+        probe: F,
+        select: bool,
+        initial_chat: Option<InitialChatPane>,
+    ) -> WorktreeWorkspaceClaim
+    where
+        F: FnOnce(&AppStateSnapshot) -> Option<String>,
+    {
         let mut snapshot = self.inner.lock().unwrap();
-        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
-            .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            if let Some(existing_id) = probe(&snapshot) {
+                return WorktreeWorkspaceClaim::Adopted(existing_id);
+            }
+            let workspace_id =
+                Self::create_workspace_with_layout_locked(snapshot, cwd_path, layout);
+            if let Some(workspace) = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id == workspace_id)
+            {
+                workspace.worktree_path = Some(worktree_path);
+                workspace.title = title;
+            }
+            if let Some(chat) = initial_chat {
+                let cwd = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id == workspace_id)
+                    .map(|w| w.cwd.clone());
+                Self::create_chat_pane_locked(
+                    snapshot,
+                    &workspace_id.0,
+                    Some(chat.provider),
+                    cwd,
+                    None,
+                    Some(chat.thread_id),
+                )
+                .expect("new workspace accepts its initial chat pane");
+            }
+            WorktreeWorkspaceClaim::Created(workspace_id)
+        })
+    }
 
-        let browser_id = BrowserId(next_id("browser"));
-        let new_pane_id = PaneId(next_id("pane"));
-        let split_pane_id = PaneId(next_id("pane"));
-        let title = format!("Browser {}", snapshot.browser_sessions.len() + 1);
-        let initial_url = url.unwrap_or(DEFAULT_BROWSER_URL).to_string();
+    pub fn create_browser_pane(
+        &self,
+        pane_id: &str,
+        url: Option<&str>,
+    ) -> Result<(PaneId, BrowserId), String> {
+        self.create_browser_pane_with_selection(pane_id, url, true)
+    }
 
-        snapshot.browser_sessions.push(BrowserSessionSnapshot {
-            browser_id: browser_id.clone(),
-            title: title.clone(),
-            current_url: Some(initial_url.clone()),
-            history: vec![initial_url],
-            history_index: 0,
-            is_loading: false,
-            last_error: None,
-            agent_session_name: None,
-        });
+    pub fn create_browser_pane_with_selection(
+        &self,
+        pane_id: &str,
+        url: Option<&str>,
+        select: bool,
+    ) -> Result<(PaneId, BrowserId), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            let (workspace_index, surface_index) =
+                find_pane_location(&snapshot.workspaces, pane_id)
+                    .ok_or_else(|| format!("No pane found for {pane_id}"))?;
 
-        let workspace = snapshot
-            .workspaces
-            .get_mut(workspace_index)
-            .ok_or_else(|| "Workspace disappeared while creating browser pane".to_string())?;
-        let surface = workspace
-            .surfaces
-            .get_mut(surface_index)
-            .ok_or_else(|| "Surface disappeared while creating browser pane".to_string())?;
+            let browser_id = BrowserId(next_id("browser"));
+            let new_pane_id = PaneId(next_id("pane"));
+            let split_pane_id = PaneId(next_id("pane"));
+            let title = format!("Browser {}", snapshot.browser_sessions.len() + 1);
+            let initial_url = url.unwrap_or(DEFAULT_BROWSER_URL).to_string();
 
-        let inserted = insert_split_at_pane(
-            &mut surface.root,
-            pane_id,
-            split_pane_id,
-            SplitDirection::Horizontal,
-            PaneNodeSnapshot::Browser {
-                pane_id: new_pane_id.clone(),
+            snapshot.browser_sessions.push(BrowserSessionSnapshot {
                 browser_id: browser_id.clone(),
-                title,
-            },
-        );
+                title: title.clone(),
+                current_url: Some(initial_url.clone()),
+                history: vec![initial_url],
+                history_index: 0,
+                is_loading: false,
+                last_error: None,
+                agent_session_name: None,
+            });
 
-        if !inserted {
-            return Err(format!("Failed to create browser pane next to {pane_id}"));
-        }
+            let workspace = snapshot
+                .workspaces
+                .get_mut(workspace_index)
+                .ok_or_else(|| "Workspace disappeared while creating browser pane".to_string())?;
+            let surface = workspace
+                .surfaces
+                .get_mut(surface_index)
+                .ok_or_else(|| "Surface disappeared while creating browser pane".to_string())?;
 
-        workspace.active_surface_id = surface.surface_id.clone();
-        surface.active_pane_id = new_pane_id.clone();
-        snapshot.active_workspace_id = workspace.workspace_id.clone();
+            let inserted = insert_split_at_pane(
+                &mut surface.root,
+                pane_id,
+                split_pane_id,
+                SplitDirection::Horizontal,
+                PaneNodeSnapshot::Browser {
+                    pane_id: new_pane_id.clone(),
+                    browser_id: browser_id.clone(),
+                    title,
+                },
+            );
 
-        Ok((new_pane_id, browser_id))
+            if !inserted {
+                return Err(format!("Failed to create browser pane next to {pane_id}"));
+            }
+
+            workspace.active_surface_id = surface.surface_id.clone();
+            surface.active_pane_id = new_pane_id.clone();
+            snapshot.active_workspace_id = workspace.workspace_id.clone();
+
+            Ok((new_pane_id, browser_id))
+        })
     }
 
     /// Spawn a new agent-chat pane inside the given workspace.
@@ -2140,8 +2291,55 @@ impl AppStateStore {
         launch_mode: Option<crate::presets::LaunchMode>,
         thread_id: Option<String>,
     ) -> Result<(PaneId, bool), String> {
-        let mut snapshot = self.inner.lock().unwrap();
+        self.create_or_reuse_agent_chat_pane_with_selection(
+            workspace_id,
+            provider,
+            cwd,
+            launch_mode,
+            thread_id,
+            true,
+        )
+    }
 
+    pub fn create_or_reuse_agent_chat_pane_with_selection(
+        &self,
+        workspace_id: &str,
+        provider: Option<crate::agent_provider::ProviderKind>,
+        cwd: Option<String>,
+        launch_mode: Option<crate::presets::LaunchMode>,
+        thread_id: Option<String>,
+        select: bool,
+    ) -> Result<(PaneId, bool), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let desktop_selection = snapshot.active_workspace_id.clone();
+        let result = Self::create_chat_pane_locked(
+            &mut snapshot,
+            workspace_id,
+            provider,
+            cwd,
+            launch_mode,
+            thread_id,
+        );
+        if !select
+            && (desktop_selection.0.is_empty()
+                || snapshot
+                    .workspaces
+                    .iter()
+                    .any(|w| w.workspace_id == desktop_selection))
+        {
+            snapshot.active_workspace_id = desktop_selection;
+        }
+        result
+    }
+
+    fn create_chat_pane_locked(
+        snapshot: &mut AppStateSnapshot,
+        workspace_id: &str,
+        provider: Option<crate::agent_provider::ProviderKind>,
+        cwd: Option<String>,
+        launch_mode: Option<crate::presets::LaunchMode>,
+        thread_id: Option<String>,
+    ) -> Result<(PaneId, bool), String> {
         let workspace_index = snapshot
             .workspaces
             .iter()
@@ -2217,10 +2415,7 @@ impl AppStateStore {
         // working in: clicking the button should mirror CLI presets
         // (new tab on plain click, split on shift+click), not always
         // split.
-        let force_new_tab = matches!(
-            launch_mode,
-            Some(crate::presets::LaunchMode::NewTab)
-        );
+        let force_new_tab = matches!(launch_mode, Some(crate::presets::LaunchMode::NewTab));
 
         // Find the active surface. If the workspace has no surfaces
         // (empty workspace state) OR the caller wants a new tab,
@@ -2284,6 +2479,31 @@ impl AppStateStore {
         snapshot.active_workspace_id = active_workspace_id;
 
         Ok((new_pane_id, true))
+    }
+
+    pub fn materialize_chat_workspace(
+        &self,
+        cwd: PathBuf,
+        chat: InitialChatPane,
+        select: bool,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let desktop_selection = snapshot.active_workspace_id.clone();
+        let workspace_id = Self::create_empty_workspace_at_path_locked(&mut snapshot, cwd.clone());
+        // A new empty workspace always accepts its first pane.
+        Self::create_chat_pane_locked(
+            &mut snapshot,
+            &workspace_id.0,
+            Some(chat.provider),
+            Some(cwd.display().to_string()),
+            None,
+            Some(chat.thread_id),
+        )
+        .expect("new workspace accepts its initial chat pane");
+        if !select {
+            snapshot.active_workspace_id = desktop_selection;
+        }
+        workspace_id
     }
 
     /// Return the [`ThreadId`] bound to the given chat pane, if any.
@@ -3197,7 +3417,9 @@ impl AppStateStore {
             .retain(|s| s.workspace_id.0 != workspace_id);
         let fallback_workspace = snapshot
             .workspaces
-            .first()
+            .iter()
+            .find(|w| w.workspace_id == snapshot.active_workspace_id)
+            .or_else(|| snapshot.workspaces.first())
             .map(|workspace| workspace.workspace_id.clone())
             .ok_or_else(|| "No fallback workspace available".to_string())?;
         snapshot.active_workspace_id = fallback_workspace.clone();
@@ -3431,76 +3653,88 @@ impl AppStateStore {
         pane_id: &str,
         direction: SplitDirection,
     ) -> Result<SessionId, String> {
+        self.split_pane_with_selection(pane_id, direction, true)
+    }
+
+    pub fn split_pane_with_selection(
+        &self,
+        pane_id: &str,
+        direction: SplitDirection,
+        select: bool,
+    ) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
-        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
-            .ok_or_else(|| format!("No pane found for {pane_id}"))?;
-        let workspace_terminal_count = snapshot
-            .workspaces
-            .get(workspace_index)
-            .map(terminal_count_for_workspace)
-            .ok_or_else(|| "Workspace disappeared while splitting pane".to_string())?;
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            let (workspace_index, surface_index) =
+                find_pane_location(&snapshot.workspaces, pane_id)
+                    .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+            let workspace_terminal_count = snapshot
+                .workspaces
+                .get(workspace_index)
+                .map(terminal_count_for_workspace)
+                .ok_or_else(|| "Workspace disappeared while splitting pane".to_string())?;
 
-        if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
-            return Err(format!(
-                "Reached the current workspace terminal limit of {MAX_TERMINAL_SESSIONS}"
-            ));
-        }
+            if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
+                return Err(format!(
+                    "Reached the current workspace terminal limit of {MAX_TERMINAL_SESSIONS}"
+                ));
+            }
 
-        let session_id = SessionId(next_id("session"));
-        let new_pane_id = PaneId(next_id("pane"));
-        let split_pane_id = PaneId(next_id("pane"));
-        let cwd = snapshot
-            .workspaces
-            .get(workspace_index)
-            .map(|w| w.cwd.clone())
-            .unwrap_or_else(|| current_project_root().display().to_string());
-        let shell = env::var("SHELL").ok();
-        let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
+            let session_id = SessionId(next_id("session"));
+            let new_pane_id = PaneId(next_id("pane"));
+            let split_pane_id = PaneId(next_id("pane"));
+            let cwd = snapshot
+                .workspaces
+                .get(workspace_index)
+                .map(|w| w.cwd.clone())
+                .unwrap_or_else(|| current_project_root().display().to_string());
+            let shell = env::var("SHELL").ok();
+            let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
-        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
-            session_id: session_id.clone(),
-            title: title.clone(),
-            shell,
-            cwd,
-            cols: 80,
-            rows: 24,
-            state: TerminalSessionState::Starting,
-            last_message: Some("Preparing shell session".into()),
-            exit_code: None,
-            original_command: None,
-            adapter_captures: Default::default(),
-        });
-
-        let workspace = snapshot
-            .workspaces
-            .get_mut(workspace_index)
-            .ok_or_else(|| "Workspace disappeared while splitting pane".to_string())?;
-        let surface = workspace
-            .surfaces
-            .get_mut(surface_index)
-            .ok_or_else(|| "Surface disappeared while splitting pane".to_string())?;
-
-        let inserted = insert_split_at_pane(
-            &mut surface.root,
-            pane_id,
-            split_pane_id,
-            direction,
-            PaneNodeSnapshot::Terminal {
-                pane_id: new_pane_id.clone(),
+            snapshot.terminal_sessions.push(TerminalSessionSnapshot {
                 session_id: session_id.clone(),
                 title: title.clone(),
-            },
-        );
+                shell,
+                cwd,
+                cols: 80,
+                rows: 24,
+                state: TerminalSessionState::Starting,
+                last_message: Some("Preparing shell session".into()),
+                exit_code: None,
+                original_command: None,
+                adapter_captures: Default::default(),
+            });
 
-        if !inserted {
-            return Err(format!("Failed to split pane {pane_id}"));
-        }
+            let workspace = snapshot
+                .workspaces
+                .get_mut(workspace_index)
+                .ok_or_else(|| "Workspace disappeared while splitting pane".to_string())?;
+            let surface = workspace
+                .surfaces
+                .get_mut(surface_index)
+                .ok_or_else(|| "Surface disappeared while splitting pane".to_string())?;
 
-        workspace.active_surface_id = surface.surface_id.clone();
-        surface.active_pane_id = new_pane_id;
-        snapshot.active_workspace_id = workspace.workspace_id.clone();
+            let inserted = insert_split_at_pane(
+                &mut surface.root,
+                pane_id,
+                split_pane_id,
+                direction,
+                PaneNodeSnapshot::Terminal {
+                    pane_id: new_pane_id.clone(),
+                    session_id: session_id.clone(),
+                    title: title.clone(),
+                },
+            );
 
-        Ok(session_id)
+            if !inserted {
+                return Err(format!("Failed to split pane {pane_id}"));
+            }
+
+            workspace.active_surface_id = surface.surface_id.clone();
+            surface.active_pane_id = new_pane_id;
+            snapshot.active_workspace_id = workspace.workspace_id.clone();
+
+            Ok(session_id)
+        })
     }
 
     pub fn resize_split(&self, pane_id: &str, child_sizes: Vec<f32>) -> Result<(), String> {
@@ -3546,52 +3780,61 @@ impl AppStateStore {
     }
 
     pub fn close_terminal_session(&self, session_id: &str) -> Result<SessionId, String> {
+        self.close_terminal_session_with_selection(session_id, true)
+    }
+
+    pub fn close_terminal_session_with_selection(
+        &self,
+        session_id: &str,
+        select: bool,
+    ) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
-
-        if snapshot.terminal_sessions.len() <= 1 {
-            return Err("Cannot close the last terminal session".into());
-        }
-
-        let session_index = snapshot
-            .terminal_sessions
-            .iter()
-            .position(|session| session.session_id.0 == session_id)
-            .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
-        snapshot.terminal_sessions.remove(session_index);
-
-        let mut fallback_session_id: Option<SessionId> = None;
-        let mut next_active_workspace_id: Option<WorkspaceId> = None;
-
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
-                if !pane_tree_contains_session(&surface.root, session_id) {
-                    continue;
-                }
-
-                let updated_root = remove_terminal_from_tree(&surface.root, session_id)
-                    .ok_or_else(|| {
-                        format!("Unable to remove session {session_id} from pane tree")
-                    })?;
-                let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
-                    .ok_or_else(|| {
-                        "Pane tree lost its last terminal pane unexpectedly".to_string()
-                    })?;
-
-                surface.root = updated_root;
-                surface.active_pane_id = next_pane_id;
-                workspace.active_surface_id = surface.surface_id.clone();
-                next_active_workspace_id = Some(workspace.workspace_id.clone());
-                fallback_session_id = Some(next_session_id);
-                break;
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            if snapshot.terminal_sessions.len() <= 1 {
+                return Err("Cannot close the last terminal session".into());
             }
-        }
 
-        if let Some(workspace_id) = next_active_workspace_id {
-            snapshot.active_workspace_id = workspace_id;
-        }
+            let session_index = snapshot
+                .terminal_sessions
+                .iter()
+                .position(|session| session.session_id.0 == session_id)
+                .ok_or_else(|| format!("No terminal session found for {session_id}"))?;
+            snapshot.terminal_sessions.remove(session_index);
 
-        fallback_session_id
-            .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
+            let mut fallback_session_id: Option<SessionId> = None;
+            let mut next_active_workspace_id: Option<WorkspaceId> = None;
+
+            for workspace in &mut snapshot.workspaces {
+                for surface in &mut workspace.surfaces {
+                    if !pane_tree_contains_session(&surface.root, session_id) {
+                        continue;
+                    }
+
+                    let updated_root = remove_terminal_from_tree(&surface.root, session_id)
+                        .ok_or_else(|| {
+                            format!("Unable to remove session {session_id} from pane tree")
+                        })?;
+                    let (next_pane_id, next_session_id) = first_terminal_pane(&updated_root)
+                        .ok_or_else(|| {
+                            "Pane tree lost its last terminal pane unexpectedly".to_string()
+                        })?;
+
+                    surface.root = updated_root;
+                    surface.active_pane_id = next_pane_id;
+                    workspace.active_surface_id = surface.surface_id.clone();
+                    next_active_workspace_id = Some(workspace.workspace_id.clone());
+                    fallback_session_id = Some(next_session_id);
+                    break;
+                }
+            }
+
+            if let Some(workspace_id) = next_active_workspace_id {
+                snapshot.active_workspace_id = workspace_id;
+            }
+
+            fallback_session_id
+                .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
+        })
     }
 
     /// Look up the `(provider, thread_id)` pair for an `AgentChat` pane.
@@ -3614,105 +3857,118 @@ impl AppStateStore {
     }
 
     pub fn close_pane(&self, pane_id: &str) -> Result<Option<SessionId>, String> {
+        self.close_pane_with_selection(pane_id, true)
+    }
+
+    pub fn close_pane_with_selection(
+        &self,
+        pane_id: &str,
+        select: bool,
+    ) -> Result<Option<SessionId>, String> {
         let mut snapshot = self.inner.lock().unwrap();
-        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
-            .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            let (workspace_index, surface_index) =
+                find_pane_location(&snapshot.workspaces, pane_id)
+                    .ok_or_else(|| format!("No pane found for {pane_id}"))?;
 
-        let target_pane = PaneId(pane_id.to_string());
-        let removed_session_id = {
-            let surface = snapshot
-                .workspaces
-                .get(workspace_index)
-                .and_then(|workspace| workspace.surfaces.get(surface_index))
-                .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-            session_id_for_pane(&surface.root, &target_pane)
-        };
-        let removed_browser_id = {
-            let surface = snapshot
-                .workspaces
-                .get(workspace_index)
-                .and_then(|workspace| workspace.surfaces.get(surface_index))
-                .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
-            browser_id_for_pane(&surface.root, &target_pane)
-        };
+            let target_pane = PaneId(pane_id.to_string());
+            let removed_session_id = {
+                let surface = snapshot
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.surfaces.get(surface_index))
+                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
+                session_id_for_pane(&surface.root, &target_pane)
+            };
+            let removed_browser_id = {
+                let surface = snapshot
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.surfaces.get(surface_index))
+                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
+                browser_id_for_pane(&surface.root, &target_pane)
+            };
 
-        let active_workspace_id: WorkspaceId;
+            let active_workspace_id: WorkspaceId;
 
-        {
-            let workspace = snapshot
-                .workspaces
-                .get_mut(workspace_index)
-                .ok_or_else(|| "Workspace disappeared while closing pane".to_string())?;
-            let surface = workspace
-                .surfaces
-                .get_mut(surface_index)
-                .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
+            {
+                let workspace = snapshot
+                    .workspaces
+                    .get_mut(workspace_index)
+                    .ok_or_else(|| "Workspace disappeared while closing pane".to_string())?;
+                let surface = workspace
+                    .surfaces
+                    .get_mut(surface_index)
+                    .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
 
-            let ordered_before = collect_leaf_pane_ids(&surface.root);
-            let active_before = surface.active_pane_id.clone();
-            let updated_root = remove_pane_from_tree(&surface.root, pane_id);
+                let ordered_before = collect_leaf_pane_ids(&surface.root);
+                let active_before = surface.active_pane_id.clone();
+                let updated_root = remove_pane_from_tree(&surface.root, pane_id);
 
-            if let Some(new_root) = updated_root {
-                // Pane removed but surface still has content. Keep focus on the
-                // current pane when a different pane was closed; when the active
-                // pane itself was closed, move to the adjacent pane (next, then
-                // previous) rather than the leftmost leaf.
-                let next_active_pane =
-                    active_id_after_removal(&ordered_before, &active_before, pane_id)
-                        .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
-                        .or_else(|| first_leaf_pane_id(&new_root))
-                        .ok_or_else(|| "No fallback pane available after close".to_string())?;
-                surface.root = new_root;
-                surface.active_pane_id = next_active_pane;
-                workspace.active_surface_id = surface.surface_id.clone();
-            } else {
-                // Last pane closed — remove the surface and its tab
-                let surface_id = workspace.surfaces[surface_index].surface_id.clone();
-                workspace.surfaces.remove(surface_index);
-                // Index of the tab about to be removed, so we can focus its
-                // neighbor instead of always jumping to the first tab.
-                let removed_tab_index = workspace
-                    .tabs
-                    .iter()
-                    .position(|t| t.surface_id.as_ref() == Some(&surface_id));
-                let was_active = workspace.active_surface_id == surface_id;
-                workspace.tabs.retain(|t| t.surface_id.as_ref() != Some(&surface_id));
-                if workspace.tabs.is_empty() {
-                    workspace.active_tab_id = String::new();
-                    workspace.active_surface_id = SurfaceId(String::new());
-                } else if was_active {
-                    // Focus the adjacent tab (next, then previous) — matches
-                    // close_tab and active_id_after_removal.
-                    let new_index = match removed_tab_index {
-                        Some(idx) if idx < workspace.tabs.len() => idx,
-                        Some(idx) => idx.saturating_sub(1),
-                        None => 0,
-                    };
-                    let new_tab = &workspace.tabs[new_index];
-                    workspace.active_tab_id = new_tab.tab_id.clone();
-                    if let Some(ref sid) = new_tab.surface_id {
-                        workspace.active_surface_id = sid.clone();
+                if let Some(new_root) = updated_root {
+                    // Pane removed but surface still has content. Keep focus on the
+                    // current pane when a different pane was closed; when the active
+                    // pane itself was closed, move to the adjacent pane (next, then
+                    // previous) rather than the leftmost leaf.
+                    let next_active_pane =
+                        active_id_after_removal(&ordered_before, &active_before, pane_id)
+                            .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
+                            .or_else(|| first_leaf_pane_id(&new_root))
+                            .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                    surface.root = new_root;
+                    surface.active_pane_id = next_active_pane;
+                    workspace.active_surface_id = surface.surface_id.clone();
+                } else {
+                    // Last pane closed — remove the surface and its tab
+                    let surface_id = workspace.surfaces[surface_index].surface_id.clone();
+                    workspace.surfaces.remove(surface_index);
+                    // Index of the tab about to be removed, so we can focus its
+                    // neighbor instead of always jumping to the first tab.
+                    let removed_tab_index = workspace
+                        .tabs
+                        .iter()
+                        .position(|t| t.surface_id.as_ref() == Some(&surface_id));
+                    let was_active = workspace.active_surface_id == surface_id;
+                    workspace
+                        .tabs
+                        .retain(|t| t.surface_id.as_ref() != Some(&surface_id));
+                    if workspace.tabs.is_empty() {
+                        workspace.active_tab_id = String::new();
+                        workspace.active_surface_id = SurfaceId(String::new());
+                    } else if was_active {
+                        // Focus the adjacent tab (next, then previous) — matches
+                        // close_tab and active_id_after_removal.
+                        let new_index = match removed_tab_index {
+                            Some(idx) if idx < workspace.tabs.len() => idx,
+                            Some(idx) => idx.saturating_sub(1),
+                            None => 0,
+                        };
+                        let new_tab = &workspace.tabs[new_index];
+                        workspace.active_tab_id = new_tab.tab_id.clone();
+                        if let Some(ref sid) = new_tab.surface_id {
+                            workspace.active_surface_id = sid.clone();
+                        }
                     }
                 }
+                active_workspace_id = workspace.workspace_id.clone();
             }
-            active_workspace_id = workspace.workspace_id.clone();
-        }
 
-        snapshot.active_workspace_id = active_workspace_id;
+            snapshot.active_workspace_id = active_workspace_id;
 
-        if let Some(session_id) = &removed_session_id {
-            snapshot
-                .terminal_sessions
-                .retain(|session| session.session_id != *session_id);
-        }
+            if let Some(session_id) = &removed_session_id {
+                snapshot
+                    .terminal_sessions
+                    .retain(|session| session.session_id != *session_id);
+            }
 
-        if let Some(browser_id) = removed_browser_id {
-            snapshot
-                .browser_sessions
-                .retain(|browser| browser.browser_id != browser_id);
-        }
+            if let Some(browser_id) = removed_browser_id {
+                snapshot
+                    .browser_sessions
+                    .retain(|browser| browser.browser_id != browser_id);
+            }
 
-        Ok(removed_session_id)
+            Ok(removed_session_id)
+        })
     }
 
     pub fn pane_browser_id(&self, pane_id: &str) -> Option<String> {
@@ -4056,61 +4312,69 @@ impl AppStateStore {
     }
 
     pub fn swap_panes(&self, source_pane_id: &str, target_pane_id: &str) -> Result<(), String> {
-        if source_pane_id == target_pane_id {
-            return Ok(());
-        }
+        self.swap_panes_with_selection(source_pane_id, target_pane_id, true)
+    }
 
+    pub fn swap_panes_with_selection(
+        &self,
+        source_pane_id: &str,
+        target_pane_id: &str,
+        select: bool,
+    ) -> Result<(), String> {
         let mut snapshot = self.inner.lock().unwrap();
+        Self::with_workspace_selection(&mut snapshot, select, |snapshot| {
+            let source_location = find_pane_location(&snapshot.workspaces, source_pane_id)
+                .ok_or_else(|| format!("No pane found for {source_pane_id}"))?;
+            let target_location = find_pane_location(&snapshot.workspaces, target_pane_id)
+                .ok_or_else(|| format!("No pane found for {target_pane_id}"))?;
 
-        let source_location = find_pane_location(&snapshot.workspaces, source_pane_id)
-            .ok_or_else(|| format!("No pane found for {source_pane_id}"))?;
-        let target_location = find_pane_location(&snapshot.workspaces, target_pane_id)
-            .ok_or_else(|| format!("No pane found for {target_pane_id}"))?;
+            if source_location != target_location {
+                return Err(
+                    "Pane swapping is currently limited to the same workspace surface".into(),
+                );
+            }
 
-        if source_location != target_location {
-            return Err("Pane swapping is currently limited to the same workspace surface".into());
-        }
+            let (workspace_index, surface_index) = source_location;
+            let workspace = snapshot
+                .workspaces
+                .get_mut(workspace_index)
+                .ok_or_else(|| "Workspace disappeared while swapping panes".to_string())?;
+            let surface = workspace
+                .surfaces
+                .get_mut(surface_index)
+                .ok_or_else(|| "Surface disappeared while swapping panes".to_string())?;
 
-        let (workspace_index, surface_index) = source_location;
-        let workspace = snapshot
-            .workspaces
-            .get_mut(workspace_index)
-            .ok_or_else(|| "Workspace disappeared while swapping panes".to_string())?;
-        let surface = workspace
-            .surfaces
-            .get_mut(surface_index)
-            .ok_or_else(|| "Surface disappeared while swapping panes".to_string())?;
+            let source_node = clone_pane_node(&surface.root, source_pane_id)
+                .ok_or_else(|| format!("Failed to clone source pane {source_pane_id}"))?;
+            let target_node = clone_pane_node(&surface.root, target_pane_id)
+                .ok_or_else(|| format!("Failed to clone target pane {target_pane_id}"))?;
+            let temp_pane_id = PaneId(next_id("pane-swap-temp"));
+            let temp_source_node = with_pane_id(source_node.clone(), temp_pane_id.clone());
 
-        let source_node = clone_pane_node(&surface.root, source_pane_id)
-            .ok_or_else(|| format!("Failed to clone source pane {source_pane_id}"))?;
-        let target_node = clone_pane_node(&surface.root, target_pane_id)
-            .ok_or_else(|| format!("Failed to clone target pane {target_pane_id}"))?;
-        let temp_pane_id = PaneId(next_id("pane-swap-temp"));
-        let temp_source_node = with_pane_id(source_node.clone(), temp_pane_id.clone());
+            if !replace_pane_node(&mut surface.root, source_pane_id, temp_source_node) {
+                return Err(format!("Failed to replace source pane {source_pane_id}"));
+            }
 
-        if !replace_pane_node(&mut surface.root, source_pane_id, temp_source_node) {
-            return Err(format!("Failed to replace source pane {source_pane_id}"));
-        }
+            if !replace_pane_node(&mut surface.root, target_pane_id, source_node.clone()) {
+                return Err(format!("Failed to replace target pane {target_pane_id}"));
+            }
 
-        if !replace_pane_node(&mut surface.root, target_pane_id, source_node.clone()) {
-            return Err(format!("Failed to replace target pane {target_pane_id}"));
-        }
+            if !replace_pane_node(&mut surface.root, &temp_pane_id.0, target_node.clone()) {
+                return Err(format!(
+                    "Failed to replace temporary pane {}",
+                    temp_pane_id.0
+                ));
+            }
 
-        if !replace_pane_node(&mut surface.root, &temp_pane_id.0, target_node.clone()) {
-            return Err(format!(
-                "Failed to replace temporary pane {}",
-                temp_pane_id.0
-            ));
-        }
+            if surface.active_pane_id.0 == source_pane_id {
+                surface.active_pane_id = pane_id_from_node(&target_node);
+            } else if surface.active_pane_id.0 == target_pane_id {
+                surface.active_pane_id = pane_id_from_node(&source_node);
+            }
 
-        if surface.active_pane_id.0 == source_pane_id {
-            surface.active_pane_id = pane_id_from_node(&target_node);
-        } else if surface.active_pane_id.0 == target_pane_id {
-            surface.active_pane_id = pane_id_from_node(&source_node);
-        }
-
-        snapshot.active_workspace_id = workspace.workspace_id.clone();
-        Ok(())
+            snapshot.active_workspace_id = workspace.workspace_id.clone();
+            Ok(())
+        })
     }
 
     pub fn update_browser_url(&self, browser_id: &str, url: String) -> Result<(), String> {

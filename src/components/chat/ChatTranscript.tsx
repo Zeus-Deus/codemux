@@ -17,6 +17,7 @@ import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
   messages: ChatViewItem[];
+  compacting?: boolean;
   /** True while a turn is in flight — either the backend has
    *  acknowledged streaming OR the composer's optimistic flag is set.
    *  Drives the transcript-tail "working" marker. */
@@ -80,6 +81,9 @@ interface Props {
   workspaceId?: string | null;
   /** Active worktree root for resolving relative source references. */
   cwd?: string | null;
+  /** Forwarded to `MessageList`: transitions of "reader has left the live
+   *  edge", which dims the composer overlay. Must be stable. */
+  onReadingBackChange?: (readingBack: boolean) => void;
 }
 
 /**
@@ -95,6 +99,7 @@ interface Props {
  */
 export const ChatTranscript = memo(function ChatTranscript({
   messages,
+  compacting = false,
   streaming,
   stalled,
   interrupted,
@@ -119,6 +124,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   onEnterSubagent,
   workspaceId,
   cwd,
+  onReadingBackChange,
 }: Props) {
   const binding = useContext(TranscriptBindingContext);
   const cacheKey = binding && binding.workspaceId === workspaceId && binding.threadKey === threadKey &&
@@ -142,6 +148,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         messages={messages}
         showThinking={showThinking}
         streaming={streaming}
+        compacting={compacting}
         stalled={stalled}
         interrupted={interrupted}
         sendAnchor={sendAnchor}
@@ -165,6 +172,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         onEnterSubagent={onEnterSubagent}
         workspaceId={workspaceId}
         cwd={cwd}
+        onReadingBackChange={onReadingBackChange}
       />
   );
   // Portals follow React ancestry, not the physical slot's ancestry. The

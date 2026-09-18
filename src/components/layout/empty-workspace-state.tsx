@@ -6,7 +6,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { useAppStore } from "@/stores/app-store";
+import { selectActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
   createTab,
@@ -63,7 +63,7 @@ export function EmptyWorkspaceState() {
   // `appState` re-rendered on every snapshot / delta commit.
   const ws = useAppStore((s) =>
     s.appState?.workspaces.find(
-      (w) => w.workspace_id === s.appState?.active_workspace_id,
+      (w) => w.workspace_id === selectActiveWorkspaceId(s),
     ) ?? null,
   );
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);

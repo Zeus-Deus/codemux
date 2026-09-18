@@ -1,3 +1,5 @@
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { loadRemoteWorkspace, saveRemoteWorkspace } from "@/remote/client-view";
 import { useMemo } from "react";
 import { create } from "zustand";
 import type {
@@ -14,6 +16,8 @@ import type { HostView } from "@/tauri/commands";
 
 interface AppStore {
   appState: AppStateSnapshot | null;
+  remoteActiveWorkspaceId: string | null;
+  setRemoteActiveWorkspace: (workspaceId: string) => void;
   /** Cached `$HOME` string from the `get_home_dir` Tauri call. Null
    *  until hydrated at App mount. Consumers (project-group selector,
    *  lazy-draft home detection) should treat null as "not yet known"
@@ -441,13 +445,39 @@ export function confirmsPending(
   next: Pick<AppStateSnapshot, "active_workspace_id">,
 ): boolean {
   return (
+    !isRemoteClient() &&
     state.pendingActiveWorkspaceId !== null &&
     next.active_workspace_id === state.pendingActiveWorkspaceId
   );
 }
 
+/** Seed once, keep selection across reconnects, and choose a local fallback
+ * only when our workspace is removed. The shared snapshot stays untouched. */
+function reconcileRemoteSelection(
+  state: Pick<AppStore, "remoteActiveWorkspaceId">,
+  next: AppStateSnapshot,
+) {
+  if (!isRemoteClient()) return {};
+  const current = state.remoteActiveWorkspaceId ?? loadRemoteWorkspace();
+  const exists = (id: string | null) => next.workspaces.some((w) => w.workspace_id === id);
+  const id = exists(current)
+    ? current!
+    : state.remoteActiveWorkspaceId === null && exists(next.active_workspace_id)
+      ? next.active_workspace_id
+      : next.workspaces[0]?.workspace_id ?? "";
+  if (id !== state.remoteActiveWorkspaceId) saveRemoteWorkspace(id);
+  return { remoteActiveWorkspaceId: id };
+}
+
 export const useAppStore = create<AppStore>((set) => ({
   appState: null,
+  remoteActiveWorkspaceId: null,
+  setRemoteActiveWorkspace: (workspaceId) => set((state) => {
+    // A close can land between touch's response and the local commit.
+    if (!state.appState?.workspaces.some((w) => w.workspace_id === workspaceId)) return state;
+    saveRemoteWorkspace(workspaceId);
+    return { remoteActiveWorkspaceId: workspaceId };
+  }),
   homeDir: null,
   workspacePushPullInFlight: null,
   workspacePushPullStartedAt: null,
@@ -512,6 +542,7 @@ export const useAppStore = create<AppStore>((set) => ({
       const confirmed = confirmsPending(state, drained.appState);
 
       return {
+        ...reconcileRemoteSelection(state, drained.appState),
         appState: drained.appState,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
@@ -577,6 +608,7 @@ export const useAppStore = create<AppStore>((set) => ({
       const drained = drainDeltaBuffer(applied, revision, state.deltaBuffer);
       const confirmed = confirmsPending(state, drained.appState);
       return {
+        ...reconcileRemoteSelection(state, drained.appState),
         appState: drained.appState,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
@@ -626,6 +658,7 @@ export const useAppStore = create<AppStore>((set) => ({
       );
       return {
         resyncInFlight: false,
+        ...reconcileRemoteSelection(state, drained.appState),
         appState: drained.appState,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
@@ -734,22 +767,25 @@ export const useAppStore = create<AppStore>((set) => ({
  */
 export function selectActiveWorkspaceId(s: {
   appState: AppStateSnapshot | null;
-  pendingActiveWorkspaceId: string | null;
+  pendingActiveWorkspaceId?: string | null;
+  remoteActiveWorkspaceId?: string | null;
 }): string | null {
-  const pending = s.pendingActiveWorkspaceId;
+  const pending = s.pendingActiveWorkspaceId ?? null;
   if (
     pending !== null &&
     s.appState?.workspaces.some((w) => w.workspace_id === pending)
   ) {
     return pending;
   }
+  if (isRemoteClient()) return s.remoteActiveWorkspaceId ?? null;
   return s.appState?.active_workspace_id ?? null;
 }
 
 /** The workspace object for `selectActiveWorkspaceId`, or null. */
 function selectActiveWorkspace(s: {
   appState: AppStateSnapshot | null;
-  pendingActiveWorkspaceId: string | null;
+  pendingActiveWorkspaceId?: string | null;
+  remoteActiveWorkspaceId?: string | null;
 }): WorkspaceSnapshot | null {
   if (!s.appState) return null;
   const id = selectActiveWorkspaceId(s);

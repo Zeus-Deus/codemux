@@ -29,7 +29,8 @@ vi.mock("@/stores/ui-store", () => ({
 let mockAppState: Record<string, unknown> | null = null;
 let mockHomeDir: string | null = null;
 
-vi.mock("@/stores/app-store", () => ({
+vi.mock("@/stores/app-store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/stores/app-store")>(),
   useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) => {
     return selector({ appState: mockAppState, homeDir: mockHomeDir });
   }),

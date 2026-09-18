@@ -56,6 +56,7 @@ import {
   type TranscriptHistory,
 } from "./transcript-derivations";
 import { CHAT_COLUMN } from "./chat-column";
+import { isReadingBack } from "./composer-overlay";
 import {
   subscribeTranscriptFade,
   transcriptFadeEnabled,
@@ -79,6 +80,7 @@ import { Eyebrow } from "@/components/ui/eyebrow";
 
 interface Props {
   messages: ChatViewItem[];
+  compacting?: boolean;
   /** Render the tail "working" shimmer marker as the last row inside the
    *  scroller content (design D9). Gated by `shouldShowThinkingIndicator`
    *  upstream so it never shows while an approval is pending or a row is
@@ -171,6 +173,11 @@ interface Props {
   workspaceId?: string | null;
   /** Active worktree root used to resolve relative source references. */
   cwd?: string | null;
+  /** Fires on transitions of "the reader has scrolled back off the live
+   *  edge", which is what dims the composer overlay below (see
+   *  `READING_BACK_THRESHOLD_PX`). Boolean transitions only, never per
+   *  scroll frame. Must be referentially stable — this list is memoized. */
+  onReadingBackChange?: (readingBack: boolean) => void;
 }
 
 /**
@@ -188,6 +195,7 @@ interface Props {
  */
 export const MessageList = memo(function MessageList({
   messages,
+  compacting = false,
   showThinking = false,
   streaming = false,
   stalled = null,
@@ -212,6 +220,7 @@ export const MessageList = memo(function MessageList({
   revertingTurnIndex,
   workspaceId,
   cwd,
+  onReadingBackChange,
 }: Props) {
   const fileLinkContext = useMemo(
     () => ({ workspaceId, cwd }),
@@ -265,15 +274,16 @@ export const MessageList = memo(function MessageList({
   // new snapshots/expanded folds still use structural slot reuse (issue #129).
   const prevSlotsRef = useRef<TranscriptSlot[] | undefined>(undefined);
   const { slots, alwaysRenderKeys } = useMemo(() => {
+    // Compaction owns the live marker; settle the ordinary activity header.
     const next = getTranscriptPresentation(
       history,
-      streaming,
+      streaming && !compacting,
       expandedTurnIds,
       prevSlotsRef.current,
     );
     prevSlotsRef.current = next.slots;
     return next;
-  }, [expandedTurnIds, history, streaming]);
+  }, [expandedTurnIds, history, streaming, compacting]);
 
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
@@ -297,7 +307,7 @@ export const MessageList = memo(function MessageList({
   const tailItemVisible =
     tailItem != null && tailBody != null && slotBodyContains(tailBody, tailItem.id);
   const showLiveMarker =
-    (showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
+    (compacting || showThinking || (streaming && tailItemIsLive && !tailItemVisible)) &&
     !tailIsWorkingActivity;
 
   const listRef = useRef<LegendListRef | null>(null);
@@ -997,6 +1007,37 @@ export const MessageList = memo(function MessageList({
     };
   }, [workspaceId]);
 
+  // "Reading back": the reader has left the live edge, so the composer
+  // overlay dims and lets the transcript read through it. Deliberately NOT
+  // `isNearEnd` (half a viewport), which is tuned for the jump pill and
+  // would hold the composer solid through the first screen of scrolling.
+  // A raw distance-from-bottom read is also immune to the anchored-send
+  // end space, which inflates `scrollHeight` without the reader moving.
+  useEffect(() => {
+    if (!onReadingBackChange) return;
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    let last: boolean | null = null;
+    const sync = () => {
+      const next = isReadingBack(viewport);
+      if (next === last) return;
+      last = next;
+      onReadingBackChange(next);
+    };
+    sync();
+    viewport.addEventListener("scroll", sync, { passive: true });
+    // The distance also changes when the content or the box resizes, with no
+    // scroll event: a streaming reply growing below a parked reader has to
+    // dim the composer the same way scrolling up does.
+    const observer = new ResizeObserver(sync);
+    observer.observe(viewport);
+    return () => {
+      viewport.removeEventListener("scroll", sync);
+      observer.disconnect();
+      onReadingBackChange(false);
+    };
+  }, [onReadingBackChange, threadKey]);
+
   const subagentTargetIndex = useMemo(() => {
     const cardId = subagentJumpRequest?.cardId;
     if (!cardId) return -1;
@@ -1219,17 +1260,28 @@ export const MessageList = memo(function MessageList({
     [sessionStartedAt],
   );
 
+  // The composer region is an overlay pinned to the bottom of the pane, so
+  // the transcript's own scrollable content has to reserve that height —
+  // otherwise the last rows can never be scrolled out from under it. The
+  // height is published as `--composer-overlay-height` by the owning pane;
+  // the fallback keeps standalone hosts (and tests) on the old geometry.
   const listFooter = useMemo(
     () => (
-      <div className={cn(CHAT_COLUMN, "pb-[30px]")}>
+      <div
+        className={CHAT_COLUMN}
+        style={{
+          paddingBottom:
+            "calc(30px + var(--composer-overlay-height, 0px))",
+        }}
+      >
         {stalled && streaming && (
           <div className="mt-[13px]">
             <RunStalledNotice silentForSecs={stalled.silentForSecs} />
           </div>
         )}
-        {showLiveMarker && !(stalled && streaming) && (
+        {showLiveMarker && (compacting || !(stalled && streaming)) && (
           <div className="mt-[13px]">
-            <StreamingMarker messages={ordered} workspaceId={workspaceId} />
+            <StreamingMarker messages={ordered} compacting={compacting} workspaceId={workspaceId} />
           </div>
         )}
         {interrupted && !streaming && (
@@ -1239,7 +1291,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
+    [compacting, interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
   );
 
   return (
@@ -1305,7 +1357,14 @@ export const MessageList = memo(function MessageList({
           onClick={handleJumpToLatest}
           variant="secondary"
           size="sm"
-          className="absolute bottom-4 left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          // Clears the composer overlay: the transcript now runs the full
+          // height of the pane with the composer floating over its bottom,
+          // so a fixed `bottom-4` would park the pill behind the pill-shaped
+          // composer it exists to escape.
+          style={{
+            bottom: "calc(1rem + var(--composer-overlay-height, 0px))",
+          }}
+          className="absolute left-1/2 z-10 w-auto -translate-x-1/2 rounded-full border border-border bg-card font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
           <ArrowDown className="size-3.5" aria-hidden />

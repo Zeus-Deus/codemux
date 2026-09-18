@@ -762,3 +762,32 @@ describe("agent-chat-store", () => {
     });
   });
 });
+
+
+describe("compaction across chat navigation", () => {
+  beforeEach(resetStore);
+  it("preserves live summarization on remount but clears it for a stopped session", () => {
+    const store = useAgentChatStore.getState();
+    store.ensureThread("t");
+    store.applyEvent("t", { type: "context_compaction_changed", thread_id: "t", active: true });
+    store.hydrateThread("t", [], { runLive: true });
+    expect(useAgentChatStore.getState().threads.t.compacting).toBe(true);
+    store.hydrateThread("t", [], { runLive: false });
+    expect(useAgentChatStore.getState().threads.t.compacting).toBe(false);
+  });
+  it("does not carry summarization into a restarted thread", () => {
+    const store = useAgentChatStore.getState();
+    store.ensureThread("old");
+    store.applyEvent("old", { type: "context_compaction_changed", thread_id: "old", active: true });
+    store.migrateThreadId("old", "new");
+    expect(useAgentChatStore.getState().threads.new.compacting).toBe(false);
+  });
+  it("isolates activity between chats", () => {
+    const store = useAgentChatStore.getState();
+    store.ensureThread("a");
+    store.ensureThread("b");
+    store.applyEvent("a", { type: "context_compaction_changed", thread_id: "a", active: true });
+    expect(useAgentChatStore.getState().threads.a.compacting).toBe(true);
+    expect(useAgentChatStore.getState().threads.b.compacting).toBe(false);
+  });
+});
