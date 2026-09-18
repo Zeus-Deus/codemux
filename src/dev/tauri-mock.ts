@@ -3291,6 +3291,8 @@ const MOCK_MARKETPLACE_VARIANTS: Record<string, unknown[]> = {
   ],
 };
 
+let mockAddonPaused = false;
+let mockAddonDeveloperMode = false;
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -3414,6 +3416,16 @@ const handlers: Record<string, Handler> = {
   }),
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
+  // Empty by default: plugins never alter a clean core-only UI.
+  addon_inventory: () => ({paused:mockAddonPaused,installed:[],error:null,warnings:[],developerMode:mockAddonDeveloperMode,developmentPackage:null}),
+  addon_pause_all: () => { mockAddonPaused = true; return null; },
+  addon_resume: () => { mockAddonPaused = false; return null; },
+  addon_developer_mode: (args) => { mockAddonDeveloperMode = !!args.enabled; return null; },
+  addon_catalog: () => ({ snapshot: null, stale: true, error: "The catalog is unavailable in the browser preview. Use the desktop app to install packages." }),
+  addon_subscribe: () => null,
+  addon_context_changed: () => null,
+  addon_composer_register: () => null,
+  addon_composer_closed: () => null,
   get_package_format: () => "AppImage",
 
   // ── Settings ──

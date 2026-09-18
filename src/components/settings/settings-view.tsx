@@ -1,3 +1,4 @@
+import { AddonsSettings } from "./addons-settings";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/format-bytes";
@@ -1449,6 +1450,7 @@ export function SettingsView() {
 
   const renderSection = () => {
     switch (activeSection) {
+      case "addons": return <AddonsSettings />;
       case "account":
         return (
           <div>
