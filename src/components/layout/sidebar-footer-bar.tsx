@@ -1,11 +1,27 @@
 import { useState, useEffect, useRef } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  DndContext,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  horizontalListSortingStrategy,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
@@ -51,7 +67,11 @@ import {
   getFooterAction,
   isFooterActionAvailable,
 } from "@/lib/footer-actions";
-import { useFooterPinsStore, type FooterPin } from "@/stores/footer-pins-store";
+import {
+  useFooterPinsStore,
+  type FooterPin,
+} from "@/stores/footer-pins-store";
+import type { FooterActionId } from "@/lib/footer-actions";
 import { CustomizeFooterDialog } from "./customize-footer-dialog";
 import { useFooterAvailability } from "./footer-availability";
 
@@ -325,6 +345,41 @@ function FooterDestination({
   );
 }
 
+/**
+ * A footer icon that can be dragged to a new slot. The wrapper is only the
+ * drag handle: the 5px activation distance keeps a plain click reaching the
+ * inner button, and dnd-kit swallows the click that ends a real drag.
+ * `attributes` is not spread so the inner button stays the only focusable,
+ * semantic control.
+ */
+function SortableFooterDestination({
+  pin,
+  tooltipSide,
+}: {
+  pin: FooterPin;
+  tooltipSide: "top" | "right";
+}) {
+  const { listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: pin.id });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid={`footer-pin-${pin.id}`}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+      }}
+      {...listeners}
+      className={cn(
+        "shrink-0 touch-none",
+        isDragging && "relative z-10 opacity-60",
+      )}
+    >
+      <FooterDestination pin={pin} tooltipSide={tooltipSide} />
+    </div>
+  );
+}
+
 export function SidebarFooterBar() {
   const { state } = useSidebar();
   const collapsed = state === "collapsed";
@@ -364,9 +419,21 @@ export function SidebarFooterBar() {
   const visible = availablePins.slice(0, visibleCount);
   const overflow = availablePins.slice(visibleCount);
   const tooltipSide = collapsed ? "right" : "top";
+  const reorderPin = useFooterPinsStore((s) => s.reorderPin);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
+  const handleDragEnd = ({ active, over }: DragEndEvent) => {
+    if (over && active.id !== over.id)
+      reorderPin(active.id as FooterActionId, over.id as FooterActionId);
+  };
 
   return (
-    <>
+    // Footer labels are plain text, so they never need to stay open for the
+    // pointer to travel into them. Radix's hoverable-content grace area would
+    // otherwise keep the previous icon's label up — and ignore the next icon —
+    // while the pointer slides sideways along the strip.
+    <TooltipProvider disableHoverableContent>
       <div
         ref={container}
         data-testid="sidebar-footer"
@@ -383,9 +450,30 @@ export function SidebarFooterBar() {
           tooltipSide={tooltipSide}
           onCustomize={() => setCustomizing(true)}
         />
-        {visible.map((pin) => (
-          <FooterDestination key={pin.id} pin={pin} tooltipSide={tooltipSide} />
-        ))}
+        {/* Destinations reorder by drag; the menu stays outside the sortable
+            list so it always anchors the start. */}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={visible.map((pin) => pin.id)}
+            strategy={
+              collapsed
+                ? verticalListSortingStrategy
+                : horizontalListSortingStrategy
+            }
+          >
+            {visible.map((pin) => (
+              <SortableFooterDestination
+                key={pin.id}
+                pin={pin}
+                tooltipSide={tooltipSide}
+              />
+            ))}
+          </SortableContext>
+        </DndContext>
         {overflow.length > 0 && (
           <Popover open={overflowOpen} onOpenChange={setOverflowOpen}>
             <PopoverTrigger asChild>
@@ -429,6 +517,6 @@ export function SidebarFooterBar() {
           onOpenChange={setCustomizing}
         />
       )}
-    </>
+    </TooltipProvider>
   );
 }

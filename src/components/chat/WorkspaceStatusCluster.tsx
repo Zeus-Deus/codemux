@@ -49,7 +49,8 @@ import {
  *    old bar rendered, so a thread's linked issue stays visible on the
  *    Context Row,
  *  - a "workspace details" button that opens a compact popover with
- *    the full picture (branch, base, behind, ahead, uncommitted diff,
+ *    the full picture (branch, base — the PR target, else the branch
+ *    the worktree was created from — behind, ahead, uncommitted diff,
  *    PR, issue, device) plus quick view / sync actions.
  *
  * Self-contained: reads the active workspace directly. This only ever
@@ -89,10 +90,11 @@ export function WorkspaceStatusCluster() {
   const cwd = workspace ? (workspace.worktree_path ?? workspace.cwd) : null;
   const prNumber = workspace?.pr_number ?? null;
 
-  // Fetch-on-open, mirroring `IssueDetailPopover`. `WorkspaceSnapshot`
-  // doesn't carry `base_branch` (see `PullRequestInfo.base_branch` in
-  // tauri/types.ts) — it only exists on the full PR detail fetch. On
-  // failure `prInfo` stays null and the Base row simply doesn't render.
+  // Fetch-on-open, mirroring `IssueDetailPopover`. A PR's target branch
+  // only exists on the full PR detail fetch; when it resolves it wins over
+  // the branch the worktree was created from (`workspace.base_branch`),
+  // since a PR can be retargeted. On failure `prInfo` stays null and the
+  // Base row falls back to the recorded fork point, if any.
   useEffect(() => {
     if (!open || !cwd || !prNumber) return;
     let cancelled = false;
@@ -124,6 +126,7 @@ export function WorkspaceStatusCluster() {
   const provider = providerForWorkspace(workspace);
   const showBehind = workspace.git_behind > 0;
   const showAhead = workspace.git_ahead > 0;
+  const baseBranch = prInfo?.base_branch ?? workspace.base_branch ?? null;
   const showUncommitted =
     workspace.git_additions > 0 || workspace.git_deletions > 0;
 
@@ -267,8 +270,8 @@ export function WorkspaceStatusCluster() {
               </div>
               <div className="flex flex-col gap-0.5 p-1.5">
                 <DetailRow label="Branch" value={gitBranch} muted />
-                {prInfo?.base_branch && (
-                  <DetailRow label="Base" value={prInfo.base_branch} muted />
+                {baseBranch && (
+                  <DetailRow label="Base" value={baseBranch} muted />
                 )}
                 {showBehind && (
                   <DetailRow

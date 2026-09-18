@@ -1581,6 +1581,119 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_initiated_question_keeps_turn_active_and_queues_follow_ups() {
+    // The SDK can start a turn on its own after a `result` (background
+    // subagents finishing wake the main agent) and park it on an
+    // AskUserQuestion callback. `active_turn` is `None` then, but the thread
+    // is not idle: hydrate must keep the question answerable, and a new
+    // message must queue behind it instead of being fed to an SDK that cannot
+    // read input until the callback resolves (the send would hang forever).
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 50, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-auto-q",
+                "message": {
+                    "type": "result", "subtype": "success",
+                    "duration_ms": 10, "num_turns": 1
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 150, "emit": "notification",
+            "method": "request-opened",
+            "params": {
+                "threadId": "t-auto-q",
+                "requestId": "r-auto",
+                "toolName": "AskUserQuestion",
+                "toolInput": {"questions": []},
+                "kind": "user-input"
+            }
+        },
+        {
+            "after": "respond-to-request", "delay_ms": 50, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-auto-q",
+                "message": {
+                    "type": "result", "subtype": "success",
+                    "duration_ms": 10, "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread = ThreadId("t-auto-q".into());
+    provider.start_session(start_input("t-auto-q")).await.unwrap();
+    let mut stream = provider.event_stream();
+    let send = |text: &str| SendTurnInput {
+        thread_id: thread.clone(),
+        text: text.into(),
+        images: vec![],
+        model_override: None,
+        effort_override: None,
+        permission_mode_override: None,
+        client_nonce: None,
+        display_text: None,
+        skill_invocations: vec![],
+        turn_checkpoint: None,
+    };
+    provider.send_turn(send("first")).await.unwrap();
+
+    let opened = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ProviderRuntimeEvent::RequestOpened { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(opened.is_ok(), "SDK-initiated question must open");
+    assert!(
+        provider.turn_active(&thread).await,
+        "a pending question after `result` keeps the turn active"
+    );
+
+    let follow_up = provider.send_turn(send("repeat it")).await.unwrap();
+    assert!(
+        follow_up.queued_id.is_some(),
+        "a message sent while the SDK waits on a question must queue"
+    );
+
+    provider
+        .respond_to_request(
+            thread.clone(),
+            RequestId("r-auto".into()),
+            ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            },
+        )
+        .await
+        .unwrap();
+    let dispatched = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnDispatched { text, .. } = ev {
+                return text;
+            }
+        }
+        String::new()
+    })
+    .await;
+    assert_eq!(
+        dispatched.as_deref().ok(),
+        Some("repeat it"),
+        "the queued message dispatches once the question turn ends"
+    );
+    provider.stop_session(thread).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_active_false_when_session_dead() {
     // Mid-turn child death: the watchdog flips `dead`, and turn_active's
     // is_dead() short-circuit reports false for the corpse even though a turn

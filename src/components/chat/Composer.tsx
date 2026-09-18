@@ -231,9 +231,6 @@ interface Props {
    *  {@link MIN_TEXTAREA_PX} when `isDraft` (a spacious prompt card) and
    *  to a single line otherwise. */
   minTextareaPx?: number;
-  /** A follow-up is parked behind the active turn — keeps the pill
-   *  expanded. */
-  hasQueuedMessage?: boolean;
   /** A file drag is over the owning pane (not necessarily this card). A
    *  collapsed pill grows into a 74px drop target. */
   paneDragActive?: boolean;
@@ -419,7 +416,6 @@ export function Composer({
   belowComposerSlot,
   stripSlot,
   minTextareaPx,
-  hasQueuedMessage = false,
   paneDragActive = false,
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
@@ -2458,7 +2454,6 @@ export function Composer({
     focusWithin ||
     stagedAttachments.length > 0 ||
     mode !== "default" ||
-    hasQueuedMessage ||
     slashOpen ||
     mentionOpen ||
     attachOpen ||

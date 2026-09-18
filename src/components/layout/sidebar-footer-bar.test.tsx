@@ -152,8 +152,17 @@ describe("SidebarFooterBar — expanded", () => {
       '[data-testid="sidebar-footer"]',
     ) as HTMLElement;
     expect(
-      Array.from(footer.children).map((el) => el.getAttribute("aria-label")),
+      Array.from(footer.querySelectorAll("button")).map((el) =>
+        el.getAttribute("aria-label"),
+      ),
     ).toEqual(["Menu", "Automations", "Devices", "Pull requests", "Ports"]);
+    // The menu is pinned first and is not a drag handle; every destination is.
+    expect(footer.firstElementChild?.getAttribute("aria-label")).toBe("Menu");
+    expect(
+      Array.from(footer.querySelectorAll('[data-testid^="footer-pin-"]')).map(
+        (el) => el.querySelector("button")?.getAttribute("aria-label"),
+      ),
+    ).toEqual(["Automations", "Devices", "Pull requests", "Ports"]);
     // Nothing pushes a group to the right, so the strip stays left-aligned.
     expect(footer.querySelector(".ml-auto")).toBeNull();
   });

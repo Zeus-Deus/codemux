@@ -1225,7 +1225,7 @@ export const MessageList = memo(function MessageList({
         )}
         {showLiveMarker && !(stalled && streaming) && (
           <div className="mt-[13px]">
-            <StreamingMarker messages={ordered} />
+            <StreamingMarker messages={ordered} workspaceId={workspaceId} />
           </div>
         )}
         {interrupted && !streaming && (
@@ -1235,7 +1235,7 @@ export const MessageList = memo(function MessageList({
         )}
       </div>
     ),
-    [interrupted, ordered, showLiveMarker, stalled, streaming],
+    [interrupted, ordered, showLiveMarker, stalled, streaming, workspaceId],
   );
 
   return (

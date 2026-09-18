@@ -134,6 +134,12 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// The branch checked out at `repo_path`, or `None` when HEAD is detached
+/// or the path isn't a git checkout.
+pub fn current_branch(repo_path: &Path) -> Option<String> {
+    Some(run_git_permissive(repo_path, &["branch", "--show-current"])).filter(|b| !b.is_empty())
+}
+
 /// Clone a remote repository into `target_dir`. Used by cross-device
 /// workspace adoption when a sibling-device workspace has no shared
 /// host — we clone the git remote and create a fresh worktree at the
@@ -3426,6 +3432,19 @@ C  source.txt -> copy.txt";
         run_git(&path, &["init"]).expect("git init");
         run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
         (dir, path)
+    }
+
+    #[test]
+    fn current_branch_reads_checkout_and_ignores_detached_head() {
+        let (_dir, repo) = setup_test_repo();
+        let head = run_git(&repo, &["branch", "--show-current"]).unwrap();
+        assert_eq!(current_branch(&repo), Some(head));
+
+        let wt = git_create_worktree(&repo, "forked", true, None, None).unwrap();
+        assert_eq!(current_branch(Path::new(&wt)).as_deref(), Some("forked"));
+
+        run_git(&repo, &["checkout", "--detach"]).unwrap();
+        assert_eq!(current_branch(&repo), None);
     }
 
     #[test]
