@@ -65,3 +65,10 @@ pnpm-debug.log*
 *.swp
 *.swo
 *~
+
+# Independent plugin runtime and author packages
+src-tauri/addon-host/target/
+src-tauri/addon-protocol/target/
+docs/addons/research-probe/target/
+docs/addons/research-probe/probe-ui.bundle.js
+*.cmxaddon
