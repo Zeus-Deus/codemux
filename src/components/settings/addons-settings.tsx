@@ -149,6 +149,7 @@ function Credentials({
                     sessionOnly: session,
                   });
                   setValues({ ...values, [field.id]: "" });
+                  onError("");
                 } catch (e) {
                   onError(addonMessage(e));
                 } finally {

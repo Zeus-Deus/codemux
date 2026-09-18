@@ -142,3 +142,42 @@ it("Escape dismisses only the install dialog and restores its opener", async () 
     window.removeEventListener("keydown", outerEscape);
   }
 });
+it("clears a credential-store failure after explicit session-only recovery", async () => {
+  vi.mocked(addonInvoke)
+    .mockReset()
+    .mockImplementation((command, args) => {
+      if (command === "addon_settings_get")
+        return Promise.resolve({ owner: "", repository: "" });
+      if (command === "addon_credential_set" && !args?.sessionOnly)
+        return Promise.reject(
+          new Error("Credential store unavailable or locked"),
+        );
+      return Promise.resolve(null);
+    });
+  useAddonsStore.setState({ installed: [installation] });
+  render(<AddonsSettings />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Configure / Permissions" }),
+  );
+  const input = screen.getByLabelText("GitHub token (optional)");
+  fireEvent.change(input, { target: { value: "synthetic-test-only" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText("Credential store unavailable or locked");
+  expect(input).toHaveValue("synthetic-test-only");
+  const fallback = screen.getByLabelText(
+    "Store new values for this session only",
+  );
+  expect(fallback).not.toBeChecked();
+  fireEvent.click(fallback);
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(input).toHaveValue(""));
+  expect(
+    screen.queryByText("Credential store unavailable or locked"),
+  ).toBeNull();
+  expect(addonInvoke).toHaveBeenLastCalledWith("addon_credential_set", {
+    id: "codemux.issue-companion",
+    credentialId: "github-token",
+    value: "synthetic-test-only",
+    sessionOnly: true,
+  });
+});
