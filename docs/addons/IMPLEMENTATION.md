@@ -172,6 +172,23 @@ publication and Settings remain separate deliverables.
 
 ## Unresolved release gates
 
+Native desktop UI acceptance now has a CI-only external `tauri-driver` harness
+(`scripts/addons/native-ui.mjs`). It refuses local and self-hosted execution,
+installs the ordinary deb/NSIS artifact, uses a synthetic loopback account API,
+and supplies only the OS file chooser's selected package path. Package review,
+installation, host execution, permissions, Remote DOM rendering, Git, HTTPS,
+and controlled draft insertion use the production app. Windows downloads the
+driver matching WebView2 and verifies Microsoft's executable signature.
+Installer and harness revisions are recorded separately so a harness-only retry
+cannot imply a newer app build was tested. This harness has passed syntax,
+workflow-parse and local-refusal checks; **native execution is still pending**.
+It currently targets import/review, enable/disable, both example views and draft
+insertion, read-only public GitHub HTTPS, no auto-submit, pause/resume, and an
+independently packaged blocking-command fixture while typing in the core draft
+and reopening Project Brief. These targets are not evidence until execution
+passes, and do not cover the full race matrix. The OS file chooser and account
+service are explicit fixture seams.
+
 - Stock built-app E2E for both examples, including real frontend/native IPC,
   actual controlled draft insertion and core UI operation during hostile plugins.
 - Latest-commit packaged rerun after the final integration follow-ups. Linux

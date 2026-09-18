@@ -2,12 +2,21 @@ name: Packaged add-on runtime
 on:
   workflow_dispatch:
   pull_request:
-    paths: ['scripts/addons/packaged-smoke.mjs', 'scripts/addons/elf-provenance.mjs', 'scripts/addons/elf-provenance-check.mjs', 'scripts/addons/host-limits.mjs', 'scripts/addons/sdk-native.mjs', 'src-tauri/addon-host/**', 'src-tauri/tauri.conf.json', 'scripts/build-addon-host.sh', '.github/workflows/addon-packaged.yml']
+    paths:
+      [
+        "scripts/addons/**",
+        "src-tauri/addon-host/**",
+        "src-tauri/tauri.conf.json",
+        "scripts/build-addon-host.sh",
+        ".github/workflows/addon-packaged.yml",
+      ]
 permissions:
   contents: read
 concurrency:
   group: addon-packaged-${{ github.ref }}
-  cancel-in-progress: true
+  # Preserve installer evidence and populated caches from an in-flight build.
+  # Harness-only iterations can reuse its artifacts through addon-native-ui.yml.
+  cancel-in-progress: false
 jobs:
   bundle:
     strategy:
@@ -15,7 +24,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -33,7 +42,7 @@ jobs:
             librsvg2-dev \
             patchelf \
             libfuse2 \
-            file
+            file webkit2gtk-driver xvfb dbus-x11
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -159,7 +168,6 @@ jobs:
           git config --global user.email "release@codemux.dev"
           git config --global user.name "Codemux Release"
 
-
       - name: Pre-cache stable linuxdeploy + plugin-appimage
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -172,12 +180,44 @@ jobs:
       - name: Build installers without publishing
         shell: bash
         env:
-          NO_STRIP: 'true'
+          NO_STRIP: "true"
         run: |
           if [ "$RUNNER_OS" = Windows ]; then formats=nsis; else formats=deb,appimage; fi
           npm run tauri -- build --verbose --bundles "$formats" --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Verify bundled host and runtime deadlines
         run: node scripts/addons/packaged-smoke.mjs src-tauri/target/release/bundle
+      - name: Record installer build revision
+        run: node -e "require('node:fs').writeFileSync('addon-native-ui-build.json', JSON.stringify({commit:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,platform:process.platform}))"
+      - name: Preserve built acceptance inputs for harness-only retries
+        uses: actions/upload-artifact@v4
+        with:
+          name: addon-native-ui-inputs-${{ runner.os }}
+          retention-days: 7
+          path: |
+            addon-native-ui-build.json
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/nsis/*.exe
+            examples/addons/project-brief/*.cmxaddon
+            examples/addons/issue-companion/*.cmxaddon
+            scripts/addons/fixtures/fault-isolation/*.cmxaddon
+      - name: Install external WebDriver
+        run: cargo install tauri-driver --version 2.0.6 --locked
+      - name: Install matching Microsoft WebView2 driver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/addons/install-webdriver.ps1
+      - name: Native desktop UI acceptance (Linux)
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a node scripts/addons/native-ui.mjs
+      - name: Native desktop UI acceptance (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/addons/native-ui.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: addon-native-ui-evidence-${{ runner.os }}
+          path: addon-native-ui-evidence/
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
