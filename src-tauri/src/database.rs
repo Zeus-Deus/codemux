@@ -4790,19 +4790,42 @@ impl DatabaseStore {
     }
 
     /// Record that an automatic resume is being dispatched: disarm and bump
-    /// the attempt count in one statement. Returns `false` when the row was
-    /// no longer armed (someone else disarmed or fired it first), so the
-    /// caller must not dispatch.
-    pub fn mark_agent_chat_usage_resume_fired(&self, thread_id: &str) -> Result<bool, String> {
+    /// the attempt count in one statement. Returns `false` when the
+    /// observed schedule changed (including a later reset), so the caller
+    /// must not dispatch a stale snapshot.
+    pub fn mark_agent_chat_usage_resume_fired(
+        &self,
+        expected: &AgentChatUsageResume,
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().unwrap();
         let changed = conn
             .execute(
                 "UPDATE agent_chat_usage_resumes
                  SET resume_at_ms = NULL, attempts = attempts + 1, updated_at = datetime('now')
-                 WHERE thread_id = ?1 AND resume_at_ms IS NOT NULL",
-                params![thread_id],
+                 WHERE thread_id = ?1 AND provider = ?2 AND resume_at_ms = ?3 AND attempts = ?4",
+                params![
+                    expected.thread_id,
+                    expected.provider,
+                    expected.resume_at_ms,
+                    expected.attempts
+                ],
             )
             .map_err(|e| format!("Failed to mark usage resume fired: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Disarm only the schedule observed by a scheduler pass. A newer
+    /// provider reset must not be cancelled by an older busy-thread check.
+    pub fn disarm_agent_chat_usage_resume(
+        &self,
+        expected: &AgentChatUsageResume,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE agent_chat_usage_resumes SET resume_at_ms = NULL, updated_at = datetime('now')
+             WHERE thread_id = ?1 AND provider = ?2 AND resume_at_ms = ?3 AND attempts = ?4",
+            params![expected.thread_id, expected.provider, expected.resume_at_ms, expected.attempts],
+        ).map_err(|e| format!("Failed to disarm usage resume: {e}"))?;
         Ok(changed > 0)
     }
 
@@ -5507,8 +5530,8 @@ mod tests {
         assert_eq!(due[0].attempts, 0);
 
         // Firing disarms and counts; a second fire of the same row is refused.
-        assert!(db.mark_agent_chat_usage_resume_fired(thread_id).unwrap());
-        assert!(!db.mark_agent_chat_usage_resume_fired(thread_id).unwrap());
+        assert!(db.mark_agent_chat_usage_resume_fired(&due[0]).unwrap());
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due[0]).unwrap());
         let row = db.get_agent_chat_usage_resume(thread_id).unwrap();
         assert_eq!(row.resume_at_ms, None);
         assert_eq!(row.attempts, 1);
@@ -5526,6 +5549,37 @@ mod tests {
             .unwrap();
         db.delete_agent_chat_session(thread_id).unwrap();
         assert!(db.get_agent_chat_usage_resume(thread_id).is_none());
+    }
+
+    #[test]
+    fn usage_resume_claim_rejects_rearmed_or_replaced_snapshots() {
+        let db = init_test_database();
+        let id = "usage-resume-rearmed";
+        db.upsert_agent_chat_session(id, "ws", None, "claude")
+            .unwrap();
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        let due = db.list_due_agent_chat_usage_resumes(1_000).remove(0);
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(10_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        assert!(!db.disarm_agent_chat_usage_resume(&due).unwrap());
+        assert_eq!(
+            db.get_agent_chat_usage_resume(id).unwrap().resume_at_ms,
+            Some(10_000)
+        );
+        assert_eq!(db.get_agent_chat_usage_resume(id).unwrap().attempts, 0);
+
+        db.upsert_agent_chat_usage_resume(id, "codex", Some(1_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        assert!(db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        db.upsert_agent_chat_usage_resume(id, "claude", Some(1_000))
+            .unwrap();
+        assert!(!db.mark_agent_chat_usage_resume_fired(&due).unwrap());
+        assert_eq!(db.get_agent_chat_usage_resume(id).unwrap().attempts, 1);
     }
 
     #[test]

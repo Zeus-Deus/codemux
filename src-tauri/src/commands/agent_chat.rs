@@ -2302,6 +2302,23 @@ pub async fn send_turn_with_origin<R: Runtime>(
         let db: State<'_, DatabaseStore> = app.state();
         super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
     }
+    // Resume callers already hold this lock. User sends disarm immediately,
+    // then wait for any already-claimed resume to finish dispatching.
+    let _activity_guard = if origin == TurnOrigin::User {
+        Some(
+            super::usage_resume::activity_lock(&input.thread_id.0)
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
+    if origin == TurnOrigin::User {
+        // A previously claimed resume may have hit another limit while this
+        // user send waited for its dispatch to finish.
+        let db: State<'_, DatabaseStore> = app.state();
+        super::usage_resume::forget_on_user_activity(&db, &input.thread_id.0);
+    }
     // Auto-resume: if the provider's session map has no live session for
     // this thread (e.g. the app was restarted), rebuild it from the
     // persisted row before the turn so the user never sees a
@@ -2549,6 +2566,9 @@ pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
+        .lock_owned()
+        .await;
     {
         // Promoting a queued turn is the user driving the thread.
         let db: State<'_, DatabaseStore> = app.state();
@@ -3321,6 +3341,11 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 ) -> Result<bool, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
+        .lock_owned()
+        .await;
+    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     let reached = match impl_.interrupt_turn(thread_id.clone(), turn_id).await {
@@ -3877,6 +3902,11 @@ pub async fn agent_chat_stop_session<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
+    let _activity_guard = super::usage_resume::activity_lock(&thread_id.0)
+        .lock_owned()
+        .await;
+    super::usage_resume::cancel_for_stopped_thread(&app, &thread_id.0);
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     match impl_.stop_session(thread_id).await {
@@ -3919,11 +3949,16 @@ pub fn shutdown_agent_chat_threads<R: Runtime>(
     let tracker: State<'_, SubagentTracker> = app.state();
     for (_, thread_id) in &threads {
         tracker.clear_thread(thread_id);
+        super::usage_resume::cancel_for_stopped_thread(app, thread_id);
     }
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let registry: State<'_, ProviderRegistry> = app_handle.state();
         for (kind, thread_id) in threads {
+            let _activity_guard = super::usage_resume::activity_lock(&thread_id)
+                .lock_owned()
+                .await;
+            super::usage_resume::cancel_for_stopped_thread(&app_handle, &thread_id);
             let Some(impl_) = registry.get(kind).await else {
                 continue;
             };

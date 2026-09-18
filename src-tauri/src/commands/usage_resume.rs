@@ -24,7 +24,7 @@
 //!   exact same text through the exact same send path as a user turn.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -311,6 +311,24 @@ pub(super) fn forget_on_user_activity(db: &DatabaseStore, thread_id: &str) {
     }
 }
 
+// Serialize a resume with user activity on the same thread, including the
+// asynchronous session rebuild before provider dispatch. Weak entries do not
+// keep locks alive after a thread stops receiving activity.
+pub(super) fn activity_lock(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(thread_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(thread_id.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
 // ── Dispatch ─────────────────────────────────────────────────────────
 
 /// Send the resume turn through the same path as a user send. The origin
@@ -370,6 +388,18 @@ fn emit_cancelled<R: Runtime>(app: &AppHandle<R>, thread_id: &ThreadId) {
     );
 }
 
+/// Stopping or closing a thread has no new user message to clear its UI.
+pub(super) fn cancel_for_stopped_thread<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
+    let db: State<'_, DatabaseStore> = app.state();
+    match db.delete_agent_chat_usage_resume(thread_id) {
+        Ok(true) => emit_cancelled(app, &ThreadId(thread_id.to_owned())),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "[codemux::usage_resume] failed to cancel stopped thread={thread_id}: {error}"
+        ),
+    }
+}
+
 /// One scheduler pass: fire every due resume.
 async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
     let due = {
@@ -377,6 +407,10 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
         db.list_due_agent_chat_usage_resumes(now_ms())
     };
     for row in due {
+        let lock = activity_lock(&row.thread_id);
+        let Ok(_guard) = lock.try_lock() else {
+            continue;
+        };
         let thread_id = ThreadId(row.thread_id.clone());
         let Some(provider) = parse_provider(&row.provider) else {
             let db: State<'_, DatabaseStore> = app.state();
@@ -391,14 +425,30 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
         if !enabled {
             // Turned off after this resume was armed: disarm, keep attempts.
             let db: State<'_, DatabaseStore> = app.state();
-            let _ = db.upsert_agent_chat_usage_resume(&row.thread_id, &row.provider, None);
-            emit_cancelled(app, &thread_id);
+            if db.disarm_agent_chat_usage_resume(&row).unwrap_or(false) {
+                emit_cancelled(app, &thread_id);
+            }
             continue;
         }
         if thread_busy(app, provider, &thread_id).await {
-            // The user is already driving the thread; step aside.
+            // The user is already driving the thread; step aside, without
+            // erasing a later limit reported while the busy check awaited.
             let db: State<'_, DatabaseStore> = app.state();
-            let _ = db.delete_agent_chat_usage_resume(&row.thread_id);
+            if db.disarm_agent_chat_usage_resume(&row).unwrap_or(false) {
+                emit_cancelled(app, &thread_id);
+            }
+            continue;
+        }
+        // Closed/archived workspaces keep history, but must never restart work.
+        let open_workspace = {
+            let db: State<'_, DatabaseStore> = app.state();
+            let state: State<'_, crate::state::AppStateStore> = app.state();
+            db.get_agent_chat_session(&row.thread_id)
+                .is_some_and(|session| state.find_workspace(&session.workspace_id).is_some())
+        };
+        if !open_workspace {
+            let db: State<'_, DatabaseStore> = app.state();
+            forget_on_user_activity(&db, &row.thread_id);
             emit_cancelled(app, &thread_id);
             continue;
         }
@@ -406,7 +456,7 @@ async fn fire_due_resumes<R: Runtime>(app: &AppHandle<R>) {
         // fire the same resume twice. `false` = disarmed meanwhile.
         let claimed = {
             let db: State<'_, DatabaseStore> = app.state();
-            db.mark_agent_chat_usage_resume_fired(&row.thread_id)
+            db.mark_agent_chat_usage_resume_fired(&row)
         };
         match claimed {
             Ok(true) => {}
@@ -449,7 +499,7 @@ pub async fn spawn_usage_resume_scheduler<R: Runtime>(app: AppHandle<R>) {
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// "Resume now": send the resume turn immediately. User-initiated, so on
-/// success the thread's pending resume is forgotten and its attempt count
+/// dispatch the thread's pending resume is forgotten and its attempt count
 /// reset, exactly like a user send.
 #[tauri::command]
 pub async fn agent_chat_resume_after_usage_limit<R: Runtime>(
@@ -459,31 +509,21 @@ pub async fn agent_chat_resume_after_usage_limit<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    // Disarm first so the scheduler cannot fire the same resume while this
-    // dispatch is in progress.
-    let was_armed = {
-        let db: State<'_, DatabaseStore> = app.state();
-        match db.get_agent_chat_usage_resume(&thread_id.0) {
-            Some(row) if row.resume_at_ms.is_some() => {
-                let _ = db.upsert_agent_chat_usage_resume(&thread_id.0, &row.provider, None);
-                true
-            }
-            _ => false,
-        }
-    };
-    match dispatch_resume(&app, provider, &thread_id).await {
-        Ok(()) => {
-            let db: State<'_, DatabaseStore> = app.state();
-            forget_on_user_activity(&db, &thread_id.0);
-            Ok(())
-        }
-        Err(error) => {
-            if was_armed {
-                emit_cancelled(&app, &thread_id);
-            }
-            Err(error)
-        }
+    let lock = activity_lock(&thread_id.0);
+    let _guard = lock
+        .try_lock()
+        .map_err(|_| "A send or resume is already in progress".to_string())?;
+    if thread_busy(&app, provider, &thread_id).await {
+        return Err("The thread is already running".into());
     }
+    // Reset before dispatch. A fast provider can report a new limit during
+    // the send; deleting afterward would erase that newly armed schedule.
+    {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.delete_agent_chat_usage_resume(&thread_id.0)?;
+    }
+    emit_cancelled(&app, &thread_id);
+    dispatch_resume(&app, provider, &thread_id).await
 }
 
 /// Disarm a pending automatic resume, keeping its attempt count. Persists
@@ -498,8 +538,11 @@ pub async fn agent_chat_cancel_usage_resume<R: Runtime>(
     feature_flag_on(&observability)?;
     {
         let db: State<'_, DatabaseStore> = app.state();
-        if db.get_agent_chat_usage_resume(&thread_id.0).is_some() {
-            db.upsert_agent_chat_usage_resume(&thread_id.0, &provider_id(provider), None)?;
+        if let Some(row) = db.get_agent_chat_usage_resume(&thread_id.0) {
+            if row.provider != provider_id(provider) {
+                return Err("The thread provider changed".into());
+            }
+            db.disarm_agent_chat_usage_resume(&row)?;
         }
     }
     emit_cancelled(&app, &thread_id);
@@ -600,6 +643,17 @@ mod tests {
         n.end_turn("t");
         assert!(!n.contains("t"));
         assert!(n.admit("t", Some(50)), "a new turn starts fresh");
+    }
+
+    #[tokio::test]
+    async fn activity_serializes_resume_and_user_send_per_thread() {
+        let first = activity_lock("resume-lock-test");
+        let guard = first.lock().await;
+        let concurrent = activity_lock("resume-lock-test");
+        assert!(concurrent.try_lock().is_err());
+        assert!(activity_lock("other-resume-lock-test").try_lock().is_ok());
+        drop(guard);
+        assert!(concurrent.try_lock().is_ok());
     }
 
     #[test]

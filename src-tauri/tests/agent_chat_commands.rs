@@ -416,6 +416,138 @@ fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     app
 }
 
+#[tokio::test]
+async fn usage_resume_manual_dispatch_rejects_overlap_and_preserves_a_new_limit() {
+    use codemux_lib::agent_provider::AgentProvider;
+    use codemux_lib::commands::usage_resume::agent_chat_resume_after_usage_limit;
+
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    registry.set_claude(provider.clone() as _).await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    let thread = "usage-resume-overlap";
+    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+        .unwrap();
+    db.upsert_agent_chat_usage_resume(thread, "claude", Some(1_000))
+        .unwrap();
+    provider.start_session(start_input(thread)).await.unwrap();
+    let (entered, release) = provider.hold_next_send();
+    let resume = agent_chat_resume_after_usage_limit(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(thread.into()),
+    );
+    let concurrent = async {
+        timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let error = agent_chat_resume_after_usage_limit(
+            handle.clone(),
+            ProviderKind::Claude,
+            ThreadId(thread.into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("already in progress"));
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60_000;
+        forward_event(
+            &handle,
+            ProviderRuntimeEvent::UsageLimitReached {
+                thread_id: ThreadId(thread.into()),
+                provider: ProviderKind::Claude,
+                resets_at_ms: Some(reset),
+                auto_resume_at_ms: None,
+                window: None,
+            },
+        );
+        release.notify_one();
+        reset
+    };
+    let (result, reset) = tokio::join!(resume, concurrent);
+    result.unwrap();
+    let row = db
+        .get_agent_chat_usage_resume(thread)
+        .expect("new provider limit remains armed");
+    assert_eq!(row.resume_at_ms, Some(reset + 45_000));
+    assert_eq!(row.attempts, 0);
+    assert_eq!(
+        provider
+            .calls
+            .snapshot()
+            .iter()
+            .filter(|call| matches!(call, MockCall::SendTurn(..)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn usage_resume_stop_commands_disarm_schedule_and_notify_clients() {
+    use codemux_lib::commands::agent_chat::{agent_chat_interrupt_turn, agent_chat_stop_session};
+
+    let app = mock_app_with_chat_state();
+    app.manage(test_observability(true));
+    let registry = ProviderRegistry::new();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    registry.set_claude(provider.clone() as _).await;
+    app.manage(registry);
+    let handle = app.handle().clone();
+    let db: State<'_, DatabaseStore> = handle.state();
+    let thread = "usage-resume-stop";
+    db.upsert_agent_chat_session(thread, "ws", None, "claude")
+        .unwrap();
+    let channels: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel, captured) = capture_channel();
+    channels.attach(thread, channel);
+
+    db.upsert_agent_chat_usage_resume(thread, "claude", Some(1_000))
+        .unwrap();
+    agent_chat_interrupt_turn(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(thread.into()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(db.get_agent_chat_usage_resume(thread).is_none());
+    db.upsert_agent_chat_usage_resume(thread, "claude", Some(2_000))
+        .unwrap();
+    agent_chat_stop_session(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId(thread.into()),
+    )
+    .await
+    .unwrap();
+    assert!(db.get_agent_chat_usage_resume(thread).is_none());
+    assert_eq!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|payload| matches!(
+                payload.event,
+                ProviderRuntimeEvent::UsageResumeCancelled { .. }
+            ))
+            .count(),
+        2
+    );
+    assert!(provider
+        .calls
+        .snapshot()
+        .iter()
+        .all(|call| !matches!(call, MockCall::SendTurn(..))));
+}
+
 #[test]
 fn event_bridge_persists_exact_grok_usage_once_per_turn() {
     let app = mock_app_with_chat_state();

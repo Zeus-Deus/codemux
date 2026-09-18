@@ -68,6 +68,7 @@ pub struct MockAgentProvider {
     /// `start_session` inserts, `stop_session` removes.
     live: Arc<Mutex<HashSet<ThreadId>>>,
     rollback_error: Arc<Mutex<Option<String>>>,
+    send_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Every `StartSessionInput` received, in order, so tests can assert
     /// on what the command layer actually handed the provider (workspace
     /// id, env overlay, resume cursor) rather than only that it was called.
@@ -84,6 +85,7 @@ impl MockAgentProvider {
             event_tx,
             live: Arc::new(Mutex::new(HashSet::new())),
             rollback_error: Arc::new(Mutex::new(None)),
+            send_gate: Mutex::new(None),
             start_inputs: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -96,6 +98,15 @@ impl MockAgentProvider {
 
     pub fn fail_next_rollback(&self, message: impl Into<String>) {
         *self.rollback_error.lock().unwrap() = Some(message.into());
+    }
+
+    /// Keep one dispatch in flight while a test drives concurrent commands.
+    #[allow(dead_code)]
+    pub fn hold_next_send(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.send_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+        (entered, release)
     }
 
     /// Convenience: emit a runtime event via the broadcaster, the
@@ -161,6 +172,11 @@ impl AgentProvider for MockAgentProvider {
     }
 
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
+        let gate = self.send_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         let checkpoint = input.turn_checkpoint.clone();
         if let Some(checkpoint) = checkpoint.as_ref() {
             checkpoint.prepare().await;
