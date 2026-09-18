@@ -185,7 +185,8 @@ async fn copy_metadata(
         #[cfg(unix)]
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
         let file = options.open(source).await.map_err(snapshot_error)?;
-        if !file.metadata().await.map_err(snapshot_error)?.is_file() {
+        let opened_metadata = file.metadata().await.map_err(snapshot_error)?;
+        if !opened_metadata.is_file() {
             return Err(snapshot_error("Git metadata is not a regular file"));
         }
         let mut bytes = Vec::new();
@@ -202,6 +203,19 @@ async fn copy_metadata(
         *remaining -= bytes.len();
         tokio::fs::write(target, bytes)
             .await
+            .map_err(snapshot_error)?;
+        // Git's racy-clean detection compares cached file stat data against the
+        // index timestamp. A freshly timestamped copy can hide a same-size edit
+        // within the filesystem's timestamp granularity (observed on Windows).
+        // Preserve the timestamp of the opened source, including split indexes.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(target)
+            .await
+            .map_err(snapshot_error)?
+            .into_std()
+            .await
+            .set_modified(opened_metadata.modified().map_err(snapshot_error)?)
             .map_err(snapshot_error)
     };
     tokio::select! {
