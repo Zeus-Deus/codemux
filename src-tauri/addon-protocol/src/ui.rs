@@ -63,7 +63,30 @@ fn string(v: &Value, max: usize) -> bool {
 }
 fn property(key: &str, v: &Value) -> bool {
     if v.is_null() {
-        return true;
+        return matches!(
+            key,
+            "spacing"
+                | "direction"
+                | "columns"
+                | "align"
+                | "width"
+                | "height"
+                | "size"
+                | "color"
+                | "label"
+                | "title"
+                | "placeholder"
+                | "name"
+                | "value"
+                | "disabled"
+                | "checked"
+                | "level"
+                | "max"
+                | "headers"
+                | "items"
+                | "rows"
+                | "options"
+        );
     }
     match key {
         "spacing" => token(v, &["none", "xs", "sm", "md", "lg"]),
@@ -157,8 +180,10 @@ impl Tree {
                     }
                     let key = r[2].as_str().ok_or_else(invalid)?.to_string();
                     let target = match r.get(4).and_then(Value::as_u64).unwrap_or(1) {
-                        1 => &mut node.properties,
-                        3 => &mut node.event_listeners,
+                        1 if property(&key, &r[3]) => &mut node.properties,
+                        3 if matches!(key.as_str(), "press" | "change") => {
+                            &mut node.event_listeners
+                        }
                         _ => return Err(invalid()),
                     };
                     if r[3].is_null() {

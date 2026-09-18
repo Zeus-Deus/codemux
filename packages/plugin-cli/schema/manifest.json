@@ -198,6 +198,7 @@
     "HttpGrant": {
       "type": "object",
       "required": [
+        "credential",
         "methods",
         "origin"
       ],
