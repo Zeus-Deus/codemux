@@ -33,6 +33,20 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- [Linux native active-update acceptance](https://github.com/Zeus-Deus/codemux/actions/runs/35397049892)
+  passes same-access watched-package update while its real panel is active,
+  expanded-permission review/cancellation, and Settings rollback restoring the
+  previous private checkbox value after it was changed in the updated release.
+  Source identity stays fixed; previous/current data generations are checked.
+  The test uses the public Developer mode and normal review/rollback controls,
+  with the existing single-use chooser seam. [Exact evidence](evidence/native-ui-linux-updates-312321e3.json)
+  records all other native gates passing on installer `312321e3` too.
+  Windows's older `da835efb` installer failed during rollback with a real
+  `UI update queue overflow`, invalidating its palette option. This installer
+  and its saved examples predate the SDK backpressure fix; the gate must repeat
+  with rebuilt Windows inputs. The harness only reacquires driver-rejected
+  stale elements and does not suppress plugin failures.
+
 - Native pane restoration, no empty accessory/footer spacing, credential
   removal/redaction and paired remote denial now all pass on
   [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35396542696) and
