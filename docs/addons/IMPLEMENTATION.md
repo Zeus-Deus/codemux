@@ -33,6 +33,26 @@ publication and Settings remain separate deliverables.
 
 ## Verified evidence (Linux x86_64 unless stated otherwise)
 
+- The expanded [Linux installed-app run](https://github.com/Zeus-Deus/codemux/actions/runs/35395837249)
+  passes on the newer `312321e3` installer, including masked credential entry,
+  missing Secret Service with explicit session-only fallback, removal/redaction,
+  and an actual paired loopback HTTP/WebSocket client. Core RPC/events remain
+  available while every tested `addon_*` command and plugin event is denied.
+  [Exact evidence](evidence/native-ui-linux-credentials-312321e3.json) also records
+  the successful public HTTPS, five hostile workloads, rendering budget,
+  restart, GUI-off and corrupt-registry checks. This is a saved installer, not
+  the final source. Windows passed OS credential save/delete and remote checks,
+  but verbose WebDriver logging captured its synthetic SendKeys value; the
+  harness now uses warning-only diagnostics and its redaction rerun is pending.
+
+- Final-source Windows CI at `ff086c77` exposed a private SQLite file handle
+  surviving runtime stop while an activation caller retained `Arc<Running>`.
+  Removal committed safely but reported pending file cleanup. Stop now explicitly
+  closes storage under its operation mutex, and stale broker access fails closed.
+  The concurrent native activation/removal regression keeps that stale reference
+  alive and requires warning-free deletion. All six real-host tests pass locally;
+  Windows verification of this correction is pending.
+
 - The full expanded saved-installer GUI harness passes on
   [Linux](https://github.com/Zeus-Deus/codemux/actions/runs/35393863385) and
   [Windows](https://github.com/Zeus-Deus/codemux/actions/runs/35393865596), including
