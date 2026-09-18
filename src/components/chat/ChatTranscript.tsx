@@ -17,6 +17,7 @@ import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
   messages: ChatViewItem[];
+  compacting?: boolean;
   /** True while a turn is in flight — either the backend has
    *  acknowledged streaming OR the composer's optimistic flag is set.
    *  Drives the transcript-tail "working" marker. */
@@ -94,6 +95,7 @@ interface Props {
  */
 export const ChatTranscript = memo(function ChatTranscript({
   messages,
+  compacting = false,
   streaming,
   stalled,
   interrupted,
@@ -140,6 +142,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         messages={messages}
         showThinking={showThinking}
         streaming={streaming}
+        compacting={compacting}
         stalled={stalled}
         interrupted={interrupted}
         sendAnchor={sendAnchor}

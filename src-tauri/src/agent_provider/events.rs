@@ -538,6 +538,11 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         workflow: WorkflowSnapshot,
     },
+    /// Transient provider-confirmed context summarization; not a turn boundary.
+    ContextCompactionChanged {
+        thread_id: ThreadId,
+        active: bool,
+    },
     /// The thread's context-window occupancy changed — emitted on
     /// assistant-message usage reports, turn completion, and compaction
     /// boundaries. Latest snapshot wins; the reducer keeps only the most

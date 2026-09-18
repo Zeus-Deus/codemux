@@ -19,9 +19,15 @@ import { formatActivityDuration } from "./activity-steps";
  * individual tool-call rows above it stay still. There is one orb per live
  * thing.
  */
-export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
-  const label = deriveStreamingLabel(messages);
-  const activity = useMemo(() => turnOrbActivity(messages), [messages]);
+export function StreamingMarker({ messages, compacting = false }: {
+  messages: ChatViewItem[];
+  compacting?: boolean;
+}) {
+  const label = compacting ? "Summarizing context…" : deriveStreamingLabel(messages);
+  const activity = useMemo(
+    () => compacting ? {} : turnOrbActivity(messages),
+    [compacting, messages],
+  );
   const startedAt = useMemo(() => deriveTurnStartedAt(messages), [messages]);
   const elapsedRef = useRef<HTMLSpanElement>(null);
 
@@ -44,7 +50,7 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
     <div
       className="flex items-center gap-[13px] pt-0.5"
       role="status"
-      aria-label="Agent is working"
+      aria-label={compacting ? "Agent is summarizing context" : "Agent is working"}
     >
       <span className="flex w-[29px] shrink-0 justify-center">
         {/* The row already announces itself via role="status", so the orb

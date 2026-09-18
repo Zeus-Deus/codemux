@@ -410,6 +410,7 @@ function finalizeReplay(
     // turn is in flight we mark the thread streaming so the streaming
     // marker shows instead of the Run-interrupted divider.
     streaming: runLive,
+    compacting: runLive && state.compacting,
     pendingRequestIds: expireOrphanRequests ? [] : state.pendingRequestIds,
     // Interrupted when EITHER the replay itself observed a `child_exited`
     // terminal turn (the watchdog persisted a `turn_completed` error) OR
